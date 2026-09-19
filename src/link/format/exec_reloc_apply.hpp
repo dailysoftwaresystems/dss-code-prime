@@ -394,25 +394,22 @@ planGotSlotSymbols(AssembledModule const& module,
                                  + "' shifted value " + std::to_string(value)
                                  + " does not fit signed "
                                  + std::to_string(static_cast<int>(bg.fieldBits))
-                                 + "-bit — branch out of range. A call beyond "
-                                   "this field's reach is rescued by a VENEER "
-                                   "(a nearer branch standing in for the "
-                                   "callee), which `injectBranchVeneers` places "
-                                   "before this kernel runs. Reaching this "
-                                   "refusal means one of THREE things, and the "
-                                   "third is the one a large image hits: the "
-                                   "target declares nothing to build a veneer "
-                                   "from; the placement ran and could not find "
-                                   "a site (it says so by name); or THE VENEER "
-                                   "PASS NEVER SAW THIS RELOCATION AT ALL — it "
-                                   "models `.text` as the module's own "
-                                   "functions concatenated, so a call whose "
-                                   "target is an IMPORT STUB is invisible to "
-                                   "it, and the stub's address is chosen by "
-                                   "this writer AFTER that pass has run. The "
-                                   "synthetic entry's call to the process-exit "
-                                   "import is exactly such a call "
-                                   "(D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER).");
+                                 + "-bit — branch out of range. A branch beyond "
+                                   "this field's reach is carried by a VENEER, "
+                                   "which `injectBranchVeneers` places before "
+                                   "this kernel runs for any target that is a "
+                                   "FUNCTION of this image or an IMPORT STUB "
+                                   "(whose address the writer reports to that "
+                                   "pass in advance). Reaching this refusal "
+                                   "means the pass did not carry this branch, "
+                                   "for one of three reasons: its target is "
+                                   "NEITHER of those (a data item, or a symbol "
+                                   "no veneer is built for); this writer was "
+                                   "called directly on a module `linker::link` "
+                                   "never prepared; or the pass's arithmetic "
+                                   "and this layout disagree, an "
+                                   "internal-invariant violation "
+                                   "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH).");
                         return false;
                     }
                     auto const inst = readInst32();

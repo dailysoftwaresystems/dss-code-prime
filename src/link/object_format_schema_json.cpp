@@ -2480,8 +2480,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             "schema declares kind '{}'. The '{}' walker "
                             "would silently DROP a stack-reserve request "
                             "routed to it. Fix the vehicle or the "
-                            "format.kind. D-SQLITE-PE64-FULL-TIER-STACK-"
-                            "DEPTH.",
+                            "format.kind. "
+                            "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.",
                             stackReserveVehicleName(info.vehicle),
                             implementer != nullptr
                                 ? std::string{implementer->configName()}
@@ -2653,8 +2653,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             "after the config that broke it was written. Fix "
                             "the dialect or the format.kind. Dialects '{}' "
                             "writes: {}. "
-                            "D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-"
-                            "AND-MACHO-WRITERS.",
+                            "D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.",
                             weakDefinitionDialectName(*dv), spelledBy,
                             backend->configName(), backend->configName(),
                             backend->configName(),

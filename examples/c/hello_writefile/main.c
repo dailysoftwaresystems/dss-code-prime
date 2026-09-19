@@ -1,4 +1,4 @@
-// ★ D-LK10-KERNEL32-WRITE-PATH closure + D-CSUBSET-LOCAL-INT-CODEGEN
+// ★ D-LK10-KERNEL32-WRITE-PATH closure + local-int codegen (step 13.3b)
 // payoff (step 13.3, 2026-06-02).
 //
 // The first DSS-emitted Windows binary that prints WITHOUT msvcrt:
@@ -25,13 +25,13 @@
 //     per C §6.3.2.3.3. Windows reads this as synchronous-mode +
 //     no OVERLAPPED struct.
 //
-//   * D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3a) — trailing
+//   * the extern library-name syntax (step 13.3a) — trailing
 //     `"kernel32.dll"` library override on each extern routes the
 //     symbols to kernel32 (vs c's default msvcrt). The
 //     per-symbol override threads through `HirExternRecord.libraryOverride`
 //     → `ExternDeclRef.libraryOverride` → `synthesizeFfiFromSourceDecls`.
 //
-//   * D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b) — `int written;` body
+//   * local-int codegen (step 13.3b) — `int written;` body
 //     declaration emits an `alloca` LIR op which the materialize
 //     pass rewrites to `lea reg, [rsp + localAreaOffset() + i*16]`.
 //     Win64 ms_x64 frame layout: [outgoing-args 32B shadow + 8B

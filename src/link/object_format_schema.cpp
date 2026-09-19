@@ -684,8 +684,8 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          "weak definition ({}). Omit the block entirely to "
                          "leave the question unanswered; an engaged block with "
                          "the invalid sentinel is neither an answer nor an "
-                         "omission. D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-"
-                         "DECLARED.",
+                         "omission. "
+                         "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
     }

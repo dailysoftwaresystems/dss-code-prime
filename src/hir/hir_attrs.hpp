@@ -51,7 +51,7 @@ using HirFfiMap = HirAttribute<FfiMetadata>;
 // optimizer's DCE-protect predicate `isExternallyVisible()` consults.
 using HirLinkageMap = HirAttribute<LinkageAttr>;
 
-// TF-C78 (D-CSUBSET-NOINLINE): native FUNCTION declarations the source marked
+// TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): native FUNCTION declarations the source marked
 // `__attribute__((noinline))`. Populated by CST→HIR lowering from the bound
 // symbol's `SymbolRecord.isNoInline`; read by HIR→MIR lowering to stamp
 // `MirFunc.noInline` — the input the optimizer's inlining legality gate refuses

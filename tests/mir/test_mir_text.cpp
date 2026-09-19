@@ -378,7 +378,7 @@ TEST(MirText, UnnamedSymbolRoundTrips) {
     EXPECT_NE(rt.firstEmit.find("%42 \"\""), std::string::npos);
 }
 
-// ── TF-C78 (D-CSUBSET-NOINLINE): per-FUNCTION attributes survive the
+// ── TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): per-FUNCTION attributes survive the
 // text round-trip ────────────────────────────────────────────────────
 //
 // ★ THIS TEST EXISTS BECAUSE THE ROUND-TRIP USED TO SILENTLY LOSE DATA.

@@ -3541,8 +3541,8 @@ TEST(PeExecWriter, NonX64MachineCarryingUnwindInfoFailsLoudButCfiFreeStillEncode
             << "an image whose unwind tables cannot be encoded must emit NO "
                "bytes -- never a silently unwind-less binary";
         EXPECT_GT(rep.errorCount(), 0u)
-            << "dropping .pdata/.xdata must be LOUD (D-WIN64-PDATA-ARM64-"
-               "SILENT-SKIP)";
+            << "dropping .pdata/.xdata must be LOUD ("
+               "D-WIN64-PDATA-ARM64-SILENT-SKIP)";
         EXPECT_EQ(::dss::test_support::countCode(
                       rep, DiagnosticCode::K_UnwindRuleUnrepresentable),
                   1u);

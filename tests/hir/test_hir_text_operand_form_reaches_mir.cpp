@@ -118,8 +118,8 @@ TEST(HirTextOperandForm, ImmediateFormReachesTheMirLoweringWithItsBindingIntact)
     (void)mir;
     std::string const diags = allDiagText(mr);
     EXPECT_EQ(diags.find(kResolvedToNothingPrefix), std::string::npos)
-        << "the round trip re-created D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-"
-           "BEING-DECLARED one tier over: the letter IS declared and the "
+        << "the round trip re-created "
+           "D-ASM-MEMORY-CONSTRAINT-REFUSED-DESPITE-BEING-DECLARED one tier over: the letter IS declared and the "
            "refusal says it is not, because the binding was dropped in "
            "transit.\n" << diags;
     EXPECT_EQ(diags.find(kResolvedToNothing), std::string::npos) << diags;

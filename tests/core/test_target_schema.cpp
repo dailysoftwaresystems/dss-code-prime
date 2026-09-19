@@ -685,8 +685,8 @@ TEST(TargetSchema, ImplicitRegistersUnknownSubKeyRejected) {
             ]})",
         "<inline>");
     ASSERT_FALSE(r.has_value())
-        << "typo'd sub-key 'inpts' must fail-loud (D-CONFIG-LOADER-"
-           "UNKNOWN-KEYS-FAIL-LOUD discipline)";
+        << "typo'd sub-key 'inpts' must fail-loud ("
+           "D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD discipline)";
     EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson));
 }
 
@@ -1096,7 +1096,7 @@ TEST(TargetSchema, CallPushBytesShippedX8664SysVDeclaresEight) {
 }
 
 TEST(TargetSchema, SlotAlignedShippedMsX64IsTrueOthersFalse) {
-    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed co-with-D-ML7-2.2, 2026-06-02): the shipped
+    // D-PLAN12-SLOT-ALIGNED-HALF-CLOSED-2026-CLOSED-WITH-ML7 (closed together with plan step ML7-2.2, 2026-06-02): the shipped
     // schemas must declare `slotAligned: true` on ms_x64 (the only
     // SLOT-ALIGNED cc DSS supports today) and leave it false elsewhere.
     // A schema regression that silently flipped this would: (a) flip

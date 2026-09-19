@@ -3,6 +3,7 @@
 #include "core/types/target_schema.hpp"
 
 #include <cstdint>
+#include <optional>
 
 // ─────────────────────────────────────────────────────────────────────
 // [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]
@@ -79,6 +80,68 @@ branchRelocFieldMax(BranchRelocGeometry g) noexcept {
 branchRelocByteReach(RelocFormulaKind k) noexcept {
     auto const g = branchRelocGeometry(k);
     return branchRelocFieldMax(g) << g.scaleLog2;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]
+// THE WINDOW A RELOCATION ROW'S FIELD CAN ENCODE, IN BYTES
+// ─────────────────────────────────────────────────────────────────────
+//
+// The veneer pass asks one question of two different kinds of field: how far
+// may the TARGET (S + A) lie from the PATCH SITE (P) before this row can no
+// longer encode it? It asks it of the BRANCH being carried (`call26`: ±128 MiB)
+// and of every field of the veneer BODY carrying it (ADRP: ±4 GiB), and the
+// body's own reach is the intersection. One function, so the two answers cannot
+// be computed two ways.
+//
+// ⚠ THE WINDOW IS ONE THAT IS ALWAYS ENCODABLE, WHATEVER P IS. A page-relative
+// field encodes `((S+A) >> 12) - (P >> 12)`, which for a given byte distance
+// varies by one page with P's offset inside its page; the window below is the
+// one that fits for EVERY P, so the pass may under-use the last page of reach
+// but can never place a field the applier then refuses.
+//
+// nullopt = the field is not bounded by distance from P at all: an absolute
+// address or its low bits, a thread-pointer offset, or a field that addresses a
+// GOT SLOT rather than S itself. Every formula is enumerated (no `default`), so
+// `-Werror=switch` makes a new one a decision somebody takes here.
+struct RelocReach {
+    std::int64_t minDelta = 0;  // most negative encodable (S + A - P)
+    std::int64_t maxDelta = 0;  // most positive encodable (S + A - P)
+};
+
+[[nodiscard]] constexpr std::optional<RelocReach>
+relocFieldReach(TargetRelocationInfo const& row) noexcept {
+    switch (row.formulaKind) {
+        case RelocFormulaKind::Aarch64Call26: {
+            auto const g     = branchRelocGeometry(row.formulaKind);
+            auto const scale = std::int64_t{1} << g.scaleLog2;
+            return RelocReach{branchRelocFieldMin(g) * scale,
+                              branchRelocFieldMax(g) * scale};
+        }
+        case RelocFormulaKind::Aarch64AdrPrelPgHi21: {
+            // Page delta in signed 21 bits: [-2^20, 2^20 - 1] pages. For a
+            // byte distance d the page delta is floor(d/4096) or one more, so
+            // every d in [-2^32, 2^32 - 4097] is encodable for EVERY P.
+            constexpr std::int64_t kPage = 4096;
+            constexpr std::int64_t kPages = std::int64_t{1} << 20;
+            return RelocReach{-kPages * kPage, (kPages - 1) * kPage - 1};
+        }
+        case RelocFormulaKind::Linear: {
+            // value = S + A - P + addendBias, written in `widthBytes` bytes.
+            // Absolute rows, and an 8-byte field, span the address space.
+            if (!row.pcRelative || row.widthBytes == 0 || row.widthBytes >= 8)
+                return std::nullopt;
+            auto const half = std::int64_t{1} << (8 * row.widthBytes - 1);
+            return RelocReach{-half - row.addendBias, half - 1 - row.addendBias};
+        }
+        case RelocFormulaKind::Aarch64AddAbsLo12:     // the low 12 bits of S + A
+        case RelocFormulaKind::Aarch64TprelAddHi12:   // a thread-pointer offset
+        case RelocFormulaKind::Aarch64AdrGotPage:     // addresses the GOT SLOT
+        case RelocFormulaKind::Aarch64Ld64GotLo12:    // addresses the GOT SLOT
+        case RelocFormulaKind::X86_64GotPcRel:        // addresses the GOT SLOT
+            return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 }  // namespace dss::link

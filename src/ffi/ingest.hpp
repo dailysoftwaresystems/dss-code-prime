@@ -51,7 +51,7 @@ namespace dss::ffi {
 // here when a new ingest shape arrives (e.g. archive `.a`/`.lib`,
 // JSON-described surface, etc.).
 
-// ── D-FFI-DECLARED-IMPORT-NAME — the recorded-identity precedence ──
+// ── Declared import names — the recorded-identity precedence ──
 //
 // Reading a library binary answers TWO separate questions, and this struct
 // keeps them separate:
@@ -351,7 +351,7 @@ using IngestionSource = std::variant<BinaryLibrarySource,
 struct DSS_EXPORT ExternDeclRef {
     HirNodeId        node;
     std::string_view canonicalName;
-    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3, 2026-06-02):
+    // The extern library-name syntax closure (step 13.3, 2026-06-02):
     // empty = the FFI synthesize stage uses the caller-supplied
     // format-level default `importLibrary`; non-empty = per-symbol
     // override (e.g. "kernel32.dll" for GetStdHandle/WriteFile when

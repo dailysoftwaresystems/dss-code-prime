@@ -20,7 +20,6 @@ config tree**, from a release tarball that is a **prefix tree** (`bin/`, `lib/`,
    is the single owner of what ships: the exe to `bin/`, the shared lib to
    `lib/` with `$ORIGIN/../lib` (Linux) / `@loader_path/../lib` (macOS), and
    `src/dss-config/` to `share/dsscp/<version>/dss-config/`.
-   (`D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE`.)
 2. ✅ **The `dss-code-prime` → `dsscp` binary rename** — **LANDED** (P32,
    2026-08-24, operator ruling “command identity”). The installed command, the
    shared library and the config tree under `share/dsscp/` now all carry the

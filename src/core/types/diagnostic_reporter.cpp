@@ -171,7 +171,7 @@ void DiagnosticReporter::reanchorFrom(std::size_t      from,
 }
 
 std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
-    // D-FF2-UNSUPP refined contract (eb2c6c7 audit-fold 2026-06-01):
+    // The unsuppressable-codes table's refined contract (eb2c6c7 audit-fold 2026-06-01):
     // unsuppressable codes bypass SILENCING (`--suppress` drops +
     // `overrides` demotion) so they always reach `all_`. Elevation
     // (`--warnings-as-errors`) applies UNIFORMLY — it strengthens the

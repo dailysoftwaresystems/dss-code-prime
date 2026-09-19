@@ -45,7 +45,7 @@ struct SlotBitWindow {
     std::uint8_t width;
 };
 
-// D-AS3-BLOCK-REL-IMM19/26 + D-CSUBSET-LONG-BRANCH: the block-relative
+// D-AS3-BLOCK-REL-IMM19-26 + D-CSUBSET-LONG-BRANCH: the block-relative
 // patch kind a slot denotes on this walker, or nullopt when the slot
 // carries no intra-function displacement at all. FACTORED OUT of the
 // `BlockRef` wire arm because the LONG-BRANCH escape election needs the
@@ -211,7 +211,7 @@ windowFor(EncodingSlotKind s) noexcept {
         // byte offset at bits 12..20. The wire-loop range-checks signed
         // -256..255 and writes the low 9 bits (two's-complement).
         case EncodingSlotKind::Imm9:  return SlotBitWindow{ 12, 9 };
-        // Imm19 (D-AS3-BLOCK-REL-IMM19/26): AArch64 B.cond signed 19-bit
+        // Imm19 (D-AS3-BLOCK-REL-IMM19-26): AArch64 B.cond signed 19-bit
         // PC-relative branch offset at bits 5..23 (the cond nibble sits
         // at bits 0..3). BLOCK-RELATIVE — the walker writes ZERO bits
         // here (a BlockRef operand pushes a BlockRelPatch instead; the
@@ -323,6 +323,22 @@ windowFor(EncodingSlotKind s) noexcept {
     return std::nullopt;
 }
 
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): the displacement
+// fields this walker range-checks are DESCRIBED in `target_schema.hpp`
+// (`memoryDisplacementField`), because the LIR frame chokepoint has to know a
+// form's reach before it emits the access. The bit WINDOW is this walker's; the
+// WIDTH is one number, and these pins make it impossible for the two to differ.
+static_assert(windowFor(EncodingSlotKind::Imm9)->width
+              == memoryDisplacementField(EncodingSlotKind::Imm9)->bits);
+static_assert(windowFor(EncodingSlotKind::Imm12)->width
+              == memoryDisplacementField(EncodingSlotKind::Imm12)->bits);
+static_assert(windowFor(EncodingSlotKind::Imm12Scaled)->width
+              == memoryDisplacementField(EncodingSlotKind::Imm12Scaled)->bits);
+static_assert(memoryDisplacementField(EncodingSlotKind::Imm9)->isSigned
+              && !memoryDisplacementField(EncodingSlotKind::Imm12Scaled)->isSigned
+              && memoryDisplacementField(EncodingSlotKind::Imm12Scaled)
+                     ->scaledByAccess);
+
 // (LE byte emission moved to `asm/format/byte_emit.hpp` — shared with
 // the x86_variable walker.)
 
@@ -338,7 +354,7 @@ bool encode(Lir const&                  lir,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,
             std::vector<SourceMapEntry>& /*srcMap*/,
-            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 control-flow): fixed32
+            // D-AS3-BLOCK-REL-IMM19-26 (ARM64 control-flow): fixed32
             // now USES blockPatches — a `BlockRef` operand on the Imm19
             // (B.cond) or Imm26 (B) slot is an intra-function branch
             // resolved at assemble time. The walker pushes a
@@ -706,18 +722,28 @@ bool encode(Lir const&                  lir,
     // Both halves OR through `orInto`, so the per-word wroteSlot collision
     // guard fires if a malformed schema double-writes either word.
     constexpr std::uint32_t kImm12HiLo24Max = 0xFFFFFFu;  // 16 MiB - 1
+    static_assert(memoryDisplacementRange(
+                      *memoryDisplacementField(EncodingSlotKind::Imm12HiLo24), 1u)
+                      .max == kImm12HiLo24Max,
+                  "the word-pair's reach is the 24-bit field target_schema.hpp "
+                  "describes — one number, not two");
     auto const writeHiLo24 = [&](std::int64_t value,
                                  std::uint8_t wordIndex,
                                  std::string_view valueDesc) -> bool {
         if (value < 0 || value > static_cast<std::int64_t>(kImm12HiLo24Max)) {
+            // ⚠ THIS USED TO SAY THE LARGER FORM WAS "not yet supported" — it
+            // is supported: the MOVZ/MOVK three-word variant carries every
+            // non-negative int32. Reaching this refusal means the value was
+            // wired to the word-pair slot anyway, i.e. the opcode declares no
+            // magnitude-routed variant past it (or a negative value reached it).
             report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': {} {} is out of range for the "
                                "shifted 'imm12.hilo24' word-pair (valid "
-                               "0..{}, i.e. 24 bits / 16 MiB) — a larger "
-                               "frame needs a third word or a MOVZ/MOVK "
-                               "scratch materialization (not yet supported, "
-                               "D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB)",
+                               "0..{}, i.e. 24 bits / 16 MiB) — a value past "
+                               "it is carried by a MOVZ/MOVK materialization, "
+                               "which this opcode's variants must declare for "
+                               "the selector to route it there",
                                info->mnemonic, valueDesc, value,
                                kImm12HiLo24Max));
             return false;
@@ -757,6 +783,11 @@ bool encode(Lir const&                  lir,
     // halves OR through `orInto`, so the per-word wroteSlot collision guard
     // fires if a malformed schema double-writes either MOVZ/MOVK word.
     constexpr std::int64_t kMovzMovkMax = 0x7FFFFFFF;  // int32 frame ceiling
+    static_assert(memoryDisplacementRange(
+                      *memoryDisplacementField(EncodingSlotKind::Imm32MovzMovk), 1u)
+                      .max == kMovzMovkMax,
+                  "the MOVZ/MOVK form's reach is the field target_schema.hpp "
+                  "describes — one number, not two");
     auto const writeMovzMovk = [&](std::int64_t value,
                                    std::uint8_t wordIndex,
                                    std::string_view valueDesc) -> bool {
@@ -812,7 +843,7 @@ bool encode(Lir const&                  lir,
     // lo12-reloc on word 1), accumulated here and stamped per-word in
     // the emit loop below.
     std::vector<PendingRelocSlot> pendingRelocs;
-    // D-AS3-BLOCK-REL-IMM19/26: a `BlockRef` operand wired to an Imm19
+    // D-AS3-BLOCK-REL-IMM19-26: a `BlockRef` operand wired to an Imm19
     // (B.cond) or Imm26 (B) slot is an INTRA-FUNCTION branch — resolved
     // at assemble time (NOT a linker relocation). Accumulated here, the
     // patch stamped at the START of the wire's word in the emit loop
@@ -939,7 +970,7 @@ bool encode(Lir const&                  lir,
                 wire.wordIndex
             });
         } else if (srcOp.kind == LirOperandKind::BlockRef) {
-            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 intra-function branch):
+            // D-AS3-BLOCK-REL-IMM19-26 (ARM64 intra-function branch):
             // the BlockRef names a target basic block resolved at
             // assemble time. The slot MUST be Imm19 (B.cond) or Imm26
             // (B) — the two ARM64 block-relative branch displacement
@@ -1142,10 +1173,11 @@ bool encode(Lir const&                  lir,
                            std::format("opcode '{}': immediate {} is out of range "
                                        "for the {}-bit '{}' slot — its complement "
                                        "{} exceeds the field's 0..{}, so only "
-                                       "values in {}..-1 are encodable here; a "
-                                       "more negative constant needs a shifted "
-                                       "(hw!=0) or multi-instruction "
-                                       "materialization, not yet supported",
+                                       "values in {}..-1 are encodable in this "
+                                       "one instruction; a more negative "
+                                       "constant is materialized as a MOVZ/MOVK "
+                                       "sequence, which the lowering emits as "
+                                       "separate instructions",
                                        info->mnemonic, raw, w->width,
                                        encodingSlotKindName(wire.slotKind),
                                        inverted, maxVal, -(maxVal + 1)));
@@ -1249,10 +1281,12 @@ bool encode(Lir const&                  lir,
                 report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': immediate {} is out of range "
-                                   "for the {}-bit '{}' slot (valid 0..{}) — a "
-                                   "wider constant needs a multi-instruction "
-                                   "or shifted materialization, not yet "
-                                   "supported",
+                                   "for the {}-bit '{}' slot (valid 0..{}) — "
+                                   "this one instruction cannot carry it; a "
+                                   "wider constant is materialized as a "
+                                   "multi-instruction sequence by the lowering, "
+                                   "or routed to a shifted variant the opcode "
+                                   "declares",
                                    info->mnemonic, imm, w->width,
                                    encodingSlotKindName(wire.slotKind), maxVal));
                 return false;
@@ -1309,8 +1343,8 @@ bool encode(Lir const&                  lir,
             //             D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SUB
             //             negative-disp lea also wires |disp| here for
             //             |disp| ≤ 4095.
-            // A future scaled LDR/STR form adds its own slot when that
-            // consumer lands. Mirrors the ImmInt arm's dual-slot shape.
+            // The scaled LDR/STR form has its own slot (`Imm12Scaled`, handled
+            // in its own arm below). Mirrors the ImmInt arm's dual-slot shape.
             //
             // D-AS4-ARM64-BASE-INDEX-LEA: the THIRD slot is the width-0
             // MemOffsetZero marker (the base+index `lea` = `ADD Xd,Xn,Xm`
@@ -1350,13 +1384,12 @@ bool encode(Lir const&                  lir,
             // multiple has no representation; an unaligned LDR is
             // architecturally undefined), and the scaled field MUST fit 12
             // bits (0..4095 ⇒ a 64-bit reach of 32760). Each is a distinct
-            // fail-loud A_ImmediateOperandOutOfRange (a frame offset that
-            // is negative-and-out-of-imm9, OR aligned-but >32760, OR non-
-            // aligned-and-out-of-imm9 stays fail-loud — the residual
-            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12; the shifted
-            // imm12<<12 form / scratch-register address materialization is
-            // the future closing work). Handled in its own arm BEFORE the
-            // Imm9/Imm12 reject so the scaled slot never leaks into the
+            // fail-loud A_ImmediateOperandOutOfRange. ⓘ A FRAME access never
+            // reaches one of them any more: an offset neither this form nor the
+            // unscaled one carries is emitted by the frame chokepoint as an
+            // address materialized in a register, then an access at offset 0
+            // (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE). Handled in its own arm BEFORE
+            // the Imm9/Imm12 reject so the scaled slot never leaks into the
             // unscaled range logic.
             if (wire.slotKind == EncodingSlotKind::Imm12Scaled) {
                 auto const w = windowFor(wire.slotKind);
@@ -1386,16 +1419,26 @@ bool encode(Lir const&                  lir,
                 std::uint32_t const accessSizeBytes =
                     std::max(1u, static_cast<std::uint32_t>(instWidth) / 8u);
                 std::int32_t const disp = srcOp.offset;
+                // ⚠ THE THREE REFUSALS BELOW USED TO END "(not yet supported)",
+                // and for a FRAME access that stopped being true: the frame
+                // chokepoint (`lir_callconv.cpp` `selectFrameMemOp`) now emits
+                // an offset past both forms as an address materialized in a
+                // register (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE), so it never hands
+                // this form one it cannot carry. What still reaches these lines
+                // is an instruction someone wrote in THIS form — hand-built LIR,
+                // or inline assembly — and the true sentence about it is that
+                // this one instruction cannot encode the offset.
                 if (disp < 0) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} is negative "
                                        "but the scaled unsigned-offset LDR/STR "
                                        "'{}' slot encodes only non-negative "
-                                       "displacements — a negative frame offset "
-                                       "needs the signed unscaled imm9 form or a "
-                                       "scratch-register address (not yet "
-                                       "supported)",
+                                       "displacements — this form cannot carry "
+                                       "it; a small negative offset takes the "
+                                       "signed unscaled form, and a larger one "
+                                       "needs its address materialized in a "
+                                       "register first",
                                        info->mnemonic, disp,
                                        encodingSlotKindName(wire.slotKind)));
                     return false;
@@ -1417,19 +1460,28 @@ bool encode(Lir const&                  lir,
                 }
                 std::uint32_t const scaled =
                     static_cast<std::uint32_t>(disp) / accessSizeBytes;
-                std::uint32_t const maxVal = (1u << w->width) - 1u;
+                // The field's reach, read from the ONE description of it the
+                // frame chokepoint also reads (the static_asserts beside
+                // `windowFor` pin that width to this window).
+                auto const reach = memoryDisplacementRange(
+                    *memoryDisplacementField(wire.slotKind), accessSizeBytes);
+                std::uint32_t const maxVal =
+                    static_cast<std::uint32_t>(reach.max / accessSizeBytes);
                 if (scaled > maxVal) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} scales to "
                                        "{} which exceeds the unsigned {}-bit "
                                        "'{}' field (valid 0..{}, i.e. a byte "
-                                       "reach of {}) — a larger frame needs the "
-                                       "shifted imm12<<12 LDR form or a scratch-"
-                                       "register address (not yet supported)",
+                                       "reach of {}) — no single instruction of "
+                                       "this form reaches it; the displacement "
+                                       "has to be carried by an address "
+                                       "materialized in a register (the form the "
+                                       "frame chokepoint emits for a frame access "
+                                       "this far)",
                                        info->mnemonic, disp, scaled, w->width,
                                        encodingSlotKindName(wire.slotKind),
-                                       maxVal, maxVal * accessSizeBytes));
+                                       maxVal, reach.max));
                     return false;
                 }
                 if (!orInto(wire.slotKind, scaled, wire.wordIndex))
@@ -1511,48 +1563,64 @@ bool encode(Lir const&                  lir,
             // signed Imm9 slot negValue is always false, so effectiveDisp
             // == srcOp.offset — the two's-complement range/write is unchanged.
             std::int32_t const disp = static_cast<std::int32_t>(effectiveDisp);
+            // The field's range, from the ONE description of it the frame
+            // chokepoint also reads (`memoryDisplacementField`, pinned to this
+            // walker's window width by the static_asserts beside `windowFor`).
+            // Neither slot here is scaled, so the access size does not enter.
+            auto const range = memoryDisplacementRange(
+                *memoryDisplacementField(wire.slotKind), /*accessBytes=*/1u);
             if (isSignedSlot) {
-                // SIGNED range derived from the slot WIDTH (two's-
-                // complement): [-(2^(w-1)), 2^(w-1)-1] — for Imm9 that is
-                // -256..255. Deriving from width (not a baked literal)
-                // keeps the signed path as generic as the unsigned arm;
-                // fail loud rather than silently truncate to a WRONG
-                // stack slot. A larger frame needs the scaled LDR/STR
-                // imm12 form (future).
-                std::int32_t const lo = -(1 << (w->width - 1));
-                std::int32_t const hi = (1 << (w->width - 1)) - 1;
-                if (disp < lo || disp > hi) {
+                // SIGNED, two's complement: for Imm9 that is -256..255. Fail
+                // loud rather than silently truncate to a WRONG stack slot.
+                // ⚠ THIS USED TO SAY "a larger frame needs the scaled LDR/STR
+                // imm12 form, not yet supported" — a FALSE DIAGNOSTIC twice
+                // over: the scaled form WAS supported, and a frame offset this
+                // refusal quoted (32768, a spill store) was one the scaled form
+                // had ALREADY been asked about and could not carry either. The
+                // frame chokepoint now emits such an offset as an address
+                // materialized in a register (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE),
+                // so a frame access never reaches this line; what does is an
+                // instruction written in THIS form, which cannot encode it.
+                if (disp < range.min || disp > range.max) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} is out "
                                        "of range for the signed {}-bit '{}' "
-                                       "slot (valid {}..{}) — a larger frame "
-                                       "needs the scaled LDR/STR imm12 form, "
-                                       "not yet supported",
+                                       "slot (valid {}..{}) — this unscaled "
+                                       "form cannot carry it; a larger "
+                                       "displacement takes the scaled "
+                                       "unsigned-offset form, where the target "
+                                       "declares one and the offset is a "
+                                       "multiple of the access size within its "
+                                       "reach, or an address materialized in a "
+                                       "register",
                                        info->mnemonic, disp, w->width,
                                        encodingSlotKindName(wire.slotKind),
-                                       lo, hi));
+                                       range.min, range.max));
                     return false;
                 }
             } else {
-                // UNSIGNED range derived from the slot WIDTH: 0..2^w-1 —
-                // for Imm12 that is 0..4095. A negative frame offset is a
-                // lowering bug (locals sit at non-negative SP offsets
-                // post-prologue), and a larger frame needs the shifted
-                // imm12<<12 form (future); fail loud rather than silently
-                // wrap a negative into a huge positive offset.
-                std::int64_t const maxVal = (std::int64_t{1} << w->width) - 1;
-                if (disp < 0 || disp > maxVal) {
+                // UNSIGNED: for Imm12 that is 0..4095. A negative frame offset
+                // is a lowering bug (locals sit at non-negative SP offsets
+                // post-prologue); fail loud rather than silently wrap it into a
+                // huge positive offset. ⚠ The larger form this used to call
+                // "not yet supported" is the opcode's shifted-imm12 word-pair
+                // (and past 16 MiB its MOVZ/MOVK form), which the variant
+                // selector routes by magnitude — reaching here means the opcode
+                // declares no such variant for this value.
+                if (disp < range.min || disp > range.max) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} is out "
                                        "of range for the unsigned {}-bit '{}' "
-                                       "slot (valid 0..{}) — a larger frame "
-                                       "needs the shifted ADD imm12<<12 form, "
-                                       "not yet supported",
+                                       "slot (valid 0..{}) — a larger "
+                                       "displacement is carried by the shifted "
+                                       "ADD imm12<<12 or MOVZ/MOVK variant, which "
+                                       "this opcode must declare for the selector "
+                                       "to route it there",
                                        info->mnemonic, disp, w->width,
                                        encodingSlotKindName(wire.slotKind),
-                                       maxVal));
+                                       range.max));
                     return false;
                 }
             }
@@ -1661,7 +1729,7 @@ bool encode(Lir const&                  lir,
                 walker_util::appendPendingReloc(relocs, out, pr);
             }
         }
-        // D-AS3-BLOCK-REL-IMM19/26: stamp each intra-function branch
+        // D-AS3-BLOCK-REL-IMM19-26: stamp each intra-function branch
         // patch at the START of its word — `out.size()` here is exactly
         // word i's first byte (its 4 bytes are appended immediately
         // after), the offset the asm.cpp resolver read-modify-writes.

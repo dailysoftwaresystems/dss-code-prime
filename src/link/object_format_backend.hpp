@@ -4,6 +4,7 @@
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (the BRIDGE type — see the tier note)
 #include "core/types/strong_ids.hpp"          // CompilationUnitId — by VALUE in readRelocatableObject
+#include "link/import_call_stub_layout.hpp"  // link::ImportCallStubLayout — by VALUE in importCallStubLayout
 
 #include <cstdint>
 #include <functional>
@@ -359,6 +360,30 @@ public:
     // wrong question. Overriding this is the act of claiming the bytes exist.
     [[nodiscard]] virtual bool
     realizesCoalescingScopeReferences() const noexcept { return false; }
+
+    // ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
+    //
+    // Where THIS backend's writer will put the call stub of each import that
+    // `module` binds, as an upper bound on the stub's distance past the end of
+    // `.text` — see `link/import_call_stub_layout.hpp` for why a bound, and why
+    // it must hold for every `.text` size. The branch-veneer pass reads it to
+    // measure an import-bound call exactly as GNU ld and ld.lld do: against
+    // the stub it lands on.
+    //
+    // ★ A WALKER CAPABILITY, like `realizesCoalescingScopeReferences()` above,
+    // because only the code that lays the stubs out knows where they go; and
+    // each implementation's writer ASSERTS its real layout against this answer
+    // when it emits the stubs, so the two cannot drift silently.
+    //
+    // ★ DEFAULT: NO STUBS. A backend whose writer emits no call stub — or no
+    // bounded branch at all — answers nothing, and a branch to an import is
+    // then measured by the relocation applier alone, exactly as before.
+    [[nodiscard]] virtual link::ImportCallStubLayout
+    importCallStubLayout(AssembledModule const&    /*module*/,
+                         TargetSchema const&       /*targetSchema*/,
+                         ObjectFormatSchema const& /*objectFormatSchema*/) const {
+        return {};
+    }
 
     // ── Emit ────────────────────────────────────────────────────────────
 

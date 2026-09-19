@@ -182,7 +182,7 @@ struct DSS_EXPORT CliArgs {
     // export table is the only way to link against it (a genuine,
     // non-duplicative capability). Threaded to `CompileOptions.resolveLibraries`.
     //
-    // D-FFI-DECLARED-IMPORT-NAME: the full spelling is
+    // Declared import names: the full spelling is
     // `--resolve-library <path>[=<import-name>]`, mirroring `--define
     // NAME[=VALUE]` -- one value-bearing flag whose value carries an OPTIONAL
     // `=`-separated second component, so no new flag enters the surface. With
@@ -432,7 +432,7 @@ enum class CliArgsError : std::uint8_t {
     InvalidDefine       = 12,   // c105: --define with an empty NAME, or a '('
                                 // in NAME (a function-like --define is not
                                 // supported — use a config predefine)
-    InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
+    InvalidJobs         = 13,   // D-PERF-4-CU-PARALLELISM: --jobs with a non-numeric value, a
                                 // zero, or trailing junk (`--jobs 0`, `--jobs x`)
     AmbiguousEmitHirTarget = 19, // --emit-hir with more than one --target.
                                 // HIR is target-dependent and `--emit-hir
@@ -454,7 +454,7 @@ enum class CliArgsError : std::uint8_t {
                                 // zero, or trailing junk. RANGE/alignment is
                                 // NOT decided here — that is the linker gate's
                                 // job, against the format's declared bounds.
-    InvalidResolveLibrary = 15, // D-FFI-DECLARED-IMPORT-NAME:
+    InvalidResolveLibrary = 15, // a declared import name:
                                 // `--resolve-library <path>=<import-name>` with
                                 // an EMPTY side — `=libfoo.so` (no path to read)
                                 // or `libfoo.so=` (no identity to record).

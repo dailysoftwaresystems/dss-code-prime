@@ -468,8 +468,8 @@ TEST(AsmX86SseDialectRows, TheShippedDialectActuallyDeclaresTheSseBlock) {
         EXPECT_TRUE(found)
             << "the shipped AT&T dialect no longer declares `" << w
             << "` — the `x` constraint has lost part of the vocabulary that "
-               "made it usable (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-"
-               "INSTRUCTION-CAN-NAME)";
+               "made it usable "
+               "(D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME)";
     }
 }
 

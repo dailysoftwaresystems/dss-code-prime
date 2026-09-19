@@ -171,7 +171,7 @@ struct CstCastTarget {
     // the target is a float, so there is no "which float?" state to get wrong.
     std::optional<TypeKind> floatKind{};
     // Integer target width: 1 (Bool) / 8 / 16 / 32 / 64, and — since
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — 128 for the two STANDARD 128-bit kinds
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94) — 128 for the two STANDARD 128-bit kinds
     // (`__int128` / `unsigned __int128`, which are NOT bit-precise and so are NOT
     // carried in the `isBitPrecise` triple below). The 128 case is the ONLY width
     // that does not fold through `narrowIntToBits`: the Cast arm routes it through

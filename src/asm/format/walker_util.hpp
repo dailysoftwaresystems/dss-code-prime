@@ -241,18 +241,16 @@ operandsMatchGuard(std::span<LirOperand const>          instOps,
 [[nodiscard]] inline std::optional<std::uint32_t>
 variantImmMagnitude(std::span<LirOperand const>        instOps,
                     std::span<OperandKindFilter const> guard) noexcept {
+    // The sign split is `variantValueMagnitude`'s (target_schema.hpp), shared
+    // with the LIR frame chokepoint so the two tiers read one value line.
     for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
         if (guard[i] == OperandKindFilter::ImmInt
             && instOps[i].kind == LirOperandKind::ImmInt) {
-            std::int32_t const v = instOps[i].immInt32;
-            if (v < 0) return std::nullopt;
-            return static_cast<std::uint32_t>(v);
+            return variantValueMagnitude(/*negValue=*/false, instOps[i].immInt32);
         }
         if (guard[i] == OperandKindFilter::MemOffset
             && instOps[i].kind == LirOperandKind::MemOffset) {
-            std::int32_t const v = instOps[i].offset;
-            if (v < 0) return std::nullopt;
-            return static_cast<std::uint32_t>(v);
+            return variantValueMagnitude(/*negValue=*/false, instOps[i].offset);
         }
     }
     return std::nullopt;
@@ -283,15 +281,11 @@ variantNegMagnitude(std::span<LirOperand const>        instOps,
     for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
         if (guard[i] == OperandKindFilter::ImmInt
             && instOps[i].kind == LirOperandKind::ImmInt) {
-            std::int32_t const v = instOps[i].immInt32;
-            if (v >= 0) return std::nullopt;
-            return static_cast<std::uint32_t>(-static_cast<std::int64_t>(v));
+            return variantValueMagnitude(/*negValue=*/true, instOps[i].immInt32);
         }
         if (guard[i] == OperandKindFilter::MemOffset
             && instOps[i].kind == LirOperandKind::MemOffset) {
-            std::int32_t const v = instOps[i].offset;
-            if (v >= 0) return std::nullopt;
-            return static_cast<std::uint32_t>(-static_cast<std::int64_t>(v));
+            return variantValueMagnitude(/*negValue=*/true, instOps[i].offset);
         }
     }
     return std::nullopt;
@@ -359,28 +353,15 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
     auto const magnitude = v.negValue
         ? variantNegMagnitude(instOps, v.operandKinds)
         : variantImmMagnitude(instOps, v.operandKinds);
-    // A negValue variant is ALWAYS sign-gated (it must reject a
-    // non-negative operand even with no immMin/immMax bound), so consult
-    // the magnitude whenever the sign axis is on OR an imm-range is declared.
-    if (v.negValue || v.immMin.has_value() || v.immMax.has_value()
-        || v.immMultipleOf.has_value()) {
-        if (!magnitude.has_value()) return false;  // wrong sign / no operand
-        if (v.immMin.has_value() && *magnitude < *v.immMin) return false;
-        if (v.immMax.has_value() && *magnitude > *v.immMax) return false;
-        // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]: the
-        // DIVISIBILITY half of the same question. `immMin`/`immMax` bound an
-        // INTERVAL; a scaled field encodes `magnitude / N` and so carries only
-        // the MULTIPLES inside one. Without this a bounded variant matches an
-        // offset its own encoder then refuses — and because election commits
-        // to an opcode, the dialect's other candidate (the unscaled form that
-        // could have carried it) is never tried. `validate()` refuses a
-        // modulus of 0 or 1, so the division is always meaningful.
-        if (v.immMultipleOf.has_value()
-            && (*magnitude % *v.immMultipleOf) != 0) {
-            return false;
-        }
-    }
-    return true;
+    // The four value axes are ONE predicate in `target_schema.hpp`
+    // (`variantValueAxesAdmit`), because the LIR frame chokepoint asks the same
+    // question about an access it has not emitted yet and must get this
+    // matcher's answer. [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]'s
+    // divisibility half lives there too: without it a bounded variant matches an
+    // offset its own encoder then refuses — and because election commits to an
+    // opcode, the dialect's other candidate (the unscaled form that could have
+    // carried it) is never tried.
+    return variantValueAxesAdmit(v, magnitude);
 }
 
 // ★★★ WHY NO VARIANT MATCHED, WHEN THE ANSWER IS "THE VALUE".
@@ -557,7 +538,7 @@ enum class BlockRelPatchKind : std::uint8_t {
     // as 4 LE bytes at `patch_offset`. Used by `E9 rel32` /
     // `0F 8x rel32` (jmp / jcc family).
     X86Rel32 = 0,
-    // ARM64 (D-AS3-BLOCK-REL-IMM19/26 — RESOLVED since 2026-06-08; the
+    // ARM64 (D-AS3-BLOCK-REL-IMM19-26 — RESOLVED since 2026-06-08; the
     // "fail-loud placeholder" this comment used to describe is long gone,
     // and `blockRelFieldGeometry` below now carries each arm's numbers).
     Arm64Imm19 = 1,  // B.cc — bits 23..5 of the 32-bit word, shift=2

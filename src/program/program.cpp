@@ -138,6 +138,16 @@ namespace {
 // Config through the SHIPPED projection rather than re-typing the config.
 // (D-LK10-7's policy knob still arrives here unchanged, at `Program::run`.)
 
+// ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: TRUE ONLY INSIDE THE NESTED
+// BUILD THAT MATERIALISES A SHIPPED RUNTIME ARCHIVE. Declared up here because
+// its three readers sit across this whole file — the diagnostic drain just
+// below, `compileOneTarget`'s artifact report, and
+// `resolveShippedRuntimeArchives`, which owns it. The full argument for why it
+// exists (without it the nested build resolves its own runtime and recurses
+// forever) is on `ShippedRuntimeBuildGuard`, which is the ONLY thing that may
+// write it.
+extern thread_local bool gCompilingShippedRuntimeUnit;
+
 // Drain reporter diagnostics to stderr. The driver is the boundary
 // between in-memory diagnostic records and the operator's terminal;
 // LSP mode owns its own emit path (LSP $/diagnostic), so this stderr
@@ -186,6 +196,22 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
                               std::size_t const         firstIndex = 0) {
     auto const all = rep.all();
     for (auto const& d : all.subspan(std::min(firstIndex, all.size()))) {
+        // ★★ THE NESTED RUNTIME BUILD SHOWS THE USER ONLY WHAT FAILS IT.
+        // Its diagnostics are about DSS's OWN shipped runtime, not the user's
+        // program, and the build runs only on a runtime-object-cache MISS —
+        // so printing its warnings and notes made the same command's stderr
+        // depend on whether this machine's cache was warm (✔MEASURED: every
+        // pe64 `--config=release` build printed the runtime's
+        // `X_OptFixpointTruncated` and `R_SpilledDueToCrossCallExhaustion`
+        // on a miss and nothing on a hit). An Error still prints — with its
+        // own positioned rendering — and still fails the build, where
+        // `resolveShippedRuntimeArchives` names the unit, format and target.
+        // Below Error the runtime's quality is DSS's own gate's business
+        // (tests/program/test_shipped_runtime_compiles), not the user's.
+        if (gCompilingShippedRuntimeUnit
+            && d.severity != DiagnosticSeverity::Error) {
+            continue;
+        }
         if (d.buffer.valid()) {
             std::cerr << rep.format(d, bufs);
         } else {
@@ -284,15 +310,6 @@ void drainDiagnosticsToStderr(DiagnosticReporter const& rep,
 }
 
 // Called ONCE per artifact, and ONLY after the write path reported success.
-// ★★★ D-RUNTIME-DSS-SHIPS-NO-IMPLEMENTATION-HALF: TRUE ONLY INSIDE THE NESTED
-// BUILD THAT MATERIALISES A SHIPPED RUNTIME ARCHIVE. Declared up here because
-// its two readers sit at opposite ends of this file — `compileOneTarget`'s
-// artifact report, immediately below, and `resolveShippedRuntimeArchives`, which
-// owns it. The full argument for why it exists (without it the nested build
-// resolves its own runtime and recurses forever) is on
-// `ShippedRuntimeBuildGuard`, which is the ONLY thing that may write it.
-extern thread_local bool gCompilingShippedRuntimeUnit;
-
 void reportArtifactWritten(std::string const& targetSpec,
                            fs::path const&    outPath) {
     // Lexical only. `absolute` needs the cwd; `lexically_normal` folds the
@@ -1293,7 +1310,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // unreadable path stays DYNAMIC -- the dynamic path's eager open-probe
     // (compile_pipeline step 2.5-pre) fails it loud, so a bad path is never
     // silently dropped.
-    // D-FFI-DECLARED-IMPORT-NAME: a STATED import name is meaningful only on
+    // Declared import names: a STATED import name is meaningful only on
     // the DYNAMIC side (it names a runtime dependency); a static archive is
     // merged into the image and records no import at all. The partition keeps
     // the whole spec on the dynamic side and takes only the PATH for archives.
@@ -1376,7 +1393,7 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     // count BEFORE the per-CU build/lower. Every genuine tier failure reports its
     // own K_/L_/A_/S_/H_ diagnostic; if a per-CU build (`buildCuMir`) or the
     // back-half lower (`lowerCuMirToAssembly`) returns a NULL module without any
-    // new diagnostic, that is a substrate-contract violation (the D-PERF-4
+    // new diagnostic, that is a substrate-contract violation (the D-PERF-4-CU-PARALLELISM
     // buildCuMir-null contract) — emit `D_CompileUnitNullNoDiagnostic` so the
     // driver never exits 1 with ZERO output. A no-op on the happy path and on
     // every genuine (already-reported) failure. Mirrors the optimizer's
@@ -4078,11 +4095,19 @@ buildDependencyArtifactKey(
             Program                        runtimeProgram;
             runtimeProgram.setOutputDir(unitDir);
             runtimeProgram.setCompileConfig(config);
-            // POLICY inherited (suppress / overrides / warnings-as-errors), CAP
-            // and DEDUP relaxed — the same split the per-target scratch
-            // reporter uses, and for the same reason: the run-wide limits are
-            // enforced once at the destination.
-            auto nestedCfg           = rep.config();
+            // ★★ THE POLICY IS DSS's OWN — DEFAULT-CONSTRUCTED, NEVER THE
+            // USER's (`--suppress` / overrides / `--warnings-as-errors`). The
+            // runtime is hermetic by design (above), and the cache key carries
+            // no policy term, so an archive whose build depended on the user's
+            // policy would be served to builds whose policy differs.
+            // ✔MEASURED when it was inherited: `--warnings-as-errors
+            // --config=release` for a pe64 target FAILED on a cold cache — the
+            // runtime's `X_OptFixpointTruncated` promoted to an error, "the
+            // shipped runtime unit 'runtime/platform/src/atomic.c' … FAILED TO
+            // COMPILE" — and PASSED on a warm one, the same command either way.
+            // CAP and DEDUP relaxed, as before: nothing here is rate-limited,
+            // and what the user sees of it is the drain's Error floor.
+            DiagnosticReporter::Config nestedCfg;
             nestedCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
             nestedCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
             nestedCfg.dedupWindow    = 0;
@@ -5390,7 +5415,7 @@ int Program::run(int argc, char* argv[]) {
     // kernel so compile_pipeline step 2.5 reads each named binary's export
     // surface to resolve + validate this run's externs. The parser already
     // produced `ResolveLibrarySpec`s (path + the OPTIONAL declared import
-    // name, D-FFI-DECLARED-IMPORT-NAME), so this is a straight stamp — no
+    // name), so this is a straight stamp — no
     // re-parse, and no layer in between can drop the declared name.
     setResolveLibraries(args.resolveLibraries);
     // `--time`: report the compilation's timings to stderr when this run
@@ -5694,7 +5719,7 @@ int Program::compileProject(
                              pc.defines.begin(), pc.defines.end());
         setUserDefines(std::move(mergedDefines));
 
-        // D-FFI-DECLARED-IMPORT-NAME: the manifest parses into the SAME
+        // Declared import names: the manifest parses into the SAME
         // `ResolveLibrarySpec` the CLI does, so the merge is a plain append —
         // a manifest entry's declared import name survives the join with the
         // CLI-stamped entries instead of being flattened back to a bare path.
@@ -6556,7 +6581,7 @@ int Program::compileUnits(
     // miss — it DOES spawn a thread, but it spawns it and immediately JOINS
     // it, so it buys stack depth, never concurrency.
     //
-    // The batch below is the SAME SHAPE the back half has used since D-PERF-4
+    // The batch below is the SAME SHAPE the back half has used since D-PERF-4-CU-PARALLELISM
     // (see `compileOneTarget`), deliberately reused rather than reinvented:
     //   • write BY INDEX into a pre-sized slot vector — no shared container is
     //     mutated, so there is nothing to lock and nothing to order;

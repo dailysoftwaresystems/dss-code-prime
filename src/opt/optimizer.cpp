@@ -465,8 +465,8 @@ struct ScheduleInterpreter {
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = "opt::optimize: pass returned ok=false WITHOUT "
                              "emitting a diagnostic — substrate contract "
-                             "violation (D-OPT1-RETURN-FALSE-DIAGNOSTIC-"
-                             "CONTRACT).";
+                             "violation ("
+                             "D-OPT1-RETURN-FALSE-DIAGNOSTIC-CONTRACT).";
                 reporter.report(std::move(d));
             }
             stopped = true;

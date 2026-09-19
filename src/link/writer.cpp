@@ -4,19 +4,29 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
+#include <vector>
 
 // HOST facilities, not target ones: `getpid` seeds the unique temp filename
 // (see `processSeed` below), and on POSIX `open`/`O_EXCL` performs the atomic
 // exclusive claim (see `detail::createExclusiveBinary`). Same include dance as
-// `tests/test_support/scratch_dir.hpp`, which established this precedent.
+// `tests/test_support/scratch_dir.hpp`, which established this precedent. On
+// Windows the header also carries the commit's replace
+// (`SetFileInformationByHandle`) and its holder query (see
+// `detail::commitReplacing`).
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
@@ -407,6 +417,445 @@ removeTempNote(std::filesystem::path const& tempPath) {
 
 } // namespace
 
+// ═════════════════════════════════════════════════════════════════════════════
+// THE COMMIT — [[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// ★★★ WHAT FAILED, AND WHY IT WAS A WRONG ANSWER RATHER THAN A USER ERROR.
+// Round 7 of cycle P68's gate failed a correct compile: `writeBytes` staged
+// `repeat0.o` and the commit — then `std::filesystem::rename`, i.e.
+// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` under both Windows standard
+// libraries — was refused with `Permission denied`. ✔MEASURED out of tree on
+// that workstation, repeating the failing test's own pattern (stage, close,
+// commit over the target, read it back) with the CPU at 100%:
+//
+//   * WHICH HANDLE: the TARGET, the previous build's output. The classic
+//     replace was refused with ERROR_ACCESS_DENIED (5) on 9/10000, 44/8000 and
+//     68/20000 commits. A held STAGED file refuses with 32 instead, and
+//     libstdc++ spells 5 `Permission denied` and 32 `Input/output error` (both
+//     measured) — so the gate's text alone says which one was held.
+//   * WHICH SHARE MODE: it shares DELETE. Each time the classic replace was
+//     refused, the POSIX-semantics replace below, tried IMMEDIATELY on the same
+//     staged file, succeeded (9/9); used for EVERY commit it was refused 0/18000.
+//   * HOW LONG: 2.9–21.5 ms, median 10.8, measured with nothing else touching
+//     the file. 🧠 A real-time scan of the freshly written file: the holder
+//     PENDS other opens of it (a filter or an oplock break does; a bare handle
+//     cannot), and `FileProcessIdsUsingFileInformation` names no process for it.
+//
+// ★★ CONTROLLED, one extra `GENERIC_READ` handle with the stated share mode,
+// the error each replace returns (✔MEASURED, Windows 11 26200, NTFS):
+//
+//     held      holder shares     classic (MoveFileExW,    POSIX semantics
+//                                 FileRenameInfo)
+//     target    none, R, R+W      5                        32
+//     target    R+W+DELETE        5                        0: it LANDS, and the
+//                                                          holder keeps reading
+//                                                          the old file
+//     staged    none, R, R+W      32 (opening it for       32
+//                                 DELETE)
+//     staged    R+W+DELETE        0                        0
+//     target is a running .exe    5                        5
+//
+// ⇒ THE REPLACE ASKS FOR POSIX SEMANTICS (`FileRenameInfoEx`,
+// `FILE_RENAME_FLAG_POSIX_SEMANTICS`): a holder that shares delete keeps its
+// handle on the file it opened while the name moves to the new one — exactly
+// what `rename(2)` has always done on the other hosts. It is still ONE atomic
+// rename: the name never stops existing, never serves a partial file, and ends
+// on the staged file's NEW identity, as
+// `D-LK-WRITER-TRUNCATES-INSTEAD-OF-RENAMING` requires. Nothing is ever copied.
+//
+// ★★ THE REFERENCES, ✔MEASURED under the same controlled holder (link
+// generation A, hold the output, link generation B over it, run the result):
+//   * MSVC link.exe 14.51 — LNK1104 against every holder; against a
+//     delete-sharing one it had already DELETED the old output: nothing left.
+//   * lld-link 19.1.5 — survives a delete-sharing holder (📄 LLVM's source:
+//     it renames the busy target aside, delete-on-close, then its own file in);
+//     refuses every other holder at once.
+//   * GNU ld (MinGW-w64 13.2) — survives a delete-sharing holder with a NEW
+//     file, and a read+write-sharing one with the SAME file: TRUNCATED IN PLACE
+//     under the holder (✔ file indices; 🧠 unlink-then-create, source not read).
+// Two references survive the holder that failed the gate ⇒ surviving it is
+// REQUIRED. Both do it NON-atomically — the name is briefly absent, or is
+// rewritten under an open handle; POSIX semantics does it atomically. GNU ld's
+// in-place survival is the inode reuse
+// `D-LK-WRITER-TRUNCATES-INSTEAD-OF-RENAMING` removed, so that one holder is
+// refused here ON PURPOSE.
+//
+// ★ NO REFERENCE WAITS — every one returned within 342 ms against a 3 s holder.
+// The wait below exists for the holders POSIX semantics cannot step past: one
+// withholding FILE_SHARE_DELETE, a program running from the target, and ANY
+// holder on a volume that cannot rename with POSIX semantics (✔MEASURED: a WSL
+// 9P share answers 87 and moves nothing — there the classic replace is the only
+// atomic one, and waiting is the only atomic way past a holder). Bounded by
+// `detail::kCommitHolderWait`, sized at its declaration.
+//
+// ⓘ POSIX IS UNTOUCHED: `rename(2)` is a directory operation that never
+// consults another open descriptor (the measurement the staging-temp note above
+// records), so that arm is the one call it always was, and the patience is
+// never asked.
+
+namespace {
+
+#ifdef _WIN32
+
+// `FileRenameInfoEx` and its two flags are SPELLED HERE because both
+// toolchains' headers declare them only when a build targets Windows 10 RS1 or
+// later, and this tree names no target version: MinGW-w64's `_mingw.h`
+// defaults `_WIN32_WINNT` to 0x0601, which hides the enumerator. ✔MEASURED
+// which checks below are live: MSVC 14.51 (SDK 10.0.26100) declares all three,
+// so all three asserts run; MinGW-w64 13.2 declares the two flag macros — only
+// because their gate names `_WIN32_WINNT_WIN10_RS1`, which it never defines and
+// the preprocessor reads as 0 — so the flag asserts run there too. The values
+// are the documented ABI either way.
+constexpr auto  kFileRenameInfoEx          = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+constexpr DWORD kRenameFlagReplaceIfExists = 0x00000001;
+constexpr DWORD kRenameFlagPosixSemantics  = 0x00000002;
+#ifdef FILE_RENAME_FLAG_POSIX_SEMANTICS
+static_assert(FILE_RENAME_FLAG_REPLACE_IF_EXISTS == kRenameFlagReplaceIfExists);
+static_assert(FILE_RENAME_FLAG_POSIX_SEMANTICS == kRenameFlagPosixSemantics);
+#endif
+#if defined(NTDDI_VERSION) && defined(NTDDI_WIN10_RS1)
+#if NTDDI_VERSION >= NTDDI_WIN10_RS1
+static_assert(FileRenameInfoEx == kFileRenameInfoEx);
+#endif
+#endif
+
+// `FILE_RENAME_INFO` as the RS1 headers declare it — the first member is the
+// union of the classic class's `BOOLEAN ReplaceIfExists` and the Ex class's
+// `DWORD Flags` — spelled here for the same reason, and held to the header's
+// own layout.
+struct RenameInfo {
+    DWORD  Flags;
+    HANDLE RootDirectory;
+    DWORD  FileNameLength;  // in bytes, without the terminator
+    WCHAR  FileName[1];
+};
+static_assert(offsetof(RenameInfo, RootDirectory)
+              == offsetof(FILE_RENAME_INFO, RootDirectory));
+static_assert(offsetof(RenameInfo, FileNameLength)
+              == offsetof(FILE_RENAME_INFO, FileNameLength));
+static_assert(offsetof(RenameInfo, FileName) == offsetof(FILE_RENAME_INFO, FileName));
+
+// The Win32 error BY NUMBER first: the text is localized (this workstation's is
+// Portuguese) and the number is what a report can be searched on — the same
+// order `core/substrate/process_spawn.cpp` gives its host error text.
+[[nodiscard]] std::string windowsError(DWORD error) {
+    return "Windows error " + std::to_string(error) + " ("
+         + std::system_category().message(static_cast<int>(error)) + ")";
+}
+
+// Rename the file behind `staged` — a handle with DELETE access — to `target`,
+// replacing whatever is there. `posix` selects `FileRenameInfoEx` with POSIX
+// semantics, else the classic `FileRenameInfo`, the replace `MoveFileExW`
+// performs. ✔MEASURED: the name is resolved the way `MoveFileExW` resolves it —
+// forward slashes, a bare relative name and a `..` component all land against
+// the current directory — so `target` is handed over exactly as spelled.
+[[nodiscard]] DWORD renameByHandle(HANDLE                       staged,
+                                   std::filesystem::path const& target,
+                                   bool                         posix) {
+    std::wstring const& name  = target.native();
+    std::size_t const   bytes =
+        offsetof(RenameInfo, FileName) + (name.size() + 1) * sizeof(WCHAR);
+    // `std::uint64_t` storage so the HANDLE member is aligned whatever the size.
+    std::vector<std::uint64_t> storage(
+        (bytes + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t), 0);
+    auto* const info = reinterpret_cast<RenameInfo*>(storage.data());
+    // The classic class reads byte 0 as `ReplaceIfExists`, so TRUE lands there.
+    info->Flags = posix ? (kRenameFlagReplaceIfExists | kRenameFlagPosixSemantics)
+                        : DWORD{TRUE};
+    info->RootDirectory  = nullptr;
+    info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(WCHAR));
+    std::memcpy(info->FileName, name.c_str(), (name.size() + 1) * sizeof(WCHAR));
+    if (::SetFileInformationByHandle(staged,
+                                     posix ? kFileRenameInfoEx : FileRenameInfo,
+                                     info, static_cast<DWORD>(bytes))) {
+        return ERROR_SUCCESS;
+    }
+    DWORD const error = ::GetLastError();
+    // A failed call must never read as a success, whatever the slot holds.
+    return error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error;
+}
+
+// The answers that mean the VOLUME (or an OS older than the class) cannot
+// rename with POSIX semantics — so the classic replace is the one to make. The
+// same three `microsoft/STL` treats as "use the classic form" when it asks for
+// POSIX delete semantics in `__std_fs_remove`. ✔MEASURED: a WSL 9P share
+// answers 87 and moves nothing, so falling through to the classic replace on
+// the same handle is a clean second attempt, never a half-done first.
+[[nodiscard]] bool posixRenameUnavailable(DWORD error) {
+    return error == ERROR_INVALID_PARAMETER || error == ERROR_INVALID_FUNCTION
+        || error == ERROR_NOT_SUPPORTED;
+}
+
+enum class RefusalKind : std::uint8_t {
+    Holder,     // another open handle — the only kind waiting can change
+    Directory,  // a file can never replace a directory
+    ReadOnly,   // a read-only file is never replaced
+    Other,      // anything else: reported at once
+};
+
+// Which refusals a HOLDER causes. 32 always is one. 5 is one too — the classic
+// replace's answer to ANY open target, and the POSIX one's to a running image —
+// except that 5 is also what a directory target and a read-only target answer
+// (✔MEASURED, both replaces), and neither of those ever lets go, so waiting on
+// them would only delay a refusal that is already certain. A target that cannot
+// even be stat'ed is held when the answer is 5 — ✔MEASURED: a delete-PENDING
+// file (classic disposition, a holder still open) answers 5 here and to both
+// replaces, and is gone once its last handle closes — and is NOT held when
+// nothing is at the name at all: then the 5 came from elsewhere (an ACL).
+[[nodiscard]] RefusalKind classifyRefusal(DWORD                        error,
+                                          bool                         onStaged,
+                                          std::filesystem::path const& target) {
+    if (error == ERROR_SHARING_VIOLATION) return RefusalKind::Holder;
+    if (error != ERROR_ACCESS_DENIED || onStaged) return RefusalKind::Other;
+    DWORD const attributes = ::GetFileAttributesW(target.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        DWORD const why = ::GetLastError();
+        return (why == ERROR_FILE_NOT_FOUND || why == ERROR_PATH_NOT_FOUND)
+                 ? RefusalKind::Other
+                 : RefusalKind::Holder;
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) return RefusalKind::Directory;
+    if ((attributes & FILE_ATTRIBUTE_READONLY) != 0) return RefusalKind::ReadOnly;
+    return RefusalKind::Holder;
+}
+
+// ── Naming the holders ─────────────────────────────────────────────────────
+// `NtQueryInformationFile` with `FileProcessIdsUsingFileInformation` (class 47,
+// declared with its FILE_PROCESS_IDS_USING_FILE_INFORMATION result in the WDK's
+// `ntifs.h`): every process with a handle open on the file. Reached
+// through `GetProcAddress` so the library gains no link dependency, and asked
+// ONCE, after the commit has already given up — a refusal that names its cause
+// is the reason to ask at all. ⓘ ✔MEASURED: it names a running program and
+// any ordinary handle; for the real-time scan it names nobody (and its own open
+// is pended until the scan ends), so "nobody" is reported as exactly that.
+struct IoStatusBlock {
+    union {
+        LONG  Status;
+        void* Pointer;
+    };
+    ULONG_PTR Information;
+};
+struct ProcessIdsUsingFile {
+    ULONG     NumberOfProcessIdsInList;
+    ULONG_PTR ProcessIdList[1];
+};
+using NtQueryInformationFileFn = LONG(WINAPI*)(HANDLE, IoStatusBlock*, void*, ULONG, int);
+constexpr int  kFileProcessIdsUsingFileInformation = 47;
+constexpr LONG kStatusInfoLengthMismatch = static_cast<LONG>(0xC0000004UL);
+constexpr LONG kStatusBufferOverflow     = static_cast<LONG>(0x80000005UL);
+
+[[nodiscard]] std::string nameProcess(DWORD pid) {
+    std::string const id = "(pid " + std::to_string(pid) + ")";
+    if (pid == ::GetCurrentProcessId()) return "this process " + id;
+    HANDLE const process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) {
+        return "a process " + id + " whose image could not be read ("
+             + windowsError(::GetLastError()) + ")";
+    }
+    // 32767 is the longest path the NT namespace can hold, so this never truncates.
+    std::wstring image(32768, L'\0');
+    DWORD        length = static_cast<DWORD>(image.size());
+    BOOL const   ok     = ::QueryFullProcessImageNameW(process, 0, image.data(), &length);
+    DWORD const  error  = ok ? ERROR_SUCCESS : ::GetLastError();
+    ::CloseHandle(process);
+    if (!ok) {
+        return "a process " + id + " whose image could not be read (" + windowsError(error) + ")";
+    }
+    image.resize(length);
+    return pathForDiag(std::filesystem::path{image}) + " " + id;
+}
+
+[[nodiscard]] std::string describeHolders(std::filesystem::path const& file) {
+    auto const query = reinterpret_cast<NtQueryInformationFileFn>(
+        reinterpret_cast<void (*)()>(::GetProcAddress(
+            ::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    if (query == nullptr) {
+        return "the holders could not be listed (ntdll exports no "
+               "NtQueryInformationFile)";
+    }
+    HANDLE const handle = ::CreateFileW(
+        file.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return "the holders could not be listed (" + windowsError(::GetLastError()) + ")";
+    }
+    // Grown until the list fits; every growth is the system saying "too small".
+    std::vector<std::uint64_t> buffer(1 + 16, 0);
+    LONG                       status = 0;
+    for (;;) {
+        IoStatusBlock io{};
+        status = query(handle, &io, buffer.data(),
+                       static_cast<ULONG>(buffer.size() * sizeof(std::uint64_t)),
+                       kFileProcessIdsUsingFileInformation);
+        if (status != kStatusInfoLengthMismatch && status != kStatusBufferOverflow) break;
+        buffer.assign(buffer.size() * 2, 0);
+    }
+    ::CloseHandle(handle);
+    if (status < 0) {
+        char hex[16];
+        std::snprintf(hex, sizeof hex, "0x%08lX", static_cast<unsigned long>(status));
+        return std::string{"the holders could not be listed (NTSTATUS "} + hex + ")";
+    }
+    auto const* const list = reinterpret_cast<ProcessIdsUsingFile const*>(buffer.data());
+    std::string       names;
+    for (ULONG i = 0; i < list->NumberOfProcessIdsInList; ++i) {
+        if (!names.empty()) names += ", ";
+        names += nameProcess(static_cast<DWORD>(list->ProcessIdList[i]));
+    }
+    if (names.empty()) {
+        return "no process the system can name — the holder let go as it was "
+               "asked, or it is not an ordinary handle (a real-time scan names "
+               "none; measured)";
+    }
+    return names;
+}
+
+[[nodiscard]] std::string composeRefusal(DWORD                        error,
+                                         RefusalKind                  kind,
+                                         bool                         onStaged,
+                                         bool                         posix,
+                                         std::uint32_t                holderRefusals,
+                                         std::chrono::milliseconds    waited,
+                                         std::filesystem::path const& staged,
+                                         std::filesystem::path const& target) {
+    std::string text = windowsError(error);
+    if (onStaged) {
+        text += " opening the staged file '" + pathForDiag(staged) + "' for the rename";
+    }
+    switch (kind) {
+    case RefusalKind::Directory:
+        return text + " — the target is a DIRECTORY, which a file can never "
+                      "replace; nothing was waited for";
+    case RefusalKind::ReadOnly:
+        return text + " — the target carries the READ-ONLY attribute, and a "
+                      "read-only file is never replaced; nothing was waited for";
+    case RefusalKind::Other:
+        return text;
+    case RefusalKind::Holder:
+        break;
+    }
+    text += " — another open handle on the " + std::string{onStaged ? "staged file" : "target"}
+          + " refused it " + std::to_string(holderRefusals) + " time(s) across "
+          + std::to_string(waited.count()) + " ms, and a commit waits at most "
+          + std::to_string(detail::kCommitHolderWait.count())
+          + " ms (linker::detail::kCommitHolderWait) for a holder to let go. ";
+    text += posix ? "The replace asked for POSIX semantics, which a holder that "
+                    "shares delete access cannot refuse — so this one withholds "
+                    "FILE_SHARE_DELETE, or the target is a running program's "
+                    "image. "
+                  : "This volume cannot rename with POSIX semantics, so the "
+                    "classic replace was used, which ANY open handle on the "
+                    "target refuses. ";
+    text += "Held open by: " + describeHolders(onStaged ? staged : target);
+    return text;
+}
+
+#endif  // _WIN32
+
+}  // namespace
+
+namespace detail {
+
+CommitOutcome commitReplacing(std::filesystem::path const& staged,
+                              std::filesystem::path const& target,
+                              CommitPatience const&        patience) {
+    CommitOutcome outcome;
+#ifdef _WIN32
+    bool   posix    = true;  // until the volume answers that it cannot
+    bool   onStaged = false;
+    DWORD  error    = ERROR_SUCCESS;
+    HANDLE handle   = INVALID_HANDLE_VALUE;
+    auto   firstRefusal = std::chrono::steady_clock::time_point{};
+    for (;;) {
+        // The rename is made on a handle to the staged file — DELETE access,
+        // every share granted, not inheritable (null SECURITY_ATTRIBUTES, the
+        // `createExclusiveBinary` rule) — so no second open of it is ever
+        // needed and a cross-volume target cannot be copied into.
+        // FILE_FLAG_OPEN_REPARSE_POINT renames the ENTRY, as `MoveFileExW`
+        // does, never a link's target.
+        if (handle == INVALID_HANDLE_VALUE) {
+            handle = ::CreateFileW(staged.c_str(), DELETE | SYNCHRONIZE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT,
+                                   nullptr);
+        }
+        if (handle == INVALID_HANDLE_VALUE) {
+            error    = ::GetLastError();
+            onStaged = true;
+        } else {
+            onStaged = false;
+            error    = renameByHandle(handle, target, posix);
+            if (posix && posixRenameUnavailable(error)) {
+                posix = false;
+                error = renameByHandle(handle, target, false);
+            }
+            if (error == ERROR_SUCCESS) {
+                ::CloseHandle(handle);
+                outcome.committed = true;
+                return outcome;
+            }
+        }
+        RefusalKind const kind = classifyRefusal(error, onStaged, target);
+        if (kind != RefusalKind::Holder) {
+            if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
+            outcome.refusal = composeRefusal(error, kind, onStaged, posix,
+                                             outcome.holderRefusals,
+                                             std::chrono::milliseconds{0}, staged,
+                                             target);
+            return outcome;
+        }
+        if (outcome.holderRefusals == 0) firstRefusal = std::chrono::steady_clock::now();
+        ++outcome.holderRefusals;
+        if (!patience(outcome.holderRefusals)) break;
+    }
+    if (handle != INVALID_HANDLE_VALUE) ::CloseHandle(handle);
+    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - firstRefusal);
+    outcome.refusal = composeRefusal(error, RefusalKind::Holder, onStaged, posix,
+                                     outcome.holderRefusals, waited, staged, target);
+    return outcome;
+#else
+    // `rename(2)`: never refused because another process holds the file, so
+    // there is no holder to wait for and `patience` is never asked.
+    (void)patience;
+    std::error_code ec;
+    std::filesystem::rename(staged, target, ec);
+    if (!ec) {
+        outcome.committed = true;
+        return outcome;
+    }
+    outcome.refusal = ec.message()
+                    + " (rename(2); it is never refused because another process "
+                      "holds the file, so nothing was waited for — likely "
+                      "causes: the target is a directory, the target's directory "
+                      "is not writable, or the parent was removed mid-write)";
+    return outcome;
+#endif
+}
+
+CommitOutcome commitReplacing(std::filesystem::path const& staged,
+                              std::filesystem::path const& target) {
+    // The cap runs from the FIRST refusal, so it measures the holder and never
+    // the attempt before it.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    return commitReplacing(staged, target, [&deadline](std::uint32_t) {
+        auto const now = std::chrono::steady_clock::now();
+        if (!deadline) deadline = now + kCommitHolderWait;
+        if (now >= *deadline) return false;
+        // The shortest wait the host can express, and not a tuning: the
+        // measured holds are 3–22 ms, so re-asking at the timer's own
+        // granularity notices a release within one tick, while a zero wait
+        // would spin a core against the holder for the whole cap.
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        return true;
+    });
+}
+
+}  // namespace detail
+
 bool writeImage(LinkedImage const&             image,
                 std::filesystem::path const&   path,
                 DiagnosticReporter&            reporter,
@@ -644,14 +1093,23 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
     // extra. MSVC's STL implements it as
     // `MoveFileExW(src, dst, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)`
     // (microsoft/STL `stl/src/filesystem.cpp`), and MOVEFILE_REPLACE_EXISTING
-    // replaces an existing target. So plain `std::filesystem::rename` is
-    // correct on every host we build for and needs no `_WIN32` arm. The one
-    // residual Windows difference — it does not use POSIX-semantics rename,
+    // replaces an existing target. So rename-over-target is the right commit
+    // on every host we build for.
+    //
+    // ⚠ SUPERSEDED FOR WINDOWS — the paragraph that stood here accepted "the
+    // one residual Windows difference — it does not use POSIX-semantics rename,
     // so a target held OPEN by another process (a running .exe, a scanner)
-    // refuses to be replaced — is NOT a regression: the `trunc` open this
-    // replaces failed on the very same input one step earlier. It is
-    // handled the same way every other failure here is: loudly, with the
-    // temp cleaned up. The rename diagnostic names that cause explicitly.
+    // refuses to be replaced" as NOT a regression, and failed loudly on it. The
+    // round-7 gate of cycle P68 measured that holder on the PREVIOUS artifact:
+    // sharing delete, 3–22 ms, 🧠 a real-time scan — not a user error, and a
+    // compile that fails because of it is a wrong answer. The commit is now
+    // `detail::commitReplacing`, which asks for exactly the POSIX semantics
+    // this paragraph said it lacked
+    // ([[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]).
+    // It also drops `MOVEFILE_COPY_ALLOWED`: the rename is made on a handle, so
+    // a cross-volume target is REFUSED rather than silently copied into — the
+    // hazard the sibling-temp note above describes can no longer be reached
+    // even by a construction that stops being a sibling.
     //
     // KNOWN, ACCEPTED CONSEQUENCES (inherent to getting a new identity):
     //   * Overwriting no longer inherits the old file's permission bits;
@@ -822,24 +1280,24 @@ bool writeBytes(std::span<std::uint8_t const> bytes,
         return false;
     }
 
-    // COMMIT. Same-directory rename over the target: atomic on POSIX,
-    // MOVEFILE_REPLACE_EXISTING on Windows. A failure here must NEVER be
-    // reported as success — that would leave the stale previous artifact in
-    // place while the caller believes it shipped fresh bytes, which is the
-    // precise silent-failure class this substrate exists to prevent.
-    std::error_code rec;
-    std::filesystem::rename(tempPath, path, rec);
-    if (rec) {
+    // COMMIT. A same-directory rename over the target, owned by
+    // `detail::commitReplacing`: `rename(2)` on POSIX; on Windows a
+    // POSIX-semantics replace that a holder sharing delete — as the round-7
+    // gate's holder does (🧠 a real-time scan) — cannot refuse, and that gives any other
+    // holder `detail::kCommitHolderWait` to let go before it refuses, naming it
+    // ([[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]).
+    // A failure here must NEVER be reported as success — that would leave the
+    // stale previous artifact in place while the caller believes it shipped
+    // fresh bytes, which is the precise silent-failure class this substrate
+    // exists to prevent.
+    auto const commit = detail::commitReplacing(tempPath, path);
+    if (!commit.committed) {
         emit(reporter, DiagnosticCode::K_ImageWriteOpenFailed,
              std::string{"link::writeBytes: staged the bytes but could not "
                          "rename the temp over '"}
-                 + pathForDiag(path) + "': " + rec.message()
+                 + pathForDiag(path) + "': " + commit.refusal
                  + ". The artifact was NOT updated — any file at that path "
-                   "is the PREVIOUS build's output. Likely causes: the "
-                   "target is a directory, the target or its directory is "
-                   "not writable, the parent was removed mid-write, or (on "
-                   "Windows) the target is currently open/running and so "
-                   "cannot be replaced."
+                   "is the PREVIOUS build's output."
                  + removeTempNote(tempPath));
         return false;
     }

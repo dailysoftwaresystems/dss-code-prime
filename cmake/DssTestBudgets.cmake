@@ -47,6 +47,13 @@
 #   the arm64 VPS's Debug and Release trees. linux-clang-asan is `sanitized`; the
 #   four CI release legs and every local or VPS Release tree are `release`; every
 #   Debug tree is `debug`.
+#   ⚠ TWO BLIND SPOTS IN THAT POPULATION, both ✔MEASURED since (the rows re-derived below,
+#   from lane_worktree_guard on). A cost-data AVERAGE is not a ceiling: it is a running mean
+#   over every run a tree ever made, so it lags a suite that grew and sits below every loaded
+#   run. And no source above was a run under this workstation's everyday load, several lanes
+#   building and testing at once, where an entry that starts processes runs several times
+#   slower than alone, up to 39x (the UNC include pin, 2026-09-19). Such a run PASSED, so it
+#   is a healthy run, and a ceiling that leaves it out is not the slowest measured.
 #
 #                 corpus  unit   set by (corpus; unit)
 #   sanitized        289    53   examples/c/deep_comma_chain_lowers_in_order 288.39 s, CI ASan;
@@ -138,16 +145,87 @@ set(_DSS_TB_NAMED
     "program/test_dependency_resolver|119|12|24"
     "analysis/semantic/test_type_identity_vocabulary|112|8|19"
     "link/test_descriptor_library_role_agreement|105|14|20"
-    "lane_worktree_guard|37|104|33"
+    # ★★ lane_worktree_guard: THE ROW WAS MEASURED ON THE WRONG POPULATION, AND THE SUITE DID
+    # NOT GET SLOWER. It read `|37|104|33`, and the entry was green only on a quiet machine
+    # (✔MEASURED: 315.40 s Timeout in a -j8 repo-guard run, 314.64 s in the round-6 gate).
+    #   · The suite is UNCHANGED since the row was derived: `test-lane-worktree.sh` differs by
+    #     2 lines between e8dbc3c5 (2026-09-15) and 7df54cc1, its subject only by a printed hint.
+    #   · It GREW EIGHTFOLD before that: 113 lines, 2 assertions and no PowerShell on
+    #     2026-09-02; 932 lines, 133 assertions and 46 `pwsh` starts from 2026-09-15.
+    #   · The debug 33 came from ctest's cost data, a RUNNING AVERAGE over every run the tree
+    #     ever made -- the main tree's MinGW Debug average is 24.78 s over 68 runs, most of them
+    #     the 113-line predecessor. An average over two programs is a measurement of neither.
+    #   · The release 104 sat BELOW that class's own average: 117.68 s over 8 MSVC Release runs.
+    # ⇒ RE-DERIVED from healthy runs of the CURRENT suite, Windows being the slowest host in
+    #   both classes (each of its ~50 arm groups is a real `git worktree add` + guarded
+    #   `remove`; one `pwsh` start costs 0.99 s through the .NET-tool shim, ✔MEASURED):
+    #   debug  -- 114.99 s (lane il), 139.66 s (round-6, alone), 192.44 s (the main tree's
+    #             MinGW Debug gate, 2026-09-17), 243.87 s (lane mig, under a -j12 build): 244;
+    #   release -- the 117.68 s average bounds the slowest run from below, last run 110.87 s: 118.
+    #   sanitized 37 (CI linux-clang-asan) is unaffected: Linux starts processes cheaply.
+    "lane_worktree_guard|37|118|244"
+    # ★ AND TWO NEIGHBOURS OF THE SAME SHAPE, NAMED BY THIS MODULE'S OWN TIER RULE ("every
+    # non-corpus entry whose ceiling passed 60 s on some class"), never named because no
+    # Windows gate log was read for them. ✔MEASURED 2026-09-18, Windows MinGW Debug, a -j8
+    # repo-guard run, both PASSING: leg_tree_guard 179.38 s (115.9 s standalone),
+    # lane_fold_selftest_guard 220.45 s (37 s standalone). Unmeasured classes take the unit
+    # ceilings, below which no named row is ever budgeted.
+    "leg_tree_guard|53|50|180"
+    "lane_fold_selftest_guard|53|50|221"
+    # ★★ THE SAME CLASS AGAIN, THREE MORE ENTRIES. link/test_coff_object_reader,
+    # link/test_pe_object_data_import_slot and core/test_include_path_rooted_resolution each
+    # hit (Timeout) at 315 s in one -j10 full run on 2026-09-18, beside another lane's build,
+    # and passed alone minutes later (55.57 / 50.51 / 12.77 s).
+    #   · The suites did NOT grow: no code line of either link test changed between e8dbc3c5
+    #     and 7df54cc1 (comments only), and the UNC test is unchanged since 7f452a5f.
+    #   · WRONG POPULATION: the link rows' debug 23 / 22 were ctest's cost-data AVERAGE (the
+    #     main tree's MinGW Debug tree says 24.70 / 22.90 s over 32 runs), not a ceiling. Of the
+    #     109 Debug runs this host recorded before 2026-09-15, 30 / 27 were slower than those
+    #     rows (the slowest 38.6 / 35.7 s).
+    #   · WHERE THE TIME GOES, ✔MEASURED per gtest case: every MSVC native case enters
+    #     vcvars64.bat in a FRESH cmd.exe for each tool it runs (11 entries per run of the coff
+    #     test, 10 of the pe test); one entry costs 1.2-2.4 s alone and 3.9-16.2 s beside a
+    #     compile storm. The UNC test's two rooted-UNC cases resolve 120 paths through
+    #     \\localhost\C$, and every resolution enumerates the header's ancestor directories over
+    #     SMB, %TEMP% among them: 11,907 entries on this host, about 3,000 on 2026-09-05. With a
+    #     small TEMP the same binary runs 4-5x faster alone (6.99 s -> 1.51 s) and 18x faster
+    #     under the storm (274.13 s -> 15.08 s).
+    # ⇒ RE-DERIVED from healthy runs measured alone AND under gate-like load: this tree's full
+    #   ctest -j10 with the three started side by side on top, beside a 20-worker compile storm
+    #   of this tree's own heavy TUs standing in for another lane's build (host CPU at 100% in 52
+    #   of 61 samples; that full run took 807 s without the three, against 1287 s on 2026-09-18,
+    #   so that gate's load was heavier still):
+    #   debug -- coff 16.54-23.30 s alone, 129.89 s under load: 130; pe 16.49-20.77 s alone,
+    #            122.21 s under load: 123; UNC 6.99-11.12 s alone, 274.13 s under load: 275.
+    #   No other class was re-measured. The link rows keep their release and sanitized
+    #   figures; the UNC test, named for the first time, takes its measured release 17.04 s (a
+    #   Release tree on this host) and, for sanitized, where the UNC arms skip on Linux and no
+    #   per-entry figure was recorded, the unit ceiling.
+    #   ✔ THE COST WAS CUT BY ITS OWNERS on 2026-09-19 (lane cr), and the debug figures are
+    #   re-derived from the NEW binaries by the same method, with the pre-fix binaries run in the
+    #   same windows as the control (two rounds of the storm plus this tree's ctest -j10 without
+    #   the three; alone on a host other lanes kept at about a third busy):
+    #   · coff / pe: the MSVC developer environment is entered ONCE per process
+    #     (tests/core/native_c_probe.hpp). Under load 171.21-183.94 / 162.73-176.24 s before,
+    #     25.59-33.14 / 24.33-32.28 s after; alone 19.04 / 18.14 s before, 5.68 / 6.58 s after:
+    #     debug 34 / 33, under the unit ceiling, which then governs.
+    #   · UNC: every arm's tree lives under the test's own build directory, not the host TEMP;
+    #     its time no longer moves with TEMP (alone 2.26-2.52 s with the host's, 2.25-2.51 s
+    #     with a small one; before 9.98-10.27 s). Under load 218.19-393.65 s before,
+    #     39.92-208.97 s after: debug 209, still named. What load still multiplies is the
+    #     resolver listing every ancestor over SMB on each resolution
+    #     (src/core/types/include_path_resolve.cpp), not anything the test controls.
+    #   Release and sanitized were not re-measured and keep their figures.
+    "link/test_coff_object_reader|18|89|34"
+    "link/test_pe_object_data_import_slot|14|71|33"
+    "core/test_include_path_rooted_resolution|53|18|209"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"
-    "link/test_coff_object_reader|18|89|23"
     "program/test_project_config|84|11|15"
     "orphan_tests_guard|7|76|15"
     "lir/test_mir_to_lir|76|8|16"
     "harness/test_sqlite_harness_legs|66|73|67"
-    "link/test_pe_object_data_import_slot|14|71|22"
     "core/test_config_enum_vocabulary_projection|71|3|14"
     "core/test_target_schema|62|3|15"
 )

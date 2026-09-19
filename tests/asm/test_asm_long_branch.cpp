@@ -216,7 +216,7 @@ OversizedBuild buildOversizedFunction(Arm64Kit const& kit) {
 // ─────────────────────────────────────────────────────────────────────────
 //
 // ★★★ THIS IS THE ASSERTION THAT MAKES THE FIX A FIX RATHER THAN A REWRITE.
-// The six words below are the ones `D-AS3-BLOCK-REL-IMM19/26` measured against
+// The six words below are the ones `D-AS3-BLOCK-REL-IMM19-26` measured against
 // the ARM ARM when it closed, reproduced here so a relaxation that fires too
 // eagerly — on a branch that fits, on the wrong wire, on every conditional —
 // is caught by a byte comparison rather than by a semantic argument.

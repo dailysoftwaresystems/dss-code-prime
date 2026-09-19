@@ -150,7 +150,7 @@ int buildOne(fs::path const& outDir,
 }
 
 // Same as `buildOne`, but each `--resolve-library` entry also STATES the
-// runtime identity to record (D-FFI-DECLARED-IMPORT-NAME, the
+// runtime identity to record (a declared import name, the
 // `<path>=<import-name>` form). Needed wherever two stand-in libraries must
 // stay distinguishable in the emitted dependency table.
 int buildOneWithSpecs(fs::path const& outDir,
@@ -855,7 +855,7 @@ TEST(FfiResolveLibraryRoundTrip, MissingResolveLibraryPathFailsLoudEvenWithNoExt
 // `kFormatLegs`.
 //
 // The library identity is STATED via `--resolve-library <path>=<name>`
-// (D-FFI-DECLARED-IMPORT-NAME), which exercises PRECEDENCE LEVEL 1 — a
+// (a declared import name), which exercises PRECEDENCE LEVEL 1 — a
 // declared name beats a binary's embedded identity — and that is the level
 // this case is for. It deliberately does NOT reach level 2 (the embedded
 // identity), and the reason is worth the sentence:
@@ -1990,7 +1990,7 @@ TEST(FfiResolveLibraryDeclaredImportName, RelocatableObjectInputReportsTheIgnore
 // A DYNAMIC library with a legitimate stated identity must stay SILENT **and**
 // must still RECORD the name. Without this arm, "warn on every
 // `--resolve-library` that states a name" would satisfy every assertion in (1)
-// and (2) while breaking the feature D-FFI-DECLARED-IMPORT-NAME exists for.
+// and (2) while breaking the very thing a declared import name exists for.
 TEST(FfiResolveLibraryDeclaredImportName, DynamicLibraryStaysSilentAndStillRecordsTheName) {
     for (auto const& leg : kMergedInputLegs) {
         SCOPED_TRACE(leg.label);

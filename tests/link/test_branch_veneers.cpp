@@ -1,56 +1,514 @@
-// [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]
-// The veneer pass. Its sibling one tier down is [[D-CSUBSET-LONG-BRANCH]].
+// [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]
+// (parent mechanism: [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]])
+// The link-tier branch-veneer pass. Its sibling one tier down is
+// [[D-CSUBSET-LONG-BRANCH]] (assembler islands, intra-function).
 //
-// ★★★ THIS FILE MEASURES THE REAL EDGE, AND THAT IS WORTH SAYING OUT LOUD
-// BECAUSE ITS SIBLING CANNOT. The assembler's ±128 MiB arm is pinned by
-// COMPOSITION — the machinery at a synthetic ±32 KiB field, the geometry by
-// byte-for-byte arms — because reaching the real edge there means assembling
-// 33 million instructions. Here it costs a `resize`: the veneer pass reads
-// function SIZES and relocation entries, never instruction bytes, so a quarter
-// of a gigabyte of filler is a zero-filled `resize` rather than 33 million
-// encoded instructions. The edge below is the true ±128 MiB
-// `R_AARCH64_CALL26` edge, twice over.
+// ★★★ EVERY EXPECTATION HERE WAS READ OFF A REFERENCE LINKER FIRST. Lane `vn`
+// (2026-09-19) measured GNU ld 2.42, ld.lld 18.1.3 and ld64.lld 18.1.3
+// separately, on the same shapes these arms build; each arm names the reference
+// behaviour it pins. The transcripts are cited in the row.
 //
-// ⓘ COST, ✔MEASURED and stated because it is the largest allocation in the
-// suite: 256 MiB of zero-filled filler (2 x the field's reach), spread over 64
-// functions, live for the duration of two of the four tests — 96 ms and 32 ms
-// respectively, 175 ms for the file. The pass never copies those bytes:
-// `injectBranchVeneers` reserves before inserting, so every shift is a buffer
-// steal rather than a copy.
+// ★★ THE PLANNER IS PINNED AT THE REAL ±128 MiB REACH WITHOUT ALLOCATING A BYTE
+// OF FILLER. It reads function SIZES and branch sites, so a 300 MiB `.text` is a
+// few numbers in a `VeneerLayout`. `injectBranchVeneers` builds exactly that
+// model from a module and runs exactly that planner, so a planner arm is an arm
+// on the production decision, not on a copy of it. Only the arms that must see
+// real BYTES — the assembled body, the re-aimed relocations — build a module,
+// and they share ONE 144 MiB zero-filled filler.
 //
-// ⚠ WHAT IS NOT MEASURED HERE: the emitted IMAGE. This pins the pass that
-// decides and places, not a linked binary with a 200 MiB text section on disk.
-// The applier that writes the branch field is pinned by
-// `test_aarch64_reloc_formulas.cpp`, and the two now read their field's width,
-// scale and bit window from one source (`link::branchRelocGeometry`).
+// ⓘ WHY NOT A TEST TARGET WITH A TINY REACH. The reach is not declared in a
+// target document: it is the relocation FORMULA's geometry
+// (`branch_reloc_geometry.hpp`), and the loader admits only 4- and 8-byte fields.
+// A tiny-reach test target would need a formula no real target has. The model
+// makes the real reach free instead.
 
 #include "asm/asm.hpp"
-#include "asm/branch_island.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/branch_reloc_geometry.hpp"
 #include "link/branch_veneers.hpp"
+#include "link/import_call_stub_layout.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 using namespace dss;
+using linker::kVeneerTargetIsStub;
+using linker::VeneerLayout;
+using linker::VeneerLayoutSite;
+using linker::VeneerLayoutTarget;
+using linker::VeneerPlan;
+using linker::VeneerPlanStatus;
 
 namespace {
 
-// ARM ARM, quoted so an assertion can name what it read:
-//   `BL <label>` = 0x94000000 | imm26     (branch with link)
-//   `B  <label>` = 0x14000000 | imm26     (plain branch — what a veneer is)
-//   `RET`        = 0xD65F03C0
-constexpr std::uint32_t kBL      = 0x94000000u;
-constexpr std::uint32_t kB       = 0x14000000u;
-constexpr std::uint32_t kRet     = 0xD65F03C0u;
-constexpr std::uint32_t kImm26Mask = 0x03FFFFFFu;
+constexpr std::uint64_t kMiB = 1024u * 1024u;
+
+// The shipped arm64 target: the vocabulary under test is its own.
+TargetSchema const& arm64() {
+    static auto const loaded = TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(loaded.has_value()) << "arm64 target did not load";
+    return **loaded;
+}
+
+// The `call26` window, derived from the formula exactly as the pass derives it
+// — never from a memory of "128 MiB".
+link::RelocReach call26Window() {
+    auto const* row = arm64().relocationByName("call26");
+    EXPECT_NE(row, nullptr);
+    return *link::relocFieldReach(*row);
+}
+
+// The body the shipped vocabulary elects, as a planner input: 12 bytes, ADRP
+// reach measured from the veneer's start (the ADRP is its first word).
+link::RelocReach adrpWindow() {
+    auto const* row = arm64().relocationByName("adr_prel_pg_hi21");
+    EXPECT_NE(row, nullptr);
+    return *link::relocFieldReach(*row);
+}
+constexpr std::uint64_t kBodyBytes = 12;
+
+// A model builder that reads like the layout it describes.
+struct Model {
+    VeneerLayout L;
+    Model() {
+        L.reaches.push_back(call26Window());
+        L.veneerSize  = kBodyBytes;
+        L.veneerReach = adrpWindow();
+    }
+    std::uint32_t fn(std::uint64_t size) {
+        L.functionSizes.push_back(size);
+        return static_cast<std::uint32_t>(L.functionSizes.size() - 1);
+    }
+    std::uint32_t toFunction(std::uint32_t f, std::int64_t addend = 0) {
+        L.targets.push_back(VeneerLayoutTarget{f, 0, addend});
+        return static_cast<std::uint32_t>(L.targets.size() - 1);
+    }
+    std::uint32_t toStub(std::uint64_t pastTextEnd) {
+        L.targets.push_back(VeneerLayoutTarget{kVeneerTargetIsStub, pastTextEnd, 0});
+        return static_cast<std::uint32_t>(L.targets.size() - 1);
+    }
+    void branch(std::uint32_t f, std::uint32_t offset, std::uint32_t target,
+                bool routable = true) {
+        L.sites.push_back(VeneerLayoutSite{f, offset, target, 0, routable});
+    }
+};
+
+// A plan is only correct if it survives its own insertions: every arm that
+// accepts a plan re-measures it exactly on the layout it produces.
+void expectExact(VeneerLayout const& L, VeneerPlan const& plan) {
+    auto const misfit = linker::findVeneerPlanMisfit(L, plan);
+    EXPECT_FALSE(misfit.has_value())
+        << "the plan does not survive its own insertions: "
+        << (misfit->isVeneer ? "veneer " : "site ") << misfit->index
+        << " is " << misfit->delta << " bytes from where it aims";
+}
+
+}  // namespace
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE CONTROL — a branch that reaches is not touched.
+// ─────────────────────────────────────────────────────────────────────────
+TEST(LinkBranchVeneerPlanner, ABranchInReachGetsNoVeneerAndNoWork) {
+    Model m;
+    auto const caller = m.fn(64);
+    auto const filler = m.fn(64 * kMiB);
+    auto const callee = m.fn(16);
+    (void)filler;
+    m.branch(caller, 8, m.toFunction(callee));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_TRUE(plan.veneers.empty())
+        << "64 MiB is inside +-128 MiB — a veneer here would bloat every image";
+    EXPECT_EQ(plan.siteVeneer[0], -1);
+    EXPECT_EQ(plan.work.farSites, 1u)
+        << "64 MiB is past HALF the reach, so the site counts as far — the "
+           "margin's base — and is still decided direct";
+    EXPECT_EQ(plan.margin, kBodyBytes)
+        << "one far site can add at most one body's worth of bytes";
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLACEMENT — the furthest boundary AHEAD within reach (ld64.lld's rule).
+// ─────────────────────────────────────────────────────────────────────────
+TEST(LinkBranchVeneerPlanner, AVeneerStandsAtTheFurthestBoundaryAheadInReach) {
+    Model m;
+    auto const caller = m.fn(64);
+    (void)m.fn(100 * kMiB);                 // f1
+    auto const f2 = m.fn(20 * kMiB);        // starts at ~100 MiB: in reach
+    auto const f3 = m.fn(30 * kMiB);        // starts at ~120 MiB: in reach
+    auto const callee = m.fn(16);           // starts at ~150 MiB: out of reach
+    (void)f2;
+    m.branch(caller, 8, m.toFunction(callee));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    ASSERT_EQ(plan.veneers.size(), 1u);
+    EXPECT_EQ(plan.veneers[0].boundary, f3)
+        << "the veneer must stand at the FURTHEST boundary still in reach of "
+           "the call (before f3, ~120 MiB on), where it can serve every later "
+           "call as far as possible — not at the first boundary it meets";
+    EXPECT_EQ(plan.siteVeneer[0], 0);
+    EXPECT_EQ(plan.work.behindPlacements, 0u);
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHARING — one veneer per target per reachable window (all three refs).
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ✔MEASURED shape (f): a1,a2 │ 144 MiB │ m1,m2 │ 144 MiB │ far2 — GNU ld and
+// ld.lld each make exactly TWO veneers for far2, one per region, shared.
+TEST(LinkBranchVeneerPlanner, BranchesInOneWindowShareOneVeneerPerTarget) {
+    Model m;
+    auto const a = m.fn(64);                // a1, a2 live here
+    (void)m.fn(144 * kMiB);
+    auto const mid = m.fn(64);              // m1, m2 live here
+    (void)m.fn(144 * kMiB);
+    auto const far2 = m.fn(16);
+    auto const t = m.toFunction(far2);
+    m.branch(a, 0, t);
+    m.branch(a, 4, t);
+    m.branch(mid, 0, t);
+    m.branch(mid, 4, t);
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_EQ(plan.veneers.size(), 2u)
+        << "two regions a full reach apart need exactly two veneers for one "
+           "target — the count GNU ld 2.42 and ld.lld 18.1.3 both produce";
+    EXPECT_EQ(plan.work.veneersPlaced, 2u);
+    EXPECT_EQ(plan.work.veneersReused, 2u);
+    EXPECT_EQ(plan.siteVeneer[0], plan.siteVeneer[1]) << "a1 and a2 share";
+    EXPECT_EQ(plan.siteVeneer[2], plan.siteVeneer[3]) << "m1 and m2 share";
+    EXPECT_NE(plan.siteVeneer[0], plan.siteVeneer[2]);
+    expectExact(m.L, plan);
+}
+
+// Two branches to the SAME symbol at different addends are different targets:
+// one veneer each (ld.lld keys its thunks on symbol + addend).
+TEST(LinkBranchVeneerPlanner, ADifferentAddendIsADifferentTarget) {
+    Model m;
+    auto const caller = m.fn(64);
+    (void)m.fn(144 * kMiB);
+    auto const callee = m.fn(64);
+    m.branch(caller, 0, m.toFunction(callee, 0));
+    m.branch(caller, 4, m.toFunction(callee, 8));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_EQ(plan.veneers.size(), 2u);
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BACKWARD — a far call to something BEFORE it is carried the same way.
+// ─────────────────────────────────────────────────────────────────────────
+TEST(LinkBranchVeneerPlanner, ABackwardFarCallIsCarried) {
+    Model m;
+    auto const near = m.fn(16);
+    (void)m.fn(144 * kMiB);
+    auto const tail = m.fn(64);
+    m.branch(tail, 8, m.toFunction(near));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    ASSERT_EQ(plan.veneers.size(), 1u);
+    EXPECT_GE(plan.veneers[0].boundary, tail)
+        << "the only boundaries in reach of a call in `tail` are its own";
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BEHIND — the call is near the TOP of a function longer than the reach.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ✔MEASURED: ld.lld 18.1.3 LINKS this (a thunk 4 bytes before the big section;
+// the image ran, exit 42); GNU ld 2.42 refuses (*relocation truncated to fit*)
+// and ld64.lld 18.1.3 refuses (*thunk range overrun*). One working reference
+// makes it required.
+TEST(LinkBranchVeneerPlanner, ACallAtTheTopOfAHugeFunctionUsesTheBoundaryBehindIt) {
+    Model m;
+    (void)m.fn(16);                          // _start
+    auto const big = m.fn(144 * kMiB);       // bl callee at offset 4
+    auto const callee = m.fn(16);
+    m.branch(big, 4, m.toFunction(callee));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    ASSERT_EQ(plan.veneers.size(), 1u);
+    EXPECT_EQ(plan.veneers[0].boundary, big)
+        << "no boundary ahead is within reach (the function's end is 144 MiB "
+           "on); the boundary BEHIND the call, 4 bytes back, is";
+    EXPECT_EQ(plan.work.behindPlacements, 1u);
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE SHAPE NO REFERENCE LINKS — refused, by name, at their boundary.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ✔MEASURED: a call 144 MiB from BOTH ends of its own section — GNU ld 2.42
+// *relocation truncated to fit*, ld.lld 18.1.3 *InputSection too large for
+// range extension thunk*.
+TEST(LinkBranchVeneerPlanner, ACallBuriedAFullReachFromBothEndsHasNoSite) {
+    Model m;
+    auto const R = static_cast<std::uint64_t>(call26Window().maxDelta);
+    (void)m.fn(16);
+    auto const big = m.fn(2 * R + 64);
+    auto const callee = m.fn(16);
+    m.branch(big, static_cast<std::uint32_t>(R + 32), m.toFunction(callee));
+    auto const plan = linker::planBranchVeneers(m.L);
+    EXPECT_EQ(plan.status, VeneerPlanStatus::NoBoundaryInReach)
+        << "no boundary stands within reach of the call on either side; no "
+           "veneer body of any shape changes that";
+    EXPECT_EQ(plan.failedSite, 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE SUBJECT — the synthetic entry's call to its process-exit import.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// `_start` sits at `.text` offset 0; the writer puts `exit`'s stub past ALL of
+// `.text`. ✔MEASURED before this change: a 212 992-statement program refused for
+// a `call26` of 139 722 816 bytes. ld.lld and ld64.lld veneer this call at the
+// boundary right after the caller (GNU ld avoids it by putting `.plt` first).
+TEST(LinkBranchVeneerPlanner, TheEntrysCallToItsExitImportIsCarriedFromOffsetZero) {
+    Model m;
+    auto const start = m.fn(24);             // the entry trampoline
+    auto const main  = m.fn(139 * kMiB);     // the program
+    (void)main;
+    auto const exitStub = m.toStub(64);      // `.rodata` + alignment + slot
+    m.branch(start, 16, exitStub);
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    ASSERT_EQ(plan.veneers.size(), 1u);
+    EXPECT_EQ(plan.veneers[0].boundary, 1u)
+        << "the only boundary in reach of the entry's call is the one right "
+           "after the entry itself";
+    EXPECT_EQ(plan.veneers[0].target, exitStub);
+    expectExact(m.L, plan);
+}
+
+// The mirror: a call to an import from the END of a large `.text` reaches the
+// stub directly — which is why ld.lld and ld64.lld need no veneer there.
+TEST(LinkBranchVeneerPlanner, ACallToAnImportFromTheEndOfTextReachesDirectly) {
+    Model m;
+    (void)m.fn(139 * kMiB);
+    auto const tail = m.fn(64);
+    m.branch(tail, 8, m.toStub(64));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_TRUE(plan.veneers.empty());
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// WHAT THE ABI DOES NOT ROUTE — refused like both references refuse it.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// ✔MEASURED: an out-of-reach CONDBR19/TSTBR14 — GNU ld *relocation truncated to
+// fit*, ld.lld *out of range*. AAELF64 lets a linker veneer only CALL26/JUMP26.
+TEST(LinkBranchVeneerPlanner, ANonRoutableBranchOutOfReachIsRefused) {
+    Model m;
+    auto const caller = m.fn(64);
+    (void)m.fn(144 * kMiB);
+    auto const callee = m.fn(16);
+    m.branch(caller, 8, m.toFunction(callee), /*routable=*/false);
+    auto const plan = linker::planBranchVeneers(m.L);
+    EXPECT_EQ(plan.status, VeneerPlanStatus::NotRoutable);
+    EXPECT_TRUE(plan.veneers.empty());
+}
+
+// A body whose own fields cannot reach the target from where it must stand is
+// refused — the > ±4 GiB edge, measured here on a narrowed body window so the
+// arm costs nothing.
+TEST(LinkBranchVeneerPlanner, ABodyThatCannotReachTheTargetIsRefused) {
+    Model m;
+    m.L.veneerReach = link::RelocReach{-static_cast<std::int64_t>(16 * kMiB),
+                                       static_cast<std::int64_t>(16 * kMiB)};
+    auto const caller = m.fn(64);
+    (void)m.fn(144 * kMiB);
+    auto const callee = m.fn(16);
+    m.branch(caller, 8, m.toFunction(callee));
+    auto const plan = linker::planBranchVeneers(m.L);
+    EXPECT_EQ(plan.status, VeneerPlanStatus::BodyOutOfReach);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ONE PASS IS EXACT — and the exact check is not vacuous.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The adversarial shape for a one-pass planner: 4096 functions of 64 KiB, and
+// every function i < 2048 calls function i + 2048 — exactly 128 MiB on, ONE
+// word past the reach. Each veneer lands at the furthest boundary in reach,
+// 64 KiB short of its target, so between every call and its veneer stand up
+// to 2046 OTHER veneers, each pushing the pair apart by 12 bytes. The margin
+// (far sites × body size) is what absorbs exactly that; the plan must survive
+// its own insertions with no second pass.
+TEST(LinkBranchVeneerPlanner, EdgeBranchesSurviveEveryVeneerInsertedBetweenThemAndTheirVeneers) {
+    Model m;
+    constexpr std::uint64_t kFn   = 64 * 1024;
+    constexpr std::uint32_t kFns  = 4096;
+    constexpr std::uint32_t kSpan = 2048;  // 2048 x 64 KiB = 128 MiB
+    for (std::uint32_t i = 0; i < kFns; ++i) (void)m.fn(kFn);
+    for (std::uint32_t i = 0; i + kSpan < kFns; ++i)
+        m.branch(i, 0, m.toFunction(i + kSpan));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_FALSE(plan.marginCapped);
+    ASSERT_EQ(plan.veneers.size(), kFns - kSpan)
+        << "every call is one word out of reach and has a target of its own";
+    for (std::uint32_t i = 0; i < plan.veneers.size(); ++i) {
+        EXPECT_EQ(plan.veneers[i].boundary, i + kSpan - 1)
+            << "veneer " << i << " must stand at the furthest boundary in "
+               "reach of its call — the one right before its target";
+        if (::testing::Test::HasFailure()) break;
+    }
+    expectExact(m.L, plan);
+}
+
+// ★ THE MARGIN, AT THE RAZOR'S EDGE. Call A reaches its target T with 8 bytes
+// to spare. A LATER call, from the next function, needs a veneer, and the
+// furthest boundary in ITS reach is the one right before T — so that veneer is
+// inserted between A and T and pushes T 12 bytes further, out of A's reach. A
+// planner that judged A against the raw reach would leave it direct and emit a
+// broken branch; judged against the reach minus the margin, A gets a veneer of
+// its own and the plan survives every insertion.
+TEST(LinkBranchVeneerPlanner, ACallThatReachesOnlyBeforeLaterInsertionsIsJudgedAgainstTheMargin) {
+    Model m;
+    auto const R = static_cast<std::uint64_t>(call26Window().maxDelta);
+    auto const a  = m.fn(64);                 // site A at offset 0
+    auto const f1 = m.fn(64);                 // site B at offset 0 (starts at 64)
+    (void)m.fn(R - 8 - 128);                  // T then starts at exactly R - 8
+    auto const t  = m.fn(256);                // the boundary AFTER T is out of B's reach
+    (void)m.fn(144 * kMiB);
+    auto const z  = m.fn(16);                 // B's target: far beyond everything
+    m.branch(a, 0, m.toFunction(t));
+    m.branch(f1, 0, m.toFunction(z));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_GE(plan.siteVeneer[0], 0)
+        << "A reaches T by 8 bytes today, but B's veneer will stand before T; "
+           "only a decision taken against the margin sees that A must not stay "
+           "direct";
+    ASSERT_GE(plan.siteVeneer[1], 0);
+    EXPECT_EQ(plan.veneers[static_cast<std::size_t>(plan.siteVeneer[1])].boundary, t)
+        << "B's veneer stands at the furthest boundary in its reach: right "
+           "before T — the insertion that would break a direct A";
+    expectExact(m.L, plan);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE CAPPED MARGIN — the one regime where one pass is not exact by
+// construction, and what happens there.
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The margin is (far branches × body size), capped at half the narrowest reach.
+// At the real reach the cap engages only past 5 592 405 far branches, so these
+// arms shrink the REACH instead: a reach class is a model value and the planner
+// reads nothing else, so ±1 KiB engages the cap at 43 far branches. Capped,
+// every decision is taken against HALF the reach and the exact check decides:
+// the plan stands while the veneers between any branch and its aim fit in that
+// half, and past it the check names the first branch that no longer reaches.
+namespace {
+
+// K calls from one function, call k at byte 4k, each to a target of its own
+// behind a 4 KiB function: every veneer lands in the ONE island right after the
+// calling function, in call order, so call k's veneer stands 4K + 8k bytes on.
+Model cappedMarginSubject(std::uint32_t k) {
+    Model m;
+    m.L.reaches     = {link::RelocReach{-1024, 1020}};
+    m.L.veneerReach = link::RelocReach{std::numeric_limits<std::int64_t>::min(),
+                                       std::numeric_limits<std::int64_t>::max()};
+    auto const caller = m.fn(4u * k);
+    (void)m.fn(4096);
+    std::vector<std::uint32_t> targets;
+    for (std::uint32_t i = 0; i < k; ++i) targets.push_back(m.toFunction(m.fn(4)));
+    for (std::uint32_t i = 0; i < k; ++i) m.branch(caller, 4u * i, targets[i]);
+    return m;
+}
+
+}  // namespace
+
+// 85 far calls want 1020 bytes of margin — the whole forward reach, which would
+// leave no boundary ahead in reach of any call and refuse the link. Capped at
+// 510, every veneer lands right after the caller, and the farthest call is
+// 340 + 8 × 84 = 1012 bytes from its veneer: in reach, with 8 to spare.
+TEST(LinkBranchVeneerPlanner, ACappedMarginStillLinksWhileTheVeneersFitHalfTheReach) {
+    auto m = cappedMarginSubject(85);
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_TRUE(plan.marginCapped);
+    EXPECT_EQ(plan.margin, 510u) << "half of the narrower side of [-1024, 1020]";
+    ASSERT_EQ(plan.veneers.size(), 85u);
+    for (auto const& v : plan.veneers) {
+        EXPECT_EQ(v.boundary, 1u)
+            << "decided against half the reach, the boundary right after the "
+               "caller is in reach of every call";
+        if (::testing::Test::HasFailure()) break;
+    }
+    expectExact(m.L, plan);
+}
+
+// 127 far calls put 1524 bytes of veneers in one island: call k's veneer stands
+// 508 + 8k bytes on, past the 1020-byte reach from k = 65. The planner cannot
+// see that; the exact check must, and name call 65.
+TEST(LinkBranchVeneerPlanner, ACappedMarginTheVeneersOutgrowIsCaughtByTheExactCheck) {
+    auto m = cappedMarginSubject(127);
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_TRUE(plan.marginCapped);
+    auto const misfit = linker::findVeneerPlanMisfit(m.L, plan);
+    ASSERT_TRUE(misfit.has_value())
+        << "more than half the reach of veneers stands between a call and its "
+           "aim; a plan that does not reach must never be blessed";
+    EXPECT_FALSE(misfit->isVeneer);
+    EXPECT_EQ(misfit->index, 65u);
+    EXPECT_EQ(misfit->delta, 508 + 8 * 65);
+}
+
+// CONTROL, the same shape under the cap: 42 far calls want 504 bytes, the
+// margin is exactly that, and the plan is exact by construction.
+TEST(LinkBranchVeneerPlanner, AnUncappedMarginIsTheFarBranchesTimesTheBody) {
+    auto m = cappedMarginSubject(42);
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_FALSE(plan.marginCapped);
+    EXPECT_EQ(plan.work.farSites, 42u);
+    EXPECT_EQ(plan.margin, 42u * kBodyBytes);
+    expectExact(m.L, plan);
+}
+
+// The exact check must be able to say NO: a hand-made plan that aims a branch
+// at a veneer a full reach away is caught, by index.
+TEST(LinkBranchVeneerPlanner, TheExactCheckCatchesAVeneerOutOfItsBranchsReach) {
+    Model m;
+    auto const caller = m.fn(64);
+    (void)m.fn(144 * kMiB);
+    auto const callee = m.fn(16);
+    auto const t = m.toFunction(callee);
+    m.branch(caller, 8, t);
+    VeneerPlan bad;
+    bad.siteVeneer = {0};
+    bad.veneers.push_back(linker::PlannedVeneer{2, t});  // right before callee
+    auto const misfit = linker::findVeneerPlanMisfit(m.L, bad);
+    ASSERT_TRUE(misfit.has_value())
+        << "a veneer 144 MiB from its branch cannot be reached; the check that "
+           "blesses every accepted plan must be able to refuse one";
+    EXPECT_FALSE(misfit->isVeneer);
+    EXPECT_EQ(misfit->index, 0u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE FULL PATH — real bytes, the shipped vocabulary, one shared filler.
+// ─────────────────────────────────────────────────────────────────────────
+namespace {
+
+constexpr std::uint32_t kBL = 0x94000000u;
+constexpr std::uint32_t kRet = 0xD65F03C0u;
 
 AssembledFunction word(SymbolId sym, std::uint32_t w) {
     AssembledFunction fn;
@@ -62,453 +520,165 @@ AssembledFunction word(SymbolId sym, std::uint32_t w) {
     return fn;
 }
 
-std::uint32_t wordOf(std::vector<std::uint8_t> const& b) {
-    return static_cast<std::uint32_t>(b[0])
-         | (static_cast<std::uint32_t>(b[1]) << 8)
-         | (static_cast<std::uint32_t>(b[2]) << 16)
-         | (static_cast<std::uint32_t>(b[3]) << 24);
-}
-
-// caller (`BL callee`) │ `fillerCount` filler functions │ callee (`RET`)
-//
-// The caller's relocation names the callee directly, which is what every
-// compiled call looks like before anything is laid out.
-//
-// ⚠ THE FILLER IS MANY FUNCTIONS, NOT ONE, AND THAT IS THE FIXTURE'S WHOLE
-// SHAPE. A veneer is a whole FUNCTION, so it can only stand at a function
-// boundary — unlike an assembler island, which goes between two instructions
-// and can therefore always be placed. An image whose caller and callee are
-// separated by ONE oversized function has no boundary to stand at, and the pass
-// must REFUSE it rather than search forever; that case has its own arm below.
-// A real image has boundaries every few hundred bytes, and this is the shape
-// that tests the mechanism rather than its refusal.
-struct Span {
-    AssembledModule module;
-    SymbolId        caller{1}, callee{2};
-    std::size_t     fillerCount = 0;
+// entry: `BL main` @0 and `BL exit@stub` @4 │ main (`RET`) │ 144 MiB filler │
+// callee (`RET`) — the subject's shape: the entry's own import call reaches
+// past the whole image.
+struct EntryShaped {
+    AssembledModule            module;
+    link::ImportCallStubLayout stubs;
+    SymbolId entry{10}, main{11}, filler{12}, callee{13}, exitImport{50};
 };
 
-Span buildSpannedCall(TargetSchema const& target,
-                      std::uint64_t       fillerBytes,
-                      std::size_t         fillerCount = 64) {
-    Span s;
-    auto const* call26 = target.relocationByName("call26");
-    EXPECT_NE(call26, nullptr) << "arm64 declares no 'call26' relocation row";
-
-    auto caller = word(s.caller, kBL);
-    if (call26 != nullptr)
-        caller.relocations.push_back(Relocation{0u, s.callee, call26->kind, 0});
-    s.module.functions.push_back(std::move(caller));
-
-    s.fillerCount = fillerCount == 0 ? 1u : fillerCount;
-    std::uint64_t const each = fillerBytes / s.fillerCount;
-    std::uint64_t placed = 0;
-    for (std::size_t i = 0; i < s.fillerCount; ++i) {
-        AssembledFunction filler;
-        filler.symbol = SymbolId{static_cast<std::uint32_t>(100 + i)};
-        std::uint64_t const n =
-            (i + 1u == s.fillerCount) ? fillerBytes - placed : each;
-        filler.bytes.resize(static_cast<std::size_t>(n), 0u);
-        placed += n;
-        s.module.functions.push_back(std::move(filler));
+EntryShaped buildEntryShaped() {
+    EntryShaped s;
+    auto const* call26 = arm64().relocationByName("call26");
+    EXPECT_NE(call26, nullptr);
+    AssembledFunction entry;
+    entry.symbol = s.entry;
+    for (auto const w : {kBL, kBL, kRet}) {
+        auto const one = word(s.entry, w);
+        entry.bytes.insert(entry.bytes.end(), one.bytes.begin(), one.bytes.end());
     }
-
+    entry.relocations.push_back(Relocation{0u, s.main, call26->kind, 0});
+    entry.relocations.push_back(Relocation{4u, s.exitImport, call26->kind, 0});
+    s.module.functions.push_back(std::move(entry));
+    s.module.functions.push_back(word(s.main, kRet));
+    AssembledFunction filler;
+    filler.symbol = s.filler;
+    filler.bytes.resize(static_cast<std::size_t>(144 * kMiB), 0u);
+    s.module.functions.push_back(std::move(filler));
     s.module.functions.push_back(word(s.callee, kRet));
     s.module.expectedFuncCount = s.module.functions.size();
+    s.module.imageEntryOverride = 0;
+    ExternImport exitImp;
+    exitImp.symbol      = s.exitImport;
+    exitImp.mangledName = "exit";
+    exitImp.libraryPath = "libc.so.6";
+    s.module.externImports.push_back(exitImp);
+    s.stubs.maxPastTextEnd.emplace(s.exitImport, 64u);
     return s;
 }
 
-bool isFiller(SymbolId sym) { return sym.v >= 100u && sym.v < 1000u; }
-
-std::int64_t call26Reach() {
-    return link::branchRelocByteReach(RelocFormulaKind::Aarch64Call26);
+std::uint32_t wordAt(std::vector<std::uint8_t> const& b, std::size_t at) {
+    return static_cast<std::uint32_t>(b[at])
+         | (static_cast<std::uint32_t>(b[at + 1]) << 8)
+         | (static_cast<std::uint32_t>(b[at + 2]) << 16)
+         | (static_cast<std::uint32_t>(b[at + 3]) << 24);
 }
 
 }  // namespace
 
-// ─────────────────────────────────────────────────────────────────────────
-// THE POSITIVE ARM — a call past ±128 MiB now links, through a chain of
-// register-free veneers.
-// ─────────────────────────────────────────────────────────────────────────
-TEST(LinkBranchVeneer, ACallBeyondCall26RangeReachesThroughAChainOfVeneers) {
-    auto sOpt = TargetSchema::loadShipped("arm64");
-    ASSERT_TRUE(sOpt.has_value());
-    auto const& target = **sOpt;
-
-    // Past the reach AND past one veneer's own reach-plus-stride, so the pass
-    // has to CHAIN rather than place a single pad. Derived from the geometry
-    // row, never from a memory of "128 MiB".
-    auto const reach = call26Reach();
-    Span span = buildSpannedCall(
-        target, static_cast<std::uint64_t>(2 * reach));
-
-    ASSERT_TRUE(linker::branchVeneersNeeded(span.module, target))
-        << "a call across " << (2 * reach) << " bytes must be beyond a signed "
-           "26-bit word-scaled field — if this is false the fixture stopped "
-           "testing the edge";
+// ★★★ THE HEADLINE, ON REAL BYTES. Before this change the pass never saw the
+// import-bound call (its target is no function of the module) and the writer
+// refused the image. Now the writer's stub layout makes it a target like any
+// other, and the veneer is the reference body, byte for byte.
+TEST(LinkBranchVeneer, TheEntrysImportCallIsCarriedByTheReferenceBody) {
+    auto s = buildEntryShaped();
+    auto const& target = arm64();
+    ASSERT_TRUE(linker::branchVeneersNeeded(s.module, target, s.stubs))
+        << "the entry's call to its exit import spans 144 MiB of `.text`; the "
+           "pass must SEE it through the writer's stub layout";
+    // CONTROL — the SAME module without the stub layout: the call is invisible
+    // (nothing says where the stub lands), which is exactly the blind spot the
+    // stub layout exists to close.
+    EXPECT_FALSE(linker::branchVeneersNeeded(s.module, target,
+                                             link::ImportCallStubLayout{}))
+        << "CONTROL: with no stub layout the import is no placeable target, so a "
+           "`true` above could only have come from the layout";
 
     DiagnosticReporter rep;
-    ASSERT_TRUE(linker::injectBranchVeneers(span.module, target, rep));
+    linker::BranchVeneerWork work;
+    ASSERT_TRUE(linker::injectBranchVeneers(s.module, target, s.stubs, rep, &work));
     EXPECT_EQ(rep.errorCount(), 0u);
-    // ⚠ THE HEADLINE. Before this pass the image was refused outright by
-    // `applyExecRelocations`: *"does not fit signed 26-bit — branch out of
-    // ±128 MiB range"*, with nothing to be done about it.
-    EXPECT_FALSE(linker::branchVeneersNeeded(span.module, target))
-        << "after the pass every branch relocation must reach where it points";
+    EXPECT_FALSE(linker::branchVeneersNeeded(s.module, target, s.stubs))
+        << "after the pass every branch must reach where it points";
 
-    // ── WALK THE CHAIN ───────────────────────────────────────────────────
-    std::unordered_map<std::uint32_t, std::size_t> byId;
-    std::vector<std::uint64_t> starts;
-    std::uint64_t at = 0;
-    for (std::size_t i = 0; i < span.module.functions.size(); ++i) {
-        byId.emplace(span.module.functions[i].symbol.v, i);
-        starts.push_back(at);
-        at += span.module.functions[i].bytes.size();
-    }
+    // Exactly one veneer, at the FURTHEST boundary still in reach of the call:
+    // after `main`, before the 144 MiB filler (the next boundary, after the
+    // filler, is out of reach).
+    ASSERT_EQ(s.module.functions.size(), 5u);
+    EXPECT_EQ(work.veneersPlaced, 1u);
+    EXPECT_EQ(s.module.functions[0].symbol.v, s.entry.v);
+    EXPECT_EQ(s.module.functions[1].symbol.v, s.main.v);
+    auto const& veneer = s.module.functions[2];
+    EXPECT_EQ(s.module.functions[3].symbol.v, s.filler.v);
 
-    std::size_t hops = 0;
-    std::size_t fi   = byId.at(span.caller.v);
-    for (int guard = 0; guard < 64; ++guard) {
-        auto const& fn = span.module.functions[fi];
-        ASSERT_EQ(fn.relocations.size(), 1u)
-            << "every node of the chain carries exactly one branch relocation";
-        auto const& rel = fn.relocations[0];
-        auto const nextIt = byId.find(rel.target.v);
-        ASSERT_NE(nextIt, byId.end())
-            << "a chain node points at a symbol no function defines";
-        std::int64_t const delta =
-            static_cast<std::int64_t>(starts[nextIt->second])
-          - static_cast<std::int64_t>(starts[fi] + rel.offset);
-        EXPECT_EQ(delta % 4, 0) << "an AArch64 branch target must be aligned";
-        EXPECT_LE(std::abs(delta), reach)
-            << "a hop exceeds the field's reach — the applier would refuse it";
-        if (rel.target.v == span.callee.v) break;
-        ++hops;
-        fi = nextIt->second;
-        ASSERT_LT(guard, 63) << "the chain never reached the callee";
-    }
+    // THE REFERENCE BODY: `adrp x16, T; add x16, x16, :lo12:T; br x16` —
+    // ✔MEASURED identical words in GNU ld 2.42, ld.lld 18.1.3 (PIE) and
+    // ld64.lld 18.1.3. Built from the target's own `lea` and `jmp_indirect`
+    // rows, never spelled in the linker.
+    ASSERT_EQ(veneer.bytes.size(), 12u);
+    EXPECT_EQ(wordAt(veneer.bytes, 0), 0x90000010u) << "adrp x16, <page>";
+    EXPECT_EQ(wordAt(veneer.bytes, 4), 0x91000210u) << "add x16, x16, #<lo12>";
+    EXPECT_EQ(wordAt(veneer.bytes, 8), 0xD61F0200u) << "br x16";
+    ASSERT_EQ(veneer.relocations.size(), 2u);
+    EXPECT_EQ(veneer.relocations[0].offset, 0u);
+    EXPECT_EQ(veneer.relocations[0].kind,
+              target.relocationByName("adr_prel_pg_hi21")->kind);
+    EXPECT_EQ(veneer.relocations[1].offset, 4u);
+    EXPECT_EQ(veneer.relocations[1].kind,
+              target.relocationByName("add_abs_lo12_nc")->kind);
+    for (auto const& r : veneer.relocations)
+        EXPECT_EQ(r.target.v, s.exitImport.v)
+            << "the veneer finishes the trip to the IMPORT, not to a function";
 
-    // ★★★ IT IS A CHAIN. A span of twice the reach cannot be covered by one
-    // veneer placed a half-reach along, which is the whole reason the pass is a
-    // fixed point rather than a single fix-up.
-    EXPECT_GE(hops, 2u)
-        << "the call reached its callee in fewer than two veneers — the span "
-           "arithmetic moved, or a veneer is reaching further than its field";
+    // The entry's call is re-aimed at the veneer; its call to main is not.
+    auto const& entryRelocs = s.module.functions[0].relocations;
+    EXPECT_EQ(entryRelocs[0].target.v, s.main.v)
+        << "a call that reached was re-pointed";
+    EXPECT_EQ(entryRelocs[1].target.v, veneer.symbol.v);
+    EXPECT_EQ(entryRelocs[1].addend, 0);
 
-    // ★★★ AND EVERY VENEER IS A BARE BRANCH — NO SCRATCH REGISTER. At a call
-    // boundary AAPCS64 leaves x16/x17 free, so an ADRP+ADD+BR thunk WOULD be
-    // legal here; it is not taken, because `BL veneer` / `veneer: B callee`
-    // leaves x30 holding the real return address and costs one word. This
-    // compares the word against the ARM ARM's `B` with only its displacement
-    // field allowed to differ.
-    for (auto const& fn : span.module.functions) {
-        if (fn.symbol.v == span.caller.v || fn.symbol.v == span.callee.v
-         || isFiller(fn.symbol))
-            continue;
-        ASSERT_EQ(fn.bytes.size(), 4u) << "a veneer is one word";
-        EXPECT_EQ(wordOf(fn.bytes) & ~kImm26Mask, kB)
-            << "a veneer's word is not a bare `B` — any other bits would name "
-               "a register the linker cannot know is free";
-        EXPECT_EQ(wordOf(fn.bytes) & kImm26Mask, 0u)
-            << "the displacement field must be emitted ZERO; the applier ORs "
-               "the computed value in and refuses a dirty field";
-    }
-
-    // The caller's own word is untouched: a veneer re-points a RELOCATION, it
-    // never rewrites the call instruction.
-    EXPECT_EQ(wordOf(span.module.functions[byId.at(span.caller.v)].bytes), kBL);
-    EXPECT_EQ(span.module.expectedFuncCount, span.module.functions.size());
+    // The image still starts at the entry, and the count moved with the veneer.
+    ASSERT_TRUE(s.module.imageEntryOverride.has_value());
+    EXPECT_EQ(*s.module.imageEntryOverride, 0u);
+    EXPECT_EQ(s.module.expectedFuncCount, s.module.functions.size());
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// THE CONTROL ARM — a call that FITS must not be touched at all.
-// ─────────────────────────────────────────────────────────────────────────
-//
-// ★★★ WITHOUT THIS THE ARM ABOVE PROVES ONLY THAT VENEERS APPEAR. A pass that
-// veneered every call would satisfy it and would bloat every image ever linked.
-TEST(LinkBranchVeneer, ACallWithinRangeGetsNoVeneerAndNoCopy) {
-    auto sOpt = TargetSchema::loadShipped("arm64");
-    ASSERT_TRUE(sOpt.has_value());
-    auto const& target = **sOpt;
-
-    Span span = buildSpannedCall(target, 4096u);
-    auto const before = span.module.functions.size();
-    EXPECT_FALSE(linker::branchVeneersNeeded(span.module, target))
-        << "a 4 KiB span is three orders of magnitude inside ±128 MiB — a "
-           "veneer here would be placed on a call that reaches perfectly well";
-
+// A module whose branches all reach is returned untouched.
+TEST(LinkBranchVeneer, AModuleThatReachesIsUntouched) {
+    AssembledModule module;
+    auto const* call26 = arm64().relocationByName("call26");
+    ASSERT_NE(call26, nullptr);
+    auto caller = word(SymbolId{1}, kBL);
+    caller.relocations.push_back(Relocation{0u, SymbolId{2}, call26->kind, 0});
+    module.functions.push_back(std::move(caller));
+    module.functions.push_back(word(SymbolId{2}, kRet));
+    module.expectedFuncCount = 2;
+    EXPECT_FALSE(linker::branchVeneersNeeded(module, arm64(),
+                                             link::ImportCallStubLayout{}));
     DiagnosticReporter rep;
-    ASSERT_TRUE(linker::injectBranchVeneers(span.module, target, rep));
-    EXPECT_EQ(rep.errorCount(), 0u);
-    EXPECT_EQ(span.module.functions.size(), before)
-        << "the pass inserted a function into an image that needed none";
-    EXPECT_EQ(span.module.functions[0].relocations[0].target.v, span.callee.v)
-        << "the call's relocation was re-pointed although it already reached";
+    ASSERT_TRUE(linker::injectBranchVeneers(module, arm64(),
+                                            link::ImportCallStubLayout{}, rep));
+    EXPECT_EQ(module.functions.size(), 2u);
+    EXPECT_EQ(module.functions[0].relocations[0].target.v, 2u);
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// THE ELECTION — two declarations have to agree, and the refusal says which.
-// ─────────────────────────────────────────────────────────────────────────
-//
-// ★★★ THE VENEER IS NOT SYNTHESIZED, IT IS QUOTED. Its word comes from an
-// opcode the target declares `terminatorKind: br` on, and the relocation that
-// fills its field comes from a row whose formula writes THAT SAME field. A
-// target missing either half gets a loud refusal naming the missing one, not a
-// fabricated branch.
-TEST(LinkBranchVeneer, AnUnconditionalBranchWordAndAMatchingRelocationRowMustBothExist) {
-    auto sOpt = TargetSchema::loadShipped("arm64");
-    ASSERT_TRUE(sOpt.has_value());
-    auto const& target = **sOpt;
-
-    // The body the election finds on the shipped target, and the fact that it
-    // matches `call26`'s field exactly — which is WHY the election succeeds.
-    auto const body = asm_island::widestDeclaredIslandBody(target);
-    ASSERT_TRUE(body.declared());
-    auto const fg = walker_util::blockRelFieldGeometry(body.kind);
-    auto const rg = link::branchRelocGeometry(RelocFormulaKind::Aarch64Call26);
-    EXPECT_EQ(rg.fieldBits, fg.width);
-    EXPECT_EQ(rg.scaleLog2, fg.scaleLog2);
-    EXPECT_EQ(rg.lsb, fg.lsb)
-        << "the quoted branch word's field and the relocation formula's field "
-           "must be the same window, or the linker would OR the displacement "
-           "into the wrong bits of a word it copied";
-
-    // A target with a relocation row but no `br` opcode to quote: the refusal
-    // must name the missing half rather than invent a branch.
-    constexpr char const* kNoBranchOpcode = R"({
+// A target that declares NO veneer vocabulary refuses by name — it is never
+// handed a body it did not declare, and never a clobber it did not grant.
+TEST(LinkBranchVeneer, ATargetWithNoVocabularyRefusesByName) {
+    constexpr char const* kNoVocabulary = R"({
       "dssTargetVersion": 1,
-      "target": {"name":"no_branch_opcode"},
+      "target": {"name":"no_link_veneers"},
       "relocations":[
         { "name": "call26", "kind": 1, "formula": "aarch64_call26" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })";
-    auto bare = TargetSchema::loadFromText(kNoBranchOpcode);
+    auto bare = TargetSchema::loadFromText(kNoVocabulary);
     ASSERT_TRUE(bare.has_value());
-    Span span = buildSpannedCall(**bare, static_cast<std::uint64_t>(
-                                     2 * call26Reach()));
-    ASSERT_TRUE(linker::branchVeneersNeeded(span.module, **bare));
+    ASSERT_EQ((*bare)->linkVeneers(), nullptr);
+
+    auto s = buildEntryShaped();
+    // Aim the entry's second call at the far callee instead of the import, so
+    // the out-of-reach branch is a plain module call.
+    s.module.functions[0].relocations[1].target = s.callee;
+    ASSERT_TRUE(linker::branchVeneersNeeded(s.module, **bare, s.stubs));
     DiagnosticReporter rep;
-    EXPECT_FALSE(linker::injectBranchVeneers(span.module, **bare, rep));
-    EXPECT_GT(rep.errorCount(), 0u)
-        << "a target that declares nothing to build a veneer from must REFUSE, "
-           "loudly, rather than link an image whose call goes nowhere";
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// THE CASE THIS TIER CANNOT BRIDGE, AND WHICH MUST REFUSE RATHER THAN SEARCH.
-// ─────────────────────────────────────────────────────────────────────────
-//
-// ★★★ THIS ARM EXISTS BECAUSE THE PASS FAILED IT. ✔MEASURED 2026-09-17: the
-// first draft placed a veneer at whatever function boundary was NEAREST its
-// desired offset, without asking whether that boundary made any progress
-// towards the callee. Handed a module whose caller and callee are separated by
-// ONE function larger than the field's reach — where every boundary is on the
-// WRONG side of the gap — it placed a veneer four bytes further along and
-// measured again, forever: 315 seconds and no refusal. A bound that counts the
-// veneers' own branch relocations grew as fast as the veneers did, so it never
-// fired either.
-//
-// ⚠⚠ THIS COMMENT USED TO END *"a single function bigger than ±128 MiB is
-// exactly what the ASSEMBLER's branch islands are for … the right answer is a
-// refusal that says so"*, AND THE REFUSAL SAID SO, AND IT WAS FALSE. The
-// assembler's islands serve `walker_util::BlockRelPatch`es — INTRA-function
-// branches to a block of the SAME function, resolved at assemble time and never
-// carried past it. A cross-function CALL relocation is not one of those, so no
-// island the assembler can place will ever serve this shape. A refusal naming a
-// tier that structurally cannot help is worse than one naming nothing, because a
-// reader acts on it.
-//
-// ★★★ AND THERE ARE TWO SHAPES HERE, NOT ONE, SEPARATED BY WHETHER A BOUNDARY
-// IS IN REACH OF THE CALL SITE AT ALL. ✔MEASURED 2026-09-17 against
-// `aarch64-linux-gnu-ld` 2.42: it REFUSES the first (*"relocation truncated to
-// fit: R_AARCH64_CALL26"*) and LINKS the second, with an `adrp/add/br x16` stub
-// standing at a boundary 24 bytes from the call site and 150 994 960 bytes from
-// the callee. So one of our two refusals matches a working reference and the
-// other does not, and the messages must not be interchangeable.
-// ⚠⚠ AND THIS ARM'S OWN SUBJECT TURNED OUT TO BE THE **BRIDGEABLE** SHAPE, which
-// is why its expectation moved. Its layout is caller │ oversized filler │ callee,
-// so the boundary between the caller and the filler is FOUR BYTES from the call
-// site — comfortably in reach — and two reaches from the callee. There was always
-// somewhere to stand; what could not use it is a one-word veneer body. The
-// genuinely site-less shape is a call buried inside an oversized function, and it
-// has its own arm below.
-TEST(LinkBranchVeneer, OneOversizedFunctionBetweenCallerAndCalleeRefusesLoudly) {
-    auto sOpt = TargetSchema::loadShipped("arm64");
-    ASSERT_TRUE(sOpt.has_value());
-    auto const& target = **sOpt;
-
-    // ONE filler, so the only boundaries in the image are at its two ends.
-    Span span = buildSpannedCall(
-        target, static_cast<std::uint64_t>(2 * call26Reach()), /*fillerCount=*/1);
-    ASSERT_TRUE(linker::branchVeneersNeeded(span.module, target));
-
-    DiagnosticReporter rep;
-    EXPECT_FALSE(linker::injectBranchVeneers(span.module, target, rep))
-        << "a gap no veneer body can bridge must be refused, not searched";
-    EXPECT_GT(rep.errorCount(), 0u);
-    bool saidBoundaryInReach = false, saidNoBoundaryAtAll = false;
-    bool namedTheCost = false, sentToTheAssembler = false;
-    for (auto const& d : rep.all()) {
-        if (d.actual.find("stand within a veneer's placement reach of the call "
-                          "site") != std::string::npos)
-            saidBoundaryInReach = true;
-        if (d.actual.find("NO FUNCTION BOUNDARY") != std::string::npos)
-            saidNoBoundaryAtAll = true;
-        if (d.actual.find("WHAT IS REFUSED AND WHAT IT COSTS")
-            != std::string::npos)
-            namedTheCost = true;
-        if (d.actual.find("belongs to the assembler") != std::string::npos)
-            sentToTheAssembler = true;
-    }
-    EXPECT_TRUE(saidBoundaryInReach)
-        << "a boundary WAS in reach of the call site here; claiming there was "
-           "none sends the reader after a site that already exists";
-    EXPECT_FALSE(saidNoBoundaryAtAll)
-        << "this is the shape a reference linker LINKS, with an indirect stub "
-           "at exactly that boundary; it must not borrow the message written "
-           "for the shape every linker refuses";
-    EXPECT_TRUE(namedTheCost)
-        << "a refusal with a working reference AGAINST it must record what it "
-           "costs, or a later cycle applying the union rule reverts it blind";
-    EXPECT_FALSE(sentToTheAssembler)
-        << "a cross-function CALL relocation can never be served by an "
-           "assembler branch island, which is intra-function and resolved "
-           "before this tier exists; the refusal must not send a reader there";
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// THE SHAPE **NO** LINKER CAN BRIDGE — AND THE ONE OUR REFUSAL MATCHES.
-// ─────────────────────────────────────────────────────────────────────────
-//
-// ★★★ THE CALL SITE IS BURIED DEEPER THAN THE PLACEMENT STRIDE INSIDE ONE
-// FUNCTION, so no function boundary exists that the call could even branch to.
-// No veneer body of any shape changes that: a trampoline the call cannot reach
-// is not a trampoline. ✔MEASURED 2026-09-17 that `aarch64-linux-gnu-ld` 2.42
-// refuses the identical shape — *"relocation truncated to fit:
-// R_AARCH64_CALL26"* — so THIS refusal matches a working reference and the one
-// above does not. Keeping the two messages apart is what stops a later reader
-// treating them as one problem.
-TEST(LinkBranchVeneer, ACallBuriedDeeperThanTheStrideInsideOneFunctionHasNoSite) {
-    auto sOpt = TargetSchema::loadShipped("arm64");
-    ASSERT_TRUE(sOpt.has_value());
-    auto const& target = **sOpt;
-    auto const* call26 = target.relocationByName("call26");
-    ASSERT_NE(call26, nullptr);
-
-    // callee (`RET`) │ ONE caller function, with the call buried inside it.
-    //
-    // ⚠ EVERY OFFSET BELOW IS DERIVED FROM THE FIELD'S OWN REACH, and each has
-    // to hold or the arm proves nothing. With R the reach and the placement
-    // stride R/2:
-    //   * the call sits at R+8 inside the caller, so the callee (at 0) is R+12
-    //     away — OUT of range, which is what puts the pass in this code path;
-    //   * the boundary BEFORE it is R+8 away and the one AFTER it is R/2+8
-    //     away, both strictly more than the stride — so nothing is standable.
-    // Making the caller any shorter puts its trailing boundary back in reach and
-    // the arm silently becomes a copy of the one above.
-    auto const R      = static_cast<std::uint64_t>(call26Reach());
-    auto const stride = R / 2u;
-    auto const callAt = R + 8u;            // offset of the `BL` inside the caller
-    auto const size   = callAt + stride + 8u;
-
-    AssembledModule module;
-    SymbolId const caller{1}, callee{2};
-    module.functions.push_back(word(callee, kRet));
-    AssembledFunction big;
-    big.symbol = caller;
-    big.bytes.resize(static_cast<std::size_t>(size), 0u);
-    for (std::uint8_t b = 0; b < 4; ++b)
-        big.bytes[static_cast<std::size_t>(callAt) + b] =
-            static_cast<std::uint8_t>((kBL >> (8u * b)) & 0xFFu);
-    big.relocations.push_back(
-        Relocation{static_cast<std::uint32_t>(callAt), callee, call26->kind, 0});
-    module.functions.push_back(std::move(big));
-    module.expectedFuncCount = module.functions.size();
-
-    ASSERT_TRUE(linker::branchVeneersNeeded(module, target));
-    DiagnosticReporter rep;
-    EXPECT_FALSE(linker::injectBranchVeneers(module, target, rep));
-    ASSERT_GT(rep.errorCount(), 0u);
-
-    bool saidNoBoundaryAtAll = false, saidBoundaryInReach = false;
-    for (auto const& d : rep.all()) {
-        if (d.actual.find("NO FUNCTION BOUNDARY") != std::string::npos)
-            saidNoBoundaryAtAll = true;
-        if (d.actual.find("stand within a veneer's placement reach of the call "
-                          "site") != std::string::npos)
-            saidBoundaryInReach = true;
-    }
-    EXPECT_TRUE(saidNoBoundaryAtAll)
-        << "with the call site a full reach from every boundary there is "
-           "nowhere to stand, and the refusal must say THAT";
-    EXPECT_FALSE(saidBoundaryInReach)
-        << "no boundary is in reach here; reporting one would be a count of "
-           "sites that do not exist";
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// THE MEASURED BLIND SPOT — AN IMPORT-BOUND CALL IS INVISIBLE TO THIS PASS.
-// ─────────────────────────────────────────────────────────────────────────
-//
-// ★★★ THIS ARM PINS A DEFECT'S PREMISE, NOT A CONTRACT, AND SAYS SO IN ITS OWN
-// ASSERTION TEXT. `branchVeneersNeeded` walks `module.functions` and `continue`s
-// on any relocation whose target is not one of them. An extern import is not one
-// of them, so an out-of-range call to an import reports "no veneers needed" and
-// the writer refuses later with a message about a pass that never looked.
-//
-// ⚠ IT IS NOT A HYPOTHETICAL. ✔MEASURED 2026-09-17,
-// `arm64:elf64-aarch64-linux-exec`: the linker's own entry trampoline calls
-// `exit` through the PLT, `elf.cpp` places `.plt` past the whole of `.text`, and
-// every shipped `processExit` declares `"mechanism": "by-name-import"` — so a
-// 212 992-statement program is refused for a `call26` of 139 722 816 bytes that
-// no user wrote. The island edge above it is therefore unreachable in a linked
-// image: at 196 608 statements the body's own branch spans 128 974 856 bytes
-// (in range, no island) while the artifact is already 128 984 576 bytes, so the
-// import call crosses the reach ~9 720 bytes BEFORE the island is needed.
-//
-// ★ WHEN THIS IS FIXED THIS ARM GOES RED, WHICH IS THE POINT.
-TEST(LinkBranchVeneer, AnOutOfRangeCallToAnImportIsNotSeenByThisPassYet) {
-    auto sOpt = TargetSchema::loadShipped("arm64");
-    ASSERT_TRUE(sOpt.has_value());
-    auto const& target = **sOpt;
-    auto const* call26 = target.relocationByName("call26");
-    ASSERT_NE(call26, nullptr);
-
-    // A module holding ONLY an oversized function and a caller whose `BL` names
-    // a symbol that is NOT a function of this module — which is exactly the
-    // shape of a call to an import stub.
-    AssembledModule module;
-    SymbolId const caller{1};
-    SymbolId const importSym{9999};
-    auto callerFn = word(caller, kBL);
-    callerFn.relocations.push_back(Relocation{0u, importSym, call26->kind, 0});
-    module.functions.push_back(std::move(callerFn));
-    AssembledFunction filler;
-    filler.symbol = SymbolId{100};
-    filler.bytes.resize(static_cast<std::size_t>(2 * call26Reach()), 0u);
-    module.functions.push_back(std::move(filler));
-    module.expectedFuncCount = module.functions.size();
-
-    // THE CONTROL, first: the identical module with the call aimed at a symbol
-    // this module DOES define is seen. Without it a `false` below could mean the
-    // fixture never built an out-of-range call at all.
-    {
-        AssembledModule seen = module;
-        seen.functions.push_back(word(SymbolId{2}, kRet));
-        seen.expectedFuncCount = seen.functions.size();
-        // Aim it past the filler, so the distance really is out of range and a
-        // `false` below cannot mean "the call was in range all along".
-        seen.functions[0].relocations[0].target = SymbolId{2};
-        EXPECT_TRUE(linker::branchVeneersNeeded(seen, target))
-            << "CONTROL: an out-of-range call to a symbol this module defines "
-               "must be seen, or the negative below proves nothing";
-    }
-
-    EXPECT_FALSE(linker::branchVeneersNeeded(module, target))
-        << "MEASURED BLIND SPOT, not a contract: this pass cannot see a call "
-           "whose target is an import, because the stub is not a function of "
-           "the module and its address is chosen by the format writer "
-           "afterwards. When a later cycle gives the pass a layout oracle that "
-           "includes import stubs, this expectation is what must change";
+    EXPECT_FALSE(linker::injectBranchVeneers(s.module, **bare, s.stubs, rep));
+    bool namedTheKey = false;
+    for (auto const& d : rep.all())
+        if (d.actual.find("`linkVeneers`") != std::string::npos) namedTheKey = true;
+    EXPECT_TRUE(namedTheKey)
+        << "the refusal must name the vocabulary the target did not declare";
 }

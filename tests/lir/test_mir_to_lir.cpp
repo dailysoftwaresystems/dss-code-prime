@@ -2371,8 +2371,8 @@ TEST(MirToLir, CondBrFusesIcmpConditionIntoJccPayload) {
     EXPECT_EQ(lir.instPayload(term),
               static_cast<std::uint32_t>(::dss::TargetCondCode::Sgt))
         << "CondBr-fused jcc payload must be Sgt (the ICmpSgt's "
-           "cond code), NOT the legacy default Ne — D-CSUBSET-"
-           "WHILE-LOOP-SUBSTRATE fusion pin";
+           "cond code), NOT the legacy default Ne — "
+           "D-CSUBSET-WHILE-LOOP-SUBSTRATE fusion pin";
 }
 
 TEST(MirToLir, TernaryProducesPhiResolutionMoves) {
@@ -6347,8 +6347,13 @@ buildF128BinaryArith(::dss::TypeInterner& interner, ::dss::MirOpcode op) {
     return std::move(mb).finish();
 }
 
-// Index of the FIRST inst in block `bb` whose opcode == `op` and whose sole
-// SymbolRef operand names symbol `symV`, or nullopt.
+// Index of the FIRST inst in block `bb` whose opcode == `op` and whose callee
+// (operand 0) is a SymbolRef naming symbol `symV`, or nullopt. ⓘ The argument
+// operands after it are not constrained here: a softcall's F128 arguments are
+// hand-placed and unlisted, while a USER call now lists its marshalled F128
+// arguments at their positions as their physical registers
+// (D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED) — the tests
+// that care assert the operand list themselves.
 [[nodiscard]] std::optional<std::uint32_t>
 findCallToSymbol(::dss::Lir const& lir, ::dss::LirBlockId bb,
                  std::uint16_t callOp, std::uint32_t symV) {
@@ -6356,7 +6361,7 @@ findCallToSymbol(::dss::Lir const& lir, ::dss::LirBlockId bb,
         auto const inst = lir.blockInstAt(bb, i);
         if (lir.instOpcode(inst) != callOp) continue;
         auto const ops = lir.instOperands(inst);
-        if (ops.size() == 1 && ops[0].kind == ::dss::LirOperandKind::SymbolRef
+        if (!ops.empty() && ops[0].kind == ::dss::LirOperandKind::SymbolRef
             && ops[0].symbolV == symV) {
             return i;
         }
@@ -6835,7 +6840,11 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
     //       *pr = add(*pa, *pb);   // add: long double(long double,long double)
     //   }
     // The two F128 args are marshalled into v0/v1 (a burst of Q-form `fldur`s)
-    // IMMEDIATELY before the call — NOT operand-listed — and the F128 result is
+    // IMMEDIATELY before the call — and, since
+    // D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED, operand-listed
+    // at their positions AS those physical registers, so `lir_callconv`'s one
+    // argument walk counts them (pinned in `test_lir_aapcs64_mixed_fp_call`) —
+    // and the F128 result is
     // captured from v0 by a Q-form `fstur` IMMEDIATELY after (the LD-2
     // marshal→call adjacency). ⓘ Those two accesses used to be the separate
     // `fldur_q`/`fstur_q` mnemonics; they are width-128 variants now.
@@ -6899,6 +6908,14 @@ TEST(MirToLir, F128CallArgsMarshalIntoV0V1BeforeCall) {
                 && lir.instResult(m1).regClass() == LirRegClass::FPR
                 && lir.instResult(m1).id == *v1Ord)
         << "second F128 arg → v1";
+    // …and the call LISTS them, at their positions, as those registers — the
+    // one argument walk counts what it can see.
+    auto const callOps2 = lir.instOperands(lir.blockInstAt(bb, *callIdx));
+    ASSERT_EQ(callOps2.size(), 3u) << "callee + the two F128 arguments";
+    EXPECT_TRUE(callOps2[1].kind == LirOperandKind::Reg && callOps2[1].reg.isPhysical
+                && callOps2[1].reg.id == *v0Ord);
+    EXPECT_TRUE(callOps2[2].kind == LirOperandKind::Reg && callOps2[2].reg.isPhysical
+                && callOps2[2].reg.id == *v1Ord);
     // The immediately-following inst is the result capture (Q-form store of v0).
     ASSERT_LT(*callIdx + 1, lir.blockInstCount(bb));
     auto const cap = lir.blockInstAt(bb, *callIdx + 1);

@@ -378,7 +378,7 @@ public:
     // not a formatting nit, it MINTS A SECOND ANCHOR. The first spelling here
     // was `…-ABORTS-THE-MIR-` + `REBUILDER` on the next comment line, and
     // `anchor_registry_guard` correctly reported an unregistered
-    // `D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR` (its scanner reads one line,
+    // id cut short at `…-ABORTS-THE-MIR` (its scanner reads one line,
     // and the truncation then matched as a prefix in four other files).
     // See D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER.)
 

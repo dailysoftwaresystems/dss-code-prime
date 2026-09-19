@@ -1721,7 +1721,7 @@ TEST(ConstEval, IterativeDeepCastChainFoldsFlatAndByteIdentical) {
     });
 }
 
-// ── TF-C94 (D-CSUBSET-INT128-CONSTFOLD): 128-bit const-folds keep 128 bits ──
+// ── TF-C94 (D-CSUBSET-INT128-CONSTFOLD-WIDE): 128-bit const-folds keep 128 bits ──
 //
 // `__int128` / `__uint128_t` bind to TypeKind::I128/U128 — STANDARD integer types
 // (not `_BitInt`), but 128 bits wide, so they do not fit the engine's int64/uint64

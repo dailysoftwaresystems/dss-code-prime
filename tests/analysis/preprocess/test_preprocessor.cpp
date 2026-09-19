@@ -6325,8 +6325,8 @@ TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
     auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, DiagnosticBudget::libraryDefault(), {}, std::nullopt, defines);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "the command-line define seed must thread into the child builder so "
-           "outer.h's own #ifdef GATE-gated include is LIVE (D-PP-PRESCAN-"
-           "DEFINEDNESS-PARITY child-threading)";
+           "outer.h's own #ifdef GATE-gated include is LIVE ("
+           "D-PP-PRESCAN-DEFINEDNESS-PARITY child-threading)";
     fs::remove_all(dir, ec);
 }
 
@@ -6605,8 +6605,8 @@ TEST(Preprocessor, AngleShippedMacroSplicesUnderQuoteIncludeGatedIf) {
     }
     EXPECT_TRUE(has777)
         << "the shipped object-macro must inject+expand under a quote-include-gated "
-           "#if the pre-scan is blind to (D-PP-PRESCAN-ANGLE-MACRO-SPLICE-"
-           "AUTHORITATIVE-LIVENESS)";
+           "#if the pre-scan is blind to ("
+           "D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS)";
     EXPECT_FALSE(hasBareMac) << "SHIPPED_MAC must not survive the parser boundary "
                                "unexpanded";
     fs::remove_all(sysdir, ec);
@@ -9043,7 +9043,7 @@ TEST(Preprocessor, FC179HasEmbedPreScanParityGatesQuoteInclude) {
     std::error_code ec; fsemb::remove_all(dir, ec);
 }
 
-// D-PERF-1 (macro-pass O(n^2) -> O(n)) EFFECTIVENESS PIN. The macro expander
+// D-PERF-1-PREPROCESSOR (macro-pass O(n^2) -> O(n)) EFFECTIVENESS PIN. The macro expander
 // consumes its stream from a FRONT-CONSUMED deque and splices only at the front,
 // so the TOTAL splice-work (`PreprocessResult::macroTokenMoves`, summing
 // `consumed + produced` over every `spliceOver`) is LINEAR in the invocation
@@ -9077,10 +9077,11 @@ TEST(Preprocessor, DPerf1MacroPassTokenMovesStayLinear) {
     // The load-bearing assertion: EXACTLY 2 front-splice token-moves per object-
     // like expansion (pop the name `A`, push its replacement `1`) -> 2*N total,
     // LINEAR in N. The exact count is the strongest provable property here.
-    // RED-ON-DISABLE: `tokenMoves_` is intrinsic to the D-PERF-1 deque splice;
-    // reverting `spliceOver` to the pre-D-PERF-1 `std::vector` erase+insert removes
-    // it (the counter lives inside the deque splice), so macroTokenMoves -> 0 and
-    // this EQ fails (0 != 2*N). A logical op-counter
+    // RED-ON-DISABLE: `tokenMoves_` is intrinsic to the deque splice
+    // (D-PERF-1-PREPROCESSOR); reverting `spliceOver` to the `std::vector`
+    // erase+insert it replaced removes it (the counter lives inside the deque
+    // splice), so macroTokenMoves -> 0 and this EQ fails (0 != 2*N). A logical
+    // op-counter
     // cannot by itself distinguish the deque's O(n) front-splice from a
     // same-formula vector mid-splice; the PHYSICAL O(n^2)->O(n) tail-shift win is
     // proven separately by the sqlite `preprocess-expand` phase re-measure

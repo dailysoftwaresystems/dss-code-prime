@@ -388,8 +388,8 @@ TEST(FramePointerReservation, TheReservationIsReadFromTheShippedSchemaNotTheEngi
             << "with the declaration removed the allocator still withheld x29 — "
                "the reservation is coming from the ENGINE, not from the "
                "`.target.json`, which is the defect "
-               "D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-"
-               "RESERVED-ROLE was closed by removing";
+               "D-CODEGEN-APPLE-ARM64-X29-USED-AS-GENERAL-SCRATCH-AGAINST-ITS-RESERVED-ROLE "
+               "was closed by removing";
     }
     auto const m = countPhysicalReg(p.cc.lir, t.x29Ordinal);
     EXPECT_GT(m.total(), 0u)

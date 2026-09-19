@@ -319,6 +319,27 @@ frameSlotStrideForClasses(TargetSchema const& schema,
                                        occupants.begin(), occupants.size()});
 }
 
+// ── D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE: WHICH FORM A FRAME ACCESS TAKES ──────
+//
+// The frame chokepoint's own decision (`lir_callconv.cpp` `selectFrameMemOp`),
+// published for the reason `frameSlotStride` is: a derivation no tier can
+// observe is a derivation whose mutant reddens nothing. For a frame LOAD
+// (`isStore == false`) or STORE issued with the class op `baseOp` at `offset`,
+// at the access width `widthFlags` states: the opcode the chokepoint emits —
+// the short form, or its class's scaled long-reach twin — and whether the
+// access is FAR, i.e. beyond every form the target declares for it, and
+// therefore emitted as an address materialized in a register followed by an
+// access at offset 0. Both answers are read from the target's own encoding
+// (the variant guards and the displacement field the offset is wired to),
+// never from a literal.
+struct FrameMemAccessForm {
+    std::uint16_t op  = 0;
+    bool          far = false;
+};
+[[nodiscard]] DSS_EXPORT FrameMemAccessForm
+frameMemAccessForm(TargetSchema const& schema, std::uint16_t baseOp,
+                   bool isStore, std::int32_t offset, std::uint8_t widthFlags);
+
 // ── D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL ───────────────────────────────
 //
 // PLACING ONE LOCAL WHOSE ALIGNMENT MAY EXCEED WHAT A STATIC FRAME OFFSET CAN
@@ -766,7 +787,7 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       outgoingArgAreaSize = 0; // bytes reserved at [SP+0..) for THIS function's outgoing stack args
     std::uint32_t       savedRegAreaSize  = 0;  // bytes occupied by callee-saved regs
     std::uint32_t       spillAreaSize     = 0;  // bytes occupied by spill slots
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): byte
+    // Local-int codegen (plan step 13.3b, 2026-06-02): byte
     // count for body-declared local allocas (one `alloca` LIR op =
     // one `slotSize`-byte slot). Allocas live ABOVE spill slots in
     // the frame layout (positive RSP offset post-prologue). The
@@ -852,7 +873,7 @@ struct DSS_EXPORT FrameLayout {
         return outgoingArgAreaSize + savedRegAreaSize;
     }
 
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b): local-alloca area
+    // Local-int codegen (plan step 13.3b): local-alloca area
     // starts immediately after the spill area (above spills in the
     // stack-grows-down convention; positive offset from post-prologue
     // RSP). Each alloca i (0-indexed by scan order) sits at

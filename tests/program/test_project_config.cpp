@@ -361,7 +361,7 @@ TEST(ProjectConfigLoader, FlagArraysPopulatedParseExactly) {
     ASSERT_EQ(pc->resolveLibraries.size(), 2u);
     EXPECT_EQ(pc->resolveLibraries[0].path, "libfoo.so");
     EXPECT_EQ(pc->resolveLibraries[1].path, "libbar.a");
-    // D-FFI-DECLARED-IMPORT-NAME: a PLAIN string entry states NOTHING — the
+    // Declared import names: a PLAIN string entry states NOTHING — the
     // byte-for-byte pre-existing meaning every shipped manifest relies on.
     EXPECT_TRUE(pc->resolveLibraries[0].declaredImportName.empty());
     EXPECT_TRUE(pc->resolveLibraries[1].declaredImportName.empty());
@@ -441,7 +441,7 @@ TEST(ProjectConfigLoader, NonArrayResolveLibrariesFailsLoud) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
 }
 
-// ── D-FFI-DECLARED-IMPORT-NAME: the extended `resolveLibraries` entry ────────
+// ── Declared import names: the extended `resolveLibraries` entry ────────
 //
 // Each entry is EITHER a plain path string (nothing stated) OR an object
 // `{"path", "importName"}` that additionally STATES the runtime identity to

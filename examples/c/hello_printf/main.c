@@ -31,7 +31,7 @@
 //     because c has no float type today). The count-of-FPRs
 //     scan is type-driven for future float vararg support.
 //
-//   * D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3) — printf comes
+//   * the extern library-name syntax (step 13.3) — printf comes
 //     from msvcrt.dll on Windows (the c default for PE) — no
 //     per-symbol override needed.
 

@@ -237,7 +237,7 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
-    // TF-C78 (D-CSUBSET-NOINLINE): shared accumulator of (FUNCTION decl HIR node
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): shared accumulator of (FUNCTION decl HIR node
     // → NoInlineAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isNoInline` at each Function lowering site (where the record
     // is in hand) — the exact `mutability` discipline. Applied to the result's
@@ -2893,7 +2893,7 @@ struct Lowerer {
             || attr.staticInit.any())
             linkage.push_back({node, attr});
     }
-    // TF-C78 (D-CSUBSET-NOINLINE): record the inliner opt-out for a lowered
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): record the inliner opt-out for a lowered
     // Function node from its bound symbol's `SymbolRecord.isNoInline` (sparse:
     // only annotated functions are stored; absence ⇒ freely inlinable). `sym`
     // must be the function's declared symbol. The `recordMutability` shape.
@@ -13026,7 +13026,7 @@ struct Lowerer {
         // same symbol the four `recordX` calls below read, on the ONE attribute
         // that must share a side-table entry with the linkage this call stores.
         recordLinkage(fn_, linkAttr, sym);
-        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
@@ -13474,7 +13474,7 @@ struct Lowerer {
         // same symbol the four `recordX` calls below read, on the ONE attribute
         // that must share a side-table entry with the linkage this call stores.
         recordLinkage(fn_, linkAttr, sym);
-        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
@@ -13607,7 +13607,7 @@ struct Lowerer {
         // on top of this base inside `recordExtern`, not here.
         LinkageAttr const externPrefixLink =
             linkageFrom(linkagePrefixRoots(node, decl), decl);
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
+        // The extern library-name syntax (step 13.3): the OPTIONAL trailing
         // `stringLiteralExpr` after the declarator list is a DSS per-declaration
         // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
         // — examples/c/hello_writefile). Decode it ONCE and apply the same
@@ -13887,7 +13887,7 @@ struct Lowerer {
         }
     }
 
-    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): decode the OPTIONAL trailing
+    // The extern library-name syntax (step 13.3): decode the OPTIONAL trailing
     // `stringLiteralExpr` library-override on an extern declaration (`extern void
     // f() "lib";`) — the per-declaration import-library name. Scans the declaration's
     // role children (the stringLiteralExpr sits after the initDeclaratorList, before
@@ -14008,7 +14008,7 @@ struct Lowerer {
         // same symbol the four `recordX` calls below read, on the ONE attribute
         // that must share a side-table entry with the linkage this call stores.
         recordLinkage(fn_, linkAttr, sym);
-        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
@@ -14165,7 +14165,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
-    // TF-C78 (D-CSUBSET-NOINLINE): shared (Function decl node → NoInlineAttr)
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): shared (Function decl node → NoInlineAttr)
     // accumulator, moved onto result->noInlineMap after finish().
     std::vector<std::pair<HirNodeId, NoInlineAttr>> noInlineAcc;
     // TF-C81 (D-CSUBSET-ALWAYSINLINE): shared (Function decl node →
@@ -14332,7 +14332,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
                                                   std::move(inlineAsmPool));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
-    for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE)
+    for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         result->noInlineMap.set(id, attr);
     for (auto& [id, attr] : alwaysInlineAcc)   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         result->alwaysInlineMap.set(id, attr);

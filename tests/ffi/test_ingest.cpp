@@ -721,7 +721,7 @@ TEST(FfiIngest, IngestPrefersSonameOverBasenameForImportLibrary) {
     EXPECT_TRUE(fallback.soname.empty());
 }
 
-// ── D-FFI-DECLARED-IMPORT-NAME: the caller-STATED identity outranks both ──
+// ── The DECLARED import name: the caller-STATED identity outranks both ──
 //
 // Reading a library answers two separate questions: WHICH SYMBOLS exist (the
 // file at `path`) and WHAT IDENTITY to record for them. Until this landed only
@@ -1395,7 +1395,7 @@ TEST(FfiIngest, ObservedNonDefaultCompatVersionIsNeverPinned) {
 }
 
 TEST(FfiIngest, ObservedVersionIsNotPinnedOntoADeclaredStandInIdentity) {
-    // D-FFI-DECLARED-IMPORT-NAME lets a caller read symbols out of a
+    // A declared import name lets a caller read symbols out of a
     // cross-compilation STAND-IN whose runtime counterpart is a different
     // file. The emitted verneed names the DECLARED identity, so requesting a
     // version observed in the stand-in would demand it of a library whose

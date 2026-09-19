@@ -1206,8 +1206,7 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             std::format("two Args share flat call-operand "
                                         "position {} in func #{} — a payload "
                                         "wipe at a rebuild/merge site "
-                                        "(D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-"
-                                        "ARG-DROP)",
+                                        "(D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP)",
                                 pos, f.v));
                     }
                 } else if (op == MirOpcode::CondBr) {

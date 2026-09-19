@@ -28,6 +28,7 @@
 // than by re-reading the string the parent produced.
 #include "run_binary.hpp"
 
+#include "scoped_env.hpp"  // the environment arm's pins set what the child must NOT get
 #include "scratch_dir.hpp"
 #include "test_wait_budget.hpp"  // kWaitBudget — the shared, measured wait cap
 
@@ -53,6 +54,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -132,6 +134,13 @@ constexpr std::string_view kProbeStdioDirective = "--dss-fixture-probe-stdio";
 // The flood directive: write exactly N bytes of `floodPayload` to stdout and
 // exit with the caller's code. N comes from the argv element after it.
 constexpr std::string_view kFloodStdoutDirective = "--dss-fixture-flood-stdout";
+
+// The environment PROBE directive. Every argv element after it is a variable
+// NAME, and the child records, per name, whether it received that variable and
+// with what value — in the MARKER (tags `ENV` / `NOENV`), never on a stream. It
+// is how the environment arm's pins read the CHILD's own environment rather
+// than the parent's idea of what it handed on.
+constexpr std::string_view kProbeEnvDirective = "--dss-fixture-probe-env";
 
 // ★ MORE THAN ANY PIPE BUFFER, WHICH IS THE ENTIRE POINT OF THE HEADLINE PIN.
 // Linux gives an anonymous pipe 64 KiB; a Windows anonymous pipe defaults to
@@ -213,6 +222,9 @@ struct Marker {
     // expects, so a marker that silently stopped carrying the record fails
     // rather than passing as a not-asked.
     std::string              stdinProbe;
+    // Written ONLY by the environment probe: per probed name, the value the
+    // CHILD saw, or nullopt when it did not receive the variable at all.
+    std::vector<std::pair<std::string, std::optional<std::string>>> env;
 };
 
 // Parse a marker blob. Returns nullopt with `error` filled on ANY malformed
@@ -251,6 +263,17 @@ std::optional<Marker> parseMarker(std::string const& blob, std::string& error) {
             marker.args.push_back(value);
         } else if (tag == "STDIN") {
             marker.stdinProbe = value;
+        } else if (tag == "ENV") {
+            std::size_t const equals = value.find('=');
+            if (equals == std::string::npos) {
+                error = "ENV record at offset " + std::to_string(pos)
+                      + " carries no '='";
+                return std::nullopt;
+            }
+            marker.env.emplace_back(value.substr(0, equals),
+                                    value.substr(equals + 1));
+        } else if (tag == "NOENV") {
+            marker.env.emplace_back(value, std::nullopt);
         } else if (tag != "ARGV0") {
             error = "unknown record tag '" + tag + "'";
             return std::nullopt;
@@ -294,13 +317,14 @@ struct FixtureRun {
 FixtureRun runFixture(fs::path const&                 markerPath,
                       int                             exitCode,
                       std::vector<std::string> const& payload,
-                      fs::path const&                 cwd = {}) {
+                      fs::path const&                 cwd      = {},
+                      std::vector<std::string> const& withheld = {}) {
     std::vector<std::string> argv{selfPath().string(), std::string{kFixtureFlag},
                                   markerPath.string(), std::to_string(exitCode)};
     argv.insert(argv.end(), payload.begin(), payload.end());
 
     FixtureRun run;
-    run.result = spawnAndWaitInherit(argv, cwd);
+    run.result = spawnAndWaitInherit(argv, cwd, withheld);
     if (auto const blob = readFileBinary(markerPath)) {
         run.marker = parseMarker(*blob, run.markerError);
     } else {
@@ -330,13 +354,14 @@ RedirectRun runFixtureRedirected(fs::path const&                 markerPath,
                                  int                             exitCode,
                                  std::vector<std::string> const& payload,
                                  fs::path const&                 stdoutFile,
-                                 fs::path const&                 cwd = {}) {
+                                 fs::path const&                 cwd      = {},
+                                 std::vector<std::string> const& withheld = {}) {
     std::vector<std::string> argv{selfPath().string(), std::string{kFixtureFlag},
                                   markerPath.string(), std::to_string(exitCode)};
     argv.insert(argv.end(), payload.begin(), payload.end());
 
     RedirectRun run;
-    run.result = spawnAndWaitRedirectStdout(argv, cwd, stdoutFile);
+    run.result = spawnAndWaitRedirectStdout(argv, cwd, stdoutFile, withheld);
     if (auto const blob = readFileBinary(markerPath)) {
         run.marker = parseMarker(*blob, run.markerError);
     } else {
@@ -2718,6 +2743,148 @@ TEST(RunBinaryHarness, HostileArgumentsReachTheChildByteIdentically) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// THE ENVIRONMENT ARM — `withheldVariables` (the header's "The environment
+// arm"). Its caller is the dependency cache's `git`, which must not inherit
+// git's own repository variables: a build that a `pre-commit` hook in a linked
+// worktree runs was measured writing a dependency's index into the user's
+// worktree index through an inherited `GIT_INDEX_FILE`.
+//
+// Every pin reads the CHILD's own environment out of the marker, and every
+// "not received" verdict stands beside a control arm in which the same child,
+// with nothing withheld, DOES receive the variable. An absence reported about a
+// variable the parent never really had would prove nothing.
+// RED ON DISABLE: make the arm a no-op (the child gets our whole environment
+// whatever the list says). `AWithheldVariableNeverReachesTheChildAndEveryOtherOneDoes`
+// and `TheRedirectingSpawnWithholdsToo` go red on every host, and
+// `OnWindowsAWithheldNameMatchesRegardlessOfCase` on Windows. The
+// malformed-name pin stays green (the refusal comes before the arm), and so
+// do the control arms.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr char const* kWithheldProbe = "DSS_SPAWN_TEST_WITHHELD";
+constexpr char const* kKeptProbe     = "DSS_SPAWN_TEST_KEPT";
+
+// What the child reported about `name`: "=<value>", "<not received>", or
+// "<not probed>" when the marker carries no record for it at all (a probe that
+// silently stopped probing must fail, not read as an absence).
+std::string childSaw(Marker const& marker, std::string const& name) {
+    for (auto const& [probed, value] : marker.env) {
+        if (probed == name) {
+            return value.has_value() ? "=" + *value : std::string{"<not received>"};
+        }
+    }
+    return "<not probed>";
+}
+
+std::vector<std::string> envProbe(std::vector<std::string> const& names) {
+    std::vector<std::string> payload{std::string{kProbeEnvDirective}};
+    payload.insert(payload.end(), names.begin(), names.end());
+    return payload;
+}
+
+} // namespace
+
+TEST(SpawnEnvironment, AWithheldVariableNeverReachesTheChildAndEveryOtherOneDoes) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "spawn-env"};
+    dss::test_support::ScopedEnv const withheld{kWithheldProbe, "the caller withheld me"};
+    dss::test_support::ScopedEnv const kept{kKeptProbe, "the child must see me"};
+    auto const probe = envProbe({kWithheldProbe, kKeptProbe});
+
+    // CONTROL: nothing withheld, so the child receives both — which proves the
+    // parent really had them and the fixture really reads its own environment.
+    auto const control = runFixture(scratch.path() / "control.marker", 0, probe);
+    ASSERT_TRUE(control.result.spawned) << control.result.diagnostic;
+    ASSERT_TRUE(control.marker.has_value()) << control.markerError;
+    ASSERT_EQ(childSaw(*control.marker, kWithheldProbe), "=the caller withheld me")
+        << "the control child never received the variable, so an absence below "
+           "would prove nothing";
+    ASSERT_EQ(childSaw(*control.marker, kKeptProbe), "=the child must see me");
+
+    // One name the parent does not have at all rides along: withholding what is
+    // not there is not an error, it is just already true.
+    auto const run = runFixture(scratch.path() / "withheld.marker", 0, probe, {},
+                                {kWithheldProbe, "DSS_SPAWN_TEST_NEVER_SET"});
+    ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
+    EXPECT_EQ(run.result.exitCode, 0);
+    ASSERT_TRUE(run.marker.has_value()) << run.markerError;
+    EXPECT_EQ(childSaw(*run.marker, kWithheldProbe), "<not received>")
+        << "the child received a variable the caller WITHHELD";
+    EXPECT_EQ(childSaw(*run.marker, kKeptProbe), "=the child must see me")
+        << "withholding one variable took another one with it";
+}
+
+TEST(SpawnEnvironment, TheRedirectingSpawnWithholdsToo) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "spawn-env"};
+    dss::test_support::ScopedEnv const withheld{kWithheldProbe, "the caller withheld me"};
+    dss::test_support::ScopedEnv const kept{kKeptProbe, "the child must see me"};
+    auto const probe = envProbe({kWithheldProbe, kKeptProbe});
+
+    auto const control = runFixtureRedirected(scratch.path() / "control.marker", 0,
+                                              probe, scratch.path() / "control.out");
+    ASSERT_TRUE(control.result.spawned) << control.result.diagnostic;
+    ASSERT_TRUE(control.marker.has_value()) << control.markerError;
+    ASSERT_EQ(childSaw(*control.marker, kWithheldProbe), "=the caller withheld me");
+
+    auto const run = runFixtureRedirected(scratch.path() / "withheld.marker", 0, probe,
+                                          scratch.path() / "withheld.out", {},
+                                          {kWithheldProbe});
+    ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
+    ASSERT_TRUE(run.marker.has_value()) << run.markerError;
+    EXPECT_EQ(childSaw(*run.marker, kWithheldProbe), "<not received>")
+        << "the redirecting spawn handed on a variable the caller WITHHELD";
+    EXPECT_EQ(childSaw(*run.marker, kKeptProbe), "=the child must see me");
+    EXPECT_TRUE(run.captured.has_value()) << run.captureError;
+}
+
+TEST(SpawnEnvironment, AMalformedWithheldNameIsRefusedAndNothingRuns) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "spawn-env"};
+    int index = 0;
+    for (std::string const& bad : {std::string{}, std::string{"A=B"},
+                                   std::string{"NUL\0INSIDE", 10}}) {
+        fs::path const marker =
+            scratch.path() / ("malformed-" + std::to_string(index++) + ".marker");
+        auto const run = runFixture(marker, 0, envProbe({kKeptProbe}), {},
+                                    {kKeptProbe, bad});
+        EXPECT_FALSE(run.result.spawned)
+            << "a withheld name that names no variable was accepted";
+        EXPECT_NE(run.result.diagnostic.find("withheld environment variable name #1"),
+                  std::string::npos)
+            << run.result.diagnostic;
+        EXPECT_FALSE(fs::exists(marker))
+            << "the child ran although the request was refused";
+    }
+}
+
+#if defined(_WIN32)
+// Windows environment names are case-insensitive — `Path` and `PATH` are one
+// variable — so withholding a name must remove it in every spelling of its
+// case. A byte-exact match here would hand the child exactly what the caller
+// asked to keep from it, whenever the two were spelled differently.
+TEST(SpawnEnvironment, OnWindowsAWithheldNameMatchesRegardlessOfCase) {
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::Temp,
+                                          "spawn-env"};
+    dss::test_support::ScopedEnv const withheld{kWithheldProbe, "any case withholds me"};
+    auto const probe = envProbe({kWithheldProbe});
+
+    auto const control = runFixture(scratch.path() / "control.marker", 0, probe);
+    ASSERT_TRUE(control.marker.has_value()) << control.markerError;
+    ASSERT_EQ(childSaw(*control.marker, kWithheldProbe), "=any case withholds me");
+
+    auto const run = runFixture(scratch.path() / "case.marker", 0, probe, {},
+                                {"dss_spawn_test_WITHHELD"});
+    ASSERT_TRUE(run.result.spawned) << run.result.diagnostic;
+    ASSERT_TRUE(run.marker.has_value()) << run.markerError;
+    EXPECT_EQ(childSaw(*run.marker, kWithheldProbe), "<not received>")
+        << "a withheld name spelled in a different case reached the child";
+}
+#endif
+
 // ── main: spawn fixture OR test runner ─────────────────────────────────────
 //
 // Owning `main` (rather than linking gtest_main) is what lets the flag be
@@ -2744,6 +2911,17 @@ int main(int argc, char** argv) {
         // would depend on the thing it is meant to measure.
         if (argc >= 5 && std::string_view{argv[4]} == kProbeStdioDirective) {
             appendRecord(blob, "STDIN", stdinIsLive() ? "live" : "dead");
+        }
+        // The environment probe: this process's OWN view of each named
+        // variable — received with a value, or not received at all.
+        if (argc >= 5 && std::string_view{argv[4]} == kProbeEnvDirective) {
+            for (int i = 5; i < argc; ++i) {
+                if (char const* value = std::getenv(argv[i])) {
+                    appendRecord(blob, "ENV", std::string{argv[i]} + "=" + value);
+                } else {
+                    appendRecord(blob, "NOENV", std::string{argv[i]});
+                }
+            }
         }
         // BINARY mode: a text-mode write would translate '\n' to CRLF on
         // Windows and corrupt both the length prefixes and any payload that

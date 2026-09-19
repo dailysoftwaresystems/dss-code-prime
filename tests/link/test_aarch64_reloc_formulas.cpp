@@ -401,22 +401,25 @@ TEST(Aarch64Call26, RejectsOutOfRange) {
     EXPECT_FALSE(p.ok);
 }
 
-// ★★★ AND THE REFUSAL MUST NAME THE CAUSE A REAL IMAGE ACTUALLY HITS, WHICH IT
-// DID NOT. This is the LAST line of defence: a call the veneer pass could not
-// rescue arrives here and is refused. The message used to offer exactly two
+// ★★★ AND THE REFUSAL MUST NAME ONLY CAUSES THAT CAN REACH IT. This is the LAST
+// line of defence: a branch the veneer pass did not carry arrives here and is
+// refused.
+//
+// ⓘ HISTORY, BECAUSE THE MESSAGE HAS BEEN WRONG TWICE. It first offered two
 // explanations — *"the target declares nothing to build one from, or the
-// placement was skipped"* — and ✔MEASURED 2026-09-17 on
-// `arm64:elf64-aarch64-linux-exec` AND `arm64:macho64-arm64-darwin-exec`, the
-// explanation a large image hits is NEITHER: the veneer pass never saw the
-// relocation at all, because its target is an IMPORT STUB, which is not a
-// function of the module and whose address the format writer chooses AFTER that
-// pass has run. The overflowing call in both measurements was the linker's OWN
-// synthetic entry calling its process-exit import.
+// placement was skipped"* — and ✔MEASURED 2026-09-17 the cause a large image hit
+// was NEITHER: the veneer pass never saw an import-bound call, because it could
+// not know where the writer would put the stub. Lane `il` added that third
+// cause. Lane `vn` (2026-09-19) then CLOSED that blind spot — the writer now
+// reports every stub's place before the pass runs — which made the third cause
+// false in turn, and "the target declares nothing to build one from" is caught
+// earlier and by name. So the message now names what can still arrive: a target
+// that is neither a function nor an import stub, a writer called directly on an
+// unprepared module, or an arithmetic disagreement.
 //
 // ⚠ A DIAGNOSTIC THAT CONFIDENTLY LISTS THE WRONG CAUSES IS WORSE THAN A BARE
-// ONE, because a reader acts on it — and the two it listed both point at the
-// veneer pass's own configuration, which is exactly where the answer is not.
-TEST(Aarch64Call26, TheOutOfRangeRefusalNamesTheCauseALargeImageActuallyHits) {
+// ONE, because a reader acts on it.
+TEST(Aarch64Call26, TheOutOfRangeRefusalNamesTheCausesThatCanReachIt) {
     auto tgt = loadOneRelocTarget("aarch64_call26");
     ASSERT_NE(tgt, nullptr);
 
@@ -429,24 +432,29 @@ TEST(Aarch64Call26, TheOutOfRangeRefusalNamesTheCauseALargeImageActuallyHits) {
     ASSERT_FALSE(p.messages.empty())
         << "a refusal with no message is not a refusal a reader can act on";
 
-    EXPECT_TRUE(p.anySays("NEVER SAW THIS RELOCATION"))
-        << "the third cause — the veneer pass is blind to an import-bound "
-           "call — is the one measured to fire on a real oversized image, and "
-           "it must be among the explanations offered";
+    EXPECT_TRUE(p.anySays("NEITHER of those"))
+        << "the cause a real program can still hit — a branch whose target is "
+           "neither a function nor an import stub, which no veneer is built "
+           "for — must be among the explanations offered";
     EXPECT_TRUE(p.anySays("IMPORT STUB"))
-        << "naming the mechanism is what makes the cause actionable; without "
-           "it the reader is sent to configure a pass that behaved correctly";
+        << "the message must say an import stub IS a target the pass carries a "
+           "branch to, so the reader does not go hunting a blind spot that is "
+           "closed";
+    EXPECT_FALSE(p.anySays("NEVER SAW THIS RELOCATION"))
+        << "the pass SEES import-bound calls now (the writer reports its stub "
+           "layout in advance); offering the old blind spot as a cause would "
+           "send a reader after a defect that no longer exists";
 
     // THE CONTROL, in the same arm: an UNALIGNED target is a DIFFERENT refusal
     // and must NOT pick up this text. Without it, a message that appended the
-    // import prose to every Call26 diagnostic would satisfy the two arms above.
+    // veneer prose to every Call26 diagnostic would satisfy the arms above.
     auto q = applyOneReloc(tgt, 0x94000000u,
                             /*symbolVa*/ 0x400005,
                             /*addend*/   0,
                             /*patchSectionVa*/ 0x400000,
                             /*funcOffset*/ 0);
     ASSERT_FALSE(q.ok);
-    EXPECT_FALSE(q.anySays("NEVER SAW THIS RELOCATION"))
+    EXPECT_FALSE(q.anySays("NEITHER of those"))
         << "CONTROL: a misaligned branch target is not an out-of-range one, "
            "and must not borrow its explanation";
     EXPECT_TRUE(q.anySays("word-aligned"))

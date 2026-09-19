@@ -1789,8 +1789,8 @@ encode(AssembledModule const&    module,
                      "WEAK alias of a GLOBAL definition -- but it cannot "
                      "express an alias that must NOT yield. Emitting this one "
                      "under the canonical's policy would silently change its "
-                     "semantics. D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-"
-                     "OBJECT-SYMTAB.",
+                     "semantics. "
+                     "D-LK-ALIAS-NAME-ABSENT-FROM-REEMITTED-OBJECT-SYMTAB.",
                      alias->name, canonical.name,
                      symbolBindingName(alias->binding), canonical.name,
                      symbolBindingName(canonicalBinding)));

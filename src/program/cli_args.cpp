@@ -755,7 +755,7 @@ parseCliArgs(int argc, char* argv[]) {
             // which fails loud on a missing/unreadable file or an absent
             // symbol.
             //
-            // D-FFI-DECLARED-IMPORT-NAME: the value's OPTIONAL `=<import-name>`
+            // Declared import names: the value's OPTIONAL `=<import-name>`
             // suffix STATES the runtime identity to record for every symbol
             // read out of `<path>`, outranking the binary's own embedded
             // soname (`ffi::BinaryLibrarySource` docblock). SPELLING CHOICE:
@@ -1223,7 +1223,7 @@ parseCliArgs(int argc, char* argv[]) {
          // AP6: --force-git-cache without a mode flag would silently discard
          // the request (no manifest is ever read).
          || out.forceGitCache
-         || out.jobs != 0  // D-PERF-4: --jobs supplied without a mode flag
+         || out.jobs != 0  // D-PERF-4-CU-PARALLELISM: --jobs supplied without a mode flag
          // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve without a
          // mode flag would silently discard the request.
          || out.stackReserveBytes.has_value()

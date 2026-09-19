@@ -615,8 +615,8 @@ AssembledModule assemble(Lir const&                 lir,
                        DiagnosticSeverity::Error,
                        std::format("block-address binding in fn '{}' targets "
                                    "block id {} which is not in the function's "
-                                   "block list — malformed LIR (D-CSUBSET-"
-                                   "COMPUTED-GOTO)",
+                                   "block list — malformed LIR ("
+                                   "D-CSUBSET-COMPUTED-GOTO)",
                                    outFn.symbol.v, bsp.targetBlock));
                 blockSymOk = false;
                 break;
@@ -962,7 +962,7 @@ AssembledModule assemble(Lir const&                 lir,
                                    "displacement {} which is not a multiple "
                                    "of this field's scale ({} bytes) — block "
                                    "offsets must be instruction-aligned "
-                                   "(D-AS3-BLOCK-REL-IMM19/26)",
+                                   "(D-AS3-BLOCK-REL-IMM19-26)",
                                    outFn.symbol.v, delta, alignMask + 1));
                 patchOk = false;
                 break;
@@ -2275,8 +2275,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                  std::format("lowerMirGlobalsToDataItems: global "
                              "SymbolId={{ {} }} has a runtime "
                              "initializer (__module_init__-driven) "
-                             "— anchored under D-LK4-RODATA-"
-                             "PRODUCER-RUNTIME-INIT; today's cycle "
+                             "— anchored under "
+                             "D-LK4-RODATA-PRODUCER-RUNTIME-INIT; today's cycle "
                              "scope emits no AssembledData for "
                              "this shape.",
                              sym.v));
@@ -2573,8 +2573,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "SymbolId={{ {} }} is an aggregate "
                                  "(TypeKind={}) but the target declared no "
                                  "`aggregateLayout` block — cannot compute "
-                                 "its byte layout (D-LK4-RODATA-PRODUCER-"
-                                 "AGGREGATE-GLOBAL).",
+                                 "its byte layout ("
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                  sym.v, static_cast<int>(k)));
                 continue;
             }
@@ -2585,8 +2585,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                      std::format("lowerMirGlobalsToDataItems: global "
                                  "SymbolId={{ {} }} has an un-sizeable "
                                  "aggregate type (TypeKind={}) — incomplete "
-                                 "or out-of-scope (D-LK4-RODATA-PRODUCER-"
-                                 "AGGREGATE-GLOBAL).",
+                                 "or out-of-scope ("
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                  sym.v, static_cast<int>(k)));
                 continue;
             }
@@ -2847,8 +2847,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                  std::format("lowerMirGlobalsToDataItems: global "
                              "SymbolId={{ {} }} has TypeKind={} "
                              "— non-primitive global types are "
-                             "anchored under D-LK4-RODATA-PRODUCER-"
-                             "AGGREGATE-GLOBAL.",
+                             "anchored under "
+                             "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL.",
                              sym.v, static_cast<int>(k)));
             continue;
         }
@@ -2979,8 +2979,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "TypeKind={} with a `double` "
                                  "literal — the pool cannot "
                                  "represent f16/f80/f128 losslessly "
-                                 "(D-LK4-RODATA-PRODUCER-EXOTIC-"
-                                 "FLOAT).",
+                                 "(D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT).",
                                  sym.v, static_cast<int>(k)));
             } else {
                 emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
@@ -2988,8 +2987,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "SymbolId={{ {} }} has a literal "
                                  "value of an unhandled variant arm "
                                  "(monostate) — anchored under "
-                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-"
-                                 "GLOBAL.",
+                                 "D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL.",
                                  sym.v));
             }
             continue;

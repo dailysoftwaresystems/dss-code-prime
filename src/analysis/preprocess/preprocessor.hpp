@@ -157,7 +157,7 @@ struct DSS_EXPORT PreprocessResult {
     // error must still parse so the parse-level diagnostics surface.
     bool fatal = false;
 
-    // D-PERF-1 effectiveness metric: total front-splice token-moves in the macro
+    // D-PERF-1-PREPROCESSOR effectiveness metric: total front-splice token-moves in the macro
     // pass; the O(n^2)->O(n) pin asserts this is <= k*N. Summed across every
     // `spliceOver` in `MacroExpander::expand`; the front-consumed-deque rewrite
     // keeps it LINEAR in the token count (zero for an identity pass or a TU with

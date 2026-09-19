@@ -2454,7 +2454,7 @@ enum class AttributeEffect : std::uint8_t {
     WarnOnUse,
     WarnOnDiscard,
     Align,
-    // TF-C78 (D-CSUBSET-NOINLINE): the declared function must never be inlined
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the declared function must never be inlined
     // into a caller. Folded onto `SymbolRecord.isNoInline` (gated on the declared
     // type being a FnSig, the `isNoreturn` discipline), projected to
     // `HirNoInlineMap`, stamped onto `MirFunc.noInline`, and REFUSED by the

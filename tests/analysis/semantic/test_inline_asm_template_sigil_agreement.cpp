@@ -533,8 +533,8 @@ TEST(InlineAsmTemplateSigilAgreement, MutatingTheLanguageDeclarationMovesEveryDi
                     << b.stem << ": the SHIPPED byte(s) still have a meaning in "
                        "the template mode after the language moved them — a "
                        "second owner is answering for them, which is exactly the "
-                       "defect D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-"
-                       "A-CONFIG-OWNER names";
+                       "defect "
+                       "D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER names";
             }
         }
     }

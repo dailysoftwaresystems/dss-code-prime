@@ -1414,6 +1414,32 @@ struct DSS_EXPORT TargetCallingConvention {
     // to spill LR in the prologue. Empty for x86_64.
     std::optional<NamedRegisterRef> linkRegister;
 
+    // ── D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): THE REGISTER A
+    //    FAR FRAME ACCESS CARRIES ITS ADDRESS IN — the JSON key
+    //    `frameAddressScratch`.
+    //
+    // A frame access whose offset is beyond EVERY form the target declares for it
+    // (AArch64: the unscaled LDUR/STUR imm9 and the scaled LDR/STR imm12) is
+    // emitted as `lea A, [base + offset]` then the access at `[A + 0]`. A load
+    // into the base register's own class needs no A — its destination is dead
+    // until the load writes it. A STORE, or a load into a register that cannot
+    // address memory (the SIMD&FP file), needs a register nothing else holds at
+    // that point, in the middle of an arbitrary function body. This names it.
+    //
+    // ★ WHAT MAKES A REGISTER FIT THE ROLE IS A LOAD-TIME CONTRACT, NOT A HOPE
+    // (`TargetSchemaData::validate()`): it is a full GPR, it appears in NO
+    // allocatable list — so neither the allocator nor the rewriter's reload pool
+    // can ever hand it to a value — and it holds no ABI role live across a
+    // function body (it is not the stack, frame, indirect-result or variadic
+    // vector-count register). The callconv pass then SAVES it in any function
+    // that uses it, since a register the ABI does not list as caller-saved is
+    // one a caller may expect intact (arm64's x30, the return address).
+    //
+    // ABSENT ⇒ a far store has nowhere to put its address and is REFUSED by
+    // name; a far load into the base class still works. x86_64 declares none:
+    // its displacement is a disp32, so no frame access is ever far there.
+    std::optional<NamedRegisterRef> frameAddressScratch;
+
     // Stack-pointer register. Required for any register-machine ABI —
     // ML7 callconv lowering uses this register's ordinal as the base
     // for prologue/epilogue stack adjustments and frame_load/store
@@ -1632,7 +1658,7 @@ enum class OperandKindFilter : std::uint8_t {
                     // relative displacement, resolved at assemble time
                     // via `walker_util::BlockRelPatch`). ARM64 will
                     // use Imm19/Imm26 with different patch arithmetic
-                    // (anchored D-AS3-BLOCK-REL-IMM19/26).
+                    // (anchored D-AS3-BLOCK-REL-IMM19-26).
     LiteralIndex = 6, // `LirOperand{kind == LiteralIndex}` — the wide-
                     // literal pool index (D-CSUBSET-BITFIELD-WIDE-UNIT).
                     // The pre-FC8 walkers never matched a `LiteralIndex`
@@ -1772,6 +1798,41 @@ struct DSS_EXPORT TargetAsmConstraint {
     std::optional<std::uint16_t>     registerOrdinal;  // binds == Register
     std::optional<OperandKindFilter> operandKind;      // binds == OperandKind
 };
+
+// ── the DIRECTION an asm operand carries a value in ─────────────────────────
+//
+// `asmValueCarriage` admits a carried value per direction because the
+// references DIFFER by direction (✔MEASURED 2026-09-18: clang binds a
+// `_Complex double` to an aarch64 `"w"` OUTPUT and refuses it as an input).
+// A bit set, so one entry may admit several; the JSON spells them by name.
+enum class AsmCarriageDirection : std::uint8_t {
+    In    = 1,   // an input operand — read by the template
+    Out   = 2,   // an output operand — written by the template
+    InOut = 4,   // a `+` operand — read AND written
+};
+inline constexpr std::array<std::pair<AsmCarriageDirection, std::string_view>, 3>
+    kAsmCarriageDirectionTable{{
+        {AsmCarriageDirection::In,    "in"},
+        {AsmCarriageDirection::Out,   "out"},
+        {AsmCarriageDirection::InOut, "inout"},
+    }};
+inline constexpr std::uint8_t kAsmCarriageAllDirections = 7;
+
+[[nodiscard]] inline std::optional<AsmCarriageDirection>
+asmCarriageDirectionFromName(std::string_view s) noexcept {
+    for (auto const& [d, n] : kAsmCarriageDirectionTable) {
+        if (n == s) return d;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] inline std::string_view
+asmCarriageDirectionName(AsmCarriageDirection d) noexcept {
+    for (auto const& [k, n] : kAsmCarriageDirectionTable) {
+        if (k == d) return n;
+    }
+    return {};
+}
 
 // ── how a BARE inline-asm operand reference states its width ───────────────
 //
@@ -2024,7 +2085,7 @@ enum class EncodingSlotKind : std::uint8_t {
     // so one marker covers every such position. isSymbolBearingSlot
     // returns true (a `relocationKind` is required + emitted).
     SymbolPatchMarker = 19,
-    // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow): the
+    // D-AS3-BLOCK-REL-IMM19-26 (ARM64 conditional control-flow): the
     // SIGNED 19-bit PC-relative branch offset of the AArch64 `B.cond`
     // instruction (`B.cond <label>`), bits 5..23 of the 32-bit word
     // (the cond nibble occupies bits 0..3). BLOCK-RELATIVE, NOT
@@ -2113,14 +2174,14 @@ enum class EncodingSlotKind : std::uint8_t {
     // (incoming-stack) param at `[sp + frameSize]` when frameSize exceeds
     // the unscaled imm9 ±256. DECODE (disasm) extracts the RAW 12-bit
     // field — the round-trip oracle pins the scaled value (e.g. 24 for a
-    // 64-bit `[sp,#192]`), NOT the byte offset. A frame offset that is
-    // negative-and-out-of-imm9, OR aligned-but >32760, OR
-    // non-aligned-and-out-of-imm9 stays fail-loud (anchored
-    // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12; the shifted imm12<<12 LDR
-    // form / scratch-register address materialization is the future
-    // generalization). The LOWERING (lir_callconv.cpp) picks the mnemonic
-    // (load/store vs load_u/store_u) from the offset value — the variant
-    // selector matches operand KINDS only and cannot inspect the value.
+    // 64-bit `[sp,#192]`), NOT the byte offset. The LOWERING
+    // (lir_callconv.cpp `selectFrameMemOp`) picks the mnemonic (load/store
+    // vs load_u/store_u) from the offset value, asking each form's reach of
+    // `memoryDisplacementField` below; a frame offset NEITHER form carries —
+    // negative beyond imm9, unaligned beyond imm9, or past 4095 × the access
+    // — is emitted as an address materialized in a register and an access at
+    // offset 0 (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE), so the encoder's refusals
+    // for this slot are reached only by an instruction written in this form.
     Imm12Scaled   = 26,
     // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 (v0.0.2 FC12 deferral-2):
     // the AArch64 ADD/SUB-immediate `imm12 LSL #12` shifted-immediate
@@ -2136,10 +2197,9 @@ enum class EncodingSlotKind : std::uint8_t {
     // OWN dest as the source base — SCRATCH-FREE). A function with a
     // frame > 4095 bytes (e.g. `int big[9000]` = 36000B) needs this for
     // the prologue/epilogue `sub/add sp,#frame` AND the GEP `lea
-    // [base,#disp]`. Reaches 16 MiB (every realistic frame); a value
-    // > 0xFFFFFF stays fail-loud (A_ImmediateOperandOutOfRange — the
-    // residual D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB; a third word /
-    // MOVZ+MOVK scratch materialization is its future generalization).
+    // [base,#disp]`. Reaches 16 MiB; a value past it is carried by the
+    // `Imm32MovzMovk` three-word form below, which the variant selector
+    // routes by magnitude — this slot itself still refuses one it is handed.
     // The encoder derives the split arithmetically (lo = V & 0xFFF, hi
     // = (V>>12) & 0xFFF) and writes lo into word0's window + hi into
     // word1's window — both via the same `imm12` bit-window (the slot
@@ -2458,6 +2518,143 @@ encodingSlotKindFromName(std::string_view s) noexcept {
     return kEncodingSlotKindTable.fromName(s);
 }
 
+// ── THE DISPLACEMENT A MEMORY-OFFSET SLOT CAN CARRY ─────────────────────────
+//
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm). How wide the field
+// an encoding wires a `MemOffset` operand into is, whether it is signed, and
+// whether it holds the byte offset or the offset divided by the access size. It
+// is a fact about the SLOT KIND — the same machine fact on every variant that
+// names the slot — stated once here, for the two tiers that must agree about it:
+//   * the fixed32 walker, which range-checks the displacement it is handed and
+//     refuses one its field cannot hold;
+//   * the LIR frame chokepoint (`lir_callconv.cpp` `selectFrameMemOp`), which
+//     has to know BEFORE it emits a frame access whether the form it is about to
+//     choose can carry the offset at all — and which used to answer that with
+//     the literals `-256..255` and `4095` written beside it.
+// ⚠ Two copies of these numbers are two answers to one question that can drift
+// apart; a chokepoint whose idea of the reach is wider than the encoder's hands
+// the encoder an offset it refuses, and one whose idea is narrower emits a
+// longer sequence than the machine needed. `fixed32.cpp` pins its bit windows to
+// this table with `static_assert`s, so the width can live in only one place.
+//
+// ⓘ EXHAUSTIVE AND WITHOUT A `default:`, like `slotShapeFor`: a new slot kind
+// re-triggers `-Werror=switch` here and has to be classified on purpose. A slot
+// that carries no byte displacement (a register field, an immediate, a
+// relocation placeholder, a block-relative branch field) answers nullopt.
+struct MemoryDisplacementField {
+    std::uint8_t bits           = 0;      // the field's width
+    bool         isSigned       = false;  // two's complement vs unsigned
+    bool         scaledByAccess = false;  // the field holds offset / access bytes
+};
+
+[[nodiscard]] constexpr std::optional<MemoryDisplacementField>
+memoryDisplacementField(EncodingSlotKind s) noexcept {
+    switch (s) {
+        // AArch64 unscaled LDUR/STUR: a signed 9-bit byte offset.
+        case EncodingSlotKind::Imm9:
+            return MemoryDisplacementField{9, true, false};
+        // AArch64 ADD-immediate (the single-word frame `lea`): unsigned 12-bit.
+        case EncodingSlotKind::Imm12:
+            return MemoryDisplacementField{12, false, false};
+        // AArch64 unsigned-offset LDR/STR: unsigned 12-bit, SCALED by the access.
+        case EncodingSlotKind::Imm12Scaled:
+            return MemoryDisplacementField{12, false, true};
+        // The shifted-imm12 ADD/SUB word pair: 12 low + 12 high = 24 bits.
+        case EncodingSlotKind::Imm12HiLo24:
+            return MemoryDisplacementField{24, false, false};
+        // The MOVZ/MOVK three-word form: the non-negative int32 range.
+        case EncodingSlotKind::Imm32MovzMovk:
+            return MemoryDisplacementField{31, false, false};
+        // The base+index `lea`, which has no displacement field at all.
+        case EncodingSlotKind::MemOffsetZero:
+            return MemoryDisplacementField{0, false, false};
+        // x86 ModR/M and SIB displacements: a signed 32-bit field.
+        case EncodingSlotKind::Disp32:
+        case EncodingSlotKind::Disp32Mem:
+        case EncodingSlotKind::AbsoluteDisp32Mem:
+            return MemoryDisplacementField{32, true, false};
+        case EncodingSlotKind::ModRmReg:
+        case EncodingSlotKind::ModRmRm:
+        case EncodingSlotKind::Imm32:
+        case EncodingSlotKind::Rd:
+        case EncodingSlotKind::Rn:
+        case EncodingSlotKind::Rm:
+        case EncodingSlotKind::Imm26:
+        case EncodingSlotKind::ModRmRmMem:
+        case EncodingSlotKind::MemBaseScale:
+        case EncodingSlotKind::SibIndex:
+        case EncodingSlotKind::RipRelDisp32:
+        case EncodingSlotKind::CondCodeNibble:
+        case EncodingSlotKind::BlockRel32:
+        case EncodingSlotKind::Imm16:
+        case EncodingSlotKind::MemBaseNoScale:
+        case EncodingSlotKind::SymbolPatchMarker:
+        case EncodingSlotKind::Imm19:
+        case EncodingSlotKind::Imm8:
+        case EncodingSlotKind::Ra:
+        case EncodingSlotKind::OpcodePlusReg:
+        case EncodingSlotKind::Imm64:
+        case EncodingSlotKind::MemRelocDisp32:
+        case EncodingSlotKind::Imm16Inverted:
+        case EncodingSlotKind::Imm16Bytes:
+        case EncodingSlotKind::Imm14:
+            return std::nullopt;
+    }
+    return std::nullopt;  // unreachable; satisfies non-exhaustive-switch rules
+}
+
+// The inclusive byte-offset range, and the modulus, a displacement field
+// encodes at an access of `accessBytes` bytes. A scaled field's reach grows
+// with the access and admits only its multiples; an unscaled one ignores it.
+struct MemoryDisplacementRange {
+    std::int64_t  min        = 0;
+    std::int64_t  max        = 0;
+    std::uint32_t multipleOf = 1;
+};
+
+[[nodiscard]] constexpr MemoryDisplacementRange
+memoryDisplacementRange(MemoryDisplacementField f,
+                        std::uint32_t accessBytes) noexcept {
+    std::int64_t lo = 0;
+    std::int64_t hi = 0;
+    if (f.bits > 0) {
+        if (f.isSigned) {
+            lo = -(std::int64_t{1} << (f.bits - 1));
+            hi = (std::int64_t{1} << (f.bits - 1)) - 1;
+        } else {
+            hi = (std::int64_t{1} << f.bits) - 1;
+        }
+    }
+    if (!f.scaledByAccess) return MemoryDisplacementRange{lo, hi, 1u};
+    std::uint32_t const scale = accessBytes == 0 ? 1u : accessBytes;
+    return MemoryDisplacementRange{lo * scale, hi * scale, scale};
+}
+
+// Whether `offset` is a displacement the field can carry at that access size.
+[[nodiscard]] constexpr bool
+memoryDisplacementFits(MemoryDisplacementField f, std::int64_t offset,
+                       std::uint32_t accessBytes) noexcept {
+    auto const r = memoryDisplacementRange(f, accessBytes);
+    if (offset < r.min || offset > r.max) return false;
+    auto const magnitude =
+        static_cast<std::uint64_t>(offset < 0 ? -offset : offset);
+    return magnitude % r.multipleOf == 0;
+}
+
+// The scaled field's fit agrees with what the arm64 twins DECLARE (the guards
+// `immMax: 32760, immMultipleOf: 8` on `load_u`'s width-64 variant): one field,
+// read two ways, must give one answer.
+static_assert(memoryDisplacementFits(MemoryDisplacementField{12, false, true},
+                                     32760, 8));
+static_assert(!memoryDisplacementFits(MemoryDisplacementField{12, false, true},
+                                      32768, 8));
+static_assert(!memoryDisplacementFits(MemoryDisplacementField{12, false, true},
+                                      260, 8));
+static_assert(memoryDisplacementFits(MemoryDisplacementField{9, true, false},
+                                     -256, 8));
+static_assert(!memoryDisplacementFits(MemoryDisplacementField{9, true, false},
+                                      256, 8));
+
 // One per-variant byte-emission template (plan 13 §2.5). The walker
 // reads this and emits: optional REX prefix (with W/R/B bits derived
 // from the wired registers' `hwEncoding`), opcode bytes, optional
@@ -2676,7 +2873,7 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::SibIndex:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
-        // D-AS3-BLOCK-REL-IMM19/26: Imm19 (ARM64 B.cond displacement) is
+        // D-AS3-BLOCK-REL-IMM19-26: Imm19 (ARM64 B.cond displacement) is
         // block-relative like BlockRel32 / the intra-function Imm26 use —
         // resolved at assemble time, no linker relocation. (Imm26 itself
         // stays symbol-bearing above for the BL/`call` form; the encoder
@@ -3121,6 +3318,58 @@ struct DSS_EXPORT TargetEncodingVariant {
     // goes in the emitted bytes.
     std::vector<TargetEncodingWire>    wires;
 };
+
+// ── THE VALUE AXES OF A VARIANT GUARD, AS ONE PREDICATE ─────────────────────
+//
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm). `negValue`,
+// `immMin`, `immMax` and `immMultipleOf` are four axes of ONE question — does
+// this variant carry this value? — and two tiers ask it: the encoders' shared
+// matcher (`walker_util::variantMatchesInst`), about an instruction it was
+// handed, and the LIR frame chokepoint, about an access it has not emitted yet
+// (it must know whether a form reaches an offset before it chooses the form).
+// Both call these two functions, so the chokepoint cannot believe a variant
+// matches that the encoder then rejects, or the reverse.
+//
+// The magnitude the axes read from a signed value: its absolute value when it
+// lies on the half of the value line the variant routes — the strictly
+// negative half for a `negValue` variant, the non-negative half otherwise —
+// and nullopt when it lies on the other half.
+[[nodiscard]] constexpr std::optional<std::uint32_t>
+variantValueMagnitude(bool negValue, std::int64_t value) noexcept {
+    if (negValue) {
+        if (value >= 0) return std::nullopt;
+        return static_cast<std::uint32_t>(-value);
+    }
+    if (value < 0) return std::nullopt;
+    return static_cast<std::uint32_t>(value);
+}
+
+// Whether the variant's value axes admit a value whose magnitude, on the
+// variant's own sign half, is `magnitude` (nullopt: the value is absent, or on
+// the other half). A variant declaring no value axis admits every value.
+[[nodiscard]] inline bool
+variantValueAxesAdmit(TargetEncodingVariant const& v,
+                      std::optional<std::uint32_t> magnitude) noexcept {
+    // A negValue variant is ALWAYS sign-gated (it must reject a non-negative
+    // operand even with no immMin/immMax bound), so the magnitude is consulted
+    // whenever the sign axis is on OR any value bound is declared.
+    if (!v.negValue && !v.immMin.has_value() && !v.immMax.has_value()
+        && !v.immMultipleOf.has_value()) {
+        return true;
+    }
+    if (!magnitude.has_value()) return false;  // wrong sign / no value operand
+    if (v.immMin.has_value() && *magnitude < *v.immMin) return false;
+    if (v.immMax.has_value() && *magnitude > *v.immMax) return false;
+    // [[D-ASM-ARM64-LDR-TO-LDUR-CONVENIENCE-ALIAS-REFUSED]]: the DIVISIBILITY
+    // half of the same question. `immMin`/`immMax` bound an INTERVAL; a scaled
+    // field encodes `magnitude / N` and so carries only the MULTIPLES inside
+    // one. `validate()` refuses a modulus of 0 or 1, so the division is always
+    // meaningful.
+    if (v.immMultipleOf.has_value() && (*magnitude % *v.immMultipleOf) != 0) {
+        return false;
+    }
+    return true;
+}
 
 // The full encoding facet on a `TargetOpcodeInfo`. Carries the shape
 // discriminator (closed enum, plan 13 §2.4 shape-keyed dispatch) and
@@ -4422,6 +4671,91 @@ struct DSS_EXPORT TargetOpcodeInfo {
     }
 };
 
+// ─────────────────────────────────────────────────────────────────────
+// [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]
+// WHAT A LINKER MAY BUILD — AND CLOBBER — TO CARRY A BRANCH PAST ITS REACH
+// (the JSON `linkVeneers` block)
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ EVERY FACT IN THIS BLOCK IS THE ABI'S, AND IT IS DECLARED WHERE THE ABI
+// STATES IT: PER RELOCATION KIND, NEVER PER REGISTER NAME.
+//   * 📄 AAPCS64, "Use of IP0 and IP1 by the linker": a veneer must preserve
+//     every register except IP0, IP1 and the condition flags, and a conforming
+//     program must assume one may be inserted at ANY branch exposed to a
+//     relocation that supports long branches.
+//   * 📄 AAELF64, "Call and Jump relocations": a linker may use a veneer only
+//     for the CALL26 / JUMP26 / PLT32 relocations; "in all other cases a linker
+//     shall diagnose an error".
+// So `routableRelocations` names the branches the ABI hands a linker, and
+// `scratchRegisters` the registers it hands over with them. ⚠ `callerSaved` is
+// NOT that answer and must never be read as it: it describes CALLS, and a
+// JUMP26 sibcall is not one.
+//
+// ★★ THE BODY IS A DECLARED SEQUENCE OF THIS TARGET'S OWN OPCODES, which the
+// linker assembles through `assemble()` once per link; the scratch register
+// and the target symbol are the only operands a step may name. Each step also
+// declares the relocations its encoding carries, and the linker refuses a
+// template whose assembled relocations disagree — two declarations of one fact,
+// made to agree loudly. The body's REACH is derived from those relocations'
+// formulas, never declared a second time.
+//
+// ⓘ ABSENT means this target declares no veneer, and an out-of-reach branch is
+// refused by name. x86-64 declares none on measured grounds: neither GNU ld
+// 2.42 nor ld.lld 18.1.3 extends an out-of-range `rel32`.
+
+// Which value a veneer step's operand names. Deliberately a closed pair: a
+// step that could name ANY register could clobber one the ABI does not grant.
+enum class LinkVeneerOperandRole : std::uint8_t {
+    Scratch = 0,  // the FIRST declared scratch register
+    Target  = 1,  // the symbol (plus addend) the veneer stands in for
+};
+
+inline constexpr EnumNameTable<LinkVeneerOperandRole, 2> kLinkVeneerOperandRoleTable{{{
+    { LinkVeneerOperandRole::Scratch, "scratch" },
+    { LinkVeneerOperandRole::Target,  "target"  },
+}}};
+
+DSS_CHECK_ENUM_NAME_TABLE(kLinkVeneerOperandRoleTable);
+
+[[nodiscard]] constexpr std::string_view
+linkVeneerOperandRoleName(LinkVeneerOperandRole r) noexcept {
+    return kLinkVeneerOperandRoleTable.name(r);
+}
+[[nodiscard]] constexpr std::optional<LinkVeneerOperandRole>
+linkVeneerOperandRoleFromName(std::string_view s) noexcept {
+    return kLinkVeneerOperandRoleTable.fromName(s);
+}
+
+// One instruction of a veneer body.
+struct DSS_EXPORT LinkVeneerStep {
+    std::string                        mnemonic;          // as declared
+    std::uint16_t                      opcode = 0;        // resolved at load
+    bool                               resultIsScratch = false;  // `"result": "scratch"`
+    std::vector<LinkVeneerOperandRole> operands;
+    // The relocations this step's ENCODING must carry, in emission order —
+    // checked against the assembled template, never used to build it.
+    std::vector<std::string>           relocationNames;   // as declared
+    std::vector<RelocationKind>        relocations;       // resolved at load
+};
+
+struct DSS_EXPORT LinkVeneerBody {
+    std::string                 name;
+    std::vector<LinkVeneerStep> sequence;  // the last step, and only it, branches
+};
+
+struct DSS_EXPORT LinkVeneerVocabulary {
+    // The registers a linker-built veneer may clobber — the ABI's grant, and
+    // exactly the set the declared bodies use. A step's `"scratch"` role binds
+    // to the first.
+    std::vector<std::string>    scratchRegisterNames;
+    std::vector<std::uint16_t>  scratchRegisters;          // resolved ordinals
+    // The relocation kinds the ABI lets a linker route through a veneer.
+    std::vector<std::string>    routableRelocationNames;
+    std::vector<RelocationKind> routableRelocations;       // resolved
+    // Cheapest first: the linker elects the first whose reach covers the image.
+    std::vector<LinkVeneerBody> bodies;
+};
+
 namespace detail {
 
 // Index maps reuse the project-wide `substrate::TransparentStringMap`
@@ -4538,6 +4872,59 @@ struct DSS_EXPORT TargetSchemaData {
     // with no diagnostic at either end. An `optional` is the only value that
     // cannot be mistaken for a measurement.
     std::array<std::optional<AsmBareOperandWidth>, 5> asmBareOperandWidths{};
+
+    // ★★★ WHICH VALUES A REGISTER CLASS CARRIES **FROM MEMORY** INTO AN ASM
+    // OPERAND — BY KIND, BY SIZE AND BY DIRECTION (the `asmValueCarriage` root
+    // key; D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS,
+    // D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED).
+    //
+    // A value the pipeline keeps in memory — a struct/union, a `_Complex`, a
+    // 128-bit integer (by address from the front end on), an x87 or binary128
+    // `long double` (from the LIR tier's home model) — reaches an asm register
+    // operand only by being LOADED into it and STORED back out. WHETHER a class
+    // may do that is a property of the PROCESSOR's reference toolchains, and it
+    // differs by processor, by size and even by direction — ✔MEASURED
+    // 2026-09-18, gcc 13.3.0 and clang 18.1.3 separately, -O0 and -O2, every
+    // probe RUN and checked on the VALUE the template read or wrote:
+    //   * a 16-byte struct rides ONE aarch64 Q or x86-64 XMM register (gcc), a
+    //     32-byte one neither (both: "impossible constraint");
+    //   * a `_Complex double` rides one aarch64 Q register only as an OUTPUT
+    //     (clang) — as an input gcc hands the template another register and
+    //     clang refuses — and no x86-64 XMM register at all;
+    //   * a 2-byte struct rides an XMM register (gcc), a 1-byte one does not
+    //     (neither reference), while both ride an aarch64 `"w"` register.
+    // No rule over kinds alone, or sizes alone, reproduces that set, so it is
+    // DECLARED: each row lists, for one class, `carries` entries — the KINDS,
+    // the exact value SIZES in bytes, and optionally the DIRECTIONS (`in`,
+    // `out`, `inout`; absent = all three). A value no entry admits is REFUSED
+    // BY NAME by the asm tier, never handed to the template as its address.
+    //
+    // ★ A SIZE WIDER THAN ONE REGISTER OF THE CLASS IS A REGISTER **PAIR**: the
+    // first piece a full register, the second the remainder (an x87 value is
+    // 64 + 16 bits). It is admitted by LISTING it — gcc binds a 16-byte
+    // `__int128`, struct or `_Complex double` to one `"r"` operand as two
+    // 64-bit registers on both processors (aarch64 `%H0` names the second), and
+    // a 32-byte `_Complex long double` to one aarch64 `"w"` operand as two Q
+    // registers. An unpinned pair's two registers are the allocator's choice.
+    //
+    // ★ `stagesThrough` names the class a value is moved THROUGH when this
+    // class declares no load or store at the value's width: gcc carries a
+    // 2-byte struct into an XMM register as `movzwl` + `movd` (x86-64 SSE2 has
+    // no 16-bit XMM store), and the cross-class move is the target's own
+    // `registerClassOps` row.
+    struct AsmValueCarriageEntry {
+        std::vector<TypeKind>      kinds;
+        std::vector<std::uint32_t> bytes;
+        // `AsmCarriageDirection` bits; 0 is never stored — an entry that names
+        // no direction admits all three, and the loader writes that as 7.
+        std::uint8_t               directions = 0;
+    };
+    struct AsmValueCarriageRow {
+        TargetRegClass                     regClass{};
+        std::vector<AsmValueCarriageEntry> carries;
+        std::optional<TargetRegClass>      stagesThrough;
+    };
+    std::vector<AsmValueCarriageRow> asmValueCarriage;
 
     // The CIE's `return_address_register` — the DWARF column an unwinder
     // reads to find where this frame's return address went.
@@ -4774,6 +5161,11 @@ struct DSS_EXPORT TargetSchemaData {
     // `kind` uniqueness across rows, so this index is safe to build
     // from the same monotonic loader path the name index uses.
     std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
+
+    // What a linker may build, and clobber, to carry a branch past its reach
+    // (the JSON `linkVeneers` block — see `LinkVeneerVocabulary`). nullopt =
+    // this target declares no veneer; an out-of-reach branch is refused.
+    std::optional<LinkVeneerVocabulary> linkVeneers;
 
     // Cross-field invariants the per-field JSON parse cannot express.
     // Returns the list of problems as fully-shaped `ConfigDiagnostic`s
@@ -5053,6 +5445,38 @@ public:
         return found;
     }
 
+    // In which DIRECTIONS does register class `cls` carry a `bytes`-byte value
+    // of kind `kind` from memory into an asm operand? (`asmValueCarriage` — see
+    // `AsmValueCarriageRow`.) The union of every admitting entry's
+    // `AsmCarriageDirection` bits; 0 when no entry admits the value, and the
+    // consumer refuses by name.
+    [[nodiscard]] std::uint8_t
+    asmCarriageDirections(TargetRegClass cls, TypeKind kind,
+                          std::uint32_t bytes) const noexcept {
+        std::uint8_t dirs = 0;
+        for (auto const& row : d_.asmValueCarriage) {
+            if (row.regClass != cls) continue;
+            for (auto const& e : row.carries) {
+                bool kindOk = false;
+                for (TypeKind const k : e.kinds) kindOk = kindOk || k == kind;
+                bool sizeOk = false;
+                for (std::uint32_t const b : e.bytes) sizeOk = sizeOk || b == bytes;
+                if (kindOk && sizeOk) dirs = static_cast<std::uint8_t>(dirs | e.directions);
+            }
+        }
+        return dirs;
+    }
+
+    // The class a carried value is moved THROUGH when `cls` declares no load or
+    // store at its width (`asmValueCarriage` `stagesThrough`), or nullopt.
+    [[nodiscard]] std::optional<TargetRegClass>
+    asmCarriageStageClass(TargetRegClass cls) const noexcept {
+        for (auto const& row : d_.asmValueCarriage) {
+            if (row.regClass == cls) return row.stagesThrough;
+        }
+        return std::nullopt;
+    }
+
     // The CIE's `return_address_register` (see the field's docblock in
     // `TargetSchemaData`). Nullopt ⇒ this target declares no DWARF
     // register numbering, which every unwind-table writer treats as a
@@ -5310,6 +5734,14 @@ public:
         auto it = d_.relocationNameIndex.find(name);
         if (it == d_.relocationNameIndex.end()) return nullptr;
         return &d_.relocations[it->second];
+    }
+
+    // What a linker may build, and clobber, to carry a branch past its reach
+    // ([[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]).
+    // nullptr ⇒ this target declares no veneer and the linker refuses an
+    // out-of-reach branch by name.
+    [[nodiscard]] LinkVeneerVocabulary const* linkVeneers() const noexcept {
+        return d_.linkVeneers.has_value() ? &*d_.linkVeneers : nullptr;
     }
 
     // ── Loaders ──────────────────────────────────────────────────

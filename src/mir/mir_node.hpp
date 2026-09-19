@@ -245,7 +245,7 @@ struct MirFunc {
     // Fits the existing 4-byte _pad slot — no struct-size growth.
     SymbolBinding    binding    = SymbolBinding::Global;     // 1
     SymbolVisibility visibility = SymbolVisibility::Default; // 1
-    // TF-C78 (D-CSUBSET-NOINLINE): the source declared this function
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the source declared this function
     // `__attribute__((noinline))` — the optimizer's inliner MUST NOT splice its
     // body into any caller. Reaches here as source → SymbolRecord.isNoInline →
     // HirNoInlineMap → this bit (the `binding`/`visibility` route above, whose

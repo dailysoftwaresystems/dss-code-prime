@@ -459,7 +459,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // descriptors the preprocessor actually resolved (parent + transitive
         // `includes` closure), deduped by name. A scratch reporter: a malformed
         // descriptor is reported ONCE by the semantic read, never here.
-        // ORACLE-ALIGNED (D-PERF-2): `pp.resolvedShippedDescriptors` is now the
+        // ORACLE-ALIGNED (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION): `pp.resolvedShippedDescriptors` is now the
         // AUTHORITATIVELY-LIVE descriptor set (the preprocessor drops a splice whose
         // offset falls in an `#if 0` dead range), EQUAL to the finish() oracle's
         // `shippedLibDescriptors`. So seeding resolves EXACTLY the names the finish()

@@ -133,7 +133,7 @@ TEST(LirRegAlloc, EmptyModuleProducesNoResults) {
 
 // ── Post-fold #5 code-reviewer-#82 pin: ccIndex flow ─────────
 TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
-    // Pin the D-FF3-3 wiring: passing ccIndex=1 must be recorded
+    // Pin the D-FF3-3-RESOLVED-CC-INDEX-THREADED wiring: passing ccIndex=1 must be recorded
     // on every LirFuncAllocation. Without this pin a regression
     // that drops the threaded index back to 0 would silently
     // re-emit SysV register assignments on PE+x86_64 targets.

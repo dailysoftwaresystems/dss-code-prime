@@ -2772,7 +2772,7 @@ TEST(MirLoweringCLinkage, WeakAttributeThreadsToMirBinding) {
         << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
 }
 
-// ── TF-C78 (D-CSUBSET-NOINLINE): source → MirFunc.noInline, per FORM ──
+// ── TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): source → MirFunc.noInline, per FORM ──
 //
 // The full chain in one assertion: the `attributeSemantics.effects` `noInline`
 // verb → `SymbolRecord.isNoInline` (FnSig-gated) → `HirNoInlineMap` →

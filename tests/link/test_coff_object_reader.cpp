@@ -1229,11 +1229,20 @@ TEST(CoffForeignObject, CrossObjectComdatAnyDedupsInMerge) {
 namespace {
 
 #if defined(_WIN32)
-// The vcvars64-entered cl.exe/lib.exe environment. LOCATING it is not done here —
-// `native_probe::locateMsvcToolchain` is the single implementation, shared with the ABI
-// conformance witnesses; this struct only USES what that returns.
+// The cl.exe/lib.exe/link.exe these witnesses drive come from `native_c_probe.hpp`:
+// `native_probe::locateMsvcToolchain` finds the installation, `native_probe::msvcToolsIn`
+// hands back its tools, run under the process's ONE developer environment. Nothing in
+// this file locates or enters anything.
 //
 // A native oracle that skips on error is a broken oracle that reports success.
+//
+// ★★ THIS FILE USED TO CARRY ITS OWN `MsvcEnv`, AND IT COST MORE THAN THE WITNESSES DID. It
+// wrote a batch that CALLed vcvars64.bat in a FRESH cmd.exe for EVERY tool line — 11
+// entries per run of this file, 1.2–2.4 s each alone and 3.9–16.2 s beside a concurrent
+// build (✔MEASURED by lane mig, 2026-09-19) — and that is how this entry timed out at 315 s
+// in a gate run beside another lane's build, with no witness changed. Every `env.run(...)`
+// below is still the same command line, in the same directory, asserted the same way; the
+// environment it runs in is entered once, and `MsvcDeveloperEnvironment` pins that count.
 //
 // The lookup used to be written TWICE — once here, once inside `native_c_probe.hpp`'s
 // `findCompiler` — and the copies disagreed about the same machine: this one reddened
@@ -1244,22 +1253,6 @@ namespace {
 // NOTE the asymmetry with the ABI witnesses: the SECOND stage here was always correct.
 // `env.run(...)` is consumed by `ASSERT_TRUE(...)` at every call site, so a failing
 // `cl`/`lib` already went red. Only the lookup conflated, and only the lookup changed.
-struct MsvcEnv {
-    std::filesystem::path vcvars;
-    std::filesystem::path work;
-    [[nodiscard]] bool run(std::string const& cmdline) const {
-        auto const bat = work / "dss_c53_build.bat";
-        {
-            std::ofstream b{bat};
-            b << "@echo off\r\n"
-              << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
-              << "cd /d \"" << work.string() << "\"\r\n"
-              << cmdline << " >nul 2>&1\r\n";
-        }
-        std::string const sys = "\"\"" + bat.string() + "\"\"";
-        return std::system(sys.c_str()) == 0;
-    }
-};
 
 [[nodiscard]] std::vector<std::uint8_t> readFile(std::filesystem::path const& p) {
     std::ifstream in{p, std::ios::binary};
@@ -1268,6 +1261,49 @@ struct MsvcEnv {
 #endif  // _WIN32
 
 }  // namespace
+
+// -- THE COST PIN: the developer environment is entered ONCE per process -----
+//
+// COUNTED, NEVER TIMED. This file's native witnesses cost the number of vcvars64.bat
+// entries they made (11 per run) times a price that load multiplies; this pins the NUMBER,
+// which no machine's speed can move. Two tool lines in two different scratch directories
+// stand in for two cases, so a helper that re-entered per LINE (the old `MsvcEnv`) or per
+// DIRECTORY is red here whichever cases ran before it and in whatever order — the tallies
+// belong to the process. vswhere is counted too: it used to start once per case.
+TEST(MsvcDeveloperEnvironment, IsEnteredOncePerProcessAndHandedToEveryTool) {
+#if !defined(_WIN32)
+    GTEST_SKIP() << "enters vcvars64.bat; Windows only";
+#else
+    test_support::ScratchDir first{test_support::Location::InsideRepo, "coff-foreign"};
+    test_support::ScratchDir second{test_support::Location::InsideRepo, "coff-foreign"};
+    auto const msvc = native_probe::locateMsvcToolchain(first.path());
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const again = native_probe::locateMsvcToolchain(second.path());
+    ASSERT_TRUE(again.ok()) << again.describe();
+
+    auto const inFirst = native_probe::msvcToolsIn(msvc, first.path());
+    ASSERT_TRUE(inFirst.ready()) << inFirst.describe();
+    auto const inSecond = native_probe::msvcToolsIn(again, second.path());
+    ASSERT_TRUE(inSecond.ready()) << inSecond.describe();
+    { std::ofstream f{first.path() / "once.c"};  f << "int once_first(void) { return 1; }\n"; }
+    { std::ofstream f{second.path() / "once.c"}; f << "int once_second(void) { return 2; }\n"; }
+    ASSERT_TRUE(inFirst.run("cl /nologo /c once.c")) << "cl must compile in the FIRST directory";
+    ASSERT_TRUE(inSecond.run("cl /nologo /c once.c")) << "cl must compile in the SECOND directory";
+    // Each line ran where it was sent — the `cd /d` the old batch spelled on its own line.
+    EXPECT_TRUE(std::filesystem::exists(first.path() / "once.obj"));
+    EXPECT_TRUE(std::filesystem::exists(second.path() / "once.obj"));
+
+    EXPECT_EQ(native_probe::msvcEnvironmentEntries(), 1u)
+        << "this process entered vcvars64.bat " << native_probe::msvcEnvironmentEntries()
+        << " time(s). Each entry is a fresh cmd.exe running the whole VS developer-prompt "
+           "setup, the cost that timed this suite out under load; ONE per process is the "
+           "design, and 0 would mean the tally no longer sees the entry at all.";
+    EXPECT_EQ(native_probe::msvcToolchainQueries(), 1u)
+        << "this process asked vswhere " << native_probe::msvcToolchainQueries()
+        << " time(s); an installation cannot move mid-process, so ONE is the design.";
+#endif
+}
 
 // -- Structural: a real `cl /c /GS-` `.obj` reconstructs (Gate 1 + Gate 2) ---
 TEST(CoffForeignObjectNative, RealClObjReconstructsFunctionAndSkipsMetadata) {
@@ -1279,7 +1315,8 @@ TEST(CoffForeignObjectNative, RealClObjReconstructsFunctionAndSkipsMetadata) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1320,7 +1357,8 @@ TEST(CoffForeignObjectNative, RealGyObjComdatFunctionAssociativeMetadataSkipped)
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
     auto loaded = loadShipped("x86_64", "pe64-x86_64-windows");
     ASSERT_TRUE(loaded.target && loaded.format);
 
@@ -1359,7 +1397,8 @@ TEST(CoffForeignObjectNative, SingleClObjStaticLinkExitsFortyTwo) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     { std::ofstream f{dir / "foo.c"}; f << "int foo(void){ return 42; }\n"; }
     ASSERT_TRUE(env.run("cl /nologo /c /GS- foo.c")) << "cl must compile foo.c";
@@ -1401,7 +1440,8 @@ TEST(CoffForeignObjectNative, MultiMemberComdatDedupExitsFortyTwo) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     // a.c + b.c each define a DISTINCT function AND the SAME selectany COMDAT
     // datum `shared_w` (ANY selection). main references BOTH functions -> BOTH
@@ -1603,7 +1643,8 @@ TEST(CoffForeignObjectNative, ClObjLibMemberCallingAStaticHelperExitsFortyTwo) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     { std::ofstream f{dir / "loc.c"};
       f << "static int helper(int x){ return x + 7; }\n"
@@ -2933,7 +2974,8 @@ TEST(CoffWeakExternalNative, ForeignLinkerConsumesADssReEmittedWeakAlias) {
     auto const msvc = native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     // 1. gcc writes a weak alias of a strong definition.
     std::filesystem::path src;

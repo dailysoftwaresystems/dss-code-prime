@@ -230,8 +230,7 @@ TEST(RunBinaryDeadlineClock, TheDeadlineIsSpentOnTheClockThatStopsWithTheMachine
     EXPECT_LT(absDiff(awake, uptimeRaw), kReadJitter)
         << "the deadline clock is not CLOCK_UPTIME_RAW. On Darwin that means it "
            "counts host suspend, and every spawned child is billed for time the "
-           "machine spent asleep (D-TEST-RUN-HARNESS-DEADLINE-COUNTS-HOST-"
-           "SUSPEND)";
+           "machine spent asleep";
     // WHAT steady_clock ACTUALLY IS HERE, asked of the kernel rather than
     // assumed — an earlier reading of this defect named CLOCK_MONOTONIC when
     // libc++ on this host in fact resolves to CLOCK_MONOTONIC_RAW (the two are

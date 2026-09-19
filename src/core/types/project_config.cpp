@@ -224,7 +224,7 @@ bool readOptionalStringArray(json const& doc,
     return true;
 }
 
-// D-FFI-DECLARED-IMPORT-NAME — read the OPTIONAL `resolveLibraries` array.
+// Declared import names — read the OPTIONAL `resolveLibraries` array.
 //
 // Mirrors `readOptionalStringArray` (absent ⇒ empty + no error; a
 // present-but-empty `[]` is allowed; a non-array fails loud) but each ENTRY
@@ -827,14 +827,14 @@ parseProjectConfig(std::string_view jsonText,
     // CLI `-I` / `--define` / `--resolve-library`). Absent ⇒ empty (no error);
     // present must be an array of non-empty strings (else C_MalformedJson) —
     // `resolveLibraries` additionally accepts the extended
-    // `{"path", "importName"}` object entry (D-FFI-DECLARED-IMPORT-NAME); a
+    // `{"path", "importName"}` object entry (a declared import name); a
     // present-but-empty `[]` is allowed. `Program::compileProject` threads
     // these (merge/append) onto the Program's current state.
     if (!readOptionalStringArray(doc, "includes", pc.includes, sourceLabel, rep))
         return std::nullopt;
     if (!readOptionalStringArray(doc, "defines", pc.defines, sourceLabel, rep))
         return std::nullopt;
-    // D-FFI-DECLARED-IMPORT-NAME: `resolveLibraries` entries are a plain path
+    // Declared import names: `resolveLibraries` entries are a plain path
     // STRING *or* an extended `{"path", "importName"}` object — its own reader.
     if (!readOptionalResolveLibraries(doc, "resolveLibraries",
                                       pc.resolveLibraries, sourceLabel, rep))

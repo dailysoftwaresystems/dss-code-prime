@@ -920,11 +920,27 @@ struct DSS_EXPORT AssemblyConfig {
     // validates the name against `targetRegClassFromName` (and refuses the
     // inoperable "none"), so an unknown class is a load error naming the
     // closed set — never a letter that silently scopes to nothing.
+    //
+    // ★★★ `selectsPairSecond` — THE LETTER NAMES THE **SECOND** REGISTER OF A
+    // TWO-REGISTER OPERAND, NOT A VIEW OF THE FIRST (the optional
+    // `"selects": "pairSecond"` key; D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED).
+    // ✔MEASURED 2026-09-18, aarch64-linux-gnu-gcc 13.3.0, -O0 and -O2, run
+    // under qemu: on a 16-byte value bound to `"r"` (a register PAIR), `%0`
+    // names the first x-register and `%H0` the second — `mov %0, %1; mov %H0,
+    // %2` writes both halves of an `__int128`. It is still a letter with a
+    // width (the second register's view), scoped exactly as its dialect
+    // scopes every letter (the aarch64 document scopes `H` to `gpr`: gcc
+    // refuses `%H` on a `"w"`-bound pair), so every rule above applies to
+    // it; what differs is only WHICH register it selects, and an operand
+    // bound to ONE register refuses it by name rather than answering with
+    // the first. The x86-64 AT&T dialect declares none: gcc gives the
+    // template no name for the second register there.
     struct AsmTemplateModifier {
         std::string   letter;      // as declared ("w")
         std::string   lexeme;      // sigil + letter, composed by the loader ("%w")
         std::uint32_t widthBits = 0;
         std::string   registerClass;  // "" = width-only; else a TargetRegClass name
+        bool          selectsPairSecond = false;
     };
     std::vector<AsmTemplateModifier> templateModifiers;
 

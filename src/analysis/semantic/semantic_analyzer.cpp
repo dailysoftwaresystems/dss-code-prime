@@ -6641,7 +6641,7 @@ void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
                 break;
             }
             case AttributeEffect::NoInline:
-                // TF-C78 (D-CSUBSET-NOINLINE): a pure marker — no argument, no
+                // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): a pure marker — no argument, no
                 // message, no MAX-fold. Applied to the declarator's symbol below
                 // gated on the declared type being a FnSig.
                 out.noInline = true;
@@ -8221,7 +8221,7 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     return scope;
 }
 
-// c33 (D-CSUBSET-TENTATIVE-DEFINITION): does this declarator-carrier node carry an
+// c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): does this declarator-carrier node carry an
 // INITIALIZER (`= expr` / `= {…}`)? A file-scope object declaration WITHOUT one is
 // a TENTATIVE DEFINITION (C 6.9.2) — mergeable with a later real definition and
 // with other tentatives; WITH one it is a REAL definition (collides with a second
@@ -8541,7 +8541,7 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
-// D-CSUBSET-TENTATIVE-DEFINITION: resolve a same-scope REDECLARATION (`prior`
+// D-CSUBSET-TENTATIVE-DEFINITION-MERGE: resolve a same-scope REDECLARATION (`prior`
 // already bound `name` in `bindScope`; `newId` is the new symbol). A redeclaration
 // MERGES instead of colliding when both sides name the SAME entity (both functions
 // OR both objects) and are NOT both definitions. A NON-DEFINING declaration — a bare
@@ -8589,7 +8589,7 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
                                  NodeId nameNode, SymbolId prior, SymbolId newId,
                                  bool newNonDef) {
     auto& priorRec = s.symbols.at(prior);
-    // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a file-scope tentative object definition
+    // c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): a file-scope tentative object definition
     // is non-defining for merge purposes too — so tentative+def merges (the def
     // wins) and tentative+tentative merges (one survives). Two REAL definitions stay
     // a collision: both lack `isTentativeDefinition` ⇒ `bothDefinitions` ⇒ S0002.
@@ -9249,7 +9249,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             && !declarationIsNonDefining(cfg, tree, node, decl,
                                                          dNode, atFileScope))
                             bindScope = fileScopeOf(s, tree, current);
-                        // c33 (D-CSUBSET-TENTATIVE-DEFINITION): a FILE-SCOPE object
+                        // c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): a FILE-SCOPE object
                         // declaration with NO initializer is a TENTATIVE DEFINITION
                         // (C 6.9.2) — it announces an object whose single definition
                         // merges across all its tentative declarations + at most one
@@ -9546,7 +9546,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                      dNode, atFileScope)
                             && effectiveKind != DeclarationKind::Function;
                         rec.isExternDeclaration = isExtern;
-                        // c33 (D-CSUBSET-TENTATIVE-DEFINITION): record the tentative
+                        // c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): record the tentative
                         // state so a LATER redeclaration sees THIS symbol (as `prior`)
                         // as non-defining (`priorNonDef`) and merges — a tentative is
                         // mergeable with both a real definition and another tentative.
@@ -12213,7 +12213,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 ksc.name, declarationKindName(eff), allowed);
                             s.reporter.report(std::move(d));
                         }
-                        // TF-C78 (D-CSUBSET-NOINLINE): mark a FUNCTION symbol the
+                        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): mark a FUNCTION symbol the
                         // declaration annotated `noinline`. Gated on `isFnSig` —
                         // the `isNoreturn` discipline one block below — so a
                         // `__attribute__((noinline)) int x;` is INERT rather than
@@ -21112,7 +21112,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     }
                 }
             }
-            // TF-C78 (D-CSUBSET-NOINLINE): the same OR-merge, for the same
+            // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the same OR-merge, for the same
             // reason and in the same pre-type-gate position. `noinline` is
             // routinely spelled on the PROTOTYPE only (sqlite's SQLITE_NOINLINE
             // sits on both, but a header/impl split that annotates just the

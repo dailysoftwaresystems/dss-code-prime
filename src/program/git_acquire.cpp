@@ -130,20 +130,65 @@ std::vector<std::string> gitCloneArgv(std::string const&  gitExe,
     return {gitExe, "clone", "--", url, dest.string()};
 }
 
+namespace {
+
+// The two options that NAME the checkout's repository, so git never discovers
+// one by walking up from the working directory — see the ★★★ note over the
+// argv functions in the header
+// ([[D-DEPS-GIT-RUNNER-DISCOVERS-AN-ENCLOSING-REPOSITORY-AND-FORCE-CHECKS-IT-OUT]]).
+// `<checkout>/.git` is where `gitCloneArgv` puts it; nothing else may answer.
+[[nodiscard]] std::vector<std::string>
+repositoryNamedFor(std::string const& gitExe, fs::path const& checkoutDir) {
+    return {gitExe, "--git-dir=" + (checkoutDir / ".git").string(),
+            "--work-tree=" + checkoutDir.string()};
+}
+
+} // namespace
+
+std::vector<std::string> const& gitRepositoryLocalVariables() {
+    // git's `local_repo_env`, in git's own order, minus `GIT_CONFIG_PARAMETERS`
+    // and `GIT_CONFIG_COUNT` (see the ★★★ note in the header for both halves).
+    static std::vector<std::string> const kVariables{
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    };
+    return kVariables;
+}
+
 std::vector<std::string> gitFetchArgv(std::string const& gitExe,
+                                      fs::path const&    checkoutDir,
                                       std::string const& ref) {
-    return {gitExe, "fetch", "--force", "--tags", "origin",
-            ref.empty() ? std::string{"HEAD"} : ref};
+    auto argv = repositoryNamedFor(gitExe, checkoutDir);
+    argv.insert(argv.end(), {"fetch", "--force", "--tags", "origin",
+                             ref.empty() ? std::string{"HEAD"} : ref});
+    return argv;
 }
 
 std::vector<std::string> gitCheckoutArgv(std::string const& gitExe,
+                                         fs::path const&    checkoutDir,
                                          std::string const& rev) {
-    return {gitExe, "checkout", "--detach", "--force", rev};
+    auto argv = repositoryNamedFor(gitExe, checkoutDir);
+    argv.insert(argv.end(), {"checkout", "--detach", "--force", rev});
+    return argv;
 }
 
 std::vector<std::string> gitRevParseArgv(std::string const& gitExe,
+                                         fs::path const&    checkoutDir,
                                          std::string const& rev) {
-    return {gitExe, "rev-parse", rev};
+    auto argv = repositoryNamedFor(gitExe, checkoutDir);
+    argv.insert(argv.end(), {"rev-parse", rev});
+    return argv;
 }
 
 std::optional<fs::path> SystemGitRunner::resolve_() {
@@ -170,8 +215,11 @@ GitCommandResult SystemGitRunner::clone(std::string const& url,
     }
     // cwd is INHERITED (the empty sentinel) rather than `dest`'s parent: `dest`
     // does not exist yet, and it is passed to git as an absolute path anyway.
+    // Every spawn in this runner withholds git's repository variables — see the
+    // ★★★ note over `gitRepositoryLocalVariables` in the header.
     return fromSpawn(
-        substrate::spawnAndWaitInherit(gitCloneArgv(exe->string(), url, dest)),
+        substrate::spawnAndWaitInherit(gitCloneArgv(exe->string(), url, dest),
+                                       /*cwd=*/{}, gitRepositoryLocalVariables()),
         "git clone of '" + url + "'");
 }
 
@@ -184,8 +232,9 @@ GitCommandResult SystemGitRunner::fetch(fs::path const&    checkoutDir,
         return out;
     }
     return fromSpawn(
-        substrate::spawnAndWaitInherit(gitFetchArgv(exe->string(), ref),
-                                       checkoutDir),
+        substrate::spawnAndWaitInherit(
+            gitFetchArgv(exe->string(), checkoutDir, ref), checkoutDir,
+            gitRepositoryLocalVariables()),
         "git fetch in '" + core::genericSpelling(checkoutDir) + "'");
 }
 
@@ -198,8 +247,9 @@ GitCommandResult SystemGitRunner::checkout(fs::path const&    checkoutDir,
         return out;
     }
     return fromSpawn(
-        substrate::spawnAndWaitInherit(gitCheckoutArgv(exe->string(), rev),
-                                       checkoutDir),
+        substrate::spawnAndWaitInherit(
+            gitCheckoutArgv(exe->string(), checkoutDir, rev), checkoutDir,
+            gitRepositoryLocalVariables()),
         "git checkout of '" + rev + "'");
 }
 
@@ -227,8 +277,9 @@ GitCommandResult SystemGitRunner::revParse(fs::path const&    checkoutDir,
     // for the measured deadlock a pipe would have re-imported into a facility
     // that has no timeout to escape it with.
     out = fromSpawn(
-        substrate::spawnAndWaitRedirectStdout(gitRevParseArgv(exe->string(), rev),
-                                              checkoutDir, slot.file),
+        substrate::spawnAndWaitRedirectStdout(
+            gitRevParseArgv(exe->string(), checkoutDir, rev), checkoutDir,
+            slot.file, gitRepositoryLocalVariables()),
         "git rev-parse " + rev + " in '" + core::genericSpelling(checkoutDir) + "'");
     if (!out.ok) return out;
 

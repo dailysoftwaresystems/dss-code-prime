@@ -150,7 +150,7 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // CRIT-3 belt-and-suspenders: a BitInt-typed RESULT whose operand values did NOT
     // fold to bit-precise (a shape C's typing rules never produce) must NEVER take the
     // un-wrapped int64 path — fail loud rather than silently mis-fold.
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): I128/U128 join the belt for the SAME
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): I128/U128 join the belt for the SAME
     // reason and it is the load-bearing half of this cycle's const-fold closure.
     // The int64 path below wraps at 64 bits; a 128-bit-typed result reaching it
     // would be silently mod-2^64 — green in every existing test, wrong in the
@@ -295,7 +295,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
         v.value = std::move(*bv);
         return ok(std::move(v));
     }
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): a cast TO a 128-bit integer routes
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a cast TO a 128-bit integer routes
     // through the SAME wrap-aware bignum. Without this arm `(__uint128_t)X`
     // produced a plain u64/i64 literal merely TAGGED `core = U128`: the value had
     // already been truncated to 64 bits, so every later fold read a wrapped

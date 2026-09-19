@@ -264,6 +264,11 @@ struct DSS_EXPORT AsmResolvedRegister {
     // table is two chances to disagree about which row a spelling matched.
     bool          hasImmediate = false;
     std::int64_t  value        = 0;
+    // ★ THE SECOND REGISTER OF A TWO-REGISTER OPERAND, RELAYED FROM
+    // `AsmOperandBinding::pairReg` through the SAME lookup, for the reason the
+    // immediate payload above is: one lookup, one row. Invalid for every
+    // one-register binding and for every physical spelling written in the text.
+    LirReg        pairReg      = InvalidLirReg;
     // ★★★ THE SPELLING THAT WAS LOOKED UP IS A REGISTER **NAME** THE TARGET
     // DECLARES UNSPELLABLE WITHOUT A LANE ARRANGEMENT
     // ([[D-ASM-ARM64-BARE-V-REGISTER-ACCEPTED-IN-A-SCALAR-MEMORY-OPERAND]]).
@@ -378,6 +383,16 @@ struct DSS_EXPORT AsmOperandBinding {
     // value" instead of silently encoding zero.
     bool          hasImmediate = false;
     std::int64_t  value        = 0;
+    // ★★★ THE SECOND REGISTER OF A **TWO-REGISTER** OPERAND
+    // (D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED). A value twice a
+    // register wide (`__int128` on `"r"`) is carried in two registers: `reg`
+    // holds the first half, this the second. The template reaches it only
+    // through a modifier its dialect declares with `"selects": "pairSecond"`
+    // (aarch64 `%H0`); a dialect that declares none (x86-64 AT&T — gcc gives
+    // the template no such name) still binds it, because the caller loads and
+    // stores it around the template either way. `InvalidLirReg` on every
+    // one-register binding, and the engine refuses the selector there by name.
+    LirReg        pairReg      = InvalidLirReg;
 };
 
 // ★★★ ONE `asm goto` LABEL TARGET, AS THE EMBEDDING LANGUAGE BOUND IT (GNU

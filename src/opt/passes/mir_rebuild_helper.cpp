@@ -318,7 +318,7 @@ void MirFunctionRebuilder::rebuildFunction(MirFuncId oldFn) {
     // The shared rebuild-time accumulator (see the header). RAII so every
     // return path — including the fail-loud ones — still accounts its time.
     RebuildTimerScope const rebuildTimer_;
-    // TF-C78 (D-CSUBSET-NOINLINE): `funcNoInline` rides along with
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): `funcNoInline` rides along with
     // binding/visibility. ★ THIS IS THE LOAD-BEARING PROPAGATION SITE — this
     // rebuilder is the shared substrate under EVERY optimizer pass, so a flag
     // dropped here is erased by the very release pipeline it exists to

@@ -271,7 +271,7 @@ TEST(FfiCHeaderParser, RejectDiagnosticCarriesSourceSpan) {
 }
 
 TEST(FfiCHeaderParser, ErrorStructCarriesLocationOnRejection) {
-    // D-FF2-2: HeaderReadError::at carries (buffer, span) of the
+    // D-FF2-2-HEADERREADERROR-SOURCE-LOCATION: HeaderReadError::at carries (buffer, span) of the
     // offending decl so programmatic consumers (LSP, test pins,
     // future introspection) can locate the error without re-parsing
     // reporter prose. Mirrors the (buffer, span) that emitAndReturn
@@ -421,7 +421,7 @@ TEST(FfiCHeaderParser, ErrorStructLocationAbsentEvenWithPriorCallError) {
 }
 
 TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
-    // D-FF2-2 negative: entry-point errors (EmptyImportLibrary /
+    // D-FF2-2-HEADERREADERROR-SOURCE-LOCATION negative: entry-point errors (EmptyImportLibrary /
     // FileOpenFailed / GrammarLoadFailed) have
     // no single decl locus — `at` stays default-constructed
     // (buffer.valid() == false). Programmatic consumers must check

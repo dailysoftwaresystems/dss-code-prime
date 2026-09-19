@@ -239,7 +239,7 @@ public:
         TypeId const sig = reinternType(srcInterner_, src_.funcSignature(f),
                                         host_, typeRemap(),
                                         plan_.compositeIdentity);
-        // TF-C78 (D-CSUBSET-NOINLINE): carried across the cross-CU merge — the
+        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): carried across the cross-CU merge — the
         // merged module is what the optimizer then runs on, so a flag dropped
         // here would let a `noinline` function from CU A be inlined after link.
         // TF-C81 (D-CSUBSET-ALWAYSINLINE): carried across the same boundary —

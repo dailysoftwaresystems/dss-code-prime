@@ -4,10 +4,13 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "link/linker.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <span>
+#include <string>
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate.
 //
@@ -54,6 +57,8 @@ namespace dss::linker {
 //   * `K_ImageWriteParentMissing`  — parent dir absent
 //   * `K_ImageWriteOpenFailed`     — no filename component, temp-create
 //                                    failbit, or the commit rename failed
+//                                    (after any HOLDER of the target had
+//                                    `detail::kCommitHolderWait` to let go)
 //   * `K_ImageWriteShort`          — write() mid-stream failbit
 //   * `K_ImageWriteCloseFailed`    — close() flush failbit
 //
@@ -118,7 +123,9 @@ writeImage(LinkedImage const&             image,
 //   * `K_ImageWriteParentMissing`  -- parent dir absent
 //   * `K_ImageWriteOpenFailed`     -- path has no filename component, the
 //                                     staging temp could not be created, or
-//                                     the commit rename failed
+//                                     the commit rename failed (see
+//                                     `detail::commitReplacing` for what a
+//                                     holder of the target gets first)
 //   * `K_ImageWriteShort`          -- write() mid-stream failbit
 //   * `K_ImageWriteCloseFailed`    -- close() flush failbit
 //
@@ -147,7 +154,11 @@ writeImage(LinkedImage const&             image,
 // at the host umask rather than inheriting the old file's; and if `path` is a
 // symlink or hard link the rename replaces THAT NAME rather than writing
 // through to the shared file. Reasoning and the cross-platform determination
-// are in writer.cpp at the fix site.
+// are in writer.cpp at the fix site. The rename itself is
+// `detail::commitReplacing` below: on POSIX exactly `rename(2)`; on Windows a
+// POSIX-semantics replace, so another process holding the previous artifact
+// open (✔ sharing delete; 🧠 a real-time scan) no longer refuses the commit
+// ([[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]).
 // Does NOT gate on `bytes.empty()` (that is a LinkedImage-specific contract --
 // an empty write is a legitimate raw-bytes request) and never sets the POSIX
 // execute bit (an archive / relocatable output is not executable; `writeImage`
@@ -214,6 +225,89 @@ inline constexpr std::uint32_t kMaxClaimAttempts = 1000;
 // Caller owns the returned stream and must `std::fclose` it.
 [[nodiscard]] DSS_EXPORT std::FILE*
 createExclusiveBinary(std::filesystem::path const& p);
+
+// ── THE COMMIT: rename a staged file over its target ───────────────────────
+//
+// [[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]
+//
+// ONE OWNER for every writer in this tree that stages a file and renames it
+// over a target — `writeBytes` above, the runtime object cache's store and the
+// dependency lockfile — so the Windows half is decided once. Measurements and
+// reasoning are at the definition in writer.cpp; the contract is:
+//
+//   * POSIX: exactly `rename(2)`. It never consults another open descriptor,
+//     so it has no holder to wait for and `patience` is never asked.
+//   * Windows: the replace is made with POSIX SEMANTICS, so a holder that
+//     shares delete access — ✔ as the one that failed the round-7 gate does
+//     (🧠 a real-time scan) — cannot refuse it: the name moves to the staged file
+//     and the holder keeps reading the one it opened. A volume that cannot do
+//     that (measured: a WSL 9P share answers 87) gets the classic replace. A
+//     holder that STILL refuses — one withholding FILE_SHARE_DELETE, a running
+//     program's image, any holder under the classic replace — is offered to
+//     `patience` after every refusal; the commit tries again while it answers
+//     true and refuses, naming the holders, when it answers false. A refusal
+//     waiting cannot change (a directory, a read-only target, anything else)
+//     is returned at once, without asking.
+//
+// `staged` is never deleted here: on a refusal it is still on disk and its
+// cleanup belongs to the caller, who owns its name.
+
+// How long the production commit keeps asking a HOLDER to let go before it
+// refuses — the patience of the overload that takes none. THE SINGLE SOURCE OF
+// TRUTH: a test that exercises the cap reads it, never copies it.
+//
+// A CAP, NOT A RESERVATION: the commit returns the moment a replace lands, so a
+// healthy build never spends it; only a holder that never lets go does, and
+// then the refusal names it. SIZED FROM THE MEASUREMENT, per the sizing rule the
+// test tier's `test_wait_budget.hpp` states for every budget in this repository:
+//   * ✔MEASURED 2026-09-18, the holder that failed the gate, with nothing else
+//     touching the file and the CPU at 99–100% on 32 threads (four other lanes
+//     building): 68 holds in 20000 classic replaces, 2.9 ms min, 10.8 ms
+//     median, 21.5 ms max. 2000 ms is ~93x the longest — room for a host far
+//     slower than the one that measured it, which is the host a cap is for.
+//   * 📄 and it is the one allowance a reference makes for this kind of
+//     holder: LLVM's `sys::fs::rename` retries opening its SOURCE 200 x
+//     `Sleep(10)` "to defeat badly behaved file system scanners"
+//     (`llvm/lib/Support/Windows/Path.inc`, 19.1.5).
+//     No reference's OUTPUT commit waits at all (✔MEASURED: MSVC link.exe,
+//     lld-link and GNU ld each return within 342 ms against a 3 s holder), so
+//     waiting is where DSS goes past the bar, never below it.
+// ⚠ Under POSIX semantics that measured holder never reaches this wait; it
+// governs the holders that do — see the list above.
+inline constexpr std::chrono::milliseconds kCommitHolderWait{2000};
+
+// What one commit did.
+struct CommitOutcome {
+    // The staged file now IS the target.
+    bool committed = false;
+    // How many attempts a HOLDER refused before the outcome — every one of them
+    // was offered to the patience. Always 0 on POSIX.
+    std::uint32_t holderRefusals = 0;
+    // Empty when committed. Otherwise the whole cause, ready to follow a
+    // writer's own "could not rename … over '<target>': " — the host error BY
+    // NUMBER first (the text is localized; the number is what a report can be
+    // searched on), then how often and for how long a holder refused, which
+    // replace semantics were in force, and who holds the file.
+    std::string refusal;
+};
+
+// Asked after each refusal the commit attributes to a HOLDER, with the running
+// count (1-based): `true` = try again (having waited as long as the caller
+// wants), `false` = give up and refuse.
+using CommitPatience = std::function<bool(std::uint32_t holderRefusals)>;
+
+// The production commit: waits up to `kCommitHolderWait` for a holder.
+[[nodiscard]] DSS_EXPORT CommitOutcome
+commitReplacing(std::filesystem::path const& staged,
+                std::filesystem::path const& target);
+
+// The same commit with the caller's patience — the seam a test uses to release
+// its holder at the moment the commit has been refused, by handshake rather
+// than by a timer.
+[[nodiscard]] DSS_EXPORT CommitOutcome
+commitReplacing(std::filesystem::path const& staged,
+                std::filesystem::path const& target,
+                CommitPatience const&        patience);
 
 } // namespace detail
 

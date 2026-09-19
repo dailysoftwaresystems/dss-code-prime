@@ -47,6 +47,25 @@ using dss::test_support::uncSpellingOf;
 
 namespace {
 constexpr int kRepeats = 30;
+
+// ★★★ WHERE EVERY ARM'S TREE LIVES: under the directory the TEST runs in — ctest runs it in
+// its own build directory — never under the host's TEMP.
+//
+// THE COST OF A ROOTED UNC ARM IS ITS ANCESTORS, NOT ITS HEADER. Every rooted resolution
+// enumerates the directories the path passes through (`rootPrefixOf` asks whether each
+// ancestor is listed in its parent; `matchComponent` then lists every component — in full
+// under the case-insensitive policy), and a UNC path makes each listing an SMB round trip
+// through `\\localhost\C$`. The two UNC-NAME arms resolve 120 paths. With the tree under
+// `%TEMP%`, one of those ancestors was the host's TEMP itself: 11,907 entries on the host
+// that measured it, about 2,960 there two weeks earlier, so the pin's cost tracked the
+// host's history rather than anything it tests. ✔MEASURED by lane mig, 2026-09-19: the
+// same binary with a small TEMP ran 6.99 s -> 1.51 s alone and 274.13 s -> 15.08 s beside a
+// concurrent build, and this entry timed out at 315 s in a gate run beside another lane's
+// build. Under the test's own directory every ancestor is the build tree's, small and fixed
+// by the repository. Every arm is unchanged — same header, same spellings, same repeats,
+// same assertions; only WHERE the tree sits moved, and
+// `RootedIncludeFixture.EveryArmWalksATreeUnderTheTestsOwnDirectory` pins that.
+constexpr dss::test_support::Location kFixtureRoot = dss::test_support::Location::InsideRepo;
 }  // namespace
 
 // ── The predicate itself, on every host ────────────────────────────────────
@@ -84,8 +103,7 @@ class RootedIncludeResolution
     : public ::testing::TestWithParam<HeaderNameMatching> {};
 
 TEST_P(RootedIncludeResolution, ALocalAbsoluteHeaderResolvesEveryTime) {
-    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
-                                     "rooted-include"};
+    dss::test_support::ScratchDir sd{kFixtureRoot, "rooted-include"};
     fs::path const header = sd.path() / "rooted_probe.h";
     { std::ofstream f{header}; f << "int rooted_marker = 7;\n"; }
     ASSERT_TRUE(fs::exists(header));
@@ -100,8 +118,7 @@ TEST_P(RootedIncludeResolution, ALocalAbsoluteHeaderResolvesEveryTime) {
 }
 
 TEST_P(RootedIncludeResolution, AUncHeaderResolvesInBothSpellingsEveryTime) {
-    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
-                                     "rooted-include"};
+    dss::test_support::ScratchDir sd{kFixtureRoot, "rooted-include"};
     fs::path const header = sd.path() / "rooted_probe.h";
     { std::ofstream f{header}; f << "int rooted_marker = 7;\n"; }
     ASSERT_TRUE(fs::exists(header));
@@ -161,8 +178,7 @@ TEST_P(RootedIncludeResolution, AUncHeaderResolvesInBothSpellingsEveryTime) {
 // caller's provenance. `absoluteKeepingRoot` is pinned separately in
 // `test_path_identity.cpp`.
 TEST_P(RootedIncludeResolution, AUncSearchDirectoryResolvesARelativeHeader) {
-    dss::test_support::ScratchDir sd{dss::test_support::Location::Temp,
-                                     "rooted-include-dir"};
+    dss::test_support::ScratchDir sd{kFixtureRoot, "rooted-include-dir"};
     fs::path const header = sd.path() / "rooted_probe.h";
     { std::ofstream f{header}; f << "int rooted_marker = 7;\n"; }
     ASSERT_TRUE(fs::exists(header));
@@ -195,6 +211,40 @@ TEST_P(RootedIncludeResolution, AUncSearchDirectoryResolvesARelativeHeader) {
                    "asked for: " << r.path.string();
         }
     }
+}
+
+// ── THE COST PIN: the tree every arm walks is the TEST's own ───────────────
+//
+// COUNTED, NEVER TIMED. What made this file slow under load was WHICH directories a rooted
+// UNC resolution lists, so this pins that — by count, on the fixture every arm builds
+// (`kFixtureRoot`): among the header's ancestors the test's own directory appears EXACTLY
+// once and the host's TEMP ZERO times. A tree moved back under TEMP, by a flipped constant
+// or a changed helper, is red here on every host — including the ones where the UNC arms
+// skip — and whatever the machine's speed.
+TEST(RootedIncludeFixture, EveryArmWalksATreeUnderTheTestsOwnDirectory) {
+    fs::path const own =
+        dss::test_support::canonicalizeLikeTheProduct(fs::current_path());
+    fs::path const temp =
+        dss::test_support::canonicalizeLikeTheProduct(fs::temp_directory_path());
+    dss::test_support::ScratchDir sd{kFixtureRoot, "rooted-include"};
+    fs::path const header = sd.path() / "rooted_probe.h";
+
+    int ownSeen  = 0;
+    int tempSeen = 0;
+    for (fs::path a = header.parent_path(); !a.empty(); a = a.parent_path()) {
+        if (a == own) ++ownSeen;
+        if (a == temp) ++tempSeen;
+        if (a == a.parent_path()) break;
+    }
+    EXPECT_EQ(ownSeen, 1)
+        << "the header every arm resolves, `" << header.string()
+        << "`, does not sit under the directory this test runs in, `" << own.string()
+        << "`: the tree is back under a directory the test does not control, and a rooted "
+           "UNC resolution lists every one of its ancestors over SMB.";
+    EXPECT_EQ(tempSeen, 0)
+        << "the host TEMP `" << temp.string() << "` is an ancestor of `" << header.string()
+        << "`: every rooted UNC resolution lists it over SMB, so this file's cost tracks how "
+           "much the host has left in TEMP again rather than anything it tests.";
 }
 
 INSTANTIATE_TEST_SUITE_P(BothMatchingPolicies, RootedIncludeResolution,

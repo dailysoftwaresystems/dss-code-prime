@@ -3637,7 +3637,7 @@
       }
     },
     {
-      "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). D-CSUBSET-LOCAL-INT-CODEGEN closure (step 13.3b, 2026-06-02): encoding row added so c's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",
+      "$comment": "Integer two's-complement negate — REX.W 0xF7 /3 (NEG r/m64). The local-int codegen closure (plan step 13.3b, 2026-06-02): encoding row added so c's unary minus (`-x`) lowers through the assembler. requires2Address mirrors the sub/mul shape — the operand IS the destination, the 2-addr legalize pass guarantees this invariant before encoding (insert a mov when result != operand[0] at MIR→LIR time). modrmRegExt=3 fills ModR/M.reg with the /3 opcode-extension digit.",
       "mnemonic": "neg", "result": "value",
       "requires2Address": true,
       "minOperands": 1, "maxOperands": 1,
@@ -4406,7 +4406,7 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR.",
+      "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR. ★★ KEYED AT 32, 64 AND 128 BITS — THE SAME BYTES THREE TIMES, AND THE KEYS ARE THE FACT, NOT THE BYTES (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS). MOVAPS copies the whole register, so it moves an F32, an F64 and a 128-bit value alike; the ONE width-agnostic variant it used to carry made the asm engine's width-honesty gate (`variantHonorsDeclaredWidth`: an agnostic variant is honest only at the width-default, 64) refuse every 128-bit use — ✔MEASURED at `7df54cc1`, `__asm__ volatile(\"movaps %%xmm1, %%xmm2\" ::: \"xmm2\")` refused A_AsmTextUnsupported ('movaps' operates on 128 bits … declares no width-keyed encoding variant), the registers written in the text deriving 128 — and a 16-byte value carried into an `\"x\"` operand (gcc and clang carry an `__int128` there) had no instruction that could name it. The loader refuses a keyed variant beside an agnostic one of the same `operandKinds` (D-CSUBSET-32BIT-ALU-FORMS), so every width an FPR value occupies is keyed: 32 (F32 plumbing), 64 (F64 and the width-default), 128 (a full-register spill or carried value). Sub-32 plumbing promotes to 32 (`lirWidthFlagsForBits`), so no narrower key is needed.",
       "mnemonic": "movaps", "result": "value",
       "hasSideEffects": false,
       "minOperands": 1, "maxOperands": 1,
@@ -4416,7 +4416,19 @@
         "registerClass": "fpr",
         "variants": [
           {
-            "guard":      { "operandKinds": ["reg"] },
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
             "template":   { "opcode": [15, 40] },
             "resultSlot": "modrm.reg",
             "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
@@ -4676,6 +4688,23 @@
   "asmBareOperandWidths": [
     { "class": "gpr", "derivation": "operandType" },
     { "class": "fpr", "derivation": "operandType" }
+  ],
+  "$asmValueCarriageComment": "★★★ WHICH VALUES A REGISTER CLASS CARRIES FROM MEMORY INTO AN INLINE-ASM OPERAND — BY KIND, SIZE AND DIRECTION (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS, D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED). A struct/union, a `_Complex`, a 128-bit integer or an x87 `long double` lives in MEMORY in this pipeline, so a register-constrained operand of one is LOADED into its register(s) before the template and STORED back after — never handed its address. Each entry lists the exact SIZES a reference carries; a size wider than one register is a register PAIR whose second register AT&T gives the template no name for (a `+` operand's high half survives an `addq $1, %0`); the x87 value is 64 + 16 bits. ✔MEASURED 2026-09-18, gcc 13.3.0 and clang 18.1.3 SEPARATELY, -O0 and -O2, every probe RUN and checked on the VALUE: on `\"r\"` both carry a 1/2/4/8-byte struct and an 8-byte `_Complex float` in ONE register and a 16-byte `__int128`/`unsigned __int128` in TWO, gcc also a 16-byte struct or union, a `_Complex double` and an x87 `long double` in TWO; on `\"x\"` both carry a `__int128` and a 4/8-byte struct in ONE XMM register, gcc a 2-byte struct (through a general register — `movzwl` + `movd`, hence `stagesThrough`) and a 16-byte struct or union, clang an 8-byte `_Complex float`. A `_Complex double` rides ONE XMM register as an OUTPUT (clang, all 16 bytes, both -O0 and -O2; a first probe's run crash, rc 139, was clang's own aligned `movaps` spill of the result to a misaligned stack slot, read in its assembly) — as an input or `+` neither reference carries it (gcc \"inconsistent operand constraints\", clang \"indirect register inputs\"). NOT carried, by any reference: a 1-byte struct on `\"x\"` (gcc \"inconsistent operand constraints\", clang \"couldn't allocate\"), a struct of 3/6/12/24/32 bytes on either class (\"impossible constraint in 'asm'\"), an x87 `long double` on `\"x\"`, and any `_BitInt` (the front end's refusal). ⚠ ADJUDICATED, NOT MEASURED-AWAY: a 32-byte `_Complex long double` OUTPUT on `\"r\"` is ACCEPTED by clang 18.1.3 and exits 42 on a probe that reads only its first 8 bytes — clang binds ONE 64-bit register and fills the other 24 bytes from an uninitialized stack temporary (read in its -O0 and -O2 assembly: `movq %rax, -40(%rsp)` then two `fldt` of the 32-byte temp). That is a TRUNCATION, not a carriage — the acceptance is achieved by dropping three quarters of the object, the silent-wrong-program class the 2026-08-28 ruling refuses to buy with acceptance — and gcc refuses it (\"unsupported operand size for extended register\"), so it is not listed and DSS refuses it by name. A PINNED single-register letter (`\"a\"`, `\"d\"`, …) with a two-register value is refused by BOTH (gcc \"inconsistent operand constraints\", clang \"couldn't allocate\"), so no pinned entry appears here.",
+  "asmValueCarriage": [
+    { "class": "gpr",
+      "carries": [
+        { "kinds": ["Struct", "Union"], "bytes": [1, 2, 4, 8, 16] },
+        { "kinds": ["Complex"], "bytes": [8, 16] },
+        { "kinds": ["I128", "U128"], "bytes": [16] },
+        { "kinds": ["F80"], "bytes": [10] }
+      ] },
+    { "class": "fpr", "stagesThrough": "gpr",
+      "carries": [
+        { "kinds": ["Struct", "Union"], "bytes": [2, 4, 8, 16] },
+        { "kinds": ["Complex"], "bytes": [8] },
+        { "kinds": ["Complex"], "bytes": [16], "directions": ["out"] },
+        { "kinds": ["I128", "U128"], "bytes": [16] }
+      ] }
   ],
   "$registerClassOpsComment": "FC2 Part B: per-register-class move/load/store mnemonics. A class WITHOUT a row uses the universal defaults (mov/load/store) iff it is gpr — the substrate default class; every other row-less class FAILS LOUD at the consumer (a GPR mov against an XMM hwEncoding assembles to valid-looking-but-WRONG bytes — the class-blind silent miscompile this table kills). fpr's `store` landed with its FIRST consumer (trigger discipline honored): the ms_x64 prologue saved-reg spill — Win64 callee-saved xmm6-15 + regalloc's callee-saved-first policy put the first FPR vreg in a callee-saved xmm, and classOpHandle failed loud L_RequiredLirOpcodeMissing until movsd_store was declared. ★★ THE TWO PARAGRAPHS ABOVE AND BELOW WERE TWO SEPARATE `$registerClassOpsComment` KEYS IN THIS DOCUMENT UNTIL 2026-08-30 (cycle P46), AND JSON LET THAT PASS: every mainstream parser -- nlohmann, which is what DSS uses -- keeps the LAST occurrence and drops the first WITHOUT A DIAGNOSTIC. So the paragraph above this sentence was dead text the loader never saw, while being the one a reader meets first. Merged rather than deleted, because neither subsumes the other: the first says WHY this table exists and what a missing row costs, the second says what a ROW MEANS now that its subject is an ordered pair. D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC. D-TARGET-NO-CROSS-CLASS-MOVE-VERB: a row's subject is an ORDERED PAIR of register classes — `class` is the SOURCE and the optional `to` is the DESTINATION, `to` omitted meaning the DIAGONAL (a copy within one file), which is what every row written before this key existed meant. ★ ONE TABLE, not two: `move` answers the single question *how does this machine copy a bit pattern from class A to class B?* for every (A,B) including A == B. A separate cross-class list would have given that one question two homes and a reader would have found whichever their grep reached first. ⚠ `load`/`store` are DIAGONAL-ONLY and the loader refuses them off it: they relate a class to MEMORY, and memory is not a register class. ⚠ AND THE MOVE'S OWN ENCODING IS CHECKED AGAINST THE PAIR IT IS FILED UNDER — filing the integer `mov` as the gpr->fpr move would load clean and re-create D-LIR-ASM-OPERAND-MOVE-IS-CLASS-BLIND (a register NUMBER written into the wrong file, silently), so `validate()` refuses a move whose declared banks disagree with its row.",
 "registerClassOps": [

@@ -94,11 +94,37 @@ dss_add_test(NAME link/test_macho_dylib_writer   SOURCES test_macho_dylib_writer
 
 # D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
 dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
-# [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]: the veneer pass that
-# gives an out-of-range call somewhere nearer to aim. Reaches the REAL
-# +/-128 MiB edge, because the pass reads function SIZES rather than
-# instruction bytes -- one ~200 MiB zero-filled allocation, no encoding.
+# [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] (parent:
+# [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]): the branch-veneer pass.
+# The PLANNER is pinned at the REAL +/-128 MiB reach through its size-only model
+# (no filler bytes at all); the full-path arms share one 144 MiB zero-filled
+# filler, because only they must see the assembled body's real bytes.
 dss_add_test(NAME link/test_branch_veneers SOURCES test_branch_veneers.cpp)
+# ... its COMPLEXITY pin: the placement's own counted work, doubled input,
+# never a clock (lane `cr`'s pattern).
+dss_add_test(NAME link/test_branch_veneers_complexity SOURCES test_branch_veneers_complexity.cpp)
+# ... and the two declarations it reads, each against its owner: the target's
+# `linkVeneers` vocabulary (loader, shape rules, assembled body) and every
+# writer's `importCallStubLayout` (against the image that writer emits).
+dss_add_test(NAME link/test_link_veneer_vocabulary SOURCES test_link_veneer_vocabulary.cpp)
+# The vocabulary arms mutate the shipped arm64 JSON in memory
+# (`mutate_target_schema.hpp`, an nlohmann consumer).
+target_link_libraries(dss_link_test_link_veneer_vocabulary
+    PRIVATE nlohmann_json::nlohmann_json)
+# ... and its REAL-SCALE end-to-end: the subject row's own shape at 144 MiB
+# through the real linker (entry trampoline, stub layout, veneer pass, writer)
+# for ELF exec, PIE and Mach-O, and RUN where an arm64 runner exists. OPT-IN,
+# because each arm holds ~600 MB and hashes the image for its build-id; the
+# default gate pins the same decisions through the planner's size-only model.
+# Enable with -DDSS_REAL_SCALE_TESTS=ON; the entry carries the `real-scale`
+# label so a gate that does enable it can still select or exclude it by name.
+option(DSS_REAL_SCALE_TESTS "Register the opt-in real-scale link tests" OFF)
+if(DSS_REAL_SCALE_TESTS)
+    dss_add_test(NAME link/test_branch_veneers_real_scale
+                 SOURCES test_branch_veneers_real_scale.cpp)
+    set_tests_properties(link/test_branch_veneers_real_scale
+                         PROPERTIES LABELS real-scale)
+endif()
 
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
@@ -673,3 +699,16 @@ dss_add_test(NAME link/test_elf_static_va_chain_document_boundaries
              SOURCES test_elf_static_va_chain_document_boundaries.cpp)
 target_link_libraries(dss_link_test_elf_static_va_chain_document_boundaries
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE: the
+# commit that renames a staged artifact over its target, with ONE MORE OPEN
+# HANDLE on the file — the holder the round-7 gate met (a real-time scan of the
+# previous artifact, measured sharing delete) must never refuse it; a holder
+# that lets go is waited out; a holder that never lets go is refused loudly, by
+# name. Every holder is released by the TEST (an explicit call, or the commit's
+# own patience callback as a handshake), never by a timer, and the one duration
+# involved is READ from `linker::detail::kCommitHolderWait`. Runs on every leg:
+# on POSIX, `rename(2)` never consults an open descriptor, and the pins assert
+# exactly that instead of skipping.
+dss_add_test(NAME link/test_link_writer_commit_holder
+             SOURCES test_link_writer_commit_holder.cpp)

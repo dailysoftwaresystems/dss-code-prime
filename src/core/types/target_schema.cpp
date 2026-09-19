@@ -833,7 +833,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // AArch64 MOVZ) plus MemBase + MemOffset (the unscaled
             // LDUR/STUR memory form: base reg → Rn, MemOffset → the
             // signed Imm9 slot, MemBase's scale validated == 1). Since
-            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow)
+            // D-AS3-BLOCK-REL-IMM19-26 (ARM64 conditional control-flow)
             // it ALSO handles BlockRef (an intra-function branch target
             // on the Imm19 [B.cond] or Imm26 [B] slot — resolved at
             // assemble time, no relocation). The remaining operand kinds
@@ -878,7 +878,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             // `RelocationKind` opaque tag; here we just check
             // presence-vs-required.
             //
-            // D-AS3-BLOCK-REL-IMM19/26 (operand-aware exemption): the
+            // D-AS3-BLOCK-REL-IMM19-26 (operand-aware exemption): the
             // Imm26 slot is DUAL-USE — symbol-bearing for the BL/`call`
             // form (a SymbolRef operand → `call26` relocation) but
             // BLOCK-relative for the `B` form (a BlockRef operand →
@@ -2464,6 +2464,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 if (cc.linkRegister.has_value()) {
                     requireNumber(i, "linkRegister", cc.linkRegister->name);
                 }
+                // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE: a function that uses the
+                // frame-address scratch SAVES it, so a frame rule names it.
+                if (cc.frameAddressScratch.has_value()) {
+                    requireNumber(i, "frameAddressScratch",
+                                  cc.frameAddressScratch->name);
+                }
                 for (auto const& cs : cc.calleeSaved) {
                     requireNumber(i, "calleeSaved", cs);
                 }
@@ -2915,6 +2921,69 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             std::span<std::string const> linkRefs{&cc.linkRegister->name, 1};
             checkRefs(i, "linkRegister", linkRefs, TargetRegClass::GPR);
         }
+        // ── D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): WHAT
+        //    MAKES A REGISTER FIT THE FRAME-ADDRESS-SCRATCH ROLE.
+        //
+        // The callconv pass writes an ADDRESS into this register in the middle
+        // of an arbitrary function body, at a point it knows nothing else about,
+        // and relies on nothing living there. That reliance is only sound if the
+        // register can NEVER hold a value, so it is judged here, where the
+        // config is judged, rather than trusted at the emit site:
+        //   * a full GPR (`checkRefs`): the address is an integer, and a view or
+        //     an alias would leave its parent allocatable;
+        //   * in NO allocatable list: `buildFreeLists` and the rewriter's reload
+        //     pool are built from exactly `kAllocatablePoolLists`, so a register
+        //     absent from all six is one no value is ever assigned to. ✔MEASURED
+        //     why this is the rule and not a formality: arm64's AAPCS64 IP0
+        //     (`x16`) is the textbook scratch, but both arm64 conventions list it
+        //     as `callerSaved`, and DSS allocates it to live values — naming it
+        //     here would clobber one on the first far store;
+        //   * none of the roles that ARE live across a body: the stack pointer,
+        //     the frame pointer (a VLA function's fixed-frame base), the
+        //     indirect-result register (the incoming sret pointer) and the
+        //     variadic vector-count register.
+        // ⓘ The LINK register is deliberately allowed: it is dead in a body once
+        // the prologue has saved it, and the callconv pass saves this register
+        // in every function that uses it.
+        if (cc.frameAddressScratch.has_value()) {
+            std::string const& scratchName = cc.frameAddressScratch->name;
+            std::span<std::string const> scratchRefs{&scratchName, 1};
+            checkRefs(i, "frameAddressScratch", scratchRefs, TargetRegClass::GPR);
+            for (std::size_t li = 0; li < kAllocatablePoolLists.size(); ++li) {
+                auto const& list = cc.*(kAllocatablePoolLists[li]);
+                if (std::find(list.begin(), list.end(), scratchName) == list.end())
+                    continue;
+                fail(std::format("/callingConventions/{}/frameAddressScratch", i),
+                     std::format("calling convention '{}' names '{}' as its "
+                                 "frameAddressScratch, but '{}' is in `{}` — an "
+                                 "allocatable list, so the register allocator may "
+                                 "hand it to a live value and the first frame "
+                                 "access that materializes an address in it would "
+                                 "overwrite that value with no diagnostic. The "
+                                 "frame-address scratch must be a register no "
+                                 "allocatable list names",
+                                 cc.name, scratchName, scratchName,
+                                 kAllocatablePoolListNames[li]));
+            }
+            using RoleRef = std::optional<TargetCallingConvention::NamedRegisterRef>;
+            std::array<std::pair<char const*, RoleRef const*>, 4> const liveRoles{{
+                {"stackPointer",           &cc.stackPointer},
+                {"framePointer",           &cc.framePointer},
+                {"indirectResultRegister", &cc.indirectResultRegister},
+                {"variadicVectorCountReg", &cc.variadicVectorCountReg},
+            }};
+            for (auto const& [role, ref] : liveRoles) {
+                if (!ref->has_value()) continue;
+                if ((*ref)->ordinal != cc.frameAddressScratch->ordinal) continue;
+                fail(std::format("/callingConventions/{}/frameAddressScratch", i),
+                     std::format("calling convention '{}' names '{}' as its "
+                                 "frameAddressScratch, but '{}' is also its `{}` — "
+                                 "a register that holds a live value across a "
+                                 "function body, which a frame access would "
+                                 "overwrite with an address",
+                                 cc.name, scratchName, scratchName, role));
+            }
+        }
         if (cc.stackPointer.has_value()) {
             std::span<std::string const> spRefs{&cc.stackPointer->name, 1};
             checkRefs(i, "stackPointer", spRefs, TargetRegClass::GPR);
@@ -3047,6 +3116,134 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                      std::format("callingConvention '{}': register-machine ABI "
                                  "requires a stackPointer register declaration",
                                  cc.name));
+            }
+        }
+    }
+
+    // ── linkVeneers ([[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]])
+    //
+    // The SHAPE a veneer body must have, checked on the RESOLVED fields so a
+    // schema built in memory is held to the same rules as a loaded one. Every
+    // rule is a consequence of the ABI sentence the block encodes — a veneer
+    // may change only the scratch registers and the flags, and must hand
+    // control to its target:
+    //   * no step may be a CALL (it writes the link register, which the veneer
+    //     must preserve — the branch that reached it set it);
+    //   * the last step, and only the last, is a terminator, and it is an
+    //     INDIRECT branch — the one shape whose destination comes from an
+    //     operand the body itself computed;
+    //   * a step writes a result iff its opcode produces one, and then only
+    //     into the scratch register;
+    //   * no step may carry an implicit-register constraint, which is how an
+    //     opcode declares that it writes registers it does not name.
+    if (linkVeneers.has_value()) {
+        auto const& lv = *linkVeneers;
+        if (lv.scratchRegisters.empty()) {
+            fail("/linkVeneers/scratchRegisters",
+                 "'linkVeneers' grants no scratch register — a veneer body needs "
+                 "one to hold its destination, and the grant must be stated");
+        }
+        for (std::size_t i = 0; i < lv.scratchRegisters.size(); ++i) {
+            auto const ord = lv.scratchRegisters[i];
+            if (ord >= registers.size()
+                || registers[ord].regClass != TargetRegClass::GPR) {
+                fail(std::format("/linkVeneers/scratchRegisters/{}", i),
+                     "a veneer scratch register must be a declared GENERAL-PURPOSE "
+                     "register");
+            }
+        }
+        if (lv.routableRelocations.empty()) {
+            fail("/linkVeneers/routableRelocations",
+                 "'linkVeneers' routes no relocation — a vocabulary that names no "
+                 "branch it may carry would read as a capability while granting "
+                 "none");
+        }
+        for (std::size_t i = 0; i < lv.routableRelocations.size(); ++i) {
+            if (!relocationKindIndex.contains(lv.routableRelocations[i])) {
+                fail(std::format("/linkVeneers/routableRelocations/{}", i),
+                     "a routable relocation must name a declared relocation row");
+            }
+        }
+        if (lv.bodies.empty()) {
+            fail("/linkVeneers/bodies",
+                 "'linkVeneers' declares no body — nothing to build a veneer from");
+        }
+        for (std::size_t b = 0; b < lv.bodies.size(); ++b) {
+            auto const& body = lv.bodies[b];
+            std::string const bp = std::format("/linkVeneers/bodies/{}", b);
+            if (body.name.empty()) fail(bp + "/name", "a veneer body needs a name");
+            for (std::size_t o = 0; o < b; ++o) {
+                if (!body.name.empty() && lv.bodies[o].name == body.name) {
+                    fail(bp + "/name",
+                         std::format("veneer body name '{}' is declared twice",
+                                     body.name));
+                }
+            }
+            if (body.sequence.empty()) {
+                fail(bp + "/sequence", "a veneer body's sequence is empty");
+            }
+            for (std::size_t s = 0; s < body.sequence.size(); ++s) {
+                auto const& step = body.sequence[s];
+                std::string const sp = std::format("{}/sequence/{}", bp, s);
+                if (step.opcode == 0 || step.opcode >= opcodes.size()) {
+                    fail(sp + "/mnemonic",
+                         std::format("veneer step '{}' names no declared opcode",
+                                     step.mnemonic));
+                    continue;
+                }
+                auto const& op = opcodes[step.opcode];
+                bool const last = s + 1 == body.sequence.size();
+                if (op.isCall) {
+                    fail(sp + "/mnemonic",
+                         std::format("veneer step '{}' is a CALL — it would "
+                                     "overwrite the return address the branch into "
+                                     "the veneer established, and a veneer may change "
+                                     "only the scratch registers the ABI grants a "
+                                     "linker, and the flags", step.mnemonic));
+                }
+                if (last && op.terminatorKind != TargetTerminatorKind::IndirectBr) {
+                    fail(sp + "/mnemonic",
+                         std::format("a veneer body must END in an indirect "
+                                     "branch (terminatorKind: indirect-br); '{}' "
+                                     "is not one", step.mnemonic));
+                }
+                if (!last && op.isTerminator()) {
+                    fail(sp + "/mnemonic",
+                         std::format("veneer step '{}' is a terminator before the "
+                                     "body's last step", step.mnemonic));
+                }
+                if (step.resultIsScratch != (op.result != TargetResultRule::None)) {
+                    fail(sp + "/result",
+                         step.resultIsScratch
+                             ? std::format("veneer step '{}' names a result but its "
+                                           "opcode produces none", step.mnemonic)
+                             : std::format("veneer step '{}' produces a value and "
+                                           "must write it to the scratch register "
+                                           "(\"result\": \"scratch\")",
+                                           step.mnemonic));
+                }
+                if (step.operands.size() < op.minOperands
+                    || step.operands.size() > op.maxOperands) {
+                    fail(sp + "/operands",
+                         std::format("veneer step '{}' names {} operand(s); its "
+                                     "opcode takes {}..{}", step.mnemonic,
+                                     step.operands.size(), op.minOperands,
+                                     op.maxOperands));
+                }
+                if (op.implicitRegisters.has_value()) {
+                    fail(sp + "/mnemonic",
+                         std::format("veneer step '{}' carries an implicit-register "
+                                     "constraint — it writes registers it does not "
+                                     "name, which the ABI does not grant a veneer",
+                                     step.mnemonic));
+                }
+                for (std::size_t r = 0; r < step.relocations.size(); ++r) {
+                    if (!relocationKindIndex.contains(step.relocations[r])) {
+                        fail(std::format("{}/relocations/{}", sp, r),
+                             "a veneer step's relocation must name a declared "
+                             "relocation row");
+                    }
+                }
             }
         }
     }

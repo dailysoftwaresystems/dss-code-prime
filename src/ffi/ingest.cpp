@@ -807,7 +807,7 @@ ingest(std::span<IngestionSource const> sources,
     struct TaggedRow {
         ImportSurface row;
         bool fromBinary = false;
-        // D-FFI-DECLARED-IMPORT-NAME: the caller-STATED runtime identity of the
+        // The DECLARED import name: the caller-STATED runtime identity of the
         // SOURCE this row came from (`BinaryLibrarySource::declaredImportName`;
         // empty == not stated). Carried per-row because the precedence is
         // decided per-EXTERN below, where only the matched row is in scope --
@@ -830,7 +830,7 @@ ingest(std::span<IngestionSource const> sources,
         // the reader's label intact (the pre-c162 header/JSON behavior).
         // This is precedence LEVEL 3 -- levels 1 + 2 are ranked over it at
         // the per-extern decision site below.
-        std::string declaredImportName;  // D-FFI-DECLARED-IMPORT-NAME (level 1)
+        std::string declaredImportName;  // the declared import name (level 1)
         if (fromBinary) {
             auto const& bin = std::get<BinaryLibrarySource>(src);
             if (!bin.importName.empty()) {
@@ -975,7 +975,7 @@ ingest(std::span<IngestionSource const> sources,
         // name is emitted from `ExternImport.libraryPath` == this field, so
         // this expression IS the artifact's runtime dependency.
         //
-        //   1. D-FFI-DECLARED-IMPORT-NAME — the caller STATED the identity.
+        //   1. A DECLARED import name — the caller STATED the identity.
         //      Beats everything: the file we READ may be a cross-compilation
         //      STAND-IN whose own embedded identity names a path that will not
         //      exist on the target (a MacPorts `/opt/local/...` LC_ID_DYLIB
@@ -1046,7 +1046,7 @@ ingest(std::span<IngestionSource const> sources,
             // (b) ONLY ABOUT THE FILE WE ACTUALLY READ. `meta.importLibrary`
             //     above may be a caller's DECLARED identity that deliberately
             //     differs from the binary on disk — the cross-compilation
-            //     stand-in / `.tbd` contract (D-FFI-DECLARED-IMPORT-NAME).
+            //     stand-in / `.tbd` contract (a declared import name).
             //     The verneed we emit names `importLibrary`, so requesting a
             //     version we saw in a DIFFERENT file would demand it of a
             //     library whose version set we never observed, turning a
@@ -1076,7 +1076,7 @@ ingest(std::span<IngestionSource const> sources,
         // distinct ExternImport.soname path is the future refinement, not
         // needed for the runtime-correct dependency).
         //
-        // NOT re-pointed by a level-1 declaration (D-FFI-DECLARED-IMPORT-NAME):
+        // NOT re-pointed by a level-1 declaration (a declared import name):
         // this field answers "what did the file we read declare about itself",
         // `importLibrary` answers "what identity do we RECORD". When a caller
         // states an identity the two legitimately differ (that is the whole
@@ -1193,7 +1193,7 @@ synthesizeFfiFromSourceDecls(
                                          ext.linkName);
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3) + UCRT-P4
+        // The extern library-name syntax closure (step 13.3) + UCRT-P4
         // (Decision 1): the ROW's per-symbol library is now the ONLY
         // source of an import library. It arrives from the PLATFORM's
         // shipped-descriptor realization (already folded to this

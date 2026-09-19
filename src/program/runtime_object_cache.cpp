@@ -792,8 +792,23 @@ writeThroughTemp(RuntimeObjectKey const&       key,
     if (fs::exists(destination, ec) && !ec) return {};  // the temp is discarded
     ec.clear();
 
-    fs::rename(temporary, destination, ec);
-    if (ec) {
+    // ── THE COMMIT IS THE LINKER'S, FOR THE SAME REASON THE CLAIM IS ─────────
+    // [[D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE]]
+    //
+    // 🧠 THIS STORE CANNOT MEET THE ROUND-7 GATE'S FAILURE, and the reason is
+    // the check just above: it never replaces an entry. A holder can only hold a
+    // file that EXISTS, the destination was just shown absent, and a replace
+    // refused because a concurrent winner landed there (and is being scanned)
+    // is SUCCESS by the re-probe below — same key, same bytes. What it CAN meet
+    // is a holder of its own freshly closed temp that withholds FILE_SHARE_DELETE
+    // (✔MEASURED: opening a held staged file for the rename answers 32), and the
+    // cost there is a lost cache entry and a note, never a failed build.
+    // It goes through `linker::detail::commitReplacing` anyway: one owner of the
+    // Windows replace — the argument this file makes for reusing
+    // `createExclusiveBinary` instead of re-deriving it — so this store waits
+    // out a transient holder and names a lasting one exactly as the linker does.
+    auto const commit = linker::detail::commitReplacing(temporary, destination);
+    if (!commit.committed) {
         // A concurrent winner landed between the check and the rename. Same
         // key, same bytes — success, and the guard discards our temp.
         std::error_code probeEc;
@@ -802,7 +817,7 @@ writeThroughTemp(RuntimeObjectKey const&       key,
             key,
             std::format("could not rename '{}' into place as '{}': {}.{}",
                         core::genericSpelling(temporary),
-                        core::genericSpelling(destination), ec.message(),
+                        core::genericSpelling(destination), commit.refusal,
                         composedPathNote(directory, destination))));
     }
     guard.release();  // the temp no longer exists under that name

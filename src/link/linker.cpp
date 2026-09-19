@@ -807,7 +807,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         slot.symbol  = slotSym;
         // `RelRoConst`, not `Rodata`: the slot CARRIES a relocation, and the
         // shared data-section substrate refuses a reloc-bearing rodata item
-        // (deliberately — a rodata fixup is the D-LK-RELRO-CONST-DATA class).
+        // (deliberately — a rodata fixup is the D-LK-RELRO-CONST-DATA-RELOCATABLE class).
         // `relro` is the section kind whose whole definition is "read-only
         // data that the link must still fix up", which is what this is, and
         // on PE it lands in the same `.rdata` the references place `.refptr`
@@ -2325,25 +2325,37 @@ LinkedImage link(std::span<AssembledModule const> modules,
         moduleP = &moduleCopy;
         image.expectedFuncCount = moduleCopy.expectedFuncCount;
     }
-    // ── [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]] ──────────────
+    // ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
+    // (parent mechanism: [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]])
     //
-    // A call whose callee is beyond its relocation field's reach is refused by
-    // `applyExecRelocations` — correctly, but with nothing to do about it. The
-    // veneer pass gives it somewhere nearer to aim: a one-instruction synthetic
-    // function holding the same unconditional branch, re-aimed at the callee.
-    // Its sibling [[D-CSUBSET-LONG-BRANCH]] does exactly this WITHIN a function,
-    // with branch islands between instructions.
+    // A branch whose target lies beyond its relocation field's reach is carried
+    // by a VENEER: a small synthetic function standing within reach, which
+    // finishes the trip through the scratch register the ABI grants a linker.
+    // Its sibling [[D-CSUBSET-LONG-BRANCH]] answers the same wall WITHIN a
+    // function, with assembler branch islands between instructions.
     //
-    // ⚠ THE `needsVeneers` PRE-CHECK IS THE COPY-ON-WRITE DISCIPLINE, NOT AN
-    // OPTIMIZATION (D-LK10-ENTRY-MODULE-COW). `moduleCopy` exists only when the
-    // trampoline was injected; a module that needs no veneer must not be cloned
-    // at all, and the overwhelmingly common case needs none.
-    if (branchVeneersNeeded(*moduleP, targetSchema)) {
+    // ★ THE WRITER IS ASKED WHERE ITS IMPORT STUBS WILL LAND before the pass
+    // runs, because a call to an import lands on that stub and only the writer
+    // lays it out. This is the question the pass could not ask before, and the
+    // call it could not see was the one every large image makes: the synthetic
+    // entry's call to its process-exit import. The writer asserts its real
+    // layout against this same answer when it emits the stubs.
+    //
+    // ⚠ THE `branchVeneersNeeded` PRE-CHECK IS THE COPY-ON-WRITE DISCIPLINE,
+    // NOT AN OPTIMIZATION (D-LK10-ENTRY-MODULE-COW). `moduleCopy` exists only
+    // when the trampoline was injected; a module that needs no veneer must not
+    // be cloned at all, and the overwhelmingly common case needs none.
+    link::ImportCallStubLayout const stubLayout =
+        objectFormatSchema.backend() != nullptr
+            ? objectFormatSchema.backend()->importCallStubLayout(
+                  *moduleP, targetSchema, objectFormatSchema)
+            : link::ImportCallStubLayout{};
+    if (branchVeneersNeeded(*moduleP, targetSchema, stubLayout)) {
         if (moduleP != &moduleCopy) {
             moduleCopy = inputModule;
             moduleP    = &moduleCopy;
         }
-        if (!injectBranchVeneers(moduleCopy, targetSchema, reporter)) {
+        if (!injectBranchVeneers(moduleCopy, targetSchema, stubLayout, reporter)) {
             image.resolvedFuncCount = 0;
             return image;
         }

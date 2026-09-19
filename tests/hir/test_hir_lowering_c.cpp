@@ -1709,7 +1709,8 @@ TEST(HirLoweringC, ExternFunctionDefinitionWithLibraryOverrideRejectedLoud) {
 
 // ★★★ P65 — RE-POINTED, NOT DELETED, AND THE MOVE IS THE POINT.
 //
-// This arm asserted D-FF2-3's refusal on a FILE-SCOPE `extern int x = 5;`.
+// This arm asserted the D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE refusal
+// on a FILE-SCOPE `extern int x = 5;`.
 // [[D-C-FILE-SCOPE-EXTERN-WITH-INITIALIZER-IS-A-DEFINITION]] measured that
 // C 6.9.2p1 makes that spelling a DEFINITION — "a declaration of an identifier
 // for an object that has file scope with an initializer is a definition", with
@@ -1750,8 +1751,9 @@ TEST(HirLoweringC, BlockScopeExternWithInitializerRejectedLoud) {
     // twice and disagreed with itself.
     EXPECT_EQ(countCode(r, DiagnosticCode::H_ExternRedundantOnDefinition), 0u)
         << "C 6.7.11p5 is a constraint violation, not a redundant keyword";
-    // The pre-D-FF2-3 silent path landed an ExternGlobal; the refusal lands an
-    // Error sentinel so downstream tooling cannot mistake it for a successful
+    // The silent path before D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE
+    // landed an ExternGlobal; the refusal lands an Error sentinel so
+    // downstream tooling cannot mistake it for a successful
     // extern declaration. Exactly one, and no surviving Extern* row for `x`.
     auto decls = res->hir.moduleDecls(res->hir.root());
     std::size_t errors = 0;
@@ -1974,7 +1976,7 @@ TEST(HirLoweringC, BlockScopeExternWithEmptyBraceInitializerRejectedLoud) {
 }
 
 TEST(HirLoweringC, ExternGlobalWithArraySuffixNoInitStillAccepted) {
-    // D-FF2-3 negative: `extern int x[10];` carries an array-size
+    // D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE negative: `extern int x[10];` carries an array-size
     // expression (`10`) inside arrayDeclSuffix — that's NOT an init
     // and must NOT trigger H_ExternHasInitializer. The shape-based
     // detector skips the arrayDeclSuffix subtree exactly for this
@@ -11237,7 +11239,7 @@ TEST(HirLoweringC, ExternSpecifierRoutesToTheImportLoweringInEveryOrder) {
 
 // A file-scope `extern` FUNCTION prototype must still lower to an
 // ExternFunction import through the merged rule, and its per-declaration
-// import-library override (D-CSUBSET-EXTERN-LIBRARY-SYNTAX) must still be
+// import-library override (the trailing library-name string literal) must still be
 // decoded -- that trailing `stringLiteralExpr` slot moved from `externDecl`'s
 // sequence into `topLevelDecl`'s, where a wrong index would shift the
 // kindByChild discriminator and mis-lower every function definition in the TU.

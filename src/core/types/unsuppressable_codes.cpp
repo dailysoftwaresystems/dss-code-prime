@@ -7,7 +7,7 @@ namespace dss {
 
 namespace {
 
-// D-FF2-UNSUPP closed-table. Sorted by phase letter (D / F / H / I / K
+// The unsuppressable-codes closed table. Sorted by phase letter (D / F / H / I / K
 // / L / R / A / S / P) + numeric value within each phase for at-a-glance
 // audit. The linear scan via `std::ranges::find` is O(N) over the
 // table — still faster than hash lookup at this size + needs no

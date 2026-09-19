@@ -98,7 +98,7 @@ namespace dss {
 //   * `resolveLibraries`— OPTIONAL library paths whose export surfaces resolve
 //                         this build's externs; the counterpart of the CLI
 //                         `--resolve-library <path>`. Empty when absent.
-//                         D-FFI-DECLARED-IMPORT-NAME: each entry is EITHER a
+//                         Declared import names: each entry is EITHER a
 //                         plain non-empty STRING (the path; nothing stated —
 //                         the byte-for-byte pre-existing form every shipped
 //                         manifest uses) OR an extended OBJECT

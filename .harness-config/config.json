@@ -11,11 +11,20 @@
     "processSampleSeconds": 5
   },
   "toolchains": {
+    // `msvc` NAMES its compiler. Until 2026-09-18 it declared none, so CMake took the first
+    // compiler on PATH and the "MSVC Release" leg silently built with MinGW gcc (✔MEASURED in
+    // a CMakeCache). `cl` resolves only inside a Visual Studio developer environment: outside
+    // one the configure step fails naming CC, and a directory configured with any other
+    // compiler is refused rather than reused. Never INCLUDE/LIB/PATH here -- machine-specific.
     "msvc": {
       "platforms": [
         "windows"
       ],
-      "generator": "Ninja"
+      "generator": "Ninja",
+      "env": {
+        "CC": "cl",
+        "CXX": "cl"
+      }
     },
     "mingw-gcc": {
       "platforms": [
@@ -227,7 +236,7 @@
       "project": "dss-code-prime",
       "toolchain": "mingw-gcc",
       "config": "debug",
-      "description": "Debug build and test on Windows with MinGW-w64 GCC (the build/dbg tree)"
+      "description": "Debug build and test on Windows with MinGW-w64 GCC"
     },
     "windows-x86_64-release": {
       "os": "windows",
@@ -235,7 +244,7 @@
       "project": "dss-code-prime",
       "toolchain": "msvc",
       "config": "release",
-      "description": "Release build and test on Windows with MSVC cl.exe (the build/msvc tree)"
+      "description": "Release build and test on Windows with MSVC cl.exe, inside a Visual Studio developer environment"
     },
     "linux-x86_64-debug": {
       "os": "linux",

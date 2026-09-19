@@ -194,8 +194,8 @@ void checkEveryLibraryRecorded(FormatLeg const& leg) {
     EXPECT_EQ(dependencyOccurrences(recorded, leg.libB), 1u)
         << "'" << leg.libB << "' must appear exactly once in the emitted "
            "dependency table; got [" << joinDependencies(recorded) << "] -- this is "
-           "the D-LK-ELF-EMITS-ONE-DT-NEEDED shape: the SECOND library is "
-           "the one that goes missing";
+           "the D-LK-ELF-EMITS-ONE-DT-NEEDED-WHEN-TWO-LIBRARIES-ARE-REFERENCED "
+           "shape: the SECOND library is the one that goes missing";
 }
 
 }  // namespace

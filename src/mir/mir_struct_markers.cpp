@@ -40,23 +40,22 @@ char const* structCfMarkerName(StructCfMarker m) noexcept {
 
 namespace {
 
-// ⓘ `mirModuleSelfLoopBlocks` and `mirBackEdgeCandidates` USED TO LIVE HERE, in
-// this anonymous namespace. They are now exported from `mir/mir_dom.hpp`, beside
-// the scoped `mirNaturalLoops` completeness clause they exist to discharge —
-// because the second caller that needed them (`opt::passes::runLicm`) could not
-// reach them and silently kept the O(module)-per-function sweep
-// ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]). Same bodies, moved verbatim.
+// ⓘ `mirBackEdgeCandidates` USED TO LIVE HERE, in this anonymous namespace. It
+// is exported from `mir/mir_dom.hpp`, beside the natural-loop sweep whose rule
+// it states — because the second caller that needed it (`opt::passes::runLicm`)
+// could not reach it and silently kept the O(module)-per-function sweep
+// ([[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]]). The module self-loop index
+// that moved with it is gone: rule 3 is scoped to the function's own blocks.
 
-// THE derivation. The public overloads below differ only in where the two
-// reusable substrates come from: `moduleSelfLoops` (a module property) and
-// `pdScratch` (the post-dominator scratch). A whole-module re-derivation
-// hoists both out of its per-function loop; a one-off call owns them locally.
+// THE derivation. The public overloads below differ only in where the reusable
+// post-dominator scratch and the candidate buffer come from: a whole-module
+// re-derivation hoists them out of its per-function loop; a one-off call owns
+// them locally.
 std::vector<StructCfMarker>
 deriveInto(Mir const& mir, MirFuncId f,
            std::vector<std::vector<MirBlockId>> const& preds,
            std::vector<MirBlockId> const& rpo,
            MirDomTree const& dom,
-           std::span<std::uint32_t const> moduleSelfLoops,
            MirPostDomScratch& pdScratch,
            std::vector<std::uint32_t>& candidateBuf) {
     // Rule 6 is the initialization: everything not claimed below is
@@ -106,12 +105,15 @@ deriveInto(Mir const& mir, MirFuncId f,
     }
 
     // ── rule 3: loop-exiting-edge targets → LoopExit ──
-    // The back-edge sweep is SCOPED to `f`'s own candidates (plus the module
-    // self-loop index — see `mirBackEdgeCandidates`): `dom` is a
-    // one-function tree, so the whole-module sweep was O(module) work per
-    // function, i.e. quadratic in module size, and measured 2,101ms of a
-    // 5,160ms whole-module re-derivation on merged SQLite.
-    mirBackEdgeCandidates(mir, f, rpo, moduleSelfLoops, candidateBuf);
+    // The back-edge sweep is SCOPED to `f`'s own blocks — THE rule, stated by
+    // `mirBackEdgeCandidates` — so deriving `f` claims nothing in another
+    // function's slots. `dom` is a one-function tree, so the whole-module
+    // sweep this replaced was O(module) work per function, i.e. quadratic in
+    // module size (2,101ms of a 5,160ms whole-module re-derivation on merged
+    // SQLite); the module self-loop index that later kept every OTHER
+    // function's self-loop in each forest was quadratic the same way
+    // (D-MIR-STRUCTCF-DERIVATION-REACHES-PAST-THE-FUNCTION, now closed).
+    mirBackEdgeCandidates(mir, f, rpo, candidateBuf);
     auto const loops = mirNaturalLoops(
         mir, dom, preds, std::span<std::uint32_t const>{candidateBuf});
     for (MirNaturalLoop const& loop : loops) {
@@ -196,16 +198,13 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f,
                       std::vector<std::vector<MirBlockId>> const& preds,
                       std::vector<MirBlockId> const& rpo,
                       MirDomTree const& dom) {
-    // One-off call: it owns the two reusable substrates itself. Both are
-    // O(module) to establish, which is what this overload already cost —
-    // callers that derive EVERY function (the module-wide applier below)
-    // hoist them instead.
-    std::vector<std::uint32_t> selfLoops;
-    if (mir.funcBlockCount(f) != 0) mirModuleSelfLoopBlocks(mir, selfLoops);
+    // One-off call: it owns the reusable post-dominator scratch (O(module)
+    // to establish, which is what this overload already cost) and the
+    // candidate buffer itself — callers that derive EVERY function (the
+    // module-wide applier below) hoist both instead.
     MirPostDomScratch pdScratch;
     std::vector<std::uint32_t> candidateBuf;
-    return deriveInto(mir, f, preds, rpo, dom, selfLoops, pdScratch,
-                      candidateBuf);
+    return deriveInto(mir, f, preds, rpo, dom, pdScratch, candidateBuf);
 }
 
 std::vector<StructCfMarker>
@@ -215,15 +214,15 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f,
                       MirDomTree const& dom,
                       MirStructCfScratch& scratch) {
     std::uint32_t const bc = static_cast<std::uint32_t>(mir.blockCount());
-    if (scratch.blockCount == 0) {          // first use — bind + fill the index
+    if (scratch.blockCount == 0) {          // first use — bind to this module
         scratch.moduleIdV  = mir.id().v;
         scratch.blockCount = bc;
-        mirModuleSelfLoopBlocks(mir, scratch.moduleSelfLoops);
     } else if (scratch.moduleIdV != mir.id().v || scratch.blockCount != bc) {
-        // The self-loop index is a property of the module it was swept over.
-        // Serving it for a different module would be a WRONG loop forest, not a
-        // slow one — so this is a fail-loud, exactly as MirDomScratch's and
-        // MirPostDomScratch's stale-module guards are.
+        // The bundle's post-dominator buffers are sized and reset for the
+        // module it was bound to. Serving them for a different module is a
+        // caller bug, reported here at the level the caller holds — the
+        // bundle — as MirDomScratch's and MirPostDomScratch's stale-module
+        // guards report theirs.
         std::fprintf(stderr,
             "dss::deriveStructCfMarkers fatal: MirStructCfScratch bound to "
             "module id=%u blockCount=%u was reused for module id=%u "
@@ -231,9 +230,8 @@ deriveStructCfMarkers(Mir const& mir, MirFuncId f,
             scratch.moduleIdV, scratch.blockCount, mir.id().v, bc);
         std::abort();
     }
-    return deriveInto(mir, f, preds, rpo, dom,
-                      std::span<std::uint32_t const>{scratch.moduleSelfLoops},
-                      scratch.postDom, scratch.candidates);
+    return deriveInto(mir, f, preds, rpo, dom, scratch.postDom,
+                      scratch.candidates);
 }
 
 std::vector<StructCfMarker>

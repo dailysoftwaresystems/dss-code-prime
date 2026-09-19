@@ -32,6 +32,7 @@
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList — the ONE closed-set renderer
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/number_decode.hpp"  // floatKindInfo — a float FORMAT's width
 #include "mir/mir_asm_descriptor.hpp"
 
 #include <algorithm>
@@ -108,7 +109,14 @@ namespace {
         // yet lowered" names neither the feature nor the construct.
         case MirOpcode::InlineAsm:     return "InlineAsm";
         case MirOpcode::InlineAsmGoto: return "InlineAsmGoto";
-        default:                       return "<deferred>";
+        // ★ EVERY OTHER OPCODE IS NAMED BY THE MIR's OWN TABLE — the spelling
+        // `.dssir` text and the verifier already print (`mnemonic`, the one
+        // owner of that fact). This default used to be the string `<deferred>`,
+        // and a refusal that reached it named nothing: ✔MEASURED at `7df54cc1`,
+        // an AArch64 call mixing a `long double` with a `double` was refused as
+        // "MIR opcode '<deferred>' is not yet lowered", as were several
+        // long-double conversions (D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED).
+        default:                       return mnemonic(op);
     }
 }
 
@@ -947,6 +955,13 @@ struct Lowerer {
     // shortcut around the piece machinery — it is the only placement that does
     // not require the piece machinery to learn what an asm block is.
     std::unordered_map<std::uint64_t, LirReg> asmPieceReg_;
+
+    // The same map for a piece whose value this tier keeps in MEMORY: (producer,
+    // ordinal) → the frame slot of the home the expansion stored it into
+    // (D-LIR-ASM-MEMORY-RESIDENT-FLOAT-OPERAND-CARRIED-AS-ITS-ADDRESS). Kept
+    // apart from `asmPieceReg_` because the answer is a HOME, which the reader
+    // records in `allocaSlotIndex_`, not a register it can define a value with.
+    std::unordered_map<std::uint64_t, std::uint32_t> asmPieceHomeSlot_;
 
     [[nodiscard]] static std::uint64_t asmPieceKey(MirInstId producer,
                                                    std::uint32_t ordinal) noexcept {
@@ -2398,10 +2413,11 @@ struct Lowerer {
             case MirOpcode::Bitcast: {
                 TypeId const ty = mir.instType(id);
                 if (ty.valid() && wideIntKind(classifyKind(ty))) {
-                    // `mirOpcodeName` only names the ALU/ICmp tier (everything
-                    // else is its `default: "<deferred>"`), so these three carry
-                    // explicit labels — a diagnostic that says "<deferred>" tells
-                    // the reader nothing about which access was refused.
+                    // These three carry explicit labels, which say WHICH access
+                    // was refused (a result, a value, a reinterpretation) — more
+                    // than the opcode's name alone. (`mirOpcodeName` used to fall
+                    // back to "<deferred>" for them; it now falls back to the MIR's
+                    // own mnemonic.)
                     return failWideInt(ty,
                         op == MirOpcode::Load    ? "Load result"
                       : op == MirOpcode::Const   ? "Const value"
@@ -3415,8 +3431,17 @@ struct Lowerer {
         // Axis multi-return — works through this arm with no edit, which is the
         // whole reason `ReturnPiece` was reused instead of an asm-private verb.
         if (auto const ops = mir.instOperands(id); !ops.empty()) {
-            auto const it = asmPieceReg_.find(
-                asmPieceKey(ops[0], mir.returnPieceOrdinal(id)));
+            std::uint64_t const key =
+                asmPieceKey(ops[0], mir.returnPieceOrdinal(id));
+            // A piece the producer left in a HOME (a memory-resident value —
+            // see `AsmBound::homeCarried`) is that home, recorded where every
+            // other home is; a rename with no instruction, like the register arm.
+            if (auto const h = asmPieceHomeSlot_.find(key);
+                h != asmPieceHomeSlot_.end()) {
+                allocaSlotIndex_.emplace(id.v, h->second);
+                return;
+            }
+            auto const it = asmPieceReg_.find(key);
             if (it != asmPieceReg_.end()) {
                 defineValue(id, it->second);
                 return;
@@ -3657,6 +3682,38 @@ struct Lowerer {
         // silent zero.
         bool          hasImmediate = false;
         std::int64_t  immediate    = 0;
+        // ★★★ THE VALUE TRAVELS THROUGH MEMORY, NOT BY A REGISTER MOVE — the
+        // CARRIAGE plan `planCarriage` fills in. Two producers, one plan:
+        //   * `homeCarried` — an F80/F128 value, which this tier keeps in a
+        //     HOME (its SSA value IS the home's address;
+        //     D-LIR-ASM-MEMORY-RESIDENT-FLOAT-OPERAND-CARRIED-AS-ITS-ADDRESS):
+        //     an input is loaded out of its home, an output stored into a fresh
+        //     one that becomes the MIR value;
+        //   * `carriedByAddress` — a by-address value (a struct/union, a
+        //     `_Complex`, a wide integer) whose MIR operand IS its address
+        //     (`MirAsmOperand::carriedBytes`;
+        //     D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS):
+        //     loaded through it before the template when `carriedIn`, stored
+        //     through it after when `carriedOut`.
+        // Either way the value occupies `pieces` registers — ONE, or a PAIR
+        // (`reg`, then `reg2` at `pieceStrideBytes` further on;
+        // D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED) — each moved at its
+        // own `pieceBits` by the constraint class's own load and store. Never a
+        // register move of the address, which is what the template used to get.
+        // `stageCls` is set when the constraint's class has no load or store at
+        // the value's width and the target names a class to move it THROUGH
+        // (`asmValueCarriage` `stagesThrough`): the memory access is that
+        // class's, and a cross-class move joins it to `reg`.
+        bool          homeCarried      = false;
+        bool          carriedByAddress = false;
+        bool          carriedIn        = false;
+        bool          carriedOut       = false;
+        std::uint8_t  pieces           = 0;
+        std::array<std::uint32_t, 2> pieceBits{0, 0};
+        std::uint32_t pieceStrideBytes = 0;
+        LirReg        reg2{InvalidLirReg};
+        LirRegClass   stageCls = LirRegClass::None;
+        [[nodiscard]] bool carried() const noexcept { return pieces != 0; }
     };
 
     // A spelling list as a diagnostic reads it: `'%0', '%[out]'`. An operand
@@ -3694,6 +3751,229 @@ struct Lowerer {
 
     [[nodiscard]] std::uint32_t asmWidthBitsForType(TypeId ty) const {
         return lirInstWidthBits(widthFlagsForType(ty));
+    }
+
+    // ★★★ A VALUE THIS PIPELINE KEEPS IN MEMORY, BOUND TO A REGISTER THE
+    // TEMPLATE NAMES — ONE CARRIAGE PLAN FOR BOTH PRODUCERS.
+    //
+    //   * An F80/F128 SSA value is the ADDRESS of its 16-byte home at this tier
+    //     (the LD model) — D-LIR-ASM-MEMORY-RESIDENT-FLOAT-OPERAND-CARRIED-AS-ITS-ADDRESS.
+    //     ✔MEASURED before that fix: an aarch64 `long double` on `"w"` reached
+    //     the template as `mov x17, sp; fmov d0, x17`, rc=0, the wrong answer.
+    //   * A struct/union, `_Complex` or 128-bit integer operand arrives BY
+    //     ADDRESS from the front end, its entry saying so (`carriedBytes`) —
+    //     D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS.
+    //     ✔MEASURED before: `__int128` / `_Complex float` on `"r"` read the
+    //     home's address on both processors; a 16-byte struct lost its high
+    //     half on `"w"`.
+    //
+    // ★ THE CARRIAGE IS THE CLASS'S OWN MEMORY VERBS: the value is LOADED into
+    // the register(s) the template names and STORED back out, at widths the
+    // class's `load`/`store` declare — never a register move of the address.
+    //
+    // ★★ WHETHER, AND IN HOW MANY REGISTERS, IS READ OFF THE TARGET
+    // (`asmValueCarriage`), because it is what the processor's references do
+    // and it differs by processor, size and direction (see that facet):
+    //   * some entry of the class must admit the value's KIND, its exact SIZE
+    //     and this operand's DIRECTION — a `_Complex double` rides an aarch64
+    //     `"w"` OUTPUT but no input;
+    //   * ONE register when the value is no wider than the register, loaded
+    //     and stored at its own width — through the declared staging class
+    //     when the constraint's class has no access at that width;
+    //   * a PAIR when it is wider: the first piece a full register, the second
+    //     the remainder (the x87 value is 64 + 16 bits); the second register
+    //     is what the dialect's `pairSecond` letter names (aarch64 `%H0`);
+    //   * a PINNED register with a two-register value is refused: ✔MEASURED,
+    //     gcc 13.3.0 ("inconsistent operand constraints in an 'asm'") and
+    //     clang 18.1.3 ("couldn't allocate") both refuse `"a"(__int128)`.
+    // ⓘ Any other value is bound exactly as before: the two producers are
+    // asked of the ENTRY (`carriedBytes`) and of the TYPE (the same F80/F128
+    // test every LD-model site in this file makes) — no target or format named.
+    [[nodiscard]] bool planCarriage(MirAsmOperand const& o, MirInstId at,
+                                    TypeId valueType, bool isOutputEntry,
+                                    AsmBound& out) {
+        std::uint32_t        valueBits = 0;
+        TypeKind             kind      = TypeKind::Void;
+        AsmCarriageDirection dir       = AsmCarriageDirection::In;
+        if (o.carriedBytes != 0) {
+            out.carriedByAddress = true;
+            out.carriedIn        = o.carriedIn;
+            out.carriedOut       = o.carriedOut;
+            valueBits = o.carriedBytes * 8u;
+            kind      = static_cast<TypeKind>(o.carriedTypeKind);
+            dir = (o.carriedIn && o.carriedOut) ? AsmCarriageDirection::InOut
+                : o.carriedOut                  ? AsmCarriageDirection::Out
+                                                : AsmCarriageDirection::In;
+        } else {
+            kind = interner.kind(valueType);
+            if (kind != TypeKind::F80 && kind != TypeKind::F128) return true;
+            auto const format = detail::floatKindInfo(kind);
+            if (!format.has_value()) return true;
+            out.homeCarried = true;
+            valueBits = static_cast<std::uint32_t>(format->bits);
+            // A `+` operand's two halves (the output entry and its tied read
+            // entry) are one `inout` operand; every other entry is its role.
+            dir = (isOutputEntry ? o.isReadWrite : o.tiedOutput.has_value())
+                ? AsmCarriageDirection::InOut
+                : (isOutputEntry ? AsmCarriageDirection::Out
+                                 : AsmCarriageDirection::In);
+        }
+        std::uint32_t const bytes = (valueBits + 7u) / 8u;
+        auto const kindName = typeKindNameOrEmpty(kind);
+        TargetRegClass const tcls = static_cast<TargetRegClass>(out.cls);
+        // ★ THE OPERAND IS NAMED BY ITS SPELLINGS AND ITS DIRECTION, NOT BY
+        // the caller's role and index: a by-address OUTPUT is filed among the
+        // descriptor's inputs, so those two would call a `"=r"` operand
+        // "input 0" — the lookup-not-index rule `tieAsmReadWriteOperands`
+        // states for its own messages. (A synthesized tied read half has no
+        // spelling, and never refuses first: its output half plans the same
+        // carriage before it.)
+        auto refuse = [&](std::string const& why) {
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format(
+                    "inline asm (MIR inst {}): the {} operand {} (constraint "
+                    "\"{}\") binds a {}-byte '{}' value — one this pipeline keeps "
+                    "in MEMORY — to {} of class '{}': {}. Refused rather than "
+                    "handing the template the value's address",
+                    at.v,
+                    dir == AsmCarriageDirection::InOut ? "read-write"
+                        : dir == AsmCarriageDirection::Out ? "output" : "input",
+                    renderSpellings(o.spellings), o.constraint, bytes, kindName,
+                    out.pinned ? std::format("register '{}'", out.name)
+                               : std::string{"a register"},
+                    lirRegClassName(out.cls), why));
+            return false;
+        };
+        std::uint8_t const dirs = target.asmCarriageDirections(tcls, kind, bytes);
+        if ((dirs & static_cast<std::uint8_t>(dir)) == 0) {
+            if (dirs == 0) {
+                return refuse(std::format(
+                    "this target carries no {}-byte '{}' value in class '{}' — "
+                    "`asmValueCarriage` lists the kinds, sizes and directions "
+                    "its reference toolchains carry, and this is none of them",
+                    bytes, kindName, lirRegClassName(out.cls)));
+            }
+            std::string allowed;
+            for (auto const& [d, n] : kAsmCarriageDirectionTable) {
+                if ((dirs & static_cast<std::uint8_t>(d)) == 0) continue;
+                if (!allowed.empty()) allowed += "/";
+                allowed += n;
+            }
+            return refuse(std::format(
+                "this target carries a {}-byte '{}' value in class '{}' only as "
+                "'{}' (`asmValueCarriage`), and this operand is '{}' — no "
+                "reference toolchain carries it that way",
+                bytes, kindName, lirRegClassName(out.cls), allowed,
+                asmCarriageDirectionName(dir)));
+        }
+        std::optional<std::uint32_t> regBits;
+        if (out.pinned) {
+            if (auto const* info = target.registerInfo(out.ordinal);
+                info != nullptr) {
+                regBits = static_cast<std::uint32_t>(info->widthBytes) * 8u;
+            }
+        } else {
+            regBits = target.registerClassNaturalWidthBits(tcls);
+        }
+        if (!regBits.has_value() || *regBits == 0) {
+            return refuse("the class's registers share no single width, so no "
+                          "carriage into them can be sized");
+        }
+        auto const accessWidth = [](std::uint32_t bits) {
+            return bits == 8 || bits == 16 || bits == 32 || bits == 64
+                || bits == 128;
+        };
+        if (valueBits <= *regBits) {
+            if (!accessWidth(valueBits)) {
+                return refuse(std::format(
+                    "{} bits is no access width of a register, so no single "
+                    "register carries it", valueBits));
+            }
+            if (!classCarriesWidth(out.cls, valueBits)) {
+                // ★ STAGED: the constraint's class has no access at this
+                // width, and the target names the class to move it through.
+                auto const stage = target.asmCarriageStageClass(tcls);
+                LirRegClass const scls = stage.has_value()
+                    ? static_cast<LirRegClass>(*stage) : LirRegClass::None;
+                bool const staged = stage.has_value()
+                    && classCarriesWidth(scls, valueBits)
+                    && classOp(scls, out.cls, RegClassOp::Move).has_value()
+                    && classOp(out.cls, scls, RegClassOp::Move).has_value();
+                if (!staged) {
+                    return refuse(std::format(
+                        "class '{}' declares no load AND store at {} bits{}",
+                        lirRegClassName(out.cls), valueBits,
+                        stage.has_value()
+                            ? std::format(", and neither does class '{}' it "
+                                          "stages through (`stagesThrough`), "
+                                          "or no move joins the two",
+                                          lirRegClassName(scls))
+                            : std::string{}));
+                }
+                out.stageCls = scls;
+            }
+            out.pieces    = 1;
+            out.pieceBits = {valueBits, 0};
+            out.widthBits = valueBits;
+            return true;
+        }
+        if (out.pinned) {
+            return refuse(std::format(
+                "it needs TWO {}-bit registers and the constraint pins ONE, "
+                "'{}'. gcc 13.3.0 and clang 18.1.3 both refuse the same shape "
+                "(\"inconsistent operand constraints in an 'asm'\" / "
+                "\"couldn't allocate input reg\")",
+                *regBits, out.name));
+        }
+        std::uint32_t const second = valueBits - *regBits;
+        if (valueBits > 2u * *regBits || !accessWidth(second)) {
+            return refuse(std::format(
+                "{} bits is neither one {}-bit register nor a pair of them "
+                "(a full register and an access-width remainder) — "
+                "`asmValueCarriage` admits a size no register arrangement "
+                "carries", valueBits, *regBits));
+        }
+        if (!classCarriesWidth(out.cls, *regBits)
+            || !classCarriesWidth(out.cls, second)) {
+            return refuse(std::format(
+                "class '{}' declares no load AND store at {} and {} bits",
+                lirRegClassName(out.cls), *regBits, second));
+        }
+        out.pieces           = 2;
+        out.pieceBits        = {*regBits, second};
+        out.pieceStrideBytes = *regBits / 8u;
+        out.widthBits        = *regBits;
+        out.reg2             = lir.newVReg(out.cls);
+        return true;
+    }
+
+    // Does class `cls` declare BOTH a load and a store of the base-register
+    // memory shape at exactly `bits`? Asked of the encoding variants' own width
+    // guards — the same table the encoder elects from — so a width the class
+    // cannot move is refused here by name rather than by the encoder later.
+    [[nodiscard]] bool classCarriesWidth(LirRegClass cls, std::uint32_t bits) const {
+        auto hasWidth = [&](RegClassOp which, std::size_t regs) {
+            auto const op = classOp(cls, which);
+            if (!op.has_value()) return false;
+            auto const* info = target.opcodeInfo(*op);
+            if (info == nullptr) return false;
+            for (auto const& v : info->encoding.variants) {
+                if (v.guardWidthBits != bits) continue;
+                auto const& k = v.operandKinds;
+                if (k.size() != regs + 2) continue;
+                bool shape = true;
+                for (std::size_t i = 0; i < regs; ++i) {
+                    shape = shape && k[i] == OperandKindFilter::Reg;
+                }
+                if (shape && k[regs] == OperandKindFilter::MemBase
+                    && k[regs + 1] == OperandKindFilter::MemOffset) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        return hasWidth(RegClassOp::Load, 1) && hasWidth(RegClassOp::Store, 2);
     }
 
     // `valueInst` is the MIR value bound to this operand, and it is INVALID on
@@ -3904,7 +4184,12 @@ struct Lowerer {
             out.cls          = cls;
             out.pinned       = false;
             out.earlyClobber = o.isEarlyClobber;
-            return true;
+            // `valueInst` is invalid exactly for an OUTPUT entry — a result
+            // piece has no MIR operand (see its docblock above) — which is the
+            // role fact the carriage's DIRECTION needs, asked of the entry
+            // rather than of the `role` wording.
+            return planCarriage(o, at, valueType,
+                                /*isOutputEntry=*/!valueInst.valid(), out);
         }
         std::uint16_t ord  = 0;
         std::string   name;
@@ -3921,7 +4206,8 @@ struct Lowerer {
         out.pinned  = true;
         out.ordinal = ord;
         out.name    = std::move(name);
-        return true;
+        return planCarriage(o, at, valueType,
+                            /*isOutputEntry=*/!valueInst.valid(), out);
     }
 
     // ★★★ WHEN AN OUTPUT MUST BE COPIED OUT OF THE REGISTER THE TEMPLATE WROTE.
@@ -3936,8 +4222,118 @@ struct Lowerer {
     // An unpinned output whose classes AGREE still needs no copy: the template
     // wrote the operand's own vreg, which IS the `%N` binding, and a copy of a
     // register into a fresh one of the same class would be dead.
+    // ⓘ A CARRIED output (see `planCarriage`) is never captured by a move: its
+    // value leaves the register(s) by the STORE through its address
+    // (`emitCarriageStores`), which reads them in the same place the capture
+    // would have — immediately after the template, or at the head of each
+    // `asm goto` edge.
     [[nodiscard]] static bool asmOutputNeedsCapture(AsmBound const& b) noexcept {
-        return b.pinned || b.cls != b.valueCls;
+        return !b.carried() && (b.pinned || b.cls != b.valueCls);
+    }
+
+    // The LIR width flag of a MEMORY access of `bits` — width-EXACT, unlike
+    // `lirWidthFlagsForBits` (whose sub-32 promotion is for register plumbing):
+    // a carried 1-byte struct is loaded and stored as ONE byte, never four.
+    [[nodiscard]] static constexpr std::uint8_t
+    memWidthFlagsForBits(std::uint32_t bits) noexcept {
+        switch (bits) {
+            case 8:   return kLirInstFlagWidth8;
+            case 16:  return kLirInstFlagWidth16;
+            case 32:  return kLirInstFlagWidth32;
+            case 128: return kLirInstFlagWidth128;
+            default:  return 0;
+        }
+    }
+
+    // The memory verb `op` of the class a carriage accesses memory with — the
+    // constraint's own class, or the one it stages through — refused by name
+    // when the target declares none.
+    [[nodiscard]] std::optional<std::uint16_t>
+    carriageMemOp(MirInstId at, AsmBound const& b, std::size_t index,
+                  RegClassOp op, std::string_view what) {
+        LirRegClass const cls =
+            b.stageCls != LirRegClass::None ? b.stageCls : b.cls;
+        auto const handle = classOp(cls, op);
+        if (!handle.has_value()) {
+            reportMissingClassOp(cls, op,
+                std::format("inline asm (MIR inst {}) operand {} (constraint "
+                            "\"{}\") — {} the value it carries",
+                            at.v, index, b.constraint, what));
+        }
+        return handle;
+    }
+
+    // The input half of every carriage (see `planCarriage`): LOAD each piece of
+    // the value at `addr` into the register the template names for it — the
+    // first at `addr`, a pair's second `pieceStrideBytes` on — with the
+    // class's own load at the piece's width, the `[base, MemBase, MemOffset]`
+    // shape `lowerLoad` uses. A STAGED value is loaded into a register of the
+    // staging class and moved across by the target's own cross-class move.
+    // `addr` is produced by the caller BEFORE the constrained range (see the
+    // hoist in `expandInlineAsm`).
+    [[nodiscard]] bool emitCarriageLoads(MirInstId at, AsmBound const& b,
+                                         LirReg addr, std::size_t index) {
+        auto const loadOp = carriageMemOp(at, b, index, RegClassOp::Load,
+                                          "loading");
+        if (!loadOp.has_value()) return false;
+        for (std::uint8_t piece = 0; piece < b.pieces; ++piece) {
+            std::array<LirOperand, 3> const ops{
+                LirOperand::makeReg(addr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(static_cast<std::int32_t>(
+                    piece * b.pieceStrideBytes)),
+            };
+            LirReg const dest = piece == 0 ? b.reg : b.reg2;
+            if (b.stageCls == LirRegClass::None) {
+                emitInst(*loadOp, dest, ops, /*payload=*/0,
+                         memWidthFlagsForBits(b.pieceBits[piece]));
+                continue;
+            }
+            LirReg const staged = lir.newVReg(b.stageCls);
+            emitInst(*loadOp, staged, ops, /*payload=*/0,
+                     memWidthFlagsForBits(b.pieceBits[piece]));
+            if (!emitAsmOperandMove(at, dest, staged, "input", index,
+                                    b.constraint, b.pieceBits[piece])
+                     .has_value()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The output half: STORE each piece the template wrote through `addr`, with
+    // the class's own store at the piece's width (a STAGED value is moved into
+    // a register of the staging class first). `addr` is the caller's, produced
+    // BEFORE the constrained range — the home of an F80/F128 result, or the
+    // by-address output's own address — so the range holds only real target
+    // instructions.
+    [[nodiscard]] bool emitCarriageStores(MirInstId at, AsmBound const& b,
+                                          LirReg addr, std::size_t index) {
+        auto const storeOp = carriageMemOp(at, b, index, RegClassOp::Store,
+                                           "storing");
+        if (!storeOp.has_value()) return false;
+        for (std::uint8_t piece = 0; piece < b.pieces; ++piece) {
+            LirReg value = piece == 0 ? b.reg : b.reg2;
+            if (b.stageCls != LirRegClass::None) {
+                LirReg const staged = lir.newVReg(b.stageCls);
+                if (!emitAsmOperandMove(at, staged, value, "output", index,
+                                        b.constraint, b.pieceBits[piece])
+                         .has_value()) {
+                    return false;
+                }
+                value = staged;
+            }
+            std::array<LirOperand, 4> const ops{
+                LirOperand::makeReg(value),
+                LirOperand::makeReg(addr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(static_cast<std::int32_t>(
+                    piece * b.pieceStrideBytes)),
+            };
+            emitInst(*storeOp, InvalidLirReg, ops, /*payload=*/0,
+                     memWidthFlagsForBits(b.pieceBits[piece]));
+        }
+        return true;
     }
 
     // ★★★ `"+r"` — THE TIE IS A **LOCATION IDENTITY**, AND THIS IS WHERE IT IS
@@ -4142,6 +4538,12 @@ struct Lowerer {
             ins[j].pinned  = outs[k].pinned;
             ins[j].ordinal = outs[k].ordinal;
             ins[j].name    = outs[k].name;
+            // ★ A CARRIED pair ties BOTH registers: the read half's second
+            // piece is loaded into the very register the template writes back
+            // (D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED). Both halves
+            // planned the same carriage from the same type and constraint, so
+            // only the LOCATION is copied, exactly as above.
+            ins[j].reg2     = outs[k].reg2;
         }
         // ★★★ THE ONE THAT REPLACES THE OLD BLANKET REFUSAL. Every `+` output
         // MUST have been claimed above. Reaching here unclaimed means the read
@@ -4372,8 +4774,20 @@ struct Lowerer {
         // ordinal below is already in hand (`AsmBound::ordinal`,
         // `canonicalAsmRegister`'s out-parameter) and used to be discarded.
         ImplicitRegisterConstraint c;
+        // ★ A by-address output filed among the inputs (`carriedOut`) is an
+        // OUTPUT of the block — the template writes its register — so a pinned
+        // one joins the output set (and, by the loop below, the clobber set)
+        // exactly as a pinned `"=a"` does, and names no input unless the
+        // template also reads it (`carriedIn`). (A pinned register never
+        // carries a PAIR: `planCarriage` refuses that shape, as both
+        // references do.)
         for (auto const& b : ins) {
-            if (b.pinned) c.inputNames.push_back(b.name);
+            if (!b.pinned) continue;
+            if (!b.carriedByAddress || b.carriedIn) c.inputNames.push_back(b.name);
+            if (b.carriedByAddress && b.carriedOut) {
+                c.outputNames.push_back(b.name);
+                c.outputOrdinals.push_back(b.ordinal);
+            }
         }
         for (auto const& b : outs) {
             if (!b.pinned) continue;
@@ -4526,6 +4940,59 @@ struct Lowerer {
             return false;
         }
 
+        // ── 3b. the HOME each memory-resident output is stored into ──
+        // (D-LIR-ASM-MEMORY-RESIDENT-FLOAT-OPERAND-CARRIED-AS-ITS-ADDRESS — see
+        // `planCarriage`.) Reserved here, after every refusal that needs no
+        // emission has passed and BEFORE the constrained range opens: the
+        // reservation is the frame substrate's `alloca`, not part of the
+        // statement, and ONE home per output serves every `asm goto` edge —
+        // exactly one of them runs, and each stores into the same home, so the
+        // piece every landing block reads names one object.
+        std::vector<std::optional<std::uint32_t>> outHome(outs.size());
+        for (std::size_t k = 0; k < outs.size(); ++k) {
+            if (!outs[k].homeCarried) continue;
+            outHome[k] = emitF80ScratchSlot(
+                kF80StorageBytes, "inline asm output home (memory-resident value)");
+            if (!outHome[k].has_value()) return false;
+        }
+
+        // ── 3c. every VALUE and ADDRESS the expansion reads, produced BEFORE
+        //        the constrained range opens ──
+        // ★★★ THE RANGE STEP 5 STAMPS WITH THE STATEMENT'S CONSTRAINT MUST HOLD
+        // ONLY INSTRUCTIONS THAT CARRY IT THROUGH EVERY LATER PASS — and a
+        // frame address does not. `regForValue` rematerializes an alloca's
+        // address as a `lea_frame_slot` AT EACH USE, and `emitLeaFrameSlot`
+        // emits the same virtual op for a home; `lir_callconv` rewrites those
+        // into target instructions WITHOUT carrying side data (its docblock: no
+        // producer attaches a constraint set to one). Emitted inside the range,
+        // the handle stamped on them was dropped and the rebuild verifier
+        // refused the module. ✔MEASURED at `7df54cc1` (base binary and
+        // config), x86_64 debug: `__asm__("movq %1, %0" : "=r"(r) : "r"(&x) :
+        // "r8")` — valid C gcc and clang compile — refused with
+        // L_SideStructureReferenceLost ("2 register-constraint references, down
+        // from 3"); every by-address carriage (its operand IS such an address)
+        // and every F80/F128 home store took the same path.
+        // ⇒ each input's source register and each home's address is produced
+        // HERE, once, and the range reads them. The address of a carried OUTPUT
+        // lives across the template to its store, which is also what keeps it
+        // out of every register the statement clobbers: its range covers the
+        // constrained instructions, so the allocator's forbidden set applies.
+        std::vector<LirReg> inSrc(ins.size(), InvalidLirReg);
+        for (std::size_t j = 0; j < ins.size(); ++j) {
+            // An immediate is never materialized — see the input loop below.
+            if (ins[j].hasImmediate) continue;
+            std::optional<LirReg> const src = regForValue(operands[j]);
+            if (!src.has_value()) return false;
+            inSrc[j] = *src;
+        }
+        std::vector<LirReg> outHomeAddr(outs.size(), InvalidLirReg);
+        for (std::size_t k = 0; k < outs.size(); ++k) {
+            if (!outHome[k].has_value()) continue;
+            std::optional<LirReg> const addr = emitLeaFrameSlot(*outHome[k]);
+            if (!addr.has_value()) return false;
+            outHomeAddr[k] = *addr;
+        }
+
         // ── 4. emit: pins → template → captures ──
         // The instruction ids `LirBuilder` mints are contiguous and monotonic
         // (`addInst` returns `instArena_.size() - 1`), so the block this
@@ -4565,17 +5032,28 @@ struct Lowerer {
             // where an immediate has always lived in this pipeline: the
             // `[Reg, ImmInt]` encoding variants both shipped targets declare are
             // the same ones a `.s`-written `add x0, x0, #5` elects.
-            // ⚠ `regForValue` IS DELIBERATELY NOT CALLED EITHER. `lowerConst`
-            // skips materialising a constant whose sole use is this operand
-            // (`constFoldsIntoAsmImmediate`), so asking for a register here
-            // would fail loud on the undefined vreg — which is exactly the
-            // fold-site-disagreement alarm that mechanism exists to raise.
+            // ⚠ `regForValue` IS DELIBERATELY NOT CALLED EITHER (step 3c skips
+            // it too). `lowerConst` skips materialising a constant whose sole
+            // use is this operand (`constFoldsIntoAsmImmediate`), so asking for
+            // a register here would fail loud on the undefined vreg — which is
+            // exactly the fold-site-disagreement alarm that mechanism exists to
+            // raise.
             if (ins[j].hasImmediate) continue;
-            std::optional<LirReg> const src = regForValue(operands[j]);
-            if (!src.has_value()) return false;
-            // Same early-out shape as the `regForValue` line above: this runs
-            // BEFORE any capture block is opened, so there is none to seal.
-            if (!emitOperandMove(ins[j].reg, *src, "input", j,
+            // ★ A by-address OUTPUT filed among the inputs (`carriedOut` without
+            // `carriedIn`) has nothing to READ: its register is the template's
+            // to write, and its address (`inSrc[j]`) is read by the store after.
+            if (ins[j].carriedByAddress && !ins[j].carriedIn) continue;
+            // ★ A CARRIED input: `inSrc[j]` is the ADDRESS of the value (its
+            // home, or the by-address operand itself), and the value is LOADED
+            // out of it into the register(s) the template names — moving the
+            // address is the defect this replaced.
+            if (ins[j].carried()) {
+                if (!emitCarriageLoads(id, ins[j], inSrc[j], j)) return false;
+                continue;
+            }
+            // This runs BEFORE any capture block is opened, so a refusal here
+            // has none to seal.
+            if (!emitOperandMove(ins[j].reg, inSrc[j], "input", j,
                                  ins[j].constraint,
                                  ins[j].widthBits).has_value()) {
                 return false;
@@ -4593,11 +5071,16 @@ struct Lowerer {
         // publish a second row for the `%N` its output half already answers to.
         std::vector<AsmOperandBinding> bindings;
         bindings.reserve(outs.size() + ins.size());
+        // ★ A PAIR's second register rides the same row (`pairReg`): the
+        // template reaches it only through its dialect's `pairSecond` modifier
+        // (D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED), and the engine
+        // refuses that modifier on every one-register row by name.
         auto bindOperand = [&bindings](AsmBound const& b) {
             for (auto const& s : b.spellings) {
                 bindings.push_back({s, b.reg, b.cls, b.widthBits,
                                     b.operandKind, b.hasImmediate,
-                                    b.immediate});
+                                    b.immediate,
+                                    b.pieces == 2 ? b.reg2 : InvalidLirReg});
             }
         };
         for (auto const& b : outs) bindOperand(b);
@@ -4673,7 +5156,7 @@ struct Lowerer {
         // register-PINNED — see the capture emission below, which explains why a
         // terminator has no "after the template" to put the capture in.
         std::vector<LirBlockId> const captureBlocks =
-            createAsmCaptureBlocks(succs, outs);
+            createAsmCaptureBlocks(succs, outs, ins);
         auto edgeEntry = [&](std::size_t j) {
             return captureBlocks.empty() ? lirSucc(succs[j]) : captureBlocks[j];
         };
@@ -4718,7 +5201,7 @@ struct Lowerer {
         // ⇒ `nextLirInstIdValue()` now PROBES the arena (`hasAnyInst()`)
         // instead of consulting a mirror, so the engine's emissions need no
         // separate accounting and no proxy can be wrong about them.
-        if (!stampEarlyClobberOutputs(id, outs, firstEmitted)) {
+        if (!stampEarlyClobberOutputs(id, outs, ins, firstEmitted)) {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
         }
@@ -4733,6 +5216,16 @@ struct Lowerer {
         // placement differs, the capture does not.
         if (!isGoto) {
             for (std::size_t k = 0; k < outs.size(); ++k) {
+                // A home-carried output leaves its register(s) by the STORE
+                // into its home, in the capture's own place — right after the
+                // template, inside the constrained range.
+                if (outs[k].homeCarried) {
+                    if (!emitCarriageStores(id, outs[k], outHomeAddr[k], k)) {
+                        sealOrphanedAsmCaptureBlocks(captureBlocks);
+                        return false;
+                    }
+                    continue;
+                }
                 if (!asmOutputNeedsCapture(outs[k])) continue;
                 LirReg const dest = lir.newVReg(outs[k].valueCls);
                 // The destination is the VALUE's class, not the constraint's
@@ -4748,6 +5241,17 @@ struct Lowerer {
                     return false;
                 }
                 outs[k].reg = dest;  // the VALUE now lives in the vreg, not the pin
+            }
+            // ★ A by-address OUTPUT is filed among the inputs (it yields no
+            // result piece), and its value leaves the register(s) the same way
+            // a home-carried one does: stored through its own address, in the
+            // same place and under the same constraint.
+            for (std::size_t j = 0; j < ins.size(); ++j) {
+                if (!(ins[j].carriedByAddress && ins[j].carriedOut)) continue;
+                if (!emitCarriageStores(id, ins[j], inSrc[j], j)) {
+                    sealOrphanedAsmCaptureBlocks(captureBlocks);
+                    return false;
+                }
             }
         }
         std::uint32_t const afterEmitted = nextLirInstIdValue();
@@ -4768,8 +5272,8 @@ struct Lowerer {
 
         // ── 5b. `asm goto` only: seal the block and place the edge captures ──
         if (isGoto
-            && !sealAsmGotoEdges(id, succs, outs, captureBlocks,
-                                 constraintHandle)) {
+            && !sealAsmGotoEdges(id, succs, outs, outHomeAddr, ins, inSrc,
+                                 captureBlocks, constraintHandle)) {
             sealOrphanedAsmCaptureBlocks(captureBlocks);
             return false;
         }
@@ -4802,14 +5306,29 @@ struct Lowerer {
         // wrong; the pin is still mandatory, since the guard being someone
         // else's makes it exactly the kind that can be removed without anyone
         // noticing here.
+        // ★ A HOME-CARRIED output publishes its HOME, never a register: the MIR
+        // value is memory-resident by the model every consumer of it assumes,
+        // so it is recorded where every other home is (`allocaSlotIndex_`),
+        // directly for output 0 and through `asmPieceHomeSlot_` for a piece.
         for (std::size_t k = isGoto ? 0 : 1; k < outs.size(); ++k) {
-            asmPieceReg_[asmPieceKey(id, static_cast<std::uint32_t>(k))] =
-                outs[k].reg;
+            std::uint64_t const key =
+                asmPieceKey(id, static_cast<std::uint32_t>(k));
+            if (outs[k].homeCarried) {
+                asmPieceHomeSlot_[key] = *outHome[k];
+            } else {
+                asmPieceReg_[key] = outs[k].reg;
+            }
         }
         // ⚠ AND THE TERMINATOR DEFINES NO VALUE. `mir.instType(id)` is
         // `InvalidType` for an `asm goto`; `defineValue` on it would enter a
         // register for a value the MIR says does not exist.
-        if (!isGoto && !outs.empty()) defineValue(id, outs[0].reg);
+        if (!isGoto && !outs.empty()) {
+            if (outs[0].homeCarried) {
+                allocaSlotIndex_.emplace(id.v, *outHome[0]);
+            } else {
+                defineValue(id, outs[0].reg);
+            }
+        }
         return true;
     }
 
@@ -4844,11 +5363,24 @@ struct Lowerer {
     // one where the LIR is then byte-identical to an `asm goto` with no outputs.
     [[nodiscard]] std::vector<LirBlockId>
     createAsmCaptureBlocks(std::span<MirBlockId const> succs,
-                           std::vector<AsmBound> const& outs) {
+                           std::vector<AsmBound> const& outs,
+                           std::vector<AsmBound> const& ins) {
         if (succs.empty()) return {};
-        bool const anyPinned = std::any_of(
-            outs.begin(), outs.end(), [](AsmBound const& b) { return b.pinned; });
-        if (!anyPinned) return {};
+        // ⓘ A CARRIED output needs its edge too, pinned or not: its value must
+        // be STORED through its address on every path — into its home before
+        // the landing block's piece reads that home (`homeCarried`), or into
+        // the object the source named (a by-address output, filed among the
+        // inputs) — and a label edge with no block of its own has nowhere to
+        // put the store.
+        bool const anyEdgeWork =
+            std::any_of(outs.begin(), outs.end(),
+                        [](AsmBound const& b) {
+                            return b.pinned || b.homeCarried;
+                        })
+            || std::any_of(ins.begin(), ins.end(), [](AsmBound const& b) {
+                   return b.carriedByAddress && b.carriedOut;
+               });
+        if (!anyEdgeWork) return {};
         std::vector<LirBlockId> blocks;
         blocks.reserve(succs.size() - 1);       // labels only; see above
         for (std::size_t j = 0; j + 1 < succs.size(); ++j) {
@@ -4928,6 +5460,9 @@ struct Lowerer {
     sealAsmGotoEdges(MirInstId at,
                      std::span<MirBlockId const> succs,
                      std::vector<AsmBound>& outs,
+                     std::vector<LirReg> const& outHomeAddr,
+                     std::vector<AsmBound> const& ins,
+                     std::vector<LirReg> const& inSrc,
                      std::vector<LirBlockId> const& captureBlocks,
                      std::optional<std::uint32_t> constraintHandle) {
         // The `lowerSehTryBegin` pattern: the opcode this edge needs, asked for
@@ -4959,8 +5494,32 @@ struct Lowerer {
         // this operand's class is now named by `emitAsmOperandMove`, per
         // operand, instead of being reported as a missing universal `Mov`.
         bool captureOk = true;
+        // The instructions a carriage store emitted, from `from` on, carry the
+        // same constraint the in-block captures do — the value they read out
+        // of a clobbered register is otherwise protected by nothing.
+        auto constrainFrom = [&](std::uint32_t from) {
+            if (!constraintHandle.has_value()) return;
+            for (std::uint32_t v = from; v < nextLirInstIdValue(); ++v) {
+                lir.setInstRegConstraints(LirInstId{v, lir.id().v},
+                                          *constraintHandle);
+            }
+        };
         auto emitCaptures = [&] {
             for (std::size_t k = 0; k < outs.size(); ++k) {
+                // A home-carried output is STORED into its one home at the head
+                // of every edge (the edge's own capture), under the same
+                // constraint the in-block captures carry.
+                // The home's address was produced before the constrained
+                // range (step 3c) and is live into every edge.
+                if (outs[k].homeCarried) {
+                    std::uint32_t const from = nextLirInstIdValue();
+                    if (!emitCarriageStores(at, outs[k], outHomeAddr[k], k)) {
+                        captureOk = false;
+                        return;
+                    }
+                    constrainFrom(from);
+                    continue;
+                }
                 if (!asmOutputNeedsCapture(outs[k])) continue;
                 auto const li = emitAsmOperandMove(at, captureDest[k],
                                                    outs[k].reg, "output", k,
@@ -4970,6 +5529,17 @@ struct Lowerer {
                 if (constraintHandle.has_value()) {
                     lir.setInstRegConstraints(*li, *constraintHandle);
                 }
+            }
+            // A by-address output is STORED through its own address on every
+            // edge, as the in-block loop stores it after a plain template.
+            for (std::size_t j = 0; j < ins.size(); ++j) {
+                if (!(ins[j].carriedByAddress && ins[j].carriedOut)) continue;
+                std::uint32_t const from = nextLirInstIdValue();
+                if (!emitCarriageStores(at, ins[j], inSrc[j], j)) {
+                    captureOk = false;
+                    return;
+                }
+                constrainFrom(from);
             }
         };
 
@@ -5027,19 +5597,39 @@ struct Lowerer {
     // ⚠ ZERO DEFS IS A REFUSAL, NOT A NO-OP. A template that never wrote the
     // operand leaves nothing to flag, and silently returning would ship an `&`
     // the compiler did not honour — the accept-and-ignore this refuses.
+    //
+    // ★ A CARRIED output is stamped on EVERY register it occupies — both of a
+    // pair, since `&` is a promise about the whole operand — and a by-address
+    // output is one of the INPUT entries (`carriedOut`; it yields no result
+    // piece), so those are walked too. The refusal asks for a def of ANY of
+    // the operand's registers: an x86_64 template cannot name a pair's second
+    // register at all (gcc has no modifier for it), so a template writing
+    // only `%0` is the ordinary shape there, not a dropped `&`.
     [[nodiscard]] bool
     stampEarlyClobberOutputs(MirInstId id, std::vector<AsmBound> const& outs,
+                             std::vector<AsmBound> const& ins,
                              std::uint32_t firstEmitted) {
         std::uint32_t const end = nextLirInstIdValue();
-        for (auto const& b : outs) {
-            if (!b.earlyClobber || b.pinned) continue;
+        auto stampOne = [&](AsmBound const& b) {
             std::uint32_t stamped = 0;
             for (std::uint32_t v = firstEmitted; v < end; ++v) {
                 LirInstId const li{v, lir.id().v};
-                if (!(lir.instResult(li) == b.reg)) continue;
+                LirReg const r = lir.instResult(li);
+                if (!(r == b.reg) && !(b.pieces == 2 && r == b.reg2)) continue;
                 lir.orInstFlags(li, kLirInstFlagEarlyClobberResult);
                 ++stamped;
             }
+            return stamped;
+        };
+        std::vector<AsmBound const*> earlyOutputs;
+        for (auto const& b : outs) earlyOutputs.push_back(&b);
+        for (auto const& b : ins) {
+            if (b.carriedByAddress && b.carriedOut) earlyOutputs.push_back(&b);
+        }
+        for (AsmBound const* bp : earlyOutputs) {
+            auto const& b = *bp;
+            if (!b.earlyClobber || b.pinned) continue;
+            std::uint32_t const stamped = stampOne(b);
             if (stamped == 0) {
                 dss::report(reporter,
                     DiagnosticCode::L_UnsupportedLoweringForOpcode,
@@ -9456,28 +10046,37 @@ struct Lowerer {
         auto const poisonIfValueResult = [&] {
             if (!isVoid) poisonValue(id);
         };
-        // Pre-scan the args: an F128 arg MIXED with a non-F128 FPR (F32/F64) arg
-        // is unsupported — the NSRN interleaving is not modeled across the TWO
-        // PLACERS. The F128 args are hand-placed by the burst below; the F32/F64
-        // args are placed by lir_callconv from its own separate walk, and the two
-        // cursors never meet. ⚠ This used to be phrased as "hand-placed
-        // v-registers and lir_callconv-placed d-registers", i.e. two register
-        // FILES; with the SIMD&FP file declared once
-        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]) they draw
-        // from ONE pool at two widths, which removes the file confusion but not
-        // the two-placer skew. Fail loud (never a silent register skew; the
-        // witness signatures are all-F128 or F128+GPR).
-        bool sawF128Arg = false, sawNonF128Fpr = false;
-        for (std::size_t i = 1; i < operands.size(); ++i) {
-            TypeKind const ak = interner.kind(mir.instType(operands[i]));
-            if (ak == TypeKind::F128) sawF128Arg = true;
-            else if (ak == TypeKind::F32 || ak == TypeKind::F64) sawNonF128Fpr = true;
-        }
-        if (sawF128Arg && sawNonF128Fpr) {
-            reportUnsupported(MirOpcode::Call, id);
-            poisonIfValueResult();
-            return;
-        }
+        // ★★★ ONE PLACER FOR EVERY FP ARGUMENT — THE REFUSAL THAT STOOD HERE IS
+        // GONE (D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED).
+        // An F128 argument is marshalled below into its physical argument
+        // register (a binary128 SSA value is its home's ADDRESS at this tier, so
+        // it has to be LOADED, at 128 bits, before anything can place it), and
+        // every other argument is placed by `lir_callconv`'s walk after
+        // allocation. The two placers used to share NO cursor: the F128 took
+        // v_k here, invisible to `lir_callconv`, whose walk then handed the
+        // SAME v_k to the next `float`/`double` — so a call mixing the two was
+        // refused outright, through `reportUnsupported(MirOpcode::Call)`, whose
+        // text read "MIR opcode '<deferred>' is not yet lowered" because the
+        // opcode-name table here had no `Call` row: a refusal that named neither
+        // the opcode nor the reason. ✔MEASURED at `7df54cc1`: `double
+        // second(long double, double)` called from `main` refused at debug and
+        // release, while aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 run it
+        // (and five more mixes) to 42 at -O0 and -O2.
+        // ⇒ the marshalled argument now KEEPS ITS POSITION in the call's operand
+        // list, as the physical register it was loaded into. `lir_callconv`'s
+        // ONE walk (`ArgCursors`) advances over it exactly as over any FP
+        // argument, so every later `float`/`double` takes the next register, and
+        // its own move for this slot is the identity `v_k ← v_k` (emitted as
+        // nothing, and reserved from cycle-break scratch like every destination).
+        // The cursor below walks the SAME object the same way — `next(class)`
+        // per argument, `exhaust(class)` per stacked-aggregate carrier — so the
+        // register marshalled here IS the register that walk assigns.
+        // ★ AND THE MARSHAL NO LONGER RELIES ON ADJACENCY ALONE. An FP argument
+        // computed before the call is live ACROSS the marshal loads, so the
+        // allocator could have handed it the very register a load overwrites;
+        // the loads now carry a register constraint naming every marshalled
+        // register as written, which keeps any value live across them out of
+        // those registers (the same mechanism a pinned asm operand uses).
 
         auto const* cc = target.callingConvention(0);
 
@@ -9544,7 +10143,11 @@ struct Lowerer {
         // convention reached this point and only refused if a 128-bit float
         // happened to be present. Refusing here is the same fact, asked once.
         if (cc == nullptr) {
-            reportUnsupported(MirOpcode::Call, id);
+            dss::report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                DiagnosticSeverity::Error,
+                std::format("MIR Call (inst {}): target '{}' declares no calling "
+                            "convention, so no argument can be placed",
+                            id.v, target.name()));
             poisonIfValueResult();
             return;
         }
@@ -9555,19 +10158,47 @@ struct Lowerer {
             if (ak == TypeKind::F128) {
                 auto const slot = nsrnCursors.next(LirRegClass::FPR);
                 if (!slot.has_value() || slot->index >= cc->argFprs.size()) {
-                    reportUnsupported(MirOpcode::Call, id);
+                    // ⚠ A binary128 argument past the last FP argument register
+                    // goes on the STACK under AAPCS64 (16-byte aligned), and that
+                    // placement is not realized here — refused BY NAME, never
+                    // placed by guess.
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format(
+                            "MIR Call (inst {}): argument {} is a 128-bit "
+                            "floating-point value (`long double`) and the calling "
+                            "convention's {} floating-point argument registers "
+                            "are already taken, so it belongs on the STACK — a "
+                            "placement this lowering does not realize for a "
+                            "128-bit FP argument (it loads such an argument from "
+                            "its home into a register)",
+                            id.v, i - 1, cc->argFprs.size()));
                     poisonIfValueResult();
                     return;
                 }
                 auto const fprOrd = target.registerByName(cc->argFprs[slot->index]);
                 if (!fprOrd.has_value()) {
-                    reportUnsupported(MirOpcode::Call, id);
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format(
+                            "MIR Call (inst {}): the calling convention names "
+                            "FP argument register '{}', which target '{}' does "
+                            "not declare",
+                            id.v, cc->argFprs[slot->index], target.name()));
                     poisonIfValueResult();
                     return;
                 }
                 std::optional<LirReg> const home = regForValue(operandMir);
                 if (!home.has_value()) return;
                 f128Marshals.emplace_back(*home, *fprOrd);
+                // ★ THE ARGUMENT KEEPS ITS POSITION: the physical register it is
+                // marshalled into, which `lir_callconv`'s walk assigns this very
+                // slot (see the block comment above the cursor).
+                ops.push_back(LirOperand::makeArgReg(
+                    makePhysicalReg(*fprOrd, LirRegClass::FPR),
+                    static_cast<std::uint8_t>(16)));
                 continue;
             }
             std::optional<LirReg> const r = regForValue(operandMir);
@@ -9611,31 +10242,44 @@ struct Lowerer {
                     // type, which is `pointer(datum)` — this is the last tier that
                     // still has it.
                     byValueCarrierAlignment(mir.instType(operandMir), bvBytes)));
-            } else if (ak == TypeKind::F32 || ak == TypeKind::F64) {
-                // A non-F128 FPR arg consumes an NSRN slot too — the SAME cursor
-                // the F128 arm above takes from, because with the SIMD&FP file
-                // declared once there is one FP arg pool and one FP cursor. This
-                // used to be phrased as the FPR cursor advancing "the vector one"
-                // via a sharing relation derived from the register table; the
-                // relation is gone because the second pool is gone —
-                // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]].
-                (void)nsrnCursors.next(LirRegClass::FPR);
+                // ★ THE CARRIER CLAMPS the class it exhausts, exactly as
+                // `lir_callconv`'s walk does with the same marker — a later
+                // F128 must not be handed a register that walk will not.
+                std::uint8_t const ex = static_cast<std::uint8_t>(
+                    (bvPayload >> kByValueStackArgExhaustShift) & 0x3u);
+                if (ex == kByValueStackArgExhaustGpr)
+                    nsrnCursors.exhaust(LirRegClass::GPR);
+                else if (ex == kByValueStackArgExhaustFpr)
+                    nsrnCursors.exhaust(LirRegClass::FPR);
+            } else {
+                // Every other argument takes a slot of ITS OWN class, the SAME
+                // `next(class)` `lir_callconv`'s walk makes for it — a `float` or
+                // `double` from the one FP pool the F128 arm draws on too (with
+                // the SIMD&FP file declared once there is one FP cursor;
+                // [[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]), an
+                // integer from its own (a separate counter under AAPCS64, the
+                // SHARED one under a slot-aligned convention — which is why it is
+                // asked rather than skipped).
+                (void)nsrnCursors.next(r->regClass());
             }
         }
 
         // Marshal each F128 arg into its physical arg register in a TIGHT burst
         // immediately before the call (all home addresses already resolved).
-        // ADJACENCY IS THE ARGUMENT: these physical writes sit between the last
-        // operand resolution and the `BL`, so no value of this function's own is
-        // live across them, and the `BL`'s caller-saved clobber covers the same
-        // registers afterwards. ⚠ The old note reasoned about "the BL's
-        // caller-saved clobber of the ALIASED d-regs"; with the SIMD&FP file
-        // declared once there are no aliased d-rows to protect — v0..v7 are
-        // themselves the caller-saved rows the cc lists
-        // ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]), and the
-        // allocator now SEES this ordinal instead of it being invisible in a
-        // second class.
+        // ⚠ ADJACENCY ALONE WAS THE WHOLE ARGUMENT, AND IT HELD ONLY WHILE NO FP
+        // VALUE COULD BE LIVE ACROSS THE BURST — i.e. while the mix above was
+        // refused. A `double` argument computed before the call IS live across
+        // these loads (the call reads it), so the allocator was free to give it
+        // the very register a load overwrites. ⇒ every burst load carries ONE
+        // register constraint naming ALL the marshalled registers as written
+        // (outputs ⊆ clobbers, the per-instruction contract): a value live
+        // across any of the loads is kept out of every one of them, which is the
+        // mechanism a pinned asm operand's register uses, not a new one. With
+        // the SIMD&FP file declared once, v0..v7 are the caller-saved rows the cc
+        // lists ([[D-LIR-SUBREGISTER-AWARE-ALLOCATION-FOR-ALIASED-VIEWS]]), and
+        // the `BL`'s caller-saved clobber covers them afterwards.
         std::optional<std::uint16_t> fprLoadOp;
+        std::optional<std::uint32_t> marshalConstraint;
         if (!f128Marshals.empty()) {
             fprLoadOp = classOp(LirRegClass::FPR, RegClassOp::Load);
             if (!fprLoadOp.has_value()) {
@@ -9644,6 +10288,17 @@ struct Lowerer {
                 poisonIfValueResult();
                 return;
             }
+            ImplicitRegisterConstraint written;
+            for (auto const& [home, fprOrd] : f128Marshals) {
+                (void)home;
+                auto const* info = target.registerInfo(fprOrd);
+                if (info == nullptr) continue;   // resolved above; cannot fail
+                written.outputNames.push_back(info->name);
+                written.outputOrdinals.push_back(fprOrd);
+                written.clobberedNames.push_back(info->name);
+                written.clobberedOrdinals.push_back(fprOrd);
+            }
+            marshalConstraint = lir.regConstraintPoolAdd(std::move(written));
         }
         for (auto const& [home, fprOrd] : f128Marshals) {
             LirReg const argPhys = makePhysicalReg(fprOrd, LirRegClass::FPR);
@@ -9654,8 +10309,11 @@ struct Lowerer {
             };
             // WIDTH 128 — `fldur` at its 64-bit default would load half the
             // binary128 into the callee's argument register with no diagnostic.
-            emitInst(*fprLoadOp, argPhys, ldOps, /*payload=*/0,
-                     kLirInstFlagWidth128);
+            LirInstId const ld = emitInst(*fprLoadOp, argPhys, ldOps,
+                                          /*payload=*/0, kLirInstFlagWidth128);
+            if (marshalConstraint.has_value()) {
+                lir.setInstRegConstraints(ld, *marshalConstraint);
+            }
         }
 
         // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): forward the MIR Call's variadic-payload
@@ -9690,7 +10348,13 @@ struct Lowerer {
             // store is emitted as the instruction IMMEDIATELY after the call, so
             // nothing of this function's own can be live in v0 between the two.
             if (cc == nullptr || cc->returnFprs.empty()) {
-                reportUnsupported(MirOpcode::Call, id);
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("MIR Call (inst {}): the call returns a 128-bit "
+                                "floating-point value and the calling convention "
+                                "names no floating-point return register to "
+                                "capture it from", id.v));
                 poisonValue(id);
                 return;
             }
@@ -9703,7 +10367,13 @@ struct Lowerer {
                 return;
             }
             if (!fprOrd.has_value()) {
-                reportUnsupported(MirOpcode::Call, id);
+                dss::report(reporter,
+                    DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                    DiagnosticSeverity::Error,
+                    std::format("MIR Call (inst {}): the calling convention names "
+                                "floating-point return register '{}', which target "
+                                "'{}' does not declare",
+                                id.v, cc->returnFprs[0], target.name()));
                 poisonValue(id);
                 return;
             }
@@ -12561,8 +13231,8 @@ struct Lowerer {
             "target '{}': opcode '{}' declares no '{}' role in "
             "implicitRegisters.{} — required to lower MIR '{}' (inst {}); "
             "the div/mod projection resolves registers BY ROLE, never by "
-            "positional index (D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-"
-            "CONTRACT)",
+            "positional index "
+            "(D-CSUBSET-MOD-OP-CODEGEN-OUTPUT-INDEX-CONTRACT)",
             target.name(), info != nullptr ? info->mnemonic : "?",
             role, mapName, mirOpcodeName(mir.instOpcode(at)), at.v);
         reporter.report(std::move(d));
@@ -14481,6 +15151,10 @@ struct Lowerer {
         // per-function scan callconv runs (`functionLocalAllocaPayloads` is per-fn).
         allocaSlotIndex_.clear();
         allocaLirCount_ = 0;
+        // The asm pieces' HOMES are slot indices too, so they share the
+        // counter's per-function lifetime (their keys are module-unique, but a
+        // slot index read in the next function would name a different slot).
+        asmPieceHomeSlot_.clear();
         // D-CSUBSET-LONG-DOUBLE-CONTROL-MERGE: same per-function lifetime — both
         // are keyed by the slot-index counter that just restarted at 0. The
         // pending list is normally already empty (`reserveWideFloatPhiHomes`

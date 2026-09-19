@@ -495,14 +495,14 @@ TEST(TypeInterner, FnSigEncodesResultParamsAndCc) {
     EXPECT_EQ(ti.fnResult(thunk).v, i32.v);
     EXPECT_TRUE(ti.fnParams(thunk).empty());
 
-    // D-LANG-VARIADIC (step 13.4): the 3-arg overload encodes non-
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): the 3-arg overload encodes non-
     // variadic (scalars=[cc], length 1) — backward-compat default
     // for every pre-13.4 call site.
     EXPECT_FALSE(ti.fnIsVariadic(sig));
 }
 
 TEST(TypeInterner, FnSigVariadicEncodingDistinctFromNonVariadic) {
-    // D-LANG-VARIADIC (step 13.4): the 4-arg `fnSig(...isVariadic)`
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): the 4-arg `fnSig(...isVariadic)`
     // overload encodes scalars=[cc, isVariadic]. A variadic and a
     // non-variadic signature over the same param / result / cc
     // INTERN AS DISTINCT TypeIds (scalar count + value differ), and

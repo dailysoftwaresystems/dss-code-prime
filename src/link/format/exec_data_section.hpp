@@ -256,8 +256,8 @@ struct ExecDataSectionLayout {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("{}: {} data item #{} (SymbolId={{ {} }}) carries "
                              "{} relocation(s); data->data relocations are not "
-                             "yet supported by this writer (deferred D-LK1-ELF-"
-                             "RODATA-DATAITEM-RELOC — it patches FUNCTION "
+                             "yet supported by this writer (deferred "
+                             "D-LK1-ELF-RODATA-DATAITEM-RELOC — it patches FUNCTION "
                              "relocations only).",
                              writerName, dataSectionKindName(kind), i,
                              d.symbol.v, d.relocations.size()));

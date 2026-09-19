@@ -144,7 +144,8 @@ struct Lowerer {
                                            // visibility (D-CSUBSET-LINKAGE-SPECIFIERS).
                                            // nullptr ⇒ all Global.
     HirNoInlineMap const*    noInlineMap; // optional — native-FUNCTION inliner
-                                           // opt-out (TF-C78, D-CSUBSET-NOINLINE).
+                                           // opt-out (TF-C78,
+                                           // D-CSUBSET-NOINLINE-PER-FUNCTION-SINK).
                                            // nullptr / no entry ⇒ inlinable.
     HirAlwaysInlineMap const* alwaysInlineMap;  // optional — native-FUNCTION
                                            // inliner cost-model bypass (TF-C81,
@@ -4872,8 +4873,8 @@ struct Lowerer {
                         unsupported(node,
                             "internal: an aggregate-typed comma/SeqExpr must be "
                             "lowered by ADDRESS (lowerLvalueAddress), never as a "
-                            "bare SSA rvalue (D-CSUBSET-AGGREGATE-VALUED-CONTROL-"
-                            "EXPR)");
+                            "bare SSA rvalue "
+                            "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR)");
                         return InvalidMirInst;
                     }
                 }
@@ -4909,8 +4910,8 @@ struct Lowerer {
                     "lowered into a slot by ADDRESS (lowerLvalueAddress / "
                     "lowerAggregateInitIntoSlot), never as a bare SSA-aggregate "
                     "rvalue — the MIR has no aggregate-width value and cannot "
-                    "pack bit-fields in a register (D-CSUBSET-BITFIELD-RVALUE-"
-                    "RUNTIME)");
+                    "pack bit-fields in a register "
+                    "(D-CSUBSET-BITFIELD-RVALUE-RUNTIME)");
                 return InvalidMirInst;
             }
             default: break;
@@ -5738,8 +5739,8 @@ struct Lowerer {
                 unsupported(node,
                     "internal: an aggregate-typed comma/SeqExpr must be "
                     "lowered by ADDRESS (lowerLvalueAddress), never as a "
-                    "bare SSA rvalue (D-CSUBSET-AGGREGATE-VALUED-CONTROL-"
-                    "EXPR)");
+                    "bare SSA rvalue "
+                    "(D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR)");
                 return true;
             }
         }
@@ -8809,7 +8810,7 @@ struct Lowerer {
         // D-MIR-ARRAY-FIELD-AGGREGATE-INIT: an ARRAY member. Array element
         // offsets are `j·stride` (not struct fieldOffsets), so a brace-init
         // descends in the ARRAY form; an array VALUE copies byte-wise
-        // (D-FC7-AGGREGATE-COPY).
+        // (D-FC7-AGGREGATE-COPY-MEMCPY).
         if (mk == TypeKind::Array) {
             if (hir.kind(child) == HirKind::ConstructAggregate) {
                 return pushAggregateInitFrame(work, child, dstPtr, memberTy, vf,
@@ -12623,6 +12624,11 @@ struct Lowerer {
         // corpus and mis-indexes only when a memory-form output is present.
         std::vector<std::size_t> regOutputKid;
         regOutputKid.reserve(src.outputCount);
+        // Which source operands the descriptor loop filed as MEMORY-CARRIED
+        // register operands (see `carried` inside it) — read again by the value
+        // loop, so the ADDRESS it lowers and the entry it lands beside are decided
+        // by ONE predicate evaluated once.
+        std::vector<bool> carriedOperand(src.operands.size(), false);
         for (std::size_t i = 0; i < src.operands.size(); ++i) {
             HirInlineAsmOperand const& o = src.operands[i];
             // ★★★ THE QUESTION IS "DID THE LETTER RESOLVE TO **ANYTHING**", NOT
@@ -12843,10 +12849,83 @@ struct Lowerer {
             // through `[sp, 8]`) — one working reference, so it is REQUIRED.
             bool const memoryFormOutput =
                 asmOperandBindsMemoryForm(o) && i < src.outputCount;
+            // ★★★ A REGISTER-FORM OPERAND OF A BY-ADDRESS TYPE CARRIES ITS VALUE
+            // THROUGH MEMORY — IT IS NEVER HANDED THE ADDRESS
+            // (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS).
+            //
+            // A struct/union, a `_Complex` or a wide integer has no SSA rvalue at
+            // this tier: `request`'s value→address flip hands a `_Complex` or
+            // wide-integer operand over as its ADDRESS, and a struct is loaded as
+            // an 8-byte scalar. Both reached the template: ✔MEASURED rc=0 and the
+            // wrong bits on both shipped targets (`__int128` / `_Complex float`
+            // on `"r"` read the home's address; a 16-byte struct on `"w"` lost
+            // its high half), while gcc 13.3.0 carries the VALUE — one register
+            // when it fits one, a register PAIR when it is twice a register.
+            // ⇒ such an operand is filed BY ADDRESS in `desc.inputs` — an OUTPUT
+            // too, exactly as a memory-form output is, since it yields no result
+            // piece — and its entry says how many bytes the binding carries and
+            // in which direction. `mir_to_lir` loads the value into the bound
+            // register(s) before the template and stores it back after it, and it
+            // is the tier that knows the register widths, so it is the one that
+            // refuses a size no register arrangement carries.
+            // ⚠ THE PREDICATE IS THE TYPE LATTICE'S OWN (`isMemoryResidentType`),
+            // the one every by-address decision in this file asks — no kind list
+            // is re-typed here.
+            TypeId const operandTy = hir.typeId(kids[i]);
+            bool const carried = !asmOperandBindsMemoryForm(o)
+                              && !asmOperandBindsImmediateForm(o)
+                              && isMemoryResidentType(interner, operandTy);
+            std::uint32_t carriedBytes = 0;
+            if (carried) {
+                // ★ `_BitInt(N)` IS REFUSED BY NAME: NO REFERENCE BINDS ONE.
+                // ✔MEASURED 2026-09-18, clang 18.1.3 refuses EVERY `_BitInt`
+                // asm operand — N = 32, 64, 65, 128, 200, input and output,
+                // "invalid type '_BitInt(N)' in asm input" — and gcc 13.3.0 has
+                // no `_BitInt` at all; MSVC takes no GNU `__asm__`. Only the
+                // wide ones reach this arm (a narrow `_BitInt` is an ordinary
+                // scalar here), and carrying them would give a construct a
+                // meaning no toolchain has.
+                if (interner.kind(operandTy) == TypeKind::BitInt) {
+                    unsupported(node, std::format(
+                        "inline-asm operand {} (constraint \"{}\") is a "
+                        "`_BitInt({})` — a bit-precise integer this lowering "
+                        "keeps in memory — bound to a register. No reference "
+                        "compiler binds a `_BitInt` to an asm register "
+                        "constraint (clang 18.1.3: \"invalid type in asm "
+                        "operand\" for every width; gcc 13.3.0 has no "
+                        "`_BitInt`), so there is no meaning to carry — and "
+                        "passing its address would hand the template a pointer "
+                        "where it asked for the value "
+                        "(D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS)",
+                        i, o.constraint.raw, interner.bitIntWidth(operandTy)));
+                    return false;
+                }
+                auto const bytes = aggregateByteSize(operandTy);
+                if (!bytes.has_value() || *bytes == 0
+                    || *bytes > std::numeric_limits<std::uint32_t>::max()) {
+                    unsupported(node, std::format(
+                        "inline-asm operand {} (constraint \"{}\") binds a "
+                        "value this lowering keeps in memory to a register, "
+                        "and its type has no sizeable layout — the carriage "
+                        "into the register needs the value's size "
+                        "(D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS)",
+                        i, o.constraint.raw));
+                    return false;
+                }
+                carriedBytes = static_cast<std::uint32_t>(*bytes);
+            }
+            carriedOperand[i] = carried;
+            bool const carriedOutput = carried && i < src.outputCount;
             MirAsmOperand mo;
             mo.constraint     = o.constraint.raw;
             mo.regClass       = static_cast<TargetRegClass>(o.regClass);
             mo.fixedRegister  = o.fixedRegister;
+            mo.carriedBytes   = carriedBytes;
+            mo.carriedIn      = carried
+                && (i >= src.outputCount || o.constraint.isReadWrite);
+            mo.carriedOut     = carriedOutput;
+            mo.carriedTypeKind = carried
+                ? static_cast<std::uint8_t>(interner.kind(operandTy)) : 0;
             // ★★ `isReadWrite` IS THE REQUEST FOR A **TIED READ HALF**, NOT A
             // RECORD THAT THE SOURCE WROTE `+`. Its own docblock defines it as
             // *"one input tied to one output"*, and `tieAsmReadWriteOperands` is
@@ -12864,7 +12943,11 @@ struct Lowerer {
             // on both shipped targets, `"+m"` in the input section is
             // `error: input operand constraint contains '+'`, byte-identical to
             // its `"+r"` verdict.
-            mo.isReadWrite    = o.constraint.isReadWrite && !memoryFormOutput;
+            // ⓘ A CARRIED output clears it for the memory form's reason: its read
+            // half is the load through the SAME address (`carriedIn`), so there
+            // is no second entry to tie.
+            mo.isReadWrite    = o.constraint.isReadWrite && !memoryFormOutput
+                             && !carriedOutput;
             mo.isEarlyClobber = o.constraint.earlyClobber;
             // The form arm travels beside the class arm; exactly one is live,
             // and the consumer switches rather than guessing (the `regClass`
@@ -12884,7 +12967,7 @@ struct Lowerer {
             // every real compile while hand-built unit tests, which construct
             // `MirAsmOperand` directly, keep passing.
             mo.spellings      = o.spellings;
-            if (i < src.outputCount && !memoryFormOutput) {
+            if (i < src.outputCount && !memoryFormOutput && !carriedOutput) {
                 regOutputKid.push_back(i);
                 desc.outputs.push_back(std::move(mo));
             } else {
@@ -12975,7 +13058,11 @@ struct Lowerer {
             // A memory-form output IS its address and nothing else: no
             // store-back target (the template wrote the object) and no read half
             // (the same memory serves both roles).
-            if (asmOperandBindsMemoryForm(src.operands[i])) {
+            // ★ A MEMORY-CARRIED register output is the same MIR shape for the
+            // same reason — its value is stored through this address after the
+            // template, and a `+` loads through it before — so it takes the same
+            // list, in the same source order the descriptor loop filed it in.
+            if (asmOperandBindsMemoryForm(src.operands[i]) || carriedOperand[i]) {
                 memOutAddrs.push_back(addr);
                 continue;
             }
@@ -13039,11 +13126,19 @@ struct Lowerer {
             // one the const-eval engine PROVED above — the proof and the
             // encoded number are the same measurement, so the two cannot
             // disagree about what the source wrote.
+            // ★★ A MEMORY-CARRIED input is ADDRESSED too: its register is loaded
+            // FROM this address by the LIR tier, which is the one that knows how
+            // many registers the value takes. `lowerLvalueAddress` rather than
+            // `lowerExpr` because the latter LOADS a struct as an 8-byte scalar —
+            // the very truncation this carriage replaces — while it already
+            // reaches every by-address rvalue (a call's result slot, a wide or
+            // complex arithmetic node's slot) as well as every lvalue.
             MirInstId v;
             if (immediateValues[j].has_value()) {
                 v = mir.addConst(toMirLiteral(*immediateValues[j]),
                                  hir.typeId(kids[j]));
-            } else if (asmOperandBindsMemoryForm(src.operands[j])) {
+            } else if (asmOperandBindsMemoryForm(src.operands[j])
+                       || carriedOperand[j]) {
                 v = lowerLvalueAddress(kids[j]);
             } else {
                 v = lowerExpr(kids[j]);
@@ -14945,7 +15040,7 @@ struct Lowerer {
         LinkageAttr la{};
         if (linkageMap != nullptr)
             if (auto const* p = linkageMap->tryGet(node)) la = *p;
-        // TF-C78 (D-CSUBSET-NOINLINE): ★ THE MINT SITE — the one place the
+        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): ★ THE MINT SITE — the one place the
         // source-declared `noinline` enters MIR. Everything downstream only
         // COPIES this bit; if it is not read here the whole chain (config verb →
         // SymbolRecord → HirNoInlineMap → MirFunc → the inliner's refusal) is
@@ -17464,7 +17559,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .config    = config,
         .ffiMap    = ffiMap,
         .linkageMap = linkageMap,
-        .noInlineMap = noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
+        .noInlineMap = noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         .alwaysInlineMap = alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         .noOptimizeMap = noOptimizeMap,       // TF-C85 (#pragma optimize region)
         .noSanitizeThreadMap = noSanitizeThreadMap,   // TF-C92 (no_sanitize_thread)

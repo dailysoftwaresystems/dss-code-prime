@@ -6522,7 +6522,7 @@ TEST(SemanticAnalyzerC, AtomicOnLongDoubleNotRejectedNonLockFree) {
            "not isByValueClass, so the wide-integer reject must NOT reach them";
 }
 
-// ★★ D-CSUBSET-INT128-CONSTFOLD (TF-C94) — a 128-bit INTEGER CONSTANT EXPRESSION.
+// ★★ D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94) — a 128-bit INTEGER CONSTANT EXPRESSION.
 //
 // THE DEFECT THIS PINS. `cst_const_eval.cpp`'s Cast fold gained a 128-bit arm that
 // routes `(__int128)`/`(__uint128_t)` casts through the bignum instead of narrowing
@@ -9377,7 +9377,7 @@ TEST(SemanticAnalyzerC, RepeatTypedefFunctionTypeIsAccepted) {
         << "two identical function-type typedefs are ONE interned FnSig";
 }
 
-// ── c33 D-CSUBSET-TENTATIVE-DEFINITION — a file-scope object declaration WITHOUT
+// ── c33 D-CSUBSET-TENTATIVE-DEFINITION-MERGE — a file-scope object declaration WITHOUT
 //    an initializer is a TENTATIVE DEFINITION (C 6.9.2): any number of tentatives
 //    + at most one real (initialized) definition of the same name MERGE into one
 //    object; two REAL definitions still collide. The merge reuses the

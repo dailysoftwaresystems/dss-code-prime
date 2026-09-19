@@ -321,3 +321,77 @@ dss_add_test(NAME lir/test_lir_fused_compare_dce
 # "something else broke".
 dss_add_test(NAME lir/test_lir_vreg_id_width
              SOURCES test_lir_vreg_id_width.cpp)
+
+# D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): a frame access BEYOND
+# every form the target declares for it — AArch64's unscaled imm9 and scaled
+# imm12 — is emitted as `lea A, [base + offset]` plus the access at `[A + 0]`.
+# The arms: every reach boundary read from the encoding (both files, narrowest and
+# widest access), x86_64 never far, the spill store `ee` measured refused (through
+# x30, which the leaf saves), a far integer reload through its own destination
+# (and NO fold — the predicate's exactness), a far SIMD&FP reload through x30, a
+# big frame with no far access keeping its frame, stacked params above a
+# 40000-byte local, and the refusals that remain — each by name. Byte pins are
+# words gas 2.42 and clang 18.1.3 assemble identically. mutate_target_schema.hpp
+# needs nlohmann_json.
+dss_add_test(NAME lir/test_lir_frame_far_form
+             SOURCES test_lir_frame_far_form.cpp)
+target_link_libraries(dss_lir_test_lir_frame_far_form PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LIR-ASM-MEMORY-RESIDENT-FLOAT-OPERAND-CARRIED-AS-ITS-ADDRESS: an F80/F128
+# value (the LD model keeps it in a memory HOME) bound to an inline-asm REGISTER
+# travels by that home — the constraint class's load in, its store out, at the
+# value's full width — never as the home's address, which the template used to
+# receive (rc=0, the wrong answer). Structural arms over hand-built MIR (the C
+# fixture declares no long-double format): the input's register defined by a
+# 128-bit load, the output stored at 128 bits, a piece and a `+w` tie, an
+# `asm goto` output stored on every edge; each beside a `double` control; a
+# value WIDER than the register carried as a register PAIR, half by half (it
+# was refused until D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED landed);
+# and the x87 value on an XMM register, which no reference carries, refused by
+# name — the two last beside a value of the register's own width.
+dss_add_test(NAME lir/test_lir_asm_home_carriage
+             SOURCES test_lir_asm_home_carriage.cpp)
+
+# D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS and
+# D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED: a struct, union, `_Complex`
+# or 128-bit integer bound to an inline-asm REGISTER reaches the template as its
+# VALUE — one register, or a register PAIR (`%H0` names the second on aarch64) —
+# per the target's `asmValueCarriage` (class x kind x size x direction), never as
+# its address. Arms: the MIR entry says "carried" (an output too, with no result
+# piece and no tied half); a pair loaded half by half and named in order; the
+# x86_64 pair's unnamed high half stored back; a 2-byte struct staged into an XMM
+# register through a GPR; no frame-address `lea` inside a statement's constrained
+# range (valid C used to be refused at `callconv`); four refusals by name, each
+# beside an accepted neighbour; the facet's and the `selects` key's load-time
+# contract, and a target declaring no carriage refusing the operand; `movaps`
+# keyed at 128 bits. mutate_target_schema.hpp and the dialect edits need
+# nlohmann_json.
+dss_add_test(NAME lir/test_lir_asm_carried_operand
+             SOURCES test_lir_asm_carried_operand.cpp)
+target_link_libraries(dss_lir_test_lir_asm_carried_operand PRIVATE nlohmann_json::nlohmann_json)
+
+
+# D-CODEGEN-APPLE-ARM64-X18-ALLOCATED-AGAINST-THE-PLATFORM-RESERVATION: Apple's
+# ARM64 platforms reserve x18 (Apple's ABI document; clang's
+# `isX18ReservedByDefault`), and `apple_arm64` now names it in no allocatable
+# list. Pins read the EMITTED code of a high-pressure function through regalloc,
+# the rewriter and callconv: no x18 under `apple_arm64`, the SAME source under
+# `aapcs64` (Linux reserves nothing) reaching x18 as the control, and the
+# remove-direction mutant — x18 put back into the Apple list — bringing it
+# back. mutate_target_schema.hpp needs nlohmann_json.
+dss_add_test(NAME lir/test_lir_apple_platform_register
+             SOURCES test_lir_apple_platform_register.cpp)
+target_link_libraries(dss_lir_test_lir_apple_platform_register PRIVATE nlohmann_json::nlohmann_json)
+
+
+# D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED: an AArch64 call
+# passing a binary128 `long double` AND a `float`/`double` lowers through ONE
+# placer — the marshalled F128 keeps its position in the call's operand list as
+# the register it was loaded into, so `lir_callconv`'s one `ArgCursors` walk
+# gives every later FP argument the next register, and the marshal loads carry
+# a constraint naming the registers they write. Arms over hand-built MIR: the
+# operand list and the constraint (both orders), the EMITTED call site through
+# allocation and callconv (both orders and an interleaved float/int mix), and a
+# binary128 past v7 refused by name, never '<deferred>'.
+dss_add_test(NAME lir/test_lir_aapcs64_mixed_fp_call
+             SOURCES test_lir_aapcs64_mixed_fp_call.cpp)

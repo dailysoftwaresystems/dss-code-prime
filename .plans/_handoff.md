@@ -69,13 +69,102 @@ below is IN it.
 
 ---
 
-**Last updated:** 2026-09-18 — cycles **P14 … P68** (round 6 of P68 landed; its block heads §0.0). ✔**P66 IS COMPLETE AND LANDED.** PR #57 MERGED 2026-09-15T21:22:25Z as `e8dbc3c5` on `main`, and `main` is now `adf254c7` (`v0.5.0`) — ✔MEASURED at `305604f1` with `gh pr view 57 --json state,mergedAt` and `git log --oneline origin/main -3`. The `packed_atomic_member_concurrency` P0 that lane `bl` was working is no longer open: ✔MEASURED, `bash scripts/anchors/read-anchors.sh --production --open --band P0` reports **0 rows**. ⚠ The block that used to stand here said P66 was incomplete and named that P0 as the reason; both halves are discharged. **§0.0 below is the live state; everything under `§0.1 — P66 RAN IN TWO HALVES` is P66's own record.**
+**Last updated:** 2026-09-19 — cycles **P14 … P68** (round 7 of P68 landed; its block heads §0.0). ✔**P66 IS COMPLETE AND LANDED.** PR #57 MERGED 2026-09-15T21:22:25Z as `e8dbc3c5` on `main`, and `main` is now `adf254c7` (`v0.5.0`) — ✔MEASURED at `305604f1` with `gh pr view 57 --json state,mergedAt` and `git log --oneline origin/main -3`. The `packed_atomic_member_concurrency` P0 that lane `bl` was working is no longer open: ✔MEASURED, `bash scripts/anchors/read-anchors.sh --production --open --band P0` reports **0 rows**. ⚠ The block that used to stand here said P66 was incomplete and named that P0 as the reason; both halves are discharged. **§0.0 below is the live state; everything under `§0.1 — P66 RAN IN TWO HALVES` is P66's own record.**
 
 ---
 
 # §0 — RESUME HERE (a session with no context reads this block first)
 
 ## §0.0 — STATE
+
+### ★ P68 ROUND 7 — READ THIS FIRST: six lanes folded, the "MSVC" leg is MSVC again, and the migration's last wave waits for repo-harness round four
+
+⚠ **ROUND 6's GATE TABLE BELOW MISLABELS ITS WINDOWS RELEASE LEG.** It says *"MSVC Release"*; it was
+**MinGW gcc**. ✔MEASURED 2026-09-18 (lane `rw`, confirmed by the orchestrator): the tree DssHarness
+built as `build/x86_64-msvc-release` named `C:/Strawberry/c/bin/c++.exe` (GNU 13.2.0) in its
+`CMakeCache.txt` — the same compiler as the Debug leg. `toolchains.msvc` declared no compiler, DssHarness
+has no way to establish a Visual Studio developer environment, and nothing checked what CMake resolved,
+so CMake took PATH's first compiler — in every DssHarness gate since the migration. The scripts-era
+`build/msvc` tree WAS real cl 14.51, and CI's `windows-msvc-release` still is (`ilammy/msvc-dev-cmd`).
+**Fixed on our side this round:** `toolchains.msvc` declares `CC=cl`/`CXX=cl`, so a host outside a VS
+environment is refused by name instead of silently building gcc; the gate's Windows Release leg runs as
+its own invocation inside an imported `vcvars64` environment (`vswhere` → `vcvars64.bat`, the same
+import CI's action does), on a fresh tree, and its `CMAKE_CXX_COMPILER` is read before any figure is
+quoted. The developer-environment capability and a compiler-identity check are REPORTED to repo-harness
+(not in round four).
+
+**THE LANES THIS COMMIT CARRIES**, each folded md5-verified against its lane, its `repo-guard` label run
+on its tree before the fold, and its rows applied through `dssharness {write,set}-anchor`:
+
+| lane | subject | what landed |
+|---|---|---|
+| `dl` | phantom optimized arms | an arm on a target no host runs is COMPILED and judged against its baseline (six manifests, not the seven round 6 counted); the four dynamic-library examples RUN on Linux through a per-target `loaderSearchPathVariable` both runners honour; `integrated_tests/` citations drained 24 ids → 0 |
+| `rw` | Windows rename-over race + the dependency cache | `linker::detail::commitReplacing` (POSIX-semantics replace, bounded wait, holder named); then five rows born closed on the dependency cache — two **P1**: a broken `.dss-deps/<name>/.git` let the cache run `checkout --force` on the USER's repository, and git's own `GIT_INDEX_FILE` (a build inside a git hook) let it write the USER's index |
+| `cr` | real-corpus compile time + citations + test costs | Mem2Reg rebuilt whole-module dominance per function: release `sqlite3.c` 287.6 → 138.0 G instructions; the struct-CF self-loop reach narrowed (−10% more); a compile's stderr AND VERDICT no longer depend on runtime-cache warmth; 122 substring-only citations made exact; `vcvars` entered once per test process and the UNC pin moved off `%TEMP%` |
+| `fo` | AArch64 frame reach, asm operands, x18 | frame accesses past every encodable reach take a far form; a **P0**: register-bound asm operands living in memory received their ADDRESS (147 of 148 reference-run shapes now correct, register pairs realized); `x18` no longer allocated on Apple arm64 (3 corpus binaries wrote it); an AArch64 call mixing `long double` and `double` now runs |
+| `vn` | the long-reach branch veneer | designed from MEASURED GNU ld / ld.lld / ld64.lld behaviour: `x16`-scratch ADRP veneers, one per target per reachable window, placed in one forward sweep with a place-behind fallback, import stubs visible to the planner; lane `il`'s 212,992-statement program links on all three arm64 executable formats and runs under qemu |
+| `mig` | the migration's last wave | ⛔ **NOT folded — HELD for repo-harness round four** (0.5.7's sync would leave every moved guard missing on WSL, the VPS and the Mac). Taken ahead of it, byte-identical: `cmake/DssTestBudgets.cmake`'s re-derived rows and the `toolchains.msvc` truth. Its release-day kit is preserved at `.temp/p68-lanes/mig/release-day/` |
+
+**Also (orchestrator):** CI's test legs now install DssHarness (`actions/setup-dotnet@v6` + a pinned
+`dotnet tool install` whose REPORTED version is checked) — without it every CI test leg failed both
+harness-driven guards, a MERGE BLOCKER this cycle's round 6 introduced; `examples/c/deep_stmt_mir`'s
+`t()` is now `noinline` (its release arm had folded all 250 levels away while its prose said it could
+not) and its local-variable twin is a new example; three stale refusal sentences the post-fold guard run
+found; `src/asm/branch_island.hpp` deleted (no users after `vn`); the wrapped-id inventory and the doc
+census re-derived with their own `--write`.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **580 open against 584 at HEAD**,
+banding **P0 0 · P1 61 · P2 180 · P3 324 · P4 11 · P5 4**. **Closed 22** — 7 open at HEAD (two P1s among
+them) and 15 born closed; **disclosed 3**, each measured to pre-date the round:
+`D-HIR-TEXT-STRUCTURAL-TYPE-SPELLING-EXPLODES-ON-REAL-C`, `D-HIR-TEXT-ROUND-TRIP-EXPRSTMT-IN-EXPRESSION-POSITION`,
+`D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH`.
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.7) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2 · **2238 / 2238** | **MSVC 19.51** (`cl` 14.51.36231, read from the tree's own `CMakeCache.txt`) · **2238 / 2238** — see below |
+| WSL x86_64, gcc | **2237 / 2237** | **2237 / 2237** |
+| arm64 VPS, gcc | **passed** (1h32m) | **passed** (1h19m) |
+| macOS arm64, clang | ⛔ **BLOCKED ON repo-harness round four** (merged, not deployed): `poisoned`, `cmake` not on the non-login PATH | ⛔ same |
+
+- **The first real MSVC build since the migration** failed on exactly ONE MSVC-only error:
+  `tests/lir/test_lir_asm_carried_operand.cpp` compared `json == std::string_view` — ambiguous under C++20
+  on MSVC (C2666: json's `operator==` against the synthesized reversed `string_view` comparison), where gcc
+  picks one. Fixed; a keep-going build of every remaining edge then found **0** more.
+- Its next attempt passed the build and then **failed DssHarness's post-build ninja dependency check** on
+  two CORRECT objects — `rule_id.cpp.obj` and `pch_stub.cpp.obj`, `#deps 0 (VALID)`, each compiled
+  `/Yu` + `/FI` with no `#include` of its own. The check's own excuse for exactly this never fires: it
+  reads `deps = msvc` from `build.ninja` (CMake writes it to `CMakeFiles/rules.ninja`, 1,539 times) and
+  uses the edge's ninja-escaped `C$:\…` source path raw. REPORTED to repo-harness. The suite then ran
+  through `test --no-build` on that tree: 2238 / 2238. ⚠ That tree was configured by DssHarness; its
+  objects were compiled by the same ninja and `build.ninja` in the same environment, partly by DssHarness's
+  first attempt and partly by a direct keep-going `cmake --build`.
+- **Gate run 1 measured the tree before that one-line test fix.** The changed test was re-run at the
+  committed tree on the MinGW and WSL Debug legs (`test --filter`): passed on both.
+- VPS counts stay on that host; by arithmetic, not measurement, each ran **2202** (2237 minus the
+  35-entry `repo-guard` label the ssh legs exclude).
+- The Windows Debug leg's `timings suspect: it ran 2238 test(s), where 2 other leg(s) ran 2237` is a
+  mislabelled count difference (one Windows-only test), reported as a wording defect.
+
+**DssHarness.** Round four is MERGED upstream (repo-harness PRs #9 and #10) and NOT deployed. Reported this
+round and not in round four: the Visual Studio developer environment and the resolved-compiler check;
+an id wrapped just BEFORE a hyphen (the hyphen opening the next line) escapes round four's cut rule;
+nine items from lane `mig` (Addendum 3, in progress there). ⚠ Round four's `check-anchor-citations` matches
+EXACTLY and reports every wrapped id as cut: the loose citations and wrapped ids in `src/` are drained
+this round; the 25 wrapped ids left are all in files `mig`'s held fold rewrites.
+
+**NEXT — P68 ROUND 8.** On repo-harness round four's release: update the tool on every host, run `mig`'s
+release-day kit in its `ORDER.txt` order (managed ignore block, `pathBudgetReserve` 168 / margin 2), fold
+`mig`, bump CI's `0.5.7` pin WITH the release, then the eight-leg gate with the Mac back. Lanes:
+`vn` part 2 (a veneer target past ±4 GiB — GNU ld links it for exec, PIE and shared); `fo` part 3 (a
+`register` local with an asm label is ignored and gives the wrong value; a stack-passed `long double`
+argument; a `_Complex long double` return; `__SIZEOF_LONG_DOUBLE__`); `cr` part 4 (the include resolver
+lists every ancestor directory per resolution, uncached — 209 s under load over SMB; one more test
+entering `vcvars` itself); the three disclosed rows above; `tests/examples/loader_search_path.hpp` into
+`tests/test_support`.
+
+---
 
 ### ★ P68 ROUND 6 — READ THIS FIRST: the tool is 0.5.7, and seven lanes landed
 
@@ -132,7 +221,7 @@ applied in the four documents that still called the deleted launchers "the only 
 
 | leg | Debug | Release |
 |---|---|---|
-| Windows x86_64 (MinGW Debug · MSVC Release) | run 1 **2214 / 2214** · re-run on the final tree **2213 / 2214**: `lane_worktree_guard` TIMEOUT 314.64 s with four legs on the host — alone, as a control, it PASSES in 139.66 s | run 1 **2213 / 2214**: `FrontHalfMultiTuPoolIsRepeatStable`, the rename race below · re-run on the final tree **2214 / 2214** |
+| Windows x86_64 (MinGW Debug · ⚠ **MinGW** Release, labelled "MSVC" — see round 7) | run 1 **2214 / 2214** · re-run on the final tree **2213 / 2214**: `lane_worktree_guard` TIMEOUT 314.64 s with four legs on the host — alone, as a control, it PASSES in 139.66 s | run 1 **2213 / 2214**: `FrontHalfMultiTuPoolIsRepeatStable`, the rename race below · re-run on the final tree **2214 / 2214** |
 | WSL x86_64, gcc | run 1 2211 / 2213: the bytecode husk · re-run **2213 / 2213** | run 1 2211 / 2213: the husk · re-run **2213 / 2213** |
 | macOS arm64, clang | ⛔ **BLOCKED ON repo-harness** — `poisoned`, see below | ⛔ same |
 | arm64 VPS, gcc | **passed** (1h29m) | **passed** (1h16m) |

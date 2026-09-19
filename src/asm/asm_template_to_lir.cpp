@@ -1451,6 +1451,33 @@ struct AsmInstructionLowering::Impl {
                 return std::nullopt;
             }
         }
+        // ★★★ A `pairSecond` LETTER SELECTS THE OPERAND'S **SECOND** REGISTER
+        // (D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED) — aarch64 `%H0`,
+        // ✔MEASURED to name the second x-register of a 16-byte value under gcc
+        // 13.3.0. A scoped letter has passed the class check above; scoped or
+        // not, a pair lives in the one file its operand is bound in, so what
+        // this adds is WHICH register, and the refusal when there is none:
+        // answering with the FIRST register would hand the template the low half
+        // where it asked for the high one — a silent wrong value, the defect the
+        // pair binding exists to remove.
+        if (view != nullptr && view->selectsPairSecond) {
+            if (resolved.operandKind != OperandKindFilter::Reg
+                || !resolved.pairReg.valid()) {
+                sink_.fail(node,
+                     std::format("'{}' names the SECOND register of a "
+                                 "two-register operand through letter '{}', "
+                                 "and the operand is bound to {} — only a value "
+                                 "wider than one register of its class is "
+                                 "carried in two registers{}",
+                                 writtenFull, view->letter,
+                                 resolved.operandKind != OperandKindFilter::Reg
+                                     ? std::string{"a non-register form"}
+                                     : std::string{"ONE register"},
+                                 sink_.pairSuffix()));
+                return std::nullopt;
+            }
+            resolved.reg = resolved.pairReg;
+        }
         switch (resolved.operandKind) {
             case OperandKindFilter::Reg:
                 break;
@@ -3494,6 +3521,9 @@ public:
             // themselves and no constraint letter is in play.
             out.hasImmediate = b->hasImmediate;
             out.value        = b->value;
+            // The second register of a two-register operand travels the same
+            // way — `decodePlaceholder` selects it for a `pairSecond` letter.
+            out.pairReg      = b->pairReg;
             // ★★★ AND THE WIDTH IS **DERIVED** RATHER THAN COPIED, WHICH IS THE
             // ONE FACT ABOUT AN OPERAND REFERENCE THE CALLER CANNOT SUPPLY. The
             // binding says how wide the OPERAND is; the target says which VIEW

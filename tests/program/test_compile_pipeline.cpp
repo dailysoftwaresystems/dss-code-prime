@@ -25,7 +25,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/phase_timers.hpp"   // c97: per-phase --time pin
-#include "core/substrate/thread_pool.hpp"    // D-PERF-4: executor injection (pool vs synchronous)
+#include "core/substrate/thread_pool.hpp"    // D-PERF-4-CU-PARALLELISM: executor injection (pool vs synchronous)
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
@@ -236,7 +236,7 @@ TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
 // attributed total is a plausible nonzero. RED-on-disable: deleting any
 // instrumented Scope zeroes that phase's run count and the matching
 // EXPECT fails — including the three preprocess sub-phases (splice /
-// tokenize / expand, D-PERF-1), which run for ANY C compile. (Phases a
+// tokenize / expand, D-PERF-1-PREPROCESSOR), which run for ANY C compile. (Phases a
 // trivial source legitimately skips — the STANDALONE tokenize [c
 // preprocesses, so its tokenize is the preprocess-tokenize sub-phase],
 // reparse [no ambiguous cast], synthesize-ffi [no externs] — are
@@ -1780,7 +1780,7 @@ TEST(Program_Transpile, SuppressedPlanNotLandedStillReturnsNonZero) {
         1);
 }
 
-// D-FF2-UNSUPP gate pin 2026-06-01: pins that the unsuppressable
+// Unsuppressable-code gate pin 2026-06-01: pins that the unsuppressable
 // gate keeps `H_ExternHasInitializer` visible through the full
 // post-CLI pipeline even when `--suppress=H_ExternHasInitializer`
 // is set. Reporter-level unit tests cover the gate at the policy
@@ -2660,8 +2660,8 @@ TEST(Program_CompileFiles, ThreadLocalEmitsPtTlsAndFsAccessSequence) {
     // assertion that notices a segment nobody meant to add — so it must be
     // updated deliberately, WITH the composition written out, whenever the
     // image legitimately gains one. It went 6 -> 7 when `.eh_frame_hdr` and
-    // its segment landed (D-UNWIND-NO-EH-FRAME-...); the two property pins
-    // below are what actually say WHICH segments those are.
+    // its segment landed (D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO);
+    // the two property pins below are what actually say WHICH segments those are.
     EXPECT_EQ(rdU16(bytes, 56), 7u);
     EXPECT_NE(findPhdrOfType(bytes, kPtGnuEhFrame), 0u)
         << "PT_GNU_EH_FRAME must be present — without it the process's own "

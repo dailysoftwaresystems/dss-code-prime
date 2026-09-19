@@ -134,7 +134,7 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
         if (bf.ok) return ok(std::move(bf.value));
         return fail(bf.failure, expr);
     }
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — the CRIT-3 belt, CST side. The HIR
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94) — the CRIT-3 belt, CST side. The HIR
     // walker's twin keys on the RESULT TypeId; this engine is interner-free, so it
     // keys on the OPERANDS instead: if either is 128-bit-cored and the bignum
     // above declined, the int64 path below would fold it mod 2^64 — silently. The
@@ -218,7 +218,7 @@ combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& optio
         if (uf.ok) return ok(std::move(uf.value));
         return fail(uf.failure, expr);
     }
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the unary twin of the binary belt above.
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): the unary twin of the binary belt above.
     if (detail::isInt128Kind(inner.value->core)) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
@@ -871,7 +871,7 @@ evalNode(NodeId                              expr,
             }
             return fail(ConstEvalFailure::NotAConstantExpression, expr);  // (T*)<nonzero>
         }
-        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): a cast to a 128-bit integer routes
+        // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a cast to a 128-bit integer routes
         // through the bignum, exactly like the `_BitInt` arm above — checked
         // BEFORE the generic `isInteger` arm, which would otherwise narrow the
         // value through `narrowIntToBits` into an int64 and tag it I64/U64. That
@@ -1594,7 +1594,7 @@ classifyCstCastTarget(TypeInterner const& in, TypeId ty,
         case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
         case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
         case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
-        // ★ D-CSUBSET-INT128-CONSTFOLD (TF-C94): the two 128-bit STANDARD kinds.
+        // ★ D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): the two 128-bit STANDARD kinds.
         // WITHOUT these rows they fell to `default: nullopt` and the whole cast was
         // non-foldable — which MEASURED as *every* 128-bit integer constant
         // expression refusing, not just wide ones:

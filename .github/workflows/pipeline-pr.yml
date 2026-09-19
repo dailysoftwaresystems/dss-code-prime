@@ -198,6 +198,40 @@ jobs:
         with:
           python-version: '3.x'
 
+      # DECLARED, NOT INHERITED, and here it is not even inherited by accident:
+      # no runner image ships DssHarness. `DSS_BUILD_TESTS=ON` registers
+      # `anchor_citations_guard` and `root_litter_guard` against the DssHarness
+      # that `find_program` resolves at CONFIGURE time (`dss_add_harness_guard`
+      # in the top-level CMakeLists.txt), and a host without it registers each
+      # of them as a REFUSAL — on purpose, because a guard that silently did not
+      # run would publish a figure about the host rather than the tree. So
+      # without these two steps every test leg fails on exactly those two
+      # entries. The tool is a .NET global tool built for net10.0, so its SDK is
+      # declared too rather than trusted to the image.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install DssHarness
+        # PINNED to the version this tree's gate ran, and bumped WITH the tree:
+        # a floating install would let a tool release change a gate verdict on a
+        # commit that changed nothing. The version the tool REPORTS is compared,
+        # not only the exit code, so an install that resolved anything else
+        # fails here by name instead of as a puzzling guard failure later. The
+        # tool is called by the path `dotnet tool install --global` gives it,
+        # because that directory is not on PATH until a later step.
+        env:
+          DSS_HARNESS_VERSION: '0.5.7'
+        run: |
+          set -euo pipefail
+          dotnet tool install --global DssHarness --version "$DSS_HARNESS_VERSION"
+          reported="$("$HOME/.dotnet/tools/dssharness" --version)"
+          if [ "$reported" != "$DSS_HARNESS_VERSION" ]; then
+            echo "::error::DssHarness reports '$reported', but this tree pins '$DSS_HARNESS_VERSION'."
+            exit 1
+          fi
+        timeout-minutes: 5
+
       - name: Configure Git for private dependencies
         run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "git@github.com:"
 

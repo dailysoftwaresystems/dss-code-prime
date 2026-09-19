@@ -62,7 +62,7 @@ using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 // Two subtrees built under the SAME schema compare equal iff they have identical
 // shape + spelling — used to prove a cast resolved by the FIRST-PARSE SEED is
 // structurally IDENTICAL to the SAME cast resolved by the finish() oracle
-// reparse (D-PERF-2 Opt-4 one-directional parity).
+// reparse (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION, Opt-4 one-directional parity).
 void subtreeSig(Tree const& t, NodeId n, std::string& out) {
     if (isEmptySpace(t.flags(n))) return;
     if (t.kind(n) == NodeKind::Token) {

@@ -4325,8 +4325,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                           "unresolvable shape reference. Declare the role with a "
                           "lexeme, or drop the binding and the grammar that "
                           "spells it "
-                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
-                          "CONFIG-OWNER)",
+                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER)",
                           origin, key, hostLabel, modeName, bound->second,
                           bound->second));
             continue;
@@ -4500,8 +4499,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                       "table: it synthesizes one row per template role from "
                       "'{}'s 'semantics.{}'. Declare the mode with no 'tokens' "
                       "of its own "
-                      "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
-                      "CONFIG-OWNER)",
+                      "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER)",
                       hostLabel, modeName, origin,
                       kInlineAsmTemplateLexemesKey));
         return;
@@ -4554,8 +4552,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                           "row; declare only the capability ('templateLexerMode' "
                           "+ 'templateOperandRule') and the kind binding in "
                           "'bindTokens' "
-                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
-                          "CONFIG-OWNER)",
+                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER)",
                           hostLabel, modeName, why, clash,
                           kInlineAsmTemplateLexemesKey, origin));
         }
@@ -17661,9 +17658,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                   "nothing can ever mint");
                         assemblyClean = false;
                     } else {
-                        static constexpr std::array<std::string_view, 3>
+                        static constexpr std::array<std::string_view, 4>
                             kModifierKeys{"letter", "widthBits",
-                                          "registerClass"};
+                                          "registerClass", "selects"};
                         DSS_CHECK_KEY_VOCABULARY(kModifierKeys);
                         // ⚠ THE WIDTHS ARE THE ONES `lirInstWidthBits` CAN
                         // STATE, and the check is not pedantry: a width
@@ -17841,6 +17838,43 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else if (!firstUnscoped.has_value()) {
                                 firstUnscoped = index - 1;
                             }
+                            // ── the optional REGISTER SELECTOR ──────────────
+                            //
+                            // ★ A CLOSED SET OF ONE: `"pairSecond"` — the
+                            // letter names the SECOND register of a
+                            // two-register operand (see `AsmTemplateModifier::
+                            // selectsPairSecond`). Any other spelling is
+                            // refused: a selector the engine does not know
+                            // would load as a plain view of the FIRST
+                            // register, the silent wrong register this key
+                            // exists to name. It is INDEPENDENT of the class
+                            // scope: a pair lives in the one file its operand
+                            // is bound in, and the template engine refuses the
+                            // letter on any operand the target did not carry
+                            // as a pair — so a width-only (all-unscoped)
+                            // document may declare it like any other letter,
+                            // and a scoped one scopes it like any other.
+                            bool selectsPairSecond = false;
+                            if (m.contains("selects")) {
+                                if (!m.at("selects").is_string()
+                                    || m.at("selects").get<std::string>()
+                                           != "pairSecond") {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/selects",
+                                        std::format(
+                                            "template modifier '{}' declares "
+                                            "'selects' as something other than "
+                                            "\"pairSecond\" — the one register "
+                                            "selector this pipeline realizes "
+                                            "(the second register of a "
+                                            "two-register operand)",
+                                            letter));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                selectsPairSecond = true;
+                            }
                             std::string lexeme =
                                 cfg.templatePlaceholderLexeme + letter;
                             bool duplicate = false;
@@ -17864,7 +17898,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             cfg.templateModifiers.push_back(
                                 AssemblyConfig::AsmTemplateModifier{
                                     letter, std::move(lexeme), width,
-                                    std::move(regClass)});
+                                    std::move(regClass), selectsPairSecond});
                         }
                         // ★★★ THE PER-DIALECT ALL-OR-NOTHING RULE. A document
                         // either scopes EVERY letter (aarch64: the wrong-class

@@ -1531,8 +1531,7 @@ void expectMemberFormatResolvesToTheWriterDocument(Schemas const&   s,
         << familyLabel
         << ": resolving the LINK's own image format is the defect itself — the "
            "member read must never fall back to the artifact being produced "
-           "(D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-"
-           "FORMAT)";
+           "(D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT)";
 }
 
 // The ELF instance, exactly as the anchor recorded it: a member that CALLS A
@@ -1794,8 +1793,7 @@ TEST(ArchiveMemberObjectFormat,
     EXPECT_NE(text.find(archivePath.filename().string()), std::string::npos)
         << text;
     EXPECT_NE(text.find("elf64-x86_64-linux-exec"), std::string::npos) << text;
-    EXPECT_NE(text.find("D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-"
-                        "THE-OBJECT-FORMAT"),
+    EXPECT_NE(text.find("D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT"),
               std::string::npos) << text;
     // And it must name the caller, not the runtime object cache the shared
     // resolver was first written for.

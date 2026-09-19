@@ -358,6 +358,13 @@ pltStubSizeFor(std::uint16_t machine) noexcept {
     return 0u;  // caller's machine-guard already rejected unknowns
 }
 
+// The `.plt` section's alignment — ONE constant, because two readers depend on
+// it agreeing: the dynamic writer's layout (`pltOff`) and its header row, and
+// `importCallStubLayout`, which the branch-veneer pass reads to measure an
+// import-bound call
+// ([[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]).
+constexpr std::uint64_t kPltSectionAlign = 16u;
+
 // Per-machine GOT-slot relocation type.
 [[nodiscard]] constexpr std::uint32_t
 globDatTypeFor(std::uint16_t machine) noexcept {
@@ -1208,8 +1215,8 @@ encodeElfExecDynamic(
                      + "' declares required symbol version '" + ver
                      + "' but its owning library '" + lib
                      + "' has no DT_NEEDED entry -- a versioned import must "
-                       "bind a concrete needed library (D-LK-ELF-SYMBOL-"
-                       "VERSIONING).");
+                       "bind a concrete needed library ("
+                       "D-LK-ELF-SYMBOL-VERSIONING).");
             return {};
         }
         std::size_t const libIndex =
@@ -1777,7 +1784,7 @@ encodeElfExecDynamic(
 
     // Subsequent sections in PT_LOAD #1; VA = baseImageVa + fileOff
     // (PT_LOAD with fileoff=0 and vaddr=baseImageVa maps verbatim).
-    std::uint64_t const pltOff = alignUp(rodataOff + rodataSz, 16);
+    std::uint64_t const pltOff = alignUp(rodataOff + rodataSz, kPltSectionAlign);
     std::uint64_t const pltVa  = baseImageVa + pltOff;
     std::uint64_t const pltSize = plt.size();
 
@@ -2043,12 +2050,39 @@ encodeElfExecDynamic(
     // 16-byte ADRP+LDR+BR+NOP. c84: FUNCTION externs only — the stub
     // + GOT slot ordinal is `externSlot[i]` (data externs own no PLT
     // presence at all).
+    // ★ [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]:
+    // the branch-veneer pass measured every import-bound call against
+    // `importCallStubLayout`'s bound BEFORE this layout existed. Assert the
+    // stub really lies within it — a stub past its bound is a call the pass
+    // judged in reach that may not be, and the two layout answers must not
+    // drift apart silently.
+    auto const stubBound = importCallStubLayout(module, fmt);
+    std::uint64_t const textEndVa = textVa + text.size();
     for (std::size_t i = 0; i < numExterns; ++i) {
         if (module.externImports[i].isData) continue;
         std::size_t const slot = externSlot[i];
         std::uint64_t const stubVa = pltVa + slot * pltStubSize;
         std::uint64_t const slotVa = gotVa + slot * 8;
         std::size_t   const stubOffset = slot * pltStubSize;
+        auto const bound =
+            stubBound.maxPastTextEnd.find(module.externImports[i].symbol);
+        if (bound == stubBound.maxPastTextEnd.end() || stubVa < textEndVa
+            || stubVa - textEndVa > bound->second) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("elf::encodeElfExecDynamic: import '{}''s `.plt` "
+                             "stub lands {} bytes past the end of `.text`, "
+                             "outside the bound {} that `importCallStubLayout` "
+                             "reported for it — the branch-veneer pass measured "
+                             "calls to it against that bound, so the two "
+                             "descriptions of this layout have diverged "
+                             "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
+                             module.externImports[i].mangledName,
+                             stubVa >= textEndVa ? stubVa - textEndVa : 0,
+                             bound == stubBound.maxPastTextEnd.end()
+                                 ? std::string{"<none>"}
+                                 : std::to_string(bound->second)));
+            return {};
+        }
         if (!emitPltStub(machine, plt, stubOffset, stubVa, slotVa, reporter)) {
             return {};
         }
@@ -3236,7 +3270,7 @@ encodeElfExecDynamic(
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsPlt, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
         .addr = pltVa, .offset = pltOff, .size = pltSize,
-        .addr_align = 16});
+        .addr_align = kPltSectionAlign});
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsDynsym, .type = SHT_DYNSYM, .flags = SHF_ALLOC,
         .addr = dynsymVa, .offset = dynsymOff, .size = dynsymSz,
@@ -3436,6 +3470,59 @@ encodeElfExecDynamic(
 }
 
 } // namespace
+
+// ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
+//
+// The bound follows the dynamic writer's own layout, term by term:
+//   `.text` │ pad to `.rodata`'s alignment │ `.rodata` │ pad to
+//   `kPltSectionAlign` │ `.plt`, one `pltStubSizeFor(machine)` stub per
+//   FUNCTION import in `externImports` order (a data import owns no stub).
+// Each pad is at most its alignment minus one, and `.rodata`'s span at most
+// the sum over its items of (alignment - 1 + size) — so the bound holds for
+// every `.text` size, which is what the veneer pass needs: it inserts veneers
+// into `.text` after reading this. `encodeElfExecDynamic` asserts every stub
+// against it when it lays the `.plt` out.
+//
+// Empty for the flavors `encode` routes elsewhere: ET_REL, and an ET_EXEC with
+// no import (the static writer, which emits no `.plt`).
+link::ImportCallStubLayout
+importCallStubLayout(AssembledModule const&    module,
+                     ObjectFormatSchema const& objectFormatSchema) {
+    link::ImportCallStubLayout out;
+    auto const& fmt = objectFormatSchema;
+    if (fmt.backend() != &link::format::elfBackend()) return out;
+    bool const dynamicWriter =
+        fmt.elf().objectType == ElfObjectType::Dyn
+        || (fmt.elf().objectType == ElfObjectType::Exec
+            && !module.externImports.empty());
+    if (!dynamicWriter) return out;
+    std::uint64_t const stubSize = pltStubSizeFor(fmt.elf().machine);
+    if (stubSize == 0) return out;  // the writer refuses this machine itself
+
+    auto const* secRodata = fmt.sectionByKind(SectionKind::Rodata);
+    std::uint64_t maxAlign = secRodata != nullptr
+                                 ? std::max<std::uint64_t>(1, secRodata->addrAlign)
+                                 : 1;
+    std::uint64_t span = 0;
+    bool hasRodata = false;
+    for (auto const& d : module.dataItems) {
+        if (d.section != DataSectionKind::Rodata) continue;
+        hasRodata = true;
+        std::uint64_t const align = d.alignment.bytes();
+        maxAlign = std::max(maxAlign, align);
+        span += (align - 1) + d.sizeInSection();
+    }
+    std::uint64_t const lead =
+        (hasRodata ? (maxAlign - 1) + span : 0) + (kPltSectionAlign - 1);
+
+    std::uint64_t slot = 0;
+    for (auto const& ext : module.externImports) {
+        if (ext.isData) continue;
+        out.maxPastTextEnd.emplace(ext.symbol, lead + slot * stubSize);
+        ++slot;
+    }
+    return out;
+}
 
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,

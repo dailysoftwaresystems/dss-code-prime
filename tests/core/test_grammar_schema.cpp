@@ -2459,7 +2459,7 @@ TEST(GrammarSchema, AttributeEffectAlignLoads) {
 // the message can no longer drift from the vocabulary in either direction, and
 // the fix that makes this pass is deriving one from the other.
 TEST(GrammarSchema, AttributeEffectUnknownVerbListsExactlyTheAcceptedSet) {
-    // TF-C78 (D-CSUBSET-NOINLINE) added `noInline`; TF-C81
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK) added `noInline`; TF-C81
     // (D-CSUBSET-ALWAYSINLINE) added `alwaysInline`; TF-C92
     // (D-CSUBSET-NO-SANITIZE-THREAD) added `noSanitizeThread`; P44 lane h
     // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN) added

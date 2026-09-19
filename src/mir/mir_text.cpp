@@ -990,7 +990,7 @@ private:
         out_ += '\n';
     }
 
-    // TF-C78 (D-CSUBSET-NOINLINE): the function-attribute list — the per-MirFunc
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the function-attribute list — the per-MirFunc
     // metadata that is NOT recoverable from the symbol + signature alone.
     //
     // ★ THIS PRINTER PREVIOUSLY DROPPED `binding` AND `visibility` OUTRIGHT.
@@ -2429,7 +2429,7 @@ private:
         std::uint32_t const sym = parsePercentValue();
         if (!expect(TokKind::Colon)) return;
         TypeId const sig = parseType();
-        // TF-C78 (D-CSUBSET-NOINLINE): the optional `[...]` function-attribute
+        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the optional `[...]` function-attribute
         // list `appendFuncAttrs` emits. Unambiguous after the signature: types
         // bracket with `<>`, never `[]`. Absent ⇒ the (Global, Default, not-
         // noinline) defaults, which is what an un-annotated function prints as.

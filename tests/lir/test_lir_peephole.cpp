@@ -529,14 +529,18 @@ TEST(LirPeephole, ATargetMayDeclareA128BitEncodingVariantGuard) {
     // be the integer 8, 16, 32, or 64\", so a 128-bit vector encoding could not
     // be described at all. Mutating the FPR class MOVE is deliberate: it is the
     // exact row whose full-register copy the peephole cannot currently prove.
+    // The mutant keeps ONE variant: the shipped row is keyed at 32, 64 AND 128
+    // (a 128-bit `movaps` in an asm template), and three variants all guarded
+    // at 128 would be duplicates the loader rightly refuses.
     auto r = dss::test_support::mutateShippedTargetSchemaDoc(
         "x86_64", [](nlohmann::json& doc) {
             for (auto& op : doc.at("opcodes")) {
                 if (!op.is_object()) continue;
                 if (op.value("mnemonic", std::string{}) != "movaps") continue;
-                for (auto& v : op.at("encoding").at("variants")) {
-                    v.at("guard")["width"] = 128;
-                }
+                auto& variants = op.at("encoding").at("variants");
+                nlohmann::json one = variants.at(0);
+                one.at("guard")["width"] = 128;
+                variants = nlohmann::json::array({one});
             }
         });
     ASSERT_TRUE(r.has_value())

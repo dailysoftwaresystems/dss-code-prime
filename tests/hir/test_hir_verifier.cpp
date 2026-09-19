@@ -904,7 +904,7 @@ TEST(HirVerifier, CallArgWideningIsAssignableClean) {
     EXPECT_EQ(reporter.errorCount(), 0u);
 }
 
-// ── D-LANG-VARIADIC (step 13.4) variadic-arity arm ────────────────────────
+// ── D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) variadic-arity arm ────────────────────────
 //
 // The Call walker's arity check is a 3-way branch: variadic-too-few /
 // fixed-mismatch / clean. These three tests pin the matrix at the HIR

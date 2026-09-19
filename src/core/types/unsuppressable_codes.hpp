@@ -10,7 +10,7 @@
 
 namespace dss {
 
-// One row of the D-FF2-UNSUPP closed table: the protected code, and the
+// One row of the unsuppressable-codes closed table: the protected code, and the
 // reason it is protected — AS DATA, not as a comment beside it.
 //
 // ★ WHY THE RATIONALE IS A FIELD. This table has always required a written
@@ -101,7 +101,7 @@ struct UnsuppressableEntry {
     }
 };
 
-// D-FF2-UNSUPP: closed-table of DiagnosticCodes whose emission MUST reach the
+// The unsuppressable-codes closed table: DiagnosticCodes whose emission MUST reach the
 // reporter regardless of any `--suppress` policy. These codes' emission
 // gates `ok` / `errorCount()` / exit-code semantics — suppressing them
 // would silently re-open the failure surface they were introduced to

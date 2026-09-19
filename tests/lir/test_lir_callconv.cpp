@@ -62,8 +62,9 @@ struct RewrittenBundle {
 // `ccIndex` default `= 0` is a TEST-HARNESS convenience only — the
 // underlying `allocateRegisters` parameter is REQUIRED (no default)
 // per `src/lir/lir_regalloc.hpp`'s "no default" discipline,
-// which exists to prevent a future caller from inheriting the
-// pre-D-FF3-3 hardcode silently. Tests pinning ccIndex=1 behavior
+// which exists to prevent a future caller from inheriting, silently,
+// the hardcoded cc index 0 that D-FF3-3-RESOLVED-CC-INDEX-THREADED
+// replaced. Tests pinning ccIndex=1 behavior
 // must pass `1` explicitly; the default exists so the dozens of
 // pre-existing non-cc tests don't have to be rewritten.
 [[nodiscard]] RewrittenBundle
@@ -1045,7 +1046,7 @@ TEST(LirCallconv, X8664HighStackParamHasNoScaledImm12FrameOps) {
     EXPECT_FALSE(bundle.lowered.target->opcodeByMnemonic("store_u").has_value());
 }
 
-// D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) byte-pin.
+// D-AS3-BLOCK-REL-IMM19-26 (ARM64 conditional control-flow) byte-pin.
 //
 // HAND-BUILT LIR exercising the three control-flow opcodes (cmp / jcc / jmp)
 // directly through assemble(), laid out as a while-loop control-flow skeleton:
@@ -1312,7 +1313,6 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
                   static_cast<std::uint32_t>(layout.savedRegs.size()) * layout.slotSize);
         EXPECT_EQ(layout.spillAreaSize,
                   bundle.alloc.perFunc[i].numSpillSlots * layout.slotSize);
-        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
         // localAreaSize == numLocalAllocas * slotSize. Each body-
         // local declaration (`int a1; int r; ...`) emits one
         // `alloca` LIR op which the materialize pass rewrites to a
@@ -1323,7 +1323,7 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
                   layout.outgoingArgAreaSize + layout.savedRegAreaSize
                       + layout.spillAreaSize);
         // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY (2026-06-02) + D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7
-        // (2026-06-02) + D-CSUBSET-LOCAL-INT-CODEGEN (2026-06-02):
+        // (2026-06-02) + the local-alloca area (2026-06-02):
         // expected formula incorporates outgoingArgAreaSize directly
         // (already includes the callee's shadow-space when hasCalls)
         // AND the new localAreaSize above the spill area.
@@ -1433,8 +1433,7 @@ struct InstStats {
     // [SymbolRef] (the post-ML7-cycle-2 shape) or carries extra Reg
     // operands (the pre-cycle-2 shape — would fail at the assembler).
     std::uint32_t callsWithOnlySymbol = 0;
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
-    // post-materialize, EVERY `alloca` LIR op must be rewritten to
+    // Post-materialize, EVERY `alloca` LIR op must be rewritten to
     // a `lea result, [sp + offset]`. Survival of an `alloca` would
     // trip A_NoEncodingDeclared at the assembler. The 7-agent F3
     // audit added these counters + the per-lea-offset capture so
@@ -1563,7 +1562,7 @@ TEST(LirCallconvAbi, SingleArgFunctionEmitsMovFromArgGpr0) {
 }
 
 TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
-    // D-LANG-VARIADIC (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) post-fold MEDIUM-2: Win64 ms_x64
     // has NO equivalent to SysV's AL-count register — the loader
     // ABI uses vararg double-spill instead, which DSS does not yet
     // implement. A regression that copy-
@@ -1584,7 +1583,7 @@ TEST(LirCallconvAbi, MsX64CcDoesNotDeclareVariadicVectorCountReg) {
 }
 
 TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
-    // D-LANG-VARIADIC (step 13.4) substrate pin: the SysV AMD64 cc
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) substrate pin: the SysV AMD64 cc
     // on x86_64 MUST declare `variadicVectorCountReg` (rax / AL per
     // §3.5.7). Without this field, ML7 materialize skips the
     // pre-call `mov <countReg>, <fpCount>` and printf reads garbage
@@ -1600,7 +1599,7 @@ TEST(LirCallconvAbi, SysVCcDeclaresVariadicVectorCountReg) {
     ASSERT_TRUE(cc->variadicVectorCountReg.has_value())
         << "SysV AMD64 cc (cc index 0 on x86_64) MUST declare the "
            "variadic vector-count register per SysV §3.5.7 / "
-           "D-LANG-VARIADIC step 13.4.";
+           "D-LANG-VARIADIC-CALL-SUBSTRATE step 13.4.";
     // The register name must resolve in the target's register table
     // — a typo'd or non-existent name would silently cause the
     // ordinal to refer to the wrong physical reg. The loader sets
@@ -1917,7 +1916,7 @@ TEST(LirCallconvAbi, SysVVariadicCountsSpilledFpVarargTowardAl) {
 }
 
 TEST(CallPayload, EncodeDecodeRoundtripsVariadicAndFixedCount) {
-    // D-LANG-VARIADIC (step 13.4) substrate pin: the shared MIR/LIR
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4) substrate pin: the shared MIR/LIR
     // Call payload encoding (bit 31 = isVariadic; bits 0..29 =
     // fixedOperandCount) round-trips for both the non-variadic and
     // variadic cases. The ML7 materialize call arm reads these bits
@@ -2016,7 +2015,7 @@ TEST(LirCallconvAbi, CalleeArgReceivesFromArgGprAcrossSysVAndMsX64) {
 }
 
 TEST(LirCallconvAbi, CcIndex1DrivesDifferentArgGprThanCc0) {
-    // PINS: D-FF3-3 behavioral arm — companion to
+    // PINS: D-FF3-3-RESOLVED-CC-INDEX-THREADED behavioral arm — companion to
     // `LirRegAlloc.CcIndex1RecordsThroughToFuncAllocation`
     // (metadata pin, test_lir_regalloc.cpp) and
     // `CalleeArgReceivesFromArgGprAcrossSysVAndMsX64` (ccIndex=0
@@ -3751,7 +3750,7 @@ TEST(LirCallconv, NonLeafFunctionOnWin64CcReservesFullShadowSpaceFrame) {
     EXPECT_TRUE(fLayout->hasCalls);
 }
 
-// D-CSUBSET-LOCAL-INT-CODEGEN substrate-tier tests (7-agent fold F3,
+// Local-alloca frame-layout substrate-tier tests (7-agent fold F3,
 // 2026-06-02): the FrameLayoutInvariantsHoldPerFunction test pins
 // the layout-arithmetic invariant (localAreaSize == numLocalAllocas
 // * slotSize). It does NOT pin the materialize-loop's behavior:
@@ -5333,8 +5332,9 @@ TEST(LirCallconv, Aarch64HighOutgoingStackDoubleArgUsesScaledFpFrameStore) {
         << "an 80-double outgoing argument list must emit at least one fstr_u: "
            "the trailing arguments sit past the unscaled reach whatever the "
            "frame size. 0 means the chokepoint swaps only the integer file's "
-           "op — the defect D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-"
-           "MEMORY-FORM closed, in the direction its own lane could not pin.";
+           "op — the defect "
+           "D-TARGET-REGISTER-CLASS-OPS-HAVE-NO-LONG-REACH-MEMORY-FORM "
+           "closed, in the direction its own lane could not pin.";
 
     // The arm that separates "the swap fired" from "the swap fired CORRECTLY":
     // the INTEGER twin must not have been used for an FP store, which would put

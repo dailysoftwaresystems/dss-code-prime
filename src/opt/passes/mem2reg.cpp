@@ -406,6 +406,7 @@ public:
         promoted_.clear();
         allocaElementType_.clear();
         phisByBlock_.clear();
+        phiByMarker_.clear();
         phiIncomings_.clear();
         phiNewIdByMarker_.clear();
         loadReplacement_.clear();
@@ -602,6 +603,7 @@ private:
     std::unordered_set<std::uint32_t>            promoted_;            // alloca .v
     std::unordered_map<std::uint32_t, TypeId>    allocaElementType_;   // alloca .v → pointee type
     std::unordered_map<std::uint32_t, std::vector<PendingPhi>> phisByBlock_;  // block .v → phis to insert
+    std::vector<PendingPhi>                      phiByMarker_;         // markerV - 1 → the planned phi
     std::unordered_map<std::uint32_t, std::vector<PendingIncoming>> phiIncomings_;  // marker → incomings
     std::unordered_map<std::uint32_t, ReachingValue> loadReplacement_;  // load .v → reaching value
 
@@ -631,6 +633,16 @@ private:
     // sentinel). MODULE-scoped: never cleared by resetPerFunction.
     std::uint32_t nextSyntheticSymbol_ = 0;
     std::uint64_t lastLivenessNs_ = 0;  // env-gated timing of the Step-4b liveness fixpoint
+
+    // ── PASS-scoped dominance substrate (D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION) ──
+    // The whole-module predecessor map of `src_`, built ONCE — lazily, at the
+    // first function that reaches Step 3, so a module with nothing to promote
+    // never pays for it — and the scratch that makes each function's
+    // dominator tree, frontier and children cost O(function). Both are
+    // MODULE-scoped: never cleared by `resetPerFunction`.
+    std::vector<std::vector<MirBlockId>> preds_;
+    bool                                 predsBuilt_ = false;
+    MirDomScratch                        domScratch_;
 };
 
 void Mem2RegPolicy::analyze(MirFuncId fn) {
@@ -770,11 +782,31 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     }
     if (promoted_.empty()) return;
 
-    // Step 3: dom info.
-    auto const preds = mirBuildPredecessors(src_);
-    auto const dom   = computeMirDomTree(src_, entry, rpo, preds);
-    auto const df    = mirDominanceFrontier(src_, dom, preds);
-    auto const dchild = mirDomTreeChildren(src_, dom);
+    // Step 3: dom info — ONE function's answers, at ONE function's cost.
+    //
+    // D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION. This step used to
+    // build the predecessor map, the dominator tree, the frontier and the
+    // dominator children FRESH for every function, and each of those sweeps
+    // and allocates the WHOLE module — so the pass was O(functions × module
+    // blocks). ✔MEASURED on the sqlite amalgamation at `--config=release`:
+    // the unit pipeline's first Mem2Reg took 20.1 s of a 33.8 s optimize,
+    // growing ~quadratically with the module (168 ms at 46,784 instructions,
+    // 2,498 ms at 227,374, 20,105 ms at 590,178), and every live gdb sample
+    // inside it sat in those four helpers. CSE, LICM and the marker
+    // re-derivation already share one hoisted map and a `MirDomScratch` per
+    // pass call (D-OPT-DOMTREE-SCRATCH-REUSE); this pass was the caller that
+    // was never threaded. `src_` is the SAME module for every function of this
+    // pass call (the rebuild writes a new one), which is what makes the map
+    // and the scratch shareable. Byte-identical answers: the scratch overloads
+    // are differential-pinned against the fresh ones in test_mir_dom.cpp.
+    if (!predsBuilt_) {
+        preds_      = mirBuildPredecessors(src_);
+        predsBuilt_ = true;
+    }
+    auto const& preds  = preds_;
+    auto const& dom    = computeMirDomTree(src_, entry, rpo, preds, domScratch_);
+    auto const& df     = mirDominanceFrontier(src_, dom, preds, domScratch_);
+    auto const& dchild = mirDomTreeChildren(src_, dom, domScratch_);
 
     // gaveUp-block gate: an alloca whose def-blocks or IDF members
     // touch a `gaveUp`-flagged block (idom couldn't be resolved)
@@ -966,6 +998,7 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
             pp.markerV      = nextMarker_++;
             pp.blockOld     = idfB;
             phisByBlock_[idfB.v].push_back(pp);
+            phiByMarker_.push_back(pp);   // index markerV - 1 (markers start at 1)
         }
     }
 
@@ -981,14 +1014,18 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     // count is a silent miscompile (the phi joined fewer paths than
     // exist). Fail loud rather than emit a malformed phi.
     for (auto const& [markerV, incomings] : phiIncomings_) {
-        // Find the PendingPhi for this marker to learn its block.
+        // The PendingPhi for this marker, to learn its block — an INDEX, not a
+        // search. This used to scan every phi planned for the function once
+        // per phi: O(phis²) per function, the same search-inside-a-loop shape
+        // as the Step 3 defect above, one level down. Markers are minted
+        // sequentially from 1 per function, so `phiByMarker_[markerV - 1]` is
+        // that phi.
         MirBlockId block{};
         std::uint32_t aid = 0;
-        for (auto const& [blkV, pphis] : phisByBlock_) {
-            for (PendingPhi const& pp : pphis) {
-                if (pp.markerV == markerV) { block = pp.blockOld; aid = pp.allocaOldIdV; break; }
-            }
-            if (block.valid()) break;
+        if (markerV >= 1u && markerV - 1u < phiByMarker_.size()) {
+            PendingPhi const& pp = phiByMarker_[markerV - 1u];
+            block = pp.blockOld;
+            aid   = pp.allocaOldIdV;
         }
         if (!block.valid()) continue;  // dropped during gaveUp gate
         std::size_t expected = 0;

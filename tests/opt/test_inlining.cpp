@@ -167,7 +167,7 @@ Mir buildCallerCalleeModule(TypeInterner& interner, SymbolBinding calleeBinding,
     return std::move(mb).finish();
 }
 
-// TF-C78 (D-CSUBSET-NOINLINE): the `buildCallerCalleeModule` twin whose callee
+// TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the `buildCallerCalleeModule` twin whose callee
 // carries the `noInline` flag instead of a non-default binding. Deliberately
 // GLOBAL-bound so the ONLY thing that can refuse the splice is rule 2b — a Weak
 // or Local callee would confound the two refusals and the test would stay green
@@ -335,7 +335,7 @@ constexpr std::uint32_t kOverThresholdBody = kTestThreshold + 4;   // 12
 
 } // namespace
 
-// ── TF-C78 (D-CSUBSET-NOINLINE): a noinline callee is NOT inlined ──
+// ── TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): a noinline callee is NOT inlined ──
 // The §2.9 gate's rule 2b. The callee is GLOBAL-bound, a single-block
 // leaf, non-recursive, address-not-escaped and well under the cost
 // threshold — i.e. it satisfies EVERY other rule, so the flag is the

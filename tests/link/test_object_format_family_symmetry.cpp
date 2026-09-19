@@ -428,8 +428,7 @@ TEST(ObjectFormatFamilySymmetry, EveryMachoFormatDeclaresItsDataSectionsWithThei
                    "item of that kind with K_NoMatchingObjectFormat before "
                    "any walker runs — on a `rodata` regression that is every "
                    "TU carrying a string literal "
-                   "(D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-"
-                   "ABSENT).";
+                   "(D-CONFIG-MACHO-X86_64-DARWIN-SUPPORTED-DATA-SECTIONS-ABSENT).";
         }
 
         // (b) THE WALKER'S ROWS. Mach-O segment/section names carry no arch

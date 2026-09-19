@@ -1,8 +1,8 @@
 // PIN-LK6-14-PAYLOAD-PIN: direct unit tests for the chained-fixups
 // payload builder hoisted from macho.cpp at the d312c1c audit fold.
 // Pins byte-structure invariants of the LC_DYLD_CHAINED_FIXUPS
-// __LINKEDIT payload independently of the encodeExec* integration —
-// D-LK6-14-INTEGRATION will call this same primitive, so any
+// __LINKEDIT payload independently of the encodeExec* integration,
+// which calls this same primitive (D-LK6-14-INTEGRATION-PAYLOAD), so any
 // regression here would propagate to every chained-fixups binary.
 //
 // Coverage:

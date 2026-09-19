@@ -317,7 +317,7 @@ lowerToMir(Hir const&               hir,
            // inliner callee-refusal) consult (noreturn is HIR-discharged and never
            // reaches MIR; returns-twice MUST, so it needs this flag).
            HirReturnsTwiceMap const* returnsTwiceMap = nullptr,
-           // TF-C78 (D-CSUBSET-NOINLINE): per-FUNCTION-DECLARATION inliner
+           // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): per-FUNCTION-DECLARATION inliner
            // opt-out side-table, populated by the CST→HIR lowerer from each
            // function's bound symbol `SymbolRecord.isNoInline`. Optional:
            // nullptr (or a decl with no entry) ⇒ freely inlinable, which is the

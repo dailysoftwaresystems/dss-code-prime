@@ -1212,6 +1212,6 @@ TEST(BinaryReaderElfSymbolVersion, RealSystemZlibDeflateBoundIsVersioned) {
 // (Former `Ff1ProducedRowsHaveNoCSignature` test removed at FF2
 // post-#2 type-design fold: `cSignature` field dropped from
 // `ImportSurface` since no producer or consumer needed it.
-// Anchored D-FF2-1: re-add `optional<FnSigTypeId>` only if FF3 needs
+// Anchored D-FF2-1-IMPORTSURFACE-NO-CSIGNATURE-SLOT: re-add `optional<FnSigTypeId>` only if FF3 needs
 // to attach the resolved sig to the row instead of the HIR node.)
 

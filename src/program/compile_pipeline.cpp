@@ -235,8 +235,8 @@ bool optimizeModule(Mir&                  mir,
                 d.actual   = std::format(
                     "compile_pipeline: pipeline '{}' declares unitPipeline "
                     "'{}' which failed to load — a two-stage topology must "
-                    "name a shipped pipeline document (D-OPT7-CROSSCU-LTO-"
-                    "SINGLE-OPTIMIZE).",
+                    "name a shipped pipeline document ("
+                    "D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE).",
                     *name, loadedPipeline.unitPipelineName);
                 reporter.report(std::move(d));
                 forwardConfigDiagnostics(unitLoaded.error(), reporter);
@@ -519,7 +519,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      library comes from the ROW — the PLATFORM's
     //      shipped-descriptor realization, or a source
     //      `extern "otherlib.dll" int foo();`
-    //      (D-CSUBSET-EXTERN-LIBRARY-SYNTAX) — and a row with
+    //      (the extern library-name syntax) — and a row with
     //      neither is UNBOUND, resolved at the LINK tier per C23
     //      5.1.1.2 phase 8. The former `externLibraryByFormat` map
     //      was a per-LANGUAGE GUESS standing in for the corpus and a
@@ -715,7 +715,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // LC_LOAD_DYLIB / PE import descriptor), ranked in `ingest()` and
             // documented on `ffi::BinaryLibrarySource`:
             //   1. `declaredImportName` -- what the CLI/manifest STATED for
-            //      this entry (D-FFI-DECLARED-IMPORT-NAME; empty = unstated);
+            //      this entry (its declared import name; empty = unstated);
             //   2. the binary's own embedded soname, read by FF1;
             //   3. the file BASENAME supplied here as the last-resort fallback.
             // All three are plain strings: no arm of this is language-,
@@ -949,7 +949,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
                           &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
                           &hir->returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
-                          &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
+                          &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
                           &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
                           &hir->noOptimizeMap,   // TF-C85 (#pragma optimize region)
                           &hir->noSanitizeThreadMap,   // TF-C92 (no_sanitize_thread)
@@ -1747,8 +1747,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
                 "jump-table (SymbolId={{ {} }}) requires an absolute-64 pointer "
-                "relocation but target '{}' declares none (D-OPT-SWITCH-JUMP-"
-                "TABLE) — the dense-switch address table cannot be emitted",
+                "relocation but target '{}' declares none ("
+                "D-OPT-SWITCH-JUMP-TABLE) — the dense-switch address table cannot be emitted",
                 desc.tableSymbol.v, target.name());
             reporter.report(std::move(d));
             return std::nullopt;
@@ -1800,8 +1800,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
                 "jump-table (SymbolId={{ {} }}) references a target block with no "
-                "byte offset or symbol — malformed descriptor (D-OPT-SWITCH-JUMP-"
-                "TABLE)", desc.tableSymbol.v);
+                "byte offset or symbol — malformed descriptor ("
+                "D-OPT-SWITCH-JUMP-TABLE)", desc.tableSymbol.v);
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -3065,8 +3065,8 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
             "'{}' in '{}'. The link is producing '{}', whose relocation "
             "vocabulary describes an IMAGE and was never promised to describe a "
             "relocatable member; the member's own object format {}. {} "
-            "Anchored: D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-"
-            "OBJECT-FORMAT.",
+            "Anchored: "
+            "D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT.",
             memberName, core::genericSpelling(archivePath), linkFormat.name(),
             objectFormatName.empty()
                 ? std::string{"could not be resolved"}
@@ -4233,8 +4233,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "function #{}, but this unit assembled {} "
                            "function(s) — the assembly lowering and the "
                            "assembler disagree about this file's function list "
-                           "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-"
-                           "OFFSET)",
+                           "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.funcIndex, assembled.functions.size()));
                 return std::nullopt;
             }
@@ -4250,8 +4249,8 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "a data slot takes the address of a label whose "
                            "basic block (id {}) the assembler published no byte "
                            "offset for — the relocation would name a symbol "
-                           "with no address (D-ASM-INTERIOR-LABELS-NOT-"
-                           "ADDRESSABLE-AT-AN-OFFSET)",
+                           "with no address ("
+                           "D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.lirBlockV));
                 return std::nullopt;
             }

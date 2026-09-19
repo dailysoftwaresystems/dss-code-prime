@@ -17,7 +17,8 @@
 #include <string_view>
 #include <unordered_set>
 
-// D-FF2-UNSUPP closed-table pins.
+// Pins for the CLOSED TABLE of unsuppressable diagnostic codes
+// (`core/types/unsuppressable_codes.hpp`).
 //
 // PINS the contract that severity-gating codes (architectural exclusions,
 // pending-plan announcements, lowering / verifier / linker invariants)
@@ -27,7 +28,7 @@
 // signal rather than defeating the gate (eb2c6c7 refinement). Without
 // these pins, a regression that drops the `isUnsuppressable` gate
 // would silently re-open the silent-drop surface every such code was
-// introduced to close — exactly the bug class D-FF2-UNSUPP closes.
+// introduced to close — exactly the bug class the table exists to close.
 
 using namespace dss;
 
@@ -128,7 +129,8 @@ TEST(UnsuppressableCodes, BothH2SplitArmsAreUnsuppressable) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::H_UnsupportedLoweringForKind))
         << "engine-config arm: --suppress would let an extern decl "
            "with no kindByChild config silently fall through to "
-           "makeExternGlobal, re-opening the D-FF2-3 silent-drop";
+           "makeExternGlobal, re-opening the silent drop that "
+           "D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE closed";
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::H_ExternDeclMalformed))
         << "parse-recovery arm: --suppress would let a malformed "
            "extern decl (incomplete CST) silently fall through, "

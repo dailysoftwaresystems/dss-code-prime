@@ -419,7 +419,7 @@ public:
     /// building the `main` that links against a DSS-built library. Threaded to
     /// `CompileOptions.resolveLibraries` at the per-target build.
     ///
-    /// D-FFI-DECLARED-IMPORT-NAME: each entry may additionally STATE the
+    /// Declared import names: each entry may additionally STATE the
     /// runtime identity to record for the symbols read out of it (the CLI
     /// `<path>=<import-name>` suffix / the manifest's `{"path","importName"}`
     /// object). That is what `ResolveLibrarySpec` carries.
@@ -610,12 +610,12 @@ private:
     std::map<std::string, std::vector<ResolveLibrarySpec>>
                                            resolveLibraryAdditionsByTarget_;
     std::vector<std::optional<std::filesystem::path>> artifactPaths_;
-    substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4 (non-owning; tests inject)
+    substrate::IExecutor*                  executor_ = nullptr;  // D-PERF-4-CU-PARALLELISM (non-owning; tests inject)
     // AP6: the `dependsOn` git seam (non-owning; tests inject a scripted fake)
     // and `--force-git-cache`.
     IGitRunner*                            gitRunner_     = nullptr;
     bool                                   forceGitCache_ = false;
-    unsigned                               jobs_     = 0;         // D-PERF-4: --jobs (0 = auto)
+    unsigned                               jobs_     = 0;         // D-PERF-4-CU-PARALLELISM: --jobs (0 = auto)
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest
     // `stackReserve` (nullopt = the format's declared default).
     std::optional<std::uint64_t>           stackReserveBytes_;

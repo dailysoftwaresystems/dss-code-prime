@@ -78,7 +78,7 @@ add_dependencies(dss_hir_test_torn_shipped_config_reds_not_crashes
 dss_add_test(NAME hir/test_type_representation_projection
              SOURCES test_type_representation_projection.cpp)
 
-# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION residue, front-end half (P55 `hs`) ──
+# ── D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED, front-end half (P55 `hs`) ──
 # TWO files, and the split is the point.
 #
 # `test_frontend_deep_nesting_probe` is the stage-selectable MEASUREMENT

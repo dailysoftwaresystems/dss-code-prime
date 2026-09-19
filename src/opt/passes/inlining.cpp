@@ -243,7 +243,7 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
         return std::nullopt;
     }
 
-    // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE) — never inline a callee the SOURCE
+    // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK) — never inline a callee the SOURCE
     // declared `__attribute__((noinline))`. Unlike every other rule here this
     // one is not the optimizer protecting itself from an unsound splice; it is
     // the optimizer OBEYING an explicit directive, so it is unconditional and
@@ -1022,7 +1022,7 @@ public:
             std::chrono::steady_clock::time_point t0;
             ~Acc() { if (optRebuildTraceEnabled()) optRebuildNsAdd(t0); }
         } const rebuildAcc_{rebuildT0};
-        // TF-C78 (D-CSUBSET-NOINLINE): the inliner's OWN rebuild must carry the
+        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the inliner's OWN rebuild must carry the
         // flag too. A `noinline` function is still a CALLER (it may inline other
         // functions INTO itself — the attribute constrains splicing it OUT, not
         // in), so its rebuilt copy has to keep the bit or the refusal survives

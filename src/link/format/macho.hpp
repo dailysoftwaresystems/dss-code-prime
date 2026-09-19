@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/image_request.hpp"      // ImageRequest — the per-EMISSION facts
+#include "link/import_call_stub_layout.hpp"
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -94,5 +95,16 @@ encode(AssembledModule const&    module,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter,
        ImageRequest const&       request = {});
+
+// [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]
+// Where `encode` will put each FUNCTION import's `__stubs` entry for this
+// module and format, as its distance past the end of `__text` — the answer the
+// branch-veneer pass needs to measure an import-bound call against the stub it
+// lands on (see `link/import_call_stub_layout.hpp`). Empty for every flavor
+// that emits no `__stubs`. The dynamic writer ASSERTS its real `__stubs`
+// against this answer when it lays them out.
+[[nodiscard]] DSS_EXPORT link::ImportCallStubLayout
+importCallStubLayout(AssembledModule const&    module,
+                     ObjectFormatSchema const& objectFormatSchema);
 
 } // namespace dss::macho

@@ -291,7 +291,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
         : 0u;
     layout.savedRegAreaSize    = static_cast<std::uint32_t>(layout.savedRegs.size()) * slotWidth;
     layout.spillAreaSize       = alloc.numSpillSlots * slotWidth;
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
+    // Local-int codegen (plan step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
     // local allocas sit ABOVE the spill area (positive RSP offset post-
     // prologue), in LIR scan order — the SAME order materializeOneFunc
     // assigns offsets, so the two stay in lockstep. Each alloca reserves
@@ -399,7 +399,7 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     // post-prologue RSP — the caller's outgoing area sits above the
     // callee's full frame + the post-CALL return-address push. Local
     // allocas at `[sp + localAreaOffset() + i*slotWidth]` post-
-    // prologue (D-CSUBSET-LOCAL-INT-CODEGEN); the materialize pass
+    // prologue (local-int codegen, plan step 13.3b); the materialize pass
     // emits `lea result, [sp + offset]` for each `alloca` opcode.
     std::uint32_t const rawPreShadow =
         layout.outgoingArgAreaSize + layout.savedRegAreaSize
@@ -527,7 +527,7 @@ functionHasVla(Lir const& src, LirFuncId fn, std::uint16_t subSpRegOp) noexcept 
     return false;
 }
 
-// D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): count the
+// Local-int codegen (plan step 13.3b, 2026-06-02): count the
 // `alloca` virtual ops in `fn`. Each becomes one local-area frame
 // slot of `slotSize` bytes; the materialize pass rewrites it to
 // `lea result, [sp + localAreaOffset() + i * slotSize]` using the
@@ -881,6 +881,150 @@ struct FrameMemScaledOps {
 using FrameMemScaledTable =
     std::array<FrameMemScaledOps, kTargetRegClassCount>;
 
+// The twin table, built from `registerClassOps` for EVERY class over the same
+// accessor every emitting site uses (`regClassOpOpcode`) — so the GPR class
+// picks up its universal `load`/`store`/`load_u`/`store_u` defaults from the
+// no-row fallback and a declared class picks up its own row, with no second
+// resolution path to drift from the first. One builder, two callers: the
+// module's `resolveOpcodes` and the published `frameMemFormFor` query.
+[[nodiscard]] FrameMemScaledTable
+buildFrameMemScaledTable(TargetSchema const& schema) {
+    FrameMemScaledTable table{};
+    for (std::size_t ci = 0; ci < kTargetRegClassCount; ++ci) {
+        auto const cls = static_cast<TargetRegClass>(ci);
+        auto& row = table[ci];
+        auto const get = [&](RegClassOp op) -> std::uint16_t {
+            auto const v = schema.regClassOpOpcode(cls, op);
+            return v.has_value() ? *v : std::uint16_t{0};
+        };
+        row.load        = get(RegClassOp::Load);
+        row.loadScaled  = get(RegClassOp::LoadScaled);
+        row.store       = get(RegClassOp::Store);
+        row.storeScaled = get(RegClassOp::StoreScaled);
+    }
+    return table;
+}
+
+// ── HOW FAR A FRAME FORM REACHES, ASKED OF THE TARGET'S OWN ENCODING ────────
+//
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm). The chokepoint below
+// used to decide "does the short form reach this offset?" with the literals
+// `-256..255`, and "does the scaled twin?" with `offset / access <= 4095` —
+// AArch64's imm9 and imm12 written into the LIR tier, where nothing tied them to
+// the encodings they described and where a target with a different field (a
+// RISC-V-shaped signed 12-bit one, with no scaled twin at all) would have been
+// answered with arm64's numbers.
+//
+// ★ THE QUESTION IS NOW PUT TO THE ENCODING THE ACCESS WILL ACTUALLY USE. The
+// encoder elects the FIRST variant of the opcode whose guard matches the
+// instruction — shape, width, memory direction, value axes — and then refuses,
+// without backtracking, a displacement that variant's field cannot hold. So a
+// form carries an offset iff that first-matching variant exists AND its
+// `MemOffset` wire's field (`memoryDisplacementField`) holds it. Both halves
+// are the encoder's own rules, read from the same core definitions it reads
+// (`variantValueAxesAdmit`, `memoryDisplacementFits`), so the chokepoint cannot
+// believe a form reaches an offset the encoder then refuses, or the reverse.
+enum class FrameFormFit : std::uint8_t {
+    Fits,            // the first matching variant's field carries the offset
+    OutOfReach,      // variants of the frame shape exist at this width; the one
+                     // the encoder would elect cannot carry the offset
+    NoFrameVariant,  // no variant of the frame shape at this width (or its
+                     // offset field is not a displacement this tier can read)
+};
+
+// The chokepoint's two operand shapes: a load is `[base, MemBase, MemOffset]`
+// and a store `[value, base, MemBase, MemOffset]` (`emitFrameLoad` /
+// `emitFrameStore` build exactly these).
+[[nodiscard]] bool
+isFrameMemShape(std::span<OperandKindFilter const> kinds, bool isStore) noexcept {
+    std::size_t const n = isStore ? 4u : 3u;
+    if (kinds.size() != n) return false;
+    std::size_t const b = isStore ? 1u : 0u;
+    if (isStore && kinds[0] != OperandKindFilter::Reg) return false;
+    return kinds[b] == OperandKindFilter::Reg
+        && kinds[b + 1] == OperandKindFilter::MemBase
+        && kinds[b + 2] == OperandKindFilter::MemOffset;
+}
+
+[[nodiscard]] FrameFormFit
+frameFormFit(TargetSchema const& schema, std::uint16_t op, bool isStore,
+             std::uint8_t widthFlags, std::int32_t offset) {
+    auto const* info = schema.opcodeInfo(op);
+    if (info == nullptr) return FrameFormFit::NoFrameVariant;
+    std::uint8_t const width = lirInstWidthBits(widthFlags);
+    bool const memDest = lirInstMemoryIsDestination(widthFlags);
+    std::uint8_t const offsetIdx = isStore ? 3u : 2u;
+    std::uint32_t const accessBytes =
+        std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(width) / 8u);
+    bool sawShape = false;
+    for (auto const& v : info->encoding.variants) {
+        if (!isFrameMemShape(v.operandKinds, isStore)) continue;
+        if (v.guardWidthBits != 0 && v.guardWidthBits != width) continue;
+        if (v.memoryDestination.has_value() && *v.memoryDestination != memDest)
+            continue;
+        sawShape = true;
+        if (!variantValueAxesAdmit(v, variantValueMagnitude(v.negValue, offset)))
+            continue;
+        // The encoder commits to THIS variant: its offset field decides.
+        for (auto const& w : v.wires) {
+            if (w.index != offsetIdx) continue;
+            auto const field = memoryDisplacementField(w.slotKind);
+            if (!field.has_value()) return FrameFormFit::NoFrameVariant;
+            return memoryDisplacementFits(*field, offset, accessBytes)
+                ? FrameFormFit::Fits
+                : FrameFormFit::OutOfReach;
+        }
+        return FrameFormFit::NoFrameVariant;   // an unwired offset: the encoder's call
+    }
+    return sawShape ? FrameFormFit::OutOfReach : FrameFormFit::NoFrameVariant;
+}
+
+// What the chokepoint emits for one frame access is a `FrameMemAccessForm`
+// (lir_callconv.hpp): the opcode, and whether the access is FAR — beyond every
+// form the target declares for it, so it must be emitted as an address
+// materialized in a register plus an access at offset 0.
+using FrameMemForm = FrameMemAccessForm;
+
+// Where a FAR frame access may put its address, and why there is nowhere when
+// there is nowhere. The three contexts a function builds differ only in
+// `scratch`: at ENTRY and EXIT a caller-saved register outside every ABI role is
+// dead by construction (`pickBoundaryScratchGpr`); in the BODY it is the
+// convention's declared `frameAddressScratch`, and only once the prologue has
+// saved it (see the fold in `materializeOneFunc`).
+struct FrameMemCtx {
+    TargetSchema const*        schema   = nullptr;
+    FrameMemScaledTable const* twins    = nullptr;
+    std::uint16_t              leaOp    = 0;   // 0 ⇒ no address materializer declared
+    LirReg                     scratch{};      // invalid ⇒ none available here
+    std::string_view           noScratchWhy;   // the refusal's reason when invalid
+    DiagnosticReporter*        reporter = nullptr;
+};
+
+// The byte offset of spill slot `slotV` (1-based, the rewriter's numbering) —
+// ONE formula for every site that addresses a spill slot (the reload, the
+// store, the direct-arg reload) and for the frame-scratch fold predicate, which
+// has to reach the same answer as all three before any of them runs.
+[[nodiscard]] constexpr std::int32_t
+spillSlotOffset(std::uint32_t spillAreaOffset, std::uint32_t slotSize,
+                std::uint32_t slotV) noexcept {
+    return static_cast<std::int32_t>(spillAreaOffset + (slotV - 1u) * slotSize);
+}
+
+// The byte offset, from this function's post-prologue base, of an incoming
+// stacked argument the caller placed `placeByteOffset` into its outgoing area:
+// above this function's whole frame, what the call itself pushed, and the
+// shadow space. Shared by the `arg` materialization and the fold predicate.
+[[nodiscard]] std::int32_t
+incomingStackArgOffset(FrameLayout const& layout,
+                       TargetCallingConvention const& cc,
+                       std::uint32_t placeByteOffset) noexcept {
+    return static_cast<std::int32_t>(
+        layout.totalFrameSize
+        + static_cast<std::uint32_t>(cc.callPushBytes)
+        + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+        + placeByteOffset);
+}
+
 // D-ASM-AARCH64-LARGE-FRAME-IMM12 (chokepoint selection): pick the frame
 // load/store mnemonic from the OFFSET VALUE. The unscaled form (AArch64
 // LDUR/STUR imm9 — `load`/`store` for the integer file, `fldur`/`fstur` for
@@ -903,11 +1047,18 @@ using FrameMemScaledTable =
 // and a class with no twin declared simply is not in the table with a nonzero
 // scaled field — so the short form is kept and, on a target whose memory forms
 // already carry a wide displacement (x86_64's disp32), the emitted bytes are
-// byte-identical. The genuinely-unencodable TAIL (negative beyond −256,
-// non-access-aligned, or scaled >4095) keeps `baseOp` and STAYS fail-loud at
-// the encoder — the narrower residual
-// D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12 (register-offset /
-// address-materialization).
+// byte-identical.
+//
+// ★★★ AND THE TAIL IS NO LONGER A REFUSAL — D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE,
+// the frame-offset arm, closing the case D-ASM-AARCH64-FRAME-OFFSET-BEYOND-SCALED-IMM12
+// described. An offset NEITHER form carries (negative beyond the short reach,
+// unaligned beyond it, or past 4095 × the access on arm64) used to keep `baseOp`
+// here and fail loud at the encoder — ✔MEASURED 2026-09-18 that this refused
+// correct C at the DEFAULT pipeline: a function reading its 9th integer param
+// above a 40000-byte local (`opcode 'load': memory offset 40000 … 'imm9'`), and
+// a 2174-spill function (`opcode 'store': memory offset 32768 …`), both of
+// which gcc 13.3.0 compiles and runs. The access is now reported FAR, and the
+// emitters below materialize its address in a register and access at `[A + 0]`.
 //
 // ⚠ THE LOOKUP IS BY OPCODE IDENTITY, WHICH IS WHY A MIS-FILED TWIN WOULD BE A
 // SILENT WRONG ANSWER RATHER THAN A REFUSAL — filing the integer `load_u`
@@ -931,41 +1082,166 @@ using FrameMemScaledTable =
 // encoded the wrong displacement: a silent frame clobber reachable only on a
 // large frame, i.e. only in the shapes a small test never builds.
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED.
-[[nodiscard]] std::uint16_t
-selectFrameMemOp(std::uint16_t baseOp, FrameMemScaledTable const& twins,
-                 std::int32_t offset, std::uint8_t widthFlags) {
+[[nodiscard]] FrameMemForm
+selectFrameMemOp(TargetSchema const& schema, std::uint16_t baseOp, bool isStore,
+                 FrameMemScaledTable const& twins, std::int32_t offset,
+                 std::uint8_t widthFlags) {
+    // The short form first — the one the lowering asked for. `NoFrameVariant`
+    // keeps it too: an opcode with no variant of this shape at this width is a
+    // problem the ENCODER names precisely, and no longer form would help.
+    if (frameFormFit(schema, baseOp, isStore, widthFlags, offset)
+        != FrameFormFit::OutOfReach) {
+        return FrameMemForm{baseOp, false};
+    }
     // The scaled twin of `baseOp`, whichever class declared it. 0 (the invalid
     // opcode sentinel) both for a class with no twin and for an op that is not
-    // a frame memory verb at all — one `== 0` bail covers both.
+    // a frame memory verb at all — one `== 0` test covers both.
     std::uint16_t scaledOp = 0;
     for (auto const& row : twins) {
-        if (row.load  != 0 && row.load  == baseOp) { scaledOp = row.loadScaled;  break; }
-        if (row.store != 0 && row.store == baseOp) { scaledOp = row.storeScaled; break; }
+        if (!isStore && row.load != 0 && row.load == baseOp) {
+            scaledOp = row.loadScaled;
+            break;
+        }
+        if (isStore && row.store != 0 && row.store == baseOp) {
+            scaledOp = row.storeScaled;
+            break;
+        }
     }
-    if (scaledOp == 0) return baseOp;
-    bool const fitsImm9 = offset >= -256 && offset <= 255;
-    if (fitsImm9) return baseOp;
-    std::uint32_t const accessSizeBytes =
-        std::max<std::uint32_t>(1u, lirInstWidthBits(widthFlags) / 8u);
-    if (offset >= 0
-        && static_cast<std::uint32_t>(offset) % accessSizeBytes == 0
-        && static_cast<std::uint32_t>(offset) / accessSizeBytes <= 4095u) {
-        return scaledOp;
+    if (scaledOp != 0
+        && frameFormFit(schema, scaledOp, isStore, widthFlags, offset)
+               == FrameFormFit::Fits) {
+        return FrameMemForm{scaledOp, false};
     }
-    // Unencodable as scaled imm12 (negative beyond −256, unaligned, or
-    // >4095*accessSize): keep baseOp; the encoder fails loud
-    // (A_ImmediateOperandOutOfRange) — the unencodable-offset residual.
-    return baseOp;
+    // Beyond every declared form: FAR (see the block comment above).
+    return FrameMemForm{baseOp, true};
+}
+
+// The name a refusal quotes for a register ordinal.
+[[nodiscard]] std::string
+frameRegName(TargetSchema const& schema, LirReg r) {
+    if (auto const* info = schema.registerInfo(static_cast<std::uint16_t>(r.id)))
+        return info->name;
+    return std::format("#{}", static_cast<unsigned>(r.id));
+}
+
+// (defined below, beside the frame-slot `lea` sites it was written for)
+void emitFrameAddr(LirBuilder& b, std::uint16_t leaOp, LirReg result,
+                   LirReg sp, std::int32_t offset);
+
+// ── THE FAR FORM ─────────────────────────────────────────────────────────────
+//
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm). A frame access past
+// every declared reach is two instructions, both already declared by the
+// target: `lea A, [base + offset]` — the frame-address `lea` whose own variants
+// reach every non-negative int32 (AArch64: ADD imm12, the shifted-imm12 word
+// pair, the MOVZ/MOVK three-word form) — and the access at `[A + 0]` in the
+// SHORT form, which every frame form carries. No new encoding, no register-
+// offset LDR/STR, nothing the encoders do not already emit and byte-pin.
+//
+// ★ WHICH REGISTER IS A. A LOAD whose destination is of the base register's own
+// class computes the address into its DESTINATION: the destination is dead
+// until the load writes it, so it needs nothing and clobbers nothing — the form
+// clang itself emits for the same access (`add x8, sp, #0x1, lsl #12; add x8,
+// x8, #0xca8; ldr x8, [x8, #32760]`, ✔MEASURED clang 18.1.3 -O0). A STORE's
+// value must survive until it is stored, and a load into a register that cannot
+// address memory (the SIMD&FP file) has no integer destination to borrow — both
+// take `ctx.scratch`, and are REFUSED BY NAME when the context has none.
+//
+// ⚠ NOTHING HERE ASKS WHAT IS LIVE. That is deliberate: the three contexts are
+// built so their scratch is dead BY CONSTRUCTION (a boundary register outside
+// every ABI role; the declared body scratch, which no allocatable list may name
+// and which the function has saved). A liveness query at this point would be a
+// second, weaker proof of the same fact.
+[[nodiscard]] LirInstId
+emitFarFrameAccess(LirBuilder& b, FrameMemCtx const& ctx, std::uint16_t op,
+                   bool isStore, LirReg reg, LirReg base, std::int32_t offset,
+                   std::uint8_t widthFlags) {
+    TargetSchema const& schema = *ctx.schema;
+    DiagnosticReporter& reporter = *ctx.reporter;
+    auto const* info = schema.opcodeInfo(op);
+    std::string_view const mnemonic =
+        info != nullptr ? std::string_view{info->mnemonic} : std::string_view{"?"};
+    auto const describe = [&] {
+        return std::format("a frame {} of {} at [{} + {}] ({}-bit '{}')",
+                           isStore ? "store" : "load", frameRegName(schema, reg),
+                           frameRegName(schema, base), offset,
+                           lirInstWidthBits(widthFlags), mnemonic);
+    };
+    bool const selfAddressed = !isStore && reg.regClass() == base.regClass();
+    LirReg const addr = selfAddressed ? reg : ctx.scratch;
+    if (!addr.valid()) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("callconv: {} is beyond every form the target "
+                           "declares for it — the short form and its scaled "
+                           "long-reach twin — so its address must be "
+                           "materialized in a register, and {}",
+                           describe(), ctx.noScratchWhy));
+        return InvalidLirInst;
+    }
+    // Invariants of the three contexts, checked rather than assumed: a scratch
+    // that WAS the base would lose the base, and one that was the stored value
+    // would store its own address.
+    if ((!selfAddressed && addr.id == base.id)
+        || (isStore && addr.id == reg.id)) {
+        report(reporter, DiagnosticCode::L_CcRegLookupFailed,
+               DiagnosticSeverity::Error,
+               std::format("callconv: {} would materialize its address in '{}', "
+                           "which the access itself still needs (internal: the "
+                           "frame-address scratch collides with an operand)",
+                           describe(), frameRegName(schema, addr)));
+        return InvalidLirInst;
+    }
+    if (ctx.leaOp == 0) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("callconv: {} is beyond every form the target declares "
+                           "for it, and the target declares no 'lea' to "
+                           "materialize its address with", describe()));
+        return InvalidLirInst;
+    }
+    // The access at `[A + 0]`, in whichever form carries 0 — asked, not assumed.
+    FrameMemForm const at0 =
+        selectFrameMemOp(schema, op, isStore, *ctx.twins, 0, widthFlags);
+    if (at0.far) {
+        report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+               DiagnosticSeverity::Error,
+               std::format("callconv: {} cannot be completed through a register "
+                           "address — no form of '{}' carries even offset 0",
+                           describe(), mnemonic));
+        return InvalidLirInst;
+    }
+    emitFrameAddr(b, ctx.leaOp, addr, base, offset);
+    if (isStore) {
+        std::array<LirOperand, 4> ops{
+            LirOperand::makeReg(reg),
+            LirOperand::makeReg(addr),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0)
+        };
+        return b.addInst(at0.op, InvalidLirReg, ops, /*payload=*/0, widthFlags);
+    }
+    std::array<LirOperand, 3> ops{
+        LirOperand::makeReg(addr),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(0)
+    };
+    return b.addInst(at0.op, reg, ops, /*payload=*/0, widthFlags);
 }
 
 // Emit `store reg, [SP + offset]` (saved-reg store, or frame-store
 // materialization). `store` operand layout per x86_64.target.json:
 // [value_reg, base_reg, MemBase(scale), MemOffset(disp)] — 4 ops, no result.
-// `twins` is the per-class (short-reach → scaled) frame memory-op table; the
+// `ctx` carries the per-class (short-reach → scaled) frame memory-op table; the
 // chokepoint swaps `storeOp` for ITS OWN CLASS's scaled twin when the offset
-// overruns the short reach (see selectFrameMemOp). Threading the table through
+// overruns the short reach (see selectFrameMemOp), and emits the FAR form
+// through `ctx.scratch` when it overruns both. Threading the context through
 // the ONE store chokepoint covers every frame-store caller (saved-reg, spill,
 // va-spill, by-value copy) of every class by construction.
+//
+// Returns the id of the instruction that performs the STORE (the prologue keys
+// its CFI rule to it), or `InvalidLirInst` after a refusal was reported — a far
+// store with no register to carry its address. Every caller checks.
 //
 // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: `widthFlags` states the
 // ACCESS WIDTH (`kLirInstFlagWidth*`; 0 ⇒ 64-bit).
@@ -985,45 +1261,59 @@ selectFrameMemOp(std::uint16_t baseOp, FrameMemScaledTable const& twins,
 // slots, `calleeSavedAccessFlags` for the ABI-facing save) are what the
 // whole-register sites pass, and the stacked-argument sites keep passing the
 // width their own cursor chose.
-LirInstId emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
-                         LirReg sp, std::int32_t offset,
-                         FrameMemScaledTable const& twins,
-                         std::uint8_t widthFlags) {
+[[nodiscard]] LirInstId
+emitFrameStore(LirBuilder& b, std::uint16_t storeOp, LirReg value,
+               LirReg sp, std::int32_t offset, FrameMemCtx const& ctx,
+               std::uint8_t widthFlags) {
+    FrameMemForm const form = selectFrameMemOp(*ctx.schema, storeOp,
+                                               /*isStore=*/true, *ctx.twins,
+                                               offset, widthFlags);
+    if (form.far) {
+        return emitFarFrameAccess(b, ctx, storeOp, /*isStore=*/true, value, sp,
+                                  offset, widthFlags);
+    }
     std::array<LirOperand, 4> ops{
         LirOperand::makeReg(value),
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    return b.addInst(
-        selectFrameMemOp(storeOp, twins, offset, widthFlags),
-        InvalidLirReg, ops, /*payload=*/0, widthFlags);
+    return b.addInst(form.op, InvalidLirReg, ops, /*payload=*/0, widthFlags);
 }
 
 // Emit `result = load [SP + offset]`. `load` operand layout:
 // [base_reg, MemBase(scale), MemOffset(disp)] — 3 ops + result.
-// `twins`: see `emitFrameStore` — the same per-class table, consulted for the
-// load direction.
+// `ctx`: see `emitFrameStore` — the same per-class table, consulted for the
+// load direction. A far load into the base register's own class needs no
+// scratch (it addresses through its destination); one into any other class
+// does, exactly as a far store does.
 // `widthFlags`: see `emitFrameStore` — same contract, likewise REQUIRED, same
 // reason. ⚠ A load and its matching store must be given the SAME width: a
 // 16-byte save read back 8 bytes wide leaves the top half of the restored
 // register holding whatever the caller's value was, which is the same silent
 // wrong answer from the other direction.
-LirInstId emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
-                        LirReg sp, std::int32_t offset,
-                        FrameMemScaledTable const& twins,
-                        std::uint8_t widthFlags) {
+// Returns the id of the LOAD instruction, or `InvalidLirInst` after a reported
+// refusal; every caller checks.
+[[nodiscard]] LirInstId
+emitFrameLoad(LirBuilder& b, std::uint16_t loadOp, LirReg result,
+              LirReg sp, std::int32_t offset, FrameMemCtx const& ctx,
+              std::uint8_t widthFlags) {
+    FrameMemForm const form = selectFrameMemOp(*ctx.schema, loadOp,
+                                               /*isStore=*/false, *ctx.twins,
+                                               offset, widthFlags);
+    if (form.far) {
+        return emitFarFrameAccess(b, ctx, loadOp, /*isStore=*/false, result, sp,
+                                  offset, widthFlags);
+    }
     std::array<LirOperand, 3> ops{
         LirOperand::makeReg(sp),
         LirOperand::makeMemBase(1),
         LirOperand::makeMemOffset(offset)
     };
-    return b.addInst(
-        selectFrameMemOp(loadOp, twins, offset, widthFlags),
-        result, ops, /*payload=*/0, widthFlags);
+    return b.addInst(form.op, result, ops, /*payload=*/0, widthFlags);
 }
 
-// D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): emit
+// Local-int codegen (plan step 13.3b, 2026-06-02): emit
 // `result = lea [SP + offset]` — the address of a frame-local slot
 // in a register. `lea` operand layout per x86_64.target.json 3-op
 // no-index variant: [base_reg, MemBase(scale), MemOffset(disp)] —
@@ -1100,7 +1390,7 @@ struct OpcodeHandles {
     // how the linker patches disp32 (IAT slot RVA vs callee RVA).
     // The materialize pass treats both identically for arg setup.
     std::uint16_t callIndirectViaExtern;
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): the
+    // Local-int codegen (plan step 13.3b, 2026-06-02): the
     // `alloca` virtual op is materialized by the callconv pass into
     // `lea result, [sp + localAreaOffset() + i*slotSize]` using the
     // 3-op no-index `lea` form. The opcode handle pair must both
@@ -1241,7 +1531,12 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
                   TargetSchema const& schema,
                   TargetCallingConvention const& cc, LirReg sp,
                   std::uint16_t subOp, std::uint16_t stackProbeOp,
-                  FrameMemScaledTable const& frameMemScaled,
+                  // The ENTRY context: a far saved-register store materializes
+                  // its address in a caller-saved register outside every ABI
+                  // role, which is dead here by construction — and NOT in the
+                  // body's frame-address scratch, which this very prologue may
+                  // not have saved yet.
+                  FrameMemCtx const& frameCtx,
                   std::vector<LirCfiOp>& cfiOut,
                   DiagnosticReporter& reporter, bool& ok) {
     // The CFA offset once this prologue's SP-adjust has run: what the CALL
@@ -1332,8 +1627,9 @@ void emitPrologue(LirBuilder& b, FrameLayout const& layout,
         std::int32_t const slotOff =
             static_cast<std::int32_t>(base + i * layout.slotSize);
         LirInstId const st = emitFrameStore(b, *storeOp, layout.savedRegs[i],
-                                            sp, slotOff, frameMemScaled,
+                                            sp, slotOff, frameCtx,
                                             *saveWidth);
+        if (st == InvalidLirInst) { ok = false; return; }
         // The slot is at SP_post + slotOff and CFA == SP_post + framedCfaOffset,
         // so the saved location is CFA + (slotOff - framedCfaOffset) -- negative,
         // as every unwinder expects for a callee-save below the CFA.
@@ -1362,7 +1658,11 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
                   TargetSchema const& schema,
                   TargetCallingConvention const& cc, LirReg sp,
                   std::uint16_t addOp,
-                  FrameMemScaledTable const& frameMemScaled,
+                  // The EXIT context: a far restore into a class that cannot
+                  // address memory materializes its address in a caller-saved
+                  // register outside every ABI role — dead once the return
+                  // values are in place, which they are by the time this runs.
+                  FrameMemCtx const& frameCtx,
                   std::int64_t entryCfaOffset,
                   std::vector<LirCfiOp>& cfiOut,
                   DiagnosticReporter& reporter, bool& ok) {
@@ -1388,7 +1688,8 @@ void emitEpilogue(LirBuilder& b, FrameLayout const& layout,
         LirInstId const ld = emitFrameLoad(
             b, *loadOp, layout.savedRegs[i], sp,
             static_cast<std::int32_t>(base + i * layout.slotSize),
-            frameMemScaled, *restoreWidth);
+            frameCtx, *restoreWidth);
+        if (ld == InvalidLirInst) { ok = false; return; }
         // Restored: the register holds its entry value again, so revert to this
         // function's ENTRY rule rather than inventing a fresh one.
         cfiOut.push_back(LirCfiOp{ld, CfiOpKind::RegRestoreInitial,
@@ -1442,7 +1743,7 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                           TargetSchema const& schema,
                           TargetCallingConvention const& cc, LirReg sp,
                           std::uint16_t addOp,
-                          FrameMemScaledTable const& frameMemScaled,
+                          FrameMemCtx const& frameCtx,
                           DiagnosticReporter& reporter) {
     if (!cc.vaListLayout.has_value()) return true;   // guarded by caller, defensive
     VaListLayout const& vl = *cc.vaListLayout;
@@ -1527,10 +1828,12 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
             auto const reg = resolveCcReg(schema, cc.argGprs[i], LirRegClass::GPR,
                                           "callconv: Win64 home GPR spill", reporter);
             if (!reg.has_value()) return false;
-            emitFrameStore(b, *gpStore, *reg, sp,
-                           static_cast<std::int32_t>(
-                               homeBase + i * layout.outgoingSlotSize),
-                           frameMemScaled, *gpWidth);
+            if (emitFrameStore(b, *gpStore, *reg, sp,
+                               static_cast<std::int32_t>(
+                                   homeBase + i * layout.outgoingSlotSize),
+                               frameCtx, *gpWidth) == InvalidLirInst) {
+                return false;
+            }
         }
         return true;
     }
@@ -1624,9 +1927,11 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                                           "callconv: AAPCS64 variadic GR spill",
                                           reporter);
             if (!reg.has_value()) return false;
-            emitFrameStore(b, *gpStore, *reg, *scratch,
-                           static_cast<std::int32_t>(i * vl.gpSlotBytes),
-                           frameMemScaled, *gpWidthFlags);
+            if (emitFrameStore(b, *gpStore, *reg, *scratch,
+                               static_cast<std::int32_t>(i * vl.gpSlotBytes),
+                               frameCtx, *gpWidthFlags) == InvalidLirInst) {
+                return false;
+            }
         }
         // FP block: 16-byte slots at [scratch + gpBlock + i*16], following the
         // full GR block. AAPCS64 §B saves `q0..q7` — the WHOLE SIMD&FP
@@ -1674,9 +1979,11 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
                                           "callconv: AAPCS64 variadic FP spill",
                                           reporter);
             if (!reg.has_value()) return false;
-            emitFrameStore(b, *fpStore, *reg, *scratch,
-                           static_cast<std::int32_t>(vrBase + i * vl.fpSlotBytes),
-                           frameMemScaled, *fpWidthFlags);
+            if (emitFrameStore(b, *fpStore, *reg, *scratch,
+                               static_cast<std::int32_t>(vrBase + i * vl.fpSlotBytes),
+                               frameCtx, *fpWidthFlags) == InvalidLirInst) {
+                return false;
+            }
         }
         return true;
     }
@@ -1711,9 +2018,11 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         auto const reg = resolveCcReg(schema, cc.argGprs[i], LirRegClass::GPR,
                                       "callconv: variadic GPR save spill", reporter);
         if (!reg.has_value()) return false;
-        emitFrameStore(b, *gpStore, *reg, sp,
-                       static_cast<std::int32_t>(base + i * vl.gpSlotBytes),
-                       frameMemScaled, *gpWidthFlags);
+        if (emitFrameStore(b, *gpStore, *reg, sp,
+                           static_cast<std::int32_t>(base + i * vl.gpSlotBytes),
+                           frameCtx, *gpWidthFlags) == InvalidLirInst) {
+            return false;
+        }
     }
 
     // SSE arg regs → [sp + base + gpSaveCount*gpSlotBytes + i*fpSlotBytes] (the SSE
@@ -1738,9 +2047,11 @@ emitVariadicPrologueSpill(LirBuilder& b, FrameLayout const& layout,
         auto const reg = resolveCcReg(schema, cc.argFprs[i], LirRegClass::FPR,
                                       "callconv: variadic SSE save spill", reporter);
         if (!reg.has_value()) return false;
-        emitFrameStore(b, *fpStore, *reg, sp,
-                       static_cast<std::int32_t>(fpBase + i * vl.fpSlotBytes),
-                       frameMemScaled, *fpWidthFlags);
+        if (emitFrameStore(b, *fpStore, *reg, sp,
+                           static_cast<std::int32_t>(fpBase + i * vl.fpSlotBytes),
+                           frameCtx, *fpWidthFlags) == InvalidLirInst) {
+            return false;
+        }
     }
     return true;
 }
@@ -1819,6 +2130,18 @@ std::uint32_t frameSlotStride(TargetSchema const&          schema,
         stride = std::max(stride, widest(cls));
     }
     return stride;
+}
+
+// ── WHICH FORM A FRAME ACCESS TAKES (contract: `lir_callconv.hpp`) ──────────
+//
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE. The chokepoint's OWN decision, over a twin
+// table built by the same builder `resolveOpcodes` uses — never a second
+// derivation of which form reaches which offset.
+FrameMemAccessForm
+frameMemAccessForm(TargetSchema const& schema, std::uint16_t baseOp,
+                   bool isStore, std::int32_t offset, std::uint8_t widthFlags) {
+    auto const twins = buildFrameMemScaledTable(schema);
+    return selectFrameMemOp(schema, baseOp, isStore, twins, offset, widthFlags);
 }
 
 // ── THE FRAME ACCESS WIDTHS (contract: `lir_callconv.hpp`) ──────────────────
@@ -2275,11 +2598,12 @@ struct RegMove {
 // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the frame geometry `emitParallelRegMoves`
 // needs to lower a mem-src move (`frame_load argReg, [slot]`) into a real sp-
 // relative load — the SAME formula the frame_load materialization uses
-// (`spillAreaOffset() + (slot.v-1)*slotSize`), so a direct-arg reload reads the
-// exact slot the rewriter would have. `sp` + `frameMemScaled` feed the
-// emitFrameLoad chokepoint (the load op itself is class-resolved per dst, and the
-// twin table is consulted for THAT class — an FP arg reloaded from a high spill
-// slot swaps to the FP scaled form, not to the integer one). Passed with
+// (`spillSlotOffset`), so a direct-arg reload reads the exact slot the rewriter
+// would have. `sp` + `frameCtx` feed the emitFrameLoad chokepoint (the load op
+// itself is class-resolved per dst, and the twin table is consulted for THAT
+// class — an FP arg reloaded from a high spill slot swaps to the FP scaled form,
+// not to the integer one; and one past both reaches goes FAR through the BODY
+// context's frame-address scratch, which no arg register can be). Passed with
 // `hasMemSrc=false` by the return-piece caller (which never has a mem-src move),
 // so the fields are unread there.
 struct MemSrcLoadCtx {
@@ -2287,10 +2611,10 @@ struct MemSrcLoadCtx {
     LirReg        sp{};
     std::uint32_t spillAreaOffset = 0;
     std::uint32_t slotSize = 0;
-    // Non-owning: the module's `OpcodeHandles::frameMemScaled`, which outlives
-    // every context built from it (both are function-local to one
-    // materializeOneFunc call chain).
-    FrameMemScaledTable const* frameMemScaled = nullptr;
+    // Non-owning: the function's BODY frame context, which outlives every
+    // context built from it (both are function-local to one materializeOneFunc
+    // call chain).
+    FrameMemCtx const* frameCtx = nullptr;
 };
 
 // Pick a caller-saved register of class `cls` not among the registers `moves`
@@ -2455,20 +2779,21 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
             return false;
         }
         LirSpillSlot const slot{m.memSlotV};
-        std::int32_t const offset = static_cast<std::int32_t>(
-            memCtx.spillAreaOffset + (slot.v - 1u) * memCtx.slotSize);
+        std::int32_t const offset =
+            spillSlotOffset(memCtx.spillAreaOffset, memCtx.slotSize, slot.v);
         auto const spillLoad = classOpHandle(
             schema, m.dst.regClass(), RegClassOp::Load,
             "materializeOneFunc: direct-arg spill reload", reporter);
         if (!spillLoad.has_value()) return false;
-        // A `valid` context always carries the table (the one construction site
-        // states it); the null check refuses rather than silently dropping the
-        // swap, which would fail loud at the encoder one tier further away.
-        if (memCtx.frameMemScaled == nullptr) {
+        // A `valid` context always carries the frame context (the one
+        // construction site states it); the null check refuses rather than
+        // silently dropping the swap, which would fail loud at the encoder one
+        // tier further away.
+        if (memCtx.frameCtx == nullptr) {
             report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
                    DiagnosticSeverity::Error,
                    "materializeOneFunc: direct-arg spill reload has no frame "
-                   "memory-op twin table (internal: MemSrcLoadCtx built valid "
+                   "memory context (internal: MemSrcLoadCtx built valid "
                    "without one)");
             return false;
         }
@@ -2481,9 +2806,9 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
             schema, m.dst.regClass(),
             "materializeOneFunc: direct-arg spill reload", reporter);
         if (!loadWidth.has_value()) return false;
-        emitFrameLoad(b, *spillLoad, m.dst, memCtx.sp, offset,
-                      *memCtx.frameMemScaled, *loadWidth);
-        return true;
+        return emitFrameLoad(b, *spillLoad, m.dst, memCtx.sp, offset,
+                             *memCtx.frameCtx, *loadWidth)
+               != InvalidLirInst;
     };
     while (!moves.empty()) {
         bool progressed = false;
@@ -2606,7 +2931,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // extern is lowered, so the absence here is safe.
         {&OpcodeHandles::callIndirectViaExtern,
          "call_indirect_via_extern", true},
-        // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+        // Local-int codegen (plan step 13.3b, 2026-06-02):
         // optional — a target without body-local allocas (e.g., a
         // shader / WASM target where locals are operand-stack
         // values, not stack slots) legitimately omits both. When
@@ -2700,23 +3025,201 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
     // field 0, and `selectFrameMemOp` reads 0 as "keep the short form". The
     // pairing rules that make a HALF-declared class impossible are enforced at
     // LOAD time (`TargetSchemaData::validate`), where the config is judged —
-    // this loop must not re-litigate them, or the two would come to disagree.
-    for (std::size_t ci = 0; ci < kTargetRegClassCount; ++ci) {
-        auto const cls = static_cast<TargetRegClass>(ci);
-        auto& row = h.frameMemScaled[ci];
-        auto const get = [&](RegClassOp op) -> std::uint16_t {
-            auto const v = schema.regClassOpOpcode(cls, op);
-            return v.has_value() ? *v : std::uint16_t{0};
-        };
-        row.load        = get(RegClassOp::Load);
-        row.loadScaled  = get(RegClassOp::LoadScaled);
-        row.store       = get(RegClassOp::Store);
-        row.storeScaled = get(RegClassOp::StoreScaled);
-    }
+    // this builder must not re-litigate them, or the two would come to disagree.
+    h.frameMemScaled = buildFrameMemScaledTable(schema);
     return h;
 }
 
 // remapOperand + emitTerminator are now in lir_pass_util.
+
+// ── THE FRAME-ADDRESS SCRATCH: WHO MAY USE IT, AND WHERE ─────────────────────
+//
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm). Three helpers for the
+// three contexts `materializeOneFunc` builds around every frame access.
+
+// Is `reg` among `saved` (the function's saved-register set)?
+[[nodiscard]] bool
+savedSetContains(std::vector<LirReg> const& saved, std::uint32_t ordinal) noexcept {
+    for (LirReg const& r : saved) {
+        if (r.isPhysical != 0 && r.id == ordinal) return true;
+    }
+    return false;
+}
+
+// Does the function name the physical register `ordinal` explicitly anywhere —
+// as any instruction's result or register operand? After the rewrite every
+// register is physical, so this is the complete list of values the function
+// itself places there. The frame-address scratch is never allocatable (the
+// loader refuses one that is), so the only way it appears here is a register
+// pinned by name — an inline-asm operand, say — and a register the body names
+// is one it may be holding a value in, which a far frame access must not
+// overwrite. Such a body gets no scratch; its far stores are refused by name.
+[[nodiscard]] bool
+functionNamesPhysicalReg(Lir const& src, LirFuncId fn,
+                         std::uint32_t ordinal) noexcept {
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const n = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            LirReg const r = src.instResult(inst);
+            if (r.valid() && r.isPhysical != 0 && r.id == ordinal) return true;
+            for (auto const& o : src.instOperands(inst)) {
+                if (o.kind == LirOperandKind::Reg && o.reg.valid()
+                    && o.reg.isPhysical != 0 && o.reg.id == ordinal)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+// A general register DEAD at both function boundaries by construction: the
+// first caller-saved one (so clobbering it owes the caller nothing) outside
+// every ABI role that can be live there — the argument registers (holding
+// incoming parameters at entry), the return registers (holding the result at
+// exit), the indirect-result register and the variadic vector-count register.
+// Config-derived over the convention's own lists; the AAPCS64 variadic
+// prologue's save-area base picks by the same rule. InvalidLirReg when the
+// convention leaves none — and a far boundary access then refuses by name.
+[[nodiscard]] LirReg
+pickBoundaryScratchGpr(TargetSchema const& schema,
+                       TargetCallingConvention const& cc) {
+    std::unordered_set<std::uint16_t> roles;
+    auto const absorb = [&](std::vector<std::string> const& names) {
+        for (auto const& n : names)
+            if (auto const o = schema.registerByName(n); o.has_value())
+                roles.insert(*o);
+    };
+    absorb(cc.argGprs);
+    absorb(cc.argFprs);
+    absorb(cc.returnGprs);
+    absorb(cc.returnFprs);
+    if (cc.indirectResultRegister.has_value())
+        roles.insert(cc.indirectResultRegister->ordinal);
+    if (cc.variadicVectorCountReg.has_value())
+        roles.insert(cc.variadicVectorCountReg->ordinal);
+    for (std::string_view const name : cc.callerSaved) {
+        auto const ord = schema.registerByName(name);
+        if (!ord.has_value() || roles.contains(*ord)) continue;
+        auto const* info = schema.registerInfo(*ord);
+        if (info == nullptr || info->regClass != TargetRegClass::GPR) continue;
+        return makePhysicalReg(*ord, LirRegClass::GPR);
+    }
+    return InvalidLirReg;
+}
+
+// Does any BODY frame access of `fn`, under `layout`, need the frame-address
+// scratch? Only a FAR access needs a register, and of those only a store or a
+// load into a class other than the base register's (a load into the base class
+// addresses through its own destination). Walks exactly the body sites that
+// lower a frame access through the body context, with the SAME offset formulas
+// (`spillSlotOffset`, `incomingStackArgOffset`) and the SAME form selection
+// (`selectFrameMemOp`) they use:
+//   * `frame_store` — every spilled value is stored; the store needs it;
+//   * `frame_load` into a non-base class;
+//   * a stack-resident `arg` into a non-base class, placed by the same cursor;
+//   * `store_outgoing_arg`.
+// ⚠ A CALL'S OWN FRAME STORES — its stacked arguments and by-value copies — are
+// placed by the call arm's placement walk, which this does not re-run. They all
+// land inside the outgoing area, so they are bounded instead: if the narrowest
+// integer store cannot reach the area's last byte, the function is folded. On
+// arm64 the question never arises — a function with a call has already saved
+// its link register, which IS its frame-address scratch — so the bound exists
+// for a convention whose scratch is some other register.
+// ⓘ Why the answer is exact: it is asked of the layout WITHOUT the fold, and
+// the fold only adds a save slot, which only RAISES offsets. "No" leaves that
+// very layout in place; "yes" saves the register before any access runs.
+[[nodiscard]] bool
+functionNeedsBodyFrameScratch(Lir const& src, LirFuncId fn,
+                              TargetSchema const& schema,
+                              TargetCallingConvention const& cc,
+                              OpcodeHandles const& h, FrameLayout const& layout,
+                              LirReg frameBase, ArgCursors const& argPoolBounds,
+                              bool hasCalls) {
+    // Every width and opcode looked up here is re-derived, and any failure
+    // REPORTED, by the materialization itself; this walk only predicts.
+    DiagnosticReporter quiet;
+    LirRegClass const baseClass = frameBase.regClass();
+    auto const needsScratch = [&](LirRegClass cls, bool isStore,
+                                  std::int32_t offset,
+                                  std::uint8_t widthFlags) -> bool {
+        if (!isStore && cls == baseClass) return false;  // self-addressed
+        auto const op = schema.regClassOpOpcode(
+            static_cast<TargetRegClass>(static_cast<std::uint8_t>(cls)),
+            isStore ? RegClassOp::Store : RegClassOp::Load);
+        if (!op.has_value()) return false;  // refused by the materialization
+        return selectFrameMemOp(schema, *op, isStore, h.frameMemScaled, offset,
+                                widthFlags).far;
+    };
+    auto const spillOffset = [&](std::uint32_t slotV) {
+        return spillSlotOffset(layout.spillAreaOffset(), layout.slotSize, slotV);
+    };
+    StackArgCursor incoming{cc, widthForClass(schema, LirRegClass::GPR)};
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const n = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = src.blockInstAt(blk, i);
+            std::uint16_t const op = src.instOpcode(inst);
+            auto const ops = src.instOperands(inst);
+            LirReg const result = src.instResult(inst);
+            std::uint32_t const payload = src.instPayload(inst);
+            if (op == h.frameStore) {
+                if (ops.empty() || ops[0].kind != LirOperandKind::Reg) continue;
+                LirRegClass const cls = ops[0].reg.regClass();
+                auto const w = wholeRegisterAccessFlags(schema, cls, "", quiet);
+                if (w.has_value()
+                    && needsScratch(cls, /*isStore=*/true, spillOffset(payload), *w))
+                    return true;
+                continue;
+            }
+            if (op == h.frameLoad) {
+                if (!result.valid()) continue;
+                LirRegClass const cls = result.regClass();
+                auto const w = wholeRegisterAccessFlags(schema, cls, "", quiet);
+                if (w.has_value()
+                    && needsScratch(cls, /*isStore=*/false, spillOffset(payload), *w))
+                    return true;
+                continue;
+            }
+            if (op == h.arg) {
+                if (!result.valid()) continue;
+                LirRegClass const cls = result.regClass();
+                if (payload < argPoolBounds.poolSizeFor(cls)) continue;
+                // The cursor advances for EVERY stacked arg, base class or not,
+                // exactly as the `arg` arm's does — the offsets depend on it.
+                auto const place = incoming.placeNamedScalar(std::max<std::uint32_t>(
+                    1u, lirInstWidthBits(src.instFlags(inst)) / 8u));
+                if (needsScratch(cls, /*isStore=*/false,
+                                 incomingStackArgOffset(layout, cc, place.byteOffset),
+                                 place.widthFlags))
+                    return true;
+                continue;
+            }
+            if (h.storeOutgoingArg != 0 && op == h.storeOutgoingArg) {
+                if (ops.empty() || ops[0].kind != LirOperandKind::Reg) continue;
+                std::int32_t const offset = static_cast<std::int32_t>(
+                    static_cast<std::uint32_t>(cc.shadowSpaceBytes) + payload);
+                if (needsScratch(ops[0].reg.regClass(), /*isStore=*/true, offset,
+                                 src.instFlags(inst)))
+                    return true;
+                continue;
+            }
+        }
+    }
+    if (hasCalls && layout.outgoingArgAreaSize > 0) {
+        auto const byteFlags = lirInstWidthFlagForBits(8);
+        if (byteFlags.has_value()
+            && needsScratch(LirRegClass::GPR, /*isStore=*/true,
+                            static_cast<std::int32_t>(layout.outgoingArgAreaSize - 1u),
+                            *byteFlags))
+            return true;
+    }
+    return false;
+}
 
 [[nodiscard]] bool
 materializeOneFunc(Lir const& src, LirFuncId fn,
@@ -2911,7 +3414,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     std::uint32_t const outgoingArgSlots = hasCalls
         ? computeMaxOutgoingStackArgs(src, fn, schema, cc)
         : 0u;
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): pre-
+    // Local-int codegen (plan step 13.3b, 2026-06-02): pre-
     // scan `alloca` opcodes; the prologue reserves one slotSize-byte
     // slot per body-local declaration. Order-by-scan = order-by-
     // materialize-arm — the materialize loop assigns the same index
@@ -3029,16 +3532,86 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             || cc.vaListLayout->strategy == VaListStrategy::Aapcs64DualCursor);
     std::uint32_t const vaRegSaveAreaBytes =
         usesCalleeRegSaveZone ? cc.vaListLayout->regSaveAreaBytes() : 0u;
-    auto layoutOpt = computeFrameLayout(alloc, schema, cc,
-                                        std::move(usedSaved),
-                                        hasCalls, outgoingArgSlots,
-                                        localAllocaPayloads,
-                                        perAllocaAligns,
-                                        vaRegSaveAreaBytes,
-                                        maxLocalAlign,
-                                        reporter);
+    auto const layoutFor = [&](std::vector<LirReg> saved) {
+        return computeFrameLayout(alloc, schema, cc, std::move(saved),
+                                  hasCalls, outgoingArgSlots,
+                                  localAllocaPayloads,
+                                  perAllocaAligns,
+                                  vaRegSaveAreaBytes,
+                                  maxLocalAlign,
+                                  reporter);
+    };
+    auto layoutOpt = layoutFor(usedSaved);
     if (!layoutOpt.has_value()) return false;
+
+    // ── THE FRAME-ADDRESS SCRATCH: SAVED WHERE THE BODY NEEDS IT, AND ONLY THERE
+    //
+    // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm). A far store, or a
+    // far load into a class that cannot address memory, materializes its address
+    // in the convention's `frameAddressScratch` (arm64: x30). The loader has
+    // already proved no allocatable list names it, so no value is ever assigned
+    // to it; what remains is the CALLER's claim on it — x30 is the return address
+    // — so a function that uses it must save it first.
+    //   * A function with a call already does: the link-register fold above put
+    //     it in `usedSaved`, and after the prologue it is dead until the epilogue
+    //     restores it. Nothing changes for any such function.
+    //   * A leaf gets it folded in HERE, and only if its body really has an
+    //     access that needs it — asked of the layout WITHOUT the fold, which is
+    //     exact because the fold only raises offsets. Every other leaf keeps a
+    //     byte-identical frame.
+    // ✔MEASURED precedent that this is an ordinary use of the register: gcc
+    // 13.3.0 and clang 18.1.3 both allocate x30 as a body temporary in a LEAF
+    // they have saved it in (`lsl x30, x0, #3`, `add x30, x2, x2, lsl #3`,
+    // `ldr x30, [x8, #688]`).
+    std::optional<LirReg> const declaredScratch =
+        cc.frameAddressScratch.has_value()
+            ? std::optional<LirReg>{makePhysicalReg(
+                  cc.frameAddressScratch->ordinal, LirRegClass::GPR)}
+            : std::nullopt;
+    bool const scratchNamedByBody =
+        declaredScratch.has_value()
+        && functionNamesPhysicalReg(src, fn, declaredScratch->id);
+    if (declaredScratch.has_value() && !scratchNamedByBody
+        && !savedSetContains(layoutOpt->savedRegs, declaredScratch->id)
+        && functionNeedsBodyFrameScratch(src, fn, schema, cc, h, *layoutOpt,
+                                         frameBase, argPoolBounds, hasCalls)) {
+        usedSaved.push_back(*declaredScratch);
+        layoutOpt = layoutFor(std::move(usedSaved));
+        if (!layoutOpt.has_value()) return false;
+    }
     outLayout = std::move(*layoutOpt);
+
+    // ── THE THREE FRAME CONTEXTS ─────────────────────────────────────────────
+    // ENTRY (the prologue, the variadic save spill) and EXIT (the epilogue) share
+    // one register: a caller-saved general register outside every ABI role is
+    // dead at both boundaries. The BODY gets the declared scratch, and only if
+    // this function saved it and names it nowhere itself.
+    LirReg const boundaryScratch = pickBoundaryScratchGpr(schema, cc);
+    std::string const boundaryWhy = std::format(
+        "calling convention '{}' leaves no caller-saved general register outside "
+        "its argument, return, indirect-result and vector-count roles to carry "
+        "it at a function boundary", cc.name);
+    LirReg bodyScratch = InvalidLirReg;
+    std::string bodyWhy;
+    if (!declaredScratch.has_value()) {
+        bodyWhy = std::format("calling convention '{}' declares no "
+                              "`frameAddressScratch` register", cc.name);
+    } else if (scratchNamedByBody) {
+        bodyWhy = std::format("the frame-address scratch '{}' is named explicitly "
+                              "by this function, so it may hold a live value here",
+                              cc.frameAddressScratch->name);
+    } else if (!savedSetContains(outLayout.savedRegs, declaredScratch->id)) {
+        bodyWhy = std::format("the frame-address scratch '{}' is not saved by "
+                              "this function's prologue (internal: the fold "
+                              "predicate did not foresee this access)",
+                              cc.frameAddressScratch->name);
+    } else {
+        bodyScratch = *declaredScratch;
+    }
+    FrameMemCtx const boundaryCtx{&schema, &h.frameMemScaled, h.lea,
+                                  boundaryScratch, boundaryWhy, &reporter};
+    FrameMemCtx const bodyCtx{&schema, &h.frameMemScaled, h.lea,
+                              bodyScratch, bodyWhy, &reporter};
 
     // D-CSUBSET-VLA-NONLEAF-CALL-FRAME: the non-leaf VLA frame model's ONE number
     // (see the design note above the LEAF-gate paragraph). `outgoingArgAreaSize` is
@@ -3080,7 +3653,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
     std::uint32_t const slotSize = outLayout.slotSize;
 
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
+    // Local-int codegen (plan step 13.3b) + FC7 (D-FC7-MEMBER-ACCESS):
     // a running BYTE offset advanced once per `alloca` instruction in scan
     // order — by `allocaSlotCount(payload) * slotSize`, the SAME formula +
     // scan order `functionLocalAllocaPayloads`/`computeFrameLayout` used at
@@ -3150,7 +3723,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         if (bi == 0) {
             bool prologueOk = false;
             emitPrologue(b, outLayout, schema, cc, sp, h.sub,
-                         h.stackProbe, h.frameMemScaled, outCfiFn.ops, reporter,
+                         h.stackProbe, boundaryCtx, outCfiFn.ops, reporter,
                          prologueOk);
             if (!prologueOk) return false;
             // FC12a/b/c: a function that calls va_start spills its arg registers
@@ -3161,7 +3734,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             if (usesVaStart
                 && !emitVariadicPrologueSpill(b, outLayout, schema, cc, sp,
                                               h.add,
-                                              h.frameMemScaled, reporter))
+                                              boundaryCtx, reporter))
                 return false;
             // D-CSUBSET-VLA CRITICAL-3 (C1b): the frame-pointer setup goes AFTER the
             // prologue's `sub sp,F` + saved-reg stores (incl. the caller's rbp/x29
@@ -3357,11 +3930,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     auto const place = incomingStackArgs.placeNamedScalar(
                         std::max<std::uint32_t>(
                             1u, lirInstWidthBits(src.instFlags(inst)) / 8u));
-                    std::int32_t const offset = static_cast<std::int32_t>(
-                        outLayout.totalFrameSize
-                        + static_cast<std::uint32_t>(cc.callPushBytes)
-                        + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                        + place.byteOffset);
+                    std::int32_t const offset =
+                        incomingStackArgOffset(outLayout, cc, place.byteOffset);
                     auto const argLoad = classOpHandle(
                         schema, cls, RegClassOp::Load,
                         "materializeOneFunc: stack-resident arg load",
@@ -3378,8 +3948,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // D-CSUBSET-VLA (C1b): a FIXED-FRAME ref → `frameBase` (== FP in a
                     // VLA function, captured at FB where SP == the entry SP - F, so
                     // the offset is UNCHANGED). `frameBase == sp` for a non-VLA fn.
-                    emitFrameLoad(b, *argLoad, result, frameBase, offset,
-                                  h.frameMemScaled, place.widthFlags);
+                    // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE: past BOTH forms (a param
+                    // above a frame beyond 32760 bytes) the read goes FAR — through
+                    // its own destination for an integer param, through the body's
+                    // frame-address scratch for an FP one.
+                    if (emitFrameLoad(b, *argLoad, result, frameBase, offset,
+                                      bodyCtx, place.widthFlags) == InvalidLirInst)
+                        return false;
                 }
                 continue;
             }
@@ -3431,7 +4006,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 return false;
             }
 
-            // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02):
+            // Local-int codegen (plan step 13.3b, 2026-06-02):
             // materialize `alloca` virtual op into `lea result,
             // [sp + localAreaOffset() + i * slotSize]`. Placed next
             // to the `arg` arm because both produce a frame-resident
@@ -3451,8 +4026,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                            std::format("callconv: target schema declares "
                                        "'alloca' opcode but no 'lea' opcode "
                                        "— required to materialize alloca as "
-                                       "`lea result, [sp + offset]` per "
-                                       "D-CSUBSET-LOCAL-INT-CODEGEN"));
+                                       "`lea result, [sp + offset]` "
+                                       "(D-CSUBSET-LOCAL-INT-CODEGEN-NEGATIVE-PIN)"));
                     return false;
                 }
                 if (!result.valid() || result.isPhysical == 0) {
@@ -4429,9 +5004,11 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     if (!stkStore.has_value()) return false;
                     // Outgoing stack-arg offsets live in the [0, outgoingArg
                     // AreaSize) base; a call with many stack args can push them
-                    // past imm9 — the chokepoint swaps a GPR store to store_u.
-                    emitFrameStore(b, *stkStore, s.src, sp, s.offset,
-                                   h.frameMemScaled, s.widthFlags);
+                    // past imm9 — the chokepoint swaps a GPR store to store_u,
+                    // and past that emits the far form.
+                    if (emitFrameStore(b, *stkStore, s.src, sp, s.offset,
+                                       bodyCtx, s.widthFlags) == InvalidLirInst)
+                        return false;
                 }
                 // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): emit the by-
                 // value-stack aggregate byte-copies — ALSO in the stack-store phase
@@ -4553,12 +5130,15 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // — bounded by the 16-rounded temp + the reserved slot span.
                         std::uint32_t off = 0;
                         for (; off < cpy.bytes; off += chunk) {
-                            emitFrameLoad(b, *gpLoad, *scratch, cpy.addr,
-                                          static_cast<std::int32_t>(off),
-                                          h.frameMemScaled, *chunkWidth);
-                            emitFrameStore(b, *gpStore, *scratch, sp,
-                                           cpy.dstOffset + static_cast<std::int32_t>(off),
-                                           h.frameMemScaled, *chunkWidth);
+                            if (emitFrameLoad(b, *gpLoad, *scratch, cpy.addr,
+                                              static_cast<std::int32_t>(off),
+                                              bodyCtx, *chunkWidth)
+                                    == InvalidLirInst
+                                || emitFrameStore(
+                                       b, *gpStore, *scratch, sp,
+                                       cpy.dstOffset + static_cast<std::int32_t>(off),
+                                       bodyCtx, *chunkWidth) == InvalidLirInst)
+                                return false;
                         }
                     }
                 }
@@ -4598,7 +5178,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // in a VLA function. `frameBase == sp` for a non-VLA fn (byte-identical).
                 MemSrcLoadCtx const argMemCtx{
                     /*valid=*/true, frameBase, outLayout.spillAreaOffset(),
-                    outLayout.slotSize, &h.frameMemScaled};
+                    outLayout.slotSize, &bodyCtx};
                 if (!emitParallelRegMoves(
                         b, schema, cc, std::move(argRegMoves),
                         argScratchReserved,
@@ -4793,8 +5373,8 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             // trip through the GPR mov (silent 8-byte mis-encode).
             if (op == h.frameLoad) {
                 LirSpillSlot const slot{payload};
-                std::int32_t const offset = static_cast<std::int32_t>(
-                    outLayout.spillAreaOffset() + (slot.v - 1u) * slotSize);
+                std::int32_t const offset =
+                    spillSlotOffset(outLayout.spillAreaOffset(), slotSize, slot.v);
                 auto const spillLoad = classOpHandle(
                     schema, result.regClass(), RegClassOp::Load,
                     "materializeOneFunc: spill reload", reporter);
@@ -4828,14 +5408,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     schema, result.regClass(),
                     "materializeOneFunc: spill reload", reporter);
                 if (!reloadWidth.has_value()) return false;
-                emitFrameLoad(b, *spillLoad, result, frameBase, offset,
-                              h.frameMemScaled, *reloadWidth);
+                // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE: a spill area past the
+                // scaled reach (thousands of slots) reloads FAR — an integer
+                // value through its own destination, an FP one through the
+                // body's frame-address scratch.
+                if (emitFrameLoad(b, *spillLoad, result, frameBase, offset,
+                                  bodyCtx, *reloadWidth) == InvalidLirInst)
+                    return false;
                 continue;
             }
             if (op == h.frameStore) {
                 LirSpillSlot const slot{payload};
-                std::int32_t const offset = static_cast<std::int32_t>(
-                    outLayout.spillAreaOffset() + (slot.v - 1u) * slotSize);
+                std::int32_t const offset =
+                    spillSlotOffset(outLayout.spillAreaOffset(), slotSize, slot.v);
                 if (ops.empty() || ops[0].kind != LirOperandKind::Reg) {
                     report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
                            DiagnosticSeverity::Error,
@@ -4858,8 +5443,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     schema, ops[0].reg.regClass(),
                     "materializeOneFunc: spill store", reporter);
                 if (!spillWidth.has_value()) return false;
-                emitFrameStore(b, *spillStore, ops[0].reg, frameBase, offset,
-                               h.frameMemScaled, *spillWidth);
+                // D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE: the store `ee` measured
+                // refused at offset 32768 — a spill slot past the scaled reach —
+                // is emitted FAR through the body's frame-address scratch.
+                if (emitFrameStore(b, *spillStore, ops[0].reg, frameBase, offset,
+                                   bodyCtx, *spillWidth) == InvalidLirInst)
+                    return false;
                 continue;
             }
             // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc
@@ -4890,8 +5479,9 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     schema, ops[0].reg.regClass(), RegClassOp::Store,
                     "materializeOneFunc: store_outgoing_arg", reporter);
                 if (!stkStore.has_value()) return false;
-                emitFrameStore(b, *stkStore, ops[0].reg, sp, offset,
-                               h.frameMemScaled, src.instFlags(inst));
+                if (emitFrameStore(b, *stkStore, ops[0].reg, sp, offset,
+                                   bodyCtx, src.instFlags(inst)) == InvalidLirInst)
+                    return false;
                 continue;
             }
 
@@ -5035,7 +5625,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     std::size_t const cfiMark = outCfiFn.ops.size();
                     bool epilogueOk = false;
                     emitEpilogue(b, outLayout, schema, cc, sp, h.add,
-                                 h.frameMemScaled,
+                                 boundaryCtx,
                                  static_cast<std::int64_t>(cc.callPushBytes),
                                  outCfiFn.ops, reporter, epilogueOk);
                     if (!epilogueOk) return false;

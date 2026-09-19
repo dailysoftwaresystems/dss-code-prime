@@ -1525,6 +1525,16 @@ public:
                              reporter, request);
     }
 
+    // [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]:
+    // where `encode` above puts each import's `__stubs` entry — answered by the
+    // writer's own TU, beside the layout it describes.
+    [[nodiscard]] link::ImportCallStubLayout
+    importCallStubLayout(AssembledModule const&    module,
+                         TargetSchema const&       /*targetSchema*/,
+                         ObjectFormatSchema const& objectFormatSchema) const override {
+        return macho::importCallStubLayout(module, objectFormatSchema);
+    }
+
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of
     // `encode` above. `compile_pipeline.cpp::readArchiveMemberModule` used to
     // pick this call with a 3-arm `switch (format.kind())`; the backend the

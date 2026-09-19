@@ -36,7 +36,7 @@ dss_add_test(NAME core/test_target_schema       SOURCES test_target_schema.cpp)
 target_link_libraries(dss_core_test_target_schema PRIVATE nlohmann_json::nlohmann_json)
 # Two `.target.json` loader gates that close the same shape — a config that
 # loads clean and then does nothing:
-#   * D-UNWIND-NO-EH-FRAME-…: the psABI DWARF numbering must arrive in BOTH
+#   * D-UNWIND-NO-EH-FRAME-ANY-LANGUAGE-ON-ELF-OR-MACHO: the psABI DWARF numbering must arrive in BOTH
 #     halves, and every register a calling convention names as frame-relevant
 #     must be numbered (derived from what the target already declares).
 #   * D-CONFIG-VALISTLAYOUT-INERT-CROSS-STRATEGY-KEY: `vaListLayout`'s key set

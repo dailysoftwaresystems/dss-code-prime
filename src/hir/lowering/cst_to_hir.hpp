@@ -51,7 +51,7 @@ class DiagnosticReporter;
 struct DSS_EXPORT HirExternRecord {
     HirNodeId   node;
     std::string canonicalName;  // undecorated source identifier
-    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3, 2026-06-02) +
+    // The extern library-name syntax closure (step 13.3, 2026-06-02) +
     // Model 3 (2026-06-09): per-symbol import-library override, now a
     // per-OBJECT-FORMAT map keyed by `objectFormatKindName`
     // ("pe"/"elf"/"macho"/…). Two producers populate it target-agnostically:
@@ -142,7 +142,7 @@ struct DSS_EXPORT CstToHirResult {
     HirLinkageMap  linkageMap;    // bound to `hir` — native-decl binding/visibility
                                   // (D-CSUBSET-LINKAGE-SPECIFIERS); read at HIR→MIR
     HirNoInlineMap noInlineMap;   // bound to `hir` — native-FUNCTION inliner opt-out
-                                  // (TF-C78, D-CSUBSET-NOINLINE); read at HIR→MIR to
+                                  // (TF-C78, D-CSUBSET-NOINLINE-PER-FUNCTION-SINK); read at HIR→MIR to
                                   // stamp MirFunc.noInline (the inliner's refusal)
     HirAlwaysInlineMap alwaysInlineMap; // bound to `hir` — native-FUNCTION inliner
                                   // cost-model BYPASS (TF-C81,

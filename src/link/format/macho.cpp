@@ -1463,6 +1463,39 @@ encodeExecDynamic(AssembledModule const&    module,
                   ImageRequest const&       request);
 } // namespace
 
+// ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
+//
+// `encodeExecDynamic` lays `__stubs` IMMEDIATELY after `__text`
+// (`stubsVa = sectionVa + textBody.size()`), one `machoStubSizeFor(cputype)`
+// stub per FUNCTION import in `externImports` order — a data import owns a
+// `__got` slot and no stub. So the answer here is EXACT, not merely a bound:
+// stub j lies `j * stubSize` bytes past the end of `__text`, whatever
+// `__text`'s size. `encodeExecDynamic` asserts every stub against it.
+//
+// Empty for the flavors `encode` routes elsewhere: MH_OBJECT, and an
+// MH_EXECUTE with no import (the static writer, which emits no `__stubs`).
+link::ImportCallStubLayout
+importCallStubLayout(AssembledModule const&    module,
+                     ObjectFormatSchema const& objectFormatSchema) {
+    link::ImportCallStubLayout out;
+    auto const& fmt = objectFormatSchema;
+    if (fmt.backend() != &link::format::machoBackend()) return out;
+    bool const dynamicWriter =
+        fmt.macho().filetype == MachOObjectType::Dylib
+        || (fmt.macho().filetype == MachOObjectType::Execute
+            && !module.externImports.empty());
+    if (!dynamicWriter) return out;
+    std::uint64_t const stubSize = machoStubSizeFor(fmt.macho().cputype);
+    if (stubSize == 0) return out;  // the writer refuses this cputype itself
+    std::uint64_t j = 0;
+    for (auto const& ext : module.externImports) {
+        if (ext.isData) continue;
+        out.maxPastTextEnd.emplace(ext.symbol, j * stubSize);
+        ++j;
+    }
+    return out;
+}
+
 std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
@@ -3858,10 +3891,37 @@ encodeExecDynamic(AssembledModule const&    module,
     }
     std::size_t const numFuncExterns = funcExternIdxs.size();
     // FUNCTION externs → their __stubs stub VA (the COMPACTED stub index j).
+    //
+    // ★ [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]:
+    // the branch-veneer pass measured every import-bound call against
+    // `importCallStubLayout` BEFORE this layout existed. Assert each stub lies
+    // where that answer said — the two descriptions of `__stubs` must not
+    // drift apart silently.
+    auto const stubBound = importCallStubLayout(module, fmt);
+    std::uint64_t const textEndVa = sectionVa + textBody.size();
     for (std::size_t j = 0; j < numFuncExterns; ++j) {
         std::size_t const i = funcExternIdxs[j];
         std::uint64_t const stubVa =
             stubsVa + static_cast<std::uint64_t>(j) * stubSize;
+        auto const bound =
+            stubBound.maxPastTextEnd.find(module.externImports[i].symbol);
+        if (bound == stubBound.maxPastTextEnd.end() || stubVa < textEndVa
+            || stubVa - textEndVa > bound->second) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExecDynamic: import '{}''s `__stubs` "
+                             "entry lands {} bytes past the end of `__text`, "
+                             "outside the bound {} that `importCallStubLayout` "
+                             "reported for it — the branch-veneer pass measured "
+                             "calls to it against that bound, so the two "
+                             "descriptions of this layout have diverged "
+                             "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
+                             module.externImports[i].mangledName,
+                             stubVa >= textEndVa ? stubVa - textEndVa : 0,
+                             bound == stubBound.maxPastTextEnd.end()
+                                 ? std::string{"<none>"}
+                                 : std::to_string(bound->second)));
+            return {};
+        }
         if (!symbolVa.emplace(module.externImports[i].symbol,
                               stubVa).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
