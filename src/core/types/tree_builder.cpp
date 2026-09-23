@@ -358,6 +358,7 @@ TreeBuilder::OpenScope TreeBuilder::open(RuleId rule) & {
         .openerSpan   = opener,
         .pendingStart = pendingStart,
         .cookie       = cookie,
+        .scopeDepth   = static_cast<std::uint32_t>(scopes_.size()),
     });
 
     // Walk the schema-cursor state machine in parallel with the open
@@ -531,6 +532,42 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         pendingChildren_.truncate(fr.pendingStart);
         node.firstChild = firstChild;
         node.childCount = childCount;
+
+        // ── THE SCOPES THIS FRAME OPENED ARE ITS TO CLOSE ───────────────────
+        // [[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]. The
+        // scope stack is driven by TOKENS (`{`, `(`, `[` push; their closers
+        // pop) and the frames by the PARSER, so the two drift apart exactly
+        // when the parse never reaches a closer: panic recovery consumes it
+        // without `pushToken`, an unterminated literal swallows it, or the
+        // input ends first. ✔MEASURED before this: 9 of 15 refusal shapes
+        // printed the builder's own "scope stack non-empty at finish" to the
+        // user AFTER the parser had reported the real error — an internal
+        // check spent on user input.
+        //   * A frame that closes WITH an error in it was abandoned — by
+        //     recovery, or by the end of input — and the user already holds
+        //     that error: the scopes it opened close with it, silently.
+        //     Recovery closes what it opened.
+        //   * A frame that closes CLEAN with its depth moved either way is a
+        //     grammar that splits an opener from its closer across two rules,
+        //     or a builder bug — never user input, so it stays an internal
+        //     invariant (repaired where it can be, so it is reported once).
+        // `scopes_.pop()`, not `popScope()`: `finish()` closes frames after
+        // `finished_` is set, and `popScope` refuses to run then.
+        {
+            auto const depth = static_cast<std::size_t>(fr.scopeDepth);
+            bool const frameErred = hasError(node.flags);
+            SourceSpan const frameSpan = node.span;
+            if (!frameErred && scopes_.size() != depth) {
+                addBuilderInvariant_(
+                    std::format("rule '{}' closed cleanly with the scope stack at "
+                                "depth {}, not the depth {} it opened at — an "
+                                "opener and its closer in different rules",
+                                schema_->rules().name(fr.rule), scopes_.size(),
+                                depth),
+                    frameSpan);
+            }
+            while (scopes_.size() > depth) scopes_.pop();
+        }
 
         const bool isTarget = (fr.cookie == cookie);
         if (!isTarget) {
@@ -804,7 +841,26 @@ void TreeBuilder::pushToken(Token const& tok) {
         return;
     }
 
-    const std::string_view lexeme = source_->slice(tok.span);
+    // ★ A TOKEN THE TOKENIZER READ FROM THE IMPLIED TAIL (`NodeFlags::Implied`,
+    // P68 round 8) has NO bytes in the buffer — its span is zero-width at the
+    // end — so it is spelled by the schema's `endOfInputImplies` lexeme, which
+    // is exactly what the tokenizer read, and resolves through the ordinary
+    // fast path against that lexeme's REAL meaning (flags, priority, scope
+    // rules) rather than a synthesized bare one. The provenance is the
+    // TOKENIZER's statement, never inferred here from a position: an unflagged
+    // zero-width token (an empty body at the end of the input) keeps the path it
+    // always had. ⚠ A flagged token under a schema that declares no such lexeme
+    // is a tokenizer/schema DRIFT — fatal, like every other drift this builder
+    // refuses to paper over.
+    std::string_view lexeme = source_->slice(tok.span);
+    if (has(tok.flags, NodeFlags::Implied)) {
+        if (schema_->endOfInputImplies().empty()) {
+            tbFatal("pushToken: a token flagged `Implied` under a schema that "
+                    "declares no `endOfInputImplies` lexeme — tokenizer/schema "
+                    "drift");
+        }
+        lexeme = schema_->endOfInputImplies();
+    }
 
     // Resolve the schema meaning. Three paths:
     //  1. Direct lexeme match (operator / punctuation / keyword). When
@@ -1132,17 +1188,6 @@ Tree TreeBuilder::finish() && {
     }
     finished_ = true;
 
-    // Detect "leftover scope" — a non-empty scope stack at finish means
-    // some closer (a `}`, `)`, etc.) never came. Surface it so the user
-    // sees the imbalance rather than relying solely on per-frame EOF
-    // diagnostics.
-    if (!scopes_.empty()) {
-        addBuilderInvariant_(
-            std::format("scope stack non-empty at finish ({} unbalanced)",
-                        scopes_.size()),
-            SourceSpan::empty(source_ ? source_->size() : 0));
-    }
-
     // Synthesize Missing for unclosed shapes + emit one P_PrematureEndOfInput
     // per unclosed frame. Process innermost-out so each Missing child is
     // appended to the top frame's pendingChildren_ range (the only one
@@ -1193,6 +1238,21 @@ Tree TreeBuilder::finish() && {
             closeFrame_(cookie, /*synthetic*/ true);
             closedCookies_.insert(cookie);
         }
+    }
+
+    // Detect a "leftover scope" — AFTER every frame is closed, and that order
+    // is the fix, not a tidy-up ([[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]).
+    // A missing closer at the end of input is USER input: the parser's own
+    // end-of-input handling or the cascade above reports it, and the frame
+    // that owned the scope closed it (`closeFrame_`). This check used to run
+    // FIRST, so every such input also printed this builder message beside the
+    // real one. Once every frame has closed, a scope still open was pushed with
+    // no frame to own it — builder misuse, which is what an invariant is for.
+    if (!scopes_.empty()) {
+        addBuilderInvariant_(
+            std::format("scope stack non-empty at finish ({} unbalanced)",
+                        scopes_.size()),
+            SourceSpan::empty(source_ ? source_->size() : 0));
     }
 
     // TreeId was minted at construction (treeId_) so every NodeId emit_

@@ -619,10 +619,14 @@ ingest(std::span<IngestionSource const> sources,
 // file failed. Per-file failure diagnostics already reach the
 // reporter via `readCHeader`; the propagated HeaderReadError carries
 // the FIRST failure's detail for triage convenience.
+//
+// `pair` is the `<target>:<format>` pair (with its resolved calling convention)
+// every header is read under — see `HeaderReadPair`.
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderDirectory(std::filesystem::path const& headerDir,
                      std::string_view             importLibrary,
+                     HeaderReadPair const&        pair,
                      DiagnosticReporter&          reporter);
 
 // ── synthesizeFfiFromSourceDecls (FF6 Slice 2, 2026-06-02) ────

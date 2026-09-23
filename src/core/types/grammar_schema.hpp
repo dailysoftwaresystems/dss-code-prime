@@ -97,18 +97,23 @@ static_assert(std::is_trivially_copyable_v<ScopeMatch>,
 // required to agree. Both mismatch directions failed loud, so nothing was
 // silent, but the duplication is exactly the shape this project keeps closing.
 //
-// ★★ IT DECLARES CONTINUATION ONLY, NEVER START, AND THAT ASYMMETRY IS THE
-// DESIGN RATHER THAN AN OMISSION. gas lets `.` both start and continue a
-// symbol; DSS reaches the leading `.` through the `directiveIntroducer` TOKEN
-// plus `asmDirective`'s `{optional asmLabelTail}` slot, which is what already
-// makes `.L3:` a label and `.text` a directive — two constructs that are
-// byte-identical up to the token AFTER the name. Adding an `extraStart` would
-// mint a SECOND mechanism for the same byte, and the two would then have to
-// agree about which of `.L3:` / `.text` / `.section` each owns. One mechanism
-// per question: a leading `.` is the introducer token; an interior `.` is this.
-// ⇒ An `extraStart` key is NOT accepted — it is not a gap awaiting a follow-up,
-// and a language needing one is the trigger to re-derive the question, not to
-// widen this struct.
+// ★★ A START CHARACTER IS ADMISSIBLE ONLY WHERE NO TOKEN OWNS THE BYTE — the
+// rule RE-DERIVED on 2026-09-22 for C's `$`
+// ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]), the trigger the original design named.
+// That design declared continuation only, for a reason that still stands: gas
+// lets `.` both start and continue a symbol, DSS reaches a leading `.` through
+// the `directiveIntroducer` TOKEN plus `asmDirective`'s `{optional
+// asmLabelTail}` slot (which is what makes `.L3:` a label and `.text` a
+// directive), and a start-character rule for `.` would be a SECOND mechanism
+// for that byte, the two then having to agree about which construct it opens.
+// The conflict is the BYTE BEING OWNED BY A TOKEN, not the key — so `extraStart`
+// is accepted exactly for a byte that begins NO lexeme the same document
+// declares (its global `tokens` and every mode's inline table), and refused,
+// naming that lexeme, for one that does. `.` in gas stays refused; `$` in C,
+// which begins no C lexeme, is admitted. ✔MEASURED: gcc 13.3.0, clang 18.1.3,
+// MinGW gcc and MSVC VS 18 all accept `$` leading, inside and trailing an
+// identifier, alone, in a macro name, stringized, pasted and in `#if` (C23
+// 6.4.2.1 "other implementation-defined characters").
 //
 // ★ ADDITIVE ONLY: the universal `[A-Za-z0-9_]` + UTF-8 continuation set stays
 // in force and cannot be REMOVED by config. Nothing measured needs subtraction,
@@ -123,9 +128,34 @@ struct DSS_EXPORT IdentifierClass {
     // class". EMPTY (the default, and the value for every language declaring no
     // block) means the universal rule and nothing more.
     std::string extraContinue;
+    // Extra characters that may START an identifier, in the same class syntax.
+    // EMPTY means the universal rule. The loader admits a character here only
+    // when no lexeme of the same document begins with it (see the docblock) —
+    // and a character that starts a name does NOT thereby continue one: a
+    // language wanting both (C's `$`) declares it in both keys.
+    std::string extraStart;
 
     [[nodiscard]] bool declared() const noexcept {
-        return !extraContinue.empty();
+        return !extraContinue.empty() || !extraStart.empty();
+    }
+
+    // THE UNIVERSAL START RULE, beside the universal continuation rule for the
+    // same reason: the loader has to know which characters ALREADY start an
+    // identifier, so it can refuse an `extraStart` that declares nothing. ASCII
+    // letters and `_`, plus the UTF-8 lead bytes 0xC2..0xF4 (a continuation byte
+    // 0x80..0xBF, or 0xC0/0xC1/0xF5..0xFF, never begins a well-formed character
+    // and lands in the illegal-character path). A digit never starts a name: it
+    // starts a number.
+    [[nodiscard]] static constexpr bool universalStart(char c) noexcept {
+        const auto u = static_cast<unsigned char>(c);
+        return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || u == '_'
+            || (u >= 0xC2 && u <= 0xF4);
+    }
+
+    // The question the tokenizer asks of a token's FIRST byte.
+    [[nodiscard]] bool startsIdentifier(char c) const noexcept {
+        return universalStart(c)
+            || (!extraStart.empty() && digitClassMatches(extraStart, c));
     }
 
     // ★★★ THE UNIVERSAL RULE, AND THE ONE PLACE IT IS WRITTEN DOWN. It lived as
@@ -138,7 +168,7 @@ struct DSS_EXPORT IdentifierClass {
     //
     // ASCII letters, digits and `_`, plus every byte ≥ 0x80: the tokenizer is
     // byte-oriented, and a multi-byte UTF-8 run must not terminate mid-sequence
-    // (its LEAD byte is what `isIdStart` gates on).
+    // (its LEAD byte is what `universalStart` above admits).
     [[nodiscard]] static constexpr bool universalContinue(char c) noexcept {
         const auto u = static_cast<unsigned char>(c);
         return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || u == '_'
@@ -567,6 +597,11 @@ struct DSS_EXPORT GrammarSchemaData {
     // declared token kind, and Eof/Error are rejected (Eof is always
     // an implicit sync; Error would short-circuit recovery).
     std::vector<SchemaTokenId>                        syncTokens;
+
+    // The lexeme the END OF THIS LANGUAGE'S INPUT implies (optional top-level
+    // `endOfInputImplies`). Empty ⇒ none. Loader-validated: a lexeme of the
+    // global `tokens` table. See `endOfInputImplies()`.
+    std::string                                       endOfInputImplies;
 
     // Per-language type-extension declarations (SP2; `typeExtensions[]`,
     // additive in schema v3). Empty for v1/v2 configs. Registered into a CU's
@@ -1180,6 +1215,28 @@ public:
     // Parser's panic-mode recovery consumes until peek is in this set
     // OR in `followSetOf(currentRule)`.
     [[nodiscard]] std::span<SchemaTokenId const> syncTokens() const noexcept;
+
+    // ★★★ THE LEXEME THE END OF THIS LANGUAGE'S INPUT IMPLIES — optional
+    // top-level `endOfInputImplies`; EMPTY when the document declares none,
+    // which is every language whose end of input implies nothing.
+    //
+    // A line-oriented language's statements END at a newline, so a text whose
+    // last line has none would lose that line — or, where the grammar demands
+    // the terminator, be refused. GNU as's answer is to insert the newline
+    // (✔MEASURED 2026-09-23, GNU as 2.42 on x86_64, aarch64 and mingw-w64:
+    // "end of file not at end of a line; newline inserted"; clang 18.1.3
+    // accepts the same file silently). The tokenizer reads a non-empty text
+    // that does not end with this lexeme AS IF it did (`SourceReader`'s
+    // two-argument constructor), so the grammar keeps its line boundary
+    // MANDATORY and the user's buffer is never rewritten.
+    //
+    // ⚠ A LANGUAGE WHOSE TOKENIZER ALSO RE-LEXES FRAGMENTS MUST NOT DECLARE IT
+    // WITHOUT A LOOK AT EACH ONE: the lexeme is implied at the end of EVERY
+    // buffer the language's tokenizer reads, a fragment's included. That is why
+    // C does not declare it — its preprocessor re-lexes token-paste products
+    // and `#if` scratch text through the same tokenizer, where an implied
+    // `Newline` would be a line boundary nobody wrote.
+    [[nodiscard]] std::string_view endOfInputImplies() const noexcept;
 
     // Per-language type-extension declarations (SP2; schema v3 `typeExtensions[]`).
     // Empty for v1/v2 configs. Consumed by registerSchemaTypeExtensions.

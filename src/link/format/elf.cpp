@@ -697,8 +697,17 @@ encodeElfExecDynamic(
     TargetSchema const&            targetSchema,
     ObjectFormatSchema const&      fmt,
     ObjectFormatSectionInfo const& secText,
-    DiagnosticReporter&            reporter) {
+    DiagnosticReporter&            reporter,
+    ImageRequest const&            request) {
     auto const& elfId = fmt.elf();
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpath entries this image
+    // records — the format's spelling, duplicates dropped — resolved up front
+    // so a declaration this walker cannot write refuses before any layout.
+    auto const runpaths = runpathsToRecord(request, fmt,
+                                           RunpathCarrier::ElfDynamicEntry,
+                                           "elf::encodeElfExecDynamic",
+                                           reporter);
+    if (!runpaths.has_value()) return {};
     std::uint64_t const pageAlign = elfId.pageAlign;
     // c150 (D-LK1-4): the ET_DYN shared-library arm rides THIS same
     // dynamic-image substrate. Divergences from ET_EXEC, each gated
@@ -1531,6 +1540,25 @@ encodeElfExecDynamic(
             dynstr.push_back(static_cast<std::uint8_t>(c));
         dynstr.push_back(0);
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpath — ONE string, every
+    // recorded directory joined by the declared separator in request order
+    // (measured: GNU ld and ld.lld both record one `:`-joined entry). Appended
+    // LAST, and only when there is one, so every offset above is unmoved and
+    // an image built without a request is byte-identical to before. Offset 0
+    // is the leading NUL, so a non-zero offset is also "there is a runpath".
+    std::uint32_t runpathOff = 0;
+    if (!runpaths->empty()) {
+        runpathOff = static_cast<std::uint32_t>(dynstr.size());
+        std::string_view const sep = fmt.runpath()->separator;
+        for (std::size_t i = 0; i < runpaths->size(); ++i) {
+            if (i != 0) {
+                for (char c : sep) dynstr.push_back(static_cast<std::uint8_t>(c));
+            }
+            for (char c : (*runpaths)[i])
+                dynstr.push_back(static_cast<std::uint8_t>(c));
+        }
+        dynstr.push_back(0);
+    }
 
     // ── (e) .dynsym body (STN_UNDEF + N extern symbols)
     std::vector<std::uint8_t> dynsym;
@@ -2142,6 +2170,12 @@ encodeElfExecDynamic(
     }
     if (sonameOff != 0) {
         appendDyn(DT_SONAME, sonameOff);   // c150 — dyn-only by construction
+    }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the DECLARED tag (DT_RUNPATH on the
+    // shipped documents), right after the DT_NEEDED/DT_SONAME run — GNU ld's
+    // position (ld.lld puts it first; the loader reads it from anywhere).
+    if (runpathOff != 0) {
+        appendDyn(fmt.runpath()->dynamicTag, runpathOff);
     }
     appendDyn(DT_STRTAB,  dynstrVa);
     appendDyn(DT_STRSZ,   dynstrSz);
@@ -3528,7 +3562,8 @@ std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter) {
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request) {
     // `targetSchema` is consumed by the ET_EXEC reloc-application
     // path (LK6 cycle 1) — the structured formula on each
     // `TargetRelocationInfo` (pcRelative + addendBias + widthBytes)
@@ -3615,6 +3650,17 @@ encode(AssembledModule const&    module,
         return {};
     }
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the request, checked HERE too ──
+    //
+    // A public entry point reachable without `linker::link`, so it runs the
+    // SAME `enforceImageRequest` the gate runs (the `pe::encode` precedent):
+    // an entry no carrier can hold is refused whichever door it came through.
+    // A pure predicate on success, so running it twice on the linker path
+    // reports nothing twice.
+    if (!enforceImageRequest(request, fmt, "elf::encode", reporter)) {
+        return {};
+    }
+
     // c150 + c151 (D-LK1-4): ET_DYN routes to the dynamic-image
     // walker UNCONDITIONALLY — both sub-shapes need `.dynamic` /
     // `.dynsym` / `.hash` even with zero extern imports (a `.so` for
@@ -3644,7 +3690,7 @@ encode(AssembledModule const&    module,
                            reporter);
         if (!secTextDyn) return {};
         return encodeElfExecDynamic(module, targetSchema, fmt,
-                                     *secTextDyn, reporter);
+                                     *secTextDyn, reporter, request);
     }
     // ELF dynamic-linker import-table emission — substrate landed
     // at LK6 cycle 2b.1 (PT_INTERP path field); walker emission
@@ -3740,8 +3786,31 @@ encode(AssembledModule const&    module,
                                reporter);
             if (!secTextDyn) return {};
             return encodeElfExecDynamic(module, targetSchema, fmt,
-                                         *secTextDyn, reporter);
+                                         *secTextDyn, reporter, request);
         }
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: everything below writes an image
+    // with NO dynamic section (an ET_REL object, or an ET_EXEC with nothing to
+    // import), and there is nothing to carry a runpath and no loader that would
+    // read one — gcc -static and ld.lld -static both drop -rpath silently
+    // (measured). A format with no declaration was already reported by the
+    // gate; one that DOES declare a carrier and still reaches here is said out
+    // loud rather than dropped. (Unreachable from the driver today: every
+    // shipped exec format imports its process exit, so it is always dynamic.)
+    if (!request.runpaths.empty() && fmt.runpath().has_value()) {
+        report(reporter, DiagnosticCode::K_FormatLacksRunpath,
+               DiagnosticSeverity::Warning,
+               std::format(
+                   "elf::encode: {} runpath entr{} requested, but this '{}' "
+                   "image is written WITHOUT a dynamic section — it imports "
+                   "nothing, so no loader reads it and nothing can carry a "
+                   "runpath. Nothing is recorded; gcc -static and ld.lld "
+                   "-static drop -rpath the same way. "
+                   "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.",
+                   request.runpaths.size(),
+                   request.runpaths.size() == 1 ? "y was" : "ies were",
+                   fmt.name()));
     }
 
     // Route between ET_REL and ET_EXEC based on the schema's

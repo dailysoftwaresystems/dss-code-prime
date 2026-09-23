@@ -255,7 +255,8 @@ struct EngineState {
           nodeToFoldedConstant{cu},
           nullPointerConstantNodes{cu},
           intPointeeCompatNodes{cu},
-          deprecatedTypeUseWarned{cu} {}
+          deprecatedTypeUseWarned{cu},
+          typedefNamedByToken{cu} {}
 
     DiagnosticReporter         reporter;
     TypeLattice                lattice;
@@ -263,6 +264,18 @@ struct EngineState {
     SymbolTable                symbols;
     UnitAttribute<SymbolId>    nodeToSymbol;
     UnitAttribute<TypeId>      nodeToType;
+
+    // C 6.2.1p4 (D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED): a function
+    // DEFINITION's parameter list and its body's OUTERMOST block are ONE block
+    // scope in C, but Pass 1 opens TWO — the parameters (and whatever the list
+    // itself declares) bind into the scope the definition's declaration row
+    // opened, the body block opens its own — so `ScopeTree::bind` cannot see a
+    // redeclaration across the pair. Pass 1 records the pair when it pushes the
+    // body block's scope (keyed both ways, by `ScopeId::v`), and
+    // `reportRedeclarationAcrossParameterScope` reads it at the bind sites.
+    // Lookups are untouched: the body scope's parent IS the parameter scope.
+    std::unordered_map<std::uint32_t, ScopeId> bodyScopeOfParameterScope;
+    std::unordered_map<std::uint32_t, ScopeId> parameterScopeOfBodyScope;
 
     // ★★★ THE SEMANTIC TIER'S OWN DERIVED-EXPRESSION-TYPE RECORD, and it is
     // DELIBERATELY NOT `nodeToType` (D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE).
@@ -422,6 +435,17 @@ struct EngineState {
     // TREE-KEYED for the same cross-tree-aliasing reason as
     // `nullPointerConstantNodes`. Purely internal — never moved into the model.
     UnitAttribute<bool>        deprecatedTypeUseWarned;
+    // ★★ P68 round 8 (lane `ht`): WHICH TYPEDEF A TYPE-NAME TOKEN NAMED. Written by
+    // the ONE place that decides it — `resolveTypeNodeImpl`'s alias arm — the FIRST
+    // time it resolves the token; later resolutions leave it alone. The first is the
+    // positional one: Pass 1.5 reaches every declaration head in tree order, while a
+    // typedef declared LATER still has no resolved type (the arm's own `lookupIf`
+    // proxy for "not in scope yet"), so the record cannot name a typedef the head
+    // could not see. Read through `HeadTypedefs`, by every consumer that applies a
+    // typedef's `const` / `restrict` claim to a declaration spelled with it — those
+    // two qualifiers are not interned, so the TypeId the arm returns cannot carry
+    // them. TREE-KEYED like its neighbours. Purely internal.
+    UnitAttribute<SymbolId>    typedefNamedByToken;
     // FC3 c1: the analysis-time data model (`analyze()`'s parameter —
     // the active format's width triple). Read by `buildIndexes` (the
     // `coreByDataModel` overrides), the integer-literal ladder, and the
@@ -466,7 +490,10 @@ struct EngineState {
     std::optional<TypeId> vaListType;
     // c8: the active target's object-format (`analyze()`'s param) — gates
     // per-target shipped-header availability. `nullopt` ⇒ no gate (back-compat).
-    std::optional<ObjectFormatKind> activeFormat;
+    // Typed so it cannot hold the `Unknown` sentinel
+    // ([[D-SEMANTIC-ANALYZE-ACTIVE-FORMAT-ADMITS-THE-UNKNOWN-SENTINEL]]); an ffi
+    // reader still typed `optional<ObjectFormatKind>` gets `objectFormatKindOf`.
+    std::optional<SelectableObjectFormatKind> activeFormat;
     // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: who
     // answers a descriptor `library` entry that names a runtime ROLE
     // (`analyze()`'s param). Handed verbatim to every ffi read this tier makes;
@@ -497,6 +524,11 @@ struct EngineState {
     std::unordered_map<std::uint32_t /*ScopeId.v*/, TypeId> fnResultByScope;
     // SE7 reverse use-index: SymbolId.v → its use-site NodeIds.
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol;
+    // P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the VALUE
+    // EXPRESSION node of every inline-asm INPUT operand, keyed (TreeId.v << 32
+    // | NodeId.v) — what the post-Pass-2 `denotesItsRegister` fold asks a use
+    // to be the bare content of.
+    std::unordered_set<std::uint64_t> asmInputValueExprs;
     // D5.1: composite type → the inner scope holding its fields, populated in
     // Pass 1.5 when a `fieldChildren`-bearing decl composes its struct type.
     // Pass 2's member-access resolution reads this to find the field-name's
@@ -1059,7 +1091,9 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
 void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
                              Tree const& tree,
                              std::vector<std::pair<NodeId, TypeId>>& params,
-                             bool emitOnMiss);
+                             bool variadic, bool emitOnMiss);
+[[nodiscard]] bool paramRowIsNamed(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId declNode);
 void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId scope, CallRule const& call);
 void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
@@ -1399,6 +1433,247 @@ prefixQualifiersHave(Tree const& tree, std::span<NodeId const> prefixQualifiers,
     return false;
 }
 
+// ── A QUALIFIER REACHED THROUGH A TYPEDEF (P68 round 8, lane `ht`) ─────────────
+//
+// `const` and `restrict` are not interned (type_interner.hpp), so a typedef that
+// spells one — `typedef const int CI;` — hands every user a TypeId with no trace
+// of it. The claim rides the typedef's OWN row instead: its `constMarker` /
+// `restrictMarker` feed the same Pass-1 walk every declarator-mode row gets, so
+// the typedef's record holds `isConst` + `qualSpine`. A declaration whose head
+// NAMES the typedef then takes that claim over, under its own derivation.
+// ✔MEASURED 2026-09-23 without it — gcc 13.3.0, clang 18.1.3, mingw-w64 gcc
+// 13.2.0 and MSVC 19.51 each REFUSE every one of these, DSS compiled them all:
+// `CI x = 1; x = 2;`, `CI *p; *p = 3;`, `typedef const char *CCP; CCP s; *s = 'a';`,
+// `typedef const struct P CP; CP pt; pt.a = 3;`, `typedef const int T; typedef int
+// T;`, and `typedef const void CV; void f(CV) {}`. A `CI g = 5;` global landed in
+// writable `.data` where `const int g = 5;` lands in `.rodata`, and `int f(CCP);
+// int f(char *);` was accepted while its direct spelling is refused.
+
+// The identifier token that NAMES `head`'s base type — a typedef name — or an
+// invalid NodeId. Read STRUCTURALLY, with the descent
+// `specifierPrefixQualifierTokens` uses: each of the head's visible children is
+// followed through SINGLE-child wrappers only. A node with more than one visible
+// child is never entered, so a tag's name (`struct S` is keyword + name), a
+// member declared inside a struct BODY, a `typeof` operand, an attribute's
+// argument or a `_BitInt(N)` width can never pass for the head's type name —
+// each sits under such a node. Whether the token IS a typedef name is not decided
+// here: the type resolver decides it, and records which (`typedefNamedByToken`).
+[[nodiscard]] NodeId headTypeNameToken(Tree const& tree, NodeId head,
+                                       SchemaTokenId identifierToken) {
+    if (!head.valid() || !identifierToken.valid()) return {};
+    auto const isName = [&](NodeId n) {
+        return n.valid() && tree.kind(n) == NodeKind::Token
+            && tree.tokenKind(n) == identifierToken;
+    };
+    if (tree.kind(head) == NodeKind::Token) return isName(head) ? head : NodeId{};
+    auto const soleVisibleChild = [&tree](NodeId n) -> NodeId {
+        NodeId only{};
+        for (auto const& c : tree.children(n)) {
+            if (isEmptySpace(tree.flags(c))) continue;
+            if (only.valid()) return {};      // more than one ⇒ not a wrapper
+            only = c;
+        }
+        return only;
+    };
+    for (auto const& child : tree.children(head)) {
+        if (isEmptySpace(tree.flags(child))) continue;
+        NodeId cur = child;
+        // Bounded, as the prefix walk is: a wrapper chain is a few levels in every
+        // shipped grammar, and a cap turns a corrupt node graph into a miss.
+        for (int step = 0; step < 8 && cur.valid()
+                           && tree.kind(cur) == NodeKind::Internal; ++step) {
+            cur = soleVisibleChild(cur);
+        }
+        if (isName(cur)) return cur;
+    }
+    return {};
+}
+
+// What a typedef claims about `const` / `restrict`, read off its own record.
+struct TypedefQualification {
+    // Its spine, exactly as the declarator walk built it for the typedef's own
+    // row (then with ITS head's typedef applied, so a chain `typedef CI CI2;`
+    // carries CI's claim). nullopt ⇒ the typedef makes NO claim, and neither may
+    // a declaration spelled with it ("absent is not unqualified").
+    std::optional<QualifierSpine> spine;
+    // Its object-level `const` (`declaratorObjectIsConst`'s answer for its row).
+    bool   objectConst = false;
+    // The type it denotes — the SHAPE of its levels (which are arrays, whether it
+    // is a function type), which the spine's bits do not record.
+    TypeId type{};
+};
+
+// Which typedef a declaration head names, as the type resolver recorded it, and
+// that typedef's claim. Reads only; built on the spot by each consumer. The
+// identifier token is the HEAD's tree's own (a redeclaration sweep compares
+// declarations from different trees, each read under its own schema).
+struct HeadTypedefs {
+    UnitAttribute<SymbolId> const& byToken;
+    SymbolTable const&             symbols;
+    TypeInterner const&            in;
+
+    [[nodiscard]] std::optional<TypedefQualification>
+    of(Tree const& tree, NodeId head) const {
+        NodeId const tok = headTypeNameToken(
+            tree, head, tree.schema().semantics().identifierToken);
+        if (!tok.valid()) return std::nullopt;
+        SymbolId const* named = byToken.tryGet(tok);
+        if (named == nullptr || !named->valid()) return std::nullopt;
+        SymbolRecord const& rec = symbols.at(*named);
+        if (rec.kind != DeclarationKind::Type || !rec.type.valid())
+            return std::nullopt;
+        return TypedefQualification{rec.qualSpine, rec.isConst, rec.type};
+    }
+};
+
+// The spine a head contributes BENEATH a declarator's own levels when it names a
+// typedef: the typedef's spine, with the using declaration's OWN head / prefix
+// qualifiers put on the level they qualify. That level is the typedef's type
+// itself — or its ELEMENT type when that type is an array: C11 6.7.3p9, "the
+// element type is so-qualified, not the array type" (C23 6.7.4.1p10 qualifies
+// both; ✔MEASURED either way: `typedef int A3[3]; const A3 a; a[0]
+// = 4;` is refused by all four references). A `restrict` lands only where that
+// level is a pointer (anywhere else it is a constraint violation the type
+// resolver owns), and nothing lands on a FUNCTION type (the same paragraph leaves
+// a qualified function type undefined). nullopt when the typedef
+// makes no claim, or when its type has more array levels than its spine records —
+// a shape the two walks disagree on makes no claim rather than a misplaced one.
+[[nodiscard]] std::optional<QualifierSpine>
+typedefHeadSpine(TypeInterner const& in, TypedefQualification const& td,
+                 bool headConst, bool headRestrict) {
+    if (!td.spine.has_value() || td.spine->levels == 0) return std::nullopt;
+    QualifierSpine out = *td.spine;
+    if ((!headConst && !headRestrict) || in.kind(td.type) == TypeKind::FnSig)
+        return out;
+    TypeId        cur   = td.type;
+    std::uint8_t  level = 0;
+    while (in.kind(cur) == TypeKind::Array) {
+        auto const ops = in.operands(cur);
+        if (ops.empty()) return std::nullopt;
+        cur = ops[0];
+        if (++level >= out.levels) return std::nullopt;
+    }
+    if (headConst) out.constBits |= std::uint64_t{1} << level;
+    if (headRestrict && in.kind(cur) == TypeKind::Ptr)
+        out.restrictBits |= std::uint64_t{1} << level;
+    return out;
+}
+
+// Do two declarations of ONE typedef name qualify its type differently? C11 6.7p3
+// lets a typedef name be redefined only "to denote the same type", and `const int`
+// is not the type `int` is — ✔MEASURED: `typedef const int T; typedef int T;`,
+// `typedef const char *P; typedef char *P;` and `typedef int *const Q; typedef int
+// *Q;` are refused by gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51,
+// and the TypeIds of each pair are EQUAL because neither qualifier is interned.
+// Judged only where BOTH rows claim ("absent is not unqualified"). A FUNCTION
+// typedef's spine describes its RESULT, whose own top-level qualifier is not part
+// of the function type (C23 6.7.7.4p4: "function returning the unqualified,
+// non-atomic version of T") — ✔MEASURED, `typedef const int F(void); typedef int F(void);`
+// is accepted by gcc 13.3.0 and mingw-w64 13.2.0 — so that one level is not compared.
+[[nodiscard]] bool typedefRedefinitionQualifiersDiverge(TypeInterner const& in,
+                                                        SymbolRecord const& a,
+                                                        SymbolRecord const& b) {
+    if (!a.qualSpine.has_value() || !b.qualSpine.has_value()) return false;
+    std::uint64_t const ignoredLevels =
+        a.type.valid() && in.kind(a.type) == TypeKind::FnSig ? 1u : 0u;
+    return detail::redecl::spinesDiverge(*a.qualSpine, *b.qualSpine, ignoredLevels);
+}
+
+// ── A VOID PARAMETER'S SPELLED QUALIFIERS (P68 round 8, lane `ht`, part 2) ──────
+//
+// Does the parameter row `declNode` SPELL a `const` or `restrict` qualifier in its
+// own specifier prefix or type head — or in the typedef its head names (see "A
+// QUALIFIER REACHED THROUGH A TYPEDEF" above)? Those two never ride a DSS type —
+// C 6.7.6.3p15 drops a parameter's top-level qualifiers from its function type,
+// and the interner carries no `const` bit (`volatile` / `_Atomic` are qualifier
+// SKINS, read off the type by `qualifierBits`) — so a question about a `void`
+// parameter's qualification has to read the row. The markers are the ROW's own
+// config-declared `constMarker` / `restrictMarker`; a `typeof` operand is opaque
+// exactly as `declaratorObjectIsConst` treats it; and only the prefix and the head
+// are read, so a qualifier inside the declarator — a pointer layer or an array
+// suffix, either of which makes the parameter something other than `void` — is
+// never counted.
+[[nodiscard]] bool
+paramRowSpellsUninternedQualifier(EngineState& s, SemanticConfig const& cfg,
+                                  Tree const& tree, NodeId declNode) {
+    auto const declIt = s.idx().declByRule.find(tree.rule(declNode).v);
+    if (declIt == s.idx().declByRule.end()) return false;
+    DeclarationRule const& decl = cfg.declarations[declIt->second];
+    auto const kids = declRoleChildren(tree, declNode, decl);
+    auto const headIdx = decl.headChild.has_value() ? decl.headChild : decl.typeChild;
+    NodeId const head = headIdx.has_value() && *headIdx < kids.size()
+                            ? kids[*headIdx] : NodeId{};
+    auto const prefixQuals = specifierPrefixQualifierTokens(tree, declNode, decl);
+    std::array<RuleId, 2> const typeofOpaqueRules{cfg.typeofTypeRule,
+                                                  cfg.typeofValueRule};
+    for (std::optional<SchemaTokenId> const& marker :
+         {decl.constMarker, decl.restrictMarker}) {
+        if (!marker.has_value()) continue;
+        if (prefixQualifiersHave(tree, prefixQuals, *marker)) return true;
+        if (head.valid()
+            && subtreeContainsToken(tree, head, *marker, &s.idx().declByRule,
+                                    typeofOpaqueRules))
+            return true;
+    }
+    // P68 round 8 (lane `ht`): the same qualifier SPELLED IN A TYPEDEF the head
+    // names — `typedef const void CV; void f(CV) { }` is the qualified void every
+    // reference refuses in a definition (✔MEASURED, all four), and it reached here
+    // as a bare `void`. The typedef's claim at ITS level 0 is the qualifier on the
+    // type this parameter has.
+    if (head.valid()) {
+        HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols,
+                                    s.lattice.interner()};
+        if (auto const td = typedefs.of(tree, head)) {
+            if (td->objectConst) return true;
+            if (td->spine.has_value()
+                && ((td->spine->constBits | td->spine->restrictBits) & 1u) != 0u)
+                return true;
+        }
+    }
+    return false;
+}
+
+// ── A COMPOSITE'S COMPLETENESS AT A POINT (P68 round 8, lane `ht`, part 2) ──────
+//
+// Is `t` — a struct or union, qualifier skins seen through — INCOMPLETE at byte
+// offset `point` of `tree`? C 6.2.5p1 makes completeness a property of a POINT in
+// the translation unit, and C 6.7.2.1p8 completes a composite only after the `}`
+// that closes its member list. Pass 1.5 completes composites in source order, but a
+// Pass 2 check runs after EVERY completion, so the interner's flag alone would call a
+// `f()` complete when the definition completing its return type comes later —
+// ✔MEASURED 2026-09-23: MSVC 19.51, the one reference that accepts that call, builds
+// a program that CRASHES. So the answer is positional: never completed ⇒ incomplete
+// everywhere; completed by a definition in THIS tree ⇒ incomplete before that
+// definition ENDS; completed with no recorded site (complete-at-once: a shipped
+// descriptor, a reinterned or text-read type) or in ANOTHER tree (no source order
+// spans trees) ⇒ complete. Anything but a struct or union is never incomplete here.
+[[nodiscard]] bool
+compositeIncompleteAt(EngineState const& s, Tree const& tree, TypeId t,
+                      ByteOffset point) {
+    if (!t.valid()) return false;
+    TypeInterner const& in = s.lattice.interner();
+    TypeKind const k = in.kind(t);
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    if (in.isIncompleteComposite(t)) return true;
+    auto const it = s.compositeScopeByType.find(in.stripVolatile(t).v);
+    if (it == s.compositeScopeByType.end() || !it->second.valid()) return false;
+    ScopeRecord const& sc = s.scopes.scopes()[it->second.v];
+    if (!sc.anchor.valid() || sc.tree.v != tree.id().v) return false;
+    return tree.span(sc.anchor).end() > point;
+}
+
+// The spelling of a struct/union TYPE in a diagnostic sentence — `struct S` /
+// `union U` (the lattice kind and the tag; qualifier skins seen through).
+[[nodiscard]] std::string compositeSpelling(TypeInterner const& in, TypeId t) {
+    TypeId const m = in.stripVolatile(t);
+    std::string out = in.kind(m) == TypeKind::Union ? "union" : "struct";
+    if (std::string_view const tag = in.name(m); !tag.empty()) {
+        out += ' ';
+        out += tag;
+    }
+    return out;
+}
+
 // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): does THIS declarator declare a
 // const OBJECT? `const` qualifies the type it directly modifies (C 6.7.3):
 // `const char *p` qualifies the POINTEE — the pointer OBJECT `p` is MUTABLE
@@ -1436,7 +1711,8 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                             declByRule,
                         NodeId headNode,
                         std::span<RuleId const> opaqueRules = {},
-                        std::span<NodeId const> prefixQualifiers = {}) {
+                        std::span<NodeId const> prefixQualifiers = {},
+                        bool headTypedefObjectConst = false) {
     // Descend a per-slot wrapper to the inner declaratorRule — the same descent
     // declaratorDeclaredType uses, through the ONE shared predicate (P66 lane
     // `ag`; see `isDeclaratorSlotWrapper`).
@@ -1519,9 +1795,16 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     // pointer-layer arm above: a prefix `const` is a BASE qualifier exactly like
     // a head one, so `const static char *p` declares a MUTABLE pointer to const
     // char, matching `static const char *p` token for token.
+    // P68 round 8 (lane `ht`): a head that NAMES a typedef qualifies the object
+    // exactly as the typedef's own object is qualified — `CI x;` for `typedef const
+    // int CI;` is the object `const int x;` is, and `CI a[2];` has const elements.
+    // The caller passes that answer (`TypedefQualification::objectConst`); it counts
+    // only HERE, where the declarator adds no pointer level of its own, because a
+    // pointer the declarator builds (`CI *p`) is an object the typedef never saw.
     return prefixQualifiersHave(tree, prefixQualifiers, constMarker)
         || subtreeContainsToken(tree, headNode.valid() ? headNode : declNode,
-                                constMarker, declByRule, opaqueRules);
+                                constMarker, declByRule, opaqueRules)
+        || headTypedefObjectConst;
 }
 
 // ── THE CONST SPINE (D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL) ──────
@@ -1682,7 +1965,20 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
                      std::span<RuleId const> opaqueRules = {},
                      SchemaTokenId restrictMarker = {},
                      SchemaIndexes const* idx = nullptr,
-                     std::span<NodeId const> prefixQualifiers = {}) {
+                     std::span<NodeId const> prefixQualifiers = {},
+                     HeadTypedefs const* typedefs = nullptr) {
+    // ★★ P68 round 8 (lane `ht`) — A HEAD THAT NAMES A TYPEDEF CONTRIBUTES THE
+    // TYPEDEF'S SPINE, NOT ONE BASE LEVEL. With `typedefs` supplied, every job
+    // (the root and each nested parameter) asks which typedef its head names; when
+    // one does, the levels beneath the declarator's own ctors are that typedef's
+    // spine (`typedefHeadSpine`, which also places this declaration's own head
+    // qualifier), so `CI *p` is [Ptr, int const] exactly as `const int *p` is. A
+    // FUNCTION typedef's spine describes its RESULT (the fn suffix of its own
+    // declarator adds no level, as below), so a declaration that DERIVES from it
+    // (`F *fp`) gets the Fn level back between its ctors and that result — the
+    // level `int (*fp)(void)`'s own fold has there; one that IS the function (`F
+    // h;`) keeps the result spine, as `int h(void)` does. Without `typedefs` (Pass
+    // 1, before any head is resolved) the walk is exactly what it always was.
     // ★★★ P55 — ONE EXPLICIT HEAP WORK STACK FOR THE WHOLE CLAIM TREE, AND THE
     // `nestDepth >= 4` IT REPLACES WAS THE SECOND DROPPED DIAGNOSTIC IN THIS
     // FUNCTION ([[D-SEMANTIC-DEPTH-CAPS-TRUNCATE-INTO-TWO-WRONG-ANSWERS]]).
@@ -1760,10 +2056,26 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
         bool const headConst = job.prefixConst
             || subtreeContainsToken(tree, job.head, job.constMarker, declByRule,
                                     opaqueRules);
+        // P68 round 8 (lane `ht`): the typedef this job's head names, if any. Its
+        // spine replaces the one-level base below; a head `restrict` is read only
+        // for it, where it can legally qualify the typedef's pointer (`restrict IP
+        // p`) — on a non-typedef head it is the resolver's constraint to diagnose.
+        std::optional<TypedefQualification> const td =
+            typedefs != nullptr ? typedefs->of(tree, job.head)
+                                : std::optional<TypedefQualification>{};
+        bool const headRestrict = td.has_value() && job.restrictMarker.valid()
+            && subtreeContainsToken(tree, job.head, job.restrictMarker, declByRule,
+                                    opaqueRules);
         // The one-level answer: an abstract parameter with no declarator at all
         // (`int f(const char)`), where the head IS the whole type. A one-level
-        // spine is a BASE and nothing else, so it can carry no restrict bit.
+        // spine is a BASE and nothing else, so it can carry no restrict bit. A
+        // head naming a typedef answers with that typedef's whole spine instead
+        // (`int f(CCP)`), or with no claim when the typedef makes none.
         auto headOnly = [&] {
+            if (td.has_value()) {
+                slot = typedefHeadSpine(typedefs->in, *td, headConst, headRestrict);
+                return;
+            }
             QualifierSpine sp;
             sp.levels    = 1;
             sp.constBits = headConst ? 1u : 0u;
@@ -1884,7 +2196,22 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
             }
         }
 
-        std::size_t const levels = ctors.size() + 1;
+        // P68 round 8 (lane `ht`): what sits beneath the ctors — one base level
+        // qualified by the head, or the whole spine of the typedef the head names
+        // (no claim at all when that typedef makes none). `lead` is where it
+        // starts: after the ctors, and after the Fn level a declaration DERIVING
+        // from a function typedef gets back (see the note at the top).
+        std::optional<QualifierSpine> typedefBase;
+        if (td.has_value()) {
+            typedefBase = typedefHeadSpine(typedefs->in, *td, headConst,
+                                           headRestrict);
+            if (!typedefBase.has_value()) continue;   // no claim
+        }
+        bool const insertFnLevel = td.has_value() && !ctors.empty()
+            && typedefs->in.kind(td->type) == TypeKind::FnSig;
+        std::size_t const lead = ctors.size() + (insertFnLevel ? 1u : 0u);
+        std::size_t const levels =
+            lead + (typedefBase.has_value() ? typedefBase->levels : 1u);
         // ⚠ THE ONE CEILING THAT SURVIVES, AND IT IS A REPRESENTATIONAL BOUND
         // RATHER THAN A WALK CAP: `QualifierSpine` states its levels in a 64-bit
         // positional bitset, so a chain deeper than that cannot be SPELLED. It
@@ -1902,9 +2229,18 @@ declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
         if (levels > 63) continue;   // beyond the bitset ⇒ make no claim
         QualifierSpine sp;
         sp.levels = static_cast<std::uint8_t>(levels);
-        // The BASE sits deepest, and the head qualifier is what qualifies it
-        // (`const char *p` ⇒ level 1 of a 2-level spine).
-        if (headConst) sp.constBits |= (std::uint64_t{1} << (levels - 1));
+        if (typedefBase.has_value()) {
+            // The typedef's spine, shifted beneath the ctors (and the Fn level):
+            // its bits, and the parameter claims of its own function levels.
+            sp.constBits    |= typedefBase->constBits << lead;
+            sp.restrictBits |= typedefBase->restrictBits << lead;
+            for (auto const& [lv, claim] : typedefBase->fnParams)
+                sp.fnParams.emplace_back(static_cast<std::uint8_t>(lv + lead), claim);
+        } else if (headConst) {
+            // The BASE sits deepest, and the head qualifier is what qualifies it
+            // (`const char *p` ⇒ level 1 of a 2-level spine).
+            sp.constBits |= (std::uint64_t{1} << (levels - 1));
+        }
         for (std::size_t i = 0; i < ctors.size(); ++i) {
             if (ctors[i].isConst)    sp.constBits    |= (std::uint64_t{1} << i);
             if (ctors[i].isRestrict) sp.restrictBits |= (std::uint64_t{1} << i);
@@ -2060,10 +2396,16 @@ void collectParamRowNodes(SchemaIndexes const& idx, SemanticConfig const& cfg,
 // disagreement voids ONLY the parameter axis. A count check is also the ONE
 // self-check available here: it fails loud-into-silence exactly when this walk and
 // the FnSig builder disagree about how many parameters there are.
+//
+// P68 round 8 (lane `ht`): `typedefs` applies a typedef's `const` / `restrict` to
+// every head it reads — the result's, each parameter's, and each nested function
+// pointer's — so `int f(CCP); int f(char *);` is judged exactly as its direct
+// spelling `int f(const char *);` is (✔MEASURED, refused by gcc 13.3.0, clang
+// 18.1.3 and mingw-w64 13.2.0; DSS already refused the direct one).
 [[nodiscard]] std::optional<DeclaredQualification>
 harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
                              Tree const& tree, SymbolRecord const& rec,
-                             TypeId fnType) {
+                             TypeId fnType, HeadTypedefs const& typedefs) {
     if (idx.cfg == nullptr) return std::nullopt;
     SemanticConfig const& cfg = *idx.cfg;
     if (!cfg.declarators.has_value()) return std::nullopt;
@@ -2109,7 +2451,7 @@ harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
     q.result = declaratorConstSpine(tree, mine, head, dc, *decl.constMarker,
                                     &idx.declByRule, typeofOpaqueRules,
                                     decl.restrictMarker.value_or(SchemaTokenId{}),
-                                    &idx, prefixQuals);
+                                    &idx, prefixQuals, &typedefs);
 
     std::size_t const wanted = in.fnParams(fnType).size();
     q.params.assign(wanted, std::nullopt);
@@ -2138,7 +2480,7 @@ harvestFunctionQualification(TypeInterner const& in, SchemaIndexes const& idx,
                     tree, pDeclarator, pKids[*pDecl.headChild], dc,
                     *pDecl.constMarker, &idx.declByRule, typeofOpaqueRules,
                     pDecl.restrictMarker.value_or(SchemaTokenId{}), &idx,
-                    pPrefixQuals);
+                    pPrefixQuals, &typedefs);
             }
         }
     }
@@ -2416,7 +2758,7 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // composite tag into the nearest enclosing namespace scope (C11 6.2.1).
 [[nodiscard]] ScopeId
 floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
-                      Tree const& tree, ScopeId scope);
+                      Tree const& tree, ScopeId scope, NodeId declaringNode);
 
 // D-CSUBSET-BITINT: `resolveTypeNodeImpl` (below) folds a `_BitInt(N)` width
 // through `constIntExpr`, which is DEFINED later in this TU — forward-declare it
@@ -2736,10 +3078,11 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                               "value bit); use `unsigned _BitInt(1)` for a 1-bit type");
                     return InvalidType;
                 }
-                // __BITINT_MAXWIDTH__ (C23 6.2.5) — the same 8388608 the predefined
-                // macro carries; the two encode ONE ABI constant.
-                constexpr std::int64_t kBitIntMaxWidth = 8388608;
-                if (n > kBitIntMaxWidth) {
+                // __BITINT_MAXWIDTH__ (C23 6.2.5) — the ONE shared `kBitIntMaxWidth`
+                // (`core/types/bit_int_value.hpp`) the literal arm below and both text
+                // tiers' width bounds read; the local copy this site used to carry is
+                // gone (P68 round 8, lane `ht`, part 2).
+                if (n > static_cast<std::int64_t>(kBitIntMaxWidth)) {
                     emitWidth(DiagnosticCode::S_BitIntWidthExceedsMax,
                               std::format("`_BitInt` width {} exceeds "
                                           "__BITINT_MAXWIDTH__ ({})",
@@ -2897,8 +3240,22 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         TypeId const incomplete =
                             s.lattice.interner().forwardComposite(
                                 compKind, rn.name, declSiteKey);
+                        // ⚠ NO `declaringNode`, DELIBERATELY: a BARE tag
+                        // reference in a function DEFINITION's parameter list
+                        // (`int f(struct Q *p)`, no Q visible) keeps floating to
+                        // the file scope, which is MSVC's reading — it accepts
+                        // every measured program built on it SILENTLY. C 6.2.1p4
+                        // (gcc, clang) gives Q the body's block scope instead,
+                        // and ✔MEASURED that reading cannot land alone: two
+                        // definitions `int g(struct Q *p)` / `int f(struct Q *p)
+                        // { return g(p); }` then hand g a pointer of ANOTHER
+                        // type, which gcc 13.3, clang 18.1.3 and MSVC 19.51 all
+                        // accept with a warning at most and DSS refuses
+                        // S_TypeMismatch. The row that owns that refusal owns this
+                        // reading's move; a tag DEFINED in a list (body present)
+                        // takes the list's scope — see floatToNamespaceScope.
                         ScopeId const bindScope =
-                            floatToNamespaceScope(s, cfg, tree, scope);
+                            floatToNamespaceScope(s, cfg, tree, scope, NodeId{});
                         SymbolRecord rec;
                         rec.name         = rn.name;
                         rec.scope        = bindScope;
@@ -3448,6 +3805,15 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // Both references warn at EVERY such position — ✔MEASURED gcc 13.3.0
                 // and clang 19.1.1 on declaration, parameter (proto AND definition),
                 // `sizeof`, a `_Generic` association and a cast.
+                //
+                // ★ P68 round 8 (lane `ht`): THIS ARM IS THE ONE PLACE THAT DECIDES
+                // A TYPE-NAME TOKEN NAMES A TYPEDEF, so it is also where WHICH one
+                // is recorded — once, the first resolution being the positional one
+                // (see `EngineState::typedefNamedByToken`). The TypeId returned
+                // below cannot say it: the typedef's `const` / `restrict` are not
+                // interned, and every consumer applying them reads this record.
+                if (!s.typedefNamedByToken.has(node))
+                    s.typedefNamedByToken.set(node, aliasSym);
                 auto const& arec = s.symbols.at(aliasSym);
                 if (emitTypeUse && arec.isDeprecated
                     && !s.deprecatedTypeUseWarned.has(node)) {
@@ -5554,6 +5920,13 @@ struct SpecifierStorageFacts {
     // answer (the block-scope `externDecl` row still carries the flag, and the
     // merged file-scope row carries only the specifier).
     bool nonDefining   = false;
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): a
+    // `{asmLabelNamesRegister:true}` entry matched — c's `register`, whose asm
+    // label names a MACHINE REGISTER (GNU local register variables) — and a
+    // `{addressNotTakeable:true}` one (C 6.5.3.2p1). Both OR-folded like the
+    // storage axes; the per-declarator mint site owns every consequence.
+    bool asmLabelNamesRegister = false;
+    bool addressNotTakeable    = false;
     // ★★ C 6.7.1p2, OBSERVED BUT NOT REPORTED HERE. The first two DISTINCT
     // members of one config-declared `exclusiveGroup` found in this prefix, in
     // SOURCE order, plus the group's own name. `conflictGroup` empty ⇒ no
@@ -5663,6 +6036,8 @@ scanSpecifierPrefixStorage(SemanticConfig const& cfg, Tree const& tree,
         if (it->second.threadStorage) out.threadStorage = true;
         if (it->second.staticStorage) out.staticStorage = true;
         if (it->second.nonDefining)   out.nonDefining   = true;
+        if (it->second.asmLabelNamesRegister) out.asmLabelNamesRegister = true;
+        if (it->second.addressNotTakeable)    out.addressNotTakeable    = true;
         if (it->second.binding.has_value()
             && *it->second.binding == SymbolBinding::Local) {
             out.localBinding = true;
@@ -7665,6 +8040,40 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
     if (isFnSuffixRule(r, dc)) {
+        // ★★ C 6.7.6.3p1 — "A function declarator shall not specify a return type
+        // that is a function type or an array type." `inner` IS the return type this
+        // suffix is about to wrap, so this is the one place every spelling meets: a
+        // named declarator (`int f(void)[3];`), a typedef'd return (`typedef int
+        // A[3]; A f(void);`), and a nested or abstract one (`int (*fp)(void)[3];`,
+        // `typedef int F(void)(void);`, a parameter's, a `sizeof` or cast type name).
+        // ✔MEASURED 2026-09-23 (P68 round 8, lane `ht`, part 2): gcc 13.3.0, clang
+        // 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 refuse every one of those shapes.
+        // DSS refused only a function return on a declared function or typedef (off
+        // the NAMED declarator's resolved type — the arm this replaces, so there is
+        // one owner) and ACCEPTED an array return everywhere and a function return
+        // under a pointer or in a type name; `int f(void)[3] { … }` compiled to an
+        // object. Positioned at the suffix that makes the illegal return; gated by
+        // `emitOnMiss` like every diagnostic of this resolver (a harvest
+        // re-resolution never re-reports); the type is built unchanged — the refusal
+        // fails the compile.
+        if (emitOnMiss && inner.valid()) {
+            TypeKind const innerKind = s.lattice.interner().kind(inner);
+            if (innerKind == TypeKind::FnSig || innerKind == TypeKind::Array) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_InvalidFunctionDeclarator;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(suffix);
+                d.actual   = innerKind == TypeKind::FnSig
+                    ? "a function declarator cannot specify a function return type "
+                      "(C 6.7.6.3p1) — declare it as returning a POINTER to function "
+                      "instead"
+                    : "a function declarator cannot specify an array return type "
+                      "(C 6.7.6.3p1) — return a POINTER to the element type, or wrap "
+                      "the array in a struct";
+                s.reporter.report(std::move(d));
+            }
+        }
         // The param harvest is the SHARED `collectParamTypes` walker (one
         // chokepoint with the legacy function-decl path): it descends
         // wrapper rules (c's `paramOrEllipsis` alt wrapper),
@@ -7697,7 +8106,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             if (paramsList.valid() && dc.variadicMarker.has_value()
                 && subtreeContainsToken(tree, paramsList, *dc.variadicMarker,
                                         &s.idx().declByRule)) {
-                normalizeSoleVoidParams(s, cfg, tree, params, emitOnMiss);
+                normalizeSoleVoidParams(s, cfg, tree, params, /*variadic=*/true,
+                                        emitOnMiss);
                 std::vector<TypeId> vt;
                 vt.reserve(params.size());
                 for (auto const& [pNode, pTy] : params) vt.push_back(pTy);
@@ -7707,7 +8117,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         }
         // C 6.7.6.3p10 `(void)` normalization — the same call the legacy
         // function-decl FnSig build applies (ONE convention, two paths).
-        normalizeSoleVoidParams(s, cfg, tree, params, emitOnMiss);
+        normalizeSoleVoidParams(s, cfg, tree, params, /*variadic=*/false,
+                                emitOnMiss);
         std::vector<TypeId> paramTypes;
         paramTypes.reserve(params.size());
         for (auto const& [pNode, pTy] : params) paramTypes.push_back(pTy);
@@ -8156,6 +8567,160 @@ findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
     return {};
 }
 
+// D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED: does `node` lie inside a PARAMETER
+// LIST — a node of the config's `prototypeParamScopeRule` role (c's `paramList`) —
+// that is itself inside `owner`'s subtree? Walks from `node` up to `owner` only, so
+// its cost is the distance between the two, never the depth of the tree.
+[[nodiscard]] bool
+isInsideParameterListOf(SemanticConfig const& cfg, Tree const& tree, NodeId node,
+                        NodeId owner) {
+    if (!cfg.declarators.has_value()
+        || !cfg.declarators->prototypeParamScopeRule.has_value())
+        return false;
+    RuleId const listRule = *cfg.declarators->prototypeParamScopeRule;
+    for (NodeId cur = tree.parent(node); cur.valid() && cur.v != owner.v;
+         cur = tree.parent(cur)) {
+        if (tree.kind(cur) == NodeKind::Internal && tree.rule(cur) == listRule)
+            return true;
+    }
+    return false;
+}
+
+// D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED: is `bound` — the scope a tag declared
+// at `declaringNode` was just bound into — the scope of the PARAMETER LIST that
+// declaration sits in? True for a prototype's own function-prototype scope (its
+// anchor IS the list) and for a function definition's scope when the declaration is
+// inside that definition's list (the float above stopped there). Either way the tag
+// is visible to the rest of the list and, for a definition, to the body — and to
+// nothing after the function, which is what S_TagDeclaredInParameterList says.
+[[nodiscard]] bool
+isParameterListScopeOf(EngineState const& s, SemanticConfig const& cfg,
+                       Tree const& tree, NodeId declaringNode, ScopeId bound) {
+    auto const& scs = s.scopes.scopes();
+    if (!bound.valid() || bound.v >= scs.size() || !cfg.declarators.has_value()
+        || !cfg.declarators->prototypeParamScopeRule.has_value())
+        return false;
+    NodeId const anchorN = scs[bound.v].anchor;
+    if (!anchorN.valid() || scs[bound.v].tree.v != tree.id().v
+        || tree.kind(anchorN) != NodeKind::Internal)
+        return false;
+    if (tree.rule(anchorN) == *cfg.declarators->prototypeParamScopeRule)
+        return true;
+    auto const dIt = s.idx().declByRule.find(tree.rule(anchorN).v);
+    return dIt != s.idx().declByRule.end()
+        && declNodeIsFunctionDefinition(cfg.declarations[dIt->second], tree, anchorN)
+        && isInsideParameterListOf(cfg, tree, declaringNode, anchorN);
+}
+
+// S_TagDeclaredInParameterList (0xE082, Warning): a struct/union/enum tag DEFINED in a
+// parameter list is visible to the rest of the list and, in a definition, to the body
+// — and to nothing after the function (C 6.2.1p4), so no caller can spell its type.
+// ✔MEASURED: gcc 13.3.0 and clang 18.1.3 warn on every such definition, MSVC 19.51 is
+// silent. The kind is spelled from the specifier's own keyword token — the language's
+// word, never a hardcoded one — and an anonymous tag is reported at that keyword.
+void reportTagDeclaredInParameterList(EngineState& s, Tree const& tree,
+                                      NodeId specifierNode, NodeId nameNode,
+                                      std::string_view tagName) {
+    NodeId keyword{};
+    for (NodeId c : visibleChildren(tree, specifierNode)) {
+        if (tree.kind(c) == NodeKind::Token) { keyword = c; break; }
+    }
+    std::string_view const kind =
+        keyword.valid() ? tree.text(keyword) : std::string_view{"tag"};
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::S_TagDeclaredInParameterList;
+    d.severity = DiagnosticSeverity::Warning;
+    d.buffer   = tree.source().id();
+    d.span     = tree.span(nameNode.valid() ? nameNode
+                           : keyword.valid() ? keyword : specifierNode);
+    d.actual   = tagName.empty()
+        ? std::format("an anonymous {} is declared inside a parameter list, so it is "
+                      "not visible outside this function's declaration or definition "
+                      "(C 6.2.1p4)", kind)
+        : std::format("'{} {}' is declared inside a parameter list, so it is not "
+                      "visible outside this function's declaration or definition "
+                      "(C 6.2.1p4)", kind, tagName);
+    s.reporter.report(std::move(d));
+}
+
+// D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED: is `node` the BODY of the function
+// definition whose declaration row opened `current`? Config-driven: the row's own
+// `kindByChild` discriminator is what names the body (the child whose presence makes
+// the row a definition), so no rule is named here.
+[[nodiscard]] bool
+isDefinitionBodyOpenedIn(EngineState const& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId node, ScopeId current) {
+    auto const& scs = s.scopes.scopes();
+    if (!current.valid() || current.v >= scs.size()) return false;
+    NodeId const owner = scs[current.v].anchor;
+    if (!owner.valid() || scs[current.v].tree.v != tree.id().v
+        || tree.kind(owner) != NodeKind::Internal)
+        return false;
+    auto const dIt = s.idx().declByRule.find(tree.rule(owner).v);
+    if (dIt == s.idx().declByRule.end()) return false;
+    auto const& decl = cfg.declarations[dIt->second];
+    if (!declNodeIsFunctionDefinition(decl, tree, owner)) return false;
+    return descendVisibleDecl(tree, owner, decl.kindByChild->childPath, decl).v
+        == node.v;
+}
+
+// D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED, C 6.2.1p4: `added` was just bound as
+// `name` (namespace `ns`) for a declaration that appears in `declaredIn`. When that
+// scope is one half of a function definition's (parameter scope, body scope) pair —
+// ONE block scope in C — a binding of the same name in the OTHER half is a
+// redeclaration in that one scope, which `ScopeTree::bind` cannot see. ✔MEASURED, each
+// reference separately: gcc 13.3.0, clang 18.1.3, MinGW gcc and MSVC 19.51 ALL refuse
+// a body object, `static` object, typedef or `extern` function that repeats a
+// parameter's name, a body object that repeats an enumerator the list declared, and a
+// body tag that repeats a tag the list defined — DSS accepted the first four (the body
+// shadowed the parameter). Two shapes stay LEGAL because a reference builds and runs
+// them (MSVC; gcc and clang refuse): an ENUMERATOR declared in the body, and a body
+// declaration of the predefined function name (`__func__`); both keep meaning what they
+// did — the body's own entity. Reported at the body's declaration, the later of the two.
+void reportRedeclarationAcrossParameterScope(EngineState& s, Tree const& tree,
+                                             ScopeId declaredIn,
+                                             std::string_view name,
+                                             SymbolNamespace ns, SymbolId added) {
+    ScopeId bodyScope{};
+    ScopeId parameterScope{};
+    if (auto const it = s.parameterScopeOfBodyScope.find(declaredIn.v);
+        it != s.parameterScopeOfBodyScope.end()) {
+        bodyScope      = declaredIn;
+        parameterScope = it->second;
+    } else if (auto const jt = s.bodyScopeOfParameterScope.find(declaredIn.v);
+               jt != s.bodyScopeOfParameterScope.end()) {
+        parameterScope = declaredIn;
+        bodyScope      = jt->second;
+    } else {
+        return;
+    }
+    bool const addedInBody = declaredIn.v == bodyScope.v;
+    ScopeRecord const& other =
+        s.scopes.scopes()[(addedInBody ? parameterScope : bodyScope).v];
+    auto const& peerMap =
+        ns == SymbolNamespace::Tag ? other.tagBindings : other.bindings;
+    auto const hit = peerMap.find(name);
+    if (hit == peerMap.end()) return;
+    SymbolRecord const& inBody  = s.symbols.at(addedInBody ? added : hit->second);
+    SymbolRecord const& inList  = s.symbols.at(addedInBody ? hit->second : added);
+    if (inBody.isEnumerator || inList.isPredefinedFunctionName) return;
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::S_RedeclaredSymbol;
+    d.severity = DiagnosticSeverity::Error;
+    d.buffer   = tree.source().id();
+    d.span     = tree.span(inBody.declNode);
+    d.actual   = std::format(
+        "'{}' is declared again in the outermost block of a function body, which is "
+        "the same scope as the function's parameter list (C 6.2.1p4)", name);
+    if (inList.tree.v == tree.id().v) {
+        d.related.push_back(RelatedLocation{
+            tree.source().id(), tree.span(inList.declNode),
+            "declared in the parameter list here",
+        });
+    }
+    s.reporter.report(std::move(d));
+}
+
 // Float a scope reference up to the nearest enclosing NAMESPACE scope (a block
 // or the file/CU root), past any DECLARATOR-DOMINATOR scope — a `declarations`-
 // rule scope that declares no members of its own (no fieldChildren). C11 6.2.1:
@@ -8170,8 +8735,25 @@ findTokenInSubtree(Tree const& tree, NodeId node, SchemaTokenId kind,
 // root; floats PAST declarator-dominator scopes AND (c38
 // D-CSUBSET-NESTED-TAG-SCOPE) composite-body (member) scopes — a TAG nested in
 // a struct body belongs to the enclosing block/file scope, not the member one.
+//
+// ★ ONE DECLARATOR-DOMINATOR IS ALSO A BLOCK SCOPE, AND `declaringNode` IS HOW THE
+// FLOAT KNOWS (D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED). C 6.2.1p4: a tag or
+// enumerator declared "within the list of parameter declarations in a function
+// definition" has BLOCK scope ending with the body — the scope the definition's
+// PARAMETERS bind into, which is the scope its declaration row opened (see
+// `isPrototypeParamScopeNode`: a definition's own list opens none). So the float
+// STOPS at a function definition's scope when the declaring node lies inside that
+// definition's parameter list, and floats past it for every other specifier of the
+// declaration (the return type's `struct S {…} f(void) {…}` still reaches the file
+// scope). A PROTOTYPE's list needs no test: it opens its own function-prototype
+// scope, which is not a declaration row, so the loop already stops there.
+// `declaringNode` InvalidNode keeps the pre-existing float exactly (the
+// forward-declared-tag path passes it, see its call site). The subtree walk runs
+// only against a function DEFINITION's scope, so a deep nest of composite scopes
+// never pays for it.
 ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
-                              Tree const& tree, ScopeId scope) {
+                              Tree const& tree, ScopeId scope,
+                              NodeId declaringNode) {
     auto const& scs = s.scopes.scopes();
     while (scope.valid() && scope.v < scs.size()) {
         NodeId const anchorN = scs[scope.v].anchor;
@@ -8180,6 +8762,11 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
         auto dIt = s.idx().declByRule.find(tree.rule(anchorN).v);
         if (dIt == s.idx().declByRule.end())
             break;  // a block / non-declaration scope
+        if (declaringNode.valid()
+            && declNodeIsFunctionDefinition(cfg.declarations[dIt->second], tree,
+                                            anchorN)
+            && isInsideParameterListOf(cfg, tree, declaringNode, anchorN))
+            break;  // the definition's parameters — and this declaration — bind here
         // c38 (D-CSUBSET-NESTED-TAG-SCOPE): a composite-body scope is a MEMBER
         // namespace, NOT a tag namespace. C 6.2.1p4: a struct/union/enum TAG
         // declared inside a struct body belongs to the nearest ENCLOSING block
@@ -9011,6 +9598,12 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // is still read by the mint guard below.)
         if (nodeOpensChildScope(s, cfg, tree, node)) {
             here = s.scopes.pushScope(current, node, tree.id());
+            // C 6.2.1p4: record a definition's (parameter scope, body scope) pair
+            // — one scope in C — for `reportRedeclarationAcrossParameterScope`.
+            if (isDefinitionBodyOpenedIn(s, cfg, tree, node, current)) {
+                s.bodyScopeOfParameterScope[current.v] = here;
+                s.parameterScopeOfBodyScope[here.v]    = current;
+            }
         }
 
         auto declIt = s.idx().declByRule.find(rule.v);
@@ -9351,14 +9944,76 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // routing can never disagree about which locals are
                         // automatic. A FUNCTION, a prototype, an `extern`, a
                         // file-scope object and a `static` local all keep theirs.
-                        if (!rec.asmName.empty()
-                            && effectiveKind == DeclarationKind::Variable
+                        // ★★ P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED):
+                        // the prefix's `register` facts, read ONCE — the storage
+                        // scan the static-local routing already asks.
+                        SpecifierStorageFacts const storageFacts =
+                            effectiveKind == DeclarationKind::Variable
+                                ? scanSpecifierPrefixStorage(cfg, tree, node, decl)
+                                : SpecifierStorageFacts{};
+                        bool const isAutomaticObject =
+                            effectiveKind == DeclarationKind::Variable
                             && !isProto
                             && !declarationIsNonDefining(cfg, tree, node, decl,
                                                          dNode, atFileScope)
                             && bindScope.v != fileScopeOf(s, tree, bindScope).v
-                            && !scanSpecifierPrefixStorage(cfg, tree, node, decl)
-                                    .staticStorage) {
+                            && !storageFacts.staticStorage;
+                        // C 6.5.3.2p1: the object may not be the operand of `&`.
+                        // Recorded for every declarator the specifier covers; the
+                        // `&` check and the memory-form asm check read it.
+                        if (storageFacts.addressNotTakeable)
+                            rec.addressNotTakeable = true;
+                        // ★★★ A GNU LOCAL REGISTER VARIABLE: the label names a
+                        // MACHINE REGISTER, not a symbol. 📄 GCC, "Local Register
+                        // Variables": *The `register` keyword is required* … *The
+                        // register name must be a valid register name for the
+                        // target platform* … *The only supported use for this
+                        // feature is to specify registers for input and output
+                        // operands when calling Extended asm.* ✔MEASURED
+                        // 2026-09-19, gcc 13.3.0 and clang 18.1.3 bind every
+                        // register-form operand whose value IS the variable to
+                        // that register, and both refuse an unknown name at the
+                        // declaration. The name is resolved against the TARGET's
+                        // register table — the question the clobber check asks —
+                        // so no register name is ever spelled in this file.
+                        // ⓘ No target in scope (the LSP, the header parser,
+                        // direct-API tests): the name is kept UNRESOLVED and the
+                        // question goes unasked rather than guessed; the one
+                        // consumer (the operand binding) needs a target too.
+                        if (!rec.asmName.empty() && isAutomaticObject
+                            && storageFacts.asmLabelNamesRegister) {
+                            if (s.target != nullptr
+                                && !s.target->registerByName(rec.asmName)
+                                        .has_value()) {
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_AsmRegisterNameUnknown;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(nameNode);
+                                d.actual   = std::format(
+                                    "register variable '{}' is bound by its asm "
+                                    "label to '{}', which target '{}' does not "
+                                    "declare as a register — the label of a "
+                                    "`register` local names a MACHINE REGISTER, and "
+                                    "that vocabulary is the target's register table "
+                                    "(gcc: \"invalid register name\"; clang: "
+                                    "\"unknown register name\") "
+                                    "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                    name, rec.asmName, s.target->name());
+                                s.reporter.report(std::move(d));
+                            } else {
+                                rec.asmRegister = rec.asmName;
+                                // PROVISIONAL, confirmed or cleared after Pass
+                                // 2 by the use-index (`denotesItsRegister`):
+                                // an initialized variable is written here.
+                                rec.denotesItsRegister =
+                                    !(cfg.declarators.has_value()
+                                      && declaratorHasInitializer(
+                                             tree, *cfg.declarators, dNode));
+                            }
+                            rec.asmName.clear();
+                        }
+                        if (!rec.asmName.empty() && isAutomaticObject) {
                             ParseDiagnostic d;
                             d.code     = DiagnosticCode::
                                 S_AsmLabelOnAutomaticVariable;
@@ -9555,6 +10210,16 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         boundNamed = true;
                         SymbolId const prior =
                             s.scopes.bind(bindScope, name, newId);
+                        // C 6.2.1p4: the body's outermost block and the
+                        // definition's parameter list are ONE scope. Checked
+                        // against `current` — where the declaration APPEARS — so a
+                        // bare prototype re-homed to the file scope above is still
+                        // seen; a same-scope duplicate already reported below is
+                        // not reported twice.
+                        if (!prior.valid() || bindScope.v != current.v)
+                            reportRedeclarationAcrossParameterScope(
+                                s, tree, current, name, SymbolNamespace::Ordinary,
+                                newId);
                         if (prior.valid()
                             && decl.inferTypeFromInitializer) {
                             // ★★★ P65 — C23's UNDERSPECIFIED-DECLARATION rule, and it
@@ -9734,6 +10399,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // under a synthesized unique name, anchored on the DECL node
                 // itself (the type-position resolver looks the symbol up
                 // there). Unflagged rows keep the legacy behavior exactly.
+                bool anonymousName = false;
                 if (decl.anonymousNameAllowed) {
                     std::string leafText;
                     bool const isIdentLeaf = resolved.node.valid()
@@ -9744,6 +10410,7 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         resolved.name = std::format("<anon:{}:{}>",
                                                     decl.ruleName, node.v);
                         resolved.node = node;
+                        anonymousName = true;
                     }
                 }
                 if (!resolved.name.empty() && resolved.node.valid()) {
@@ -9763,11 +10430,22 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // when it pops, invisible to the next declaration. Float
                     // past it via the shared helper; gated on fieldChildren so
                     // only composite TAGS float (a plain typedef-name keeps the
-                    // enclosing-scope binding).
+                    // enclosing-scope binding). A tag defined inside a function
+                    // definition's PARAMETER LIST stops at the definition's scope
+                    // (C 6.2.1p4, see the helper), so the body sees it and
+                    // nothing after the function does.
                     ScopeId const bindScope =
                         decl.fieldChildren.has_value()
-                            ? floatToNamespaceScope(s, cfg, tree, current)
+                            ? floatToNamespaceScope(s, cfg, tree, current, node)
                             : current;
+                    if (decl.fieldChildren.has_value()
+                        && isParameterListScopeOf(s, cfg, tree, node, bindScope)) {
+                        reportTagDeclaredInParameterList(
+                            s, tree, node,
+                            anonymousName ? NodeId{} : resolved.node,
+                            anonymousName ? std::string_view{}
+                                          : std::string_view{resolved.name});
+                    }
                     SymbolRecord rec;
                     rec.name         = resolved.name;
                     rec.scope        = bindScope;
@@ -9929,6 +10607,12 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         }
                     } else {
                         s.nodeToSymbol.set(resolved.node, newId);
+                        // C 6.2.1p4: a tag the body's outermost block defines
+                        // shares one scope with the tags the parameter list
+                        // defined (`bindScope`: a nested tag has already floated
+                        // to that block).
+                        reportRedeclarationAcrossParameterScope(
+                            s, tree, bindScope, resolved.name, bindNs, newId);
                     }
                 }
             }
@@ -11254,6 +11938,47 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     }
                                 }
                             }
+                            // ★★ P68 round 8 (lane `ht`) — APPLYING A TYPEDEF'S
+                            // QUALIFIERS. The head has just been resolved, so the
+                            // resolver has recorded which typedef it names (the
+                            // typedef's own claim was finished at ITS visit, earlier
+                            // in this tree-order walk). Pass 1 read only this row's
+                            // own tokens, which is every claim a declaration makes
+                            // EXCEPT the one its typedef carries; the two walks are
+                            // re-run here with the typedef applied, so a `CI x;` for
+                            // `typedef const int CI;` claims exactly what `const int
+                            // x;` claims — its `isConst` (which is also what places a
+                            // file-scope object in a read-only section, through
+                            // MutabilityAttr → MirGlobal.isConst) and its spine. A
+                            // typedef row is re-run the same way, so a chain `typedef
+                            // CI CI2;` hands CI's claim on. `isConst` only ever GAINS
+                            // here (a constexpr's is set in Pass 1 and stays).
+                            if (decl.constMarker.has_value()
+                                && decl.headChild.has_value()
+                                && *decl.headChild < kids.size()) {
+                                NodeId const headNode = kids[*decl.headChild];
+                                HeadTypedefs const typedefs{s.typedefNamedByToken,
+                                                            s.symbols,
+                                                            s.lattice.interner()};
+                                if (auto const td = typedefs.of(tree, headNode)) {
+                                    std::array<RuleId, 2> const typeofOpaqueRules{
+                                        cfg.typeofTypeRule, cfg.typeofValueRule};
+                                    bool const objectConst = declaratorObjectIsConst(
+                                        tree, node, dNode, *cfg.declarators,
+                                        *decl.constMarker, &s.idx().declByRule,
+                                        headNode, typeofOpaqueRules, prefixQuals,
+                                        td->objectConst);
+                                    auto spine = declaratorConstSpine(
+                                        tree, dNode, headNode, *cfg.declarators,
+                                        *decl.constMarker, &s.idx().declByRule,
+                                        typeofOpaqueRules,
+                                        decl.restrictMarker.value_or(SchemaTokenId{}),
+                                        &s.idx(), prefixQuals, &typedefs);
+                                    auto& rec = s.symbols.at(sym);
+                                    rec.isConst   = rec.isConst || objectConst;
+                                    rec.qualSpine = std::move(spine);
+                                }
+                            }
                             // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT
                             // (a named local/global, `requireNamedDeclarators` —
                             // NOT a param, NOT a struct field [those route through
@@ -11476,43 +12201,14 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
-                        // ★★ C 6.7.6.3p1 — A FUNCTION DECLARATOR SHALL NOT SPECIFY
-                        // A FUNCTION RETURN TYPE. `int f(int)(int);` and its typedef
-                        // spelling `typedef int Fn(int); Fn (f)(int);` declare "f: a
-                        // function returning a function", which no C implementation
-                        // accepts. ✔MEASURED: gcc 13.3.0 says "'f' declared as
-                        // function returning a function", clang 18.1.3 "function
-                        // cannot return function type".
-                        //
-                        // ★ THIS CHECK IS NEW, AND IT REPLACES AN ACCIDENT WITH AN
-                        // ANSWER — D-CSUBSET-PARENTHESIZED-FUNCTION-DEFINITION-DECLARATOR-REFUSED.
-                        // The typedef spelling used to be refused only as a
-                        // SIDE EFFECT of the declarator-shape walk being blind to
-                        // redundant parentheses: `f` was not recognized as carrying a
-                        // function suffix, so it fell through to the arm below and was
-                        // reported as "function prototype declarations are not
-                        // supported here" — a message naming a construct the source
-                        // does not contain, and a shipped pin
-                        // (SemanticAnalyzerC.FnTypedefParenGroupFnSuffixIsNotAPrototype)
-                        // depended on it. Teaching the walk to see through the
-                        // parentheses is correct and REMOVES that accident, so the
-                        // constraint it was standing in for has to be checked on
-                        // purpose. Checking it here — off the RESOLVED type, not off
-                        // the declarator's shape — also catches the INLINE spelling
-                        // `int f(int)(int);`, which the accident never covered at all.
-                        if (isFnSig && nameNode.valid()) {
-                            TypeId const fnRet =
-                                s.lattice.interner().fnResult(declTy);
-                            if (fnRet.valid()
-                                && s.lattice.interner().kind(fnRet)
-                                       == TypeKind::FnSig) {
-                                emitInvalidFn(nameNode,
-                                              "a function declarator cannot specify "
-                                              "a function return type (C 6.7.6.3p1) "
-                                              "— declare it as returning a POINTER "
-                                              "to function instead");
-                            }
-                        }
+                        // C 6.7.6.3p1 — a function declarator shall not specify a
+                        // FUNCTION or ARRAY return type — is checked where every
+                        // declarator meets it: at the function suffix, in
+                        // `applyDeclaratorSuffix` (P68 round 8, lane `ht`, part 2). The
+                        // check that stood here read a NAMED declarator's resolved type,
+                        // so it saw only a declared function or typedef returning a
+                        // function; an array return, and either return under a pointer
+                        // or in a type name, passed.
                         // ★★ TF-C93: "WHAT KIND OF ENTITY DOES THIS DECLARATOR
                         // EFFECTIVELY DECLARE?" — ONE definition, THREE readers.
                         //
@@ -12761,6 +13457,122 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     + std::string{tree.text(starSuffix)} + "`";
                                 s.reporter.report(std::move(d));
                             }
+                            // ★★ C 6.9.1p3 AND C 6.7.6.3p4 (P68 round 8, lane `ht`, part
+                            // 2): a function DEFINITION returns void or a COMPLETE object
+                            // type, and its parameters are complete. A declaration that is
+                            // not a definition may name an incomplete type in either place
+                            // (every reference accepts that); a definition may not — its body
+                            // is where the value is made or received. ✔MEASURED 2026-09-23 on
+                            // gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51: all
+                            // four refuse `struct S; struct S f(void) {…}` (a union, `static`,
+                            // and a definition PRECEDING the completion too), `struct S; void
+                            // f(struct S s) {…}` (named or not; completed later or never),
+                            // `void f(void v) {…}` and `void f(const void) {…}` (MSVC: C2036
+                            // "'const void': unknown size"). DSS accepted every one: the first
+                            // two died at HIR→MIR under a sentence about by-value struct
+                            // CALLING CONVENTIONS, and a parameter completed later in the TU
+                            // compiled to an object.
+                            // Completeness is POSITIONAL (C 6.2.5p1): the return type at the
+                            // name, a parameter at its own end — a composite completed later
+                            // in the TU is incomplete here, and one defined inside the
+                            // parameter list is complete. The parameters are the definition's
+                            // OWN list, harvested silently (each row's own visit already spoke
+                            // for its type) and BEFORE the `(void)` normalization, so a
+                            // qualified sole `void` is still visible. The void arms follow the
+                            // language's `(void)` convention (`parameters.soleVoidMeansEmpty`,
+                            // see `normalizeSoleVoidParams`); a `register` sole void stays legal
+                            // (clang and MSVC build and RUN `void f(register void) {}`).
+                            if (isFnSig) {
+                                TypeInterner const& ti = s.lattice.interner();
+                                TypeId const ret = ti.fnResult(declTy);
+                                if (compositeIncompleteAt(s, tree, ret,
+                                                          tree.span(nameNode).start())) {
+                                    ParseDiagnostic d;
+                                    d.code = DiagnosticCode::S_IncompleteReturnType;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(nameNode);
+                                    d.actual   =
+                                        "the return type of a function definition must "
+                                        "be void or a complete object type (C 6.9.1p3) — '"
+                                        + compositeSpelling(ti, ret)
+                                        + "' is incomplete here";
+                                    s.reporter.report(std::move(d));
+                                }
+                                NodeId const ownSuffix = declaratorFnSuffixNode(
+                                    tree, nameNode, *cfg.declarators);
+                                NodeId const ownParams =
+                                    ownSuffix.valid()
+                                            && cfg.declarators->fnSuffixParamsRule
+                                                   .has_value()
+                                        ? findVisibleChildOfRule(
+                                              tree, ownSuffix,
+                                              *cfg.declarators->fnSuffixParamsRule)
+                                        : NodeId{};
+                                std::vector<std::pair<NodeId, TypeId>> ownParamTypes;
+                                if (ownParams.valid()) {
+                                    collectParamTypes(s, cfg, tree, ownParams, here,
+                                                      ownParamTypes,
+                                                      /*emitOnMiss=*/false);
+                                }
+                                bool const soleSlot = ownParamTypes.size() == 1
+                                                      && !ti.fnIsVariadic(declTy);
+                                for (auto const& [pNode, pTy] : ownParamTypes) {
+                                    if (!pTy.valid()) continue;
+                                    auto const refuseParam = [&](DiagnosticCode code,
+                                                                 std::string what) {
+                                        ParseDiagnostic d;
+                                        d.code     = code;
+                                        d.severity = DiagnosticSeverity::Error;
+                                        d.buffer   = tree.source().id();
+                                        d.span     = tree.span(pNode);
+                                        d.actual   = std::move(what) + ": `"
+                                            + std::string{tree.text(pNode)} + "`";
+                                        s.reporter.report(std::move(d));
+                                    };
+                                    if (ti.kind(pTy) == TypeKind::Void) {
+                                        if (!cfg.parameters.soleVoidMeansEmpty) continue;
+                                        bool const named =
+                                            paramRowIsNamed(s, cfg, tree, pNode);
+                                        bool const spelledQualifier =
+                                            paramRowSpellsUninternedQualifier(
+                                                s, cfg, tree, pNode);
+                                        if (named && !spelledQualifier) {
+                                            // (a `const` / `restrict` one is refused in
+                                            // every context by the normalization)
+                                            refuseParam(
+                                                DiagnosticCode::S_InvalidVoidParam,
+                                                "a parameter of a function definition "
+                                                "cannot have type void (C 6.7.6.3p4: a "
+                                                "definition's parameters are complete)");
+                                        } else if (!named && soleSlot
+                                                   && !ti.isAtomicQualified(pTy)
+                                                   && (spelledQualifier
+                                                       || ti.qualifierBits(pTy) != 0)) {
+                                            // (an `_Atomic` one is refused in every
+                                            // context by the normalization)
+                                            refuseParam(
+                                                DiagnosticCode::S_InvalidVoidParam,
+                                                "'void' as the only parameter of a "
+                                                "function definition may not be "
+                                                "qualified (C 6.7.6.3p10 names an "
+                                                "unqualified void; a qualified one is a "
+                                                "parameter of incomplete type, C "
+                                                "6.7.6.3p4)");
+                                        }
+                                        continue;
+                                    }
+                                    if (compositeIncompleteAt(s, tree, pTy,
+                                                              tree.span(pNode).end())) {
+                                        refuseParam(
+                                            DiagnosticCode::S_IncompleteTypeObject,
+                                            "a parameter of a function definition must "
+                                            "have a complete type (C 6.7.6.3p4) — '"
+                                                + compositeSpelling(ti, pTy)
+                                                + "' is incomplete here");
+                                    }
+                                }
+                            }
                             if (tree.rule(dNode)
                                     == cfg.declarators->initDeclaratorRule) {
                                 // TF-C88: count only the children that could BE an
@@ -13793,10 +14605,15 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         // (C11 6.2.1) — past any declarator-
                                         // dominator (topLevelDecl) so a file-
                                         // scope `enum E { A } … A` resolves `A`.
+                                        // `specNode` stops the float at a function
+                                        // definition whose PARAMETER LIST defines the
+                                        // enum: its enumerators have the body's block
+                                        // scope, exactly like its tag (C 6.2.1p4).
                                         auto const enclosingId =
                                             floatToNamespaceScope(
                                                 s, cfg, tree,
-                                                s.scopes.scopes()[srec.structScope.v].parent);
+                                                s.scopes.scopes()[srec.structScope.v].parent,
+                                                specNode);
                                         // Collect enumerators in fieldIndex
                                         // order so the running counter
                                         // matches source declaration order.
@@ -13923,6 +14740,16 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                                     d2.span     = tree.span(erec.declRuleNode);
                                                     d2.actual   = erec.name;
                                                     s.reporter.report(std::move(d2));
+                                                } else {
+                                                    // C 6.2.1p4: an enumerator of an
+                                                    // enum the PARAMETER LIST defined
+                                                    // shares one scope with the body's
+                                                    // outermost block (and a body
+                                                    // enumerator is exempt, see the
+                                                    // helper).
+                                                    reportRedeclarationAcrossParameterScope(
+                                                        s, tree, enclosingId, erec.name,
+                                                        SymbolNamespace::Ordinary, eSymId);
                                                 }
                                             }
                                         }
@@ -13981,13 +14808,6 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             collectParamTypes(s, cfg, tree, paramsNode, here,
                                               params, /*emitOnMiss=*/false);
                         }
-                        normalizeSoleVoidParams(s, cfg, tree, params,
-                                                /*emitOnMiss=*/true);
-                        std::vector<TypeId> paramTypes;
-                        paramTypes.reserve(params.size());
-                        for (auto const& [pNode, pTy] : params) {
-                            paramTypes.push_back(pTy);
-                        }
                         // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): scan the params
                         // subtree for the declaration's configured
                         // variadic-marker token (e.g. `EllipsisOp` for
@@ -13998,12 +14818,21 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // rule node — a future grammar that nests a
                         // default-value expression inside a `param`
                         // cannot false-match the marker. Closes silent-
-                        // failure HIGH-2 (step 13.4 post-fold).
+                        // failure HIGH-2 (step 13.4 post-fold). Asked BEFORE the
+                        // `(void)` normalization, which needs it (P68 round 8, lane
+                        // `ht`, part 2): a `...` is an item of the list too.
                         bool const isVariadic =
                             paramsNode.valid() && decl.variadicMarker.has_value()
                             && subtreeContainsToken(
                                 tree, paramsNode, *decl.variadicMarker,
                                 &s.idx().declByRule);
+                        normalizeSoleVoidParams(s, cfg, tree, params, isVariadic,
+                                                /*emitOnMiss=*/true);
+                        std::vector<TypeId> paramTypes;
+                        paramTypes.reserve(params.size());
+                        for (auto const& [pNode, pTy] : params) {
+                            paramTypes.push_back(pTy);
+                        }
                         // CcSysV is the canonical MIR-tier placeholder
                         // (mirrors `hir_to_mir.cpp:lowerModuleInit`'s
                         // moduleInit FnSig): the target's real
@@ -15166,6 +15995,122 @@ constQualifiedLvalue(EngineState& s, SemanticConfig const& cfg, Tree const& tree
         if (many || !sole.valid()) return {};
         cur = sole;
     }
+    return {};
+}
+
+// ── THE ONE CONST-WRITE CHECK, AND THE TWO KINDS OF WRITE IT GUARDS ─────────
+//
+// C requires a MODIFIABLE lvalue in exactly these operand positions: the left
+// operand of an assignment (6.5.16p2) and the operand of a prefix or postfix `++`
+// / `--` (6.5.3.1p1, 6.5.2.4p1). An lvalue designating a const-qualified object
+// is not one. This is SE4's plain-identifier arm and P48's designation walk
+// (`constQualifiedLvalue`), extracted unchanged so every such position asks the
+// SAME question with the SAME answer.
+//
+// ★ P68 round 8 (lane `ht`): THE INCREMENT KIND IS THE CLOSE OF
+// [[D-CSUBSET-INCDEC-CONST-LVALUE]]. The check used to run for an assignment
+// alone, so `const int y = 1; y++;`, `--y`, `(*p)++` through a `const int *`,
+// `s->v++` on a const member and `a[0]++` on a const array all COMPILED, and a
+// const global's increment wrote to read-only data. ✔MEASURED 2026-09-23: gcc
+// 13.3.0, clang 18.1.3, mingw-w64 gcc 13.2.0 and MSVC 19.51 refuse every one
+// ("increment of read-only variable", "cannot assign to variable … with
+// const-qualified type", C2166). The bit-field split carries over unchanged: gcc
+// and mingw-w64 COMPILE `s->v++` on a `const int v : 3` member with a warning,
+// clang and MSVC refuse it, so it is a Warning here exactly as its assignment is.
+enum class ConstWrite : std::uint8_t { Assignment, IncrementOrDecrement };
+
+void reportWriteToConstLvalue(EngineState& s, SemanticConfig const& cfg,
+                              Tree const& tree, NodeId lvalueNode, ScopeId here,
+                              ConstWrite write) {
+    bool const increment = write == ConstWrite::IncrementOrDecrement;
+    bool reported = false;
+    auto resolved = extractNameNode(
+        tree, lvalueNode, NameMatchMode::Self, cfg.identifierToken);
+    if (resolved.node.valid()
+        && tree.kind(resolved.node) == NodeKind::Token
+        && cfg.identifierToken.valid()
+        && tree.tokenKind(resolved.node) == cfg.identifierToken) {
+        SymbolId const sym = s.scopes.lookup(here, resolved.name);
+        if (sym.valid() && s.symbols.at(sym).isConst) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_ConstViolation;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(resolved.node);
+            // An assignment reports the NAME alone, as it always has; an
+            // increment says which operator and which clause.
+            d.actual   = increment
+                ? "increment or decrement of `" + resolved.name
+                      + "`, a const-qualified object — C 6.5.2.4p1 / 6.5.3.1p1 "
+                        "require a MODIFIABLE lvalue as the operand"
+                : resolved.name;
+            s.reporter.report(std::move(d));
+            reported = true;
+        }
+    }
+    // P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): the SAME constraint for every
+    // NON-plain-identifier const lvalue — a deref of a pointer-to-const, a const
+    // member, a member of a const object, an element of a const array.
+    //
+    // ★ IT RUNS ONLY WHERE THE PLAIN-IDENTIFIER ARM DID NOT FIRE, which is what
+    // makes it purely additive: the pre-P48 verdict is produced by the pre-P48
+    // code on the pre-P48 path, and a const identifier can never draw TWO reports
+    // for one write. The span is the whole operand, because for `*p` or `a[0].v`
+    // the offending thing is the DESIGNATION, not any one token in it.
+    ConstLvalueVerdict const cv =
+        reported ? ConstLvalueVerdict{}
+                 : constQualifiedLvalue(s, cfg, tree, lvalueNode, here);
+    if (!cv.isConst) return;
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::S_ConstViolation;
+    // P48 lane cq: Error everywhere the four references REFUSE, Warning on the
+    // one shape they SPLIT on — a member declared `const` that is also a
+    // BIT-FIELD, which gcc and mingw-w64 gcc warn about and COMPILE. An Error
+    // there would refuse a program the union accepts; silence would drop a
+    // diagnostic ISO C requires and all four references emit. See
+    // `ConstLvalueVerdict`.
+    d.severity = cv.viaConstDeclaredBitField ? DiagnosticSeverity::Warning
+                                             : DiagnosticSeverity::Error;
+    d.buffer   = tree.source().id();
+    d.span     = tree.span(lvalueNode);
+    d.actual   = increment
+        ? "increment or decrement of `" + trimmedNodeText(tree, lvalueNode)
+              + "`, which designates a const-qualified object — C 6.5.2.4p1 / "
+                "6.5.3.1p1 require a MODIFIABLE lvalue as the operand"
+        : "assignment to `" + trimmedNodeText(tree, lvalueNode)
+              + "`, which designates a const-qualified object — C 6.5.16.1 "
+                "requires a MODIFIABLE lvalue as the left operand";
+    s.reporter.report(std::move(d));
+}
+
+// The operand of a prefix or postfix `++` / `--`, or an invalid NodeId when
+// `node` is not one. Which operator a node carries is read the way the type
+// oracle reads it — the operator token against the config's `unaryOps` /
+// `postfixOps`, whose HIR verb names the increment — and its operand is the
+// node's first non-token child, the one `subtreeType` types as its operand.
+[[nodiscard]] NodeId incrementOrDecrementOperand(Tree const& tree, NodeId node) {
+    if (tree.kind(node) != NodeKind::Internal) return {};
+    auto const& hirCfg = tree.schema().hirLowering();
+    RuleId const r = tree.rule(node);
+    std::vector<HirOperatorEntry> const* ops =
+        hirCfg.unaryExprRule.valid() && r == hirCfg.unaryExprRule
+            ? &hirCfg.unaryOps
+        : hirCfg.postfixExprRule.valid() && r == hirCfg.postfixExprRule
+            ? &hirCfg.postfixOps
+            : nullptr;
+    if (ops == nullptr) return {};
+    std::string_view target;
+    for (NodeId c : visibleChildren(tree, node)) {
+        if (tree.kind(c) != NodeKind::Token) continue;
+        for (auto const& e : *ops)
+            if (e.token.v == tree.tokenKind(c).v) { target = e.target; break; }
+        if (!target.empty()) break;
+    }
+    if (target != "PreInc" && target != "PreDec" && target != "PostInc"
+        && target != "PostDec")
+        return {};
+    for (NodeId c : visibleChildren(tree, node))
+        if (tree.kind(c) != NodeKind::Token) return c;
     return {};
 }
 
@@ -16373,6 +17318,15 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
 
+    // P68 round 8 (lane `ht`): the operand of `++` / `--` is a write, and it asks
+    // the SAME const question an assignment's left operand does (C 6.5.2.4p1 /
+    // 6.5.3.1p1) — see `reportWriteToConstLvalue`.
+    if (NodeId const operand = incrementOrDecrementOperand(tree, node);
+        operand.valid()) {
+        reportWriteToConstLvalue(s, cfg, tree, operand, here,
+                                 ConstWrite::IncrementOrDecrement);
+    }
+
     // SE4: const-violation check on assignment rules.
     if (k == NodeKind::Internal) {
         auto const rule = tree.rule(node);
@@ -16401,65 +17355,8 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 }
                 if (!gated) continue;
                 if (assign.lhsChild < kids.size()) {
-                    NodeId lhsNode = kids[assign.lhsChild];
-                    bool reported = false;
-                    auto resolved = extractNameNode(
-                        tree, lhsNode, NameMatchMode::Self, cfg.identifierToken);
-                    if (resolved.node.valid()
-                        && tree.kind(resolved.node) == NodeKind::Token
-                        && cfg.identifierToken.valid()
-                        && tree.tokenKind(resolved.node) == cfg.identifierToken) {
-                        SymbolId const lhsSym = s.scopes.lookup(here, resolved.name);
-                        if (lhsSym.valid() && s.symbols.at(lhsSym).isConst) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_ConstViolation;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(resolved.node);
-                            d.actual   = resolved.name;
-                            s.reporter.report(std::move(d));
-                            reported = true;
-                        }
-                    }
-                    // P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): the SAME C
-                    // 6.5.16.1 constraint for every NON-plain-identifier const
-                    // lvalue — a deref of a pointer-to-const, a const member, a
-                    // member of a const object, an element of a const array.
-                    //
-                    // ★ IT RUNS ONLY WHERE THE PLAIN-IDENTIFIER ARM DID NOT FIRE,
-                    // which is what makes it purely additive: the pre-P48 verdict
-                    // is produced by the pre-P48 code on the pre-P48 path, and a
-                    // const identifier can never draw TWO reports for one
-                    // assignment. The span is the whole LHS, because for `*p` or
-                    // `a[0].v` the offending thing is the DESIGNATION, not any one
-                    // token in it.
-                    ConstLvalueVerdict const cv =
-                        reported ? ConstLvalueVerdict{}
-                                 : constQualifiedLvalue(s, cfg, tree, lhsNode,
-                                                        here);
-                    if (cv.isConst) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::S_ConstViolation;
-                        // P48 lane cq: Error everywhere the four references
-                        // REFUSE, Warning on the one shape they SPLIT on — a
-                        // member declared `const` that is also a BIT-FIELD,
-                        // which gcc and mingw-w64 gcc warn about and COMPILE.
-                        // An Error there would refuse a program the union
-                        // accepts; silence would drop a diagnostic ISO C
-                        // requires and all four references emit. See
-                        // `ConstLvalueVerdict`.
-                        d.severity = cv.viaConstDeclaredBitField
-                                   ? DiagnosticSeverity::Warning
-                                   : DiagnosticSeverity::Error;
-                        d.buffer   = tree.source().id();
-                        d.span     = tree.span(lhsNode);
-                        d.actual   = "assignment to `"
-                                   + trimmedNodeText(tree, lhsNode)
-                                   + "`, which designates a const-qualified "
-                                     "object — C 6.5.16.1 requires a MODIFIABLE "
-                                     "lvalue as the left operand";
-                        s.reporter.report(std::move(d));
-                    }
+                    reportWriteToConstLvalue(s, cfg, tree, kids[assign.lhsChild],
+                                             here, ConstWrite::Assignment);
                 }
                 // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS: an assignment
                 // (`a = b`, statement OR nested expression) must run the SAME
@@ -17035,8 +17932,18 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                      "(D-CSUBSET-INLINE-ASM-OPERANDS)");
         } else {
             // ── (4) PER-OPERAND: split the constraint, then resolve the letter ──
+            // Which OUTPUT each matching-constraint input has claimed, so a
+            // second claim is refused rather than letting the later one win.
+            std::vector<std::optional<std::size_t>> matchClaimedBy(f.outputCount);
             for (std::size_t oi = 0; oi < f.operands.size(); ++oi) {
                 auto const& op    = f.operands[oi];
+                // An INPUT's value expression, for the post-Pass-2
+                // `denotesItsRegister` fold (P68 round 8).
+                if (oi >= f.outputCount && op.valueExpr.valid()) {
+                    s.asmInputValueExprs.insert(
+                        (static_cast<std::uint64_t>(tree.id().v) << 32)
+                        | op.valueExpr.v);
+                }
                 NodeId const at   = op.constraintNode.valid() ? op.constraintNode
                                                               : op.operandNode;
                 auto const  parse = parseAsmConstraint(op.constraint);
@@ -17045,6 +17952,82 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                            "inline-asm operand " + std::to_string(oi)
                            + " has constraint \"" + op.constraint + "\" — "
                            + std::string{asmConstraintDefectDescription(parse.defect)});
+                    continue;
+                }
+                // ★★ A GNU MATCHING CONSTRAINT (`"0"`) IS GRAMMAR, NOT A LETTER
+                // (P68, D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER):
+                // it names the operand whose location this INPUT shares, so no
+                // target is asked about it. What IS asked is whether the match is
+                // one the references give a meaning — ✔MEASURED 2026-09-19, gcc
+                // 13.3.0 and clang 18.1.3 probed SEPARATELY on aarch64, every
+                // shape below refused by BOTH, each with its own text quoted.
+                if (parse.value.matchedOperand.has_value()) {
+                    std::uint32_t const want = *parse.value.matchedOperand;
+                    std::string const head =
+                        "inline-asm operand " + std::to_string(oi)
+                        + " has the matching constraint \"" + op.constraint + "\"";
+                    if (op.isOutput || parse.value.isOutput) {
+                        report(DiagnosticCode::S_InlineAsmConstraintUnsupportedForm,
+                               at, head + " in the OUTPUT section — a matching "
+                               "constraint names the output whose location an "
+                               "INPUT shares, so on an output it names nothing "
+                               "(gcc: \"matching constraint not valid in output "
+                               "operand\"; clang: \"invalid output constraint\") "
+                               "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                        continue;
+                    }
+                    if (want >= f.outputCount) {
+                        report(DiagnosticCode::S_InlineAsmConstraintUnsupportedForm,
+                               at, head + ", and this statement declares "
+                               + std::to_string(f.outputCount) + " output(s) — "
+                               "the number must name one of them (gcc: \"matching "
+                               "constraint references invalid operand number\"; "
+                               "clang: \"invalid input constraint\") "
+                               "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                        continue;
+                    }
+                    auto const outParse =
+                        parseAsmConstraint(f.operands[want].constraint);
+                    if (outParse.ok() && outParse.value.isReadWrite) {
+                        report(DiagnosticCode::S_InlineAsmConstraintUnsupportedForm,
+                               at, head + ", and output " + std::to_string(want)
+                               + " is read-write (\"" + f.operands[want].constraint
+                               + "\") — a `+` output already carries its own read "
+                               "half, so a second input cannot share its location "
+                               "(gcc: \"inconsistent operand constraints in an "
+                               "'asm'\"; clang: \"invalid input constraint\") "
+                               "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                        continue;
+                    }
+                    if (outParse.ok() && target != nullptr) {
+                        auto const* oc = target->asmConstraint(outParse.value.letter);
+                        if (oc != nullptr
+                            && oc->binds == AsmConstraintBinding::OperandKind) {
+                            report(DiagnosticCode::S_InlineAsmConstraintUnsupportedForm,
+                                   at, head + ", and output " + std::to_string(want)
+                                   + " (\"" + f.operands[want].constraint + "\") "
+                                   "binds an operand FORM rather than a register, "
+                                   "so there is no register location to share "
+                                   "(gcc: \"inconsistent operand constraints in an "
+                                   "'asm'\"; clang: \"invalid operand for "
+                                   "instruction\") "
+                                   "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                            continue;
+                        }
+                    }
+                    if (matchClaimedBy[want].has_value()) {
+                        report(DiagnosticCode::S_InlineAsmConstraintUnsupportedForm,
+                               at, head + ", and operand "
+                               + std::to_string(*matchClaimedBy[want])
+                               + " already matches output " + std::to_string(want)
+                               + " — one location cannot hold two inputs' values "
+                               "(gcc: \"inconsistent operand constraints in an "
+                               "'asm'\"; clang: \"more than one input constraint "
+                               "matches the same output\") "
+                               "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                        continue;
+                    }
+                    matchClaimedBy[want] = oi;
                     continue;
                 }
                 // ── the TARGET half. Unasked when no target is in scope. ──
@@ -17407,16 +18390,59 @@ void collectParamTypes(EngineState& s, SemanticConfig const& cfg,
 // the ONE chokepoint both FnSig builders share (the legacy function-decl
 // arm and the declarator fn-suffix fold). When the language declares
 // `parameters.soleVoidMeansEmpty`:
-//   * exactly ONE param, resolved type Void, UNNAMED  → zero params;
-//   * any OTHER Void param (named, or void-among-others) → ill-formed,
+//   * exactly ONE param, resolved type Void, UNNAMED, and no `...` → zero
+//     params;
+//   * an UNNAMED Void beside another param or a `...` → ill-formed,
 //     S_InvalidVoidParam positioned at the param (suppressed when
 //     `emitOnMiss` is false — a harvest re-resolution must not re-report
 //     what the definitive visit already did; the normalization itself
-//     still applies so the two computations agree on the type).
+//     still applies so the two computations agree on the type);
+//   * a NAMED Void → KEPT as a parameter of type void, unless it spells
+//     `const` / `restrict` (both below).
+//
+// ★★ WHAT EACH REFERENCE MEANS BY A VOID PARAMETER (P68 round 8, lane `ht`,
+// part 2), ✔MEASURED 2026-09-23 on gcc 13.3.0 and clang 18.1.3 (`-std=c17
+// -pedantic-errors`), mingw-w64 13.2.0 and MSVC 19.51 (`/std:c17`), each
+// accepting program BUILT AND RUN with the callee defined in another TU:
+//   * A QUALIFIED or `register` sole unnamed void in a declaration that is
+//     not a definition: gcc and clang refuse `(const void)`, `(volatile
+//     void)` and a typedef'd `const void`; MSVC accepts them as `(void)` and
+//     its programs RUN — `f()` reaches a `void f(void)` definition, `f(1)` is
+//     "too many arguments", and redeclaring or pointing at it as `void(void)`
+//     is compatible. clang and MSVC build and RUN `(register void)` the same
+//     way, a definition included. So all of them stay `(void)` here (the union
+//     over what works); the C 6.9.1 definition block refuses a QUALIFIED one
+//     in a DEFINITION, where all four references refuse it. The exception is
+//     `_Atomic void`, which all four refuse in EVERY declaration (below).
+//   * A NAMED void: gcc and mingw accept it in a declaration that is not a
+//     definition, anywhere in the list (`void f(void v);`, `void f(void v,
+//     void w);`, `void f(int a, void v);`, `void f(void v, ...);`), and those
+//     programs RUN; clang and MSVC refuse every one. gcc's meaning is an
+//     ordinary parameter of the incomplete type void — C 6.7.6.3p4 constrains
+//     only a DEFINITION's parameters — at which ARGUMENT MATCHING ENDS (see
+//     `checkCallAgainstSig`), in a function type distinct from `void(void)`:
+//     a same-TU `void f(void)` redeclaration or definition is "conflicting
+//     types", and so is `void f(int)` against `void f(int a, void v)`. Kept,
+//     so the FnSig is exactly that type; a definition with one is refused by
+//     the definition block (all four refuse).
+//   * A NAMED `const`- or `restrict`-qualified void is REFUSED. gcc accepts
+//     the bare declaration, then refuses every call through it ("too few
+//     arguments" — only the UNQUALIFIED void ends its list) and every
+//     definition; clang and MSVC refuse the declaration. A DSS type carries
+//     no `const` (C 6.7.6.3p15 drops a parameter's top-level qualifiers from
+//     its function type), so keeping it would let `f()` end its argument list
+//     at it — accepting a call NO reference accepts. That is the one measured
+//     residual, and it is tracked OPEN in the production registry: DSS is below
+//     gcc on a declaration nothing can call, and the faithful model — the
+//     declaration accepted, every call and definition refused — needs the
+//     signature to carry where argument matching ends independently of its
+//     parameter types. A `volatile` / `_Atomic` one rides the type (a
+//     qualifier skin) and gets gcc's exact meaning — kept, not a terminator,
+//     so `f()` through it is "too few arguments" here too.
 void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
                              Tree const& tree,
                              std::vector<std::pair<NodeId, TypeId>>& params,
-                             bool emitOnMiss) {
+                             bool variadic, bool emitOnMiss) {
     if (!cfg.parameters.soleVoidMeansEmpty) return;
     auto const isVoid = [&](TypeId t) {
         return t.valid()
@@ -17425,20 +18451,53 @@ void normalizeSoleVoidParams(EngineState& s, SemanticConfig const& cfg,
     bool anyVoid = false;
     for (auto const& [n, t] : params) anyVoid = anyVoid || isVoid(t);
     if (!anyVoid) return;
-    if (params.size() == 1 && isVoid(params[0].second)
+    if (params.size() == 1 && !variadic && isVoid(params[0].second)
         && !paramRowIsNamed(s, cfg, tree, params[0].first)) {
+        // `_Atomic` is the one qualification NO reference accepts on the sole
+        // void, in any declaration: gcc "'void' as only parameter may not be
+        // qualified", clang and MSVC (its C11 atomics enabled) "'_Atomic' cannot
+        // be applied to incomplete type 'void'". ✔MEASURED 2026-09-23. Refused in
+        // every context here, so the definition block leaves it alone; the list
+        // still normalizes to empty, so both computations agree on the type.
+        if (emitOnMiss
+            && s.lattice.interner().isAtomicQualified(params[0].second)) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_InvalidVoidParam;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(params[0].first);
+            d.actual   = "'void' as the only parameter may not be `_Atomic`-qualified "
+                         "(no reference compiler accepts it): `"
+                         + std::string{tree.text(params[0].first)} + "`";
+            s.reporter.report(std::move(d));
+        }
         params.clear();
         return;
     }
     if (!emitOnMiss) return;
     for (auto const& [n, t] : params) {
         if (!isVoid(t)) continue;
+        std::string_view why;
+        if (!paramRowIsNamed(s, cfg, tree, n)) {
+            why = "an unnamed 'void' parameter must be the only item of the "
+                  "parameter list — no other parameter and no `...` (C 6.7.6.3p10)";
+        } else if (paramRowSpellsUninternedQualifier(s, cfg, tree, n)) {
+            why = "DSS does not accept a named parameter of `const`- or "
+                  "`restrict`-qualified void: its function type cannot carry the "
+                  "qualifier (C 6.7.6.3p15 drops a parameter's own qualifiers from "
+                  "it), so the parameter would end the argument list and make a "
+                  "call with no argument valid — which no reference compiler "
+                  "accepts (gcc, the one that accepts this declaration, refuses "
+                  "every call through it and every definition of it)";
+        } else {
+            continue;   // a named void — kept, gcc's meaning (above)
+        }
         ParseDiagnostic d;
         d.code     = DiagnosticCode::S_InvalidVoidParam;
         d.severity = DiagnosticSeverity::Error;
         d.buffer   = tree.source().id();
         d.span     = tree.span(n);
-        d.actual   = std::string{tree.text(n)};
+        d.actual   = std::string{why} + ": `" + std::string{tree.text(n)} + "`";
         s.reporter.report(std::move(d));
     }
 }
@@ -17508,8 +18567,20 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // multi-param shipped-FnSig case (`memcpy(&b,&a,4)`). Single-param libc fns
     // (malloc/free) don't trip it — a literal `4` / an existing pointer arg interns
     // nothing. Owning the params makes the loop robust against ANY downstream intern.
+    // ★★ A `void` PARAMETER ENDS THE ARGUMENT LIST (P68 round 8, lane `ht`, part
+    // 2). A named parameter of UNQUALIFIED void is kept by the `(void)`
+    // normalization (gcc's meaning — see `normalizeSoleVoidParams`), and a call's
+    // arguments bind to the parameters BEFORE it: `fnArgumentParams` /
+    // `fnArgumentsVariadic`, the lattice's one answer, which the HIR and MIR
+    // verifiers read too — so the three tiers cannot disagree about a call. For
+    // every signature without such a parameter it is exactly `fnParams` /
+    // `fnIsVariadic`. Asked only for a language whose `(void)` convention this is
+    // (`parameters.soleVoidMeansEmpty`); any other keeps the declared list.
+    bool const voidEndsArguments = cfg.parameters.soleVoidMeansEmpty;
     std::vector<TypeId> const params = [&] {
-        auto const sp = s.lattice.interner().fnParams(fnSig);
+        auto const sp = voidEndsArguments
+                            ? s.lattice.interner().fnArgumentParams(fnSig)
+                            : s.lattice.interner().fnParams(fnSig);
         return std::vector<TypeId>(sp.begin(), sp.end());
     }();
 
@@ -17518,7 +18589,52 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // FnSig admits exactly fixedParamCount. The pre-existing
     // `variadicBuiltin` flag (e.g. tsql COALESCE) admits ANY arg count
     // — those builtins have no fixed prefix to require.
-    bool const variadicFnSig   = s.lattice.interner().fnIsVariadic(fnSig);
+    bool const variadicFnSig = voidEndsArguments
+                                   ? s.lattice.interner().fnArgumentsVariadic(fnSig)
+                                   : s.lattice.interner().fnIsVariadic(fnSig);
+    // ★★ C 6.5.2.2p1 AND p4 (P68 round 8, lane `ht`, part 2): the called function
+    // returns void or a COMPLETE object type, and every argument has a complete
+    // object type — both at THIS call (C 6.2.5p1), so a composite completed later in
+    // the translation unit is still incomplete here. ✔MEASURED 2026-09-23: gcc
+    // 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 refuse all four shapes; MSVC 19.51
+    // accepts them and its programs FAIL — a call through an incomplete return
+    // CRASHES (0xC0000005), the type completed later in the TU or only in another TU,
+    // and an incomplete argument arrives WRONG (the callee summed 556434983 and
+    // 247956583 for 36). DSS accepted all four. Checked for EVERY argument, the
+    // variadic extras included (C 6.3.2.1p2: an incomplete lvalue has no value to
+    // convert), and BEFORE the arity check so neither fact hides the other; an
+    // argument refused here is not judged again for assignability below.
+    if (TypeId const resultTy = s.lattice.interner().fnResult(fnSig);
+        compositeIncompleteAt(s, tree, resultTy, tree.span(node).start())) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_IncompleteReturnType;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(node);
+        d.actual   = "the called function returns '"
+                     + compositeSpelling(s.lattice.interner(), resultTy)
+                     + "', which is incomplete at this call (C 6.5.2.2p1) — its "
+                       "result has no size";
+        s.reporter.report(std::move(d));
+    }
+    std::vector<bool> argIncomplete(argNodes.size(), false);
+    for (std::size_t i = 0; i < argNodes.size(); ++i) {
+        TypeId const argTy = subtreeType(s, tree, argNodes[i]);
+        if (!compositeIncompleteAt(s, tree, argTy,
+                                   tree.span(argNodes[i]).start()))
+            continue;
+        argIncomplete[i] = true;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_IncompleteArgumentType;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(argNodes[i]);
+        d.actual   = std::format("argument {} has type '{}', which is incomplete at "
+                                 "this call (C 6.5.2.2p4) — it has no size to pass",
+                                 i + 1,
+                                 compositeSpelling(s.lattice.interner(), argTy));
+        s.reporter.report(std::move(d));
+    }
     bool const tooFewForVariadic =
         variadicFnSig && argNodes.size() < params.size();
     bool const wrongCountForFixed =
@@ -17558,6 +18674,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
     // is defined below).
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     for (std::size_t i = 0; i < checkCount && i < argNodes.size(); ++i) {
+        if (argIncomplete[i]) continue;   // refused above; no second verdict
         TypeId argTy = subtreeType(s, tree, argNodes[i]);
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
@@ -19587,7 +20704,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
-                                 std::optional<ObjectFormatKind> activeFormat,
+                                 std::optional<SelectableObjectFormatKind> activeFormat,
                                  std::optional<std::string_view> activeTarget,
                                  LongDoubleFormat longDoubleFormat,
                                  TargetSchema const* target,
@@ -19598,7 +20715,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
                       std::optional<AggregateLayoutParams> aggregateLayout,
                       std::optional<VaListStrategy> vaListStrategy,
-                      std::optional<ObjectFormatKind> activeFormat,
+                      std::optional<SelectableObjectFormatKind> activeFormat,
                       std::optional<std::string_view> activeTarget,
                       LongDoubleFormat longDoubleFormat,
                       TargetSchema const* target,
@@ -19621,13 +20738,13 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     // every direct-API caller (the LSP, the header parser, ~40 test call sites
     // that pass an `activeFormat` and bind nothing) depends on.
     if (activeFormat.has_value() && roleResolver != nullptr
-        && roleResolver->formatKindName() != objectFormatKindName(*activeFormat)) {
+        && roleResolver->formatKindName() != objectFormatKindName(activeFormat->kind())) {
         std::fprintf(stderr,
                      "dss::analyze fatal: activeFormat is '%s' but the "
                      "runtime-library role resolver answers for '%s' -- a shipped "
                      "descriptor's role entry would resolve for neither, leaving "
                      "every import of this unit unbound\n",
-                     std::string{objectFormatKindName(*activeFormat)}.c_str(),
+                     std::string{objectFormatKindName(activeFormat->kind())}.c_str(),
                      std::string{roleResolver->formatKindName()}.c_str());
         std::abort();
     }
@@ -19662,7 +20779,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  DataModel dataModel,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
-                                 std::optional<ObjectFormatKind> activeFormat,
+                                 std::optional<SelectableObjectFormatKind> activeFormat,
                                  std::optional<std::string_view> activeTarget,
                                  LongDoubleFormat longDoubleFormat,
                                  TargetSchema const* target,
@@ -19685,7 +20802,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // under GNU/Linux and SIGNED under Darwin). Both axes present or the fact
     // stays absent; a half-answer would be worse than none.
     if (target != nullptr && activeFormat.has_value()) {
-        s.charIsUnsigned = target->charIsUnsigned(*activeFormat);
+        s.charIsUnsigned = target->charIsUnsigned(activeFormat->kind());
     }
     // Plan 25: own the arch-name string (the caller's string_view may be
     // transient) so the shipped-struct variant selector reads a stable value.
@@ -20429,7 +21546,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             vocabulary.push_back(ffi::VocabularyCore{name, core});
         }
         ffi::ShippedTypeConsistency typeConsistency{s.lattice.interner(),
-                                                    vocabulary, s.activeFormat};
+                                                    vocabulary,
+                                                    objectFormatKindOf(s.activeFormat)};
         for (ShippedDescriptorRef const& ref :
              cu->shippedLibDescriptors()) {
             std::filesystem::path const& descPath = ref.path;  // (ref.span/buffer: the c8 gate)
@@ -20468,7 +21586,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             }
             auto desc = ffi::readShippedLibDescriptor(
                 descPath, s.lattice.interner(), s.lattice.registry(), s.reporter,
-                s.dataModel, activeTargetView, s.activeFormat, namedTypes,
+                s.dataModel, activeTargetView, objectFormatKindOf(s.activeFormat),
+                namedTypes,
                 s.roleResolver);
             if (!desc) continue;
 
@@ -20482,7 +21601,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // config-declared set + a generic membership test, no `if(format==…)`.
             if (s.activeFormat.has_value()
                 && !ffi::objectFormatInAvailabilitySet(desc->availableObjectFormats,
-                                                       *s.activeFormat)) {
+                                                       s.activeFormat->kind())) {
                 // The SHARED availability predicate (ffi) — the SAME membership
                 // test the preprocessor `__has_include` + macro-splice use, so the
                 // `#include` gate here and `__has_include` can never disagree.
@@ -20551,7 +21670,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     for (auto const& [ovFmt, ovSrc] : sym.realization)
                         effectiveRealization.insert_or_assign(ovFmt, ovSrc);
                     auto const it = effectiveRealization.find(
-                        std::string{objectFormatKindName(*s.activeFormat)});
+                        std::string{objectFormatKindName(s.activeFormat->kind())});
                     if (it != effectiveRealization.end())
                         shippedSourceForFormat = it->second;
                 }
@@ -20586,7 +21705,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // diagnostic. Both properties travel or neither is honest.
                     if (!s.activeFormat.has_value()
                         || ffi::objectFormatInAvailabilitySet(
-                               sym.availableObjectFormats, *s.activeFormat)) {
+                               sym.availableObjectFormats, s.activeFormat->kind())) {
                         suppressedShippedLibraries.emplace(sym.name,
                             SuppressedShippedSymbol{std::move(effectiveLibrary),
                                                     sym.version,
@@ -20635,9 +21754,23 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // predicate the header gate + __has_include use, never if(format==).
                 if (s.activeFormat.has_value()
                     && !ffi::objectFormatInAvailabilitySet(sym.availableObjectFormats,
-                                                           *s.activeFormat))
+                                                           s.activeFormat->kind()))
                     continue;
                 if (!injectedNames.insert(sym.name).second) continue;  // first wins
+                // [[D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION]]:
+                // this row is being injected, so its realization is decided HERE. A
+                // row available on the active format with no body for it is refused
+                // on the `#include`, naming the descriptor, the symbol and the format,
+                // instead of reaching HIR as an import with no image. It is still
+                // injected, so its uses type-check and this is the only error.
+                if (s.activeFormat.has_value()) {
+                    if (auto refusal = ffi::refuseShippedSymbolWithoutABody(
+                            *desc, sym, s.activeFormat->kind(), descPath)) {
+                        refusal->buffer = ref.buffer;
+                        refusal->span   = ref.span;
+                        s.reporter.report(std::move(*refusal));
+                    }
+                }
 
                 SymbolRecord rec;
                 rec.name  = sym.name;
@@ -21334,8 +22467,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 bool const variablyModified = isVariablyModified(sRec.type)
                                            || isVariablyModified(aRec.type);
                 // The C11 permission, in full: same resolved type AND not
-                // variably modified. Anything else falls through to fail loud.
-                if (!variablyModified && sRec.type.v == aRec.type.v) continue;
+                // variably modified AND qualified alike (the `const` / `restrict`
+                // a TypeId does not carry — P68 round 8, lane `ht`). Anything else
+                // falls through to fail loud.
+                if (!variablyModified && sRec.type.v == aRec.type.v
+                    && !typedefRedefinitionQualifiersDiverge(in, sRec, aRec))
+                    continue;
                 auto aTreeIt = treeById.find(aRec.tree.v);
                 if (aTreeIt == treeById.end()) continue;
                 Tree const& aTree = *aTreeIt->second;
@@ -21409,12 +22546,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                               aTreeIt2->second->schema().schemaId().v);
                     std::optional<DeclaredQualification> sQual;
                     std::optional<DeclaredQualification> aQual;
+                    HeadTypedefs const typedefs{s.typedefNamedByToken, s.symbols, in};
                     if (sIdxIt != s.schemaIndexes.end())
                         sQual = harvestFunctionQualification(
-                            in, sIdxIt->second, *sTreeIt2->second, sRec, sRec.type);
+                            in, sIdxIt->second, *sTreeIt2->second, sRec, sRec.type,
+                            typedefs);
                     if (aIdxIt != s.schemaIndexes.end())
                         aQual = harvestFunctionQualification(
-                            in, aIdxIt->second, *aTreeIt2->second, aRec, aRec.type);
+                            in, aIdxIt->second, *aTreeIt2->second, aRec, aRec.type,
+                            typedefs);
                     DeclaredFunction const survivorDecl{
                         sRec.type, sQual.has_value() ? &*sQual : nullptr};
                     DeclaredFunction const absorbedDecl{
@@ -21613,7 +22753,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     : std::nullopt;
             auto realized = ffi::realizeShippedExternSymbols(
                 unrealized, s.lattice.interner(), s.lattice.registry(),
-                s.reporter, s.dataModel, activeTargetView, s.activeFormat,
+                s.reporter, s.dataModel, activeTargetView,
+                objectFormatKindOf(s.activeFormat),
                 namedTypes, s.roleResolver);
             // nullopt ⇒ the shippedLibs directory could not be located. That is a
             // statement about the ENVIRONMENT, never about the user's program, so
@@ -21673,7 +22814,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // the tree — and nothing here needs editing when a recipe lands.
                     auto surface = ffi::realizeShippedDescriptorSurfaceFor(
                         name, s.lattice.interner(), s.lattice.registry(),
-                        s.dataModel, activeTargetView, s.activeFormat, namedTypes,
+                        s.dataModel, activeTargetView,
+                        objectFormatKindOf(s.activeFormat), namedTypes,
                         s.roleResolver);
                     if (!surface.has_value()) continue;
                     for (auto& [coreName, core] : *surface) {
@@ -21808,8 +22950,9 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             Tree const& tree = *treeIt->second;
             std::optional<DeclaredQualification> userQual;
             if (shippedIt->second.qualification != nullptr) {
-                userQual = harvestFunctionQualification(in, s.idx(), tree, rec,
-                                                        rec.type);
+                userQual = harvestFunctionQualification(
+                    in, s.idx(), tree, rec, rec.type,
+                    HeadTypedefs{s.typedefNamedByToken, s.symbols, in});
             }
             DeclaredFunction const userDecl{
                 rec.type, userQual.has_value() ? &*userQual : nullptr};
@@ -21992,6 +23135,52 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             d.span     = tree.span(rec.declRuleNode);
             d.actual   = rec.name;
             s.reporter.report(std::move(d));
+        }
+    }
+
+    // ★★ P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): CONFIRM
+    // OR CLEAR each provisional `denotesItsRegister` against the COMPLETE use
+    // index. A GNU local register variable with no initializer denotes its
+    // register as it stands only if EVERY use of it is the bare value of an
+    // asm INPUT operand — an identifier whose parents, up to the operand's
+    // value expression, each have exactly one visible child. That test needs
+    // no list of the ways C writes an object, which is what makes it sound: an
+    // assignment, an increment, an output binding and an ordinary read all
+    // name the variable somewhere that is not such a value, and each one
+    // clears the fact. A variable with no use at all has no input to bind.
+    {
+        std::unordered_map<std::uint32_t /*TreeId.v*/, Tree const*> treeById;
+        for (auto const& tree : trees) treeById[tree.id().v] = &tree;
+        std::size_t const recordCount = s.symbols.records().size();
+        for (std::size_t i = 1; i < recordCount; ++i) {
+            SymbolRecord& rec = s.symbols.at(SymbolId{static_cast<std::uint32_t>(i)});
+            if (!rec.denotesItsRegister) continue;
+            auto const useIt = s.usesBySymbol.find(static_cast<std::uint32_t>(i));
+            auto const treeIt = treeById.find(rec.tree.v);
+            bool bare = useIt != s.usesBySymbol.end() && !useIt->second.empty()
+                     && treeIt != treeById.end();
+            if (bare) {
+                Tree const& tree = *treeIt->second;
+                std::uint64_t const treeKey =
+                    static_cast<std::uint64_t>(tree.id().v) << 32;
+                for (NodeId const use : useIt->second) {
+                    bool reached = false;
+                    NodeId at = use;
+                    for (int guard = 0; guard < 256 && at.valid(); ++guard) {
+                        NodeId const up = tree.parent(at);
+                        if (!up.valid() || visibleChildren(tree, up).size() != 1) {
+                            break;
+                        }
+                        if (s.asmInputValueExprs.contains(treeKey | up.v)) {
+                            reached = true;
+                            break;
+                        }
+                        at = up;
+                    }
+                    if (!reached) { bare = false; break; }
+                }
+            }
+            rec.denotesItsRegister = bare;
         }
     }
 

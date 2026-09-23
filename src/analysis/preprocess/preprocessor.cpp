@@ -277,6 +277,35 @@ std::vector<PPToken> tokenizeToPP(
     return bodyEnd;
 }
 
+// Does the literal whose coalesced body is at `bodyIdx` END WITH ITS CLOSER?
+//
+// [[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]: a new-line ends a quoted body,
+// so `#include "a.h` (no closing quote) lexes as an opener and a body with NO
+// closer — one unterminated preprocessing token, which is NOT a header name
+// (C23 6.4.7) and NOT a string literal (6.4.5). A directive that INTERPRETS its
+// operand as one must refuse it: ✔MEASURED 2026-09-22, gcc 13.3.0, clang
+// 18.1.3, MinGW gcc and MSVC VS 18 all refuse `#include "a.h`, `#line 10 "f`
+// and `_Pragma("once` with the named file present. Before the lexer fix the
+// body ran on to the next quote and the name could never resolve, so the
+// question never arose; after it, only this check stands between an unclosed
+// name and a silently spliced header.
+[[nodiscard]] bool literalHasCloser(GrammarSchema const&        schema,
+                                    std::vector<PPToken> const& toks,
+                                    std::size_t                 bodyIdx) {
+    return literalEndPastCloser(schema, toks, bodyIdx)
+        != toks[bodyIdx].tok.span.end();
+}
+
+// The ONE refusal text for an interpreted operand whose closer is missing, so
+// the directives that interpret one say it the same way. `subject` names the
+// operand ("the #include header name", "the #line file operand", …).
+[[nodiscard]] std::string unclosedOperandMessage(std::string_view subject) {
+    return std::string{subject}
+         + " is not complete: its closing delimiter is missing, and a new-line "
+           "cannot appear inside it (C23 6.4.5, 6.4.7), so it ends, "
+           "unterminated, at the end of its line";
+}
+
 } // namespace
 
 Token const& PreprocessResult::eofToken() const {
@@ -399,7 +428,7 @@ std::function<void(BufferId&, SourceSpan&)> PreprocessResult::makeRemap() const 
 // second location; a bare position at the invocation would say "something in
 // this macro" and stop there.
 // (The two renderings are quoted in prose deliberately: a `file:line:col`
-//  written into a source file reads to `scripts/check-plan-citations` as a
+//  written into a source file reads to `.harness-config/runner/actions/check-plan-citations` as a
 //  positional citation, and a guard that learns exceptions is a guard nobody
 //  reads.)
 //
@@ -1279,6 +1308,11 @@ struct SynthBuilder {
     // input from `activeFormat` (a KIND): deriving the rule from the kind would
     // be the identity branch the agnosticism bar forbids.
     HeaderNameMatching                   headerNameMatching;
+    // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: the
+    // COMPILE's view of the include tree, shared by reference down the whole
+    // builder tree (like `includeStack`) and with the authoritative pass, so a
+    // directory is listed once per compile however many includes search it.
+    HeaderSearchCache&                   headerSearch;
     DiagnosticReporter&                  rep;
     int                                  depth;
     std::vector<core::PathIdentity>&     includeStack;
@@ -1394,7 +1428,8 @@ struct SynthBuilder {
         // cut of this function continued to the next dir here, quietly
         // disagreeing with the shared resolver about the same question.
         auto const tryDir = [&](fs::path const& dir) -> HeaderSearchResult {
-            HeaderSearchResult r = resolveInDir(dir, filename, headerNameMatching);
+            HeaderSearchResult r =
+                resolveInDir(dir, filename, headerNameMatching, headerSearch);
             if (r.status != HeaderSearchStatus::Found) return r;
             if (!fs::is_regular_file(r.path, ec)) return HeaderSearchResult::notFound();
             return r;
@@ -1497,8 +1532,8 @@ struct SynthBuilder {
         // caller leaves the include verbatim) and is reported LOUD by the import
         // resolver, which re-resolves the surviving directive — the same
         // dead-branch-inert split the malformed-descriptor diagnostic makes.
-        HeaderSearchResult const desc =
-            resolveSystemDescriptor(headerName, systemDirs, headerNameMatching);
+        HeaderSearchResult const desc = resolveSystemDescriptor(
+            headerName, systemDirs, headerNameMatching, headerSearch);
         if (desc.status != HeaderSearchStatus::Found)
             return SystemMacroSplice::NotAvailable;
         fs::path const* descPath = &desc.path;
@@ -1677,7 +1712,8 @@ struct SynthBuilder {
         std::string parentMacrosDetail;
         std::unordered_set<core::PathIdentity> visited;  // per-call (a splice is one root)
         ffi::forEachDescriptorInClosure(
-            *descPath, systemDirs, headerNameMatching, activeFormat, visited,
+            *descPath, systemDirs, headerNameMatching, headerSearch, activeFormat,
+            visited,
             [&](fs::path const& p) {
                 bool const isParent = !sawParent;
                 sawParent = true;
@@ -2839,6 +2875,23 @@ struct SynthBuilder {
                     }
                     angleName   = std::string{toks[aBody].text};
                     angleDirEnd = literalEndPastCloser(*schema, toks, aBody);
+                    // An UNCLOSED `<name` is no header name (C23 6.4.7) — the
+                    // quote arm's refusal, for the same reason and with the
+                    // same sole-reporter drop. Gated on `includeResolvable()`
+                    // like every other emit in this pass, so an unclosed name
+                    // in a skipped group stays inert (all four references
+                    // accept one there).
+                    if (!literalHasCloser(*schema, toks, aBody)) {
+                        if (!includeResolvable()) continue;
+                        emitPP(rep, DiagnosticCode::P_PreprocessorDirective,
+                               BufferId{}, SourceSpan::empty(0),
+                               unclosedOperandMessage(
+                                   "the #include header name <" + angleName + ">"));
+                        copyVerbatim(spliced, localMap, copiedUpTo,
+                                     toks[i].tok.span.start(), out, map);
+                        copiedUpTo = angleDirEnd;
+                        continue;
+                    }
                     if (angleName.empty()) continue;
                 }
 
@@ -2892,7 +2945,7 @@ struct SynthBuilder {
                 // dead-branch-inertness reason as every other emit in this pass.
                 AngleIncludeResolution const angleRes =
                     resolveAngleInclude(angleName, systemDirs, includeDirs,
-                                        headerNameMatching);
+                                        headerNameMatching, headerSearch);
                 if (angleRes.kind == AngleIncludeKind::AmbiguousSource
                     && includeResolvable()) {
                     reportHeaderCaseAmbiguity(rep, BufferId{},
@@ -2964,7 +3017,7 @@ struct SynthBuilder {
                     copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
                     includeStack.push_back(canon);
                     SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
-                                       headerNameMatching,
+                                       headerNameMatching, headerSearch,
                                        rep, depth + 1, includeStack,
                                        includeOnce, fatal,
                                        preScanDefinePrefix, oracle,
@@ -3069,6 +3122,21 @@ struct SynthBuilder {
                 // stops BEFORE the `"` — deliberately, so `filename` stays
                 // quote-free — so this must not cut at the body end.
                 dirEnd = literalEndPastCloser(*schema, toks, bodyIdx);
+                // An UNCLOSED name is no header name: refuse it here, the only
+                // tier that interprets this operand, and DROP the directive so
+                // nothing downstream reports the same root cause again (the
+                // TF-C60 Finding-5 discipline). ✔MEASURED, all four references
+                // refuse `#include "a.h` with `a.h` present — and without this
+                // check DSS spliced it and compiled.
+                if (!literalHasCloser(*schema, toks, bodyIdx)) {
+                    emitPP(rep, DiagnosticCode::P_PreprocessorDirective,
+                           BufferId{}, SourceSpan::empty(0),
+                           unclosedOperandMessage(
+                               "the #include header name \"" + filename + "\""));
+                    copyVerbatim(spliced, localMap, copiedUpTo, dirStart, out, map);
+                    copiedUpTo = dirEnd;
+                    continue;
+                }
             }
 
             // ★ H1 (D-PP-HEADER-CASE-INSENSITIVE-PE): THIS is the site whose
@@ -3194,7 +3262,7 @@ struct SynthBuilder {
 
             includeStack.push_back(canon);
             SynthBuilder child{schema, includeDirs, systemDirs, activeFormat,
-                               headerNameMatching, rep,
+                               headerNameMatching, headerSearch, rep,
                                depth + 1, includeStack, includeOnce, fatal,
                                preScanDefinePrefix, oracle,
                                resolvedDescriptorsOut};
@@ -3494,6 +3562,11 @@ public:
                   // states — a silent fallback here would put the choice back
                   // out of sight at the one site that matters most.
                   HeaderNameMatching headerNameMatching,
+                  // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]:
+                  // REQUIRED for the same reason — the compile's view of the
+                  // include tree, so `__has_include` and `#embed` search the
+                  // listings the splice already read.
+                  HeaderSearchCache& headerSearch,
                   std::span<fs::path const> includeDirs = {},
                   std::span<fs::path const> systemDirs = {},
                   std::optional<ObjectFormatKind> activeFormat = {},
@@ -3517,6 +3590,7 @@ public:
           includeDirs_(includeDirs), systemDirs_(systemDirs),
           activeFormat_(activeFormat),
           headerNameMatching_(headerNameMatching),
+          headerSearch_(headerSearch),
           includingDir_(std::move(includingDir)),
           charIsUnsigned_(charIsUnsigned) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
@@ -3635,7 +3709,7 @@ public:
     // TRUE iff a fatal nesting-backstop truncated the expansion.
     [[nodiscard]] bool truncated() const noexcept { return truncated_; }
 
-    // D-PERF-1 effectiveness metric: the total FRONT-splice token-moves the macro
+    // D-PERF-1-PREPROCESSOR effectiveness metric: the total FRONT-splice token-moves the macro
     // pass performed -- `(consumed + produced)` summed across every `spliceOver`.
     // With the front-consumed deque each splice's PHYSICAL cost IS exactly this
     // (pop_front the consumed run + push_front the replacement), so the metric is
@@ -3653,6 +3727,14 @@ public:
     [[nodiscard]] std::vector<std::pair<ByteOffset, ByteOffset>> const&
     deadRanges() const noexcept {
         return deadRanges_;
+    }
+
+    // The tokens an EVALUATED `#if`/`#elif` operand converted — see
+    // `convertedOperandSpans_`. The other half of "converted" is the token stream
+    // `run()` returns.
+    [[nodiscard]] std::vector<SourceSpan> const&
+    convertedOperandSpans() const noexcept {
+        return convertedOperandSpans_;
     }
 
     // FC15a (A2): the accumulated `#`/`##` PRODUCT spellings, to be appended to
@@ -4878,6 +4960,14 @@ private:
         }
         return n;
     }
+    // Does the literal body at `bodyIdx` END WITH ITS CLOSER? The authoritative
+    // pass's twin of the pre-scan's `literalHasCloser`, over the same question:
+    // a directive that INTERPRETS a quoted operand must refuse one whose line
+    // ended first ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]).
+    [[nodiscard]] bool bodyHasCloser(std::vector<Token> const& in,
+                                     std::size_t bodyIdx) const {
+        return pastBodyAndCloser(in, bodyIdx) != bodyIdx + 1;
+    }
     std::size_t handleDirective(std::vector<Token> const& in, std::size_t start,
                                 std::vector<Token>& body) {
         const std::size_t end = lineEnd(in, start);
@@ -5324,7 +5414,7 @@ private:
                 //   recorder, so the seed set stays == the finish() oracle's live set.
                 AngleIncludeResolution const ar =
                     resolveAngleInclude(filename, systemDirs_, includeDirs_,
-                                        headerNameMatching_);
+                                        headerNameMatching_, headerSearch_);
                 switch (ar.kind) {
                     case AngleIncludeKind::Descriptor:
                         return !(activeFormat_.has_value()
@@ -5354,7 +5444,7 @@ private:
             }
             HeaderSearchResult const q =
                 resolveIncludePath(filename, includingDir_, includeDirs_,
-                                   headerNameMatching_);
+                                   headerNameMatching_, headerSearch_);
             if (q.status == HeaderSearchStatus::AmbiguousCase) {
                 reportHeaderCaseAmbiguity(rep_, BufferId{}, SourceSpan::empty(0),
                                           filename, q.ambiguousCandidates);
@@ -5413,8 +5503,19 @@ private:
         while (last > p && isNewline(in[last - 1])) --last;
         std::vector<Token> operand(in.begin() + static_cast<std::ptrdiff_t>(p),
                                    in.begin() + static_cast<std::ptrdiff_t>(last));
+        // This operand is being EVALUATED, so C 6.10.1p4 converts every one of
+        // its preprocessing tokens — the operand's own and every token a macro in
+        // it expands to — whether or not the arithmetic reaches them (`#if 0 &&
+        // 2d` is refused by gcc and clang alike). Recorded so a conversion
+        // diagnostic on any of them is delivered
+        // ([[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]]).
+        for (Token const& t : operand) convertedOperandSpans_.push_back(t.span);
         PpMacroExpand expandCb =
-            [this](std::vector<Token> const& toks) { return expandTokens(toks); };
+            [this](std::vector<Token> const& toks) {
+                std::vector<Token> out = expandTokens(toks);
+                for (Token const& t : out) convertedOperandSpans_.push_back(t.span);
+                return out;
+            };
         IfCallbacks const cb = makeIfCallbacks();
         auto v = evaluateIfExpression(operand, *schema_, expandCb, cb.defined,
                                       cb.hasInclude, *synth_, cb.product, rep_,
@@ -5650,13 +5751,13 @@ private:
         if (!isAngle) {
             HeaderSearchResult quote =
                 resolveIncludePath(filename, embedResolutionDir(opSpan),
-                                   includeDirs_, headerNameMatching_);
+                                   includeDirs_, headerNameMatching_, headerSearch_);
             if (quote.status != HeaderSearchStatus::NotFound) return quote;
         }
         HeaderSearchResult system =
-            findInDirs(filename, systemDirs_, headerNameMatching_);
+            findInDirs(filename, systemDirs_, headerNameMatching_, headerSearch_);
         if (system.status != HeaderSearchStatus::NotFound) return system;
-        return findInDirs(filename, includeDirs_, headerNameMatching_);
+        return findInDirs(filename, includeDirs_, headerNameMatching_, headerSearch_);
     }
 
     // ── C23 6.10.4 `#embed` (D-PP-EMBED; PARAMS / ANGLE / MACRO-ARG closed P60) ──
@@ -5804,6 +5905,14 @@ private:
                 && line[bodyIdx].span.start() == line[q].span.end()) {
                 filename = std::string{text(line[bodyIdx])};
                 after    = pastBodyAndCloser(line, bodyIdx);
+                // An unclosed name is no resource name: refuse it rather than
+                // embed whatever the truncated spelling happens to find.
+                if (!bodyHasCloser(line, bodyIdx)) {
+                    failAt(line[q].span,
+                           unclosedOperandMessage("the #embed resource name \""
+                                                  + filename + "\""));
+                    return;
+                }
             }
         }
         if (filename.empty()) {
@@ -6796,6 +6905,13 @@ private:
             emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
                    in[q].span,
                    "a linemarker's file operand must be a \"quoted\" string");
+            return;
+        }
+        if (!bodyHasCloser(in, q + 1)) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorDirective, synth_->id(),
+                   in[q].span,
+                   unclosedOperandMessage("a linemarker's file operand \""
+                                          + std::string{text(in[q + 1])} + "\""));
             return;
         }
         rec.file    = std::string{text(in[q + 1])};
@@ -8016,6 +8132,18 @@ private:
             // this position, so the else-arm below takes it.
             if (quoteIncludeKind_.valid() && op[q].schemaKind == quoteIncludeKind_
                 && q + 1 < op.size()) {
+                // A file operand whose line ended before its closing quote is no
+                // string literal: refuse it rather than rename the presumed file
+                // to a truncated spelling (✔MEASURED, all four references refuse
+                // `#line 10 "f`).
+                if (!bodyHasCloser(op, q + 1)) {
+                    emitPP(rep_, DiagnosticCode::P_PreprocessorDirective,
+                           synth_->id(), at(q),
+                           unclosedOperandMessage(
+                               "the #line file operand \""
+                               + std::string{text(op[q + 1])} + "\""));
+                    return false;
+                }
                 rec.file    = std::string{text(op[q + 1])};
                 rec.hasFile = true;
                 // Reject trailing junk LOUDLY, mirroring handleEmbed: silently
@@ -8194,6 +8322,19 @@ private:
         }
         case PredefinedMacroKind::Constant:
             // A static integer-constant spelling carried verbatim.
+            return materializeSignificant(def.value);
+        case PredefinedMacroKind::TypeSize:
+            // P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the
+            // type's size on this pair, written into `value` by
+            // `mergePredefinedMacros` — the only way into the effective list,
+            // which DROPS a row its pair does not realize. An empty value here
+            // is therefore a row that bypassed the merge, and defining the
+            // macro as empty would be a silent wrong answer.
+            if (def.value.empty()) {
+                ppFatal("materializePredefined: a 'type-size' predefined macro "
+                        "reached expansion unrealized — only "
+                        "mergePredefinedMacros may produce the effective list");
+            }
             return materializeSignificant(def.value);
         case PredefinedMacroKind::Date:
             return materializeSignificant(quoteCString(dateString_));
@@ -8433,7 +8574,7 @@ private:
     };
 
     std::vector<ExpToken> expand(std::vector<ExpToken> in) {
-        // D-PERF-1: the working stream is a FRONT-CONSUMED deque -- the cursor is
+        // D-PERF-1-PREPROCESSOR: the working stream is a FRONT-CONSUMED deque -- the cursor is
         // ALWAYS the front. The loop consumes `work` strictly front-to-back and
         // every splice happens AT the front (`spliceOver(work, 0, ...)`), so a
         // pop_front + push_front is O(consumed + repl) per expansion instead of the
@@ -8937,7 +9078,7 @@ private:
     }
 
     // Replace `in[from, to)` with `repl` (the freshly produced tokens) and leave
-    // the cursor implicitly at `from` (== the FRONT) for a rescan. D-PERF-1: the
+    // the cursor implicitly at `from` (== the FRONT) for a rescan. D-PERF-1-PREPROCESSOR: the
     // stream is a FRONT-CONSUMED deque and the cursor is ALWAYS the front, so
     // every call site passes `from == 0`. Pop `[from, to)` off the front, then
     // push `repl` at the front in REVERSE so `repl[0]` becomes the new front (the
@@ -8960,7 +9101,7 @@ private:
     // RETURNS the input verbatim (truncating the expansion). Surfaced via
     // `truncated()` so `preprocess()` can flag the result fatal.
     bool                                 truncated_ = false;
-    // D-PERF-1: accumulated FRONT-splice token-move count (see `tokenMoves()`).
+    // D-PERF-1-PREPROCESSOR: accumulated FRONT-splice token-move count (see `tokenMoves()`).
     std::size_t                          tokenMoves_ = 0;
     // D-PP-DEFINED-VIA-MACRO-EXPANSION: non-null ONLY for the duration of one
     // `#if`/`#elif` controlling-expression expansion (armed by `expandTokens`,
@@ -9072,6 +9213,9 @@ private:
     // D-PP-HEADER-CASE-INSENSITIVE-PE: the active format's header-NAME case
     // rule, applied by every include search the AUTHORITATIVE pass performs.
     HeaderNameMatching                   headerNameMatching_;
+    // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: the
+    // compile's view of the include tree those searches read through.
+    HeaderSearchCache&                   headerSearch_;
     fs::path                             includingDir_;
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: relayed to
     // `evaluateIfExpression`; see the constructor parameter.
@@ -9090,6 +9234,13 @@ private:
     // decision -- the silent-miscompile class the pre-scan oracle had (it could
     // not see predefined/header macros) is gone by construction.
     std::vector<std::pair<ByteOffset, ByteOffset>> deadRanges_;
+    // [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]]: the spans
+    // of every preprocessing token an EVALUATED `#if`/`#elif` controlling
+    // expression converted (C 6.10.1p4) — the operand's own tokens and every
+    // token its macro expansion produced. Together with the token stream `run()`
+    // hands the parser, this is the whole of what phase 7 converts; `preprocess()`
+    // delivers a conversion diagnostic only for a token in one of the two.
+    std::vector<SourceSpan> convertedOperandSpans_;
     // ── TF-C82 (D-PP-PRAGMA-REGISTRY): the `#pragma pack` state ──
     //
     // `packCurrent_` is the maximum member alignment in effect RIGHT NOW, in
@@ -9242,7 +9393,8 @@ MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> targetMacros,
     std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat,
-    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups) {
+    std::span<PredefinedMacroExclusionGroup const> exclusiveGroups,
+    PredefinedTypeFacts const*          typeFacts) {
     MergedPredefinedMacros out;
 
     // The per-format availability predicate, in its ONE surviving location.
@@ -9305,7 +9457,24 @@ MergedPredefinedMacros mergePredefinedMacros(
                           + formatMacros.size());
     for (Family const& fam : families) {
         for (PredefinedMacroDef const& pm : fam.macros) {
-            if (availableHere(pm)) out.effective.push_back(pm);
+            if (!availableHere(pm)) continue;
+            // (f) P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): a
+            // `type-size` row is REALIZED here, once, for the pair `typeFacts`
+            // describes — its value becomes the size `sizeof` gives the named
+            // type there — or DROPPED when the pair does not realize the type
+            // (or no pair was given: the LSP / direct-API / test callers), which
+            // is how gcc treats a type a target lacks. The kind is kept, so the
+            // dump can still say the number was derived rather than declared.
+            if (pm.kind == PredefinedMacroKind::TypeSize) {
+                if (typeFacts == nullptr) continue;
+                auto const size = predefinedTypeSize(pm, *typeFacts);
+                if (!size.has_value()) continue;
+                PredefinedMacroDef realized = pm;
+                realized.value = std::to_string(*size);
+                out.effective.push_back(std::move(realized));
+                continue;
+            }
+            out.effective.push_back(pm);
         }
     }
     // (e) D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC — THE MUTUAL-EXCLUSION PIN.
@@ -9399,7 +9568,7 @@ TranslationTimestamp translationTimestamp() {
     // CALLED CONCURRENTLY. `std::localtime` returns a pointer into a SHARED
     // process-wide `std::tm`, so two translation units expanding `__DATE__` /
     // `__TIME__` at the same instant read a buffer the other is overwriting —
-    // a silent wrong-spelling race, not a crash. Since D-PERF-4 the driver
+    // a silent wrong-spelling race, not a crash. Since D-PERF-4-CU-PARALLELISM the driver
     // builds the front half of every TU on a thread pool, so that is a real
     // interleaving rather than a theoretical one, and c declares BOTH
     // macros (`c.lang.json`), so the path is live for every C compile.
@@ -9488,7 +9657,9 @@ PreprocessResult preprocessRun(
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
     std::span<PredefinedMacroDef const>  formatPredefinedMacros,
-    std::optional<bool>                  charIsUnsigned) {
+    std::optional<bool>                  charIsUnsigned,
+    HeaderSearchCache&                   headerSearch,
+    PredefinedTypeFacts const*           typeFacts) {
     PreprocessResult result;
     result.diagnostics = std::make_unique<DiagnosticReporter>(budget.asConfig());
 
@@ -9500,7 +9671,9 @@ PreprocessResult preprocessRun(
     MergedPredefinedMacros const merged = mergePredefinedMacros(
         schema->preprocess().predefinedMacros, targetPredefinedMacros,
         formatPredefinedMacros, activeFormat,
-        schema->preprocess().mutuallyExclusivePredefinedMacros);
+        schema->preprocess().mutuallyExclusivePredefinedMacros,
+        // P68 round 8: the pair's facts, so the `type-size` rows realize here.
+        typeFacts);
     if (!merged.conflicts.empty()) {
         // EITHER a name owned by more than one config, OR
         // (D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC)
@@ -9723,6 +9896,7 @@ PreprocessResult preprocessRun(
                                 /*prefixLen=*/0,
                                 /*lineMap=*/nullptr,
                                 headerNameMatching,
+                                headerSearch,
                                 includeDirs,
                                 systemDirs,
                                 activeFormat,
@@ -9750,13 +9924,13 @@ PreprocessResult preprocessRun(
     // above — one `MacroExpander`, threaded by reference into every child builder
     // exactly as the `SbMacro` map and the `#undef` set used to be.
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
-                         headerNameMatching,
+                         headerNameMatching, headerSearch,
                          *result.diagnostics, 0, includeStack, includeOnce,
                          result.fatal,
                          preScanDefinePrefix, preScanOracle,
                          resolvedParents};
     {
-        // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
+        // D-PERF-1-PREPROCESSOR sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the
         // outer Preprocess scope, so its self-time is subtracted there.
         substrate::PhaseTimers::Scope ppSplice{
@@ -9786,18 +9960,24 @@ PreprocessResult preprocessRun(
     //  here, i.e. on the happy path only.)
 
     // c17 (P000E fix): the main tokenize's diagnostics go to a PROVISIONAL
-    // reporter, NOT straight onto `result.diagnostics`. A `P_IllegalChar` whose
-    // source byte falls in a DEAD conditional branch (`#if 0 $ #endif`) must be
-    // SUPPRESSED -- but only after the AUTHORITATIVE conditional pass has run and
-    // recorded its dead byte-ranges. Every OTHER tokenizer diagnostic is forwarded
-    // unconditionally below; a `P_IllegalChar` is promoted via the dead-region
-    // oracle, keyed on the source BYTE's liveness (so a `$` consumed by an ACTIVE
-    // `#define` line / `#`-stringize / an uninvoked LIVE macro body still reports;
-    // a survival oracle keyed on "did the Error token reach the parser" would
-    // wrongly drop those).
+    // reporter, NOT straight onto `result.diagnostics`. A conversion diagnostic
+    // (`isTokenConversionDiagnostic`) is a judgement phase 7 makes while
+    // CONVERTING a preprocessing token, so it can only be decided after the
+    // AUTHORITATIVE pass below has said which tokens are converted; the promotion
+    // loop after it decides. Every other tokenizer diagnostic is a phase-3
+    // judgement and is forwarded unconditionally.
+    // ⚠ THIS COMMENT USED TO RECORD THE OPPOSITE AS DELIBERATE — "keyed on the
+    // source BYTE's liveness (so a `$` consumed by an ACTIVE `#define` line /
+    // `#`-stringize / an uninvoked LIVE macro body still reports; a survival
+    // oracle keyed on 'did the Error token reach the parser' would wrongly drop
+    // those)". ✔REFUTED 2026-09-22 against all four references (gcc 13.3.0,
+    // clang 18.1.3, MinGW gcc, MSVC VS 18): EVERY one accepts `#define M $`
+    // uninvoked, `#define A 1 $` on a live line, `S($)` stringized, `#define X @`,
+    // `#warning an @ sign`, `#warning 0x1g`, `#define Z 0x1g`, `#undef Y don't` and
+    // `#if 1`/`#elif 2d` — none of those tokens is ever converted. See the loop.
     DiagnosticReporter provisionalTokDiags{budget.asConfig()};
     auto ppToks = [&] {
-        // D-PERF-1 sub-timing: the single tokenize of the synth buffer.
+        // D-PERF-1-PREPROCESSOR sub-timing: the single tokenize of the synth buffer.
         substrate::PhaseTimers::Scope ppTok{
             substrate::CompilePhase::PreprocessTokenize};
         return tokenizeToPP(prefixBuffer, schema, provisionalTokDiags);
@@ -9815,7 +9995,7 @@ PreprocessResult preprocessRun(
     // systemDirs).
     MacroExpander expander{prefixBuffer,  schema,      *result.diagnostics,
                            prefixLen,     &result.lineMap,
-                           headerNameMatching,
+                           headerNameMatching, headerSearch,
                            includeDirs,   systemDirs,   activeFormat,
                            // The SHARED derivation — see
                            // `includingDirectoryOf`. `__has_include("h")` must
@@ -9828,12 +10008,12 @@ PreprocessResult preprocessRun(
                            charIsUnsigned};
     std::vector<Token> finalTokens;
     {
-        // D-PERF-1 sub-timing: the macro pass (table build + stream expansion +
+        // D-PERF-1-PREPROCESSOR sub-timing: the macro pass (table build + stream expansion +
         // conditional elision) — the dominant preprocess stage on macro-heavy TUs.
         substrate::PhaseTimers::Scope ppExpand{
             substrate::CompilePhase::PreprocessExpand};
         finalTokens = expander.run(synthTokens);
-        // D-PERF-1: surface the macro pass's front-splice token-move total (the
+        // D-PERF-1-PREPROCESSOR: surface the macro pass's front-splice token-move total (the
         // O(n^2)->O(n) effectiveness metric; a strict test asserts it <= k*N).
         result.macroTokenMoves = expander.tokenMoves();
     }
@@ -9847,23 +10027,13 @@ PreprocessResult preprocessRun(
     result.pragmaPackByOffset = expander.pragmaPackByOffset();
     result.pragmaNoOptimizeByOffset = expander.pragmaNoOptimizeByOffset();
 
-    // c17 (authoritative dead-region oracle): promote the provisional tokenizer
-    // diagnostics. A `P_IllegalChar` is forwarded to the real reporter UNLESS its
-    // source byte (`span.start()`) lies in a DEAD conditional region as recorded
-    // by the AUTHORITATIVE macro pass (`expander.deadRanges()`) -- so an illegal
-    // char in a LIVE region reports no matter how its token is later consumed (a
-    // `#define`-line `$`, a `#`-stringized `$`, an uninvoked live macro body),
-    // including a branch the pre-scan could not evaluate but the full macro table
-    // makes live (e.g. `#if __STDC__`); only a genuinely-dead one (`#if 0 $`) is
-    // suppressed. ALL other tokenizer diagnostics forward unconditionally. The
-    // span ids are unchanged (still the prefix buffer), so the later
-    // `remapBuffers` re-homes them onto the final synth buffer exactly as before.
     // A byte offset is in an AUTHORITATIVE dead conditional region (`#if 0 …
     // #endif`) iff it falls in one of `expander.deadRanges()`. Those ranges are in
     // synthText coordinates (the expander ran over `prefixBuffer`, built from
     // `synthText`), so an offset recorded during the synth-buffer build maps
-    // DIRECTLY. SHARED by the illegal-char oracle below AND the descriptor-seed
-    // filter after it (D-PERF-2), so both read the SAME authoritative liveness.
+    // DIRECTLY. Read by the descriptor-seed filter after the promotion loop
+    // (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION). The promotion loop itself asks the
+    // stronger question — was the token CONVERTED — and a dead token never is.
     auto byteInDeadRegion = [&](ByteOffset b) {
         for (auto const& [ds, de] : expander.deadRanges()) {
             if (b >= ds && b < de) return true;
@@ -9877,34 +10047,73 @@ PreprocessResult preprocessRun(
         // DSS scans the synth buffer ONCE, in phase 3, and hands those
         // preprocessing tokens straight to the parser — there is no second,
         // phase-7 scan for a preprocessed language. So every judgement phase 7
-        // owes is made EAGERLY here, over text that includes groups phase 4 is
-        // about to delete, and this loop is the only place that knows which of
-        // them the conditional pass kept.
+        // owes is made EAGERLY here, over text that includes tokens phase 7 will
+        // never see, and this loop is the only place that knows which of them the
+        // preprocessor passed on.
         //
-        // The condition above read `d.code == P_IllegalChar`, with a comment
-        // saying all other tokenizer diagnostics forward unconditionally. That
-        // is not a rule about illegal characters — it is C 6.10.1p6, which says
-        // a skipped group's text is divided into preprocessing tokens and *not
-        // otherwise processed*, and it governs every phase-7 judgement equally.
-        // Spelled as one code name it silently excluded the next one: when the
-        // pp-number tail scan landed ([[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]),
+        // The condition once read `d.code == P_IllegalChar`; spelled as one code
+        // name it silently excluded the next one: when the pp-number tail scan
+        // landed ([[D-PP-PASTE-REJECTS-A-VALID-PREPROCESSING-NUMBER]]),
         // `P_MalformedNumber` began firing on `%2d` inside upstream sqlite's
         // `#if 0` Tcl script and refused every translation unit that contains
-        // one, on every host. The class now comes from
-        // `isTokenConversionDiagnostic`, beside the codes themselves, so a third
-        // conversion diagnostic inherits the rule instead of waiting for someone
-        // to widen this line a second time.
+        // one, on every host. The class comes from `isTokenConversionDiagnostic`,
+        // beside the codes themselves, so a new conversion diagnostic inherits
+        // the rule by classifying itself.
         //
-        // ⚠ THE ORACLE IS UNCHANGED AND STAYS THE BYTE'S LIVENESS, deliberately:
-        // it is what keeps a `#if` CONTROLLING EXPRESSION loud. A controlling
-        // directive's own line is outside the dead range (the range opens at the
-        // line's END), and C 6.10.1p4 converts that line's preprocessing tokens
-        // to tokens whether or not the expression evaluates them — ✔MEASURED,
-        // gcc 13.3.0 and clang 18.1.3 both refuse `#if 0 && 2d`.
+        // ── [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]] ──
+        //
+        // ★★ THE ORACLE IS CONVERSION, NOT LIVENESS. It was the byte's liveness
+        // (dropped only inside a SKIPPED group), and that answers an adjacent
+        // question: plenty of LIVE text is never converted either. ✔MEASURED
+        // 2026-09-22, gcc 13.3.0 + clang 18.1.3 (WSL), MinGW gcc and MSVC VS 18,
+        // one TU per shape — ALL FOUR ACCEPT `#warning 0x1g`, `#define Z 0x1g`
+        // uninvoked, `#if 1`/`#elif 2d`, `#define X @` uninvoked, `S(@)`
+        // stringized, `#warning an @ sign`, `#undef Y don't` and `#if 1`/`#elif
+        // 'a`, and gcc, clang and MinGW accept `#warning don't panic` and
+        // `#define X 'a` uninvoked. DSS refused every one. A pp-token is CONVERTED
+        // iff
+        //   (a) it reaches the parser — it is in the stream `run()` returned, as
+        //       itself or as a macro-expansion COPY (a copy keeps its spelling's
+        //       span, so `#define X @` followed by a use of `X` is converted AT
+        //       the `#define` line and reports there); or
+        //   (b) it is in the operand of an EVALUATED `#if`/`#elif`
+        //       (`MacroExpander::convertedOperandSpans`) — C 6.10.1p4 converts it
+        //       whether or not the arithmetic reaches it: ✔MEASURED, all four
+        //       references refuse `#if 0 && 2d`.
+        // Everything else is divided into preprocessing tokens and never
+        // converted: a skipped group (6.10.1p6), an `#elif` after a taken group
+        // (processed as if in a skipped group), the text of `#error` /
+        // `#warning` / `#pragma` / `#undef` / `#include` / `#line`, a
+        // replacement list nobody expands, a stringized or pasted argument.
+        //
+        // COST: nothing at all unless a conversion diagnostic exists; then ONE
+        // pass over the stream, each token asking a binary search over the few
+        // sorted diagnostic offsets.
+        std::vector<ByteOffset> pending;
         for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
-            if (isTokenConversionDiagnostic(d.code)
-                && byteInDeadRegion(d.span.start())) {
-                continue;   // skipped group — divided into pp-tokens, not converted
+            if (isTokenConversionDiagnostic(d.code)) pending.push_back(d.span.start());
+        }
+        std::sort(pending.begin(), pending.end());
+        pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
+        std::vector<char> converted(pending.size(), 0);
+        auto markConverted = [&](SourceSpan const s) {
+            auto it = std::lower_bound(pending.begin(), pending.end(), s.start());
+            for (; it != pending.end() && *it < s.end(); ++it) {
+                converted[static_cast<std::size_t>(it - pending.begin())] = 1;
+            }
+        };
+        if (!pending.empty()) {
+            for (Token const& t : finalTokens) markConverted(t.span);
+            for (SourceSpan const s : expander.convertedOperandSpans()) markConverted(s);
+        }
+        auto isConverted = [&](ByteOffset const b) {
+            auto const it = std::lower_bound(pending.begin(), pending.end(), b);
+            return it != pending.end() && *it == b
+                && converted[static_cast<std::size_t>(it - pending.begin())] != 0;
+        };
+        for (ParseDiagnostic const& d : provisionalTokDiags.all()) {
+            if (isTokenConversionDiagnostic(d.code) && !isConverted(d.span.start())) {
+                continue;   // a preprocessing token nobody converts is not judged
             }
             result.diagnostics->report(d);
         }
@@ -9978,7 +10187,8 @@ PreprocessResult preprocessRun(
         for (auto const& [parent, off] : resolvedParents) {
             if (byteInDeadRegion(off)) continue;   // authoritatively-dead -> not seeded
             ffi::forEachDescriptorInClosure(
-                parent, systemDirs, headerNameMatching, activeFormat, visited,
+                parent, systemDirs, headerNameMatching, headerSearch, activeFormat,
+                visited,
                 [&](fs::path const& p) {
                     result.resolvedShippedDescriptors.push_back(p);
                 },
@@ -10088,16 +10298,24 @@ PreprocessResult preprocess(
     std::span<std::string const>         userDefines,
     std::span<PredefinedMacroDef const>  targetPredefinedMacros,
     std::span<PredefinedMacroDef const>  formatPredefinedMacros,
-    std::optional<bool>                  charIsUnsigned) {
+    std::optional<bool>                  charIsUnsigned,
+    HeaderSearchCache*                   headerSearch,
+    PredefinedTypeFacts const*           typeFacts) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
                 "disabled - caller must gate on preprocess().enabled");
     }
+    // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: the
+    // compile's view of the include tree when a compile supplies one; a run with
+    // no compile around it (LSP, direct API, tests) is its own compile and lists
+    // for itself — once per directory for this run.
+    HeaderSearchCache runOwn;
+    HeaderSearchCache& searchCache = headerSearch != nullptr ? *headerSearch : runOwn;
     PreprocessResult result = preprocessRun(
         mainSource, std::move(schema), includeDirs, headerNameMatching,
         budget, systemDirs, activeFormat, userDefines, targetPredefinedMacros,
-        formatPredefinedMacros, charIsUnsigned);
+        formatPredefinedMacros, charIsUnsigned, searchCache, typeFacts);
     // ★ THE SINGLE EXIT. Its value is that it is not optional: a `return` added
     // anywhere inside `preprocessRun` — for a config fault nobody has thought
     // of yet — cannot bypass it.

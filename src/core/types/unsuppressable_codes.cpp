@@ -54,6 +54,19 @@ namespace {
 // S_DeprecatedSymbolUsed, S_NodiscardResultDiscarded,
 // S_AsmLabelOnAutomaticVariable below, each pinned as a NEGATIVE.
 //
+// ★ FOR AN ERROR, PRONG (2) IS NO LONGER A PER-CODE QUESTION
+// ([[D-DIAG-SUPPRESSING-AN-ERROR-REPORTS-A-FALSE-INTERNAL-FAILURE]]). Every tier
+// judges its own unpolicied reporter, so ANY suppressed Error still stops its
+// stage. ✔MEASURED on three semantic codes and one parser code: the build then
+// failed with its cause misnamed ("internal … substrate-contract violation") or
+// unsaid — and the mechanism is the same for every code outside this table that
+// is ever emitted as an Error. `DiagnosticReporter::effectiveSeverity` now never
+// silences an emission reported as an Error, whatever this table says, and
+// announces the refused request once per code. The prong-(2) members above
+// keep their entries (their rationale still reads true, and membership also
+// exempts them from the volume caps); a NEW code needs this table on prong (2)
+// only if it is emitted below Error somewhere and must still never be silenced.
+//
 // Examples in shipped
 // closed-table: D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET split codes (silent ABI mismatch ⇒
 // SIGILL at user runtime), I_* verifier invariants (SSA / CFG
@@ -254,6 +267,11 @@ constexpr MembershipReason kWhyShippedSymbolTarget{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, a symbol unknown to this object format binds to the "
     "format-default library, links clean, and dies at LOAD"};
+constexpr MembershipReason kWhyShippedSymbolNoBody{
+    MembershipProng::BuildFailsWithNothingSaid,
+    "the semantic tier's error gate stops the build on this row whether or "
+    "not the line is shown; silenced, it stops with nothing naming the "
+    "descriptor, the symbol or the format that has no body"};
 constexpr MembershipReason kWhyHeaderNameCase{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the resolver picks one of several case-folded matches, and "
@@ -388,6 +406,10 @@ constexpr MembershipReason kWhyStackReserve{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the build reports success while emitting an image whose "
     "stack is not the size the program asked for"};
+constexpr MembershipReason kWhyRunpathRequest{
+    MembershipProng::BuildFailsWithNothingSaid,
+    "a runpath entry no image can record stops the link; silenced, the link "
+    "still stops, with nothing saying which entry was refused or why"};
 constexpr MembershipReason kWhyEntryTrampoline{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the image entry points at the wrong code and the program "
@@ -405,6 +427,17 @@ constexpr MembershipReason kWhyLirStructural{
     "a LIR verifier / lowering structural invariant; silenced, the "
     "violation reaches the assembler and miscompiles through the LIR "
     "layer"};
+constexpr MembershipReason kWhyArgPassingPool{
+    MembershipProng::WrongArtifactShipsGreen,
+    "an argument's register class has no pool, or a pool this calling "
+    "convention declares empty; silenced, the argument is passed in a "
+    "register file the callee does not read, a wrong-register codegen in a "
+    "green build"};
+constexpr MembershipReason kWhySymbolIdSpace{
+    MembershipProng::WrongArtifactShipsGreen,
+    "a lowering-minted symbol would have wrapped past the top of the 32-bit "
+    "SymbolId space onto the invalid sentinel or an id the module already "
+    "owns; silenced, two symbols alias one address in a green build"};
 constexpr MembershipReason kWhySideStructureIntegrity{
     MembershipProng::WrongArtifactShipsGreen,
     "a module side structure (literal pool / per-instruction register-"
@@ -568,6 +601,11 @@ constexpr MembershipReason kWhyAsmDuplicateSymbolicName{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, one of the two bindings the repeated name introduces is "
     "discarded by a first-match lookup and the template reads the other"};
+constexpr MembershipReason kWhyAsmBoundRegisterConflict{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, a statement that asks one register for two things through "
+    "local register variables lowers with one of the meanings the reference "
+    "compilers disagree on, chosen without a word"};
 constexpr MembershipReason kWhyBitfieldMutation{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the mutation falls to a full-unit store that clobbers "
@@ -685,7 +723,66 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // they would still be here — with a reason that is false — which is why the row
 // required the argument to be MADE. ✔The explicit extent did its job a SEVENTH
 // time: the count refused the two new rows until this note existed.
-constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
+// ⓘ EXTENT 174 → 183 (2026-09-21, cycle P68 round 8, lane `ht`): the nine
+// Error-severity `HirVerifier` codes that were not members join, all on prong
+// (1) under `kWhyHirStructural` — `H_InvalidBreak`, `H_UnknownIntrinsic`,
+// `H_ShaderViolation`, the four `H_Seh*` context rules and the two `H_Vla*`
+// scope rules. The measured argument is in the H_* band header below. ✔The
+// explicit extent did its job again: g++ answered the nine rows with `too many
+// initializers for 'dss::UnsuppressableEntry [174]'` until this line moved.
+// ⓘ EXTENT 183 → 184 (2026-09-19, cycle P68 round 8, lane `vn`,
+// D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): `K_InvalidRunpathRequest` (0x8028) joins
+// on prong (2) alone — the refused link fails with or without it, and it is the
+// only line naming the entry no image can record. Its warning sibling
+// `K_FormatLacksRunpath` (0x8027) stays OUT, on purpose, beside it below.
+// (Lane `vn` wrote this note as 174 → 175 in its own tree; it landed after
+// lane `ht`'s nine rows, and the fold reconciled the count, as ruled.)
+// ⓘ EXTENT 184 → 185 (2026-09-21, cycle P68 round 8, lane `cr`):
+// `F_ShippedSymbolDeclaresNoBodyForFormat` joins on prong (2) under
+// `kWhyShippedSymbolNoBody`; the argument is beside its row.
+// (Lane `cr` wrote this note as 174 → 175 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+// ⓘ EXTENT 185 → 190 (2026-09-21, cycle P68 round 8, lane `ht`, part 1b): the
+// five `MirVerifier` codes that never joined — `I_LayoutUseBeforeDef`,
+// `I_SehStructure`, `I_AllocaAlignmentNotPowerOfTwo`,
+// `I_BitIntWidthInconsistent`, `I_VlaStackRestorePairing` — join under
+// `kWhyMirVerifier`, prong (1); the measured argument is beside the rows in the
+// I_* band. ✔The explicit extent did its job again: g++ answered the five rows
+// with `too many initializers for 'dss::UnsuppressableEntry [183]'` until this
+// line moved.
+// (Lane `ht` wrote this note as 183 → 188 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+// ⓘ EXTENT 190 → 191 (2026-09-19, P68 round 8,
+// D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): `S_InlineAsmBoundRegisterConflict`
+// (0xE07F) joins on prong (1) — see its row. Its two siblings minted with it,
+// `S_AsmRegisterNameUnknown` (0xE07D) and `S_AddressOfRegisterObject` (0xE07E),
+// are deliberately NOT members: each drops the binding it refuses, so a silenced
+// one leaves an ordinary automatic reading and writing its own storage.
+// (Lane `fo` wrote this note as 174 → 175 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+// ⓘ EXTENT 191 → 192 (2026-09-21, cycle P68 round 8, lane `ht`, part 1c):
+// `L_SymbolIdSpaceExhausted` joins under `kWhySymbolIdSpace`, prong (1), created
+// a member together with the code (MIR→LIR's symbol minter refusing to wrap).
+// (Lane `ht` wrote this note as 190 → 191 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+// ⓘ EXTENT 192 → 194 (2026-09-23, cycle P68 round 8, lane `ht`, part 1c-b):
+// `L_ArgClassHasNoRegisterPool` and `L_ArgClassPoolUndeclared` join under
+// `kWhyArgPassingPool`, prong (1) — their own note already said unsuppressable.
+// ⓘ EXTENT 194 → 196 (2026-09-23, cycle P68 round 8, lane `ht`, part 2):
+// `S_IncompleteReturnType` and `S_IncompleteArgumentType` join under
+// `kWhyIncompleteType`, prong (1), minted as members.
+// ⓘ EXTENT 196 → 198 (2026-09-22, P68 round 8 part 4, the inline-asm bundle):
+// `L_AsmRegionMalformed` (0xB016) and `L_AsmRegionOperandUnallocatable`
+// (0xB017) join beside the side-structure rows — see their rows. (Written from
+// lane `fo`'s base of 191; main was at 192 when they were announced, so the
+// fold reconciles the count.)
+// (Lane `fo` wrote this note as 191 → 193 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+// (Lane `fo` wrote this note as 192 → 194 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+// (Lane `fo` wrote this note as 194 → 196 in its own tree; it landed after the entries above,
+// and the fold reconciled the count, as ruled.)
+constexpr std::array<UnsuppressableEntry, 198> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -952,6 +1049,16 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // restore exactly that silent loader death — the class this fail-loud exists
     // to convert into a compile-time error.
     {DiagnosticCode::F_ShippedSymbolUnavailableForTarget, kWhyShippedSymbolTarget},
+    // F_ShippedSymbolDeclaresNoBodyForFormat
+    // (D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION,
+    // 2026-09-21): an `#include`d row available on the active format with no body
+    // for it. PRONG (2) ONLY, argued from the control flow: the report is a
+    // semantic-tier Error, and the driver's per-unit gate stops on the MODEL's
+    // error count, which `--suppress` does not reach — so a suppressed report
+    // still stops the build before HIR, with nothing saying which descriptor row
+    // has no body. No wrong bytes can ship either way: before this code existed
+    // the same row stopped the build in HIR.
+    {DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat, kWhyShippedSymbolNoBody},
     // F_HeaderNameCaseAmbiguous (D-PP-HEADER-CASE-INSENSITIVE-PE, 2026-08-04): an
     // `#include` name fold-matched TWO OR MORE distinct files under a
     // case-INSENSITIVE format's header-name convention. Suppressing it would
@@ -1018,11 +1125,36 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // `H_ExternHasInitializer` MUST be here — they are the two arms
     // of the H2 split, both terminate lowering with `return
     // errorNode(node)` + gate ok via errorCount.
+    //
+    // ★ P68 round 8 (lane `ht`): EVERY Error-severity code `HirVerifier` emits is
+    // a member now. The nine rows marked "verifier, P68" joined, and they were
+    // the only ones missing; the one other code it emits, `H_UnreachableCode`, is
+    // a WARNING about ISO-valid dead code and rightly stays suppressible. All nine
+    // are emitted ONLY by `hir_verifier.cpp`, each is a structural refusal, and
+    // ✔MEASURED what `--suppress=<code>` did BEFORE they joined, on the six a C
+    // source reaches (`dsscp --compile`, WSL x86_64 Release): two green PE
+    // executables (`H_SehJumpIntoRegion`, `H_SehLabelAddress`, rc 0), two
+    // compiler PROCESS ABORTS in MIR (`H_VlaJumpIntoScope` in PruneUnreachable,
+    // `H_VlaComputedGotoInScope` in MirBuilder, rc 134), and two refusals replaced
+    // by an unrelated LIR error (`H_SehBuiltinContext`, `H_SehEarlyExit`,
+    // `L_UnsupportedLoweringForOpcode`). Prong (1) in every case: the invalid tree
+    // went on past its refusal. The other three no C source reaches — the
+    // semantic tier refuses a stray `break` first (`S_ControlOutsideLoop`), and
+    // only a `.dsshir` read or direct construction builds a shader call cycle or
+    // an unminted intrinsic — and they join on the same argument, because the
+    // verifier's refusal is the last thing between such a module and codegen.
     {DiagnosticCode::H_TypeUnresolved, kWhyHirStructural},
+    {DiagnosticCode::H_InvalidBreak, kWhyHirStructural},             // verifier, P68
     {DiagnosticCode::H_VerifierFailure, kWhyHirStructural},
+    {DiagnosticCode::H_UnknownIntrinsic, kWhyHirStructural},         // verifier, P68
+    {DiagnosticCode::H_ShaderViolation, kWhyHirStructural},          // verifier, P68
     {DiagnosticCode::H_UnsupportedLoweringForKind, kWhyHirStructural},
     {DiagnosticCode::H_ExternHasInitializer, kWhyHirStructural},
     {DiagnosticCode::H_ExternDeclMalformed, kWhyHirStructural},
+    {DiagnosticCode::H_SehBuiltinContext, kWhyHirStructural},        // verifier, P68
+    {DiagnosticCode::H_SehJumpIntoRegion, kWhyHirStructural},        // verifier, P68
+    {DiagnosticCode::H_SehEarlyExit, kWhyHirStructural},             // verifier, P68
+    {DiagnosticCode::H_SehLabelAddress, kWhyHirStructural},          // verifier, P68
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5, wide/UTF string literals):
     // a code point that cannot be represented in the requested element width
     // without truncation (astral under a 16-bit element, ill-formed UTF-8, or
@@ -1063,6 +1195,8 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // `u"a" U"b";` statement typed Array<Char,3> "ab"). Closed here so a mixed-prefix
     // concat is never silent.
     {DiagnosticCode::H_ConflictingStringLiteralPrefixes, kWhyConflictingStringPrefixes},
+    {DiagnosticCode::H_VlaJumpIntoScope, kWhyHirStructural},         // verifier, P68
+    {DiagnosticCode::H_VlaComputedGotoInScope, kWhyHirStructural},   // verifier, P68
     // H_ShippedShimSignatureMismatch (TF-C112, D-FFI-PE-CRT-UCRT-MIGRATION): a
     // user prototype re-declares a shipped row realized as a compiler-synthesized
     // SHIM with a signature that is not the row's. Unlike its H_* neighbours this
@@ -1095,6 +1229,27 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     {DiagnosticCode::I_NullptrTypeInMir, kWhyMirVerifier},
     {DiagnosticCode::I_StructCfMismatch, kWhyMirVerifier},
     {DiagnosticCode::I_UnreachableBlock, kWhyMirVerifier},
+    // ★ P68 round 8 (lane `ht`, part 1b): the five `MirVerifier` codes added
+    // AFTER the "all 12" above was written — and that never joined. Each is
+    // emitted ONLY by `mir_verifier.cpp`, at Error, and each is a frozen-module
+    // invariant exactly like its neighbours (a def laid out after its use, the
+    // SEH region structure, an alloca alignment outside the representable
+    // domain, a `_BitInt` width that disagrees with its type, a VLA stack
+    // save/restore that does not pair). ✔MEASURED BEFORE they joined (WSL
+    // Release, a `MirVerifier` over a module carrying the violation):
+    // `--suppress`-style policy naming `I_AllocaAlignmentNotPowerOfTwo` passed the
+    // module with NOTHING printed; and, unsuppressed, the same module verified
+    // twice into ONE reporter PASSED the second time (the repeat dropped as a
+    // recent duplicate — members bypass that gate), the same for
+    // `I_LayoutUseBeforeDef`. No C source reaches any of the five today except
+    // through a lowering defect (two did, historically: the over-aligned stack
+    // local and `_BitInt` control flow examples), so the refusal is the last
+    // thing between such a module and codegen.
+    {DiagnosticCode::I_LayoutUseBeforeDef, kWhyMirVerifier},             // P68, 1b
+    {DiagnosticCode::I_SehStructure, kWhyMirVerifier},                   // P68, 1b
+    {DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo, kWhyMirVerifier},   // P68, 1b
+    {DiagnosticCode::I_BitIntWidthInconsistent, kWhyMirVerifier},        // P68, 1b
+    {DiagnosticCode::I_VlaStackRestorePairing, kWhyMirVerifier},         // P68, 1b
     // I_VlaAllocaOperandInvalid (VLA C1a, D-CSUBSET-VLA): the runtime-sized-Alloca
     // operand↔payload invariant (a VLA alloca carries exactly one size operand +
     // zero payload; a fixed alloca carries none). A member like every I_* verifier
@@ -1223,6 +1378,16 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // with no diagnostic trail back to the dropped request.
     {DiagnosticCode::K_FormatLacksStackReserveControl, kWhyStackReserve},
     {DiagnosticCode::K_InvalidStackReserveRequest, kWhyStackReserve},
+    // K_InvalidRunpathRequest (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — PRONG (2)
+    // alone. The runpath gate refuses an entry no carrier can hold (empty, or
+    // holding a NUL byte) and `linker::link` returns no image, so the build
+    // fails with or without the diagnostic and no wrong bytes ship; silenced,
+    // it fails with nothing naming the entry. Its WARNING sibling
+    // `K_FormatLacksRunpath` is deliberately NOT here: a request a format
+    // cannot carry is accepted and the artifact is exactly what the references
+    // ship, so suppressing it hides advice while the build proceeds — the
+    // negative case this file's header names.
+    {DiagnosticCode::K_InvalidRunpathRequest, kWhyRunpathRequest},
     // K_FormatLacksProcessExit / K_ExecEntryNotTrampolined (D-LK10-ENTRY §2.13)
     // — the entry-trampoline contract, the same format-capability shape as the
     // two codes above. They are TWO codes because their predicates DISAGREE on
@@ -1350,6 +1515,30 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     {DiagnosticCode::L_SideStructureIndexDangling, kWhySideStructureIntegrity},
     {DiagnosticCode::L_SideStructurePoolShrank, kWhySideStructureIntegrity},
     {DiagnosticCode::L_SideStructureReferenceLost, kWhySideStructureIntegrity},
+    // L_SymbolIdSpaceExhausted (P68, lane `ht`, part 1c): MIR→LIR's one minter
+    // of block / jump-table / sign-mask symbols refuses instead of wrapping.
+    // Created a member, with the code — its own note says why.
+    {DiagnosticCode::L_SymbolIdSpaceExhausted, kWhySymbolIdSpace},
+    // L_ArgClassHasNoRegisterPool / L_ArgClassPoolUndeclared
+    // (D-LIR-ARG-PASSING-POOL-SELECTION-IS-TWO-WAY-AND-VR-FALLS-INTO-GPR): their own
+    // note says "Both UNSUPPRESSABLE: suppressed, each is a wrong-register codegen
+    // with a green build", and neither was a row until P68 round 8 (lane `ht`, part
+    // 1c-b) — so `--suppress` dropped both. Found by reading every code's note
+    // against this table: 41 notes call their code unsuppressable, three were
+    // absent, and the third (`S_BitIntWideMulDivUnsupported`) is retired and was
+    // de-listed on purpose.
+    {DiagnosticCode::L_ArgClassHasNoRegisterPool, kWhyArgPassingPool},
+    {DiagnosticCode::L_ArgClassPoolUndeclared, kWhyArgPassingPool},
+    // The inline-asm BUNDLE (P68 round 8 part 4). `L_AsmRegionMalformed` is
+    // the fourth side structure's integrity rule — the body pool is referenced
+    // by index like the other two, and a bundle whose roles, slots or body
+    // disagree reads or writes its operands in the wrong register.
+    // `L_AsmRegionOperandUnallocatable` is the rewriter refusing to reload a
+    // statement's operand INSIDE its template, which is the livelock the
+    // bundle removed; suppressed, the build would ship a statement with an
+    // operand in no register at all.
+    {DiagnosticCode::L_AsmRegionMalformed, kWhySideStructureIntegrity},
+    {DiagnosticCode::L_AsmRegionOperandUnallocatable, kWhyLirStructural},
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion
@@ -1706,6 +1895,23 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // it: `volatile volatile` has one candidate reading, a name used twice has
     // exactly two and the compiler picks one in silence.
     {DiagnosticCode::S_InlineAsmDuplicateSymbolicName, kWhyAsmDuplicateSymbolicName},
+    // S_InlineAsmBoundRegisterConflict (0xE07F, P68 round 8,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED) — prong (1). Every arm is a
+    // statement that asks ONE register for two things through GNU local
+    // register variables (a clobbered bound register; two inputs bound to one
+    // register by two variables; a letter whose register set excludes the bound
+    // register), and the front end refuses to bind any operand of it. Silenced,
+    // the statement would lower with each operand bound independently, which is
+    // one of the two meanings the references DISAGREE on — a meaning chosen in
+    // silence, with a green build.
+    {DiagnosticCode::S_InlineAsmBoundRegisterConflict, kWhyAsmBoundRegisterConflict},
+    // S_IncompleteReturnType / S_IncompleteArgumentType (0xE080 / 0xE081, P68 round
+    // 8, lane `ht`, part 2) — prong (1), the S_IncompleteTypeObject reason. The
+    // measured cost of accepting them is on record: MSVC accepts both call shapes,
+    // and its programs CRASH (a call through an incomplete return) or run with a
+    // WRONG result (an incomplete argument) — the silenced build ships exactly that.
+    {DiagnosticCode::S_IncompleteReturnType, kWhyIncompleteType},
+    {DiagnosticCode::S_IncompleteArgumentType, kWhyIncompleteType},
     // S_BitfieldMutationUnsupportedBase (D-CSUBSET-BITFIELD-ANON-ARROW-MUTATION-RESIDUAL):
     // a bit-field compound/inc-dec/value mutation whose containing aggregate the
     // read-modify-write reconstruction could not address. Suppressed, the mutation
@@ -1771,6 +1977,14 @@ constexpr std::array<UnsuppressableEntry, 174> kUnsuppressableCodes{{
     // is exactly why both references make it an ordinary, silenceable warning
     // (clang's is even named: -Wimplicitly-unsigned-literal) rather than an
     // error. `--warnings-as-errors` is the lever for a project that wants it out.
+    // P_ClosedByEndOfInput (P68 round 8,
+    // D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED) is deliberately NOT
+    // a member, by the same two prongs: the input is ACCEPTED and assembled
+    // exactly as the accepting reference (GNU as, "end of file in comment")
+    // assembles it, so suppressing the notice ships no wrong bytes and hides no
+    // build failure. It is advice — a `*/` is probably missing — and
+    // `--warnings-as-errors` turns it back into clang's refusal for a project
+    // that wants that.
     {DiagnosticCode::P_PreprocessorErrorDirective, kWhyErrorDirective},
     // TF-C82 (D-PP-PRAGMA-REGISTRY): a REACHED pragma DSS does not implement, or
     // one whose operand it cannot honour. Same argument as its `#error` neighbour

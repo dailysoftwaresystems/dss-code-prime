@@ -1,0 +1,20 @@
+# PURPOSE: compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs.
+name: profile-compile
+description: >-
+  The action compiles the fixed kit with this leg's RELEASE dsscp and reports where the time went.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+inputs:
+  kit:
+    description: 'a materialized kit directory (profile-compile-support.py kit)'
+    required: true
+  target:
+    description: 'the ONE target every leg compiles, so the host is the only variable'
+    default: 'x86_64:elf64-x86_64-linux-exec'
+steps:
+  - name: profile
+    workingDirectoryRoot: action
+    run: |
+      python3 ./profile-compile.py --kit {kit} --target {target} --label {leg} --no-build --build-dir {buildDir}
+    successPattern: 'PROFILE-LEG-OK '
+    requireInputsUnmoved: true

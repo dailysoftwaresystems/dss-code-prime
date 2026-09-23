@@ -2630,6 +2630,84 @@ TEST(TargetSchema, TFC75DollarPrefixedInnerKeysAccepted) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) — `abiTypedefs`, the
+// platform ABI typedefs (`wchar_t`, `wint_t`) in `charIsUnsigned`'s shape.
+// The SHIPPED values are pinned against the references by
+// `tests/analysis/preprocess/test_sizeof_macro_family.cpp`; these pin the
+// loader: the resolution rule and every refusal.
+// ═════════════════════════════════════════════════════════════════════════════
+namespace {
+using ::dss::TypeKind;
+
+[[nodiscard]] std::string targetWithAbiTypedefs(std::string_view body) {
+    return std::string{
+               R"({"dssTargetVersion":1,"target":{"name":"X"},)"
+               R"("opcodes":[{"mnemonic":"invalid","result":"none"}],)"
+               R"("abiTypedefs":)"}
+           + std::string{body} + "}";
+}
+}  // namespace
+
+// The format's override where declared, the processor's default elsewhere, and
+// NOTHING for a typedef the target does not declare — never a default core.
+TEST(TargetSchema, AbiTypedefsResolvePerFormatThenTheDefault) {
+    auto r = TargetSchema::loadFromText(
+        targetWithAbiTypedefs(
+            R"({"$comment":"prose","wchar_t":{"default":"I32",
+                "byObjectFormat":{"$peComment":"UTF-16","pe":"U16"}},
+                "wint_t":{"default":"U32","byObjectFormat":{"macho":"I32"}}})"),
+        "<inline>");
+    ASSERT_TRUE(r.has_value()) << r.error().front().message;
+    auto const& t = **r;
+    EXPECT_EQ(t.abiTypedefCore("wchar_t", ObjectFormatKind::Pe), TypeKind::U16);
+    EXPECT_EQ(t.abiTypedefCore("wchar_t", ObjectFormatKind::Elf), TypeKind::I32);
+    EXPECT_EQ(t.abiTypedefCore("wchar_t", ObjectFormatKind::MachO), TypeKind::I32);
+    EXPECT_EQ(t.abiTypedefCore("wint_t", ObjectFormatKind::MachO), TypeKind::I32);
+    EXPECT_EQ(t.abiTypedefCore("wint_t", ObjectFormatKind::Elf), TypeKind::U32);
+    EXPECT_FALSE(t.abiTypedefCore("char16_t", ObjectFormatKind::Elf).has_value())
+        << "an undeclared typedef has no core";
+    EXPECT_EQ(t.abiTypedefNames(),
+              (std::vector<std::string_view>{"wchar_t", "wint_t"}))
+        << "declaration order, `$` keys skipped";
+    // Absent as a whole: no typedef at all.
+    auto none = TargetSchema::loadFromText(
+        R"({"dssTargetVersion":1,"target":{"name":"X"},
+            "opcodes":[{"mnemonic":"invalid","result":"none"}]})",
+        "<inline>");
+    ASSERT_TRUE(none.has_value());
+    EXPECT_TRUE((*none)->abiTypedefNames().empty());
+}
+
+// Every malformed shape fails the LOAD and names where — each one would
+// otherwise leave a typedef on an answer no file states.
+TEST(TargetSchema, AbiTypedefsRefuseEveryMalformedShape) {
+    struct Case {
+        char const* body;
+        char const* needle;   // in the message or the path
+    };
+    constexpr Case kCases[] = {
+        {R"(["wchar_t"])", "abiTypedefs"},                               // not an object
+        {R"({"wchar_t":"I32"})", "wchar_t"},                              // entry not an object
+        {R"({"wchar_t":{"byObjectFormat":{"pe":"U16"}}})", "default"},    // no default
+        {R"({"wchar_t":{"default":"F32"}})", "integer core"},             // a float core
+        {R"({"wchar_t":{"default":"Struct"}})", "integer core"},          // an aggregate
+        {R"({"wchar_t":{"default":"Int32"}})", "integer core"},           // no such core
+        {R"({"wchar_t":{"default":7}})", "integer core"},                 // not a string
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":{"machO":"I32"}}})", "machO"},
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":{"unknown":"I32"}}})", "unknown"},
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":{"pe":"F64"}}})", "integer core"},
+        {R"({"wchar_t":{"default":"I32","byObjectFormat":["pe"]}})", "byObjectFormat"},
+        {R"({"wchar_t":{"defualt":"I32","default":"I32"}})", "defualt"},  // typo'd key
+    };
+    for (auto const& c : kCases) {
+        auto r = TargetSchema::loadFromText(targetWithAbiTypedefs(c.body), "<inline>");
+        ASSERT_FALSE(r.has_value()) << "must be REFUSED: " << c.body;
+        EXPECT_TRUE(anyMentions(r.error(), c.needle))
+            << "the refusal of " << c.body << " must name '" << c.needle << "'";
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // `wideFloatSoftcallLibraryByFormat` — THE HOLE THE TF-C75 TESTS NAMED
 // ═════════════════════════════════════════════════════════════════════════════
 //
@@ -4715,4 +4793,81 @@ TEST(TargetSchema, ShippedTargetsDeclareTheirMeasuredUnderAlignedAtomicForm) {
     EXPECT_NE((*a)->underAlignedAtomicForm(), (*x)->underAlignedAtomicForm())
         << "arm64 FAULTS and x86_64 silently de-atomizes; a single answer for "
            "both is the conflation this vocabulary exists to prevent";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P68 round 8 — `isaFeatures`: the ISA features a target's code may assume, the
+// one TARGET fact an inline-asm template form reads (gcc's x86 `%~` expands to
+// `i` under `-mavx2` and `f` without — ✔MEASURED 2026-09-23, gcc 13.3.0).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+[[nodiscard]] std::string targetWithIsaFeatures(std::string_view block) {
+    return std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "opcodes":[{"mnemonic":"invalid","result":"none"}],
+        "isaFeatures":)"} + std::string{block} + "}";
+}
+}  // namespace
+
+TEST(TargetSchema, IsaFeaturesAreDeclaredOnOrOffAndAnUndeclaredOneIsUnknown) {
+    auto r = TargetSchema::loadFromText(targetWithIsaFeatures(
+        R"({"$comment":"prose","avx2":false,"sse4":true})"));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->isaFeature("avx2"), std::optional<bool>{false});
+    EXPECT_EQ((*r)->isaFeature("sse4"), std::optional<bool>{true});
+    EXPECT_EQ((*r)->isaFeature("avx512"), std::nullopt)
+        << "an undeclared feature is UNKNOWN — never read as off";
+    EXPECT_EQ((*r)->isaFeature("$comment"), std::nullopt)
+        << "a `$` key is documentation, not a feature";
+}
+
+TEST(TargetSchema, AnIsaFeatureThatIsNotABooleanIsRefused) {
+    for (char const* block : {R"({"avx2":"yes"})", R"({"avx2":1})", R"(["avx2"])"}) {
+        auto r = TargetSchema::loadFromText(targetWithIsaFeatures(block));
+        EXPECT_FALSE(r.has_value()) << block;
+        if (!r.has_value()) {
+            EXPECT_TRUE(anyHasCode(r.error(), DiagnosticCode::C_MalformedJson)) << block;
+        }
+    }
+}
+
+TEST(TargetSchema, TheShippedX86TargetAssumesNoAvx2) {
+    // RED-ON-DISABLE: drop `isaFeatures` from x86_64.target.json and x86's `%~`
+    // is refused by name ("declares no such feature") instead of expanding.
+    auto x = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x.has_value());
+    EXPECT_EQ((*x)->isaFeature("avx2"), std::optional<bool>{false});
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// P68 round 8 — `resultEarlyClobber`: an opcode whose result may share a
+// register with none of its operands (arm64 STLXR's status register — the
+// overlap is CONSTRAINED UNPREDICTABLE in the Arm ARM; ✔MEASURED 2026-09-23:
+// gas 2.42 warns and assembles it, clang 18.1.3 refuses it).
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+[[nodiscard]] std::string targetWithOpcode(std::string_view row) {
+    return std::string{R"({"dssTargetVersion":1,"target":{"name":"X"},
+        "opcodes":[{"mnemonic":"invalid","result":"none"},)"} + std::string{row} + "]}";
+}
+}  // namespace
+
+TEST(TargetSchema, ResultEarlyClobberIsABooleanOnAnOpcodeWithAResult) {
+    auto ok = TargetSchema::loadFromText(targetWithOpcode(
+        R"({"mnemonic":"x","result":"value","resultEarlyClobber":true})"));
+    ASSERT_TRUE(ok.has_value());
+    auto const op = (*ok)->opcodeByMnemonic("x");
+    ASSERT_TRUE(op.has_value());
+    EXPECT_TRUE((*ok)->opcodeInfo(*op)->resultEarlyClobber);
+
+    auto notBool = TargetSchema::loadFromText(targetWithOpcode(
+        R"({"mnemonic":"x","result":"value","resultEarlyClobber":1})"));
+    EXPECT_FALSE(notBool.has_value()) << "`1` is not a boolean";
+
+    auto noResult = TargetSchema::loadFromText(targetWithOpcode(
+        R"({"mnemonic":"x","result":"none","resultEarlyClobber":true})"));
+    ASSERT_FALSE(noResult.has_value())
+        << "an early-clobber claim on an opcode with no result reads nothing";
+    EXPECT_TRUE(anyHasCode(noResult.error(), DiagnosticCode::C_ConflictingField));
 }

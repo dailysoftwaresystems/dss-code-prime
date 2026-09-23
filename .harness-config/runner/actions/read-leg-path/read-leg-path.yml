@@ -1,0 +1,29 @@
+# PURPOSE: print the tail of a file, or the newest entries of a directory, inside a leg's tree on the host that leg runs on, redacted and kept, so a remote step's log can be read without a raw ssh session.
+name: read-leg-path
+description: >-
+  Reads ONE path inside the leg's tree, on the host the leg runs on: a file's last `lines` lines
+  (only those matching `match`), or a directory's newest `lines` entries. What it read is printed
+  and kept, redacted (the tree's absolute path, the home directory, the user and the host name never
+  leave the host). It refuses a path outside the tree and any connection data or secret by name,
+  because it prints what it reads. Built 2026-09-23 because DssHarness 0.5.8 keeps a remote leg's
+  logs on its host with no verb to read them. The program documents itself in its own header; this
+  file declares only how a runner starts it and what witnesses that it ran.
+  Bring the kept file back with `dssharness sync --legs <leg> --pull <its path>`.
+inputs:
+  path:
+    description: 'a path RELATIVE to the leg tree, e.g. .harness-config/runs/<run id>/<leg>/build.log'
+    required: true
+  lines:
+    description: 'how many trailing lines of a file, or newest entries of a directory'
+    default: '200'
+  match:
+    description: 'a Python regular expression; a file prints only its lines that match it'
+    default: '.'
+steps:
+  - name: read
+    workingDirectoryRoot: action
+    run: |
+      python3 ./read-leg-path.py --tree "{treeDir}" --path "{path}" --lines "{lines}" --match "{match}" --out "{stepBuild}/read-leg-path.txt"
+    outputs: [read-leg-path.txt]
+    persist: true
+    successPattern: 'read-leg-path: OK '

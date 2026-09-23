@@ -1583,6 +1583,16 @@ encode(AssembledModule const&    module,
         return {};
     }
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the request, checked HERE too ──
+    //
+    // A public entry point reachable without `linker::link`, so it runs the
+    // SAME `enforceImageRequest` the gate runs (the `pe::encode` precedent):
+    // an entry no carrier can hold is refused whichever door it came through.
+    // A pure predicate on success, so the linker path reports nothing twice.
+    if (!enforceImageRequest(request, fmt, "macho::encode", reporter)) {
+        return {};
+    }
+
     // Dispatch between MH_OBJECT (cycle 1), MH_EXECUTE (cycle 2) and
     // MH_DYLIB (c153, D-LK3-3) based on the schema's declared
     // filetype (closed enum — the loader rejects anything else). The
@@ -1669,6 +1679,26 @@ encode(AssembledModule const&    module,
             }
             return encodeExecDynamic(module, targetSchema, fmt,
                                      *secText, reporter, request);
+        }
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the static arm writes no
+        // LC_LOAD_DYLIB and no dyld information at all, so nothing would ever
+        // consult an LC_RPATH — a runpath this format declares is said out
+        // loud here rather than dropped (the same shape as the ELF writer's
+        // no-dynamic-section arm; a format declaring none was reported by the
+        // gate). Unreachable from the driver today: every shipped exec
+        // document imports its process exit, so it is always dynamic.
+        if (!request.runpaths.empty() && fmt.runpath().has_value()) {
+            report(reporter, DiagnosticCode::K_FormatLacksRunpath,
+                   DiagnosticSeverity::Warning,
+                   std::format(
+                       "macho::encode: {} runpath entr{} requested, but this "
+                       "'{}' executable imports nothing, so it is written "
+                       "WITHOUT any dyld information and nothing would read an "
+                       "LC_RPATH. Nothing is recorded. "
+                       "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.",
+                       request.runpaths.size(),
+                       request.runpaths.size() == 1 ? "y was" : "ies were",
+                       fmt.name()));
         }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
@@ -2288,7 +2318,7 @@ encode(AssembledModule const&    module,
     // reference reaching only the alias would then keep that empty atom while
     // the body was stripped: perfect bytes, wrong program, rc=0.
     // ✔MEASURED 2026-08-20 on real Apple Silicon
-    // (scripts/macho-alias-ld64-matrix): 8 cells — a bare second `.globl` label,
+    // (.harness-config/runner/actions/macho-alias-ld64-matrix): 8 cells — a bare second `.globl` label,
     // the same plus `.alt_entry`, and a clang-authored `.globl`+`.set` alias as
     // the attribution control, each linked with and without `-dead_strip`
     // against a caller referencing ONLY the alias, plus a canonical-only
@@ -3389,6 +3419,7 @@ encodeExec(AssembledModule const&    module,
 //   [LC_LOAD_DYLINKER]                        optional: emitDylinker (~24)
 //   [LC_MAIN]                                       optional: !isDylib (24)
 //   [LC_LOAD_DYLIB[N]]                                        (~32 each)
+//   [LC_RPATH[M]]           optional: one per recorded runpath (~24 each)
 //   [LC_SYMTAB]                                                       (24)
 //   [LC_DYSYMTAB]                                                     (80)
 //   [LC_UUID]                                    optional: emitUuid    (24)
@@ -3420,9 +3451,9 @@ namespace {
 
 // D-LK6-14 chained-fixups payload builder hoisted to private
 // header `link/format/macho_chained_fixups.hpp` at the d312c1c
-// audit fold for direct unit testing. When D-LK6-14-INTEGRATION
-// lands, encodeExecDynamic will `#include` the header and call
-// `dss::macho::detail::buildChainedFixupsPayload()`.
+// audit fold for direct unit testing. D-LK6-14-INTEGRATION-PAYLOAD
+// has landed: this file `#include`s the header and encodeExecDynamic
+// calls `dss::macho::detail::buildChainedFixupsPayload()`.
 
 [[nodiscard]] std::vector<std::uint8_t>
 encodeExecDynamic(AssembledModule const&    module,
@@ -3441,6 +3472,15 @@ encodeExecDynamic(AssembledModule const&    module,
                           "text", reporter, textAlignLog2)) {
         return {};
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the LC_RPATH paths this image
+    // records — the format's spelling of a leading `${ORIGIN}`, duplicates
+    // dropped (dyld refuses a duplicate LC_RPATH under its current policy).
+    // Resolved up front so a declaration this walker cannot write refuses
+    // before any layout; each path becomes one `rpath_command` below.
+    auto const rpaths = runpathsToRecord(request, fmt,
+                                         RunpathCarrier::MachoLoadCommand,
+                                         "macho::encodeExecDynamic", reporter);
+    if (!rpaths.has_value()) return {};
     // c153 (D-LK3-3): the MH_DYLIB arm rides THIS dynamic substrate
     // with schema-keyed divergences (filetype is closed-enum schema
     // data — the elf.cpp `isDyn` precedent, never a format-name
@@ -5112,6 +5152,13 @@ encodeExecDynamic(AssembledModule const&    module,
     for (auto const& path : emittedDylibs) {
         totalDylibCmdSize += commandSizeWithPath(24, path);
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: one `rpath_command` per recorded
+    // path — cmd, cmdsize, lc_str offset 12, the NUL-terminated path, padded to
+    // 8 (measured against ld64.lld: `@loader_path` → cmdsize 32).
+    std::size_t totalRpathCmdSize = 0;
+    for (auto const& path : *rpaths) {
+        totalRpathCmdSize += commandSizeWithPath(12, path);
+    }
     // Stable map: library → dylib ordinal (1-based per dyld). Keyed off
     // `emittedDylibs` (schema ∪ referenced) so a referenced non-schema
     // library resolves to ITS ordinal (not libSystem's) — each import's
@@ -5859,6 +5906,8 @@ encodeExecDynamic(AssembledModule const&    module,
     //       + [LC_DYLD_EXPORTS_TRIE when emitExportsTrieCmd]
     //       + [LC_LOAD_DYLINKER] + [LC_MAIN] + [LC_ID_DYLIB]
     //       + N × LC_LOAD_DYLIB
+    //       + M × LC_RPATH (one per recorded runpath —
+    //         D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH)
     //       + LC_SYMTAB + LC_DYSYMTAB (UNCONDITIONAL — ld64 emits it on
     //       the chained path too, ✔MEASURED with the -no_fixup_chains
     //       control; see the indirect-symbol construction above and
@@ -5884,6 +5933,7 @@ encodeExecDynamic(AssembledModule const&    module,
         + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
         + (isDylib ? 0u : 1u)          // LC_MAIN
         + emittedDylibs.size()         // N × LC_LOAD_DYLIB (schema ∪ referenced)
+        + rpaths->size()               // M × LC_RPATH (the recorded runpaths)
         + 1u                           // LC_SYMTAB
         + 1u                           // LC_DYSYMTAB (both binding paths)
         + (emitExportsTrieCmd ? 1u : 0u)
@@ -5900,7 +5950,8 @@ encodeExecDynamic(AssembledModule const&    module,
         segCmdPageZeroActual + kSegCmdTextSize + segCmdDataConstActual +
         kSegCmdDataSize + kSegCmdLinkeditSize + dyldBindCmdSize +
         dylinkerCmdSizeActual + lcMainSizeActual + idDylibCmdSize +
-        totalDylibCmdSize + kSymtabCommandSize + kDysymtabCommandSize +
+        totalDylibCmdSize + totalRpathCmdSize +
+        kSymtabCommandSize + kDysymtabCommandSize +
         (emitExportsTrieCmd ? kLinkeditDataCommandSize : 0u) +
         (emitCodeSig ? kCodeSigCommandSize : 0u) +
         (emitUuid ? kUuidCommandSize : 0u) +  // D-LK-MACHO-EMITS-NO-LC-UUID
@@ -7114,6 +7165,23 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
         appendU32LE(bytes, 0);
+        for (char c : path)
+            appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);
+        while (bytes.size() - cmdStart < cmdSize) appendU8(bytes, 0);
+    }
+
+    // LC_RPATH[] — D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH. One `rpath_command`
+    // per recorded path, in request order, right after the libraries they
+    // resolve (ld64's order): the DECLARED command number, cmdsize, the lc_str
+    // offset (12 — the path follows the three words), the NUL-terminated path,
+    // zero padding to the 8-byte multiple `commandSizeWithPath` sized above.
+    for (auto const& path : *rpaths) {
+        std::size_t const cmdStart = bytes.size();
+        std::size_t const cmdSize = commandSizeWithPath(12, path);
+        appendU32LE(bytes, fmt.runpath()->loadCommand);
+        appendU32LE(bytes, static_cast<std::uint32_t>(cmdSize));
+        appendU32LE(bytes, 12);
         for (char c : path)
             appendU8(bytes, static_cast<std::uint8_t>(c));
         appendU8(bytes, 0);

@@ -5974,6 +5974,30 @@ struct Lowerer {
     // inline tail of `lowerUnary`.
     E combineUnaryOp(NodeId node, HirOperatorEntry const& e, E operand) {
         if (e.target == "AddressOf") {
+            // ★★ C 6.5.3.2p1 (P68, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED):
+            // "The operand of the unary & operator shall be … an lvalue that
+            // designates an object that … is not declared with the register
+            // storage-class specifier." The object is found by walking the
+            // lowered operand to the variable it designates — through a member
+            // or an element of an ARRAY, never through a pointer (`&p->f`,
+            // `&p[i]` address the POINTEE). ✔MEASURED 2026-09-19, gcc 13.3.0 and
+            // clang 18.1.3 both refuse `&v`, `&(v)`, `&v.m`, `&v[i]` and `&` of a
+            // `register` PARAMETER ("address of register variable requested");
+            // DSS compiled every one. Which specifier forbids it is the
+            // language's `{addressNotTakeable: true}` facet, never a keyword.
+            if (SymbolRecord const* obj = designatedObjectRecord(operand.id);
+                obj != nullptr && obj->addressNotTakeable) {
+                emitH(DiagnosticCode::S_AddressOfRegisterObject, node,
+                      std::format("the address of '{}' is requested, and it is "
+                                  "declared with a storage-class specifier that "
+                                  "forbids it (C 6.5.3.2p1: the operand of unary "
+                                  "`&` shall not be declared `register`; gcc and "
+                                  "clang: \"address of register variable "
+                                  "requested\") "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name));
+                return {errorNode(node), InvalidType};
+            }
             TypeId const result = operand.type.valid() ? interner.pointer(operand.type) : InvalidType;
             return {track(builder.makeAddressOf(operand.id, result), node), result};
         }
@@ -7247,7 +7271,12 @@ struct Lowerer {
                 std::vector<HirNodeId> children;
                 children.reserve(f.operands.size());
                 bool refused = false;
-                for (auto const& op : f.operands) {
+                // The operands bound to a register through a GNU LOCAL REGISTER
+                // VARIABLE (P68, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED),
+                // kept for the statement-level checks after the loop.
+                std::vector<BoundAsmOperand> boundOperands;
+                for (std::size_t oi = 0; oi < f.operands.size(); ++oi) {
+                    auto const& op = f.operands[oi];
                     if (op.malformed) {
                         stmtResult = reportedError(
                             op.operandNode.valid() ? op.operandNode : n,
@@ -7341,12 +7370,73 @@ struct Lowerer {
                             }
                         }
                     }
-                    desc.operands.push_back(std::move(rec));
+                    // ★★ A MATCHING CONSTRAINT SHARES ITS OUTPUT'S LOCATION (P68,
+                    // D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER): the
+                    // input inherits the output's resolution — class, pinned
+                    // register or form — because GNU defines `"N"` as "the same
+                    // location as operand N". Outputs precede inputs in `f`, so
+                    // operand N is already filed. The semantic tier refuses every
+                    // illegal match by name; one arriving here anyway (a caller
+                    // that skipped the semantic gate) is refused, never guessed.
+                    if (parsed.value.matchedOperand.has_value()) {
+                        std::uint32_t const want = *parsed.value.matchedOperand;
+                        if (op.isOutput || want >= desc.operands.size()
+                            || !desc.operands[want].isOutput) {
+                            stmtResult = reportedError(
+                                op.constraintNode.valid() ? op.constraintNode : n,
+                                "inline-asm matching constraint \"" + op.constraint
+                                + "\" does not name an earlier OUTPUT operand — the "
+                                  "semantic tier reports this as "
+                                  "S_InlineAsmConstraintUnsupportedForm "
+                                  "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                            refused = true;
+                            break;
+                        }
+                        HirInlineAsmOperand const& matched = desc.operands[want];
+                        rec.regClassResolved    = matched.regClassResolved;
+                        rec.regClass            = matched.regClass;
+                        rec.fixedRegister       = matched.fixedRegister;
+                        rec.operandKindResolved = matched.operandKindResolved;
+                        rec.operandKind         = matched.operandKind;
+                    }
 
-                    E const value = lowerExpr(op.valueExpr);
+                    E value = lowerExpr(op.valueExpr);
+                    // ★★ AN INPUT THAT IS NOT A MEMORY FORM TAKES THE OPERAND'S
+                    // VALUE, AND AN ARRAY'S VALUE IS A POINTER TO ITS FIRST
+                    // ELEMENT (C 6.3.2.1p3) — P68 round 8,
+                    // D-ASM-ARRAY-INPUT-OPERAND-NOT-DECAYED. `"r"(cells)` hands
+                    // the template `&cells[0]` on gcc 13.3.0 and clang 18.1.3
+                    // (✔MEASURED 2026-09-21: `ldr %0, [%1, #8]` over it reads
+                    // cells[1]); DSS carried the ARRAY and refused it at the
+                    // carriage ("binds a 16-byte 'Array' value"). Routed through
+                    // the shared `arrayToPointerDecay` + `coerce`, the decay every
+                    // other value context performs. ⚠ A MEMORY-FORM input (`"m"`)
+                    // names the OBJECT and keeps it; an output is an lvalue and
+                    // never decays.
+                    if (!op.isOutput
+                        && !(rec.operandKindResolved
+                             && static_cast<OperandKindFilter>(rec.operandKind)
+                                    == OperandKindFilter::MemBase)) {
+                        TypeId const decayed =
+                            arrayToPointerDecay(interner, value.type);
+                        if (decayed.valid() && decayed != value.type) {
+                            value = coerce(value, decayed);
+                        }
+                    }
+                    if (!bindLocalRegisterVariable(op, oi, value, rec, desc,
+                                                   boundOperands)) {
+                        stmtResult = errorNode(n);
+                        refused = true;
+                        break;
+                    }
+                    desc.operands.push_back(std::move(rec));
                     children.push_back(value.id);
                 }
                 if (refused) return;
+                if (!checkBoundRegisterConflicts(f, ia, boundOperands)) {
+                    stmtResult = errorNode(n);
+                    return;
+                }
 
                 // ── the clobbers: the two configured spellings hoisted to flags ──
                 // ⚠ `"memory"` / `"cc"` are NEVER C++ literals here — they are
@@ -7913,8 +8003,8 @@ struct Lowerer {
         // (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY, both say
         // "lvalue required as left operand of assignment" / "expression is not
         // assignable" at the user's own token.
-        // ⓘ `const int x; x = 5;` is a DIFFERENT gap — the `Ref` is addressable
-        // and passes this test — still open as [[D-CSUBSET-INCDEC-CONST-LVALUE]].
+        // ⓘ `const int x; x = 5;` is not this test's: the `Ref` is addressable
+        // and passes it, and the semantic tier refuses it first (S_ConstViolation).
         if (lhs.type.valid() && !loweredNodeIsAddressable(lhs.id)) {
             emitH(DiagnosticCode::S_AssignNeedsModifiableLvalue, lhsN,
                   "the left operand of an assignment must be a modifiable lvalue "
@@ -7958,11 +8048,15 @@ struct Lowerer {
                 // exprError after this one — both loud, 0xE040 first). Plain
                 // reads never pass through here (lowerExpr
                 // folds them) and `&__func__` rides the operator-table
-                // AddressOf path — both stay legal. Simple `=` / `+=` are
-                // already stopped at SEMANTIC by the symbol's isConst
-                // (S_ConstViolation), so this guard is the inc/dec class's
-                // fail-loud gate. `__func__[0] = 'x'` is the pre-existing
-                // rodata-write class (D-CSUBSET-INCDEC-CONST-LVALUE family).
+                // AddressOf path — both stay legal. `=`, `+=` and (since P68
+                // round 8) `++` / `--` are all stopped at SEMANTIC by the
+                // symbol's isConst (S_ConstViolation), so this guard is the
+                // BACKSTOP that fires when that check did not stop the build (a
+                // suppressed S_ConstViolation). A write to an ELEMENT
+                // (`__func__[0] = 'x'`) does not come here and is not refused
+                // today: gcc, clang and mingw-w64 refuse it while MSVC accepts
+                // it, a reference split tracked OPEN in the production registry
+                // under its own row.
                 SymbolId const sym = model.symbolAt(c);
                 if (auto const* rec = model.recordFor(sym);
                     rec != nullptr && rec->isPredefinedFunctionName) {
@@ -8113,11 +8207,12 @@ struct Lowerer {
     // (a literal `5++` / `++5`, an arithmetic result) lowers to a non-addressable
     // HIR node (Literal / BinaryOp / …), which has no object to read-modify-write —
     // reject it here rather than synthesize a write-back to a non-object.
-    // `classifyLvalue` itself stays permissive (the same gap plain assignment has —
-    // `5 = 3`; the `const`-lvalue case `const int x; x++;` is also still
-    // unmodelled), anchored D-CSUBSET-INCDEC-CONST-LVALUE. Lowers the operand
-    // ONCE (no double-lowering) and is the single source the three ++/-- sites
-    // share, so the guard + diagnostic stay identical across pre/post/stmt.
+    // `classifyLvalue` asks the same shape question for an assignment
+    // (`loweredNodeIsAddressable`). A `const`-qualified lvalue (`const int x;
+    // x++;`) IS addressable and passes this guard; the semantic tier's const-write
+    // check refuses it first (S_ConstViolation, since P68 round 8). Lowers the
+    // operand ONCE (no double-lowering) and is the single source the three ++/--
+    // sites share, so the guard + diagnostic stay identical across pre/post/stmt.
     [[nodiscard]] std::optional<Lvalue> classifyIncDecLvalue(NodeId operandN, NodeId anchor) {
         if (auto s = simpleLvalue(operandN)) {     // a plain variable is always an lvalue
             if (!s->second.valid()) return std::nullopt;
@@ -10978,6 +11073,230 @@ struct Lowerer {
     // callers, two bugs.
     // ⓘ A FnSig-typed `Ref` (a function DESIGNATOR — `f = 5;`, `++f`) is excluded:
     // a function is not an object, and C 6.5.16p2 wants a MODIFIABLE lvalue.
+    // ★ THE VARIABLE A LOWERED LVALUE DESIGNATES, or nullptr (P68,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). A `Ref` names it; a
+    // `MemberAccess` or an `Index` over an ARRAY value designates part of its
+    // base, so the walk continues into the base; a `MemberAccess` over a `Deref`
+    // (`p->f`) or an `Index` over a POINTER (`p[i]`) designates the POINTEE, so
+    // the walk stops — the address taken there is not the variable's. Bounded,
+    // like every walk in this file, so a malformed tree fails soft.
+    [[nodiscard]] SymbolRecord const* designatedObjectRecord(HirNodeId id) {
+        for (int guard = 0; guard < 256 && id.valid(); ++guard) {
+            HirKind const k = builder.kind(id);
+            if (k == HirKind::Ref) {
+                SymbolId const sym{builder.payload(id)};
+                return sym.valid() ? model.recordFor(sym) : nullptr;
+            }
+            if (k != HirKind::MemberAccess && k != HirKind::Index) return nullptr;
+            auto const kids = builder.children(id);
+            if (kids.empty()) return nullptr;
+            HirNodeId const base = kids.front();
+            if (!base.valid() || builder.kind(base) == HirKind::Deref) return nullptr;
+            if (k == HirKind::Index) {
+                TypeId const bt = builder.typeId(base);
+                if (!bt.valid() || interner.kind(bt) != TypeKind::Array) return nullptr;
+            }
+            id = base;
+        }
+        return nullptr;
+    }
+
+    // One inline-asm operand bound to a machine register through a GNU LOCAL
+    // REGISTER VARIABLE — what the statement-level checks compare.
+    struct BoundAsmOperand {
+        std::size_t   index = 0;          // position in the captured operand list
+        SymbolId      sym{};              // the variable
+        std::uint16_t fullRegister = 0;   // the full-width register it names
+        bool          isOutput = false;
+        bool          isMatched = false;  // an input tied by a matching constraint
+        NodeId        at{};               // the value expression, for the span
+        std::string   variable;           // its name, for the message
+        std::string   spelled;            // the register as its label spells it
+    };
+
+    // ★★★ THE GNU LOCAL REGISTER VARIABLE BINDING (P68,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). 📄 GCC, "Local Register
+    // Variables": *"The only supported use for this feature is to specify
+    // registers for input and output operands when calling Extended asm … Then
+    // use the local variable for the asm operand and specify any constraint
+    // letter that matches the register."* ⇒ a REGISTER-form operand whose value
+    // IS such a variable is PINNED to its register — the `fixedRegister` field a
+    // pinning letter (x86 `"a"`) already fills, so every tier below realizes it
+    // with no new mechanism (MIR→LIR's `canonicalAsmRegister` follows `subOf`,
+    // so a `w9` label binds x9 at the value's width). ✔MEASURED 2026-09-19, gcc
+    // 13.3.0 and clang 18.1.3 SEPARATELY, both targets, -O0/-O2, every binary
+    // RUN: the binding holds for inputs, outputs, `+`, tied, `asm goto`, GPR
+    // and FP registers, sub-register names, char/int/float/struct values.
+    // Returns false after REPORTING a refusal; true otherwise (bound or not).
+    [[nodiscard]] bool bindLocalRegisterVariable(
+            InlineAsmOperandFact const& op, std::size_t oi, E const& value,
+            HirInlineAsmOperand& rec, HirInlineAsmDescriptor& desc,
+            std::vector<BoundAsmOperand>& bound) {
+        TargetSchema const* target = model.target();
+        if (target == nullptr) return true;          // unasked, not guessed
+        SymbolRecord const* obj = designatedObjectRecord(value.id);
+        if (obj == nullptr || obj->asmRegister.empty()) return true;
+        NodeId const at = op.valueExpr.valid() ? op.valueExpr : op.operandNode;
+        bool const isWholeVariable =
+            value.id.valid() && builder.kind(value.id) == HirKind::Ref;
+        // ── a MEMORY-form operand asks for the object's ADDRESS ──
+        // ✔MEASURED: both references refuse a bound variable (or a part of
+        // one) on `"m"` — gcc "address of register variable 'v' requested",
+        // clang "Don't know how to handle indirect register inputs yet". (A
+        // PLAIN `register` object with no label is a different case: clang
+        // accepts it on `"m"` and runs it, so it is admitted — it never
+        // reaches here, having no `asmRegister`.)
+        if (rec.operandKindResolved) {
+            if (static_cast<OperandKindFilter>(rec.operandKind)
+                == OperandKindFilter::MemBase) {
+                emitH(DiagnosticCode::S_AddressOfRegisterObject, at,
+                      std::format("'{}' is a local register variable bound to "
+                                  "'{}', and a memory-form operand (constraint "
+                                  "\"{}\") asks for its address — the object "
+                                  "lives in a register at the statement (gcc: "
+                                  "\"address of register variable requested\"; "
+                                  "clang refuses it too) "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name, obj->asmRegister, op.constraint));
+                return false;
+            }
+            return true;   // an immediate form: a variable is no constant, and
+                           // hir_to_mir refuses the non-constant value by name
+        }
+        // A PART of the variable (`v.m`, `v[i]`) on a register form is an
+        // ordinary value: the binding is the variable's, not its member's.
+        if (!isWholeVariable) return true;
+        auto const full = target->fullRegisterOf(obj->asmRegister);
+        if (!full.has_value()) return true;   // refused at the declaration
+        auto const* rinfo = target->registerInfo(*full);
+        std::string const named = rinfo != nullptr ? rinfo->name : obj->asmRegister;
+        // ★★ AN INPUT WHOSE VARIABLE IS NEVER WRITTEN READS ITS REGISTER AS IT
+        // STANDS (P68 round 8; `SymbolRecord::denotesItsRegister` carries the
+        // proof and the measurement): nothing is copied in below.
+        bool const asItStands = !op.isOutput && obj->denotesItsRegister;
+        // ── the letter must MATCH the register (the manual's own words) ──
+        // ⚠ Two references ACCEPT a mismatch and DISAGREE on it (gcc drops the
+        // binding and uses a register of the letter's class; clang keeps the
+        // bound register), so no meaning is chosen: it is refused by name.
+        if (!rec.fixedRegister.empty()) {
+            auto const pin = target->fullRegisterOf(rec.fixedRegister);
+            if (!pin.has_value() || *pin != *full) {
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, at,
+                      std::format("'{}' is a local register variable bound to "
+                                  "'{}', and operand {} (constraint \"{}\") "
+                                  "places it in '{}' — {}. gcc and clang both "
+                                  "accept this and DISAGREE on which register "
+                                  "the operand is (gcc: the constraint's; clang: "
+                                  "the variable's), so it is refused rather than "
+                                  "given one meaning "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name, obj->asmRegister, oi, op.constraint,
+                                  rec.fixedRegister,
+                                  rec.constraint.matchedOperand.has_value()
+                                      ? "the location of the output it matches"
+                                      : "the register its letter pins"));
+                return false;
+            }
+            rec.registerAsItStands = asItStands;
+        } else if (rec.regClassResolved) {
+            if (rinfo == nullptr
+                || static_cast<std::uint8_t>(rinfo->regClass) != rec.regClass) {
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, at,
+                      std::format("'{}' is a local register variable bound to "
+                                  "'{}', and operand {} (constraint \"{}\") "
+                                  "selects a register class that does not "
+                                  "contain it. The manual's rule is \"specify "
+                                  "any constraint letter that matches the "
+                                  "register\"; gcc and clang both accept a "
+                                  "mismatch and DISAGREE on it (gcc uses a "
+                                  "register of the letter's class, clang the "
+                                  "bound one), so it is refused rather than "
+                                  "given one meaning "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name, obj->asmRegister, oi, op.constraint));
+                return false;
+            }
+            rec.fixedRegister      = obj->asmRegister;
+            // The pin is the VARIABLE's, so a value wider than the register
+            // continues in the one the target declares (`continuesIn`) — a
+            // LETTER pin never does (both references refuse that shape).
+            rec.pinnedByVariable   = true;
+            rec.registerAsItStands = asItStands;
+            // A MATCHED input pins the OUTPUT it shares a location with, when
+            // that output was not already pinned: the two are one location.
+            if (rec.constraint.matchedOperand.has_value()) {
+                auto& out = desc.operands[*rec.constraint.matchedOperand];
+                if (out.fixedRegister.empty()) {
+                    out.fixedRegister    = obj->asmRegister;
+                    out.pinnedByVariable = true;
+                }
+            }
+        } else {
+            return true;   // an unresolved letter: the semantic tier refused it
+        }
+        bound.push_back(BoundAsmOperand{
+            oi, SymbolId{builder.payload(value.id)}, *full, op.isOutput,
+            rec.constraint.matchedOperand.has_value(), at, obj->name, named});
+        return true;
+    }
+
+    // The STATEMENT-level refusals of the binding (P68,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED), each ✔MEASURED 2026-09-19:
+    //   (a) a bound register named in the clobber list — gcc AND clang refuse
+    //       ("'asm' specifier for variable 'v' conflicts with 'asm' clobber
+    //       list");
+    //   (b) two INPUTS bound to one register through two DIFFERENT variables —
+    //       both references accept and DISAGREE (gcc: the value assigned last;
+    //       clang: the operand listed last), so no meaning exists to carry.
+    [[nodiscard]] bool checkBoundRegisterConflicts(
+            InlineAsmFacts const& f, InlineAsmConfig const& ia,
+            std::vector<BoundAsmOperand> const& bound) {
+        TargetSchema const* target = model.target();
+        if (target == nullptr || bound.empty()) return true;
+        for (auto const& c : f.clobbers) {
+            if (!ia.memoryClobber.empty() && c.text == ia.memoryClobber) continue;
+            if (!ia.conditionCodeClobber.empty() && c.text == ia.conditionCodeClobber)
+                continue;
+            auto const cf = target->fullRegisterOf(c.text);
+            if (!cf.has_value()) continue;   // S_InlineAsmClobberUnknown's case
+            for (auto const& b : bound) {
+                if (b.fullRegister != *cf) continue;
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, c.node,
+                      std::format("clobber \"{}\" names register '{}', which "
+                                  "operand {} binds through the local register "
+                                  "variable '{}' — a register cannot both carry "
+                                  "an operand and be promised dead (gcc and "
+                                  "clang: \"asm-specifier for variable conflicts "
+                                  "with asm clobber list\") "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  c.text, b.spelled, b.index, b.variable));
+                return false;
+            }
+        }
+        for (std::size_t i = 0; i < bound.size(); ++i) {
+            if (bound[i].isOutput || bound[i].isMatched) continue;
+            for (std::size_t j = i + 1; j < bound.size(); ++j) {
+                if (bound[j].isOutput || bound[j].isMatched) continue;
+                if (bound[j].fullRegister != bound[i].fullRegister) continue;
+                if (bound[j].sym.v == bound[i].sym.v) continue;
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, bound[j].at,
+                      std::format("inputs {} and {} are bound to register '{}' "
+                                  "through two different local register "
+                                  "variables ('{}' and '{}'), and one register "
+                                  "cannot hold two values. gcc and clang both "
+                                  "accept this and DISAGREE on the value it holds "
+                                  "(gcc: the one assigned last; clang: the operand "
+                                  "listed last), so it is refused rather than "
+                                  "given one meaning "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  bound[i].index, bound[j].index, bound[i].spelled,
+                                  bound[i].variable, bound[j].variable));
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] bool loweredNodeIsAddressable(HirNodeId id) {
         HirKind const k = id.valid() ? builder.kind(id) : HirKind::Error;
         if (k == HirKind::Ref) {
@@ -11022,11 +11341,11 @@ struct Lowerer {
         // user's own file. The defect is older than that change and independent
         // of it — bare `8 = 5;` takes the identical route with no descriptor in
         // the picture.
-        // ⓘ The `const`-QUALIFIED lvalue (`const int x; x = 5;`) is a DIFFERENT
-        // gap, still open as [[D-CSUBSET-INCDEC-CONST-LVALUE]]: a const lvalue IS
-        // addressable and passes this shape test, and the simple-variable path
-        // above never reaches here anyway. Narrowing that is a `const`-modelling
-        // question in the type lattice, not a shape question.
+        // ⓘ The `const`-QUALIFIED lvalue (`const int x; x = 5;`) is not this
+        // test's: a const lvalue IS addressable and passes it, and the
+        // simple-variable path above never reaches here anyway. The semantic
+        // tier refuses it first (S_ConstViolation), because that is where the
+        // declared qualifiers are known.
         if (!loweredNodeIsAddressable(target.id)) {
             emitH(DiagnosticCode::S_AssignNeedsModifiableLvalue, exprCst,
                   "the left operand of an assignment must be a modifiable lvalue "
@@ -14368,9 +14687,11 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
                          // descriptor handle against the pool this same
                          // lowering just filled.
                          &result->inlineAsmPool};
-    (void)verifier.verify(reporter);
+    // The verifier's OWN verdict, not only the delta: a refusal the reporter drops
+    // as a recent duplicate or past a cap must still fail the lowering (P68).
+    bool const verified = verifier.verify(reporter);
 
-    result->ok = reporter.errorCount() == errBefore;
+    result->ok = verified && reporter.errorCount() == errBefore;
     return result;
 }
 

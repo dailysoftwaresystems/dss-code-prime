@@ -639,7 +639,7 @@ TEST(MachOWriter, ObjectWeakDefinitionRoundTripsBackToWeakThroughDssReader) {
 // values — a well-formed object whose relocations name the wrong symbols.
 //
 // ★ Emitting an alias at all is safe under MH_SUBSECTIONS_VIA_SYMBOLS, and that
-// was MEASURED, not assumed: scripts/macho-alias-ld64-matrix, 8 cells on real
+// was MEASURED, not assumed: .harness-config/runner/actions/macho-alias-ld64-matrix, 8 cells on real
 // Apple Silicon (plain second label / `.alt_entry` / a clang `.globl`+`.set`
 // control, each × with and without `-dead_strip`, linked against a caller
 // referencing ONLY the alias, plus a canonical-only control). Every cell: both
@@ -1666,8 +1666,9 @@ TEST(MachOWriter, Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef) {
            "fabricated-extern break this pin guards";
     EXPECT_EQ(bytes[n1 + 5], 1u)             // n_sect = __text
         << "block symbol lives in __text";
-    // n_desc = N_ALT_ENTRY (0x0200) — D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS
-    // -BLOCK-LABEL-NOT-ATOM. n_type/n_sect/n_value above are byte-for-byte what
+    // n_desc = N_ALT_ENTRY (0x0200) —
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
+    // n_type/n_sect/n_value above are byte-for-byte what
     // a file-local (`static`) whole FUNCTION also carries, so before this bit
     // existed nothing on the wire distinguished the two and the archive-member
     // reader had to guess from N_EXT — guessing wrong for every `static`

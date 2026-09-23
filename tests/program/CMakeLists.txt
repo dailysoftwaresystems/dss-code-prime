@@ -43,6 +43,14 @@ dss_add_test(NAME program/test_cross_validate_language_target
 dss_add_test(NAME program/test_project_config
              SOURCES test_project_config.cpp)
 
+# D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY: every
+# relative path a manifest holds resolves against THAT manifest's directory. One
+# TEST per path-bearing field, each compiled from the manifest's own directory,
+# an empty one and one holding look-alikes, and each RUN, so a red names the
+# field and a wrong file cannot pass as a right one.
+dss_add_test(NAME program/test_manifest_path_base
+             SOURCES test_manifest_path_base.cpp)
+
 # D-DRIVER-ASM-DIALECT-SELECTED-BY-TARGET: the assembly dialect is resolved PER
 # TARGET, so one invocation compiling a `.s` for two CPUs parses it under two
 # grammars. Driver tier, not tests/examples/, for the structural reason the
@@ -83,8 +91,8 @@ dss_add_test(NAME program/test_asm_data_directives
 # parses argv, exactly as `tests/test_support/test_run_binary_capture.cpp` does
 # for its payload flag. Self-spawn (rather than a second `add_executable`) keeps
 # the fixture available on every host in the matrix with no PATH assumptions, and
-# needs no `$<TARGET_FILE:…>` define, no `add_dependencies` edge, and no
-# allowlist row in the two `scripts/check-orphan-tests/check-orphan-tests` twins.
+# needs no `$<TARGET_FILE:…>` define, no `add_dependencies` edge, and no row in
+# `.harness-config/runner/actions/check-orphan-tests/allowlist.json`.
 dss_add_test(NAME program/test_build_scripts
              SOURCES test_build_scripts.cpp)
 
@@ -122,8 +130,8 @@ dss_add_test(NAME program/test_dependency_git_cache
 # reason: U-7's pins need a hook program that writes a file AT A PATH RELATIVE
 # TO ITS OWN WORKING DIRECTORY, and the binary re-execs ITSELF as that fixture.
 # Self-spawn keeps the fixture available on every host with no PATH assumption,
-# and needs no second target, no `$<TARGET_FILE:…>` define and no allowlist row
-# in the two `scripts/check-orphan-tests/check-orphan-tests` twins.
+# and needs no second target, no `$<TARGET_FILE:…>` define and no row in
+# `.harness-config/runner/actions/check-orphan-tests/allowlist.json`.
 dss_add_test(NAME program/test_dependency_resolver
              SOURCES test_dependency_resolver.cpp)
 
@@ -545,3 +553,14 @@ dss_add_test(NAME program/test_emit_hir_round_trips_every_example
 # runtime-cache wiring case above.
 target_link_libraries(dss_program_test_emit_hir_round_trips_every_example
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpath request through the REAL
+# driver — the CLI flag, the project-manifest key and their merge (manifest
+# first), what the ELF and Mach-O writers record (decoded from the bytes), the
+# PE image left byte-identical with ONE warning, ONE warning for an N-member
+# archive, the refusal's two facts (no image, one explanation), a dependency's
+# own runpaths, and the dependency-artifact cache key term. HOST-INDEPENDENT:
+# every image is built and decoded, none is executed — the corpus pair
+# `dynlib_runpath_origin` / `dynlib_runpath_absent_exits_127` is the run.
+dss_add_test(NAME program/test_image_runpath_build
+             SOURCES test_image_runpath_build.cpp)

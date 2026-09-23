@@ -1,0 +1,20 @@
+{
+  "$comment": "[[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]] + [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]] runtime witness. A lone apostrophe or double quote in text phase 7 never converts — a skipped group's prose, a skipped #error / #warning / unclosed #include <, an unexpanded #define, the words of a live #warning — must neither swallow the lines after it nor be judged. ✔MEASURED 2026-09-22: gcc 13.3.0, clang 18.1.3 and MinGW gcc accept this translation unit (MSVC VS 18 errors on the #define and the live #warning; one working reference makes acceptance required). Before the fix DSS refused it: the first lone quote opened a character constant that ran to the next quote lines later.",
+  "$commentWhyNotVacuous": "Every line in a skipped group is a line the old lexer broke, so a regression leaves NO ARTIFACT and the harness fails on the build, not on a comparison. The live #warning is pinned by expectWarnings at its own line: a lexer that ran its `'` on would move or lose it. The live arithmetic returns 42 only if the `#if 1` arm was kept.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "P_PreprocessorWarningDirective", "line": 30, "col": 2,
+      "$comment": "`#warning don't panic: …` — live, so it warns; its lone quote is never converted, so it is not judged" }
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -410,6 +410,23 @@ struct DSS_EXPORT CliArgs {
     // `stackReserve` key when both are present (see
     // `Program::compileProject`).
     std::optional<std::uint64_t>  stackReserveBytes;
+
+    // `--rpath <dir>` / `--rpath=<dir>`, repeatable
+    // (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): directories the emitted image
+    // records for its loader to search for the libraries it needs, in the
+    // order given — gcc's `-Wl,-rpath,<dir>` / ld64's `-rpath <dir>`, with
+    // gcc's LITERAL semantics: the string is recorded verbatim (`$ORIGIN`,
+    // `$LIB`, `@loader_path`, a `:` list included), except that a LEADING
+    // `${ORIGIN}` is written in the chosen format's own spelling. Nothing is
+    // validated here beyond the generic non-empty value; the linker gate
+    // refuses only an entry no carrier can hold, and a format that records no
+    // runpath accepts the request with a warning. Threaded to
+    // `Program::setRunpaths`.
+    //
+    // PRECEDENCE: a LIST, so it ACCUMULATES with a project manifest's
+    // `runpaths` — the manifest's entries first, then these — the way repeated
+    // `-rpath` accumulates (see `Program::compileProject`).
+    std::vector<std::string>      runpaths;
 };
 
 // Parse-failure kinds. Mirror the `TargetSpecError` shape so the

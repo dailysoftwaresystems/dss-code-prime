@@ -117,6 +117,42 @@ struct MirAsmOperand {
     // template will use for both halves.
     std::optional<std::uint32_t> tiedOutput;
 
+    // ★★ TRUE ⇔ THIS TIE WAS WRITTEN BY THE SOURCE AS A GNU **MATCHING
+    // CONSTRAINT** (`"0"`) rather than synthesized from a `"+"` output (P68,
+    // D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER). The two share
+    // ONE location either way (GNU's own `"+r"` IS `"=r"` plus `"0"`), and they
+    // differ in exactly one fact: a `"+"` operand's two halves are ONE C lvalue,
+    // so their widths must agree, while a matching input is a SEPARATE
+    // expression whose width is its own. ✔MEASURED 2026-09-19, gcc 13.3.0 and
+    // clang 18.1.3 on both shipped targets: an `int` input matched to a `long`
+    // output is materialized at ITS width (a -5 reads back as 4294967291), and a
+    // `long` input matched to an `int` output reads back its low half. It also
+    // keeps its own `spellings` — the source wrote it, so its `%N` names it.
+    bool matchesOutput = false;
+
+    // ★★ TRUE ⇔ `fixedRegister` WAS SET BY A GNU LOCAL REGISTER VARIABLE
+    // (`register long v asm("x4")`) rather than by a pinning LETTER (x86
+    // `"a"`), P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). The
+    // two pin ONE register identically and differ on a value wider than it:
+    // ✔MEASURED 2026-09-19, a LETTER-pinned `__int128` is refused by gcc 13.3.0
+    // and clang 18.1.3 alike, while a VARIABLE-bound one CONTINUES in the next
+    // register of the target's order (aarch64 x4→x5 on both references, x7→x8
+    // on clang; x86-64 rax→rdx, rdx→rcx, r8→r9 on gcc) — the register the
+    // target declares as `continuesIn`.
+    bool pinnedByVariable = false;
+
+    // ★★ TRUE ⇔ THIS INPUT READS ITS BOUND REGISTER AS IT STANDS: the variable
+    // it names is never written anywhere — no initializer, and every use of it
+    // is the bare value of an asm INPUT operand — so no value exists to copy in
+    // (P68 round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). C 6.3.2.1p2
+    // makes reading such an object undefined, and gcc gives it the meaning this
+    // carries: the variable IS its register, so the template sees the register's
+    // content. ✔MEASURED 2026-09-19: `register unsigned long sp asm("sp")` read
+    // on `"r"` returns the stack pointer on gcc 13.3.0 at -O0/-O2 on both
+    // targets; clang 18.1.3 copies the indeterminate value IN (SIGSEGV on
+    // x86-64 at -O0). Only ever set on a pinned input.
+    bool registerAsItStands = false;
+
     // ★★★ EVERY SPELLING THIS OPERAND ANSWERS TO, AS THE TEMPLATE WRITES IT —
     // MINTED BY THE FRONT END, ONLY EVER *COMPARED* HERE AND BELOW. The
     // positional form always, plus the symbolic form when the source named the

@@ -1,3 +1,4 @@
+# PURPOSE: run the manual end-to-end corpus, the entries whose cost makes them wrong to put in a gate, taken deliberately instead.
 name: manual-end-to-end
 description: >-
   Runs the MANUAL end-to-end corpus — the entries whose cost makes them wrong to put in a gate,

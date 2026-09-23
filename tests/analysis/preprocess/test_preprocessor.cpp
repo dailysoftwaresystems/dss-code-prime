@@ -4059,8 +4059,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // identical to C11's `memory_order_*`, so the two spellings share ONE
     // numbering rather than needing a translation.
     // 26 un-gated, 13 pe-gated, 3 macho-gated = 42.
-    EXPECT_EQ(pms.size(), 42u)
-        << "c declares 26 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // P68 round 8 part 4 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): +13
+    // UN-GATED rows, the `__SIZEOF_*__` family (`type-size` rows naming a TYPE,
+    // realized per pair; `tests/analysis/preprocess/test_sizeof_macro_family.cpp`
+    // pins the family itself). Un-gated because whether each is defined is the
+    // PAIR's question — answered by whether the pair realizes the type — not a
+    // format filter's. 39 un-gated, 13 pe-gated, 3 macho-gated = 55.
+    EXPECT_EQ(pms.size(), 55u)
+        << "c declares 39 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -4097,8 +4103,10 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 26u)
-        << "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
+    EXPECT_EQ(ungated, 39u)
+        << "the 13 `__SIZEOF_*__` type-size rows "
+           "(D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING, realized per pair) + "
+           "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
            "kind) + the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
            "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
@@ -5863,12 +5871,20 @@ TEST(Preprocessor, FC15ObjectLikeDanglingPasteFailsLoud) {
 // global tokenize. Two symptoms, both closed:
 //   P0016 -- a quote-`#include` inside `#if 0`/`#if SQLITE_OS_WIN` is no longer
 //            resolved (a missing dead-branch header no longer errors);
-//   P000E -- a `P_IllegalChar` (`$ @ ``) inside a DEAD branch is suppressed,
-//            while an ACTIVE one (a live body, a `#define`/`#if` line, a
-//            `#`-stringized arg, an uninvoked live macro body) STILL reports
-//            (the FIX-1 dead-region oracle keys on the source BYTE's liveness).
+//   P000E -- a `P_IllegalChar` (`@ ``) inside a DEAD branch is suppressed,
+//            while one that is CONVERTED (a live body, an evaluated `#if`
+//            operand, the use of a macro whose body holds it) STILL reports.
+//            ⚠ This header used to add "a `#define` line, a `#`-stringized
+//            arg, an uninvoked live macro body" to the reporting list — the
+//            byte-liveness oracle. ✔REFUTED 2026-09-22 by all four references;
+//            see (4b)–(4d) and
+//            [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]].
 // Every assertion is RED-ON-DISABLE. The completeness pins (tests 2/4/4b/6)
 // prove the fix did not over-suppress.
+// ⓘ `$` left every stray-character witness below when it became an identifier
+// character ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]): a LIVE `$` is a name now and
+// reports nothing, so a pin that expected it to report would red for the wrong
+// reason, and a DEAD one would prove nothing.
 // ============================================================================
 
 // (1) P0016 core: a quote-`#include` of a NONEXISTENT header inside `#if 0` is
@@ -5899,12 +5915,12 @@ TEST(Preprocessor, LiveBranchQuoteIncludeStillErrorsLoud) {
         << "a LIVE-branch missing quote-#include must STILL fail loud";
 }
 
-// (3) P000E core: illegal characters (`$ @ ``) inside `#if 0` are suppressed.
+// (3) P000E core: illegal characters (`@ ``) inside `#if 0` are suppressed.
 // RED-ON-DISABLE: dropping the dead-region promotion (forwarding every
-// provisional P_IllegalChar unconditionally) re-errors the dead `$`/`@`.
+// provisional P_IllegalChar unconditionally) re-errors the dead `@`/`` ` ``.
 TEST(Preprocessor, DeadBranchIllegalCharDoesNotError) {
     PreprocessResult r;
-    auto lexs = ppLexemes("#if 0\n$ @ `\n#endif\nint x;\n", r);
+    auto lexs = ppLexemes("#if 0\n@ `\n#endif\nint x;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "illegal chars inside #if 0 must be elided (no P_IllegalChar)";
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
@@ -5918,64 +5934,84 @@ TEST(Preprocessor, DeadBranchIllegalCharDoesNotError) {
 // bytes) would silence this.
 TEST(Preprocessor, ActiveIllegalCharStillErrorsLoud) {
     PreprocessResult r;
-    (void)ppLexemes("#if 1\n$\n#endif\nint x;\n", r);
+    (void)ppLexemes("#if 1\n@\n#endif\nint x;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "a LIVE-branch illegal char must STILL fail loud";
 }
 
-// (4b) ★ FIX-1 PROOF (the dead-region oracle, NOT the survival oracle): an
-// illegal char on an ACTIVE `#define` LINE still errors. The `$` is consumed by
-// the directive line (it never survives into the final token stream), so the
-// REJECTED "Error token survived" oracle would WRONGLY drop it. The dead-region
-// oracle reports it because its source byte is in a LIVE region.
-// RED-ON-DISABLE: switching the promotion to the survival oracle drops this.
-TEST(Preprocessor, ActiveIllegalCharOnDefineLineStillErrors) {
-    PreprocessResult r;
-    (void)ppLexemes("#define A 1 $\nint x;\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char on an ACTIVE #define line must STILL error (it is "
-           "consumed by the directive, so only the BYTE-liveness oracle catches "
-           "it -- the survival oracle would wrongly drop it)";
+// ── (4b)–(4d): A TOKEN NOBODY CONVERTS IS NOT JUDGED, WHEREVER IT SITS ──────
+//
+// [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]]. These three
+// pins used to assert the OPPOSITE, as "an explicit, asserted choice": a stray
+// character on a live `#define` line, in a stringized argument or in an
+// uninvoked macro body errored, because the gate keyed on the byte's LIVENESS
+// and rejected the "did the token reach the parser" oracle as one that would
+// "wrongly drop" them. ✔MEASURED 2026-09-22, one TU per shape, gcc 13.3.0 and
+// clang 18.1.3 (WSL, `-std=c2x -fsyntax-only`), MinGW gcc (`-std=c2x -c`), MSVC
+// VS 18 (`cl /std:clatest /c`):
+//
+//   | shape                                        | gcc | clang | MinGW | MSVC |
+//   |----------------------------------------------|-----|-------|-------|------|
+//   | `#define X @` never used                     | rc0 | rc0   | rc0   | rc0  |
+//   | `#define S(x) #x` + `S(@)`                   | rc0 | rc0   | rc0   | rc0  |
+//   | `#warning an @ sign`                         | rc0 | rc0   | rc0   | rc0  |
+//   | `#define X @` + `X;` (the token IS converted) | rc1 | rc1   | rc1   | rc2  |
+//   | (the three pins' own `$` shapes)             | rc0 | rc0   | rc0   | rc0  |
+//
+// EVERY reference accepts what these pins refused, and refuses exactly the one
+// shape whose token reaches phase 7. So the gate delivers a conversion
+// diagnostic only for a token that was CONVERTED — one that reached the parser
+// (as itself or as a macro-expansion copy) or sat in an evaluated `#if`/`#elif`
+// operand. ⓘ The witnesses use `@`, not the pins' old `$`: in the same change `$`
+// became an identifier character (C23 6.4.2.1 implementation-defined; all four
+// references accept it), so it is no longer a stray character at all.
+// (4b) and (4d) carry their own CONVERTED twin, and (4c) the product it must
+// still contain, so a gate that stopped judging anything cannot pass them.
+// RED-ON-DISABLE: put the byte-liveness gate back and each accept arm reds.
+
+// (4b) a live `#define` LINE: its replacement list is converted only where the
+// macro is expanded.
+TEST(Preprocessor, IllegalCharOnALiveDefineLineIsJudgedOnlyWhereExpanded) {
+    PreprocessResult unused;
+    (void)ppLexemes("#define A 1 @\nint x;\n", unused);
+    EXPECT_FALSE(hasPPCode(unused, DiagnosticCode::P_IllegalChar))
+        << "a replacement list nobody expands is never converted";
+    EXPECT_FALSE(unused.diagnostics->hasErrors());
+
+    PreprocessResult used;
+    (void)ppLexemes("#define A 1 @\nint x = A;\n", used);
+    EXPECT_TRUE(hasPPCode(used, DiagnosticCode::P_IllegalChar))
+        << "expanded, the `@` reaches the parser and IS converted";
 }
 
-// (4c) FIX-1 (the `#`-stringize variant): an illegal char in a STRINGIZED macro
-// argument still errors. c declares `#` (HashOp), so `#define S(x) #x` +
-// `S($)` consumes the `$` into a `#`-product string -- the original `$` token
-// does NOT survive, so again only the dead-region (byte-liveness) oracle catches
-// it. RED-ON-DISABLE: the survival oracle drops it. (If `#` were out of c
-// scope this case would be covered generically by the same byte-liveness
-// predicate and could be skipped.)
-TEST(Preprocessor, ActiveIllegalCharInStringizedArgStillErrors) {
+// (4c) a STRINGIZED argument: the `#` product is a string literal; the argument
+// token itself never reaches phase 7.
+TEST(Preprocessor, IllegalCharInAStringizedArgumentIsNotJudged) {
     PreprocessResult r;
-    auto lexs = ppLexemes("#define S(x) #x\nint y = S($);\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char in a (live) #-stringized argument must STILL error";
-    // DISCRIMINATOR vs the survival oracle: the `$` was CONSUMED into the
-    // `#`-stringize product (a `"$"` string literal), so it does NOT survive as a
-    // standalone Error token -- yet P_IllegalChar still fired. That co-occurrence
-    // is what only the byte-liveness oracle (not the survival oracle) achieves.
-    bool stringizedDollarPresent = false;
+    auto lexs = ppLexemes("#define S(x) #x\nchar const *y = S(@);\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "a stringized argument is spelled into a string, never converted";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool stringizedAtPresent = false;
     for (auto const& s : lexs) {
-        if (s.find('$') != std::string::npos) stringizedDollarPresent = true;
+        if (s.find('@') != std::string::npos) stringizedAtPresent = true;
     }
-    EXPECT_TRUE(stringizedDollarPresent)
-        << "the `$` must appear inside the #-stringized product (proving it was "
-           "consumed, not surviving as a token) -- so the survival oracle would "
-           "have seen nothing while the byte-liveness oracle still reports it";
+    EXPECT_TRUE(stringizedAtPresent)
+        << "the `@` must survive INSIDE the stringized product — proving the "
+           "argument was consumed, and that nothing was lost to make this pass";
 }
 
-// (4d) FIX-1 (the uninvoked-live-macro-body variant; an EXPLICIT pinned choice):
-// an illegal char in the replacement of a LIVE-region `#define` that is NEVER
-// invoked STILL errors. The `$` byte is in a live region (the `#define` line),
-// so the byte-liveness oracle reports it -- matching today's behavior (the
-// tokenizer sees every byte of the synth buffer). RED-ON-DISABLE: the survival
-// oracle would drop it (an uninvoked macro body never reaches finalTokens).
-TEST(Preprocessor, ActiveUninvokedMacroBodyIllegalCharStillErrors) {
-    PreprocessResult r;
-    (void)ppLexemes("#define M $\nint x;\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char in an uninvoked LIVE macro body still errors (its "
-           "byte is in a live region) -- an explicit, asserted choice";
+// (4d) an UNINVOKED macro body, and its invoked twin.
+TEST(Preprocessor, IllegalCharInAnUninvokedMacroBodyIsNotJudged) {
+    PreprocessResult unused;
+    (void)ppLexemes("#define M @\nint x;\n", unused);
+    EXPECT_FALSE(hasPPCode(unused, DiagnosticCode::P_IllegalChar))
+        << "an uninvoked macro body is never converted";
+
+    PreprocessResult used;
+    (void)ppLexemes("#define M @\nint x = M;\n", used);
+    EXPECT_TRUE(hasPPCode(used, DiagnosticCode::P_IllegalChar))
+        << "invoked, the body's `@` is converted where it lands";
 }
 
 // (5) P0016 via `#ifdef`: a quote-`#include` guarded by `#ifdef SQLITE_OS_WIN`
@@ -6828,13 +6864,13 @@ TEST(Preprocessor, DeadBranchIncludeSkipIsConfigDrivenNotHardcoded) {
 }
 
 // A `#if 0` block combining ALL c17 symptoms (the corpus pattern in unit form):
-// illegal chars `$ @ ``, a quote-`#include` of a missing header, AND a nested
+// illegal chars `@ ``, a quote-`#include` of a missing header, AND a nested
 // `#ifdef SQLITE_OS_WIN #include` -- the whole group elides cleanly.
 TEST(Preprocessor, DeadBranchCombinedGarbageAndIncludeElides) {
     PreprocessResult r;
     auto lexs = ppLexemes(
         "#if 0\n"
-        "$ @ `\n"
+        "@ `\n"
         "#include \"does_not_exist.h\"\n"
         "#ifdef SQLITE_OS_WIN\n"
         "#include \"os_win.h\"\n"
@@ -6855,11 +6891,11 @@ TEST(Preprocessor, DeadBranchCombinedGarbageAndIncludeElides) {
 // that is ENCLOSED by a dead `#if 0` must still be suppressed (the inner branch
 // is dead because its enclosing context is dead). RED-ON-DISABLE: a per-frame
 // (rather than whole-stack) dead test would wrongly treat the inner #else as
-// live and re-error the `$`.
+// live and re-error the `@`.
 TEST(Preprocessor, NestedDeadBranchIllegalCharSuppressed) {
     PreprocessResult r;
     auto lexs = ppLexemes(
-        "#if 0\n#if 1\n$\n#else\n@\n#endif\n#endif\nint x;\n", r);
+        "#if 0\n#if 1\n@\n#else\n`\n#endif\n#endif\nint x;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "illegal chars in a dead-enclosed nested conditional must be elided";
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar));
@@ -6869,22 +6905,22 @@ TEST(Preprocessor, NestedDeadBranchIllegalCharSuppressed) {
 
 // The LIVE arm of a conditional keeps its illegal char an ERROR while the DEAD
 // arm's is suppressed -- the two arms are treated independently by byte. `#if 1`
-// -> `$` in the then-arm errors; the `#else` `@` is dead + suppressed.
+// -> `@` in the then-arm errors; the `#else` `` ` `` is dead + suppressed.
 TEST(Preprocessor, LiveArmErrorsDeadArmSuppressedInSameGroup) {
     PreprocessResult r;
-    (void)ppLexemes("#if 1\n$\n#else\n@\n#endif\nint x;\n", r);
-    // Exactly the live `$` reports; the dead `@` does not. We assert at least
+    (void)ppLexemes("#if 1\n@\n#else\n`\n#endif\nint x;\n", r);
+    // Exactly the live `@` reports; the dead `` ` `` does not. We assert at least
     // the live one fires AND that suppression did not silence it.
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "the LIVE arm's illegal char must report";
-    // Count: there must be exactly ONE illegal-char diagnostic (the live `$`),
-    // proving the dead `@` was suppressed (not 2).
+    // Count: there must be exactly ONE illegal-char diagnostic (the live `@`),
+    // proving the dead `` ` `` was suppressed (not 2).
     int illegalCount = 0;
     for (auto const& d : r.diagnostics->all()) {
         if (d.code == DiagnosticCode::P_IllegalChar) ++illegalCount;
     }
     EXPECT_EQ(illegalCount, 1)
-        << "exactly the LIVE `$` reports; the DEAD `@` is suppressed";
+        << "exactly the LIVE `@` reports; the DEAD `` ` `` is suppressed";
 }
 
 // ============================================================================
@@ -6898,23 +6934,26 @@ TEST(Preprocessor, LiveArmErrorsDeadArmSuppressedInSameGroup) {
 // ★ THE PROVEN c17 SILENT MISCOMPILE, now fixed. `#if __STDC__` is a PREDEFINED-
 // macro guard: the SynthBuilder pre-scan never sees predefined macros, so it
 // folds `__STDC__` -> 0 and calls the branch DEAD -- but the real macro pass
-// materializes `__STDC__` = 1, so the branch is LIVE. A `$` on the live `#define`
-// line is CONSUMED by the directive (it reaches no token stream), so ONLY a
-// byte-liveness oracle keyed on the AUTHORITATIVE pass can catch it. Before
-// Option 1 (the pre-scan dead-region oracle) this compiled SILENTLY. RED-ON-
-// DISABLE: revert the oracle to the pre-scan's `deadRegions` and this `$` is
-// silently dropped again (verified: the pre-scan records the whole `#if __STDC__`
-// body as dead).
+// materializes `__STDC__` = 1, so the branch is LIVE, and a stray character in it
+// must be judged. RED-ON-DISABLE: key the gate on the pre-scan's liveness and
+// this `@` is silently dropped again (verified: the pre-scan records the whole
+// `#if __STDC__` body as dead).
+// ⚠ THE WITNESS MOVED, THE PIN DID NOT. It used to be a `$` on an UNUSED
+// `#define` line inside the branch — a token no phase converts, which every
+// reference accepts ([[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]];
+// and `$` is an identifier character since the same change). The live branch's
+// `@` below reaches the parser, so only a gate that knows the branch is LIVE —
+// the authoritative pass, whose output stream the gate reads — reports it.
 TEST(Preprocessor, PredefinedMacroGuardedLiveIllegalCharStillErrors) {
     PreprocessResult r;
     auto lexs = ppLexemes(
-        "#if __STDC__\n#define UNUSED_MACRO $\nint live_in_stdc_branch;\n"
+        "#if __STDC__\n#define USED_MACRO @\nint live_in_stdc_branch = USED_MACRO;\n"
         "#endif\nint x;\n",
         r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char in a PREDEFINED-macro-guarded LIVE branch (consumed "
-           "by a #define line) must STILL fail loud -- the AUTHORITATIVE oracle "
-           "catches it where the pre-scan oracle silently dropped it";
+        << "an illegal char in a PREDEFINED-macro-guarded LIVE branch must STILL "
+           "fail loud -- the AUTHORITATIVE pass passes it to the parser, where "
+           "the pre-scan oracle silently dropped it";
     // GUARD AGAINST FALSE GREEN: prove `#if __STDC__` is genuinely LIVE here, so
     // the assertion above can't pass for the WRONG reason (the branch going dead).
     // The live-branch declaration must survive into the token stream.
@@ -6930,11 +6969,11 @@ TEST(Preprocessor, PredefinedMacroGuardedLiveIllegalCharStillErrors) {
 
 // An UNTERMINATED dead `#if 0` (no `#endif`): the dead illegal chars up to EOF
 // are suppressed (no double-report), but the missing-`#endif` STILL fails loud.
-// RED-ON-DISABLE: dropping the EOF dead-span close re-errors the dead `$`/`@`/`` ` ``;
+// RED-ON-DISABLE: dropping the EOF dead-span close re-errors the dead `@`/`` ` ``;
 // dropping the unterminated-conditional check silences the structural error.
 TEST(Preprocessor, UnterminatedDeadBranchSuppressesCharsButErrorsUnterminated) {
     PreprocessResult r;
-    (void)ppLexemes("#if 0\n$ @ `\n", r);
+    (void)ppLexemes("#if 0\n@ `\n", r);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "illegal chars in an unterminated dead `#if 0` must be suppressed (the "
            "EOF dead-span close covers them)";
@@ -6942,21 +6981,21 @@ TEST(Preprocessor, UnterminatedDeadBranchSuppressesCharsButErrorsUnterminated) {
         << "the unterminated conditional (missing #endif) must STILL fail loud";
 }
 
-// A LIVE-outer / DEAD-inner nest: `#if 1 { $ } #if 0 { @ }`. The authoritative
+// A LIVE-outer / DEAD-inner nest: `#if 1 { @ } #if 0 { ` }`. The authoritative
 // recorder must open a dead range ONLY for the inner dead group -- the live-outer
-// `$` is in NO dead range and must report. RED-ON-DISABLE: a per-frame (not
-// whole-stack) or sloppy boundary recorder swallows the live `$`.
+// `@` is in NO dead range and must report. RED-ON-DISABLE: a per-frame (not
+// whole-stack) or sloppy boundary recorder swallows the live `@`.
 TEST(Preprocessor, LiveOuterDeadInnerNestReportsLiveSuppressesInner) {
     PreprocessResult r;
-    (void)ppLexemes("#if 1\n$\n#if 0\n@\n#endif\n#endif\nint x;\n", r);
+    (void)ppLexemes("#if 1\n@\n#if 0\n`\n#endif\n#endif\nint x;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "the LIVE-outer `$` must report";
+        << "the LIVE-outer `@` must report";
     int illegalCount = 0;
     for (auto const& d : r.diagnostics->all()) {
         if (d.code == DiagnosticCode::P_IllegalChar) ++illegalCount;
     }
     EXPECT_EQ(illegalCount, 1)
-        << "exactly the live-outer `$` reports; the dead-inner `@` is suppressed";
+        << "exactly the live-outer `@` reports; the dead-inner `` ` `` is suppressed";
 }
 
 // (FIX-3, the nullopt arm) a guard the pre-scan cannot evaluate as an ICE (an
@@ -6974,9 +7013,9 @@ TEST(Preprocessor, UnevaluableGuardSkipsIncludeConservatively) {
 
 // AGNOSTICISM (RED-ON-DISABLE), the `#endif` word: the dead-region CLOSE boundary
 // reads `endifDirective` from config, not a hard-coded "endif". Rebind it to
-// "endwhile": after `#endwhile` the `#if 0` reactivates, so a following `$` is
+// "endwhile": after `#endwhile` the `#if 0` reactivates, so a following `@` is
 // LIVE and must report. RED-ON-DISABLE: hard-coding "endif" leaves `#endwhile`
-// unrecognized -> the `#if 0` stays open -> the live `$` is wrongly suppressed.
+// unrecognized -> the `#if 0` stays open -> the live `@` is wrongly suppressed.
 TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
@@ -6987,10 +7026,10 @@ TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
     ASSERT_EQ(schema->preprocess().endifDirective, "endwhile");
 
     auto buf = SourceBuffer::fromString(
-        std::string{"#if 0\n#endwhile\n$\nint x;\n"}, "main.c");
+        std::string{"#if 0\n#endwhile\n@\nint x;\n"}, "main.c");
     PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "the dead-region close must use the CONFIG `#endwhile`, so the `$` "
+        << "the dead-region close must use the CONFIG `#endwhile`, so the `@` "
            "AFTER it is LIVE and reports -- not a hard-coded `#endif`";
 }
 

@@ -194,6 +194,30 @@ dss_add_test(NAME analysis/semantic/test_paren_declarator_function
 target_include_directories(dss_analysis_semantic_test_paren_declarator_function
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
+# P68 round 8 lane `ht` part 2: what a C function type may spell and when its types
+# must be complete -- C 6.7.6.3p1 at the function suffix, C 6.9.1p3 / 6.7.6.3p4 in a
+# definition, C 6.5.2.2p1/p4 at a call (positionally, C 6.2.5p1), and the `(void)` /
+# named-void parameter rules, each against its MEASURED reference verdict. Every
+# refusal sits beside its nearest accepting twin, because the refusing half alone
+# passes under a check that refuses everything. The runnable half of the named-void
+# meaning is `examples/c/named_void_param_prototype/`.
+dss_add_test(NAME analysis/semantic/test_function_type_completeness
+             SOURCES test_function_type_completeness.cpp)
+target_include_directories(dss_analysis_semantic_test_function_type_completeness
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 8 lane `ht`: a `const` / `restrict` reached through a TYPEDEF claims
+# what its written-out spelling claims — the object's own const, a deeper level's,
+# an array typedef's elements, the C23 redeclaration axis, a qualified void
+# parameter and a typedef's redefinition — each beside its accepting twin. The
+# section it places a global in is pinned at MIR
+# (`MirLoweringC.AGlobalDeclaredThroughAConstTypedefIsReadOnlyData`), the constant
+# fold it enables by `examples/c/const_typedef_folds_array_dimension/`.
+dss_add_test(NAME analysis/semantic/test_const_through_typedef
+             SOURCES test_const_through_typedef.cpp)
+target_include_directories(dss_analysis_semantic_test_const_through_typedef
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P44 lane a: [[D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED]],
 # [[D-LANG-TYPE-IDENTITY-QUALIFIER-BLIND-VS-C23-REDECL]] and
 # [[D-CSUBSET-INCOMPATIBLE-REDECL-DIAGNOSED-AT-CALL-SITE-NOT-DECLARATION]] --

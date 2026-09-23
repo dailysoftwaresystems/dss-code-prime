@@ -320,7 +320,7 @@ TEST(LspSemantic, SignatureHelpReturnsExactCalleeSignature) {
 
 // SE7 staleness — directly drive the DocumentStore. After a model is
 // stored at gen N, an update() bumps the generation; a SUBSEQUENT
-// setSemanticModel against the old gen must be rejected (return false)
+// `setAnalyses` against the old gen must be rejected (return false)
 // and must NOT overwrite the stored model.
 //
 // Uses REAL SemanticModel instances (built via buildShippedUnit +
@@ -329,7 +329,7 @@ TEST(LspSemantic, SignatureHelpReturnsExactCalleeSignature) {
 // the same tiny source so they're distinct objects with distinct
 // addresses, letting the test pin "stored model unchanged" by pointer
 // identity.
-TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
+TEST(LspSemantic, StaleStoredModelIsNotOverwritten) {
     using dss::sem_test::buildShippedUnit;
 
     auto cuOld = buildShippedUnit("c", {"int x;\n"});
@@ -340,10 +340,22 @@ TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
         dss::analyze(cuNew, dss::DiagnosticBudget::libraryDefault()));
     ASSERT_NE(modelOld.get(), modelNew.get());
 
+    auto const analysesWith = [](std::shared_ptr<dss::SemanticModel const> m) {
+        dss::lsp::DocumentAnalysis a;
+        a.model = std::move(m);
+        std::vector<dss::lsp::DocumentAnalysis> out;
+        out.push_back(std::move(a));
+        return out;
+    };
+    auto const storedModel = [](DocumentStore const& s) {
+        auto const all = s.analysesFor("file:///s.c");
+        return all.empty() ? nullptr : all.front().model.get();
+    };
+
     DocumentStore store;
     store.open("file:///s.c", 1, "int x;\n", nullptr);
-    ASSERT_TRUE(store.setSemanticModel("file:///s.c", 0, modelOld));
-    EXPECT_EQ(store.semanticModelFor("file:///s.c").get(), modelOld.get());
+    ASSERT_TRUE(store.setAnalyses("file:///s.c", 0, analysesWith(modelOld)));
+    EXPECT_EQ(storedModel(store), modelOld.get());
 
     // An update bumps the generation — anything keyed on gen 0 is now stale.
     auto newGen = store.update("file:///s.c", 2, "int y;\n");
@@ -352,9 +364,9 @@ TEST(LspSemantic, StaleSetSemanticModelIsDropped) {
 
     // A delayed worker storing its (gen 0) model must be rejected AND
     // must not overwrite the stored one.
-    EXPECT_FALSE(store.setSemanticModel("file:///s.c", 0, modelNew));
-    EXPECT_EQ(store.semanticModelFor("file:///s.c").get(), modelOld.get())
-        << "stale setSemanticModel must NOT overwrite the stored model";
+    EXPECT_FALSE(store.setAnalyses("file:///s.c", 0, analysesWith(modelNew)));
+    EXPECT_EQ(storedModel(store), modelOld.get())
+        << "a stale `setAnalyses` must NOT overwrite the stored model";
 }
 
 // SE7 diagnostic union: didOpen of a c doc containing a

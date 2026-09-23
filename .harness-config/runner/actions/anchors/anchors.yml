@@ -1,0 +1,14 @@
+# PURPOSE: read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled.
+name: anchors
+description: >-
+  The action proves the registry row reader and writer can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `anchors_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./anchors.py --self-test
+    successPattern: 'anchors self-test: 0 failed'
+    requireInputsUnmoved: true

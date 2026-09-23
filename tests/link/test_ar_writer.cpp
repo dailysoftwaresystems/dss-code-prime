@@ -41,6 +41,7 @@
 #include "link/format/elf.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/compile_pipeline.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -406,10 +407,14 @@ TEST(ArWriter, PipelineStaticArchiveFromRealDssObject) {
     AssembledModule mod = makeFnModule({"dss_lib_answer", "dss_data"});
     std::string const memberName = "lib.o";
 
-    auto const outPath = std::filesystem::temp_directory_path()
-                       / "dss_ar_pipeline_test_libdsslib.a";
+    // A per-PROCESS directory (`ScratchDir`): the constant
+    // `temp/dss_ar_pipeline_test_libdsslib.a` was one file per MACHINE, which a
+    // concurrent run from another build tree could remove or rewrite between
+    // this run's write and its read-back (the P68 round 8 cross-tree temp race).
+    dss::test_support::ScratchDir const scratch{
+        dss::test_support::Location::Temp, "ar-writer"};
+    auto const outPath = scratch.path() / "libdsslib.a";
     std::error_code ec;
-    std::filesystem::remove(outPath, ec);
 
     DiagnosticReporter rep;
     bool const ok = linkAndWriteStaticArchive(
@@ -447,8 +452,11 @@ TEST(ArWriter, PipelineRejectsImageFlavorFormat) {
     ASSERT_TRUE(t.has_value() && f.has_value());
     AssembledModule mod = makeFnModule({"dss_lib_answer"});
     std::string const name = "lib.o";
-    auto const outPath = std::filesystem::temp_directory_path()
-                       / "dss_ar_reject_imageflavor.a";
+    // Per PROCESS, like every path this binary may write: a regression that
+    // wrote the refused archive must not land on a name another tree shares.
+    dss::test_support::ScratchDir const scratch{
+        dss::test_support::Location::Temp, "ar-writer"};
+    auto const outPath = scratch.path() / "reject_imageflavor.a";
     DiagnosticReporter rep;
     bool const ok = linkAndWriteStaticArchive(
         std::span<AssembledModule const>{&mod, 1},

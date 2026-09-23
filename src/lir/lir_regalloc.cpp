@@ -7,6 +7,7 @@
 // pre-coloring hint rather than re-derived. A .cpp-level dependency only:
 // `lir_callconv.hpp` includes `lir_regalloc.hpp` (for `LirAllocation`), so the
 // edge runs one way and no header cycle is created.
+#include "lir/lir_asm_region.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -332,16 +333,29 @@ computeReloadReserve(Lir const& lir, TargetSchema const& schema,
             // already dominate it. The `store_outgoing_arg` carriers the wide-call
             // pass emits are NON-call single-operand insts, still counted below.
             if (info != nullptr && info->isCall) continue;
+            // ★ P68 round 8 part 4 — AN INLINE-ASM BUNDLE IS EXCLUDED TOO, and
+            // for the calls' reason: its demand is not this reserve's to meet.
+            // A bundle names EVERY operand of its statement at once (fifteen on
+            // an x86_64 statement gcc and clang both accept), so counting it
+            // here would hold that many registers out of the allocatable pool
+            // for the WHOLE function, for one program point. Its operands are
+            // short ranges the linear scan places by eviction; one that still
+            // spills is reloaded by the rewriter into a register nothing in the
+            // function was given — this reserve's own registers among them —
+            // and the rewriter refuses by name when none is left
+            // (`L_AsmRegionOperandUnallocatable`).
+            if (lir.instAsmRegion(inst) != nullptr) continue;
             std::array<std::uint16_t, kLirRegClassCount> demand{};
             auto const bump = [&](LirReg r) {
                 if (!r.valid() || r.isPhysical != 0) return;
                 std::size_t const c = static_cast<std::size_t>(r.regClass());
                 if (c < demand.size()) ++demand[c];
             };
-            for (auto const& o : lir.instOperands(inst)) {
-                if (o.kind == LirOperandKind::Reg) bump(o.reg);
-            }
-            bump(lir.instResult(inst));
+            // Every register OCCURRENCE the rewriter resolves: each read, then
+            // each write (the one helper's two questions — a register named as
+            // both, like a 2-address op's tied operand, is resolved twice).
+            lirForEachInstUse(lir, inst, bump);
+            lirForEachInstDef(lir, inst, [&](LirReg r, bool) { bump(r); });
             for (std::size_t c = 0; c < reserve.size(); ++c) {
                 if (demand[c] > reserve[c]) reserve[c] = demand[c];
             }
@@ -477,7 +491,10 @@ collectArgRegisterOccupied(Lir const& lir, TargetSchema const& schema,
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const inst = lir.blockInstAt(b, i);
             if (lir.instOpcode(inst) == *argOp) {
-                LirReg const res = lir.instResult(inst);
+                // The register this `arg` DEFINES — asked of the one helper,
+                // which for an `arg` names exactly its result.
+                LirReg res = InvalidLirReg;
+                lirForEachInstDef(lir, inst, [&](LirReg r, bool) { res = r; });
                 if (res.valid() && res.isPhysical == 0) {
                     LirRegClass const cls = res.regClass();
                     // Shared with the rewriter's spill-scratch forbid
@@ -1143,12 +1160,28 @@ lirMaxStatedAccessWidthBits(Lir const& lir, LirFuncLiveness const& flow) {
         std::uint32_t const n = lir.blockInstCount(blk);
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const  inst = lir.blockInstAt(blk, i);
-            std::uint8_t const bits = lirInstWidthBits(lir.instFlags(inst));
-            note(lir.instResult(inst), bits);
-            for (auto const& o : lir.instOperands(inst)) {
-                if (o.kind != LirOperandKind::Reg) continue;
-                note(o.reg, bits);
+            // ★ P68 round 8 part 4 — A BUNDLE STATES NO WIDTH OF ITS OWN; ITS
+            // TEMPLATE DOES. The statement's widths live in its body, one per
+            // template instruction, and the flat lowering this bundle replaced
+            // showed each of them to this census. Crediting a bundle operand
+            // with the bundle's own (default, 64-bit) flags would UNDER-state a
+            // 128-bit template access to an `"x"` operand, and this census is
+            // the coalescer's only defence against merging a 64-bit copy into a
+            // value the template then reads whole — the admit direction, which
+            // is the unsafe one.
+            if (LirAsmRegion const* region = lir.instAsmRegion(inst);
+                region != nullptr) {
+                auto const widths = lirAsmRegionSlotAccessWidthBits(*region);
+                auto const ops = lir.instOperands(inst);
+                for (std::size_t k = 0; k < ops.size() && k < widths.size(); ++k) {
+                    if (ops[k].kind != LirOperandKind::Reg) continue;
+                    note(ops[k].reg, widths[k]);
+                }
+                continue;
             }
+            std::uint8_t const bits = lirInstWidthBits(lir.instFlags(inst));
+            lirForEachInstDef(lir, inst, [&](LirReg r, bool) { note(r, bits); });
+            lirForEachInstUse(lir, inst, [&](LirReg r) { note(r, bits); });
         }
     }
     return widest;
@@ -1405,6 +1438,12 @@ collectCoalesceInput(Lir const& lir, TargetSchema const& schema,
             auto const  opcode = lir.instOpcode(inst);
             auto const* info   = schema.opcodeInfo(opcode);
             if (info == nullptr) continue;
+            // ★ P68 round 8 part 4: an inline-asm bundle is none of the shapes
+            // below (2-address op, call, return, copy) — its definitions are
+            // its operand ROLES (`lirForEachInstDef`), not the result field the
+            // arms below read, and the statement's operands are copied in and
+            // out by moves that carry its constraint and are never coalesced.
+            if (lir.instAsmRegion(inst) != nullptr) continue;
             LirReg const result = lir.instResult(inst);
             auto const   ops    = lir.instOperands(inst);
 
@@ -2362,6 +2401,28 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 appendEffectiveForbiddenOrdinals(lir, schema,
                                                  producingInst,
                                                  excludedScratch);
+            }
+            // ★★ P68 round 8 part 4 — AN INLINE-ASM STATEMENT'S OUTPUT AVOIDS
+            // THE STATEMENT'S CLOBBERED SET. The bundle defines an output at its
+            // LATE slot (an earlyclobber one at its EARLY slot), and the
+            // covering-range rule below consults the clobber entry at the EARLY
+            // slot — so a plain output's range, which starts one slot later,
+            // is never reached by it: the same gap the FC3.5 note above records
+            // for a 2-address result. GCC forbids an operand in a clobbered
+            // register outright, because the template may overwrite that
+            // register after it wrote the output. The flat lowering this
+            // replaced got the rule by accident, from whichever template line
+            // came after the defining one; the last line's output got nothing.
+            // Asked of the one helper: does THIS bundle define THIS vreg?
+            if (lir.instAsmRegion(producingInst) != nullptr) {
+                bool definesMember = false;
+                lirForEachInstDef(lir, producingInst, [&](LirReg d, bool) {
+                    if (d == mr.vreg) definesMember = true;
+                });
+                if (definesMember) {
+                    appendClobberedOrdinals(lir, schema, producingInst,
+                                            excludedScratch);
+                }
             }
         }
         }  // end per-member exclusion walk

@@ -170,7 +170,8 @@ void DiagnosticReporter::reanchorFrom(std::size_t      from,
     }
 }
 
-std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
+std::optional<DiagnosticSeverity>
+DiagnosticReporter::effectiveSeverity(DiagnosticCode code, DiagnosticSeverity severity) const {
     // The unsuppressable-codes table's refined contract (eb2c6c7 audit-fold 2026-06-01):
     // unsuppressable codes bypass SILENCING (`--suppress` drops +
     // `overrides` demotion) so they always reach `all_`. Elevation
@@ -186,18 +187,73 @@ std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d
     // the unsuppressable arm, one after silencing); the single-flip
     // shape makes "elevation is universal; only silencing is gated
     // by unsuppressable" the literal control flow.
-    if (!isUnsuppressable(d.code)) {
-        if (cfg_.policy.suppress.contains(d.code)) {
+    //
+    // ★ P68 (lane `ht`): the rules moved here out of `applyPolicy`, unchanged,
+    // so they can be ASKED without reporting — `HirVerifier` judges each finding
+    // by this answer — while `report` still applies exactly this answer. One
+    // owner; a second copy of these rules is the drift the shape note above
+    // already removed once.
+    if (!isUnsuppressable(code)) {
+        // ★ AN ERROR IS NEVER SILENCED — decided by the EMITTED severity, per
+        // emission ([[D-DIAG-SUPPRESSING-AN-ERROR-REPORTS-A-FALSE-INTERNAL-FAILURE]]).
+        // Every tier judges its OWN unpolicied reporter (`DiagnosticBudget`: the
+        // policy runs only at the drain), so a suppressed Error still stops its
+        // stage and only its REPORT vanished. ✔MEASURED through the CLI: a
+        // suppressed S_ArgCountMismatch, S_InvalidFunctionDeclarator or
+        // S_UndeclaredIdentifier ended in the driver's own "internal … substrate-
+        // contract violation", and a suppressed P_BacktrackFailed in nothing but
+        // `D_LaterPhasesNotRun` — rc 1 and no artifact every time, the cause
+        // hidden or misnamed. So `--suppress` silences warnings and notes and
+        // never an Error, gcc's, clang's and MSVC's rule; `report` announces
+        // the refused request once per code. The EMITTED severity decides, not
+        // the promoted one: `--warnings-as-errors` promotes AFTER this, so a
+        // suppressed warning stays silenced (gcc's `-Werror -Wno-x`).
+        if (cfg_.policy.suppress.contains(code)
+            && severity != DiagnosticSeverity::Error) {
             return std::nullopt;
         }
-        if (auto it = cfg_.policy.overrides.find(d.code); it != cfg_.policy.overrides.end()) {
-            d.severity = it->second;
+        if (auto it = cfg_.policy.overrides.find(code); it != cfg_.policy.overrides.end()) {
+            severity = it->second;
         }
     }
-    if (cfg_.policy.warningsAsErrors && d.severity == DiagnosticSeverity::Warning) {
-        d.severity = DiagnosticSeverity::Error;
+    if (cfg_.policy.warningsAsErrors && severity == DiagnosticSeverity::Warning) {
+        severity = DiagnosticSeverity::Error;
     }
+    return severity;
+}
+
+std::optional<ParseDiagnostic> DiagnosticReporter::applyPolicy(ParseDiagnostic d) const {
+    // The verdict is `effectiveSeverity`'s — see there for the rules.
+    std::optional<DiagnosticSeverity> const severity = effectiveSeverity(d.code, d.severity);
+    if (!severity.has_value()) return std::nullopt;
+    d.severity = *severity;
     return d;
+}
+
+// ONCE PER CODE, AND "ONCE" IS READ OFF THE STORED DIAGNOSTICS — the reporter
+// keeps no memory of its own for it. A speculative rollback (`truncateTo`) that
+// removes the notice therefore also removes the only record that it was said,
+// and the next such Error says it again: exactly one notice per code survives in
+// what the operator sees, with nothing to trail. The scan runs only for an Error
+// whose code the operator asked to suppress.
+void DiagnosticReporter::announceRefusedErrorSuppression_(DiagnosticCode code) {
+    std::string_view const name = diagnosticCodeName(code);
+    std::string const lead = std::format("--suppress={} had no effect", name);
+    for (ParseDiagnostic const& e : all_) {
+        if (e.code == DiagnosticCode::D_SuppressRequestIgnored
+            && e.actual.starts_with(lead)) {
+            return;
+        }
+    }
+    ParseDiagnostic notice;
+    notice.code     = DiagnosticCode::D_SuppressRequestIgnored;
+    notice.severity = DiagnosticSeverity::Warning;
+    notice.actual   = std::format(
+        "{0} on an ERROR: {1} stops the build whether or not it is reported, so "
+        "--suppress silences warnings and notes only, and this error is reported "
+        "as usual. Use --suppress=D_SuppressRequestIgnored to silence this notice.",
+        lead, name);
+    report(std::move(notice));
 }
 
 namespace {
@@ -466,6 +522,12 @@ bool DiagnosticReporter::isRecentDuplicate(ParseDiagnostic const& d) const noexc
 }
 
 void DiagnosticReporter::report(ParseDiagnostic d) {
+    // An Error whose code the operator asked to suppress is reported anyway
+    // (`effectiveSeverity`), and the refused request is SAID, once per code.
+    if (d.severity == DiagnosticSeverity::Error && !isUnsuppressable(d.code)
+        && cfg_.policy.suppress.contains(d.code)) {
+        announceRefusedErrorSuppression_(d.code);
+    }
     // Policy first so the unsuppressable check below sees the post-
     // policy code. See `applyPolicy` above for the canonical
     // silencing-vs-elevation contract.

@@ -31,11 +31,6 @@ target_link_libraries(integrated_tests
 target_include_directories(integrated_tests
     PRIVATE
         ${CMAKE_SOURCE_DIR}/tests/test_support
-        # `loader_search_path.hpp` — the value BOTH corpus runners hand a spawned
-        # arm's loader, from ONE definition. It sits beside the in-process runner
-        # only because `tests/test_support/` was another lane's for the round
-        # that added it; its home is there, and moving it deletes this line.
-        ${CMAKE_SOURCE_DIR}/tests/examples
 )
 # Same repo root the `tests/` targets bake in (tests/CMakeLists.txt,
 # dss_add_test), so `tests/test_support/repo_root.hpp` resolves here too.

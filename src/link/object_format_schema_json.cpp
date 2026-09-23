@@ -357,7 +357,16 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 39> kFormatDocumentKeys{
+    // RE-DERIVED in P68 round 8 (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): two new
+    // root keys — `runpath` (WHERE an image of this format records the
+    // directories its loader searches for its libraries) and its remedy axis
+    // `runpathUnsupportedReason` (where the loader of an image format that
+    // records none looks instead). Both OPTIONAL, so the asymmetry applies in
+    // its harmless direction for every document that declares neither; the
+    // ten `runpath` documents and the two `runpathUnsupportedReason` ones land
+    // in the same change. 39 + 2 = 41 — the array's declared extent, checked
+    // by `DSS_CHECK_KEY_VOCABULARY`, not by this sentence.
+    static constexpr std::array<std::string_view, 41> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -429,6 +438,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "runtimeLibraries", "sehPersonality", "atomicsRuntime",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
+        // where an image records its library search path (DT_RUNPATH /
+        // LC_RPATH), and its remedy axis. A typo in the first would leave the
+        // ten image documents that declare it recording NOTHING while the gate
+        // accepted every request.
+        "runpath", "runpathUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
         // A typo here does NOT silently default: the walker refuses
         // an unanswered schema the moment it meets a weak definition, so the
@@ -2542,6 +2556,200 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             } else {
                 data.stackReserveUnsupportedReason = *r;
             }
+        }
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `runpath` block — WHETHER an image
+    // of this format records the directories its loader searches for its
+    // libraries, and in WHICH structure. PRESENCE is the capability: the gate
+    // and both writers ask `runpath().has_value()`, never a format identity,
+    // and a request against a format that declares nothing is ACCEPTED with a
+    // warning (both PE references accept it and emit nothing — measured).
+    //
+    // This tier reads the KEYS, and they are closed PER CARRIER: `dynamicTag`
+    // and `separator` belong to `elf-dynamic-entry`, `loadCommand` to
+    // `macho-load-command`, and a key of the other arm would load clean and be
+    // read by nothing, so it is refused by name. The VALUES are judged by
+    // `validate()`, through the one rule set the writers run too
+    // (`runpathDeclarationProblems`) plus the two rules that need the backend.
+    if (doc.contains("runpath")) {
+        auto const& rp = doc.at("runpath");
+        if (!rp.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/runpath",
+                      std::format("'runpath' must be an object {{ \"carrier\": "
+                                  "{}, \"origin\": \"<this format's spelling of "
+                                  "the image's own directory>\", <the carrier's "
+                                  "own keys> }}",
+                                  allowedList(allNames(kRunpathCarrierTable),
+                                              " | ")));
+        } else {
+            static constexpr std::array<std::string_view, 2> kCommonKeys{
+                "carrier", "origin"};
+            static constexpr std::array<std::string_view, 2> kElfArmKeys{
+                "dynamicTag", "separator"};
+            static constexpr std::array<std::string_view, 1> kMachOArmKeys{
+                "loadCommand"};
+            DSS_CHECK_KEY_VOCABULARY(kCommonKeys);
+            DSS_CHECK_KEY_VOCABULARY(kElfArmKeys);
+            DSS_CHECK_KEY_VOCABULARY(kMachOArmKeys);
+            auto const armKeys = [](RunpathCarrier c)
+                -> std::span<std::string_view const> {
+                switch (c) {
+                    case RunpathCarrier::ElfDynamicEntry:  return kElfArmKeys;
+                    case RunpathCarrier::MachoLoadCommand: return kMachOArmKeys;
+                    case RunpathCarrier::Unspecified:      break;
+                }
+                return {};
+            };
+            auto const armOwning = [&](std::string_view key) -> std::string_view {
+                for (auto const& row : kRunpathCarrierTable.rows) {
+                    for (std::string_view k : armKeys(row.first)) {
+                        if (k == key) return row.second;
+                    }
+                }
+                return {};
+            };
+
+            RunpathDeclaration decl{};
+            bool ok = true;
+            if (!rp.contains("carrier") || !rp.at("carrier").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/runpath/carrier",
+                          std::format("'runpath.carrier' is required and must "
+                                      "be a string — accepted: {}",
+                                      allowedList(
+                                          allNames(kRunpathCarrierTable), ", ")));
+                ok = false;
+            } else {
+                auto const s = rp.at("carrier").get<std::string>();
+                auto const c = runpathCarrierFromName(s);
+                if (!c.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/runpath/carrier",
+                              std::format("unknown runpath carrier '{}' — "
+                                          "accepted: {}. A carrier names a "
+                                          "structure some walker records; a "
+                                          "spelling none records would accept "
+                                          "every request and write nothing.",
+                                          s,
+                                          allowedList(
+                                              allNames(kRunpathCarrierTable),
+                                              ", ")));
+                    ok = false;
+                } else {
+                    decl.carrier = *c;
+                }
+            }
+            if (ok) {
+                // `common + the declared arm's own`: a key of the OTHER arm is
+                // named as such, not as a typo.
+                std::vector<std::string_view> allowed{kCommonKeys.begin(),
+                                                      kCommonKeys.end()};
+                for (std::string_view k : armKeys(decl.carrier)) {
+                    allowed.push_back(k);
+                }
+                rejectUnknownArmKeys(rp, allowed, "/runpath",
+                                     "the 'runpath' block",
+                                     runpathCarrierName(decl.carrier),
+                                     armOwning, coll);
+            } else {
+                // No arm could be resolved: still refuse what belongs to NO
+                // arm, so a typo is not hidden behind the carrier diagnostic.
+                std::vector<std::string_view> anyArm{kCommonKeys.begin(),
+                                                     kCommonKeys.end()};
+                anyArm.insert(anyArm.end(), kElfArmKeys.begin(), kElfArmKeys.end());
+                anyArm.insert(anyArm.end(), kMachOArmKeys.begin(),
+                              kMachOArmKeys.end());
+                rejectUnknownKeys(rp, anyArm, "/runpath", "the 'runpath' block",
+                                  coll);
+            }
+
+            auto const readString = [&](char const* key, std::string& out) {
+                auto const ptr = std::string{"/runpath/"} + key;
+                if (!rp.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, ptr,
+                              std::format("'runpath.{}' is required for carrier "
+                                          "'{}'", key,
+                                          runpathCarrierName(decl.carrier)));
+                    ok = false;
+                    return;
+                }
+                if (!rp.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, ptr,
+                              std::format("'runpath.{}' must be a string", key));
+                    ok = false;
+                    return;
+                }
+                out = rp.at(key).get<std::string>();
+            };
+            auto const readUnsigned = [&](char const* key, std::uint64_t max,
+                                          std::uint64_t& out) {
+                auto const ptr = std::string{"/runpath/"} + key;
+                if (!rp.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, ptr,
+                              std::format("'runpath.{}' is required for carrier "
+                                          "'{}'", key,
+                                          runpathCarrierName(decl.carrier)));
+                    ok = false;
+                    return;
+                }
+                // `is_number_unsigned` refuses a negative and a float in one
+                // check, so a `-1` can never wrap into a huge value.
+                if (!rp.at(key).is_number_unsigned()
+                    || rp.at(key).get<std::uint64_t>() > max) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, ptr,
+                              std::format("'runpath.{}' must be a non-negative "
+                                          "integer no greater than {}", key, max));
+                    ok = false;
+                    return;
+                }
+                out = rp.at(key).get<std::uint64_t>();
+            };
+
+            if (ok) {
+                readString("origin", decl.origin);
+                switch (decl.carrier) {
+                    case RunpathCarrier::ElfDynamicEntry:
+                        readUnsigned("dynamicTag",
+                                     std::numeric_limits<std::uint64_t>::max(),
+                                     decl.dynamicTag);
+                        readString("separator", decl.separator);
+                        break;
+                    case RunpathCarrier::MachoLoadCommand: {
+                        std::uint64_t cmd = 0;
+                        readUnsigned("loadCommand",
+                                     std::numeric_limits<std::uint32_t>::max(),
+                                     cmd);
+                        decl.loadCommand = static_cast<std::uint32_t>(cmd);
+                        break;
+                    }
+                    case RunpathCarrier::Unspecified:
+                        break;
+                }
+            }
+            if (ok) data.runpath = std::move(decl);
+        }
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `runpathUnsupportedReason` — the
+    // REMEDY axis, the `stackReserveUnsupportedReason` shape. Not a second
+    // capability: it declares WHERE this image format's loader finds a library
+    // when the format records no runpath, so the warning can say so. The
+    // exclusivity with `runpath` and the image-flavor rule are `validate()`'s.
+    if (doc.contains("runpathUnsupportedReason")) {
+        auto const& rr = doc.at("runpathUnsupportedReason");
+        std::optional<RunpathUnsupportedReason> reason;
+        if (rr.is_string()) {
+            reason = runpathUnsupportedReasonFromName(rr.get<std::string>());
+        }
+        if (!reason.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/runpathUnsupportedReason",
+                      std::format("'runpathUnsupportedReason' must be one of: "
+                                  "{}",
+                                  allowedList(
+                                      allNames(kRunpathUnsupportedReasonTable),
+                                      ", ")));
+        } else {
+            data.runpathUnsupportedReason = *reason;
         }
     }
 

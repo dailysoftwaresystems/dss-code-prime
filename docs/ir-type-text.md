@@ -149,7 +149,11 @@ The name is a quoted string literal; members are comma-separated types until the
 
 **`opaque`** marks an **incomplete** composite (a tag declared but not defined). It is terminal — no field list follows — and it is *not* interchangeable with `{ }`, which is a legal **complete** zero-member composite. Both `struct` and `union` accept it.
 
-**`rec <H>`** marks a composite whose own type graph reaches itself, and **`rec <H>` in type position** is the back-reference that closes the cycle. `H` is a handle for the *composite*, artifact-local and 1-based, and the same composite carries the same handle everywhere in one document — which is what lets a mutually recursive pair be written down, since one type then has two different spellings in one file. A back-reference resolves only against composites **currently open** at that point; a handle of `0`, a back-reference to a closed composite, and one handle carrying two different bodies are each refused by name. See [`hir-text-format.md` §5.1](./hir-text-format.md) for the worked mutual-recursion example and what a reader that re-interns must do about it.
+**`rec <H>`** marks a composite whose own type graph reaches itself, and **`rec <H>` in type position** is the back-reference that closes the cycle. `H` is a handle for the *composite*, artifact-local and 1-based, and the same composite carries the same handle everywhere in one text — which is what lets a mutually recursive pair be written down, since one type then has two different spellings in one text. A back-reference resolves only against composites **currently open** at that point; a handle of `0`, a back-reference to a closed composite, and one handle carrying two different bodies are each refused by name.
+
+**⚠ Inline composites and `rec <H>` are the STANDALONE form.** A `.dsshir` *module* (format v5) defines every composite ONCE, in its `types` section, and names it everywhere else as **`type <H>`** — so in a module an inline `struct "N" {…}`, `union "N" {…}` or `rec <H>` is refused by name, and `type <H>` is the only composite spelling. A standalone type text — every FFI-descriptor signature `parseTypeFromText` decodes — has no `types` table, so it keeps every form in this section unchanged and refuses `type <H>` instead, by name, as module-only. See [`hir-text-format.md` §4.7 and §5.1](./hir-text-format.md) for the table, the cycle and mutual-recursion examples, and what a reader that re-interns must do about them.
+
+**The MIR text follows the same rule since `.dssir` v2.** A `.dssir` module defines every composite ONCE, in a `types` section between the `dssir 2` header and the `symbols` preamble, with the **same entry spelling** as the HIR table — `type <H> = struct|union "<name>" (opaque | [packed] [aligned N] [pack N] { <type> [@N | ~N] [bits N] [packed], … })` — and names it everywhere else as `type <H>`. Both tables are written and completed through one owner of what a definition carries (`src/core/types/type_lattice/composite_definition.hpp`), so the two tiers cannot drift on a layout channel. `.dssir` v1 spelled every composite inline at every use, with its field types only; a v1 text is refused by the version check, and an inline `struct "N" {…}` in a v2 module is refused by name.
 
 **`packed`** (after the name) is the whole-composite packed flag; **`@<byteOffset>`** and **`~<align>`** after a field are explicit offsets and per-member alignment (all-or-none, and mutually exclusive with each other); a trailing **`packed`** on one field is the per-member packed attribute.
 
@@ -248,8 +252,9 @@ This is the IR type-text for the C signature `int puts(const char *)`: a functio
 | slice | `slice<T>` |
 | vector / matrix / array | `vec<T, n>`, `mat<T, r, c>`, `arr<T, n>` |
 | tuple | `tuple<T, ...>` |
-| struct / union | `struct "N" { T, ... }`, `union "N" { T, ... }`, `struct "N" opaque`, `struct "N" rec 1 { ptr<rec 1> }` |
-| recursive back-reference | `rec <H>` (in type position — names an enclosing `rec <H>` composite) |
+| struct / union (standalone text) | `struct "N" { T, ... }`, `union "N" { T, ... }`, `struct "N" opaque`, `struct "N" rec 1 { ptr<rec 1> }` |
+| recursive back-reference (standalone text) | `rec <H>` (in type position — names an enclosing `rec <H>` composite) |
+| composite reference (`.dsshir` module only) | `type <H>` (names entry `H` of the module's `types` section; refused by name in a standalone text) |
 | enum | `enum "N"`, `enum "N" : u8` |
 | function | `fn(T, ...) -> R`, `fn(...) -> R cc <name>` |
 | extension | `ext "name" (T, ...)`, `ext "name" (...) [n, ...]` |

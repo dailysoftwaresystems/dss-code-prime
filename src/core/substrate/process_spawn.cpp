@@ -1,6 +1,6 @@
 #include "core/substrate/process_spawn.hpp"
 
-#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot -- UNC-safe absolute
+#include "core/substrate/path_identity.hpp"   // absoluteKeepingRoot, genericSpellingU8
 
 #include <algorithm>
 #include <cstddef>
@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <exception>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -545,6 +546,76 @@ std::optional<fs::path> resolveDetailed(std::string const& command,
     return std::nullopt;
 }
 
+// ── Where a missed program was looked for, in the operator's words ─────────
+//
+// ★ THE SENTENCE NAMES THE LOOKUP THAT HAPPENED, BRANCHING ON THE SAME
+// PREDICATE THE RESOLVER BRANCHES ON.
+// [[D-SPAWN-PATH-FORM-PROGRAM-REPORTED-AS-LOOKED-UP-IN-PATH]]. `resolveDetailed`
+// runs one of two lookups and the not-found text used to describe only one of
+// them: a path-form argv[0] — never searched for, probed at ONE file — was
+// reported as "It was looked up in PATH (the current directory is deliberately
+// never searched); pass a path containing a directory separator to run a local
+// tool." ✔MEASURED through `dsscp --project`, a pre-build hook naming a missing
+// `tools/gen.exe`: every clause false for that input — no PATH lookup happened,
+// a relative path-form is resolved AGAINST the current directory, and the
+// advice asks for the separator the name already has. Since a hook's path-form
+// program is re-based onto its manifest's directory, every missing one reaches
+// this text.
+//
+// The path-form arm names the file probed as the probe saw it: made absolute
+// against the CALLER's working directory by the same `makeAbsolute` a hit goes
+// through, spelled with `core::genericSpellingU8` (UTF-8 — argv's own encoding
+// — and a UNC authority kept). If that rendering throws (a working directory
+// holding text no encoding accepts), the path is named as given, which is
+// still the exact path the probe was handed. On Windows the extension rule is
+// stated too, because it decides which files were tried: a name with an
+// extension is tried as given and then with each PATHEXT extension appended,
+// and a name without one ONLY with them appended.
+//
+// `foundNonExecutable` = the caller already named a file that IS there (POSIX
+// permission bits), so the "no regular file exists there" clause would
+// contradict it and is left out.
+std::string whereItWasLookedFor(std::string const& command,
+                                bool               foundNonExecutable) {
+    if (!hasDirectoryComponent(command)) {
+        return "It was looked up in PATH (the current directory is "
+               "deliberately never searched); pass a path containing a "
+               "directory separator to run a local tool.";
+    }
+    // `spawnAndWaitInherit` decoded argv[0] before resolving it, so this
+    // decode succeeds there; the fallback only keeps the function total.
+    auto const  commandPath = pathFromUtf8(command);
+    std::string probed      = command;
+    if (commandPath.has_value()) {
+        try {
+            std::u8string const u8 =
+                core::genericSpellingU8(makeAbsolute(*commandPath));
+            probed.assign(reinterpret_cast<char const*>(u8.data()), u8.size());
+        } catch (std::exception const&) {
+            probed = command;
+        }
+    }
+    std::string text = "It contains a directory separator, so it names one "
+                       "file and was NOT searched for in PATH. The path probed "
+                       "was '" + probed + "'";
+#if defined(_WIN32)
+    // The same test `probeCandidate` applies, on the same decoded path.
+    bool const hasOwnExtension =
+        commandPath.has_value() && commandPath->has_extension();
+    std::string extensions;
+    for (auto const& ext : pathExtensions()) {
+        extensions += (extensions.empty() ? "" : " ") + ext;
+    }
+    text += hasOwnExtension
+                ? " (as given, then with each PATHEXT extension appended: "
+                      + extensions + ")"
+                : " (only with each PATHEXT extension appended, since it has "
+                  "no extension of its own: " + extensions + ")";
+#endif
+    text += foundNonExecutable ? "." : ", and no regular file exists there.";
+    return text;
+}
+
 #if defined(_WIN32)
 
 // ── Handing our OWN stdin/stderr on when the child's stdout is redirected ───
@@ -960,9 +1031,7 @@ SpawnResult spawnAndWaitImpl(std::vector<std::string> const& argv,
                          + "' exists and is a regular file but is not "
                            "executable by this user (check its permission "
                            "bits). ")
-            + "It was looked up in PATH"
-              " (the current directory is deliberately never searched); pass"
-              " a path containing a directory separator to run a local tool.";
+            + whereItWasLookedFor(argv[0], !notExecutable.empty());
         return out;
     }
 

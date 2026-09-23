@@ -272,6 +272,10 @@ windowFor(EncodingSlotKind s) noexcept {
         // operand's bitwise COMPLEMENT `~V` rather than `V`, which is the
         // Imm12 vs Imm12Scaled relationship one field over.
         case EncodingSlotKind::Imm16Inverted: return SlotBitWindow{ 5, 16 };
+        // ElementIndex (P68 round 8): the AdvSIMD copy class's `imm5` at bits
+        // 16..20 — the whole field; the wire arm computes its content (the
+        // element's size bit and index) from the paired element field.
+        case EncodingSlotKind::ElementIndex:  return SlotBitWindow{ 16, 5 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -1083,6 +1087,62 @@ bool encode(Lir const&                  lir,
                 /*widerFieldDeclared=*/widerDeclaredThan(patchKind),
                 /*island=*/islandBodyFor(patchKind)});
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
+            // P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS):
+            // an ELEMENT's index. The field is the whole AdvSIMD `imm5`, and
+            // it holds the element's SIZE as its lowest set bit with the index
+            // above it — so the size is read off the variant's `elementBits`
+            // field on the operand just before this one (`validate()` pairs
+            // them), and the index range is what the field has left: 4, 3, 2
+            // or 1 bits for an 8-, 16-, 32- or 64-bit element. ✔MEASURED
+            // against GNU as 2.42 and clang 18.1.3: `umov w0, v1.b[3]` imm5 =
+            // 00111, `umov x0, v1.d[1]` imm5 = 11000, and both refuse
+            // `v1.b[16]`.
+            if (wire.slotKind == EncodingSlotKind::ElementIndex) {
+                std::uint8_t elementBits = 0;
+                for (auto const& other : selected->wires) {
+                    if (other.elementBits != 0 && wire.index > 0
+                        && other.index == wire.index - 1u) {
+                        elementBits = other.elementBits;
+                    }
+                }
+                std::uint32_t sizeBit = 0;  // log2 of the element's bytes
+                switch (elementBits) {
+                    case 8:  sizeBit = 0; break;
+                    case 16: sizeBit = 1; break;
+                    case 32: sizeBit = 2; break;
+                    case 64: sizeBit = 3; break;
+                    default:
+                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                               DiagnosticSeverity::Error,
+                               std::format("opcode '{}': the 'imm5.element' "
+                                           "field on operand {} has no element "
+                                           "field before it to read a size "
+                                           "from (validate() should have "
+                                           "rejected the schema)",
+                                           info->mnemonic, wire.index));
+                        return false;
+                }
+                std::int64_t const index = srcOp.immInt32;
+                std::int64_t const maxIndex =
+                    (std::int64_t{1} << (4u - sizeBit)) - 1;
+                if (index < 0 || index > maxIndex) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': element index {} is out of "
+                                       "range for an element of {} bits — the "
+                                       "'imm5.element' field leaves {} index "
+                                       "bit(s) beside that size, so the index "
+                                       "runs 0..{}",
+                                       info->mnemonic, index, elementBits,
+                                       4u - sizeBit, maxIndex));
+                    return false;
+                }
+                std::uint32_t const imm5 =
+                    (static_cast<std::uint32_t>(index) << (sizeBit + 1u))
+                    | (1u << sizeBit);
+                if (!orInto(wire.slotKind, imm5, wire.wordIndex)) return false;
+                continue;
+            }
             // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
             // word-pair slot. The callconv's prologue/epilogue `sub/add
             // sp,#frame` (an [reg, ImmInt] form) wires its frame size here

@@ -1,0 +1,14 @@
+# PURPOSE: refuse a NEW anchor id split across a line break, which no grep can ever return.
+name: check-wrapped-anchor-ids
+description: >-
+  The action holds wrapped anchor ids to their ratchet, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `wrapped_anchor_ids_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-wrapped-anchor-ids.py
+    successPattern: 'wrapped-anchor-ids selftest: OK'
+    requireInputsUnmoved: true

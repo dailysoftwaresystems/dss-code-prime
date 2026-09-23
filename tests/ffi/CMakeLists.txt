@@ -118,6 +118,11 @@ target_link_libraries(dss_ffi_test_shipped_realization_oracle
 # shipped reader, so it needs no json link.
 dss_add_test(NAME ffi/test_shipped_no_library_for_format
              SOURCES test_shipped_no_library_for_format.cpp)
+# D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION: its
+# end-to-end arm stages a copy of the config tree and removes one descriptor's
+# body in the COPY, editing that descriptor's JSON — hence the json link.
+target_link_libraries(dss_ffi_test_shipped_no_library_for_format
+                      PRIVATE nlohmann_json::nlohmann_json)
 
 # D-FFI-SHIPPED-DESCRIPTOR-PARSE-CACHE-SERVES-A-STALE-DOCUMENT (P42): the
 # thread-local descriptor PARSE CACHE must answer about the file on disk NOW — a

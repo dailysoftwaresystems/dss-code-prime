@@ -55,11 +55,36 @@
 //     every large image hit: the linker's own synthetic entry calls the
 //     process-exit import from offset 0 of `.text`.
 //
+// ★★★ PAST ±4 GiB, THE BODY CHANGES, VENEER BY VENEER
+// ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]). The ADRP body reaches
+// ±4 GiB; GNU ld 2.42 links every output kind past that with a second body — a
+// 64-bit PC-relative literal the veneer loads and adds to its own address —
+// and it elects PER STUB: every stub is sized long and relaxed to the ADRP form
+// when the page delta fits (📄 `aarch64_build_one_stub`). So does this pass: a
+// target declares its bodies cheapest first, and each new veneer gets the first
+// that reaches its target from where it stands. A body is a CANDIDATE only if
+// the output format declares every relocation it is written through — config,
+// not a format check: the Mach-O formats declare no 64-bit PC-relative data
+// relocation, because no Mach-O reference links past ±4 GiB (✔MEASURED
+// ld64.lld 18.1.3: it refuses the shape, or emits a thunk whose ADRP wrapped),
+// so there the long body is never elected and such a branch is refused by name.
+// And only bodies up to the first whose reach covers the whole image are
+// candidates, so an image under ~4 GiB plans exactly as it did with one body.
+//
+// ★★ A DATA WORD LANDS NATURALLY ALIGNED, as GNU ld keeps its literal (📄 its
+// stub section is 8-aligned "as long branch stubs contain a 64-bit address";
+// ld.lld's AArch64 thunks are only 4-aligned). A veneer can stand at any
+// instruction boundary, so a body with a data word carries enough slack to
+// place the word on its alignment from wherever the veneer lands, and the pass
+// picks the slot per veneer from the veneer's final offset and the alignment
+// the format declares for the start of `.text`.
+//
 // ★★★ ONE PASS IS EXACT, AND THE ARGUMENT IS ARITHMETIC. Only the F branches
 // farther than HALF their reach can ever receive a veneer, so veneers can add at
-// most F × (body size) bytes anywhere. Every decision is taken against the
-// reach minus exactly that margin M, so no later insertion can invalidate one:
-// there is no fixed point to iterate to.
+// most F × (the largest candidate body) bytes anywhere. Every decision — direct
+// or not, which boundary, which body — is taken against the reach minus exactly
+// that margin M, so no later insertion can invalidate one: there is no fixed
+// point to iterate to.
 //
 // ★★ THE ONE REGIME WHERE THAT IS NOT BY CONSTRUCTION: F × body > half the
 // narrowest reach — on arm64 more than 5 592 405 far branches. There M is
@@ -73,13 +98,18 @@
 //
 // ★★ AND IT IS LINEAR. Branches are visited once, in text order; the boundary
 // search is a pointer that only moves forward; reuse is an O(1) lookup per
-// target; veneers are merged into the function list in ONE sweep instead of
-// being inserted one `vector::insert` at a time. The work is COUNTED
+// target; a new veneer's body is the first of a handful of declared candidates;
+// veneers are merged into the function list in ONE sweep instead of being
+// inserted one `vector::insert` at a time. The work is COUNTED
 // (`BranchVeneerWork`) and pinned by a test that doubles its input.
 //
 // The `applyExecRelocations` refusal stays exactly where it is, and stays the
 // backstop: a veneer pass that got the arithmetic wrong is caught there,
 // loudly, rather than emitting a branch to the wrong place.
+namespace dss {
+class ObjectFormatSchema;
+}  // namespace dss
+
 namespace dss::linker {
 
 // What the pass did, COUNTED — never timed. Every field is deterministic,
@@ -93,6 +123,7 @@ struct DSS_EXPORT BranchVeneerWork {
     std::uint64_t veneersPlaced    = 0;
     std::uint64_t veneersReused    = 0;  // sites served by a veneer an earlier site placed
     std::uint64_t behindPlacements = 0;  // veneers placed at the boundary BEHIND their site
+    std::uint64_t bodyProbes       = 0;  // candidate bodies tried while electing new veneers' bodies
 };
 
 // ── THE PLANNER'S MODEL ────────────────────────────────────────────────
@@ -120,20 +151,29 @@ struct DSS_EXPORT VeneerLayoutSite {
     bool          routable = true;  // may this branch be routed through a veneer?
 };
 
+// A veneer body as the planner sees it: the bytes it adds, and the
+// (target - veneer start) distances it can encode.
+struct DSS_EXPORT VeneerBodyModel {
+    std::uint64_t    size = 0;
+    link::RelocReach reach{};
+};
+
 struct DSS_EXPORT VeneerLayout {
     std::vector<std::uint64_t>      functionSizes;
     std::vector<VeneerLayoutSite>   sites;    // ascending (function, offset)
     std::vector<VeneerLayoutTarget> targets;
     std::vector<link::RelocReach>   reaches;
-    std::uint64_t                   veneerSize  = 0;  // the elected body's byte count
-    link::RelocReach                veneerReach{};    // (target - veneer start) the body can encode
+    // The CANDIDATE bodies, cheapest first. Each new veneer gets the first
+    // whose reach, shrunk by the margin, covers its target from where it
+    // stands; the margin is priced at the LARGEST of them.
+    std::vector<VeneerBodyModel>    bodies;
 };
 
 enum class VeneerPlanStatus : std::uint8_t {
     Ok,
     NotRoutable,        // a branch the ABI lets no linker veneer is out of reach
     NoBoundaryInReach,  // no function boundary within reach of the branch, on either side
-    BodyOutOfReach,     // the veneer body cannot reach the target from where it must stand
+    BodyOutOfReach,     // no candidate body reaches the target from where the veneer must stand
     Malformed,          // the model itself is inconsistent (an internal-invariant breach)
     // (The capped-margin regime has no status of its own: the planner cannot
     // see it fail. `findVeneerPlanMisfit` does, on the plan it returns.)
@@ -143,6 +183,7 @@ struct DSS_EXPORT PlannedVeneer {
     std::uint32_t boundary = 0;  // stands immediately before function `boundary`
                                  // (== functionSizes.size(): after the last one)
     std::uint32_t target   = 0;  // index into `VeneerLayout::targets`
+    std::uint32_t body     = 0;  // index into `VeneerLayout::bodies`
 };
 
 struct DSS_EXPORT VeneerPlan {
@@ -151,6 +192,8 @@ struct DSS_EXPORT VeneerPlan {
     std::vector<PlannedVeneer> veneers;      // in placement order
     std::uint32_t              failedSite   = 0;   // meaningful when status != Ok
     std::int64_t               failedDelta  = 0;   // that site's (target - site) distance
+    std::int64_t               failedVeneerDelta = 0;  // BodyOutOfReach: (target - veneer)
+                                                       // from where the veneer must stand
     std::uint64_t              margin       = 0;
     bool                       marginCapped = false;
     BranchVeneerWork           work;
@@ -189,11 +232,16 @@ branchVeneersNeeded(AssembledModule const&            module,
 // each routed relocation at the veneer standing in for it. Returns false (with a
 // diagnostic naming the cause) when a branch cannot be carried — the target
 // declares no veneer vocabulary, the branch is not one the ABI lets a linker
-// route, no function boundary stands within its reach, or the body cannot reach
-// the target from there.
+// route, no function boundary stands within its reach, or no body the output
+// format can carry reaches the target from there.
+//
+// `format` is the OUTPUT format: a body is usable only if it declares every
+// relocation kind the body is written through, and a body's data word is laid
+// out on the alignment it declares for the start of `.text`.
 [[nodiscard]] DSS_EXPORT bool
 injectBranchVeneers(AssembledModule&                  module,
                     TargetSchema const&               target,
+                    ObjectFormatSchema const&         format,
                     link::ImportCallStubLayout const& stubs,
                     DiagnosticReporter&               reporter,
                     BranchVeneerWork*                 work = nullptr);

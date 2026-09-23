@@ -617,28 +617,29 @@ toFfiVisibility(SymbolVisibility v) noexcept {
 // Returns std::nullopt on hard failure (each path emits its own
 // F_* diagnostic via the underlying reader).
 //
-// `format` is threaded in for the BinaryLibrarySource arm alone: a binary
-// source is the one shape whose CONTENT can disagree with the target's object
-// format, and `readImportsForTargetFormat` is the shared chokepoint that says
-// so (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL). The header arms
-// are unaffected -- a `.h` declares no object format, so there is nothing to
-// compare and no arm here branches on `format` itself.
+// `pair.format` is what the BinaryLibrarySource arm checks the binary against:
+// a binary source is the one shape whose CONTENT can disagree with the target's
+// object format, and `readImportsForTargetFormat` is the shared chokepoint that
+// says so (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL). The header
+// arms read each header UNDER the pair (D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE:
+// a `.h` declares no object format, but what it MEANS depends on one), and no
+// arm here branches on the format itself.
 [[nodiscard]] std::vector<ImportSurface>
-readSource(IngestionSource const& src, ObjectFormatSchema const& format,
+readSource(IngestionSource const& src, HeaderReadPair const& pair,
            DiagnosticReporter& reporter, bool& outFailed) {
     return std::visit(
         [&](auto const& s) -> std::vector<ImportSurface> {
             using T = std::decay_t<decltype(s)>;
             if constexpr (std::is_same_v<T, BinaryLibrarySource>) {
-                auto r = readImportsForTargetFormat(s.path, format, reporter);
+                auto r = readImportsForTargetFormat(s.path, pair.format, reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
             } else if constexpr (std::is_same_v<T, CHeaderSource>) {
-                auto r = readCHeader(s.path, s.importLibrary, reporter);
+                auto r = readCHeader(s.path, s.importLibrary, pair, reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
             } else if constexpr (std::is_same_v<T, CHeaderDirSource>) {
-                auto r = readCHeaderDirectory(s.dir, s.importLibrary,
+                auto r = readCHeaderDirectory(s.dir, s.importLibrary, pair,
                                               reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
@@ -692,6 +693,7 @@ toCanonicalName(ImportSurface const& row, CSymbolDecorationScheme scheme,
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderDirectory(std::filesystem::path const& headerDir,
                      std::string_view             importLibrary,
+                     HeaderReadPair const&        pair,
                      DiagnosticReporter&          reporter) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -732,7 +734,7 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
     // the whole directory read if EVERY file failed.
     std::optional<HeaderReadError> firstError;
     for (auto const& path : headers) {
-        auto r = readCHeader(path, importLibrary, reporter);
+        auto r = readCHeader(path, importLibrary, pair, reporter);
         if (!r) {
             ++failedFiles;
             if (!firstError) firstError = std::move(r.error());
@@ -779,9 +781,13 @@ ingest(std::span<IngestionSource const> sources,
     // FfiMetadata via FF4 for those targets would silently emit
     // wrong-shape metadata once plan 17/18 grows real ingestion
     // paths.
+    // The resolved calling convention, kept for the header arms below: they read
+    // each header under this exact pair (`HeaderReadPair`).
+    TargetCallingConvention const* resolvedCc = nullptr;
     {
         auto abi = resolveAbi(target, format, reporter);
         if (!abi) return returnWithSnapshot();
+        resolvedCc = abi->cc;
         if (abi->cc == nullptr) {
             // post-fold #6 silent-failure C2: dedicated code (not
             // `D_PlanNotLanded` reuse). The (operand-stack /
@@ -816,9 +822,10 @@ ingest(std::span<IngestionSource const> sources,
     };
     std::vector<TaggedRow> aggregated;
 
+    HeaderReadPair const pair{target, format, resolvedCc};
     for (auto const& src : sources) {
         bool failed = false;
-        auto rows = readSource(src, format, reporter, failed);
+        auto rows = readSource(src, pair, reporter, failed);
         if (failed) return returnWithSnapshot();
         bool const fromBinary =
             std::holds_alternative<BinaryLibrarySource>(src);

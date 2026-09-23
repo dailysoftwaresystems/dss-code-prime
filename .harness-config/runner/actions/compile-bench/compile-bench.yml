@@ -1,0 +1,13 @@
+# PURPOSE: time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find.
+name: compile-bench
+description: >-
+  The action times this leg's RELEASE dsscp against every reference compiler on the host over the subject ladder.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+steps:
+  - name: bench
+    workingDirectoryRoot: action
+    run: |
+      python3 ./compile-bench.py --dsscp {buildDir}/bin/dss/dsscp
+    successPattern: 'floor is the per-invocation cost'
+    requireInputsUnmoved: true

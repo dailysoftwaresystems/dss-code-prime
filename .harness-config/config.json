@@ -11,19 +11,33 @@
     "processSampleSeconds": 5
   },
   "toolchains": {
-    // `msvc` NAMES its compiler. Until 2026-09-18 it declared none, so CMake took the first
-    // compiler on PATH and the "MSVC Release" leg silently built with MinGW gcc (✔MEASURED in
-    // a CMakeCache). `cl` resolves only inside a Visual Studio developer environment: outside
-    // one the configure step fails naming CC, and a directory configured with any other
-    // compiler is refused rather than reused. Never INCLUDE/LIB/PATH here -- machine-specific.
+    // EVERY toolchain NAMES its compiler (`env` CC/CXX) and HOLDS the build to it (`compilerId`,
+    // CMake's own id): a leg CMake configured with any other compiler fails before anything is
+    // built, and every leg's line names what CMake resolved. The lesson is `msvc`'s: until
+    // 2026-09-18 it named none, so CMake took the first compiler on PATH and the "MSVC Release"
+    // leg silently built with MinGW gcc (✔MEASURED in a CMakeCache).
+    // `compilerId` holds only CXX, because CXX is the only language this project compiles: the
+    // top-level `project()` declares `LANGUAGES CXX`, and C is enabled only by googletest's own
+    // `project()`, which compiles no C source. CMake never identifies that compiler, so its
+    // file-API toolchain entry carries a path and no id (✔MEASURED 2026-09-22, MSVC tree:
+    // C `cl.exe` id ABSENT, CXX `cl.exe` id MSVC 19.51). A C id declared here would make the
+    // harness judge every leg unwitnessed and build nothing. `env` CC still names the C
+    // compiler, so every toolchain names both.
+    // `msvc` starts in the Visual Studio developer environment the harness sets up itself
+    // (`developerEnvironments.visualStudio`), so no wrapper script or developer prompt is
+    // involved. Never INCLUDE/LIB/PATH here -- machine-specific.
     "msvc": {
       "platforms": [
         "windows"
       ],
       "generator": "Ninja",
+      "developerEnvironment": "visualStudio",
       "env": {
         "CC": "cl",
         "CXX": "cl"
+      },
+      "compilerId": {
+        "CXX": "MSVC"
       }
     },
     "mingw-gcc": {
@@ -34,6 +48,9 @@
       "env": {
         "CC": "gcc",
         "CXX": "g++"
+      },
+      "compilerId": {
+        "CXX": "GNU"
       }
     },
     "gcc": {
@@ -44,8 +61,15 @@
       "env": {
         "CC": "gcc",
         "CXX": "g++"
+      },
+      "compilerId": {
+        "CXX": "GNU"
       }
     },
+    // `AppleClang` is INFERRED, not yet measured: over ssh the Mac's PATH answers `clang` with
+    // /usr/bin/clang, Apple's (the directories the harness finds programs in are APPENDED, never
+    // prepended). The first macOS leg's line names what CMake resolved, and any other id fails
+    // that leg before it builds -- confirm or correct this there.
     "clang": {
       "platforms": [
         "macos"
@@ -54,6 +78,9 @@
       "env": {
         "CC": "clang",
         "CXX": "clang++"
+      },
+      "compilerId": {
+        "CXX": "AppleClang"
       }
     }
   },
@@ -116,6 +143,11 @@
           "successPattern": "100% tests passed",
           "countPattern": "tests failed out of (?<total>\\d+)"
         }
+        // ⓘ NO PER-PLATFORM TEST SET: every leg's count is compared with every other leg's. Until
+        // 2026-09-23 Windows legs formed their own set because a Windows build registered one test
+        // no other did (`line_endings_watchdog_sh_guard`, retired with the shell guards on
+        // 2026-09-21). ✔MEASURED 2026-09-23 by diffing `ctest -N` names built from one tree:
+        // Windows MinGW Debug, WSL gcc Debug and WSL gcc Release register the same 2325 names.
       }
     }
   ],
@@ -227,6 +259,15 @@
         "pattern": "^x86_64$"
       },
       "description": "runs x86_64 Mach-O artefacts on the Apple Silicon Mac"
+    }
+  },
+  // Set up by the harness on the host that runs the leg, never written here: `visualStudio` is
+  // the newest instance Visual Studio's own vswhere finds with the C++ build tools, and its
+  // vcvarsall.bat for the leg's processor. A host without such an instance turns the leg away
+  // (skipped-tool-missing); one whose vcvarsall.bat fails or sets up another processor FAILS it.
+  "developerEnvironments": {
+    "visualStudio": {
+      "kind": "visualStudio"
     }
   },
   "legs": {
@@ -379,19 +420,14 @@
       },
       "why": "the configure step runs find_package(Python3 COMPONENTS Interpreter REQUIRED), and most repository guards registered as ctest entries are Python"
     },
-    {
-      "name": "pwsh",
-      "platforms": [
-        "windows"
-      ],
-      "probe": {
-        "args": [
-          "--version"
-        ],
-        "regex": "PowerShell (\\d+\\.\\d+\\.\\d+)"
-      },
-      "why": "on a Windows host the configure step requires a PowerShell interpreter for the anchor-registry and line-endings guards"
-    },
+    // ⓘ NO `pwsh` AND NO `bash` ENTRY (removed 2026-09-23). An entry here is what
+    // `install-missing-tools` probes and the allowlist for a run line's first program
+    // (`dssharness help tools`), and neither is needed any more: no configure step requires
+    // PowerShell (the anchor-registry and line-endings guards are Python since 2026-09-21), and
+    // every step of every action under `.harness-config/runner/actions` starts `python3` (the
+    // operator's ruling: no `.sh`/`.ps1` there). What still runs a shell does so under ctest, not
+    // as a runner step: the prebuild example runs `powershell` (Windows PowerShell, shipped with
+    // Windows) or `/bin/sh`.
     {
       "name": "g++",
       "platforms": [
@@ -445,10 +481,24 @@
       "platforms": [
         "windows"
       ],
-      "why": "the MSVC compiler the windows-x86_64-release leg builds with; it is on PATH only inside a Visual Studio developer environment, so no probe is declared"
+      "toolchains": [
+        "msvc"
+      ],
+      "why": "the MSVC compiler the msvc toolchain's legs build with; it is looked for on the PATH the visualStudio developer environment sets up for the leg, never on a plain shell's, and no MinGW leg of the same machine needs it"
     },
     {
       "name": "tclsh",
+      // ★ WHERE IT IS NEEDED, MEASURED FROM WHAT RUNS IT, AND IT WAS DECLARED "EVERYWHERE".
+      // An entry with no `platforms` is needed on EVERY platform (`dssharness help tools`), while
+      // its own `install` has always named `linux` and `macos` only. ✔MEASURED 2026-09-18: the
+      // sqlite corpus runs tclsh on Linux and macOS, and on a Windows host the recipe is derived
+      // INSIDE WSL (the harness's POSIX half, `sqlite_stage.py derive`, run through `wsl.exe -e`:
+      // deriving the SQLite recipe needs make, configure and tclsh), i.e. on the WSL leg's Linux
+      // host. No Windows-native program starts it. The declaration now says what is true.
+      "platforms": [
+        "linux",
+        "macos"
+      ],
       "install": {
         "linux": {
           "manager": "apt",
@@ -463,6 +513,19 @@
     },
     {
       "name": "qemu-aarch64",
+      // ★ LINUX x86_64 LEGS ONLY, AND "EVERYWHERE" WAS FALSE. ✔MEASURED 2026-09-18 with
+      // `install-missing-tools --legs windows-x86_64-debug`: with no `platforms` this entry was
+      // reported MISSING on the Windows leg (exit 1) -- a leg that never starts it. Its users are
+      // the TEST SUITE's own spawns on an x86_64 Linux host (the corpus runners' arm64 arms and
+      // the real-scale veneer test, which look it up on PATH); no leg or runner declares the
+      // `qemu-aarch64` emulator entry, so an `emulators` scope would cover no leg (0.5.8
+      // refuses one). `processors` is the exact scope: the arm64 VPS runs those arms natively.
+      "platforms": [
+        "linux"
+      ],
+      "processors": [
+        "x86_64"
+      ],
       "probe": {
         "args": [
           "--version"
@@ -479,6 +542,18 @@
     },
     {
       "name": "qemu-x86_64",
+      // ★ LINUX arm64 LEGS ONLY, AND "EVERYWHERE" WAS FALSE. ✔MEASURED 2026-09-18 with
+      // `install-missing-tools --legs windows-x86_64-debug`: with no `platforms` this entry was
+      // reported MISSING on the Windows leg (exit 1) -- a leg that never starts it. Its users are
+      // the TEST SUITE's own spawns on the arm64 VPS (the corpus runners' x86_64 arms); no leg or
+      // runner declares the `qemu-x86_64` emulator entry, so `processors`, not `emulators`, is
+      // the exact scope: an x86_64 Linux host runs those arms natively.
+      "platforms": [
+        "linux"
+      ],
+      "processors": [
+        "arm64"
+      ],
       "probe": {
         "args": [
           "--version"
@@ -524,9 +599,10 @@
       // a file whose name differs from its directory's. That is the fix this comment asked for:
       // combine, resolve, and require the result to stay UNDER the actions directory, which keeps
       // the reviewability reason intact while allowing one directory per action.
-      // ⚠ ONE DIRECTORY LEVEL ONLY, still: ✔MEASURED 2026-09-17, a nested
-      // `actions/<name>/<sub>/<file>.yml` is refused with exit 12, and the refusal rejects the
-      // WHOLE config file rather than the one entry.
+      // ⓘ GROUPED ACTIONS SHIPPED IN 0.5.7: `actions/<group>/.../<name>/<name>.yml` loads and
+      // runs, and `real-examples/c/sqlite/sqlite.yml` below is one. (At 0.5.6 a nested action was
+      // refused with exit 12, and the refusal rejected the WHOLE config file -- ✔MEASURED
+      // 2026-09-17; kept as the reason an older tool refuses this file.)
       // ⓘ The paragraph above is kept rather than deleted because it records what was measured at
       // 0.5.3, and a reader meeting a `run` refusal on an older tool needs to find it.
       // ★ THE UPSTREAM FIX IS NOT 'REMOVE THE CHECK'. RepoHarness.Core.Runners.ActionFileParser.LoadAsync
@@ -542,6 +618,27 @@
       // when a runner is invoked - against `help configuration`'s promise that problems are listed
       // at once when the file is read.
       "action": "clock-step-probe/clock-step-probe.yml",
+      "stallSeconds": 120
+    },
+    // ★ HOW A REMOTE LEG'S LOG IS READ. ✔MEASURED 2026-09-23 at DssHarness 0.5.8: a remote leg's run
+    // logs stay on its host; `build`/`test` report only the step's exit ("build exited 1"), `-v`
+    // streams no remote child output, and `host-exec -- build` on the leg's own host refuses because
+    // that host does not know it IS the leg's host. A runner is the sanctioned way to run code there,
+    // so reading a log is one - every leg, because any of them can be the one that failed. Reported
+    // upstream: a failed step's log tail belongs in the verdict itself.
+    "read-leg-path": {
+      "description": "Reads one path inside the leg's tree on the leg's own host - a file's trailing lines, optionally filtered by a regular expression, or a directory's newest entries - and prints and keeps it redacted, refusing any path outside the tree and any connection data or secret by name.",
+      "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "action": "read-leg-path/read-leg-path.yml",
       "stallSeconds": 120
     },
     // ★★★ THE MANUAL END-TO-END CORPUS. Declared here because a runner is reachable ONLY through
@@ -585,6 +682,324 @@
       ],
       "action": "macho-alias-ld64-matrix/macho-alias-ld64-matrix.yml",
       "stallSeconds": 900
+    },
+    // ★★★ EVERY PROGRAM THIS REPOSITORY SHIPS IS AN ACTION, AND EVERY ACTION HAS A RUNNER.
+    // Operator ruling, 2026-09-18: *"there is no `scripts/` directory and no `real-examples/`
+    // directory"* -- every program that lived there moved under `.harness-config/runner/actions/`,
+    // one directory per program holding its `<name>.yml`, and `real-examples/c/sqlite` kept its
+    // shape as the GROUPED action `sqlite`. `dssharness run <runner>` reaches an action ONLY
+    // through this map, so an action without an entry is a program nothing can start:
+    // `scripts_index_guard` refuses that, and a runner naming a missing action, by name.
+    // ★ WHAT EACH RUNNER RUNS is the invocation its ctest entry runs, where it has one -- a guard's
+    // runner answers the question its gate entry answers, on the legs named here.
+    // ★ LEGS, and why so few: a repository guard is HOST-INDEPENDENT, so one host per program
+    // language answers it; the gate still runs every guard on every leg through ctest.
+    //   · a program: `windows-x86_64-debug` and `linux-x86_64-debug`, both on this machine. Every
+    //     program is Python since 2026-09-21 (operator ruling: no `.sh` and no `.ps1` under the
+    //     actions directory -- `scripts_index_guard` refuses one by name), so one program runs on
+    //     every leg its runner declares; the POSIX-only and Windows-only leg sets of the retired
+    //     shell and PowerShell twins went with them;
+    //   · an instrument that needs a RELEASE dsscp or a produced artefact names the legs it
+    //     measures on, and a path it cannot know is a REQUIRED input: refused by name, never
+    //     guessed.
+    // ⚠ A LINUX LEG CANNOT RUN AN ACTION UNDER 0.5.7: its sync withholds everything under
+    // `.harness-config/` except this file, so the action's own directory never reaches the host.
+    // Fixed upstream (round four, unreleased at this writing); the Windows legs run today.
+    "anchors": {
+      "description": "Read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "anchors/anchors.yml"
+    },
+    "apply-registry-row": {
+      "description": "Replace one deferred-anchor registry row with a lane's verbatim row text from a file.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "apply-registry-row/apply-registry-row.yml"
+    },
+    "burndown-queue": {
+      "description": "Re-derive the prioritized burndown queue from the registry, production errors first.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "burndown-queue/burndown-queue.yml"
+    },
+    "check-anchor-balance": {
+      "description": "Refuse a cycle that ends with more OPEN deferral-registry rows than it began.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-anchor-balance/check-anchor-balance.yml"
+    },
+    "check-anchor-registry": {
+      "description": "Refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-anchor-registry/check-anchor-registry.yml"
+    },
+    "check-diagnostic-codes": {
+      "description": "Refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-diagnostic-codes/check-diagnostic-codes.yml"
+    },
+    "check-doc-census": {
+      "description": "Refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-doc-census/check-doc-census.yml"
+    },
+    "check-enum-name-table-guards": {
+      "description": "Refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-enum-name-table-guards/check-enum-name-table-guards.yml"
+    },
+    "check-export-macro-placement": {
+      "description": "Refuse DSS_EXPORT on a member of an already-exported class, which is MSVC error C2487.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-export-macro-placement/check-export-macro-placement.yml"
+    },
+    "check-guard-output-encoding": {
+      "description": "Refuse a Python script whose report cannot carry a non-cp1252 character through a pipe.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-guard-output-encoding/check-guard-output-encoding.yml"
+    },
+    "check-line-endings": {
+      "description": "Refuse a tracked text blob that carries a CR, and a CR instrument that cannot see one.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-line-endings/check-line-endings.yml"
+    },
+    "check-lsp-coordinates": {
+      "description": "Refuse a raw coordinate conversion in src/lsp/ outside lsp_coordinates.cpp — the anti-regression device for LSP positions resolved in synthesized preprocessor coordinates.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-lsp-coordinates/check-lsp-coordinates.yml"
+    },
+    "check-ninja-deps": {
+      "description": "Refuse a gate over a build directory whose objects recorded no header dependencies.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-ninja-deps/check-ninja-deps.yml",
+      "requireBuild": true
+    },
+    "check-no-abort-in-tests": {
+      "description": "Refuse a new live `abort()` call site in test or test-support code.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-no-abort-in-tests/check-no-abort-in-tests.yml"
+    },
+    "check-orphan-tests": {
+      "description": "Refuse a test source that no CMake target compiles and no ctest entry runs.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-orphan-tests/check-orphan-tests.yml"
+    },
+    "check-path-identity": {
+      "description": "Refuse a second path canonicalizer -- path resolution lives in exactly one place.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-path-identity/check-path-identity.yml"
+    },
+    "check-pkg-pipeline": {
+      "description": "Pin the package pipeline's release-path step sequence and refuse an artifacts-only run that can reach a release.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-pkg-pipeline/check-pkg-pipeline.yml"
+    },
+    "check-plan-citations": {
+      "description": "Refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-plan-citations/check-plan-citations.yml"
+    },
+    "check-retyped-closed-sets": {
+      "description": "Census the diagnostics that RETYPE a closed vocabulary instead of projecting it.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-retyped-closed-sets/check-retyped-closed-sets.yml"
+    },
+    "check-scripts-index": {
+      "description": "Refuse an action that no index documents, an index entry that no action backs, and an action no runner can start.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-scripts-index/check-scripts-index.yml"
+    },
+    "check-stale-blockers": {
+      "description": "List OPEN registry rows whose Closing-work cell waits on a blocker that has since CLOSED.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-stale-blockers/check-stale-blockers.yml"
+    },
+    "check-stale-refusal-citations": {
+      "description": "Refuse a new present-tense refusal sentence that cites an anchor row already marked CLOSED.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-stale-refusal-citations/check-stale-refusal-citations.yml"
+    },
+    "check-wall-clock-in-tests": {
+      "description": "Refuse a new wall-clock duration literal in test code outside the shared measured budget.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-wall-clock-in-tests/check-wall-clock-in-tests.yml"
+    },
+    "check-wrapped-anchor-ids": {
+      "description": "Refuse a NEW anchor id split across a line break, which no grep can ever return.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-wrapped-anchor-ids/check-wrapped-anchor-ids.yml"
+    },
+    "cmake-import": {
+      "description": "Convert a CMake project into a DSS `.dss-project.json` manifest.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "cmake-import/cmake-import.yml"
+    },
+    "compile-bench": {
+      "description": "Time dsscp against gcc/clang/MSVC/tcc on ONE host over a subject size ladder, naming every reference it could not find.",
+      "legs": [
+        "linux-x86_64-release"
+      ],
+      "action": "compile-bench/compile-bench.yml",
+      "requireBuild": true,
+      "stallSeconds": 900
+    },
+    "corpus-census": {
+      "description": "Census the real-example corpus into a run-identified report instead of one overwritten log.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "corpus-census/corpus-census.yml"
+    },
+    "examples-census": {
+      "description": "Re-derive every corpus-manifest figure examples/README.md states, by parsing the manifests.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "examples-census/examples-census.yml"
+    },
+    "lane-fold": {
+      "description": "Seed a lane worktree from the main tree, fold only that lane's real changes back, and land it with its rows applied and its evidence preserved.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "lane-fold/lane-fold.yml"
+    },
+    "lane-worktree": {
+      "description": "Create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "lane-worktree/lane-worktree.yml"
+    },
+    "owning-tree": {
+      "description": "Name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "owning-tree/owning-tree.yml"
+    },
+    "pragma-profile-census": {
+      "description": "Census `#pragma` usage across the corpus and hold the profile to its expected shape.",
+      "legs": [
+        "linux-x86_64-debug"
+      ],
+      "action": "pragma-profile-census/pragma-profile-census.yml",
+      "requireBuild": true
+    },
+    "profile-compile": {
+      "description": "Compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs.",
+      "legs": [
+        "linux-x86_64-release"
+      ],
+      "action": "profile-compile/profile-compile.yml",
+      "requireBuild": true
+    },
+    "refresh_landing_log": {
+      "description": "Regenerate the PR landing-log hash anchors in the plans from git log.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "refresh_landing_log/refresh_landing_log.yml"
+    },
+    "sqlite": {
+      "description": "Prove dsscp builds SQLite from its real sources into the Tcl testfixture and the sqlite3 CLI, and runs SQLite's own unit corpus green, for every declared target.",
+      "legs": [
+        "linux-x86_64-debug"
+      ],
+      "action": "real-examples/c/sqlite/sqlite.yml"
+    },
+    "sqlite-round-trip": {
+      "description": "Carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip).",
+      "legs": [
+        "linux-x86_64-debug",
+        "linux-arm64-debug"
+      ],
+      "action": "sqlite-round-trip/sqlite-round-trip.yml"
+    },
+    "sqlite-runtime-bench": {
+      "description": "Measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument.",
+      "legs": [
+        "linux-x86_64-release"
+      ],
+      "action": "sqlite-runtime-bench/sqlite-runtime-bench.yml"
     }
   },
   "commit": {
@@ -601,28 +1016,43 @@
       "test-scratch",
       ".worktrees",
       ".claude/worktrees",
-      ".secrets",
       ".temp",
       ".venv",
-      "node_modules",
       ".kilo",
-      "__pycache__",
       ".ccache",
       ".cache",
       // ★★ `**/name` MEANS THAT NAME AT ANY DEPTH (whole segments, so `**/cache` does not cover
       // `src/mycache`). A BARE NAME STAYS ROOTED, deliberately, upstream -- widening bare names
       // would silently stop transferring every nested directory of that name to every host.
-      // ⇒ ✔MEASURED before 0.5.6: every entry above is a bare name, so `__pycache__` (133 nested,
+      // ⇒ ✔MEASURED before 0.5.6: every entry was then a bare name, so `__pycache__` (133 nested,
       // no root instance), `node_modules` and `.claude/worktrees` protected NOTHING AT ALL.
-      // ★ THE ONE THAT MATTERED IS `.secrets`: the bare entry covers the root instance, while a
+      // ★ THE ONE THAT MATTERED IS `.secrets`: a bare entry covered only the root instance, while a
       // SECOND `.secrets` at depth 3 under `.harness-config/` -- the directory the superuser design
       // names as where a host credential goes -- was covered by nothing. It holds only `.gitkeep`
       // today, so this closes a LATENT exposure rather than an incident. `.env` is the same shape.
       // ⚠ A protective rule that silently matches nothing is WORSE than no rule, because the name
       // in this file reads as evidence that the thing is protected. 0.5.6 now says so at sync time.
+      // ★ `**/.secrets` COVERS THE ROOT INSTANCE TOO, so the bare `.secrets` beside it was removed
+      // on 2026-09-23 (in a lane worktree, which has no root `.secrets`, it warned on every sync).
+      // Removed ONLY because DssHarness's own source states the contract, ✔READ at the v0.5.8 tag:
+      // `PathPatterns.CoversAnyDepth` (src/RepoHarness.Core/Repository/PathPatterns.cs) answers
+      // "candidate is name at any depth", its first comparison being `candidate == name` -- the
+      // root itself -- and the test `PathPatternsTests.AnAnyDepthEntry_CoversThatNameWhereverItIs`
+      // pins `("**/__pycache__", "__pycache__", true)`. ONE matcher decides both sides of a sync:
+      // this tree's plan (`SyncExclusions`) and the host's own listing (`sync-serve manifest` ->
+      // `LocalSyncTransport.ReadManifestAsync` -> `PathSet` -> `PathPatterns.Matches`), so a root
+      // `.secrets` is never transferred and never deleted. Were that contract ever dropped, a
+      // bare `.secrets` must come back: a secret's exclusion is the one place a belt stays.
       "**/.secrets",
-      "**/.env"
-      // ⛔ AND DELIBERATELY NOT `**/__pycache__`, though the upstream deploy list asked for it and
+      "**/.env",
+      // `node_modules` at ANY depth, because a TOOL writes one wherever the tool lives: on 2026-08-26
+      // the arm64 VPS held 3,667 files of `.kilo/node_modules` that a ROOTED `node_modules` exclusion
+      // let through (`.gitignore` records it). No `package.json` is tracked here, so nothing of ours
+      // makes one, and no deleted project can leave one behind as a husk.
+      "**/node_modules"
+      // ⛔ NO `__pycache__` ENTRY AT ALL. The bare name matched nothing -- no root instance -- and was
+      // removed on 2026-09-23, after 0.5.8 had warned on every sync that it protected nothing. And
+      // DELIBERATELY NOT `**/__pycache__`, though the upstream deploy list asked for it and
       // repo-harness then agreed the arithmetic here is better. Protecting it makes every emptied
       // directory persist on every host, for every `.py` this migration deletes, until somebody
       // removes it by hand -- and `scripts_index_guard` reds on each one. Leaving it unprotected
@@ -641,7 +1071,14 @@
     ],
     "sharedResourceTools": [
       "dsscp"
-    ]
+    ],
+    // Printed in the warning as "it shares <this>". ✔READ in `src/program/runtime_object_cache.cpp`
+    // (`kPlatformRootCandidates`, `resolveArtifactCacheRoots`) and `dss_build_stamp.hpp`: the stamp is
+    // version + commit + a digest of uncommitted changes, so another tree's dsscp shares the cache
+    // ROOT but never an entry. It contends for disk and CPU, not for a result.
+    "sharedState": {
+      "dsscp": "the per-user runtime object cache (%LOCALAPPDATA%/dsscp/runtime-cache on Windows, $XDG_CACHE_HOME or ~/.cache/dsscp/runtime-cache elsewhere, DSS_RUNTIME_CACHE_DIR overriding both), one subdirectory per build stamp (version + commit + a digest of uncommitted changes), so a dsscp from another tree shares the directory but no entry; and the system temp directory"
+    }
   },
   "worktrees": {
     "root": ".worktrees",
@@ -650,8 +1087,15 @@
       ".temp"
     ],
     "maxNameLength": 10,
-    "pathBudgetReserve": 163,
-    "pathBudgetMargin": 20,
+    // Reserve = the longest file below `build/<variant>/`: 166, a test object, + 2 for its transient
+    // `.obj.d` depfile (✔MEASURED 2026-09-21 in every Windows build directory). The harness adds
+    // `build/<longest variant>/` and every separator itself, and holds a path UNDER `pathLimit` (the
+    // NUL counts), so the margin is only headroom: 1. At this checkout's root that is
+    // 50 + name + 30 + 168 + 1 < 260, admitting a `maxNameLength` name with one character to spare;
+    // physically 248 + name <= 259 (a 260-character path fails to write). A build warns when it
+    // writes deeper than the reserve: re-derive it then, since the longest test name drives it.
+    "pathBudgetReserve": 168,
+    "pathBudgetMargin": 1,
     "pathLimit": 260,
     "detach": true
   },
@@ -660,12 +1104,25 @@
     "doneAnchorsPath": ".plans/_deferred-anchor-registry-done.md",
     "idPrefix": "D",
     "minimumIdSegments": 3,
+    // `.harness-config` joined 2026-09-18, when every program this repository ships moved under
+    // it (`scripts/` and `real-examples/` retired) and its dangling citations -- mostly the retired
+    // harness registry's rows -- were settled first. Run output (`build/`, `artifacts/`, `runs/`)
+    // and connection data are gitignored, and `--current-tree` reads no ignored file.
+    // `packaging`, `integrated_tests` and `tests/examples` joined the same day, each drained to zero
+    // dangling citations first. `tests` as a whole joined 2026-09-19 (it contains `tests/examples`),
+    // once its last short forms were written out in full: checked under the EXACT rule DssHarness
+    // round four ships -- a citation resolves only to the row whose id it is, and an id cut at a
+    // line's end is reported as cut -- over the main tree with this change folded in.
     "citationRoots": [
       "src",
       "examples",
       "docs",
       "README.md",
-      ".gitattributes"
+      ".gitattributes",
+      ".harness-config",
+      "packaging",
+      "integrated_tests",
+      "tests"
     ]
   },
   "sshItems": [

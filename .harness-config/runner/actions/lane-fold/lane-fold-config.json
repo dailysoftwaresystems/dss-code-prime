@@ -1,0 +1,10 @@
+{
+  "$comment": [
+    "lane-fold's own configuration: the two directories it keeps BESIDE the lanes, under the worktrees root (worktrees.root in .harness-config/config.json, a DssHarness key). Each value is ONE name beginning with '.', so it can never be taken for a lane, whose name is lowercase letters and digits.",
+    "manifests -- WRITTEN by lane-worktree (`add` resets seed-<lane>.json there, an empty seed recording the lane's base commit) and by lane-fold (`seed` and `refresh-plans` rewrite it); READ by lane-fold (`fold`, `land`, `list`).",
+    "evidence -- WRITTEN by lane-fold (`land` keeps a removed lane's evidence there by default, through lane-worktree's `remove --preserve-to`); READ by lane-fold (`list`). lane-worktree never names it: its `list` hides every dot-led entry.",
+    "BOTH programs read this file, from the tree they act on, and neither has a default: lane-worktree reads `manifests`, lane-fold reads both. One edit here moves both, so the two can never look in different places."
+  ],
+  "manifests": ".manifests",
+  "evidence": ".evidence"
+}

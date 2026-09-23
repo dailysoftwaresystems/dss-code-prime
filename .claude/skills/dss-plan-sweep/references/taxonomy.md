@@ -18,7 +18,7 @@ Ten classes. For each: the **tell**, the **source of truth** to reconcile agains
 ## Useful starting greps
 
 `.claude/skills/dss-plan-sweep/scripts/scan_staleness.py` — this skill's own script, NOT the
-repository's `scripts/` — automates classes 2, 3, 5 and the class-4 co-occurrence check. The rest
+repository's actions (`.harness-config/runner/actions/`) — automates classes 2, 3, 5 and the class-4 co-occurrence check. The rest
 need reading. Manual starting points:
 
 - `pending push|commit-pending`

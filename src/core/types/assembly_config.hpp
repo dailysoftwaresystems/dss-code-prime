@@ -8,6 +8,7 @@
 // shape the bar vetoes, and `cfi.hpp` is dependency-free by construction (it
 // includes `core/export.hpp` and the standard library only), so there is no
 // cycle to route around the way `sectionName` has to.
+#include "core/types/asm_template_text_forms.hpp"   // AsmTemplateTextForms
 #include "core/types/cfi.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
@@ -520,6 +521,37 @@ struct AsmInstructionSpelling {
     // operands: a disagreement is refused, in both directions, exactly as gas
     // rejects `movl %rax,%ecx` and `movl %eax,%rcx`.
     std::optional<std::uint32_t> width;
+    // ★★★ OPTIONAL — THE WIDTH THIS SPELLING OPERATES AT WHEN **NOTHING
+    // WRITTEN STATES ONE**: no `width` on the row, and no operand whose name
+    // states a width. P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS.
+    //
+    // ★★ IT IS A MEASURED PROPERTY OF A REFERENCE, AND THE LOWERING SAYS SO
+    // EVERY TIME IT IS USED. ✔MEASURED 2026-09-21: GNU as 2.42 assembles AT&T
+    // `mov $1, (%rax)`, `add $1, (%rax)`, `test $1, (%rax)`, `not (%rax)` and
+    // their siblings at 32 bits (`c7 00 01 00 00 00`, `83 00 01`,
+    // `f7 00 01 00 00 00`, `f7 10`) and WARNS "no instruction mnemonic suffix
+    // given and no register operands; using default for `mov'"; clang 18.1.3
+    // REFUSES each ("ambiguous instructions require an explicit suffix"). One
+    // working reference makes the spelling required, with that reference's
+    // meaning — so the row states the number gas uses, and the lowering emits
+    // an (unsuppressable) warning naming it, exactly as gas does.
+    //
+    // ⚠ ABSENT KEEPS THE OLD MEANING: an operand-less spelling (`ret`, `jmp
+    // .L1`) operates at the width a flags-less LIR instruction means. PRESENT
+    // is legal only on a row that DERIVES its width (no `width`, no
+    // `destWidth`, no `destWidthFromOperands`) — beside a stated width it could
+    // never be reached, and the loader refuses a key that states nothing.
+    // ⓘ NOT EVERY SUCH WIDTH IS A DEFAULT: `movaps %xmm1, %xmm0` names two
+    // registers that state nothing (x86 xmm names state no width) and is a
+    // 128-bit move by its MNEMONIC — gas says nothing about it. So the warning
+    // is its own key, below; this one only states the number.
+    std::optional<std::uint32_t> unstatedWidth;
+    // ★ OPTIONAL, legal only beside `unstatedWidth`: the reference WARNS when it
+    // falls back to that width (GNU as: "no instruction mnemonic suffix given
+    // and no register operands; using default for `mov'"), so the lowering
+    // warns too — the acceptance comes from the reference and so does the
+    // loudness. False where the width is the mnemonic's own (`movaps`).
+    bool                         unstatedWidthWarns = false;
     // ★★★ OPTIONAL — THE DESTINATION'S WIDTH, WHEN THIS SPELLING WRITES A
     // RESULT WIDER (OR NARROWER) THAN THE VALUE IT OPERATES ON.
     // D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE.
@@ -781,6 +813,22 @@ struct DSS_EXPORT AssemblyConfig {
     RuleId labelTailRule{};
     RuleId operandSeqRule{};
 
+    // ★★★ GNU as's NUMERIC LOCAL LABELS (P68 round 8,
+    // D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED). `1:` may be
+    // defined any number of times; `1b` names the nearest definition BEFORE the
+    // reference and `1f` the nearest AFTER it (GNU as, "Local Symbol Names").
+    //   • `numericLabelRule` — the shared grammar's DEFINITION rule
+    //     (`asm.lang.json`'s `asmNumericLabel`: a number, then the label tail),
+    //     read by rule identity exactly as `labelTailRule` is;
+    //   • the two REFERENCE suffixes (`b` / `f` in gas) — dialect DATA, never
+    //     spelled in C++, and required to be `numberStyle.integerSuffixes` too,
+    //     because that is what makes `1b` ONE token (the loader refuses one that
+    //     is not). A dialect declaring none has no numeric labels; the loader
+    //     refuses a partial declaration.
+    RuleId      numericLabelRule{};
+    std::string localLabelBackwardSuffix;
+    std::string localLabelForwardSuffix;
+
     // ★★★ THE TEMPLATE SURFACE — how an EMBEDDED `__asm__` template differs
     // from a standalone `.s`, declared as two names rather than built into the
     // engine (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER, 2026-08-15).
@@ -968,6 +1016,17 @@ struct DSS_EXPORT AssemblyConfig {
     // `templateModifierRule.valid()`, which cannot be true without it.
     std::string templatePlaceholderLexeme;
 
+    // ★★★ THE TEMPLATE TEXT FORMS THIS DIALECT'S TEMPLATE SURFACE EXPANDS
+    // BEFORE ITS LEXER RUNS (`assembly.templateTextForms`, P68 round 8,
+    // D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED): `%=`, the fixed forms
+    // (`%{` → `{`, `%;` → nothing), the forms a TARGET feature selects (`%~`),
+    // and the `{…|…}` dialect alternatives. See `asm_template_text_forms.hpp`
+    // for the measured table and why every row is per dialect. ✔MEASURED that a
+    // BASIC template (no colon) expands NOTHING in either reference, so only an
+    // EXTENDED template is expanded. Empty ⇒ the dialect's templates expand no
+    // text form, and any `%<punctuation>` in one is refused by name.
+    AsmTemplateTextForms templateTextForms;
+
     // The declared modifier whose composed lexeme is exactly `lexeme`, or
     // nullptr. ⚠ EXACT — never folded by `spellingCase`. A template placeholder
     // is the EMBEDDING language's vocabulary rather than gas vocabulary, which
@@ -1069,6 +1128,62 @@ struct DSS_EXPORT AssemblyConfig {
             if (best == nullptr || a.suffix.size() > best->suffix.size()) {
                 best = &a;
             }
+        }
+        return best;
+    }
+
+    // ★★★ AN ELEMENT OF A VECTOR REGISTER — `v1.d[1]`, `%1.s[3]` (P68 round 8,
+    // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). ONE lane, named by a
+    // size SUFFIX and an INDEX. The suffix is the arrangement table's shape one
+    // step narrower — a width with no count — and like it serves both lexical
+    // surfaces (`v1.d` is one identifier in a `.s`, `%1.d` four tokens in a
+    // template). The index is the shared core's `asmElementIndex`, found by
+    // RuleId through `elementIndexRule`, never by its bracket bytes.
+    // ⚠ DECLARED TOGETHER OR NOT AT ALL: an index rule with no sizes would parse
+    // `[i]` with no width to read it at; sizes with no rule name a spelling no
+    // shape produces. The loader refuses either half alone.
+    struct AsmRegisterElement {
+        std::string   suffix;         // as declared, WITH its separator (".d")
+        std::uint32_t laneBits = 0;   // the element's width: 8, 16, 32 or 64
+        std::string   registerClass;  // required; a TargetRegClass name
+    };
+    std::vector<AsmRegisterElement> registerElements;
+    RuleId elementIndexRule{};
+
+    // What an ELEMENT spelling (the text before its index) ends with: how many
+    // bytes of suffix to strip, the element's width, and the register class the
+    // suffix is declared for — or nullopt when it ends with no size.
+    // ★ AN ELEMENT SIZE WINS; AN ARRANGEMENT IS THE FALLBACK, AND THAT IS gas's
+    // READING, MEASURED: GNU as 2.42 takes `v1.16b[3]` as `v1.b[3]` and
+    // `v1.8b[15]` as index 15 — the arrangement's LANE WIDTH is the element's,
+    // its count ignored — while clang 18.1.3 refuses the form. One working
+    // reference makes it required, and the width is still read off a declared
+    // table rather than parsed out of the text.
+    // ⚠ FOLDED BY `spellingCase`: both references accept `V2.S[1]`.
+    struct ElementSuffix {
+        std::size_t      length   = 0;
+        std::uint32_t    laneBits = 0;
+        std::string_view registerClass;
+    };
+    [[nodiscard]] std::optional<ElementSuffix>
+    elementSuffixOf(std::string_view written) const {
+        std::string const key = spellingKey(written);
+        std::optional<ElementSuffix> best;
+        auto const consider = [&](std::string const& suffix,
+                                  std::uint32_t laneBits,
+                                  std::string const& cls) {
+            std::string const s = spellingKey(suffix);
+            if (s.size() >= key.size()) return;
+            if (key.compare(key.size() - s.size(), s.size(), s) != 0) return;
+            if (best.has_value() && best->length >= s.size()) return;
+            best = ElementSuffix{s.size(), laneBits, cls};
+        };
+        for (auto const& e : registerElements) {
+            consider(e.suffix, e.laneBits, e.registerClass);
+        }
+        if (best.has_value()) return best;
+        for (auto const& a : registerArrangements) {
+            consider(a.suffix, a.laneBits, a.registerClass);
         }
         return best;
     }

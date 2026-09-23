@@ -48,51 +48,56 @@ was ALREADY carrying **9,661 files / 410 MB** of orphaned checkouts under `.clau
 (three full copies, one 287 MB with its own `build/perf-lane/`), and **`git worktree list` knew
 about none of them**.
 
-**★ ONE OWNER: `scripts/lane-worktree/lane-worktree.sh`** — `add <name> [committish]`,
-`remove <name>`, `list`. The same shape as `scripts/leg-tree/`, and for the same reason:
-**never hand-roll `git worktree add` in a lane.** A location rule is only as good as the last
-person who remembered it, and this skill already records what happens to a rule that lives only in
-a document.
+**★ ONE OWNER: `.harness-config/runner/actions/lane-worktree/lane-worktree.py`** — `add <name> [committish]`,
+`remove <name>`, `list`; one Python program on every host. **Never hand-roll `git worktree add` in
+a lane.** A location rule is only as good as the last person who remembered it, and this skill
+already records what happens to a rule that lives only in a document.
 
 ```bash
-bash scripts/lane-worktree/lane-worktree.sh add k        # -> <repo>/.worktrees/k
-bash scripts/lane-worktree/lane-worktree.sh remove k     # removes AND prunes
-python scripts/lane-fold/lane-fold.py land k harness --apply   # the way a FINISHED lane leaves
+python3 .harness-config/runner/actions/lane-worktree/lane-worktree.py add k      # -> <repo>/.worktrees/k
+python3 .harness-config/runner/actions/lane-worktree/lane-worktree.py remove k   # removes AND prunes
+python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k harness --apply   # the way a FINISHED lane leaves
 ```
+
+★ **Every directory both tools use is READ, never spelled in them:** the lanes' root and the
+evidence roots from `.harness-config/config.json` (`worktrees.root`, `worktrees.evidenceRoots`), and
+lane-fold's two bookkeeping directories beside the lanes — the seed manifests `add` writes and `fold`
+reads, and the evidence `land` keeps — from `lane-fold/lane-fold-config.json` (`manifests`,
+`evidence`). Both programs read that one file, so a change there moves both.
 
 ⚠ **`remove` REFUSES (exit 8) a worktree that still carries the lane's work** — by its own
 `git status`, a tracked modification or an untracked file that is not ignored (seeded paths
 included); or a commit its HEAD holds that no ref of the repository reaches, asked at the repository
 root as `git rev-list <HEAD> --not --glob=refs/*` (removing the worktree would orphan that commit,
-and gc would delete it) — until it is told `--discard-work` (`-DiscardWork`), which names every path
+and gc would delete it) — until it is told `--discard-work`, which names every path
 and commit it discards. It cannot tell folded work from unfolded work; `lane-fold.py land` can,
 builds that flag only from its own "nothing left to fold" measurement, and refuses a lane whose HEAD
 left its base: past the recorded base, or, for a format-1 manifest that records none, holding such a
 commit.
 
-⚠ **`remove` REFUSES (exit 7) a worktree whose evidence roots, `scratchpad/` AND `.temp/`, hold
-any file**, until it is told `--preserve-to <dir>` or `--discard-evidence` (`-PreserveTo` /
-`-DiscardEvidence` in PowerShell). ✔MEASURED P66: the gate used to count `scratchpad/` only, while
+⚠ **`remove` REFUSES (exit 7) a worktree whose evidence roots (`worktrees.evidenceRoots`:
+`scratchpad/` AND `.temp/`) hold any file**, until it is told `--preserve-to <dir>` or
+`--discard-evidence`. ✔MEASURED P66: the gate used to count `scratchpad/` only, while
 every live lane kept its evidence under `.temp/<lane>-scratch/`, so it counted zero for all of them.
 A preserve refuses a destination inside the worktree or one already holding a same-named file with
 other bytes, and re-reads every file at the destination. `--discard-scratchpad` is retired and refused.
 
 ★ **A finished lane is LANDED, never removed by hand:** `lane-fold.py land <lane> <production|harness>`
 folds it, applies its `row/` cells through the row writer all-or-nothing and re-reads each row, checks
-nothing is left to fold, keeps the whole evidence set under `.worktrees/.evidence/<lane>-<stamp>/`,
+nothing is left to fold, keeps the whole evidence set under `.worktrees/.evidence/<lane>-<stamp>/`
+(the lanes' root and lane-fold's `evidence`, both read),
 and only then removes the worktree. Without `--apply` it is a dry run; a stopped landing can be re-run.
 
-⚠ **THE THREE LANE VERBS RESOLVE THEIR TREE FROM THE SCRIPT'S OWN LOCATION, NOT FROM YOUR
-`cwd` — SINCE P53, AND THE INVOCATIONS ABOVE ARE UNCHANGED.** `lane-worktree.sh`,
-`lane-worktree.ps1` and `lane-fold.py` each carried a bare `git rev-parse --show-toplevel`, so
+⚠ **THE LANE VERBS RESOLVE THEIR TREE FROM THE PROGRAM'S OWN LOCATION, NOT FROM YOUR
+`cwd` — SINCE P53.** The lane-worktree shell and PowerShell programs of the time and
+`lane-fold.py` each carried a bare `git rev-parse --show-toplevel`, so
 every path they derived was rooted at whichever repository the CALLER happened to be standing
 in. ✔MEASURED in P52 it silently redirected a whole guard run at another repository, and
 ✔MEASURED again in P53 it hit the ORCHESTRATOR live: a shell that had drifted into
 `.worktrees/io` made `lane-fold fold io --apply` resolve `…/.worktrees/io/.worktrees/io`.
-⇒ **Closed: the lane verbs' repo root is no longer `cwd`-keyed.** Each verb now anchors on its
-own file through the owner for its language (`leg_tree_owning_root` in `scripts/leg-tree/`,
-`Get-RepoTreeOwningRoot` in `scripts/repo-tree/`), and every one accepts an explicit
-**`--repo <path>`** (`-Repo` in PowerShell) for a caller that genuinely means another tree.
+⇒ **Closed: the lane verbs' repo root is no longer `cwd`-keyed.** Each verb anchors on its own
+file through the one owner, `.harness-config/runner/actions/owning-tree/owning-tree.py`, and every
+one accepts an explicit **`--repo <path>`** for a caller that genuinely means another tree.
 
 ⚠ **DO NOT "IMPROVE" THIS INTO "the tree that owns `.worktrees/`".** The orchestrator proposed
 exactly that in P53 and the lane REFUTED it by measurement: from inside `.worktrees/lw`, the
@@ -107,9 +112,11 @@ on every build path. ✔MEASURED 2026-08-26 in a live lane worktree: the longest
 suffix is **163 chars**, so `C:/dssp40k` totalled 173 (**87 spare**) and `<repo>/.worktrees/k`
 totals 214 (**46 spare**). It fits — but the margin more than halved, and this repository's test
 names are what dominate that suffix and keep growing.
-⇒ `lane-worktree.sh` **refuses by arithmetic** any root leaving under 20 chars of margin, naming in
-the refusal the anchor for a worktree root that cannot be built on Windows. ✔The
-refusal arm is exercised: a 44-char lane name is refused at rc=3 with 3 chars spare.
+⇒ `lane-worktree.py` **refuses by arithmetic** (exit 3) a name whose longest build path would not
+stay under `worktrees.pathLimit`: the lanes' root and the name, `/build/<longest variant>/`, then
+`pathBudgetReserve` and `pathBudgetMargin` — every term read from `.harness-config/config.json`, and
+every term, with how long a name would still fit, named in the refusal. ✔ Its self-test exercises
+both sides: a name ONE character over the exact budget is refused, one character shorter is admitted.
 ⇒ **Keep lane names SHORT** — `k`, `l`, `rod`. A descriptive name spends the margin that protects
 the next long test name.
 

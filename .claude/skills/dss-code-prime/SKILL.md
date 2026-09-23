@@ -32,7 +32,9 @@ the bar → `dss-audit`. Reconciling plan drift → `dss-plan-sweep`.
 **Authority order:** [`docs/tree-model.md`](../../../docs/tree-model.md) and
 [`docs/language-config-spec.md`](../../../docs/language-config-spec.md) and
 [`.plans/`](../../../.plans/) all outrank this skill. When they disagree, the doc and the plan win.
-[`real-examples/`](../../../real-examples/) outranks every claim here — it is the registry of real
+The real-example corpus harnesses —
+[`.harness-config/runner/actions/real-examples/`](../../../.harness-config/runner/actions/real-examples/),
+DssHarness actions grouped by language — outrank every claim here: they are the registry of real
 repositories DSS compiles from unmodified upstream source and whose own suites it then runs.
 
 ## What exists today
@@ -68,7 +70,10 @@ IS the compiler's behaviour, and a diagnostic IS its output to a user.
 
     | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
 
-`Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 🟠 OPEN (DISCLOSED)`.
+`Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCLOSED`, and
+`--status` or a `--status-file` holds one of those cells or its bare word (`closed`, `open`, `gated`,
+`disclosed`); `DssHarness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)`
+included.
 The status cell keeps its glyph because the project's one definition of closed is *"the cell OPENS
 with ✅"* — a column holding the bare word would make that test false for every closed row at once.
 `DISCLOSED` marks OPEN work whose debt PRE-DATES this cycle: it counts as open everywhere and is
@@ -84,8 +89,8 @@ not punished like shipping a new deferral.
   writer takes the FIELDS, so a wrapped anchor id (invisible to every grep, and it mints a false
   id), an unescaped `|` and a wrong cell count are inexpressible. ⚠ The registry selector is
   `--pending`, not `--production`; `--done` is unchanged.
-  ⏳ **SCRIPT-ERA, and the predicate has fired:** the eight `scripts/anchors/*.{sh,ps1}` launchers
-  this line used to name are DELETED. `scripts/anchors/anchors.py` itself survives — it is still the
+  ⏳ **SCRIPT-ERA, and the predicate has fired:** the eight `.harness-config/runner/actions/anchors/*.{sh,ps1}` launchers
+  this line used to name are DELETED. `.harness-config/runner/actions/anchors/anchors.py` itself survives — it is still the
   subject of `anchors_selftest_guard` — but it is no longer a door anyone should reach for.
 - ★ **RESOLUTION reads both files; ORIENTATION reads only the working one.** A `D-*` cited in `src/`
   must resolve wherever its row lives, so resolvers glob `_deferred-anchor-registry*.md`. Anything
@@ -141,7 +146,7 @@ eroding.
   scope". A row closes when the BEHAVIOUR changed.
 - **NET OPEN must be ≤ 0 for the cycle**, measured — not asserted — against the cycle's own start
   commit, and reported as closed / opened / net rather than one flattering total:
-  `python scripts/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown`
+  `python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown`
 - ⚠ **Mark a shipped row ✅ THE MOMENT IT SHIPS.** The gate counts a row OPEN unless its status
   cell explicitly says closed — correct polarity, never to be softened — so a 🟢 "DESIGN RECORD —
   SHIPPED" row inflates the OPEN count for free. Three `D-OPT*` rows were doing exactly that on
@@ -163,43 +168,28 @@ Everything else — strongly-typed IDs, immutable post-build `Tree`, `DSS_EXPORT
 `[[nodiscard]]`, comment policy, move semantics, no abbreviations — is in
 `references/testing-and-conventions.md` and is equally mandatory, just less explosive.
 
-### Script conventions (`scripts/`)
+### Program conventions (`.harness-config/runner/actions/`)
 
-**Layout.** One directory per script, named for the script, every sibling implementation inside it:
-`scripts/<name>/<name>.{sh,ps1,py}`, assets alongside. Nothing loose at the top of `scripts/`, nothing
-buried a level deeper. Each script declares its purpose once in a `PURPOSE:` line; both indexes
-(`scripts/README.md`, `dss-cycle/references/scripts.md`) are generated from it and held to the tree by
-`scripts_index_guard`.
+**Layout.** Every program this repository ships is a DssHarness ACTION: one directory per program,
+named for it, holding its `<name>.yml` and every file it runs —
+`.harness-config/runner/actions/[<group>/...]<name>/<name>.{yml,py}`, assets alongside, started by
+`dssharness run <name>` through a `predefinedRunners` entry in `.harness-config/config.json`. There is no
+`scripts/` and no `real-examples/`. Nothing loose in a group directory, no program buried a level
+deeper, no action inside another. A program that another LOADS is loaded as a sibling of the loader's
+own directory, and a program finds the tree it lives in through the one owner, `owning-tree`, never
+by counting `..`. Each action declares its purpose once, in a
+`PURPOSE:` comment line in its `<name>.yml`; both indexes
+(`.harness-config/runner/actions/README.md`, `dss-cycle/references/actions.md`) are generated from it and held to the
+tree — and to the runners — by `scripts_index_guard`.
 
-**`.sh`/`.ps1` pairing — a judgement the author makes and writes down, never a gate.**
-Operator ruling 2026-08-19: *"some scripts are posix executed only, and don't have a .ps1 pair. so we
-must just enforce the dss cycle and dss code prime skills to always create the pair, except when the
-execution is posix only."*
-
-- **Create the `.ps1` twin whenever the capability must reach the Windows leg** — that is where this
-  project's primary ctest runs, so a bash-only capability is one the main gate cannot use.
-- **Omit it, and say so in the header, when either holds:** the script is already cross-platform (a
-  `.py` runs on both hosts; a twin would be a second implementation of something never split), or its
-  execution is POSIX-ONLY BY NATURE (a driver that runs inside a WSL distro where PowerShell is not the
-  shell; `profile-compile` drives a POSIX toolchain over a carriage).
-- **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
-  script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
-  review, before the commit, when the script is being created or modified. Not after and not a script
-  to it. After committed it must be already working."*
-  ⚠ **Not automatable, and the reason is not laziness:** a script can do literally anything, so
-  equivalence of two arbitrary programs is not a property a detector can decide. What a gate CAN see is
-  existence and metadata — which is why `scripts_index_guard` refuses a sibling whose `PURPOSE:`
-  contradicts its primary, and stops exactly there.
-  **What the reviewer owes when a `.sh`/`.ps1` pair is touched:** the two scan the same inputs, check
-  the same properties, accept the same flags, and return the same exit codes for the same conditions —
-  and a change to one landed in the other in the SAME commit. Pairing by EXISTENCE is not pairing by
-  BEHAVIOUR.
-
-⚠ **Deliberately not gated, and the reason is measured:** ✔11 of 21 script directories carry no `.ps1`
-and every one is correct. A guard cannot tell a deliberate POSIX-only script from a forgotten twin, so
-it would need an allowlist of eleven exceptions — the convention written twice, in the place least
-likely to be read, reddening honest work by default. The anchor that demanded such a guard was
-WITHDRAWN on that ruling.
+**No `.sh` and no `.ps1` under `.harness-config/runner/actions` — one Python program per action.**
+Operator ruling 2026-09-21: *"I don't want .sh/.ps1 files inside .harness-config\runner\actions.
+entrypoint is .yml, you can call .py files, BUT NOT .sh/.ps1 please. They are specific per OS. I
+don't want this anymore"*. Every step of every action starts `python3 <file>.py`, and one program
+runs on every host, so there is no twin to keep in step. `scripts_index_guard` refuses a `.sh` or a
+`.ps1` anywhere under the actions root, by name. The 2026-08-19 convention it replaced — a `.ps1`
+twin for every `.sh` that had to reach the Windows leg, their parity checked in review — retired with
+the last pair on 2026-09-21.
 
 ## Workflow
 
@@ -232,7 +222,7 @@ The full checklist, including the per-pattern recipes, is in `references/workflo
 - Read `references/testing-and-conventions.md` before writing any test or any new code. It holds
   the strict-assert rules, known-good test patterns, Windows/MinGW death tests, and all eight
   mandatory coding conventions.
-- Read `references/repo-map.md` when you need the directory layout, `real-examples/`, the build
+- Read `references/repo-map.md` when you need the directory layout, the real-example corpus, the build
   system and toolchain, the SSH-reachable non-x86 hardware, canonical examples, or the header map.
 - Read `references/workflows-and-status.md` for the step-by-step recipes (adding a type, a typed
   view, a grammar, a diagnostic code, driving `TreeBuilder` from tests), the `.plans/` system, the
@@ -244,5 +234,5 @@ The full checklist, including the per-pattern recipes, is in `references/workflo
   of config — the slow break that no grep catches until a second target arrives.
 - **Writing a test that passes both ways.** Verify red-on-disable directly.
 - **Reaching for `<cassert>`** instead of the local `*Fatal` helpers.
-- **Trusting this skill over the docs, the plans, or `real-examples/`** when they disagree.
+- **Trusting this skill over the docs, the plans, or the real-example corpus** when they disagree.
 - **Inventing a pattern** the repo already has a canonical example for.

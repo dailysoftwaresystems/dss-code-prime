@@ -51,15 +51,20 @@ deferral is the rare exception that must earn its place, not the convenient way 
 
    **The schema is SIX cells:** `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`
    — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` /
-   `🔵 🟠 OPEN (DISCLOSED)`. The last one is **OPEN WORK** whose debt PRE-DATES this cycle: it
+   `🔵 DISCLOSED`, and `--status` or a `--status-file` holds one of those cells or its bare word
+   (`closed`, `open`, `gated`, `disclosed`); `DssHarness write-anchor` refuses anything else, the
+   retired `🔵 🟠 OPEN (DISCLOSED)` included. The last one is **OPEN WORK** whose debt PRE-DATES this cycle: it
    counts in every total and is exempt only from the balance gate's net-increase refusal, so
    writing up a defect you merely FOUND is not punished like shipping a new deferral. The claim
    is checkable against the base ref — never use it for a defect this cycle introduced.
    ⚠⚠ **DO NOT HAND-WRITE THE ROW.** Use the writer, which takes the FIELDS:
 
        DssHarness write-anchor D-<AREA>-<NAME> \
-            --priority P1 --status open --trigger '...' --closing '...' --cross-refs '...' \
-            --insert --apply
+            --priority P1 --status open --trigger '...' --closing '...' --cross-refs '...'
+
+   It WRITES by default; `--anchor-dry-run` shows the row and where it would be filed without writing,
+   and every cell has a `--<cell>-file` form (`--trigger-file`, …) for a long cell. `--insert` and
+   `--apply` do not exist, and a command carrying either exits 10.
 
    A hand-typed row can WRAP the anchor id (invisible to every grep, and it MINTS a false id),
    carry an unescaped `|` (silently adds a column, shifting the status into the closing work), or
@@ -91,7 +96,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
 |---|---|
 | Build | `cmake --build build` |
 | Full test suite | `ctest --test-dir build --output-on-failure` |
-| Anchor guard | `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `scripts/check-anchor-registry/check-anchor-registry.sh`) |
+| Anchor guard | `python .harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py` (ctest `anchor_registry_guard`) |
 | **Handoff — read at Step 0, rewritten at Step 8.1** | `.plans/_handoff.md` — ①where we are ②where we need to get ③priorities ④concurrent branches/PRs (rebase surface) ⑤timeline (accumulates) |
 | Open PRs / rebase surface | `gh pr list --state open` · `gh pr view <n> --json files` (Step 8.2) |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
@@ -101,11 +106,11 @@ deferral is the rare exception that must earn its place, not the convenient way 
 | List anchors — name, priority, status | `DssHarness read-anchors --pending [--band P0]` |
 | Write a NEW row from fields | `DssHarness write-anchor <ANCHOR> --trigger '...' --closing '...'` — ⚠ it WRITES; `--anchor-dry-run` is how you look first |
 | Change a row — **closing MOVES it to the archive** | `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` — ⚠ it WRITES |
-| Apply a lane's VERBATIM row file | `python scripts/apply-registry-row/apply-registry-row.py <working-registry> <ANCHOR> <row-file> --apply` |
+| Apply a lane's VERBATIM row file | `python .harness-config/runner/actions/apply-registry-row/apply-registry-row.py <working-registry> <ANCHOR> <row-file> --apply` |
 | Lint every row a reader cannot key on | `DssHarness read-anchors --lint` |
 
 ⛔⛔ **THE DEFAULT INVERTED WHEN THE DOOR MOVED, AND A COPIED IDIOM NOW WRITES.** The retired
-`scripts/anchors/*-anchor.{sh,ps1}` twins DRY-RAN unless given `--apply`; `DssHarness write-anchor`
+`.harness-config/runner/actions/anchors/*-anchor.{sh,ps1}` twins DRY-RAN unless given `--apply`; `DssHarness write-anchor`
 and `set-anchor` **WRITE unless given `--anchor-dry-run`**. So the one habit that used to be safe —
 leaving `--apply` off to see what would happen — now lands the change. ✔MEASURED 2026-09-17:
 `DssHarness set-anchor <ID> --priority P2 --anchor-dry-run` answers *"dry run: … would be updated in
@@ -114,7 +119,7 @@ the pending registry; nothing was written"*, exit 0, and `git status` is clean a
 `--pending` / `--done` narrow a LISTING. Every field also has a `--<field>-file` form, which is how
 a multi-line cell reaches the tool without a shell quoting it.
 
-| Anchor balance gate | `python scripts/check-anchor-balance/check-anchor-balance.py` |
+| Anchor balance gate | `python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
 | Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |
 | Per-cycle review (+ re-review the fold) | `/pr-review-toolkit:review-pr` ×N to a fixed point (Step 5) |

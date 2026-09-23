@@ -5,9 +5,11 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // MIR text format `.dssir` (ML4) — a round-trippable, human-readable
@@ -30,7 +32,10 @@
 //
 // Text grammar (representative):
 //
-//   dssir 1
+//   dssir 2
+//   types {
+//     type 1 = struct "Node" {i32, ptr<type 1>}
+//   }
 //   symbols {
 //     %1 "main"
 //     %2 "factorial"
@@ -44,6 +49,17 @@
 //       }
 //     }
 //   }
+//
+// ★★ v2 (P68 round 8, lane `ht`, part 1d): A COMPOSITE IS `type <H>`, DEFINED ONCE
+// in the `types` section — `type <H> = struct|union "<name>" (opaque | [packed]
+// [aligned N] [pack N] { <type> [@N | ~N] [bits N] [packed], … })`, the HIR v5
+// table's spelling, written and completed through the ONE owner of what a
+// definition carries (`core/types/type_lattice/composite_definition.hpp`). v1
+// spelled every composite inline at every use with its field types only: the text
+// was O(mentions × graph) (✔MEASURED, `emitMir` of sqlite3.c ran to 30 GB and
+// `std::bad_alloc`), a self-referential composite had no spelling, and every layout
+// channel was lost on the way back. An inline `struct "N" {…}` in a v2 module is
+// refused by name, and a `dssir 1` text by the version check.
 //
 // ★★ ONE INSTRUCTION PER LINE, and it is a RULE of this grammar rather than a
 // habit of the emitter. `parseInstruction` refuses any instruction whose line
@@ -93,6 +109,16 @@ struct DSS_EXPORT MirTextContext {
     // `%<v>` handle without a name. A production caller fills this
     // from the CU's symbol table; a unit test may leave it null.
     std::vector<std::string> const* symbolNames = nullptr;
+
+    // The SPARSE form of the same table: one entry per symbol, keyed by
+    // `SymbolId.v` — what `parseMir` hands back (`MirParseResult::symbolNames`).
+    // A `.dssir` text's slots are the RAW ids of the CU's symbol table, and a
+    // module references a scattering of them: ✔MEASURED P68 (lane `ht`, part
+    // 1c) through the product's own lower half — 804 of 804 example modules
+    // sparse (up to 434× max slot / entries), sqlite3.c's 6755 symbols spread
+    // to %48033. A dense table would cost the NUMBER, not the text. A caller
+    // sets at most one of the two; the dense one is consulted first.
+    std::unordered_map<std::uint32_t, std::string> const* symbolNameMap = nullptr;
 };
 
 // Serialize `mir` to canonical `.dssir` text. Pure function. The call never
@@ -119,12 +145,21 @@ struct DSS_EXPORT MirTextContext {
 // owns types re-interned from the text. Non-movable / non-copyable —
 // the `Mir`'s arenas hold tag references that mustn't change address.
 struct DSS_EXPORT MirParseResult {
-    Mir                      mir;
-    TypeInterner             interner;
-    std::vector<std::string> symbolNames;   // SymbolId.v → name; slot 0 unused
-    bool                     ok = false;
+    Mir          mir;
+    TypeInterner interner;
+    // SymbolId.v → name, ONE ENTRY PER SYMBOL THE TEXT DECLARES — sparse,
+    // because the slots are raw CU ids (see `MirTextContext::symbolNameMap`,
+    // which takes it back for a re-emission). It used to be a dense vector
+    // sized by the LARGEST slot written: ✔MEASURED P68 (lane `ht`, part 1c),
+    // `symbols { %4000000000 "x" }` threw `std::bad_alloc` out of `parseMir`,
+    // `%4294967295` wrapped `v + 1` to 0 and wrote out of bounds (SIGSEGV), and
+    // 40 bytes of `%100000000 "x"` built a 3.2 GB table. Memory is now the
+    // text's: one entry per declaration.
+    std::unordered_map<std::uint32_t, std::string> symbolNames;
+    bool         ok = false;
 
-    MirParseResult(Mir m, TypeInterner ti, std::vector<std::string> names)
+    MirParseResult(Mir m, TypeInterner ti,
+                   std::unordered_map<std::uint32_t, std::string> names)
         : mir(std::move(m)), interner(std::move(ti)),
           symbolNames(std::move(names)) {}
 

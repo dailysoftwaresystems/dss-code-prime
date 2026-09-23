@@ -17,14 +17,15 @@
 | `src/dss-config/` | **The config vocabulary — this is where "target = data, not code" lives**: `sources/` (`.lang.json`), `targets/` (`.target.json`), `object-formats/` (`.format.json`), `pipelines/`, `shippedLibs/`, `schemas/` |
 | `examples/c/` | The runnable corpus — each dir is `main.c` + `expected.json`, compiled → executed → exit/stdout asserted |
 | `tests/` | GoogleTest unit + integration tests (one executable per file) |
-| **`real-examples/`** | **★ The real-world repository registry — see §2.1. Known upstream projects DSS compiles from unmodified source and whose own test suites it runs** |
+| **`.harness-config/runner/actions/real-examples/`** | **★ The real-world repository registry — see §2.1. Known upstream projects DSS compiles from unmodified source and whose own test suites it runs.** DssHarness actions grouped by language (`sqlite` is the action `real-examples/c/sqlite`) |
 | `integrated_tests/` | The CLI-subprocess examples runner (live ctest entry `integrated_tests`) — sibling of the in-process `tests/examples/examples_runner.cpp`; **a capability added to one MUST be added to the other** |
 | `docs/` | User-facing onboarding docs |
 | `.plans/` | Internal design records, roadmap, and `_deferred-anchor-registry*.md` |
-| `scripts/`, `packaging/` | Every repo script — one directory per script, siblings inside — plus build/publish tooling. Index: `scripts/README.md` |
+| `.harness-config/runner/actions/` | Every program this repository ships, as a DssHarness action — one directory per program holding its `<name>.yml` and every file it runs; started by `dssharness run <name>`. Index: `.harness-config/runner/actions/README.md` |
+| `packaging/` | Build/publish tooling |
 | `build*/` | CMake build dirs (gitignored). Windows Debug gate dir is **`build-dbg`** |
 
-### 2.1 `real-examples/` — the real-world repository registry
+### 2.1 `.harness-config/runner/actions/real-examples/` — the real-world repository registry
 
 **This is the project's primary end-to-end evidence, and the answer to "what real software does
 DSS actually compile?"** It is not a snapshot of vendored source: each entry is a harness that
@@ -33,12 +34,14 @@ runs **that project's own test suite**, classifying every failure.
 
 | Entry | What it proves |
 |---|---|
-| [`real-examples/c/sqlite`](../../../real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The `sqlite3` CLI is ALSO built from full source — **103 TUs**, not the amalgamation (`real-examples/c/sqlite/gen-pe64-manifest.py` emits its manifest). The single-file amalgamation is compiled and run as a separate, much faster probe — an ADDITIONAL check, never a stand-in for the real build |
+| [`.harness-config/runner/actions/real-examples/c/sqlite`](../../../.harness-config/runner/actions/real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The `sqlite3` CLI is ALSO built from full source — **103 TUs**, not the amalgamation (`.harness-config/runner/actions/real-examples/c/sqlite/gen-pe64-manifest.py` emits its manifest). The single-file amalgamation is compiled and run as a separate, much faster probe — an ADDITIONAL check, never a stand-in for the real build |
 
-Each entry ships **both drivers** — `build-and-test.sh` (Linux; adds an arm64-under-qemu leg on
-an x86_64 host) and `build-and-test.ps1` (Windows pe64). Tiers: `veryquick | quick | full | all`.
+Each entry ships **one driver**, `build_and_test.py`, the same program on every host: its legs come
+from the entry's catalogue (`legs.json`, resolved by `harness_legs.py`), never from the host, and a
+leg the host cannot run natively runs under its declared launcher (arm64 under qemu, pe64 under Wine,
+the ELF legs through `wsl.exe -e` on Windows). Tiers (`DSS_TIER`): `veryquick | quick | full | all`.
 
-Non-negotiable rules for anything under `real-examples/`:
+Non-negotiable rules for anything under `.harness-config/runner/actions/real-examples/`:
 
 - **Never patch the upstream tree** — not the library, not the test infrastructure — and **never
   exclude a test file to reach green**. An upstream bug is root-caused, anchored and reported
@@ -79,7 +82,7 @@ Non-negotiable rules for anything under `real-examples/`:
 Two physical machines are reachable, which changes what "verified" can mean for the non-native
 targets. Both are declared hosts of the repository harness: `dssharness host-exec --ssh macos` and
 `--ssh arm64-vps` run a command in each host's own checkout, and `dssharness legs` says which legs
-they can carry. They used to be reached through a capability-paired helper per host in `scripts/`.
+they can carry.
 
 | host | what it is | why it matters |
 |---|---|---|
@@ -110,8 +113,8 @@ they can carry. They used to be reached through a capability-paired helper per h
 - **`Test-Connection <host>.local` resolves the IPv6 link-local FIRST**, so `.IPv4Address` is
   `$null` and a naive script reports "cannot resolve" for a Mac that is powered on and
   answering pings. Use `Resolve-DnsName` filtered to IPv4. MEASURED 2026-08-04.
-- `.local` very often does **not** resolve from WSL (no mDNS responder); the `.sh` helper says
-  so and names the literal-IP override rather than leaving it to be discovered.
+- `.local` very often does **not** resolve from WSL (no mDNS responder): name the Mac by a literal
+  IP there rather than discovering it by a failed connection.
 
 **What the Mac settled that nothing else could** (MEASURED 2026-08-04): it carries **no
 `/usr/lib/libtcl*.dylib` at all**; system Tcl is a *framework* at **8.5**; Homebrew is not

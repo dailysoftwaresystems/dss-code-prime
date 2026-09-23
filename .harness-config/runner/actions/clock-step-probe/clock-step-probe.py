@@ -31,7 +31,18 @@ and four below the tolerance. An instrument that only ever answers one way has n
 be answering the question.
 """
 
+import sys
 import time
+
+# A cp1252 console turns a printed glyph into a traceback or a mangled byte; reconfigure BOTH
+# streams at IMPORT, the property `guard_output_encoding_guard` ratchets for every Python
+# primary program -- this one joined that population when the action index began covering
+# every action, 2026-09-18, and it was measured UNPROTECTED that day.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):  # pragma: no cover - an odd stream
+        pass
 
 # Mirrors defaults.clockStepToleranceMilliseconds (2000) in .harness-config/config.json.
 # RESTATED rather than read: an action file's values come from .harness-config/runner/.env and

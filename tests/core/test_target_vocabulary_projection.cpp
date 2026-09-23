@@ -572,16 +572,18 @@ TEST(TargetVocabularyProjection,
 }
 
 TEST(TargetVocabularyProjection, PredefinedMacroKindRefusalNamesTheWholeTable) {
-    // ⚠ The acceptance here is the enum table PLUS one config-only spelling:
-    // `version` LOWERS to `Constant` at load, so it has no enum row. The pin
-    // therefore has two halves — the table projection must be complete, AND the
-    // extra spelling must still be named — because a message that dropped
-    // either would be narrower than the check in a different direction.
+    // ⚠ The acceptance here is the enum table PLUS the config-only spellings:
+    // `version` and `model-limit` (P68 round 8) each LOWER to `Constant` at
+    // load, so neither has an enum row. The pin therefore has two halves — the
+    // table projection must be complete, AND every extra spelling must still be
+    // named — because a message that dropped either would be narrower than the
+    // check in a different direction.
     // ⚠ This set was UNQUOTED (`expected line/file/constant/date/time/version`)
     // and the acceptance was a hand-written six-way `kind ==` chain duplicating
     // the table; neither was visible to a quoted-token census.
     static constexpr auto kNames = allNames(dss::kPredefinedMacroKindTable);
-    constexpr char const* kIgnore[] = {kBadSpelling, "version"};
+    constexpr char const* kConfigOnly[] = {"version", "model-limit"};
+    constexpr char const* kIgnore[] = {kBadSpelling, "version", "model-limit"};
     for (char const* t : kTargets) {
         SCOPED_TRACE(t);
         bool injected = false;
@@ -599,18 +601,21 @@ TEST(TargetVocabularyProjection, PredefinedMacroKindRefusalNamesTheWholeTable) {
             << "an unknown predefinedMacros kind must be REFUSED";
         expectRefusalNamesExactly(r.error(), kNames, kIgnore,
                                   "predefinedMacros/kind");
-        bool namesVersion = false;
-        for (auto const& d : r.error()) {
-            auto const q = quotedTokens(d.message);
-            if (std::find(q.begin(), q.end(), std::string{"version"})
-                != q.end()) {
-                namesVersion = true;
+        for (char const* const extra : kConfigOnly) {
+            bool named = false;
+            for (auto const& d : r.error()) {
+                auto const q = quotedTokens(d.message);
+                if (std::find(q.begin(), q.end(), std::string{extra})
+                    != q.end()) {
+                    named = true;
+                }
             }
+            EXPECT_TRUE(named)
+                << "the refusal must also name the config-only '" << extra
+                << "' spelling, which the loader accepts and the enum table "
+                   "does not carry — dropping it makes the message narrower "
+                   "than its own check";
         }
-        EXPECT_TRUE(namesVersion)
-            << "the refusal must also name the config-only 'version' spelling, "
-               "which the loader accepts and the enum table does not carry — "
-               "dropping it makes the message narrower than its own check";
     }
 }
 

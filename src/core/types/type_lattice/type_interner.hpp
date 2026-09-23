@@ -676,6 +676,26 @@ public:
     // encode scalars=[(int)cc] only — `fnIsVariadic` returns false
     // for them (scalar count < 2 → no variadic encoding present).
     [[nodiscard]] bool                     fnIsVariadic(TypeId id) const;
+    // ★★ THE PARAMETERS A CALL'S ARGUMENTS BIND TO (P68 round 8, lane `ht`, part
+    // 2) — the ONE owner of that question, read by the semantic tier's call check,
+    // the HIR verifier's call check and the MIR verifier's call gate, so the three
+    // cannot answer it differently. It is the declared list (`fnParams`) up to, NOT
+    // including, the first parameter of UNQUALIFIED void, which ENDS the argument
+    // list. That parameter exists only in a declaration that is not a definition
+    // (`void f(void v);`, `void f(int a, void v);` — a C front end refuses one in a
+    // definition), and gcc's measured meaning for a call through it is exactly
+    // this: `f()` / `f(42)` compile and RUN against a `void f(void)` / `void
+    // f(int)` defined in another translation unit, and an argument at or past the
+    // void is "too many arguments", a `...` after it included. A QUALIFIED void (a
+    // `volatile` / `_Atomic` skin) does not end the list — gcc calls `f()` through
+    // one "too few arguments". Every signature without such a parameter answers
+    // `fnParams` itself. The declared list — type identity, a text spelling —
+    // stays `fnParams`: `void(void v)` and `void(void)` are distinct types.
+    [[nodiscard]] GuardedSpan<TypeId>      fnArgumentParams(TypeId id) const;
+    // …and whether arguments may follow them as a variadic tail: `fnIsVariadic`,
+    // unless a void parameter ended the list first (the `...` after it is then
+    // unreachable — gcc: "too many arguments").
+    [[nodiscard]] bool                     fnArgumentsVariadic(TypeId id) const;
 
     // ── THE OBJECT-REPRESENTATION PROJECTION (D-CSUBSET-NULLPTR-T-DECLARABLE) ──
     //

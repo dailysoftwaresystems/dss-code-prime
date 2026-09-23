@@ -44,6 +44,9 @@ namespace dss::pe {
 // rather than trusting the linker gate, because `pe::encode` is a public
 // entry point AND this same walker serves the .dll flavor, whose schema
 // declares no capability (the loader ignores a DLL's SizeOfStackReserve).
+// The request's RUNPATHS are accepted and recorded nowhere — PE declares no
+// runpath carrier, and the linker gate's warning says so; the entry refusal in
+// `enforceImageRequest` still applies here (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH).
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,

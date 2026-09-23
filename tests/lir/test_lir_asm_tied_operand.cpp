@@ -69,6 +69,7 @@
 #include "mir/mir.hpp"
 #include "mir/mir_asm_descriptor.hpp"
 #include "mir/mir_opcode.hpp"
+#include "asm_region_test_support.hpp"
 #include "lowered_lir_fixture.hpp"
 
 #include <gtest/gtest.h>
@@ -168,21 +169,37 @@ TEST(LirAsmTiedOperand, ReadWriteOperandBindsBothHalvesToTheOutputsRegister) {
     auto const addOp = opOf(*L.target, "add");
     auto const movOp = opOf(*L.target, "mov");
 
+    // P68 round 8 part 4: the statement is ONE `asm_region` bundle, and the
+    // template's own instructions are its BODY.
+    auto const bundle = onlyAsmRegion(lir);
+    ASSERT_TRUE(bundle.has_value());
+    Lir const& body = bundle->region->body;
+
     // The template's own instruction: x86's two-address `add` carrying the
     // literal 2 the source wrote.
-    auto const add = findWithImm(lir, addOp, 2);
+    auto const add = findWithImm(body, addOp, 2);
     ASSERT_TRUE(add.has_value())
         << "the template `addl $2, %0` must lower to an `add` carrying the "
            "immediate 2";
-    LirReg const tied = lir.instResult(*add);
+    LirReg const tied = body.instResult(*add);
     ASSERT_TRUE(tied.valid());
+
+    // ── (0) ★ THE TIE IS ONE SLOT, READ AND WRITTEN. A `"+r"` operand is ONE
+    // register the statement both reads (before) and writes (after): the
+    // bundle's slot for it is `UseDef`, and there is no second slot for the
+    // read half. A lowering that gave the read half a slot of its own would
+    // read a register nothing wrote.
+    EXPECT_EQ(asmSlotRoleOf(*bundle->region, tied), LirAsmOperandRole::UseDef)
+        << "the tied register is ONE slot of the statement, read and written";
+    EXPECT_EQ(bundle->region->roles.size(), 1u)
+        << "one source operand, one register — one slot";
 
     // ── (a) THE TWO-ADDRESS IDENTITY. The core's tie is an operand INDEX on the
     // TARGET OPCODE (`requires2Address`), and x86's `add` declares it at 0. With
     // the asm tie in place the legalizer has nothing to do — result and
     // operand[0] are already the same register — which is what makes the two
     // mechanisms compose instead of fighting.
-    auto const ops = lir.instOperands(*add);
+    auto const ops = body.instOperands(*add);
     ASSERT_GE(ops.size(), 1u);
     ASSERT_EQ(ops[0].kind, LirOperandKind::Reg);
     EXPECT_EQ(ops[0].reg, tied)
@@ -194,7 +211,7 @@ TEST(LirAsmTiedOperand, ReadWriteOperandBindsBothHalvesToTheOutputsRegister) {
     // register the template reads. Without the tie, `bindAsmOperand` mints a
     // fresh vreg for the read half and this `mov` targets something the template
     // never names — the register stays undefined, rc=0, wrong answer.
-    auto const materialise = findDefBefore(lir, tied, *add);
+    auto const materialise = findDefBefore(lir, tied, bundle->bundle);
     ASSERT_TRUE(materialise.has_value())
         << "nothing defines the register the template reads — the read half was "
            "materialised into some OTHER register, which is the "

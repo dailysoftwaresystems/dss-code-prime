@@ -75,7 +75,8 @@ This tier cannot be reached by a program a gate can afford: the branch must miss
 
 - the corpus entry lives at
   `.harness-config/runner/actions/manual-end-to-end/corpus/c/branch_island_arm64_edge/`,
-  grouped by language the way `examples/<lang>/<name>/` and `real-examples/<lang>/<name>/` are
+  grouped by language the way `examples/<lang>/<name>/` and
+  `.harness-config/runner/actions/real-examples/<lang>/<name>/` are
 - it declares `manualRun: true`, and the driver skips any entry that does not
 - it is executed by `DssHarness run manual-end-to-end`
 

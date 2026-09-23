@@ -228,7 +228,7 @@ struct DSS_EXPORT LirFuncAllocation {
     // ⚠ **A COUNTER, DELIBERATELY, AND NOT A STOPWATCH.** A wall-clock
     // performance assertion is sized on the machine that wrote it and reds on
     // the slowest leg that runs it, naming the wrong event;
-    // `scripts/check-wall-clock-in-tests/` refuses new ones for exactly that
+    // `.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones for exactly that
     // reason. This number is the ALGORITHM'S OWN WORK: it is identical on every
     // host, under every load, in Debug and Release, so a test may assert its
     // GROWTH RATIO between two input sizes and that assertion reds on a genuine

@@ -7,6 +7,7 @@
 // definition is needed rather than a forward declaration. `project_config.hpp`
 // is already this tier's manifest vocabulary and `program.cpp` includes it.
 #include "core/types/project_config.hpp"
+#include "core/types/project_sources.hpp"   // ManifestSourceSettings
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"      // CompileConfig
 #include "program/input_resolver.hpp"
@@ -412,6 +413,22 @@ public:
         return includeDirs_;
     }
 
+    /// [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]: the settings a
+    /// `module` dependency applies to ITS OWN sources, keyed by the source's
+    /// spelling in the list this build compiles (the resolver's merged-source
+    /// spelling). A source with an entry compiles with the module's include
+    /// directories searched BEFORE `includeDirs()` and the module's defines
+    /// after `userDefines()`; a source without one — every source the build's
+    /// own manifest names — compiles exactly as before. Set by
+    /// `compileProject` and by a dependency build from the resolver's answer.
+    void setSourceSettings(std::map<std::string, ManifestSourceSettings> s) {
+        sourceSettings_ = std::move(s);
+    }
+    [[nodiscard]] std::map<std::string, ManifestSourceSettings> const&
+    sourceSettings() const noexcept {
+        return sourceSettings_;
+    }
+
     /// c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` binaries
     /// whose export surfaces resolve + validate this run's source-declared
     /// externs. `Program::run` stamps this from `CliArgs::resolveLibraries`;
@@ -590,6 +607,25 @@ public:
     [[nodiscard]] std::optional<std::uint64_t>
     stackReserveBytes() const noexcept { return stackReserveBytes_; }
 
+    /// D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the directories the emitted image
+    /// records for its loader to search for the libraries it needs, in order.
+    /// Empty (the default) ⇒ the image records none, exactly as before.
+    ///
+    /// Sources + PRECEDENCE: `Program::run` stamps the CLI `--rpath` entries
+    /// (gcc's literal semantics); `Program::compileProject` then PREPENDS the
+    /// manifest's `runpaths` (the portable rule, already checked at load). A
+    /// LIST, so the two ACCUMULATE — manifest first, then CLI — as repeated
+    /// `-rpath` does; the writer drops an exact duplicate.
+    ///
+    /// Carried, not honoured, at this tier: whether an entry can be recorded
+    /// and whether the target format records runpaths at all are decided at
+    /// the linker gate (refuse / warn) and by the format's writer.
+    void setRunpaths(std::vector<std::string> entries) {
+        runpaths_ = std::move(entries);
+    }
+    [[nodiscard]] std::vector<std::string> const&
+    runpaths() const noexcept { return runpaths_; }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<std::string>             artifactName_;             // D-AP2-OUTPUT-ROUTING: project binary base name (nullopt = source stem)
@@ -603,6 +639,7 @@ private:
     LtoModeArg                             ltoMode_ = LtoModeArg::Full;
     std::vector<std::string>               userDefines_;  // c105: --define
     std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
+    std::map<std::string, ManifestSourceSettings> sourceSettings_;  // a module's own, per merged source
     std::vector<ResolveLibrarySpec>        resolveLibraries_;  // c162: --resolve-library
     // AP6: per-target ADDITIONS to the line above, keyed by target spec
     // (internal channel — no CLI / manifest surface), and the artifact paths
@@ -619,6 +656,9 @@ private:
     // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: --stack-reserve / manifest
     // `stackReserve` (nullopt = the format's declared default).
     std::optional<std::uint64_t>           stackReserveBytes_;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: manifest `runpaths` + CLI --rpath
+    // (empty = the image records none).
+    std::vector<std::string>               runpaths_;
     /// `--emit-hir`: the buffer `compileOneTarget` renders the `.dsshir` text
     /// into instead of compiling. Set ONLY by `emitHirText`, for the duration of
     /// that one call, and cleared on the way out — a compiling entry point must

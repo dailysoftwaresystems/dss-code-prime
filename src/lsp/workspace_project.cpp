@@ -21,9 +21,18 @@
 // tier and the splitter is plain `core`. ONE splitter, reached downward — the
 // editor and the compiler cannot disagree about what a target spec MEANS.
 #include "core/types/target_spec.hpp"
+// D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: the rest of what a manifest says,
+// read through the BUILD's own readers — the format document's loader, the ABI
+// resolver, the `sources[]` expansion (moved down to `core` for this) and the
+// one base rule for a manifest's paths. None is a second implementation of its
+// question.
+#include "core/types/project_sources.hpp"   // expandAndDedupProjectSources + resolveManifestPathSpelling
+#include "ffi/abi/abi_catalog.hpp"
+#include "link/object_format_schema.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <system_error>
 #include <utility>
 
@@ -146,6 +155,12 @@ std::string_view workspaceProjectErrorName(
             return "TargetConfigLoadFailed";
         case WorkspaceProjectErrorKind::TargetDeclaresNoAssemblyLanguage:
             return "TargetDeclaresNoAssemblyLanguage";
+        case WorkspaceProjectErrorKind::FormatConfigLoadFailed:
+            return "FormatConfigLoadFailed";
+        case WorkspaceProjectErrorKind::CallingConventionUnresolved:
+            return "CallingConventionUnresolved";
+        case WorkspaceProjectErrorKind::SourcesUnresolved:
+            return "SourcesUnresolved";
     }
     return "Unknown";
 }
@@ -443,6 +458,242 @@ std::string describeUnresolvedSchema(
         out += "]: ";
         out += preference.error().detail;
         out += '.';
+    }
+    return out;
+}
+
+// ══ THE BUILD'S CONFIGURATIONS (see the header) ═══════════════════════════════
+
+namespace {
+
+// The first diagnostic a loader reported: its code, and the "CODE: text" the
+// operator reads. A loader that failed WITHOUT reporting is a loader defect and
+// says so under `fallback` rather than producing an empty reason.
+struct ReportedCause {
+    DiagnosticCode code;
+    std::string    text;
+};
+
+[[nodiscard]] ReportedCause firstCause(DiagnosticReporter const& rep,
+                                       DiagnosticCode            fallback) {
+    auto const all = rep.all();
+    if (all.empty()) {
+        return {fallback, "the loader failed without reporting a reason"};
+    }
+    return {all[0].code, std::string{diagnosticCodeName(all[0].code)} + ": "
+                             + all[0].actual};
+}
+
+[[nodiscard]] std::unexpected<WorkspaceProjectError>
+refusal(WorkspaceProjectErrorKind kind, DiagnosticCode code, std::string detail) {
+    return std::unexpected(WorkspaceProjectError{kind, std::move(detail), code});
+}
+
+// A manifest `includes` entry, resolved by the BUILD's own two steps: THE one
+// base rule for a manifest's paths (`resolveManifestPathSpelling` — the call
+// `Program::compileProject` and the dependency builds make), then absolute with
+// the root kept (`core::absoluteKeepingRoot` — the driver's `applyIncludeDirs`).
+// The editor and the build agree on an include directory by construction, not
+// by a second copy of the rule
+// ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]).
+[[nodiscard]] fs::path rebasedDirectory(fs::path const&    manifestDir,
+                                        std::string const& entry) {
+    fs::path const p{resolveManifestPathSpelling(manifestDir, entry)};
+    std::error_code ec;
+    fs::path const abs = core::absoluteKeepingRoot(p, ec);
+    return ec ? p : abs;
+}
+
+} // namespace
+
+WorkspaceBuildResult resolveWorkspaceBuild(
+    std::span<fs::path const> workspaceRoots) {
+    if (workspaceRoots.empty()) {
+        return refusal(WorkspaceProjectErrorKind::NoWorkspaceRoot,
+                       DiagnosticCode::D_UnknownFileExtension,
+                       "the client named no workspace folder, so there is no "
+                       "project file to read a build configuration from");
+    }
+    std::vector<fs::path> manifests;
+    for (auto const& root : workspaceRoots) collectManifests(root, manifests);
+    std::sort(manifests.begin(), manifests.end());
+    if (manifests.empty()) {
+        return refusal(WorkspaceProjectErrorKind::ProjectFileNotFound,
+                       DiagnosticCode::D_UnknownFileExtension,
+                       "no `" + std::string{kProjectFileSuffix}
+                           + "` project file directly inside the workspace "
+                             "root(s), so no build configuration exists");
+    }
+
+    WorkspaceBuild build;
+    for (auto const& manifest : manifests) {
+        std::string const where = "project file `" + manifest.string() + "`";
+        DiagnosticReporter rep;
+        auto cfg = loadProjectConfig(manifest, rep);
+        if (!cfg.has_value()) {
+            auto const cause = firstCause(rep, DiagnosticCode::D_SchemaLoadFailed);
+            return refusal(WorkspaceProjectErrorKind::ProjectFileLoadFailed,
+                           cause.code,
+                           where + " could not be loaded — " + cause.text);
+        }
+        fs::path const dir = manifest.parent_path();
+
+        WorkspaceBuildManifest m;
+        m.path     = manifest;
+        m.language = cfg->language;
+        for (auto const& inc : cfg->includes) {
+            m.includeDirs.push_back(rebasedDirectory(dir, inc));
+        }
+        m.defines = cfg->defines;
+
+        // The BUILD's own answer to "which files does this manifest name",
+        // against the manifest's directory (see `includeDirs` in the header).
+        DiagnosticReporter sourcesRep;
+        auto files = expandAndDedupProjectSources(cfg->sources, dir, sourcesRep);
+        if (!files.has_value()) {
+            auto const cause =
+                firstCause(sourcesRep, DiagnosticCode::D_FileNotFound);
+            return refusal(WorkspaceProjectErrorKind::SourcesUnresolved,
+                           cause.code,
+                           where + " names sources the build cannot find — "
+                               + cause.text);
+        }
+        m.sources.reserve(files->size());
+        for (auto const& f : *files) {
+            m.sources.push_back(core::PathIdentity::of(fs::path{f}));
+        }
+
+        for (auto const& spec : cfg->targets) {
+            auto parsed = TargetSpec::parse(spec);
+            if (!parsed.has_value()) {
+                return refusal(WorkspaceProjectErrorKind::TargetSpecMalformed,
+                               DiagnosticCode::D_InvalidTargetSpec,
+                               where + " declares target `" + spec
+                                   + "` which is not a `<targetName>:<formatName>` "
+                                     "spec ("
+                                   + std::string{targetSpecErrorName(parsed.error())}
+                                   + ")");
+            }
+            auto target = TargetSchema::loadShipped(parsed->targetName);
+            if (!target.has_value()) {
+                return refusal(WorkspaceProjectErrorKind::TargetConfigLoadFailed,
+                               DiagnosticCode::D_SchemaLoadFailed,
+                               where + " declares target `" + parsed->targetName
+                                   + "` whose `<name>.target.json` could not be "
+                                     "loaded — "
+                                   + firstConfigDiag(target.error()));
+            }
+            auto format = ObjectFormatSchema::loadShipped(parsed->formatName);
+            if (!format.has_value()) {
+                return refusal(WorkspaceProjectErrorKind::FormatConfigLoadFailed,
+                               DiagnosticCode::D_SchemaLoadFailed,
+                               where + " declares format `" + parsed->formatName
+                                   + "` whose `<name>.format.json` could not be "
+                                     "loaded — "
+                                   + firstConfigDiag(format.error()));
+            }
+            DiagnosticReporter abiRep;
+            auto abi = ffi::resolveAbi(**target, **format, abiRep);
+            if (!abi.has_value()) {
+                auto const cause =
+                    firstCause(abiRep, DiagnosticCode::F_AbiUnknownTuple);
+                return refusal(WorkspaceProjectErrorKind::CallingConventionUnresolved,
+                               cause.code,
+                               where + " declares target `" + spec
+                                   + "`, for which no calling convention "
+                                     "resolves — " + cause.text);
+            }
+            WorkspaceBuildTarget t;
+            t.spec              = spec;
+            t.callingConvention = abi->cc;   // an entry of `*target`, kept alive below
+            t.target            = std::move(*target);
+            t.format            = std::move(*format);
+            m.targets.push_back(std::move(t));
+        }
+        build.manifests.push_back(std::move(m));
+    }
+    return build;
+}
+
+bool sameConfigurations(WorkspaceBuildResult const& a,
+                        WorkspaceBuildResult const& b) {
+    if (a.has_value() != b.has_value()) return false;
+    if (!a.has_value()) return a.error() == b.error();
+    auto const& ma = a->manifests;
+    auto const& mb = b->manifests;
+    if (ma.size() != mb.size()) return false;
+    for (std::size_t i = 0; i < ma.size(); ++i) {
+        if (ma[i].path != mb[i].path || ma[i].language != mb[i].language
+            || ma[i].includeDirs != mb[i].includeDirs
+            || ma[i].defines != mb[i].defines || ma[i].sources != mb[i].sources
+            || ma[i].targets.size() != mb[i].targets.size()) {
+            return false;
+        }
+        for (std::size_t t = 0; t < ma[i].targets.size(); ++t) {
+            if (ma[i].targets[t].spec != mb[i].targets[t].spec) return false;
+        }
+    }
+    return true;
+}
+
+DocumentBuildSelection selectDocumentConfigurations(
+    WorkspaceBuild const&                       build,
+    std::optional<fs::path> const&              documentPath,
+    std::string_view                            documentLanguage) {
+    DocumentBuildSelection out;
+
+    // Membership is decided on IDENTITY, never on a spelling: the expansion
+    // stored identities, and the document's path is reduced the same way.
+    std::vector<WorkspaceBuildManifest const*> chosen;
+    if (documentPath.has_value()) {
+        auto const id = core::PathIdentity::of(*documentPath);
+        for (auto const& m : build.manifests) {
+            if (std::find(m.sources.begin(), m.sources.end(), id)
+                != m.sources.end()) {
+                chosen.push_back(&m);
+            }
+        }
+    }
+    out.listed = !chosen.empty();
+    if (!out.listed) {
+        for (auto const& m : build.manifests) {
+            if (!documentLanguage.empty() && m.language == documentLanguage) {
+                chosen.push_back(&m);
+            }
+        }
+    }
+
+    for (auto const* m : chosen) {
+        for (auto const& t : m->targets) {
+            bool const duplicate = std::any_of(
+                out.configurations.begin(), out.configurations.end(),
+                [&](DocumentBuildConfiguration const& c) {
+                    return c.language == m->language && c.spec == t.spec
+                        && c.includeDirs == m->includeDirs
+                        && c.defines == m->defines;
+                });
+            if (duplicate) continue;
+            DocumentBuildConfiguration c;
+            c.spec              = t.spec;
+            c.manifest          = m->path;
+            c.language          = m->language;
+            c.target            = t.target;
+            c.format            = t.format;
+            c.callingConvention = t.callingConvention;
+            c.includeDirs       = m->includeDirs;
+            c.defines           = m->defines;
+            out.configurations.push_back(std::move(c));
+        }
+    }
+
+    // Labels: the spec, and the manifest's file name only when two surviving
+    // configurations share a spec (two manifests building one pair differently).
+    std::map<std::string, std::size_t> specCount;
+    for (auto const& c : out.configurations) ++specCount[c.spec];
+    for (auto& c : out.configurations) {
+        c.label = specCount[c.spec] > 1
+                      ? c.spec + " (" + c.manifest.filename().string() + ")"
+                      : c.spec;
     }
     return out;
 }

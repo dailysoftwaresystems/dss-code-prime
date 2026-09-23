@@ -7,6 +7,10 @@ add_library(link OBJECT
     object_format_backend.cpp
     object_format_schema.cpp
     object_format_schema_json.cpp
+    # D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpath vocabulary and its three
+    # rules (gate, portable, translation), one owner for the loader, the gate,
+    # both writers and the project manifest.
+    runpath.cpp
     static_init_tables.cpp
     # D-LINK-OBJECT-FORMAT-SCHEMA-RETAINS-KIND-IDENTITY-BRANCHES (TF-C125).
     # `object_format_backends.cpp` holds THE table — the one place in the tree

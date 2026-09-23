@@ -26,39 +26,6 @@ namespace dss {
 
 namespace {
 
-// Emit one HIR verifier diagnostic, locating it via the source map when one is
-// available. A node WITH a `HirSourceLoc` gets its real (buffer, span); a node
-// without one — a synthetic lowering node with no origin, or any run with no map
-// (e.g. a unit test that builds HIR directly) — gets an honest "no location"
-// (`InvalidBuffer` + empty span). Either way the node's identity travels in
-// `actual` ("hir node #N …"); because `actual` participates in the reporter's
-// dedup key, two findings on DIFFERENT nodes are never coalesced even when both
-// lack a span and so share the empty one.
-//
-// `severity` defaults to `Error` — almost every verifier rule reports a
-// structural-invariant breach that REJECTS the module, so every existing call
-// site stays unchanged. The one exception is `checkBlockTermination`'s
-// unreachable-after-terminator finding, which is ISO-C-valid and so passes
-// `DiagnosticSeverity::Warning` (a warning doesn't bump `errorCount`, so
-// `verify()` still returns true and the module compiles).
-void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
-              std::string actual, HirSourceMap const* sourceMap,
-              DiagnosticSeverity severity = DiagnosticSeverity::Error) {
-    ParseDiagnostic d;
-    d.code     = code;
-    d.severity = severity;
-    if (sourceMap != nullptr && sourceMap->has(id)) {
-        HirSourceLoc const& loc = sourceMap->get(id);
-        d.buffer = loc.buffer;
-        d.span   = loc.span;
-    } else {
-        d.buffer = InvalidBuffer;
-        d.span   = SourceSpan::empty(0);
-    }
-    d.actual = std::move(actual);
-    reporter.report(std::move(d));
-}
-
 // ★★★ THE CONSTRUCT'S NAME, NEVER A BARE ORDINAL — the diagnostic half of
 // D-C-SUBSCRIPT-OPERANDS-ARE-NOT-COMMUTATIVE, which this file carried for every
 // kind rather than for subscripts alone.
@@ -85,14 +52,63 @@ void reportAt(DiagnosticReporter& reporter, DiagnosticCode code, HirNodeId id,
 
 } // namespace
 
+// Emit one HIR verifier diagnostic, locating it via the source map when one is
+// available. A node WITH a `HirSourceLoc` gets its real (buffer, span); a node
+// without one — a synthetic lowering node with no origin, or any run with no map
+// (e.g. a unit test that builds HIR directly) — gets an honest "no location"
+// (`InvalidBuffer` + empty span). Either way the node's identity travels in
+// `actual` ("hir node #N …"); because `actual` participates in the reporter's
+// dedup key, two findings on DIFFERENT nodes are never coalesced even when both
+// lack a span and so share the empty one.
+//
+// `severity` defaults to `Error` — almost every verifier rule reports a
+// structural-invariant breach that REJECTS the module, so every existing call
+// site stays unchanged. The one exception is `checkBlockTermination`'s
+// unreachable-after-terminator finding, which is ISO-C-valid and so passes
+// `DiagnosticSeverity::Warning` (a warning doesn't bump `errorCount`, so
+// `verify()` still returns true and the module compiles).
+//
+// ★★ AND IT COUNTS, BEFORE THE REPORTER STORES ANYTHING. Whether `report` keeps
+// the diagnostic — or drops it as a recent duplicate, or past a cap — is the
+// reporter's business, and it must not become the verdict's: the Error count
+// taken HERE is what `verify()` answers with. What counts as an Error is the
+// POLICY's answer (`effectiveSeverity`, the one owner `report` itself asks), so
+// a `--warnings-as-errors` promotion of the Warning finding counts, and a
+// finding the operator suppressed does not.
+void HirVerifier::reportAt(DiagnosticReporter& reporter, DiagnosticCode code,
+                           HirNodeId id, std::string actual,
+                           HirSourceMap const* sourceMap,
+                           DiagnosticSeverity severity) const {
+    if (std::optional<DiagnosticSeverity> const effective =
+            reporter.effectiveSeverity(code, severity);
+        effective == DiagnosticSeverity::Error) {
+        ++errorsFound_;
+    }
+    ParseDiagnostic d;
+    d.code     = code;
+    d.severity = severity;
+    if (sourceMap != nullptr && sourceMap->has(id)) {
+        HirSourceLoc const& loc = sourceMap->get(id);
+        d.buffer = loc.buffer;
+        d.span   = loc.span;
+    } else {
+        d.buffer = InvalidBuffer;
+        d.span   = SourceSpan::empty(0);
+    }
+    d.actual = std::move(actual);
+    reporter.report(std::move(d));
+}
+
 bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     std::size_t const errorsBefore = reporter.errorCount();
+    errorsFound_ = 0;
     checkRequiredTypes(reporter);
     checkNodeArity(reporter);
     checkBreakContinueScoping(reporter);
     checkSehContext(reporter);
     checkVlaJumpScoping(reporter);
     checkDeclarationShape(reporter);
+    checkFunctionSignatures(reporter);
     // HR6 rules.
     checkBlockTermination(reporter);
     checkReturnCompleteness(reporter);
@@ -109,7 +125,16 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     // to certify a clean module when the reporter can't have recorded
     // everything — never hand back a false all-clear.
     if (reporter.hitCap()) return false;
-    return reporter.errorCount() == errorsBefore;
+    // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT of the findings the policy makes
+    // Errors (see `reportAt`), AND-ed with the reporter's delta. The delta alone
+    // was not a verdict — the reporter drops a diagnostic identical to one in its
+    // recent window without storing it, so ✔MEASURED P68 (lane `ht`) a module the
+    // verifier refused (`H_InvalidBreak`), read twice into ONE reporter, verified
+    // CLEAN the second time; a per-code cap loses a finding the same way. (Every
+    // Error code this verifier emits is unsuppressable now, and members bypass
+    // those gates — the own count is what keeps the verdict right for a promoted
+    // Warning, and for the next code added without joining that table.)
+    return errorsFound_ == 0 && reporter.errorCount() == errorsBefore;
 }
 
 void HirVerifier::checkRequiredTypes(DiagnosticReporter& reporter) const {
@@ -760,6 +785,61 @@ void HirVerifier::checkDeclarationShape(DiagnosticReporter& reporter) const {
     }
 }
 
+void HirVerifier::checkFunctionSignatures(DiagnosticReporter& reporter) const {
+    if (interner_ == nullptr) return;  // a FnSig can't be decoded without it
+    std::uint32_t const moduleTag = hir_.id().v;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        HirKind const kind = hir_.kind(id);
+        if (kind != HirKind::Function && kind != HirKind::ExternFunction) continue;
+        // Cascade suppression, as in every rule: a declaration already on a broken
+        // path carries HasError, and its signature is a downstream effect.
+        if (hasError(hir_.flags(id))) continue;
+        TypeId const sig = hir_.typeId(id);
+        // A `Function` with NO type is `checkRequiredTypes`' H_TypeUnresolved; an
+        // `ExternFunction` with none is LEGAL (binary-only ingestion — see
+        // `requiresValidType`). Either way there is no signature to read here.
+        if (!sig.valid()) continue;
+        std::uint32_t const symbol = hir_.payload(id);
+
+        if (TypeKind const k = interner_->kind(sig); k != TypeKind::FnSig) {
+            // The kind's NAME, never a bare ordinal (see `describeKind`); a kind
+            // with no spelling falls back to the ordinal rather than to nothing.
+            std::string_view const name = typeKindNameOrEmpty(k);
+            reportAt(reporter, DiagnosticCode::H_VerifierFailure, id,
+                     std::format("{} %{} (hir node #{}) has a type of kind {}, not a "
+                                 "function signature (FnSig)",
+                                 describeKind(kind), symbol, id.v,
+                                 name.empty()
+                                     ? std::format("ordinal {}", static_cast<unsigned>(k))
+                                     : std::string{name}),
+                     sourceMap_);
+            continue;
+        }
+
+        // ONE diagnostic per declaration, naming every unresolved position: a
+        // signature with N holes is one fault in one declaration, and N lines for
+        // it would be the cascade this rule must not add.
+        std::string holes;
+        auto const note = [&holes](std::string const& what) {
+            holes += holes.empty() ? what : ", " + what;
+        };
+        if (!interner_->fnResult(sig).valid()) note("its result");
+        auto const params = interner_->fnParams(sig);
+        for (std::size_t p = 0; p < params.size(); ++p) {
+            if (!params[p].valid())
+                note(std::format("parameter {} of {}", p + 1, params.size()));
+        }
+        if (!holes.empty()) {
+            reportAt(reporter, DiagnosticCode::H_TypeUnresolved, id,
+                     std::format("{} %{} (hir node #{}) declares a signature with no "
+                                 "resolved type for {}",
+                                 describeKind(kind), symbol, id.v, holes),
+                     sourceMap_);
+        }
+    }
+}
+
 // ── HR6 rule helpers ─────────────────────────────────────────────────────────
 
 namespace {
@@ -857,8 +937,13 @@ void HirVerifier::checkReturnCompleteness(DiagnosticReporter& reporter) const {
 
         TypeId const sig = hir_.functionSignature(id);
         if (!sig.valid()) continue;                             // checkRequiredTypes flags this
-        if (interner_->kind(sig) != TypeKind::FnSig) continue;  // not a FnSig — caller's contract
-        if (interner_->kind(interner_->fnResult(sig)) == TypeKind::Void) continue;  // void: ok
+        if (interner_->kind(sig) != TypeKind::FnSig) continue;  // checkFunctionSignatures flags this
+        // ★ checkFunctionSignatures flags an unresolved result, and this rule must
+        // not read one: `kind(InvalidType)` is `TypeInterner::get`'s range check, a
+        // PROCESS ABORT — which is what reading `fn() -> invalid` back did here.
+        TypeId const result = interner_->fnResult(sig);
+        if (!result.valid()) continue;
+        if (interner_->kind(result) == TypeKind::Void) continue;  // void: ok
 
         auto kids = hir_.children(id);
         // A missing/non-Block body is checkDeclarationShape's to report.
@@ -895,7 +980,10 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
         }
         if (interner_->kind(sig) != TypeKind::FnSig) continue;  // opaque/extension callee
 
-        auto params = interner_->fnParams(sig);
+        // P68 round 8 (lane `ht`, part 2): the parameters the ARGUMENTS bind to —
+        // the lattice's one answer (`fnArgumentParams`), which a parameter of
+        // unqualified void ends; the semantic call check reads the same helper.
+        auto params = interner_->fnArgumentParams(sig);
         auto args   = kids.subspan(1);
         // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): a variadic FnSig admits args
         // beyond `fnParams().size()` — the declared params are the
@@ -906,7 +994,7 @@ void HirVerifier::checkCallArguments(DiagnosticReporter& reporter) const {
         // arity check rejects only when there are FEWER args than
         // fixed params. For non-variadic FnSigs the check is
         // unchanged (exact match).
-        bool const isVariadic = interner_->fnIsVariadic(sig);
+        bool const isVariadic = interner_->fnArgumentsVariadic(sig);
         bool const arityBad   = isVariadic
             ? (args.size() < params.size())
             : (args.size() != params.size());

@@ -1,9 +1,11 @@
 # DssHarness — the harness this repository runs on
 
 `DssHarness` is a cross-platform .NET tool, built in `dailysoftwaresystems/repo-harness` and published
-on nuget.org. It is replacing `scripts/`: the anchor registries, the worktrees, the legs, the builds,
-the test runs and the corpus runners all move to it, so that one implementation serves every host and
-no capability depends on whether a `.sh` and a `.ps1` agree.
+on nuget.org. It REPLACED `scripts/`: the anchor registries, the worktrees, the legs, the builds,
+the test runs and the corpus runners moved to it, so that one implementation serves every host and
+no capability depends on whether a `.sh` and a `.ps1` agree. Every program this repository still
+ships is one of its ACTIONS, under `.harness-config/runner/actions/`; there is no `scripts/` and no
+`real-examples/` directory.
 
     dotnet tool install --global DssHarness      # or `dotnet tool update --global DssHarness`
     DssHarness --version                         # every leg must match the root host
@@ -83,7 +85,7 @@ a script can be DELETED rather than merely replaced — both are statements abou
 why they are safe to write down:
 - **Success witnesses.** A test invocation must declare a `successPattern`, and a runner phase may;
   the work passes only if the exit code is zero **AND** the pattern matches the command's own output.
-  That is the same contract `scripts/run-gate` enforces, so the property SURVIVES that script's
+  That is the contract the retired `run-gate` enforced, so the property SURVIVED that program's
   deletion rather than being lost with it.
 - **Timeouts are deliberately not wall-clock** for phases and legs, because a time budget is a guess
   about workload size and honest runs exceeding it get killed. A phase declares a **stall** bound
@@ -101,16 +103,16 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | Verb | What it replaces here |
 |---|---|
 | `init`, `verify-git`, `legs`, `install-missing-tools`, `host-exec`, `help` | host discovery, the leg catalogue, host provisioning, remote invocation |
-| `create-worktree`, `delete-worktree`, `list-worktree` | `scripts/lane-worktree` |
-| `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | `scripts/anchors`, `scripts/apply-registry-row`, `scripts/burndown-queue` |
-| `check-anchor-citations` | `scripts/check-anchor-registry` |
-| `check-root-litter` | `scripts/check-root-litter` |
-| `fix-line-endings` | `scripts/check-line-endings` |
-| `check-ci-legs` | ~~`scripts/check-ci-legs`~~ — **DELETED** |
-| `build` | ~~`scripts/local-build`~~ — **DELETED**; with `--time`, `scripts/profile-compile` and `scripts/compile-bench` still pending |
-| `test` | ~~`scripts/run-gate`~~ — **DELETED** |
-| `sync` | the leg drivers, the carriages and the exclude derivation — **DELETED**. ⚠ `leg-tree` STAYS: it is also the `.sh` owner of *which tree am I standing in*, sourced by `check-line-endings`, `check-root-litter` and `lane-worktree`, so it retires with its LAST CONSUMER beside `repo-tree.ps1` and `owning-tree.py` |
-| `run` | the sqlite corpus driver, `sqlite-round-trip`, `sqlite-runtime-bench` and `macho-alias-ld64-matrix`, as predefined runners |
+| `create-worktree`, `delete-worktree`, `list-worktree` | the plain lane-worktree lifecycle. ⚠ The `lane-worktree` ACTION stays for what the verbs lack: a VERIFIED evidence copy (`--preserve-to`) and the seed manifest `lane-fold` adjudicates a fold with |
+| `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | the eight anchor launchers — **DELETED**. The `anchors` action stays as the row LIBRARY other actions load; `apply-registry-row` stays for a lane's one-line VERBATIM row file, a different input than `set-anchor`'s file-per-cell |
+| `check-anchor-citations` | resolving cited ids, over the roots in `anchors.citationRoots` (`.harness-config` since 2026-09-18, `tests` since 2026-09-19). ✔MEASURED: `--current-tree` reads tracked and untracked-not-ignored files and never an ignored one. From round four — the release this tree lands with — a citation resolves only to the row whose id it EXACTLY is (case counts; `read-anchor` agrees), and an id that runs into a hyphen at a line's end is reported as CUT whatever rows exist, even cut at its first or second hyphen when the next line completes it (0.5.7 resolved by substring and saw no cut at all). ⚠ Still unseen: a wrap inside a string literal whose prefix happens to be a row, and an id cut at a hyphen that OPENS the next line (that one fails as unresolved, not as cut) — `check-wrapped-anchor-ids` owns the first. ⚠ The `check-anchor-registry` action stays for what no verb covers: the plans' table cell-width property and the retired-id matcher |
+| `check-root-litter` | the `check-root-litter` program — **DELETED** |
+| `fix-line-endings` | rewriting endings. ⚠ The `check-line-endings` action stays: HEAD and index blobs, a CR instrument that cannot see a CR, `--files`, and its watchdog |
+| `check-ci-legs` | the `check-ci-legs` program — **DELETED** |
+| `build` | the `local-build` program — **DELETED**. ⓘ It also reads `ninja -t deps` since 0.5.7; the `check-ninja-deps` action stays because CI runs `ctest` with no DssHarness installed |
+| `test` | the `run-gate` program — **DELETED** |
+| `sync` | the leg drivers, the carriages and the exclude derivation — **DELETED**. The `owning-tree` action is the one owner of *which tree am I standing in*; the `.sh` and PowerShell owners it stood beside were folded into it |
+| `run` | EVERY program this repository ships: each is an action under `.harness-config/runner/actions/` with a `predefinedRunners` entry, started by `dssharness run <name>` |
 
 ⚠ **A verb EXISTING is not a script deleted, and this rule did not change when the verbs shipped.**
 **Nothing is deleted before the verb that replaces it has been proven on all four legs**, and the
@@ -140,7 +142,7 @@ it untouched. Until its replacement is proven, a script stays and is the only wa
   configs;
 - **three emulators** — qemu for arm64 inside WSL, qemu for x86_64 on the VPS, Rosetta on the Mac.
   ⚠ **Not wine**: a DssHarness emulator changes the processor and never the operating system, and the
-  pe64-under-wine arm is cross-OS, so that launcher stays in `real-examples/c/sqlite/legs.json` with
+  pe64-under-wine arm is cross-OS, so that launcher stays in `.harness-config/runner/actions/real-examples/c/sqlite/legs.json` with
   the rest of the corpus's own leg catalogue;
 - **every remote leg's repository directory**, because `sync` creates it when it is not there;
 - the never-transfer floor, the contention tools, the worktree budget, and both registry paths.
@@ -172,11 +174,19 @@ additional files like a big python command or anything else, you can use it insi
 example: `python3 ./bla.py`"*. ⚠ **This SUPERSEDES the flat `actions/<name>.yml`** that the migration
 contract's S3 and R28 were written against.
 
+★★★ **Operator ruling, 2026-09-21**, verbatim: *"I don't want .sh/.ps1 files inside
+.harness-config\runner\actions. entrypoint is .yml, you can call .py files, BUT NOT .sh/.ps1 please.
+They are specific per OS. I don't want this anymore"*. ⇒ An action's entry point is its `.yml`, and
+every step starts `python3 <file>.py` (or a DssHarness verb); no `.sh` and no `.ps1` lives anywhere
+under `.harness-config/runner/actions/`, and `check-scripts-index` refuses one by name. A program that
+was a `.sh`/`.ps1` twin became ONE `.py` carrying the union of both twins' checks, so the same step
+runs on every leg its runner declares — the host dispatch that picked a twin is gone with the twins.
+
 ★ **The reason is the `run` contract, and it is why a flat directory cannot work.** A `run` line is a
 program and its arguments with **no shell**, so anything that is not a one-liner — a Python program, a
 fixture, a data table — has to live in a FILE beside the action, and a flat directory gives it nowhere
-to live that is obviously owned by that action. It is the same rule this repository already applies to
-`scripts/`: **one directory per script, named for the script, assets alongside.**
+to live that is obviously owned by that action. It is the rule this repository applies to every
+program it ships: **one directory per program, named for it, assets alongside.**
 
 ⚠ **The table below was written when the tool could express only HALF of this ruling, and the layout
 was declared as ruled anyway.** ⇒ **re-answer it before relying on it** — `DssHarness help runners`
@@ -212,6 +222,11 @@ NOT work as written** — it looks for `bla.py` beside `CMakeLists.txt`. Name a 
 root: `python3 ./.harness-config/runner/actions/<action>/bla.py`, which is verified working with
 forward slashes on the Windows host. ★ That spelling also survives the `.yml` moving, because it was
 never relative to the `.yml`.
+★ **A step can ask to run beside its own files**: `workingDirectoryRoot: action` runs it in the
+action's directory, and then `python3 ./bla.py` is right — ✔MEASURED through `DssHarness run` on the
+Windows leg, and it is the form every action in this tree uses (`DssHarness help runners` states the
+three roots, `tree` the default). A step may also name the operating systems it runs on (`runOn`);
+a Python program needs none, which is the point of having one program instead of a twin per OS.
 ⓘ `actions/` is tracked (its `.gitkeep`, and every action directory under it); `runner/.env/` and
 `runner/.secrets/` are ignored, resolved against the MAIN checkout so worktrees share them. Precedence
 is values, then secrets, then the runner's `env`, then the step's `env` — so a path set in the tracked

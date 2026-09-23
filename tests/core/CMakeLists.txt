@@ -7,6 +7,10 @@ dss_add_test(NAME core/test_source_buffer       SOURCES test_source_buffer.cpp)
 dss_add_test(NAME core/test_token               SOURCES test_token.cpp)
 dss_add_test(NAME core/test_rule_id             SOURCES test_rule_id.cpp)
 dss_add_test(NAME core/test_parse_diagnostic    SOURCES test_parse_diagnostic.cpp)
+# The ONE expansion of an inline-asm template's TEXT forms, pinned against the
+# measured gcc/clang outputs (D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED).
+dss_add_test(NAME core/test_asm_template_text_forms
+             SOURCES test_asm_template_text_forms.cpp)
 dss_add_test(NAME core/test_config_path_walk    SOURCES test_config_path_walk.cpp)
 # The ONE path-identity chokepoint (D-PATH-IDENTITY-8DOT3-SPELLINGS-SPLIT-KEYS).
 # Its 8.3 arms CONSTRUCT the hazard and SKIP LOUDLY where the volume cannot

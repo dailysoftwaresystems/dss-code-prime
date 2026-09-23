@@ -6,8 +6,8 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★★★ THE BUILD IS VERIFIABLE — run this BEFORE trusting any ctest result:**
 
   ```bash
-  python scripts/check-ninja-deps/check-ninja-deps.py            # no argument: it finds the tree
-  python scripts/check-ninja-deps/check-ninja-deps.py build/p29-x  # or name YOUR lane's tree
+  python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py            # no argument: it finds the tree
+  python .harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py build/p29-x  # or name YOUR lane's tree
   ```
 
   ⚠⚠ **THIS LINE USED TO READ `… check-ninja-deps.py build-dbg`, AND THAT PATH HAS NOT EXISTED SINCE
@@ -111,7 +111,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **no NEW `abort()` in test code:**
 
   ```bash
-  python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py
+  python .harness-config/runner/actions/check-no-abort-in-tests/check-no-abort-in-tests.py
   ```
 
   `std::abort()` in a fixture kills the whole test PROCESS, so every sibling test in that
@@ -126,34 +126,27 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   ceiling is lowered, because unclaimed headroom is where the next regression hides. ⚠ Do not
   confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. The burn-down stays
   open in the registry until the inventory is empty.
-  ⓘ Self-tests: `python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
+  ⓘ Self-tests: `python .harness-config/runner/actions/check-no-abort-in-tests/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
   the whole correctness — a bare token grep would red on the very file that documents the fix).
-- anchor-registry guard OK: `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`).
+- anchor-registry guard OK: `python .harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py`
+  (ctest `anchor_registry_guard`; one program on every host).
   ⓘ Exit **4** now means *a citation names a RETIRED anchor id* — a name whose registry row opens
   with the `RETIRED-ID` marker. Resolution is substring-anywhere (load-bearing: it is what lets a
   line-wrapped citation resolve), so it cannot otherwise tell a live name from a dead one — a stale
   id resolved for weeks on the strength of the row written to report it as stale.
-- script-index guard OK: `python scripts/check-scripts-index/check-scripts-index.py`.
+- script-index guard OK: `python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py`.
   Rides ctest as `scripts_index_guard`, so it runs anyway — run it directly when this cycle
   added, renamed, deleted or REPURPOSED a script. It reds when the tree and the two indexes
-  (`scripts/README.md`, `references/scripts.md`) disagree, or when a script's own `PURPOSE:`
+  (`.harness-config/runner/actions/README.md`, `references/actions.md`) disagree, or when a script's own `PURPOSE:`
   line differs from its index row. Regenerate both with `--write`; never hand-edit the block
-  between the generated-index markers.
-- shell-portability guard OK: `python scripts/check-shell-portability/check-shell-portability.py`.
-  Rides ctest as `shell_portability_guard`, so it runs anyway — run it directly when this cycle
-  touched a `.sh`. It refuses two shapes that are fatal on **macOS bash 3.2** and invisible
-  everywhere else: a `case` inside `$( … )` whose patterns are not `(`-prefixed, and a bash-4+
-  construct in a file with no `BASH_VERSINFO` gate above it.
-  ★★ ⚠ **`bash -n` CANNOT FIND THE FIRST ONE** — ✔MEASURED 2026-08-22: the probe file parses clean
-  under 3.2 (exit 0) and fails only when the substitution is EXPANDED. Do not "check it with the old
-  shell" instead; that instrument is blind by construction. The cost of not having this guard was
-  `anchor_registry_guard` dying inside its OWN self-test on `macos-latest`, so the anchor registry
-  had never been checked on that host.
-  ⓘ It walks the TREE and asks git only what is IGNORED — never `git ls-files`. ✔MEASURED on the
-  macOS leg the same day: a carriage's checkout sits at an old commit with the working tree rsynced
-  over it, so the INDEX named seven deleted `tools/*.sh` paths and the guard reported seven
-  violations on a host where nothing was wrong. Every carriage has that shape, so the distinction is
-  operational, not academic.
+  between the generated-index markers. ★ It also refuses any `.sh` or `.ps1` under the actions root,
+  by name: every action runs one Python program on every host (operator ruling 2026-09-21).
+- ⓘ There is no shell-portability guard any more: its subject, the `.sh` programs of the actions
+  tree, was retired on 2026-09-21 (what covers it is in `cmake/DssHarnessDeletionInventory.md`).
+  Its lesson outlives it: a guard running on a carriage's checkout asks git only what is IGNORED,
+  never `git ls-files` — ✔MEASURED 2026-08-22, a checkout sitting at an old commit with the working
+  tree synced over it made the INDEX name seven deleted `tools/*.sh` paths, and a guard reading the
+  index reported seven violations on a host where nothing was wrong.
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.
@@ -167,7 +160,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   a gate item with a number, checked exactly like ctest. Count before and after and report both:
 
   ```bash
-  python scripts/check-anchor-balance/check-anchor-balance.py
+  python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py
   ```
 
   It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
@@ -240,7 +233,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **★★ THE DIAGNOSTIC-CODE ALLOCATION GATE — the ordinal space has no lock, so this is the lock.**
 
   ```bash
-  python scripts/check-diagnostic-codes/check-diagnostic-codes.py
+  python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py
   ```
 
   `DiagnosticCode` is one flat ordinal space whose values are PUBLISHED identities (`error[D0029]`,
@@ -291,7 +284,8 @@ Keep the plans honest in the **same commit** as the code:
 - In the registry: **close a row by MOVING it**, never by editing a status in place —
   `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` stamps the
   `Status` column and lifts the row out of its working registry into
-  `_deferred-anchor-registry-done.md`. Add new anchors with `write-anchor.sh ... --insert --apply`.
+  `_deferred-anchor-registry-done.md`. Add new anchors with `DssHarness write-anchor <ID> ...` (it
+  WRITES unless given `--anchor-dry-run`).
   **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive
   exists rather than a deletion (operator, 2026-09-01). ⚠ Hand-editing a table is refused by
   `check-anchor-balance`'s partition arm; a hand-typed row can also wrap the anchor id, which does
@@ -408,6 +402,6 @@ what makes "two cycles running shipped on one leg" visible as a pattern instead 
   cannot be compressed, that is a signal the project has more open fronts than priorities, and
   saying so IS the handoff.
 - ⚠ **A handoff written from memory is worse than none.** Re-measure the numbers at cycle end
-  (`ctest`, `scripts/check-anchor-balance/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
+  (`ctest`, `.harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
   This repo has recorded three counts written from memory that all erred LOW; the handoff is the
   single most-quoted document in the project, so a wrong number there propagates furthest.

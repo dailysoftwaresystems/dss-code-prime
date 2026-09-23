@@ -3,6 +3,7 @@
 #include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey + DSS_CHECK_KEY_VOCABULARY
 #include "core/types/parse_diagnostic.hpp"
+#include "link/runpath.hpp"                      // portableRunpathEntryRefusal — the ONE portable-runpath rule
 #include "program/platform_token.hpp"            // kRunOnPlatformTokens / isValidRunOnToken / runOnTokenList
 
 #include <nlohmann/json.hpp>
@@ -34,11 +35,11 @@ using json = nlohmann::json;
 // The human-readable "recognized fields" list in the diagnostic is DERIVED
 // from this array by `projectConfigKnownKeyList()` — see the header note. Do
 // not re-type it anywhere.
-constexpr std::array<std::string_view, 14> kKnownKeys = {
+constexpr std::array<std::string_view, 15> kKnownKeys = {
     "language", "artifactProfile", "targets", "sources", "output",
     "artifactName", "includes", "defines", "resolveLibraries",
-    "stackReserve", "preBuildScripts", "postBuildScripts", "dependsOn",
-    "dependencyArtifactCache",
+    "stackReserve", "runpaths", "preBuildScripts", "postBuildScripts",
+    "dependsOn", "dependencyArtifactCache",
 };
 DSS_CHECK_KEY_VOCABULARY(kKnownKeys);
 
@@ -943,6 +944,27 @@ parseProjectConfig(std::string_view jsonText,
             return std::nullopt;
         }
         pc.stackReserveBytes = n;
+    }
+
+    // `runpaths` (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — an OPTIONAL array of
+    // directories every image this project builds records for its loader to
+    // search for the libraries it needs; the file-driven, PORTABLE twin of the
+    // CLI `--rpath`. A manifest builds for MANY targets, so each entry must mean
+    // the same thing on every one of them: absolute, or rooted at `${ORIGIN}`
+    // (the directory of the image that carries the path, which each format's
+    // DOCUMENT spells its own way — `$ORIGIN`, `@loader_path`), with no other
+    // `$` and no `:`. That rule is `portableRunpathEntryRefusal`'s, stated once
+    // in link/runpath.hpp; its refusal names the CLI flag as the place for a
+    // loader-specific spelling. Absent ⇒ empty ⇒ nothing recorded (unchanged).
+    if (!readOptionalStringArray(doc, "runpaths", pc.runpaths, sourceLabel, rep))
+        return std::nullopt;
+    for (std::size_t i = 0; i < pc.runpaths.size(); ++i) {
+        if (auto const why = portableRunpathEntryRefusal(pc.runpaths[i])) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             std::string{"field 'runpaths' entry ["}
+                                 + std::to_string(i) + "] is refused: " + *why);
+            return std::nullopt;
+        }
     }
 
     // The OPTIONAL build-lifecycle hooks + project prerequisites. All three

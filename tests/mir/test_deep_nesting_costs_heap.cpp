@@ -248,11 +248,15 @@ constexpr std::size_t kProbeBudgetFactor = std::size_t{1} << 20;
 // the crash is proof of a cycle rather than of a deep input — no stack size fixes
 // it, and neither does a depth cap that merely truncates.
 //
-// The contract now: the emit COMPLETES, the self-reference is refused BY NAME
-// with an `Error`, and the text carries the `?` mark that `parseType` rejects on
-// the way back in — never a quietly truncated type that would read back as a
-// DIFFERENT struct.
-TEST(MirTextDeepNesting, SelfReferentialCompositeIsRefusedLoudNotACrash) {
+// The P55 contract was: the emit COMPLETES, the self-reference is refused BY NAME
+// with an `Error`, and the text carries a `?` mark the reader rejects — never a
+// quietly truncated type. ★ `.dssir` v2 (P68 round 8, lane `ht`, part 1d) REPLACES
+// THE REFUSAL WITH A SPELLING: a composite is `type <H>`, defined ONCE in the
+// `types` table, so nothing expands and the cycle is an ordinary entry whose field
+// names its own handle. The contract now: the emit completes with NO error, the
+// definition spells the self-reference by handle, and the text reads back — verify
+// on load included — to a module that re-emits byte-identically.
+TEST(MirTextDeepNesting, SelfReferentialCompositeIsATableEntryAndReadsBack) {
     auto L = lowerC("struct S { int v; struct S *next; };\n"
                     "struct S g;\nint main(void){ return g.v; }",
                     /*exprDepthCap=*/1024);
@@ -262,18 +266,20 @@ TEST(MirTextDeepNesting, SelfReferentialCompositeIsRefusedLoudNotACrash) {
     ctx.interner = &L.model.lattice().interner();
     std::string const text = emitMir(L.mir.mir, ctx, reporter);
 
-    // It came back at all. Before the fix control never returned from here.
+    // It came back at all — the P55 property, kept.
     EXPECT_FALSE(text.empty());
-    // The composite IS still named — the refusal must say WHAT it refused.
-    EXPECT_NE(text.find("struct \"S\""), std::string::npos);
-    // …and the self-reference carries the reader-refused mark, so the text
-    // cannot silently round-trip as a struct whose `next` lost its pointee.
-    EXPECT_NE(text.find("struct \"S\" ?"), std::string::npos)
-        << "a self-referential composite must render with the '?' mark the "
-           "reader refuses, never as a silently truncated type";
-    // LOUD: an Error, not a warning and not silence.
-    EXPECT_GT(reporter.errorCount(), 0u)
-        << "refusing to render a self-referential composite must be an Error";
+    EXPECT_EQ(reporter.errorCount(), 0u)
+        << "a self-referential composite has a spelling now; rendering it is not an error";
+    // The ONE definition names its own handle — the cycle, spelled.
+    EXPECT_NE(text.find("type 1 = struct \"S\" {i32, ptr<type 1>}"), std::string::npos) << text;
+    EXPECT_EQ(text.find("?"), std::string::npos) << "no unrenderable mark is left:\n" << text;
+
+    DiagnosticReporter back;
+    auto parsed = parseMir(text, CompilationUnitId{1}, back);
+    ASSERT_TRUE(parsed->ok) << "the text must read back (verify-on-load included):\n" << text;
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
+    DiagnosticReporter again;
+    EXPECT_EQ(emitMir(parsed->mir, ctx2, again), text) << "the round trip must be byte-identical";
 }
 
 // The complement: a type that is merely DEEP must still render completely, so the
@@ -797,7 +803,7 @@ TEST(HirToMirSehDeepNesting, NestedTryExceptRegionsCostHeapNotCallFrames) {
 TEST(MirTextDeepNesting, DeeplyNestedTypeParsesBackOnAnOrdinaryThread) {
     constexpr int kDepth = 4000;   // 4x the MEASURED pre-fix crash floor (1000)
 
-    std::string text = "dssir 1\nmodule {\n  global %1 : ";
+    std::string text = "dssir 2\nmodule {\n  global %1 : ";
     for (int i = 0; i < kDepth; ++i) text += "ptr<";
     text += "i32";
     for (int i = 0; i < kDepth; ++i) text += ">";
@@ -846,7 +852,7 @@ TEST(MirTextDeepNesting, DeeplyNestedTypeParsesBackOnAnOrdinaryThread) {
 TEST(MirTextDeepNesting, DeeplyNestedLiteralParsesBackOnAnOrdinaryThread) {
     constexpr int kDepth = 4000;   // 2.6x the recursive reader's crash floor
                                    // (1500) AND 2x the pre-fix destructor wall
-    std::string text = "dssir 1\nmodule {\n  global %1 : i64 = ";
+    std::string text = "dssir 2\nmodule {\n  global %1 : i64 = ";
     for (int i = 0; i < kDepth; ++i) text += "lit agg { ";
     text += "lit int 7 : i64";
     for (int i = 0; i < kDepth; ++i) text += " } : i64";

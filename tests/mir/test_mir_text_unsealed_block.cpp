@@ -52,7 +52,7 @@ namespace {
 // transition to a NEXT block calls `beginBlock` and therefore `closeBlock_`.
 [[nodiscard]] std::string doc(std::string_view body1) {
     return std::string{
-        "dssir 1\n"
+        "dssir 2\n"
         "symbols {\n"
         "  %1 \"main\"\n"
         "}\n"

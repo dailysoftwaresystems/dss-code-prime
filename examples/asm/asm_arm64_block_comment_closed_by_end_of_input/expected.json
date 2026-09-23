@@ -1,0 +1,30 @@
+{
+  "$comment": "★★ AN arm64 `.s` THAT ENDS INSIDE AN UNTERMINATED `/*` ASSEMBLES AND RUNS, WITH gas's WARNING (P68 round 8, D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED) — the AT&T sibling's claim on the second dialect. ✔MEASURED 2026-09-23: `aarch64-linux-gnu-as` 2.42 assembles it, warning 'end of file in multiline comment', and it returns 42 under qemu-aarch64; clang 18.1.3 refuses it. DSS accepts it with `P_ClosedByEndOfInput` at the opener, then terminates the `ret` line with the implied end-of-input newline. ★ RED-ON-DISABLE: set this dialect's `block-comment` `atEndOfInput` back to its default and the example is refused again. The `release` arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "expectWarnings": [
+    {
+      "code": "P_ClosedByEndOfInput",
+      "line": 17,
+      "col": 6,
+      "$comment": "the `/*` opener on the `ret` line; the comment runs to the end of the input"
+    }
+  ],
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

@@ -282,12 +282,18 @@ TEST(AsmTextToLir, DialectWithoutFunctionEntryVerbSaysSo) {
 
 // ── conditional branches ──────────────────────────────────────────────────
 
-// ★★ A `jcc` CARRIES TWO BlockRef OPERANDS **AND** TWO RECORDED SUCCESSORS.
-// `addCondBr` does not synthesize either one — the walker must mint the
-// anonymous fallthrough block itself and pass both edges explicitly. A
-// regression that passed only the taken target would leave the encoder writing
-// a displacement to whatever operand[1] happened to be.
-TEST(AsmTextToLir, CondBranchCarriesBothEdgesAndBothSuccessors) {
+// ★★ A `jcc` RECORDS BOTH SUCCESSORS, AND ITS FALSE EDGE IS THE BLOCK LAID OUT
+// NEXT. `addCondBr` synthesizes neither — the walker hands the taken target and
+// the fall-through block over explicitly. The fall-through block is the one the
+// NEXT line of the text begins, created in text order by the block plan, so it
+// is laid out right after the branch and — the target declaring `jcc`'s
+// shorter fall-through form — the branch is WRITTEN without it: one BlockRef,
+// the taken target, while the successor list keeps both edges (R2's shape,
+// which the verifier's Rule 1b accepts). P68 round 8,
+// D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END: this pin
+// used to require TWO BlockRefs, because the fall-through block was minted at
+// the branch and laid out at the function's end.
+TEST(AsmTextToLir, CondBranchRecordsBothSuccessorsAndFallsIntoTheNextBlock) {
     auto const run = lowerAsmText(baseDialectDoc(), src(
         ".globl main\n"
         ".func main\n"
@@ -310,15 +316,18 @@ TEST(AsmTextToLir, CondBranchCarriesBothEdgesAndBothSuccessors) {
             auto const inst = lir.blockInstAt(blk, ii);
             if (lir.instOpcode(inst) != jcc) continue;
             seen = true;
-            auto const ops = lir.instOperands(inst);
-            ASSERT_EQ(ops.size(), 2u);
-            EXPECT_EQ(ops[0].kind, LirOperandKind::BlockRef);
-            EXPECT_EQ(ops[1].kind, LirOperandKind::BlockRef);
-            EXPECT_NE(ops[0].blockSlot, ops[1].blockSlot);
             auto const succs = lir.blockSuccessors(blk);
             ASSERT_EQ(succs.size(), 2u);
+            EXPECT_NE(succs[0].v, succs[1].v);
+            ASSERT_LT(bi + 1, lir.funcBlockCount(fn));
+            EXPECT_EQ(succs[1].v, lir.funcBlockAt(fn, bi + 1).v)
+                << "the false edge is the block laid out next";
+            auto const ops = lir.instOperands(inst);
+            ASSERT_EQ(ops.size(), 1u)
+                << "the false edge is layout, so the branch writes the taken "
+                   "target alone";
+            EXPECT_EQ(ops[0].kind, LirOperandKind::BlockRef);
             EXPECT_EQ(succs[0].v, ops[0].blockSlot);
-            EXPECT_EQ(succs[1].v, ops[1].blockSlot);
             // The condition rides the payload, resolved from the dialect's
             // `cond` key against the substrate's TargetCondCode vocabulary.
             EXPECT_EQ(lir.instPayload(inst),
@@ -871,14 +880,24 @@ TEST(AsmTextToLir, FallthroughIntoALabelBecomesAnExplicitBranch) {
     EXPECT_EQ(lir.blockInstCount(lir.funcBlockAt(fn, 1)), 1u);
 }
 
-// An instruction after a terminator with no intervening label has no block.
-TEST(AsmTextToLir, InstructionAfterTerminatorIsRefusedNotAborted) {
+// An instruction after a terminator with no intervening label begins a block of
+// its own, no LirBuilder abort and no refusal — gas and clang assemble it
+// (P68 round 8, D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED, where this pin
+// used to assert the refusal). Nothing reaches that block, so ending the
+// function there closes it with the target's unreachable trap; the layout and
+// the fall-off control are pinned in `test_asm_block_plan.cpp`.
+TEST(AsmTextToLir, InstructionAfterTerminatorBeginsABlockOfItsOwn) {
     auto const run = lowerAsmText(baseDialectDoc(), src(
         ".globl main\n.func main\nmain:\n  ret\n  movq %rax, %rcx\n"));
     ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
-    EXPECT_FALSE(run->module.has_value());
-    EXPECT_NE(messages(*run).find("unreachable"), std::string::npos)
-        << messages(*run);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+    auto const& lir = run->module->lir;
+    auto const  fn  = lir.funcAt(0);
+    ASSERT_EQ(lir.funcBlockCount(fn), 2u);
+    auto const tail = lir.funcBlockAt(fn, 1);
+    ASSERT_EQ(lir.blockInstCount(tail), 2u);
+    EXPECT_EQ(lir.instOpcode(lir.blockTerminator(tail)),
+              op(*run->target, "unreachable"));
 }
 
 // ── the program entry ─────────────────────────────────────────────────────

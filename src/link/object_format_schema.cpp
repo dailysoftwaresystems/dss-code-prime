@@ -809,6 +809,88 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a runpath declaration must be
+    //    one some walker records, on an image some loader reads ─────────────
+    //
+    // The VALUES are judged by the one rule set the writers also run
+    // (`runpathDeclarationProblems`, link/runpath.hpp). The two rules only
+    // THIS tier can state need the backend, which is why they are here and not
+    // in that shared set:
+    //   * the resolved backend's walker must record the declared carrier —
+    //     "does anyone write this, and is it you?", the `weakDefinition` and
+    //     `stackReserveControl` shape — or the request would be accepted at the
+    //     gate and dropped by the walker it was handed to;
+    //   * the format must be an IMAGE flavor. A relocatable object or an archive
+    //     member is never loaded by the loader that reads a runpath, so the key
+    //     there would load clean and never act.
+    if (runpath.has_value()) {
+        for (auto& p : runpathDeclarationProblems(*runpath)) {
+            fail(std::string{"/runpath/"} + std::string{p.key},
+                 std::move(p.message) + ". D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.");
+        }
+        if (runpath->carrier != RunpathCarrier::Unspecified) {
+            auto const writes = [&](link::ObjectFormatBackend const* b) {
+                if (b == nullptr) return false;
+                for (RunpathCarrier c : b->runpathCarriers()) {
+                    if (c == runpath->carrier) return true;
+                }
+                return false;
+            };
+            if (!writes(backend)) {
+                link::ObjectFormatBackend const* writer = nullptr;
+                for (auto const* candidate : link::objectFormatBackendTable()) {
+                    if (writes(candidate)) { writer = candidate; break; }
+                }
+                fail("/runpath/carrier",
+                     std::format(
+                         "runpath carrier '{}' is recorded by {}, but this "
+                         "document resolves to the '{}' backend, whose walker "
+                         "would accept the request at the gate and then drop "
+                         "it. Fix the carrier or the format.kind. "
+                         "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.",
+                         runpathCarrierName(runpath->carrier),
+                         writer != nullptr
+                             ? std::format("the '{}' walker",
+                                           writer->configName())
+                             : std::string{"NO walker in this build"},
+                         backend != nullptr
+                             ? std::string{backend->configName()}
+                             : std::string{"<unresolved>"}));
+            }
+        }
+        if (backend == nullptr || !backend->isImageFlavor(*this)) {
+            fail("/runpath",
+                 "a runpath is declared on a format that is not an IMAGE "
+                 "flavor: a relocatable object or an archive member is never "
+                 "loaded by the loader that reads a runpath, so the declaration "
+                 "could never act. Declare it on the executable / shared-library "
+                 "formats, where the final link records it. "
+                 "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.");
+        }
+    }
+    // The remedy axis: a document cannot both record a runpath and explain why
+    // it records none, and a relocatable/archive format needs no explanation —
+    // the warning derives its answer from `isImageFlavor()` — so one declared
+    // there would sit inert.
+    if (runpathUnsupportedReason.has_value()) {
+        if (runpath.has_value()) {
+            problems.push_back(ConfigDiagnostic{
+                DiagnosticCode::C_ConflictingField, DiagnosticSeverity::Error,
+                "/runpathUnsupportedReason",
+                "a format must not declare BOTH 'runpath' (it RECORDS a "
+                "runpath) and 'runpathUnsupportedReason' (why it records "
+                "none) — delete whichever no longer applies. "
+                "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH."});
+        } else if (backend == nullptr || !backend->isImageFlavor(*this)) {
+            fail("/runpathUnsupportedReason",
+                 "'runpathUnsupportedReason' is declared on a format that is "
+                 "not an IMAGE flavor: nothing loads a relocatable object or an "
+                 "archive, and the warning already says so for every such "
+                 "format, so the declaration would never be read. "
+                 "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.");
+        }
+    }
+
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
     // shared substrate with TargetSchema so the two sides of plan
     // 13 §2.6's reloc-taxonomy unifier are validated identically.

@@ -170,7 +170,8 @@ void expectGenericClean(SemanticModel const& m) {
     builder.addInMemory(std::move(src), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt, fmt, arch);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt, std::nullopt,
+                   SelectableObjectFormatKind::of(fmt), arch);
 }
 
 // The (dataModel, objectFormat, arch) triples the shipped descriptors are
@@ -230,7 +231,8 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
         builder.addInMemory(mainSrc, "main.c");
         auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
         assertNoBuilderErrors(*cu);
-        return analyze(cu, DiagnosticBudget::libraryDefault(), ax.dm, std::nullopt, std::nullopt, ax.fmt, ax.arch);
+        return analyze(cu, DiagnosticBudget::libraryDefault(), ax.dm, std::nullopt, std::nullopt,
+                       SelectableObjectFormatKind::of(ax.fmt), ax.arch);
     };
     if (flagOn) return build(loadShippedSchema("c"));
     nlohmann::json doc = loadShippedCJson();

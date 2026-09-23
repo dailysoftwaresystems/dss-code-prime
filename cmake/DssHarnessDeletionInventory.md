@@ -844,6 +844,258 @@ HELPS: a per-root floor of ≥ 1 is spellable for the first time.
 **16** at this commit. §9's rule holds — the retarget belongs to the commit that takes it under 16,
 which is the FOLD, not this lane.
 
+## 18. Lane `mig` (P68 round 7): `scripts/` and `real-examples/` are GONE
+
+**Added 2026-09-18, lane `mig`, on base `7df54cc1`.** Operator ruling: *"there is no `scripts/` directory
+and no `real-examples/`"* — every program is either DELETED because a verb provably does its job, or MOVED
+into `.harness-config/runner/actions/` as an action: one directory per program, holding `<name>.yml` and
+every file it runs.
+
+### 18.1 Disposition
+| What | Where it went | How |
+|---|---|---|
+| 39 program directories under `scripts/` | `.harness-config/runner/actions/<name>/`, FLAT — siblings of the three actions already there | `git mv`, blob and mode preserved; each gained `<name>.yml` (its `# PURPOSE:` line read from the program) and a `predefinedRunners` entry |
+| `scripts/README.md` | `.harness-config/runner/actions/README.md` | `git mv`; still a GENERATED index, now of actions (`check-scripts-index` owns it) |
+| `real-examples/c/sqlite/` | `.harness-config/runner/actions/real-examples/c/sqlite/` | `git mv`; `real-examples/` and `c/` are GROUP directories, `sqlite` is the action (`sqlite.yml`) |
+| `scripts/repo-secrets/repo-secrets.sh` | — DELETED | its own header: *"THIS FILE HAS NO CONSUMER"*; connection data lives in the main checkout's `.harness-config/sshItems/<host>/`, resolved by the tool for every worktree |
+| `scripts/profile-compile/profile-compile-dispatch.sh` | — DELETED | it drove the retired ssh carriages and `run-gate`; a remote leg is `dssharness run profile-compile --legs <leg>` |
+
+✔MEASURED: `git status` shows **89 renames and 2 deletions**; exactly **6** tracked files carry mode
+`100755`, the same six as before the move. FLAT, not grouped, because every program loads its libraries as
+SIBLINGS (`dirname(dirname(__file__))/<lib>/`) and that idiom survives a flat move unchanged.
+
+### 18.2 The tree-identity rule was keyed on the directory being deleted
+`owning-tree.MARKERS`, `leg_tree_dss_tree` and the walk inside `repo-tree.ps1` all recognised a DSS tree by
+`.plans/` + `scripts/`. With `scripts/` gone NO ancestor matches, so every consumer's root refuses. The markers
+are now `.plans/` + `.harness-config/` in all three owners (one per language; `repo-tree.ps1` gained the public
+`Get-RepoTreeDssTree`). About 25 programs had computed their tree by counting `..` and named
+`.harness-config/runner` after the move; each was routed through its language's owner instead, and THREE of
+them failed SILENTLY rather than loudly (`check-shell-portability` scanned only `.harness-config/runner` and
+still cleared its floor; the sqlite `.sh` driver took its "copied out of the repository" path; the `.ps1`
+drivers' `Resolve-Path ../../..` succeeded on a directory that exists).
+
+### 18.3 Floors — retargeted, never lowered
+| Guard | Before | After | ✔MEASURED live |
+|---|---|---|---|
+| `check-scripts-index` | `SCRIPT_FLOOR = 12` over `scripts/` | `ACTION_FLOOR = 12` over the actions tree (groups recursed, reachability from `predefinedRunners` enforced) | 43 actions, 43 self-test arms |
+| `kScriptFloor` (`tests/harness/test_sqlite_harness_legs.cpp`) | 16 over `scripts/` | 16 over the actions tree (skips `build/`, `artifacts/`, `__pycache__/`) | 32 besides the two drivers |
+| `check-shell-portability` | floor 15 over the tree, but the move had narrowed the ROOT to `.harness-config/runner` | floor 15 over the whole tree | 21 = every tracked `.sh` |
+| `check-guard-output-encoding` | floor 8 | floor 8 | 30 primaries (26 self, 2 transitive, 2 unprotected) |
+| `check-plan-citations` `CODE_ROOTS` | named `scripts`, `real-examples` | names `.harness-config/runner/actions`, and skips `artifacts/` | 2140 citations over 210 documents; arm 13 plants at the harness's NEW path |
+| `check-wrapped-anchor-ids` | 68 wraps / 30 files | 48 / 28 (burned down by the guard's own lowering verb) | — |
+
+### 18.4 Corrections to §17
+- §17.5 says `macho-alias-ld64-matrix.remote.sh` moved with mode **100755**. ✔MEASURED `git ls-files -s`:
+  **100644**. The action therefore runs it as `bash ./macho-alias-ld64-matrix.remote.sh`, and its comment says so.
+- §17.3's `check-ninja-deps` row says the tool has **none**. At 0.5.7 `help legs` says every cmake `build`
+  reads `ninja -t deps` and reports a build whose records cannot be read as `unmeasured`. The action STAYS
+  anyway: CI runs `ctest` with no DssHarness installed, so `build/ninja-deps-freshness` is the only place the
+  property is checked on a CI leg.
+- §17.1's CAPITALISED file is RELEASE-DEPENDENT. The shim is named after the package's `ToolCommandName`:
+  `DssHarness` through 0.5.5, `dssharness` from 0.5.6 (📄 `src/RepoHarness.Cli/RepoHarness.Cli.csproj` at
+  each repo-harness tag). ✔MEASURED 2026-09-19 on WSL x86_64 under 0.5.7:
+  `<home>/.dotnet/tools/dssharness`, no capitalised sibling; on Windows `dssharness.exe`. The `NAMES` list
+  already covers both spellings. The LOGIN-PATH half of §17.1 still holds: a non-login `which dssharness`
+  exits 1, and only the login PATH carries `<home>/.dotnet/tools`.
+- §17.5's `kScriptFloor` note ("NOT retargeted … belongs to the FOLD"): retargeted by this lane, because the
+  `scripts/` walk found 0 after the move and the floor refused — correctly.
+- §17.4's directory target: the end state is 39 moved program directories plus one grouped action, all under
+  `.harness-config/runner/actions/`.
+
+### 18.5 Rows, budgets and roots this record depends on
+- `cmake/DssTestBudgets.cmake`: named rows **37 ⟶ 40** (`lane_worktree_guard` re-derived from the current
+  suite; `leg_tree_guard` and `lane_fold_selftest_guard` added under the module's own tier rule; on
+  2026-09-19 the two `link/` MSVC-witness rows re-derived and `core/test_include_path_rooted_resolution`
+  named, all three from runs measured alone AND under gate-like load, because their rows had come from a
+  cost-data average and each had timed out at 315 s in one full run).
+- `anchors.citationRoots` gained `.harness-config` after its dangling citations were settled (1104 → 0 in this
+  lane's files, measured with `check-anchor-citations` itself); then `packaging`, `integrated_tests` and
+  `tests/examples` the same day, and on 2026-09-19 `tests` in place of `tests/examples` — checked under the
+  EXACT rule of DssHarness round four (a round-four build over the main tree with this fold laid over it: zero
+  unresolved or cut citations in any file this fold carries, and none in `tests`).
+- ⚠ A remote leg cannot run an action until DssHarness round four ships: 0.5.7's `sync` withholds
+  `.harness-config/runner/actions`. Every remote-leg claim about an action is BLOCKED on that release.
+
+## 19. Lane `mig` (P68 round 8, part 4): no `.sh` and no `.ps1` under the actions directory
+
+**Added 2026-09-22, lane `mig`.** Operator ruling of 2026-09-21, verbatim: *"I don't want .sh/.ps1 files inside
+.harness-config\runner\actions. entrypoint is .yml, you can call .py files, BUT NOT .sh/.ps1 please. They are specific
+per OS. I don't want this anymore"*. Every action's entry point is its `.yml`, and every step starts
+`python3 <file>.py`. `check-scripts-index` refuses a `.sh` or `.ps1` anywhere under the actions root BY NAME (the
+tool's run directories exempt), so the property is a gate and not a convention. Outside the ruling's subject and left
+alone: `examples/c/project_prebuild_script_codegen/gen_answer_source.{sh,ps1}`, product test data its example runs.
+
+★ **THE METHOD, for every pair:** a `.sh`/`.ps1` twin became ONE `.py` carrying the UNION of both twins' checks —
+where they disagreed, the stricter rule — with every self-test arm ported under its old label, each negative
+synthesized, and a red-on-disable proved THROUGH ctest (the mutant written into the file ctest runs, its md5 moved and
+returned, the failing arm's name read, a named control green). The transcription tables (old check → new function,
+old arm → new arm) are in the lane's findings, part 4 (P4-4 … P4-11), beside the eleven read-only analyses of the old
+files they were written from.
+
+### 19.1 Disposition
+| Retired (34 files in 13 actions) | Now | Its own proof |
+|---|---|---|
+| `check-anchor-registry.{sh,ps1}` | `check-anchor-registry.py` | self-test, 60 arms (the 20 inherited + 40 new), run first on every invocation |
+| `check-orphan-tests.{sh,ps1}` | `check-orphan-tests.py` + `allowlist.json` (the allowlist once, schema-checked) | self-test, 40 arms (12 + 28) |
+| `check-line-endings.{sh,ps1}` | `check-line-endings.py` | `--selftest` 35 arms; `--selftest-watchdog` 6 arms |
+| `lane-worktree.{sh,ps1}`, `test-lane-worktree.sh` | `lane-worktree.py` | `--self-test`, 154 assertions (81 ported + 73 new), 0 shell starts |
+| `leg-tree/leg-tree.sh`, `leg-tree/test-leg-tree.sh`, `repo-tree/repo-tree.ps1` (and their two actions) | `owning-tree.py`, extended | `--self-test`, 54 arms |
+| `cmake-import.{sh,ps1}` (the wrappers) | folded into `cmake-import.py` | `--self-test` 20 arms; `--prove-any-cwd <dsscp>` (19.2) |
+| `profile-compile.sh`, `macho-alias-ld64-matrix.remote.sh` | `profile-compile.py`, `macho-alias-ld64-matrix.py` | differential runs against the old programs: identical output |
+| `compile-bench.sh`, `corpus-census.{sh,ps1}`, `pragma-profile-census.{sh,ps1}` (launchers of the `.py` their `.yml` already started) | — deleted | the `.py` each `.yml` starts |
+| `check-shell-portability/` (the whole action) | — RETIRED WITH ITS SUBJECT (19.3) | — |
+| sqlite: `build-and-test.{sh,ps1}` | `build_and_test.py` + flat `sqlite_common`, `_compiler`, `_launch`, `_libs`, `_build`, `_smoke`, `_units`, `_verdicts`, `_report`, `_stage`, `_corpus`, `_procs` | `--self-test` = the driver's Step 0 (19.2) |
+| sqlite: `base-harness.{sh,ps1}`, `check-source-coherence.sh` | `sqlite_base.py`, `sqlite_coherence.py` | self-tests, 134 and 32 arms |
+| sqlite: `benchmark-speedtest1.{sh,ps1}` | `benchmark_speedtest1.py` | `--self-test`, 105 arms |
+| sqlite: `test-confound-scope.{sh,ps1}`, `test-driver-contracts.{sh,ps1}` | `test_confound_scope.py`, `test_driver_contracts.py` | 158 arms (220 of the twins' 322 carried, 102 retired — 19.3); 81 arms (pins DC-01…DC-22, red arms RD-01…RD-42 each a mutation of a scratch copy of a driver module, 10 mutator arms) |
+| sqlite: `test-mirror-regions.{sh,ps1}` (+ the resolver's `--check-regions`) | — RETIRED WITH THE SECOND DRIVER (19.3) | — |
+
+### 19.2 ctest entries
+| Entry | Change |
+|---|---|
+| `anchor_registry_guard`, `orphan_tests_guard`, `line_endings_guard` | ONE `${Python3_EXECUTABLE}` entry each, the same on every host; the `CMAKE_HOST_WIN32` dispatch and `find_program(POWERSHELL_EXE … REQUIRED)` gone with the twins |
+| `line_endings_watchdog_guard` | the ONE program's `--selftest-watchdog`; labelled `repo-guard` by name |
+| `lane_worktree_guard` | `lane-worktree.py --self-test`; the bash probe block and its refusal gone |
+| `line_endings_watchdog_sh_guard` (Windows only), `leg_tree_guard`, `repo_tree_guard`, `shell_portability_guard` | RETIRED — 19.3 names what covers each |
+| ★ `harness/sqlite_driver_selftest` (NEW) | `build_and_test.py --self-test`: the driver's Step 0 alone — both suites, every module's `--self-test`, the leg plan's self-test and lint — the same list and judgement a real run applies before it starts |
+| ★ `harness/sqlite_benchmark_selftest` (NEW) | `benchmark_speedtest1.py --self-test` |
+| ★ `harness/cmake_import_selftest`, `harness/cmake_import_any_cwd` (NEW) | the program's arms; and the path-base pin: a manifest written OUTSIDE the project root builds, with this build's dsscp, the same artefact byte for byte from the root, from a directory of `#error` look-alikes and from an empty one, while the root-relative manifest the tool wrote until 2026-09-21 fails from the last two, and a trap control proves the look-alikes are read when named |
+⓪ Before this part NO gate ran any sqlite-harness self-test, the benchmark's, or `cmake-import` at all. The new
+entries are not `repo-guard`: what they exercise depends on the host (process enumeration, the POSIX half in process
+or inside WSL, a real compile), so every leg runs them.
+
+### 19.3 What retired with its subject, and what covers the property now
+- `leg_tree_guard`, `repo_tree_guard` (+ `DSS_PWSH_FOR_REPO_TREE_GUARD`, the probe, refusal and not-applicable
+  branches) → `owning_tree_selftest_guard`: `owning-tree.py` carries every arm both helpers proved (the identity of a
+  worktree git cannot follow, git asked through that identity, the one-root rule, the owning root of a nested copy) on
+  every host. The helpers' carriage half (`leg_tree_prepare`/`restore`, the remote loader) had NO caller (✔ grep) —
+  `dssharness sync` replaced it; nothing is needed.
+- `line_endings_watchdog_sh_guard` existed only so the bash twin's bound was proved on SOME leg → the one program's
+  watchdog, proved by `line_endings_watchdog_guard` on every host (arm W6: a probe blocked on a registered grandchild
+  dies inside its budget and nothing survives holding its pipe).
+- `shell_portability_guard` refused bash-3.2-fatal shapes in this repository's `.sh` programs → no `.sh` remains under
+  the actions root, and `scripts_index_guard` refuses one by name; the one `.sh` left in the tree is an example's
+  product test data, run by that example on the POSIX legs. Its `SCAN_FLOOR = 15` could no longer be met.
+- The sqlite twins' parity machinery — `test-mirror-regions`, the resolver's `--check-regions`, `DSS_REGIONS`,
+  `MIRROR_PAIRS`, `MIRROR_CASES`, the emitted shell forms (`--plan --format sh`, `--stage-build --format sh`, the
+  monitor's `sh` format) — proved that TWO drivers agree; one driver has no counterpart to disagree with. Every mirror
+  CASE with an answer is carried as a unit test of the ONE Python function (`sqlite_corpus.py`'s self-test: the 8
+  corpus-engine cases, the two with stated answers and the six whose answers the old copies were measured to agree
+  on); `confound-report` and its `crClean` by property (`test_driver_contracts.py` DC-17); and
+  `unknown-library-provider` by `tests/harness/test_sqlite_harness_legs.cpp`, part (c) of
+  `BothDriversRefuseAnUnimplementedProviderWithTheSameVerdict`, which runs the ONE decision on the case's six
+  inputs and requires its answer byte for byte — restated for one driver (the retired answer told a reader to
+  add the arm to both).
+- The 102 cross-driver parity arms of the confound-scope suite and the region markers → one implementation the suite
+  IMPORTS by name (a missing function fails the import — stronger than a substring match).
+- The 27 `test-lane-worktree.sh` lines that mirrored a ported arm 1:1 for the `.ps1`, and the interpreter probes of
+  every twin → the ported arms against the one implementation.
+
+### 19.4 Floors — moved with their population, never lowered
+| Floor | Before | After | ✔MEASURED at this record |
+|---|---|---|---|
+| `check-scripts-index` `ACTION_FLOOR` | 12 | 12, unchanged | 40 actions (the two tree-helper actions retired) |
+| `check-guard-output-encoding` | 8 | 8, unchanged | 39 Python primaries probed (36 self, 2 transitive, 1 inventoried debt) |
+| `kScriptFloor` (`tests/harness/test_sqlite_harness_legs.cpp`) | 16, over the `.sh`/`.ps1` population the ruling takes to zero | `kPythonFloor = 33`, over the `.py` population — the same half-of-the-population ratio as 16 of 32 | 66 tracked `.py` under the actions tree |
+| the per-file WSL-invocation floor (≥ 3) | on `build-and-test.ps1` | on `sqlite_common.py`: `PosixSide`, the one route into WSL for the driver and the benchmark alike | exactly 3 |
+| `check-shell-portability` `SCAN_FLOOR = 15` | — | RETIRED with its guard (19.3) | — |
+| `check-line-endings` 1500, `check-orphan-tests` 150/12/150, `check-anchor-registry` 20/100/1500 and its root floors | — | unchanged, carried by the one program | green on this tree |
+
+### 19.5 Defects the port found and fixed (each pinned by an arm that reds on its return)
+- `make -n -B` is NOT write-free: GNU make runs a makefile's self-remake rule even under `-n`, and sqlite's
+  `bld-dss/Makefile` re-runs configure — so the old drivers' recipe derivation RE-CONFIGURED the tree it was reading.
+  The dry run now passes `-o Makefile` (arm n39b).
+- `-D`/`-I` harvested from INSIDE a token: a path holding `-DailySoftware-` yielded the define `ailySoftware`. A flag
+  counts only at a token start (arm n06b).
+- The shared clone lock judged liveness by `ps -o lstart`, which WSL2 moves when the clock steps (25 s between two
+  samples 0.5 s apart): a live reader looked dead and a writer was let in. Its owner file keeps the old four lines and
+  gains `proc-start=<ticks>`, which the new code judges by. A FOUR-line owner (the retired bash driver's) is judged by
+  its pid ALONE: ✔MEASURED 2026-09-23, a live WSL2 process's lstart read wrong in 84 of 1184 samples (±26 s, in step
+  with `/proc/stat btime`, its start ticks unmoved), and the proof run's Step 0 caught the twin's lstart rule, kept
+  until then for such owners, calling a live one dead (arm CL09). Without the fifth line a moved lstart cannot tell a
+  clock step from a reused pid; a false hold is loud and names the lock entry to remove, a false steal is silent
+  (arms CL09, CL10, CL10b; CL20 keeps a Windows host's by-name skips equal to the arms a POSIX run runs).
+- `lane-worktree.sh` under an exported `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` deleted an uncommitted edit and
+  reported "VERIFIED absent"; removed a SIBLING lane through a link; deleted a locked lane's directory while its
+  registration survived. Each is refused or completed and verified now.
+- `check-source-coherence.sh` printed `checkout: matches` on an incoherent stage, hung on a trailing `--label`, and
+  passed a stale `sqlite3.c` that was a symlink or unreadable (two false greens).
+- `check-guard-output-encoding`'s probe imported each subject without `-B`, writing bytecode beside every probed
+  program (arms 20, 20b).
+- The PowerShell process sweep could not see a fixture running inside WSL (the launched sweep now enters the
+  launcher's own kernel).
+- `pragma-profile-census.py` could not decode `c.lang.json` under cp1252 and did not find `dsscp.exe`;
+  `corpus-census.py` died with `NameError` at import in a tree without `parse_diagnostic.cpp`.
+- `sqlite_compiler`'s candidate search missed every DssHarness build directory (`build/<processor>-<toolchain>-
+  <config>`), while the benchmark searched them on its own: one owner now (`search_roots`), both callers.
+- `cmake-import` wrote paths relative to the PROJECT ROOT into a manifest that may live elsewhere (its own runner
+  writes into the step's build directory): relative now to the MANIFEST's directory, absolute outside it.
+- The driver's provenance count excluded CR-only changes by `diff --ignore-cr-at-eol --name-only`, which still lists
+  them on git 2.43 (the WSL and arm64 hosts' git), and it compared git's QUOTED names with unquoted porcelain paths,
+  so a real change to a quoted name read as clean. Both answers are read NUL-separated now (`--numstat -z`).
+- The corpus loop's process sweep kept only its kills: a leftover it could not kill, and a sweep that could not look
+  inside the fixture's kernel, reached the log and never the leg's verdict. Both are verdict hygiene now.
+- `pid_alive` answered TRUE for an unreaped zombie on POSIX, against its own contract, so a lock whose holder
+  crashed into a zombie read as held; Windows already answered "exited".
+- One marker, three reading rules: the resolver stripped lines, the benchmark core found the marker anywhere, the
+  driver anchored it. One rule now (`sqlite_base`), every reader through it.
+- The `CloneLock` refused on an `os.name` test of its own, and the benchmark core spelled `.exe` keyed on the host.
+  The lock is keyed on the driver's one host switch (`PosixSide`); the extension comes from the target format's
+  own config (`outputExtension`) through the plan.
+- `stage-zinc.py` imported the resolver with bytecode on, writing `__pycache__` into its own action directory on
+  every run.
+
+### 19.6 Rows, budgets and configuration this record depends on
+- `cmake/DssTestBudgets.cmake`: the `leg_tree_guard` row left with its entry. Two rows, each granted by the
+  orchestrator on 2026-09-22 under the module's own rule (a ceiling past 60 s takes a NAMED row), each with its
+  measurement in a comment beside it: ★ `harness/sqlite_driver_selftest|230|230|230` — ✔MEASURED 38 s direct, 41–89 s
+  through ctest on MinGW Debug and MSVC Release, 229 s once under heavy load; one ceiling on every class because the
+  entry is Python, whose speed follows the machine's load and never the C++ build class. And
+  `harness/test_sqlite_harness_legs` re-derived from its stale `|66|73|67` to `|66|108|215` (debug 215, the slowest
+  healthy run; release 108; sanitized kept, as only CI builds it) — ✔MEASURED over four direct runs: the pins this part
+  re-pointed or added take ~30 % of the binary's time and the 22 it never touched ~70 %, in every run, and one binary
+  ran 83 s and 148 s minutes apart, so the rise is mostly the shared machine's load; the part's own cost is the new pins'
+  Python inspector (~2–3.4 s per batch). The other two new `harness/*` entries stay in the unit tier's budget. The
+  kept-name rows `lane_worktree_guard`, `orphan_tests_guard` and `lane_fold_selftest_guard` were re-measured on the new
+  programs and reported, not edited.
+- `.harness-config/config.json`: the runners `leg-tree`, `repo-tree` and `check-shell-portability` left with their
+  actions; `check-anchor-registry`, `check-line-endings`, `check-orphan-tests`, `lane-worktree` and `cmake-import`
+  gained `windows-x86_64-debug` beside `linux-x86_64-debug`, each PROVED first with `dssharness run <runner> --legs
+  windows-x86_64-debug` (a `.sh` entry point could not run there; a Python one can). In `sync.neverTransfer` (the
+  orchestrator's item, 2026-09-23): the bare `__pycache__` entry, which matched nothing, left, and `node_modules`
+  became `**/node_modules`; the file's own comment gives each reason. ✔MEASURED `sync --dry-run`: neither warns
+  after, and the transfer plan is unchanged.
+- `.gitattributes`: the `.sh`/`.ps1` pins under `.harness-config/**` retired — the layout forbids the files.
+- `sqlite.yml`: its one step runs `python3 ./build_and_test.py` on every leg, with no `runOn`; the success pattern
+  is unchanged.
+
+### 19.7 The hang question this port was the test of — answered, as measured
+Before the port, `line_endings_guard` and `line_endings_watchdog_guard` — then `.sh`/`.ps1` twins, the PowerShell
+pair on a Windows host — TIMED OUT under ctest 3 runs of 3 on main when the host was loaded, at "Enter-RepoTree (git
+rev-parse…)" or at start-up, while passing by hand in about 4 s. Their replacement is ONE Python program that bounds
+every wait (90 s, naming what it waited on) and starts every child with no inherited handle.
+✔MEASURED 2026-09-22/23 on the lane's tree, `ctest -L repo-guard -j8` on this shared, loaded workstation, TEN runs
+across BOTH build classes — MinGW Debug ×6 (an early read, three consecutive, two on the final tree) and MSVC Release
+×4 (three consecutive, one on the final tree): 31/31 every time, 0 timeouts; `line_endings_guard` 3.3–17.7 s (the
+slowest 17.7 s against its 90 s bound), `line_endings_watchdog_guard` 10.7–19.8 s. The hang class did not appear. Scope: Windows only, where the hang was;
+the Linux legs' runs belong to the round's gate. 🧠INFERRED, not isolated: the PowerShell pair's start-up and child
+handles under load as the cause — the question is closed by removing PowerShell from the path, not by a mechanism
+proven alone.
+
+### 19.8 The one sqlite driver, proven on both host kinds
+The retired drivers were one per host kind: `build-and-test.sh` on a POSIX host, `build-and-test.ps1` on Windows.
+✔MEASURED 2026-09-23: the ONE Python driver ran end to end on the final code on both, its own Step 0 first (both
+suites, every module's self-test, the leg plan's self-test and lint), against sqlite `b943fa1288` (the fixture recipe
+189 TUs / 36 defines, the CLI's 103 / 30), with the full `veryquick` tier:
+| Host | Compiler | Verdict | Unit corpus per runnable leg (errors, every one a known non-DSS confound) |
+|---|---|---|---|
+| Windows (the POSIX half derived inside WSL) | the MSVC Release dsscp, named by `DSS_BIN` | 3 of 5 VERIFIED, 0 poisoned, exit 0, 1 h 11 min | elf64-x86_64 through `wsl.exe -e`: 9 / 394 845; elf64-arm64 through `wsl.exe -e qemu-aarch64`: 7 / 394 849; pe64-x86_64 native: 3 / 394 498 |
+| WSL as a POSIX host | its own Release dsscp, rebuilt by Step 5 | 3 of 5 VERIFIED, 0 poisoned, exit 0, 1 h 47 min | elf64-x86_64 native: 8 / 394 845; elf64-arm64 under `qemu-aarch64`: 8 / 394 849; pe64-x86_64 under `wine`: 3 / 392 964 over 4 segments, three aborts proven not DSS by earned rows and their remainders named |
+On both, the two macho legs BUILT and were skipped by `runOn=[darwin]`, and the sqlite3 CLI BUILT on 5 of 5 with its
+14-assertion smoke gate green on the 3 runnable legs. The first WSL attempt refused to start: Step 0 caught the clone
+lock still judging a four-line holder by its lstart line (19.5), and it was fixed and proven before the run was
+repeated.
+
 ## Summary of disagreements with contract S4
 
 | # | Contract S4 says | ✔MEASURED at this commit |

@@ -62,10 +62,11 @@ not folded — finish the fold.
 ## Migration status — NOT yet done, and it is not a `mv`
 
 ⚠ The live tree still uses the flat layout. **✔MEASURED 2026-08-17 (corrected): 19 files carry 33
-reference lines** — the witness gate twins (since retired), `scripts/check-ninja-deps/check-ninja-deps.py`, `tests/CMakeLists.txt`,
+reference lines** — the witness gate twins (since retired), `.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py`, `tests/CMakeLists.txt`,
 `tests/core/native_c_probe.hpp`, `tests/core/test_header_name_matching.cpp`,
-`tests/harness/test_sqlite_harness_legs.cpp`, `real-examples/c/sqlite/build-and-test.ps1` (9 lines,
-`build-rel`), plus narrative mentions in `src/core/types/parse_diagnostic.hpp`, a `.format.json`, a
+`tests/harness/test_sqlite_harness_legs.cpp`, the PowerShell sqlite driver of the time (9 lines,
+`build-rel`; since 2026-09-21 the one Python driver, whose compiler search is `sqlite_compiler.py`),
+plus narrative mentions in `src/core/types/parse_diagnostic.hpp`, a `.format.json`, a
 `.lang.json` and an `expected.json`. Every hit is a genuine token — no `build-rel*` prefix collisions.
 
 ★★ **THE FIRST FIGURE WRITTEN HERE WAS WRONG AND IT INVERTED THE RECOMMENDATION.** This file
@@ -96,7 +97,7 @@ narration went with them.
 path alone breaks every run made before the physical move; one left on the old path alone silently
 follows a tree that is being deleted. So each site spans BOTH layouts with the new path FIRST, and
 **existence decides, never a version flag** — the list follows the tree instead of having to be kept
-in sync with it. ✔Applied: `scripts/check-ninja-deps/check-ninja-deps.py` picks `build/dbg` if it exists else
+in sync with it. ✔Applied: `.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py` picks `build/dbg` if it exists else
 `build-dbg` (and returns the NEW path when neither does, so it fails loud on a missing tree rather
 than sending the reader after a deliberately removed one — both arms measured); the sqlite harness
 searches `build/rel`, `build/dbg`, then the three legacy roots, and a from-scratch build lands in the

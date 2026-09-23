@@ -1,6 +1,7 @@
 #pragma once
 
 #include "analysis/semantic/semantic_model.hpp"  // SemanticModel (CuMirModule member, move-only)
+#include "analysis/semantic/target_format_analysis.hpp"  // the three effective* resolvers + analyzeForTargetFormat, moved below the driver tier
 #include "asm/asm.hpp"  // AssembledModule (assembleUnit return + linkAndWrite span)
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"  // DataModel (CuMirModule member + lowerMergedToAssembly arg)
@@ -129,19 +130,19 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // pollution bug, and explained it — **and the number rotted anyway, because a
 // figure in a comment has no instrument attached.** ★ Care is not the missing
 // ingredient. A COMPARISON is. The figures below now carry
-// `<!--census:source:<key>-->` markers bound to `scripts/check-doc-census/source-census.json`,
+// `<!--census:source:<key>-->` markers bound to `.harness-config/runner/actions/check-doc-census/source-census.json`,
 // so `doc_census_guard` re-derives them on every ctest run and a drift is a RED
 // rather than a discovery. The PATTERN lives in that document, not here — a
 // pattern quoted in prose is prose, and rots exactly like the number did:
-//     <!--census:source:program.exportedDecls-->30 exported declarations
-// — <!--census:source:program.exportedFunctions-->25 exported functions plus
+//     <!--census:source:program.exportedDecls-->27 exported declarations
+// — <!--census:source:program.exportedFunctions-->22 exported functions plus
 // <!--census:source:program.exportedStructs-->5 exported structs (`CuMirModule`,
 // `CuHirModule`, `EntryCandidate`, `ResolvedEntry`, `ResolveLibraryPartition`).
 //
 // ⚠ THE CALL-SITE FIGURES BELOW ARE **NOT** MACHINE-CHECKED, and that is stated
 // rather than left to be assumed from the markers above. Driver call-site counts
-// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 29 call sites
-// over 19 of the 25 entry points — and neither is expressible as a census CLAIM,
+// come from a COMMENT-STRIPPED scan of `src/program/program.cpp` — 27 call sites
+// over 17 of the 22 entry points — and neither is expressible as a census CLAIM,
 // which binds one integer to one line-count: "19 of 25" is a DISTINCT count and
 // the ratio further down is a RATIO. They were corrected by hand in P63 and
 // again in P64 and are unguarded. A raw grep over-counts there too:
@@ -155,8 +156,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // stale. A number is repairable by a script; the claim it sits in is not.
 //
 // ── A. NO DRIVER SEAM — `program.cpp` never calls these ────────────────────
-// `effectiveLongDoubleFormat`, `compileSingleUnit`, `assembleUnit`,
-// `linkAndWrite`, `pullStaticArchiveMembers`. Their callers live in
+// `compileSingleUnit`, `assembleUnit`, `linkAndWrite`,
+// `pullStaticArchiveMembers`. Their callers live in
 // `compile_pipeline.cpp`, so the composition is inside one TU and any test that
 // builds a CU exercises the supplying. ★ `pullStaticArchiveMembers` is the P22
 // case and belongs here for a reason worth keeping: it has no driver seam of
@@ -374,8 +375,8 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ── AND WHAT THE MERGED ROUTE COSTS TO REACH AT ALL ────────────────────────
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
-// <!--census:examples:top.sources-->30 of the
-// <!--census:examples:manifests-->851 shipped corpus example manifests declare a
+// <!--census:examples:top.sources-->31 of the
+// <!--census:examples:manifests-->891 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -415,61 +416,6 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // becomes unnecessary; this routing IS the design.)
 DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
                                  DiagnosticReporter&       dst);
-
-// D-CSUBSET-BITFIELD-ABI-EXACT: resolve the effective per-ABI bit-field packing
-// strategy for a (target, format) pair. C bit-field allocation is FORMAT/OS-
-// determined (one CPU target — x86_64 — serves BOTH ELF-SysV `gnu_packed` and
-// PE-MS `msvc_straddle`), so the FORMAT's declared strategy WINS; when the format
-// declares none (`None`), it falls back to the TARGET's
-// `aggregateLayout().bitFieldStrategy` (back-compat for targets that predate the
-// format-side field). This is the ONE resolution chokepoint the driver overlays
-// onto the target's `AggregateLayoutParams` before threading them into the layout
-// engine at all three consumer sites (analyze / HIR→MIR / asm globals). It selects
-// purely on config (the declared enum), NEVER on a target/format name.
-[[nodiscard]] DSS_EXPORT BitFieldStrategy
-effectiveBitFieldStrategy(TargetSchema const&       target,
-                          ObjectFormatSchema const& format) noexcept;
-
-// FC17.9(e) (D-CSUBSET-LONG-DOUBLE): resolve the effective `long double` axis
-// for a (target, format) pair — the effectiveBitFieldStrategy twin. The
-// representation is FORMAT/OS-determined (one x86_64 target serves BOTH pe64's
-// 64-bit-IEEE and ELF-SysV's x87 80-bit `long double`), and UNLIKE
-// bitFieldStrategy no target-side fallback field exists — the axis is
-// format-only, so `None` means genuinely undeclared (wasm/spirv skeletons):
-// the semantic bind then leaves `long double` rows unrealized
-// (S_LongDoubleFormatUndeclared on use), never a silent width guess. The
-// (target, format) signature keeps the resolver-family shape so a future
-// target-side contribution slots in without touching the call sites.
-[[nodiscard]] DSS_EXPORT LongDoubleFormat
-effectiveLongDoubleFormat(TargetSchema const&       target,
-                          ObjectFormatSchema const& format) noexcept;
-
-// D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolve whether an UNNAMED bit-field
-// contributes its declared type's alignment, for a (target, format) pair. The
-// `effectiveLongDoubleFormat` twin, NOT the `effectiveBitFieldStrategy` one: the axis
-// is FORMAT-ONLY, so there is no target-side field to fall back to and `None` means
-// genuinely undeclared. The layout engine then fails loud — but ONLY if an unnamed
-// bit-field is actually laid out under `gnu_packed`, so the wasm/spirv skeletons that
-// declare no C ABI stay unaffected. Never a silent default: BOTH answers are a real
-// ABI somewhere (`ignored` on SysV/Darwin, `contributes` on AAPCS), so guessing one
-// would be a silent miscompile on every platform holding the other.
-[[nodiscard]] DSS_EXPORT UnnamedBitFieldAlignment
-effectiveUnnamedBitFieldAlignment(TargetSchema const&       target,
-                                  ObjectFormatSchema const& format) noexcept;
-
-// ★ NO `effectiveCharIsUnsigned` HERE — and its absence is the design, not an
-// omission (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM, TF-C75). The two resolvers
-// above exist because their axes have contributions from BOTH schemas that must
-// be reconciled. Bare-`char` signedness has exactly ONE contributor: the TARGET
-// declares the whole (processor × platform) fact in its single `charIsUnsigned`
-// key (`{"default": …, "byObjectFormat": {…}}`), and resolution is
-// `TargetSchema::charIsUnsigned(ObjectFormatKind)` — a method on the owner, with
-// the format KIND as a REQUIRED argument so no caller can silently take the
-// processor half alone. A wrapper here would be a second place the fact is
-// "about", which is precisely the duplication this reshape removed. The result
-// still lands in `MirLoweringConfig.charIsUnsigned`, whose sole reader is
-// `isSignedIntKind(TypeKind::Char)` — the single SExt-vs-ZExt decision for the
-// char→int promotion.
 
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every
@@ -631,7 +577,7 @@ struct CompileOptions {
     // default) ⇒ every build before c162 is byte-identical (synthesize over
     // all externs). See the step-2.5 precedence docblock.
     //
-    // D-FFI-DECLARED-IMPORT-NAME: an entry may additionally STATE the runtime
+    // Declared import names: an entry may additionally STATE the runtime
     // identity to RECORD for the symbols read out of it, which the pipeline
     // hands to `ffi::BinaryLibrarySource::declaredImportName` — the top of the
     // three-level recorded-identity precedence (`src/ffi/ingest.hpp`). Empty

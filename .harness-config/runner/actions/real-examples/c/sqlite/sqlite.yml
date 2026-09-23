@@ -1,0 +1,34 @@
+# PURPOSE: prove dsscp builds SQLite from its real sources into the Tcl testfixture and the sqlite3 CLI, and runs SQLite's own unit corpus green, for every declared target.
+name: sqlite
+description: >-
+  The real-example corpus harness: clone the repository and run ONE command to prove
+  DSS Code Prime builds SQLite from its REAL sources (no amalgamation) and runs
+  SQLite's own `.test` corpus green, for every leg `legs.json` declares, on whatever
+  host runs it. The driver documents itself in its own header (`build_and_test.py`,
+  and each step's module beside it); this file declares only how a runner starts the
+  driver and what witnesses that it ran.
+
+  ★ GROUPED, AND THE GROUP IS THE OPERATOR'S OWN SHAPE. This directory was
+  `real-examples/c/sqlite/` until 2026-09-18, when `real-examples/` and `scripts/`
+  stopped existing and every program moved under DssHarness's actions directory. The
+  action is `sqlite`; `real-examples` and `c` only group it (`dssharness help runners`:
+  directories above an action group actions and hold no file of their own name).
+
+  ★ ONE DRIVER ON EVERY HOST, SO ONE STEP ON EVERY LEG, AND NO `runOn`. Until
+  2026-09-21 this action started a POSIX shell driver and its PowerShell twin was run by
+  hand on Windows, because DssHarness then gave a step no platform selector. The
+  operator's order that no `.sh`/`.ps1` lives under the actions directory collapsed the
+  twins into one Python driver carrying the union of both drivers' checks, so the step
+  needs no selector: on a Windows host the driver runs its POSIX half (the sqlite
+  configure, the recipe derivation, the reference oracles) inside WSL through
+  `wsl.exe -e`, which is the only host switch it has.
+
+steps:
+  - name: build-and-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./build_and_test.py
+    # The driver's closing claim, printed only after every declared leg's verdict is
+    # counted from the ledger -- a run that verified nothing exits 1 before reaching it.
+    successPattern: 'declared leg\(s\) VERIFIED'
+    requireInputsUnmoved: true

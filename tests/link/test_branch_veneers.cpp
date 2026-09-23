@@ -29,11 +29,13 @@
 #include "link/branch_reloc_geometry.hpp"
 #include "link/branch_veneers.hpp"
 #include "link/import_call_stub_layout.hpp"
+#include "link/object_format_schema.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -57,6 +59,15 @@ TargetSchema const& arm64() {
     return **loaded;
 }
 
+// The output format the full-path arms link into. The pass reads two facts from
+// it: which relocations it declares (a body is usable only if all of its are),
+// and how aligned `.text` starts (for a body's data word).
+ObjectFormatSchema const& elfExecFormat() {
+    static auto const loaded = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    EXPECT_TRUE(loaded.has_value()) << "the ELF exec format did not load";
+    return **loaded;
+}
+
 // The `call26` window, derived from the formula exactly as the pass derives it
 // — never from a memory of "128 MiB".
 link::RelocReach call26Window() {
@@ -74,13 +85,14 @@ link::RelocReach adrpWindow() {
 }
 constexpr std::uint64_t kBodyBytes = 12;
 
-// A model builder that reads like the layout it describes.
+// A model builder that reads like the layout it describes. By default its one
+// candidate body is the shipped ADRP body — exactly what every image under
+// ~4 GiB plans with.
 struct Model {
     VeneerLayout L;
     Model() {
         L.reaches.push_back(call26Window());
-        L.veneerSize  = kBodyBytes;
-        L.veneerReach = adrpWindow();
+        L.bodies.push_back(linker::VeneerBodyModel{kBodyBytes, adrpWindow()});
     }
     std::uint32_t fn(std::uint64_t size) {
         L.functionSizes.push_back(size);
@@ -327,14 +339,145 @@ TEST(LinkBranchVeneerPlanner, ANonRoutableBranchOutOfReachIsRefused) {
 // arm costs nothing.
 TEST(LinkBranchVeneerPlanner, ABodyThatCannotReachTheTargetIsRefused) {
     Model m;
-    m.L.veneerReach = link::RelocReach{-static_cast<std::int64_t>(16 * kMiB),
-                                       static_cast<std::int64_t>(16 * kMiB)};
+    m.L.bodies[0].reach = link::RelocReach{-static_cast<std::int64_t>(16 * kMiB),
+                                           static_cast<std::int64_t>(16 * kMiB)};
     auto const caller = m.fn(64);
     (void)m.fn(144 * kMiB);
     auto const callee = m.fn(16);
     m.branch(caller, 8, m.toFunction(callee));
     auto const plan = linker::planBranchVeneers(m.L);
     EXPECT_EQ(plan.status, VeneerPlanStatus::BodyOutOfReach);
+    EXPECT_GT(plan.failedVeneerDelta, static_cast<std::int64_t>(16 * kMiB))
+        << "the refusal carries the veneer's distance, not only the branch's";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TWO BODIES, ELECTED PER VENEER — [[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]
+// ─────────────────────────────────────────────────────────────────────────
+//
+// GNU ld 2.42 sizes every stub long and relaxes each to the ADRP form when the
+// page delta fits (📄 `aarch64_build_one_stub`); the pass elects per veneer the
+// same way. The real edge — ±4 GiB — is not a unit test's to allocate, so BOTH
+// reaches are scaled down in the model the planner reads, and nothing else
+// changes: the call field ±1 KiB, the cheap body ±4 KiB in 12 bytes, the long
+// body unbounded in 32. The boundary "the cheap body cannot reach, the long
+// one can" is then a few KiB of numbers.
+namespace {
+
+constexpr std::uint64_t kCheapBytes = 12;
+constexpr std::uint64_t kLongBytes  = 32;
+constexpr std::int64_t  kCheapReach = 4096;
+
+// Scaled reaches, same shapes as the real ones: the call field's window is
+// asymmetric by one word, like `call26`'s.
+Model scaledTwoBodyModel() {
+    Model m;
+    m.L.reaches = {link::RelocReach{-1024, 1020}};
+    m.L.bodies  = {
+        linker::VeneerBodyModel{kCheapBytes, link::RelocReach{-kCheapReach, kCheapReach - 4}},
+        linker::VeneerBodyModel{kLongBytes,
+                                link::RelocReach{std::numeric_limits<std::int64_t>::min(),
+                                                 std::numeric_limits<std::int64_t>::max()}},
+    };
+    return m;
+}
+
+}  // namespace
+
+// Two far calls from one function: one target just inside the cheap body's
+// reach from the veneer's boundary, one just outside it. Each veneer gets the
+// cheapest body that reaches — the long one only where the cheap one cannot —
+// and the margin is priced at the LARGEST candidate.
+TEST(LinkBranchVeneerPlanner, EachVeneerGetsTheCheapestBodyThatReachesItsTarget) {
+    auto m = scaledTwoBodyModel();
+    auto const caller = m.fn(8);      // calls at 0 and 4; the next boundary is at 8
+    auto const near   = m.fn(3000);   // starts at 8
+    auto const nearT  = m.fn(4);      // starts at 3008: 3000 bytes from the boundary
+    (void)m.fn(8000);
+    auto const farT   = m.fn(4);      // starts at 11012: far past the cheap body
+    (void)near;
+    m.branch(caller, 0, m.toFunction(nearT));
+    m.branch(caller, 4, m.toFunction(farT));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_EQ(plan.margin, 2u * kLongBytes)
+        << "two far branches, priced at the largest candidate body";
+    ASSERT_EQ(plan.veneers.size(), 2u);
+    EXPECT_EQ(plan.veneers[0].body, 0u)
+        << "the near target is within the cheap body's reach: no long veneer";
+    EXPECT_EQ(plan.veneers[1].body, 1u)
+        << "the far target is out of the cheap body's reach: the long one";
+    EXPECT_EQ(plan.work.bodyProbes, 3u)
+        << "one probe for the first veneer, two for the second — the election is "
+           "a scan of the declared bodies, never of the image";
+    expectExact(m.L, plan);
+}
+
+// THE BOUNDARY ITSELF, to the word: the cheap body's window shrunk by the
+// margin ends at kCheapReach - 4 - margin. A target at exactly that distance
+// from the veneer's boundary takes the cheap body; one word further takes the
+// long one.
+TEST(LinkBranchVeneerPlanner, TheLongBodyStartsExactlyOneWordPastTheCheapBodysWindow) {
+    for (std::int64_t const extra : {0, 4}) {
+        auto m = scaledTwoBodyModel();
+        auto const caller = m.fn(4);  // one call; the next boundary is at 4
+        std::int64_t const margin = static_cast<std::int64_t>(kLongBytes);  // one far branch
+        std::int64_t const edge   = kCheapReach - 4 - margin;
+        // The target stands `edge + extra` bytes past the boundary at 4.
+        (void)m.fn(static_cast<std::uint64_t>(edge + extra));
+        auto const t = m.fn(4);
+        m.branch(caller, 0, m.toFunction(t));
+        auto const plan = linker::planBranchVeneers(m.L);
+        ASSERT_EQ(plan.status, VeneerPlanStatus::Ok) << "extra " << extra;
+        ASSERT_EQ(plan.veneers.size(), 1u);
+        EXPECT_EQ(plan.veneers[0].boundary, 1u);
+        EXPECT_EQ(plan.veneers[0].body, extra == 0 ? 0u : 1u)
+            << "at the window's edge the cheap body; one word past it the long one";
+        expectExact(m.L, plan);
+    }
+}
+
+// The margin must be priced at the LARGEST candidate, not the cheapest. Call A
+// reaches its target T with 28 bytes to spare; B's far call gets a 32-byte
+// long veneer, and the furthest boundary in B's reach is the one right before
+// T. Priced at 2 x 12 = 24, A would be judged direct and B's veneer would push
+// T 4 bytes out of A's reach; priced at 2 x 32, A gets a veneer of its own.
+TEST(LinkBranchVeneerPlanner, TheMarginIsPricedAtTheLargestCandidateBody) {
+    auto m = scaledTwoBodyModel();
+    auto const a  = m.fn(64);         // site A at 0
+    auto const f1 = m.fn(64);         // site B at 64
+    (void)m.fn(1020 - 28 - 128);      // T starts at exactly 1020 - 28
+    auto const t  = m.fn(256);        // the boundary after T is out of B's reach
+    (void)m.fn(64 * 1024);
+    auto const z  = m.fn(4);          // B's target: past the cheap body
+    m.branch(a, 0, m.toFunction(t));
+    m.branch(f1, 0, m.toFunction(z));
+    auto const plan = linker::planBranchVeneers(m.L);
+    ASSERT_EQ(plan.status, VeneerPlanStatus::Ok);
+    EXPECT_EQ(plan.margin, 2u * kLongBytes);
+    ASSERT_GE(plan.siteVeneer[1], 0);
+    auto const& vb = plan.veneers[static_cast<std::size_t>(plan.siteVeneer[1])];
+    EXPECT_EQ(vb.boundary, t) << "B's veneer stands right before T";
+    EXPECT_EQ(vb.body, 1u) << "and it is the 32-byte long body";
+    EXPECT_GE(plan.siteVeneer[0], 0)
+        << "A reaches T by 28 bytes today; a 32-byte veneer will stand between "
+           "them, which only a margin priced at the largest body sees";
+    expectExact(m.L, plan);
+}
+
+// When no candidate reaches, the refusal is BodyOutOfReach — here with the long
+// body bounded too, so the arm has something to be out of.
+TEST(LinkBranchVeneerPlanner, ATargetPastEveryCandidatesReachIsRefused) {
+    auto m = scaledTwoBodyModel();
+    m.L.bodies[1].reach = link::RelocReach{-65536, 65532};
+    auto const caller = m.fn(4);
+    (void)m.fn(200 * 1024);
+    auto const t = m.fn(4);
+    m.branch(caller, 0, m.toFunction(t));
+    auto const plan = linker::planBranchVeneers(m.L);
+    EXPECT_EQ(plan.status, VeneerPlanStatus::BodyOutOfReach);
+    EXPECT_TRUE(plan.veneers.empty());
+    EXPECT_EQ(plan.work.bodyProbes, 2u) << "both candidates were tried";
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -420,9 +563,9 @@ namespace {
 // calling function, in call order, so call k's veneer stands 4K + 8k bytes on.
 Model cappedMarginSubject(std::uint32_t k) {
     Model m;
-    m.L.reaches     = {link::RelocReach{-1024, 1020}};
-    m.L.veneerReach = link::RelocReach{std::numeric_limits<std::int64_t>::min(),
-                                       std::numeric_limits<std::int64_t>::max()};
+    m.L.reaches         = {link::RelocReach{-1024, 1020}};
+    m.L.bodies[0].reach = link::RelocReach{std::numeric_limits<std::int64_t>::min(),
+                                           std::numeric_limits<std::int64_t>::max()};
     auto const caller = m.fn(4u * k);
     (void)m.fn(4096);
     std::vector<std::uint32_t> targets;
@@ -588,7 +731,8 @@ TEST(LinkBranchVeneer, TheEntrysImportCallIsCarriedByTheReferenceBody) {
 
     DiagnosticReporter rep;
     linker::BranchVeneerWork work;
-    ASSERT_TRUE(linker::injectBranchVeneers(s.module, target, s.stubs, rep, &work));
+    ASSERT_TRUE(linker::injectBranchVeneers(s.module, target, elfExecFormat(), s.stubs,
+                                            rep, &work));
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_FALSE(linker::branchVeneersNeeded(s.module, target, s.stubs))
         << "after the pass every branch must reach where it points";
@@ -648,7 +792,7 @@ TEST(LinkBranchVeneer, AModuleThatReachesIsUntouched) {
     EXPECT_FALSE(linker::branchVeneersNeeded(module, arm64(),
                                              link::ImportCallStubLayout{}));
     DiagnosticReporter rep;
-    ASSERT_TRUE(linker::injectBranchVeneers(module, arm64(),
+    ASSERT_TRUE(linker::injectBranchVeneers(module, arm64(), elfExecFormat(),
                                             link::ImportCallStubLayout{}, rep));
     EXPECT_EQ(module.functions.size(), 2u);
     EXPECT_EQ(module.functions[0].relocations[0].target.v, 2u);
@@ -675,7 +819,7 @@ TEST(LinkBranchVeneer, ATargetWithNoVocabularyRefusesByName) {
     s.module.functions[0].relocations[1].target = s.callee;
     ASSERT_TRUE(linker::branchVeneersNeeded(s.module, **bare, s.stubs));
     DiagnosticReporter rep;
-    EXPECT_FALSE(linker::injectBranchVeneers(s.module, **bare, s.stubs, rep));
+    EXPECT_FALSE(linker::injectBranchVeneers(s.module, **bare, elfExecFormat(), s.stubs, rep));
     bool namedTheKey = false;
     for (auto const& d : rep.all())
         if (d.actual.find("`linkVeneers`") != std::string::npos) namedTheKey = true;

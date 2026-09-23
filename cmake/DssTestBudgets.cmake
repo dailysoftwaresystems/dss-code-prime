@@ -164,13 +164,14 @@ set(_DSS_TB_NAMED
     #   release -- the 117.68 s average bounds the slowest run from below, last run 110.87 s: 118.
     #   sanitized 37 (CI linux-clang-asan) is unaffected: Linux starts processes cheaply.
     "lane_worktree_guard|37|118|244"
-    # ★ AND TWO NEIGHBOURS OF THE SAME SHAPE, NAMED BY THIS MODULE'S OWN TIER RULE ("every
+    # ★ AND A NEIGHBOUR OF THE SAME SHAPE, NAMED BY THIS MODULE'S OWN TIER RULE ("every
     # non-corpus entry whose ceiling passed 60 s on some class"), never named because no
-    # Windows gate log was read for them. ✔MEASURED 2026-09-18, Windows MinGW Debug, a -j8
-    # repo-guard run, both PASSING: leg_tree_guard 179.38 s (115.9 s standalone),
-    # lane_fold_selftest_guard 220.45 s (37 s standalone). Unmeasured classes take the unit
-    # ceilings, below which no named row is ever budgeted.
-    "leg_tree_guard|53|50|180"
+    # Windows gate log was read for it. ✔MEASURED 2026-09-18, Windows MinGW Debug, a -j8
+    # repo-guard run, PASSING: lane_fold_selftest_guard 220.45 s (37 s standalone). Unmeasured
+    # classes take the unit ceilings, below which no named row is ever budgeted.
+    # ⓘ Its 2026-09-18 neighbour `leg_tree_guard` (179.38 s) retired with its subject on
+    # 2026-09-21 (lane mig, part 4: the bash tree helper became part of `owning-tree.py`,
+    # proved by `owning_tree_selftest_guard`), and its row left with it.
     "lane_fold_selftest_guard|53|50|221"
     # ★★ THE SAME CLASS AGAIN, THREE MORE ENTRIES. link/test_coff_object_reader,
     # link/test_pe_object_data_import_slot and core/test_include_path_rooted_resolution each
@@ -212,20 +213,44 @@ set(_DSS_TB_NAMED
     #   · UNC: every arm's tree lives under the test's own build directory, not the host TEMP;
     #     its time no longer moves with TEMP (alone 2.26-2.52 s with the host's, 2.25-2.51 s
     #     with a small one; before 9.98-10.27 s). Under load 218.19-393.65 s before,
-    #     39.92-208.97 s after: debug 209, still named. What load still multiplies is the
-    #     resolver listing every ancestor over SMB on each resolution
-    #     (src/core/types/include_path_resolve.cpp), not anything the test controls.
+    #     39.92-208.97 s after: debug 209 at that point. What load still multiplied was the
+    #     resolver listing every ancestor over SMB on each resolution.
     #   Release and sanitized were not re-measured and keep their figures.
+    #   ✔ AND THE RESOLVER'S SHARE WAS CUT ON 2026-09-19 TOO (lane cr, part 4): a compile now
+    #   lists each directory ONCE (src/core/types/include_path_resolve.cpp, `HeaderSearchCache`,
+    #   D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION). Re-measured by the same
+    #   method beside the part-3 binary in the same windows (a 20-worker storm plus this tree's
+    #   ctest -j10 without it, host CPU 98% on average, eight rounds): 0.41-1.30 s after against
+    #   13.56-115.05 s before; alone 0.12-0.40 s against 1.67-1.98 s. No class passes 60 s any
+    #   more, so core/test_include_path_rooted_resolution is no longer NAMED: it takes the unit
+    #   ceilings, like every entry that never needed its own.
     "link/test_coff_object_reader|18|89|34"
     "link/test_pe_object_data_import_slot|14|71|33"
-    "core/test_include_path_rooted_resolution|53|18|209"
     "core/test_type_kind_vocabulary_projection|103|4|17"
     "analysis/semantic/test_fc3_width_semantics|96|6|19"
     "analysis/preprocess/test_preprocess_no_rework|94|5|18"
     "program/test_project_config|84|11|15"
     "orphan_tests_guard|7|76|15"
     "lir/test_mir_to_lir|76|8|16"
-    "harness/test_sqlite_harness_legs|66|73|67"
+    # ★ harness/test_sqlite_harness_legs: RE-DERIVED 2026-09-22 (lane mig, part 4), when its pins were
+    # re-pointed from the retired shell drivers' text to the one Python driver. ✔MEASURED on the new
+    # binary: MinGW Debug 71, 83, 92, 97, 121, 148 s and 215 s under heavy load; MSVC Release 81, 108 s.
+    # The old row read |66|73|67. WHY SLOWER, measured rather than assumed: across four direct runs the
+    # 30 re-pointed or new pins took 26-57 s and the 22 untouched ones 55-90 s, the same ~30/70 split
+    # every time, and one binary ran 83 s and 148 s minutes apart on this shared host -- the rise is
+    # mostly LOAD. The port's own cost is the new pins' Python inspector (tokenize + ast over every
+    # `.py` under the actions tree, ~2-3.4 s per batch, cached); the old binary cannot be re-run for an
+    # A/B, its subjects deleted. Sanitized is NOT re-measured here (only CI builds it) and keeps 66:
+    # the added work is Python child processes, which a sanitizer does not slow.
+    "harness/test_sqlite_harness_legs|66|108|215"
+    # ★ harness/sqlite_driver_selftest: NEW 2026-09-22 (lane mig, part 4) -- the sqlite driver's Step 0
+    # alone (`build_and_test.py --self-test`: two suites, every module's self-test, the leg plan's
+    # self-test and lint). ✔MEASURED 38 s direct; 41-89 s through ctest on MinGW Debug and MSVC
+    # Release; 229 s once under heavy load (a C++ build, the WSL wine corpus and four helpers at once).
+    # ONE ceiling on every class, and that is deliberate: the entry runs only Python, so its speed
+    # depends on load and never on the build class -- the maximum across classes is the honest
+    # ceiling for each.
+    "harness/sqlite_driver_selftest|230|230|230"
     "core/test_config_enum_vocabulary_projection|71|3|14"
     "core/test_target_schema|62|3|15"
 )

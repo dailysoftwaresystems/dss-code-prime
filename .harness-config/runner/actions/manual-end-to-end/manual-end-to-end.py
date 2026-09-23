@@ -80,6 +80,16 @@ import threading
 import time
 from pathlib import Path
 
+# A cp1252 console turns a printed glyph into a traceback or a mangled byte; reconfigure BOTH
+# streams at IMPORT, the property `guard_output_encoding_guard` ratchets for every Python
+# primary program -- this one joined that population when the action index began covering
+# every action, 2026-09-18, and it was measured UNPROTECTED that day.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):  # pragma: no cover - an odd stream
+        pass
+
 HERE = Path(__file__).resolve().parent
 CORPUS = HERE / "corpus"
 HEARTBEAT_DEFAULT = 15.0

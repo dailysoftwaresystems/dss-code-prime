@@ -4,7 +4,6 @@
 #include "core/types/artifact_profile.hpp"
 #include "core/types/config_path_walk.hpp"   // findShippedConfigDir
 #include "core/types/grammar_schema.hpp"
-#include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE rooted-path predicate
 #include "core/types/object_format_kind.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
@@ -14,7 +13,7 @@
 #include "program/cross_validate_target_format.hpp"
 #include "program/dependency_cache.hpp"
 #include "program/program.hpp"
-#include "program/project_sources.hpp"
+#include "core/types/project_sources.hpp"   // expandAndDedupProjectSources + THE one base rule for a manifest's paths
 #include "program/target_spec.hpp"
 
 #include <algorithm>
@@ -74,6 +73,20 @@ void emitGuaranteed(DiagnosticReporter& rep, DiagnosticCode code,
 // duplicate-symbol link error no diagnostic can tie back to a manifest.
 [[nodiscard]] core::PathIdentity sourceKey(std::string const& spelling) {
     return core::PathIdentity::of(fs::path{spelling});
+}
+
+// A manifest's `includes`, each resolved against THAT manifest's directory
+// through THE one base rule (`resolveManifestPathSpelling`). Used for a
+// dependency's OWN build and for a `module`'s sources merged into another's.
+[[nodiscard]] std::vector<std::string>
+resolvedIncludes(fs::path const& manifestDirectory,
+                 std::vector<std::string> const& includes) {
+    std::vector<std::string> out;
+    out.reserve(includes.size());
+    for (auto const& inc : includes) {
+        out.push_back(resolveManifestPathSpelling(manifestDirectory, inc));
+    }
+    return out;
 }
 
 // A shipped object-format document, remembered under THE NAME IT WAS LOADED BY.
@@ -194,8 +207,10 @@ private:
     [[nodiscard]] DependencyCache* cache_();
     [[nodiscard]] std::span<ShippedFormat const> shippedFormats_();
     void collectMergeSources_(std::size_t index, std::vector<std::string>& out,
-                              std::set<core::PathIdentity>& seen) const;
-    [[nodiscard]] std::vector<std::string> buildSourcesFor_(std::size_t index) const;
+                              std::set<core::PathIdentity>& seen,
+                              std::map<std::string, ManifestSourceSettings>& settings) const;
+    [[nodiscard]] std::vector<std::string> buildSourcesFor_(
+        std::size_t index, std::map<std::string, ManifestSourceSettings>& settings) const;
 
     DependencyResolveRequest const& req_;
     IGitRunner&                     git_;
@@ -311,21 +326,13 @@ Resolver::locateEntry_(Node const& parent, DependencyEntry const& entry,
         fs::path const raw{spelling};
         // B.3: a DEPENDENCY path is relative to the CONSUMING manifest's own
         // directory. Anything else makes a dependency's meaning depend on
-        // where the depender happened to be invoked from.
-        //
-        // ⚠ `isRootedPath`, NOT `is_absolute()`
-        // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]] is the same
-        // discriminator, on the include path). ✔MEASURED 2026-08-28 on a
-        // REACHABLE UNC directory with the toolchain that builds DSS:
-        //     '//localhost/C$/…'.is_absolute()   -> FALSE
-        //     'C:/some/consumer/project' / that  -> 'C://localhost/C$/…'
-        // So the bare test classifies a dependency that names ANOTHER MACHINE
-        // as relative and glues the consumer's DRIVE in front of the authority.
-        // That is the exact silent relocation the paragraph above forbids, and
-        // it fails as a not-a-directory report naming a path the manifest never
-        // wrote. The run of TWO is the discriminator; a run of ONE is genuinely
-        // a location on this drive and must keep being re-based.
-        dir = canonicalize(isRootedPath(raw) ? raw : (parent.dir / raw));
+        // where the depender happened to be invoked from — through THE one base
+        // rule every manifest path takes
+        // ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]),
+        // which keeps a `//host/share` authority rooted (`isRootedPath`, not
+        // `is_absolute()`: ✔MEASURED 2026-08-28, the bare test glued the
+        // consumer's DRIVE in front of another machine's authority).
+        dir = canonicalize(resolveManifestPath(parent.dir, raw));
         std::error_code ec;
         if (!fs::is_directory(dir, ec)) {
             emitDriverError(
@@ -789,25 +796,45 @@ Resolver::deriveFormat_(Node const& node, std::string const& consumerSpec,
 // M4(b) applies inside a dependency's own build too: the node's OWN sources
 // lead, then each `SourceMerge` descendant's, because `sourceFiles.front()`'s
 // stem names the artifact when the manifest states no `artifactName`.
+//
+// [[D-DEPS-MODULE-INCLUDES-AND-DEFINES-SILENTLY-DROPPED]]: a `module` node's
+// sources carry its OWN settings into whichever build compiles them — its
+// `includes` resolved against its directory, its `defines` verbatim — keyed by
+// the spelling appended to `out`. They used to be dropped: only the paths
+// crossed the edge, so a module including a header from its own include
+// directory could not compile inside any consumer. The node whose OWN build
+// this is (an `ArtifactLink` dependency collecting for itself) needs no entry:
+// its `Program` carries its settings for every source.
 void Resolver::collectMergeSources_(std::size_t index,
                                     std::vector<std::string>& out,
-                                    std::set<core::PathIdentity>& seen) const {
+                                    std::set<core::PathIdentity>& seen,
+                                    std::map<std::string, ManifestSourceSettings>& settings) const {
     Node const& node = nodes_[index];
+    bool const isModule = node.composition == DependencyComposition::SourceMerge;
+    ManifestSourceSettings own;
+    if (isModule) {
+        own.includeDirs = resolvedIncludes(node.dir, node.config.includes);
+        own.defines     = node.config.defines;
+    }
+    bool const carries = !own.includeDirs.empty() || !own.defines.empty();
     for (auto const& s : node.ownSources) {
-        if (seen.insert(sourceKey(s)).second) out.push_back(s);
+        if (!seen.insert(sourceKey(s)).second) continue;
+        out.push_back(s);
+        if (carries) settings.emplace(s, own);
     }
     for (std::size_t const child : node.children) {
         if (nodes_[child].composition != DependencyComposition::SourceMerge) {
             continue;
         }
-        collectMergeSources_(child, out, seen);
+        collectMergeSources_(child, out, seen, settings);
     }
 }
 
-std::vector<std::string> Resolver::buildSourcesFor_(std::size_t index) const {
+std::vector<std::string> Resolver::buildSourcesFor_(
+    std::size_t index, std::map<std::string, ManifestSourceSettings>& settings) const {
     std::vector<std::string>     out;
     std::set<core::PathIdentity> seen;
-    collectMergeSources_(index, out, seen);
+    collectMergeSources_(index, out, seen, settings);
     return out;
 }
 
@@ -848,10 +875,27 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
     // deliberately NOT read: the first is B.10's whole ruling, and the second
     // is U-9's.
     prog.setArtifactName(node.config.artifactName);
-    prog.setIncludeDirs(node.config.includes);
+    // [[D-DEPS-ARTIFACTLINK-INCLUDES-AND-LIBRARIES-RESOLVE-AGAINST-THE-CONSUMERS-CWD]]:
+    // the dependency's `includes` and `resolveLibraries` are ITS paths, relative
+    // to ITS directory, like its `sources` (B.3). They were handed over VERBATIM
+    // and resolved against the process working directory — ✔MEASURED, such a
+    // dependency failed to build from its consumer's own directory and took a
+    // same-named decoy header (rc 0) from a directory holding one.
+    prog.setIncludeDirs(resolvedIncludes(node.dir, node.config.includes));
     prog.setUserDefines(node.config.defines);
-    prog.setResolveLibraries(node.config.resolveLibraries);
+    {
+        std::vector<ResolveLibrarySpec> libs = node.config.resolveLibraries;
+        for (auto& lib : libs) lib.path = resolveManifestPath(node.dir, lib.path);
+        prog.setResolveLibraries(std::move(libs));
+    }
     prog.setStackReserveBytes(node.config.stackReserveBytes);
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the dependency's OWN `runpaths` —
+    // never the consumer's. A runpath is a property of the image that CARRIES
+    // it (`${ORIGIN}` is that image's directory), so a consumer's `--rpath` or
+    // manifest entries describe the consumer's layout and would be wrong inside
+    // a library built for it; gcc's -rpath likewise applies only to the one
+    // image being linked.
+    prog.setRunpaths(node.config.runpaths);
     if (!inputs.empty()) {
         std::vector<ResolveLibrarySpec> libs;
         libs.reserve(inputs.size());
@@ -859,7 +903,11 @@ Resolver::buildNode_(std::size_t index, std::string const& consumerSpec,
         prog.setResolveLibraryAdditionsByTarget({{depSpec, std::move(libs)}});
     }
 
-    std::vector<std::string> const sources = buildSourcesFor_(index);
+    std::map<std::string, ManifestSourceSettings> moduleSettings;
+    std::vector<std::string> const sources = buildSourcesFor_(index, moduleSettings);
+    // A `module` merged INTO this dependency brings its own settings to its own
+    // sources, exactly as one merged into the root does.
+    prog.setSourceSettings(std::move(moduleSettings));
     if (sources.empty()) {
         emitDriverError(rep_, DiagnosticCode::D_EmptyInput,
                         "dependency '" + core::genericSpelling(node.manifestPath)
@@ -1059,7 +1107,8 @@ std::optional<DependencyResolution> Resolver::run(ProjectConfig const& rootConfi
             if (nodes_[child].composition != DependencyComposition::SourceMerge) {
                 continue;
             }
-            collectMergeSources_(child, out.mergedSources, seen);
+            collectMergeSources_(child, out.mergedSources, seen,
+                                 out.mergedSourceSettings);
         }
     }
 

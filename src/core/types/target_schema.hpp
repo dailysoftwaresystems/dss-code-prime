@@ -473,6 +473,32 @@ struct DSS_EXPORT TargetRegisterInfo {
     // scalar operand spelling declares none (✔MEASURED at HEAD: x86_64 sets it
     // nowhere; arm64 sets it on the 32 `v` rows and nowhere else).
     bool nameRequiresLaneArrangement = false;
+    // ★★★ THIS ROW'S NAMES STATE **NO OPERATION WIDTH** — the JSON key
+    // `nameStatesNoWidth` (P68 round 8,
+    // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS).
+    //
+    // ★★ THE FACT: on some ISAs a register name picks a width view (`%eax` is
+    // the low 32 bits of `%rax`, `d0` the low 64 of `v0`), so an assembler reads
+    // the OPERATION width off the names; on others a name only picks the
+    // CONTAINER. x86 writes `%xmm5` for a scalar-double `addsd` (64 bits), a
+    // scalar-single `addss` (32) and a packed `movaps` (128) alike — the ISA has
+    // no narrower spelling of an xmm register, and the MNEMONIC states the
+    // width. ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 both assemble
+    // `addsd %xmm1, %xmm0` (f2 0f 58 c1) and `movq %xmm0, %rax`
+    // (66 48 0f 7e c0), and DSS refused both — it took each xmm name as a
+    // 128-bit WIDTH statement and found it disagreeing with the 64 the mnemonic
+    // and the other register stated. Every scalar SSE instruction written with
+    // a literal xmm register, in a `.s` or in an `__asm__` template, was refused.
+    //
+    // ★ IT GOVERNS WHAT A NAME **SAYS**, NEVER THE REGISTER: the row keeps its
+    // width, class, encoding and allocation; an instruction naming it simply
+    // takes its width from the mnemonic or from another operand that states one
+    // — the same thing an absent mnemonic width already means for the operands.
+    // ⚠ `validate()` refuses it on a row that IS a width view (`subOf`) and on a
+    // row that HAS one: where narrower names exist, every name states a width.
+    // ⓘ FALSE IS THE NORMAL STATE (✔MEASURED at this commit: x86_64 sets it on
+    // the sixteen xmm rows and nowhere else; arm64 nowhere).
+    bool nameStatesNoWidth = false;
     // ★★★ WHICH **READING** OF A SHARED `hwEncoding` THIS REGISTER IS — the JSON
     // key `encodingRole`. [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
     // (cycle P55, 2026-09-03).
@@ -523,6 +549,20 @@ struct DSS_EXPORT TargetRegisterInfo {
     // EXACTLY ONE default per shared-encoding group, so the fall-back reading is
     // never ambiguous and never absent.
     bool encodingRoleIsDefault = false;
+    // ★★ THE REGISTER A VALUE TOO WIDE FOR THIS ONE CONTINUES IN, when a GNU
+    // local register variable binds it here — the JSON key `continuesIn` (P68
+    // round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). Empty = none:
+    // such a value bound here is refused by name.
+    // ★ DECLARED, NOT DERIVED, because the order is the reference compilers'
+    // and is not the encoding's: ✔MEASURED 2026-09-19 with gcc 13.3.0 and clang
+    // 18.1.3 SEPARATELY, `register __int128 v asm(R)` on `"r"` binds R and then
+    // x(N+1) on aarch64 (x4:x5 on both; x7:x8 on clang, gcc wanting an even N),
+    // while on x86-64 gcc binds rax:rdx, rdx:rcx and r8:r9 — gcc's own hard-
+    // register order (ax, dx, cx, bx, si, di, bp), in which rdx follows rax
+    // although its encoding is 2 and rcx's is 1. `validate()` requires the
+    // named register to exist, to be FULL-width and to share this row's class
+    // and width.
+    std::string continuesIn;
     // 16/8/4/1 etc. — width in bytes. Required so ML6 knows spill-slot
     // sizing without re-deriving it from the regClass.
     std::uint16_t  widthBytes = 0;
@@ -2366,11 +2406,22 @@ enum class EncodingSlotKind : std::uint8_t {
     // posture for `Imm32` — the width is a true fact about the slot, and the
     // next caller should read it rather than re-derive it.
     Imm14 = 33,
+    // P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS): the
+    // AArch64 AdvSIMD "copy" class's `imm5` (bits 16..20), which holds an
+    // ELEMENT's size AND index at once — the lowest set bit names the size (b
+    // 00001, h 00010, s 00100, d 01000) and the bits above it the index
+    // (`umov w0, v1.b[3]` → imm5 = 00111). The wired operand is the INDEX (an
+    // ImmInt); the size is read off the SAME variant's `elementBits` field on
+    // the operand just before it (the element's register), which `validate()`
+    // requires to exist. The walker writes the whole field, so no fixed word
+    // carries a marker bit, and the range is the field's own capacity: 5 bits
+    // less the marker's position (4, 3, 2 or 1 index bits). Not symbol-bearing.
+    ElementIndex = 34,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 34> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 35> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -2405,6 +2456,7 @@ inline constexpr EnumNameTable<EncodingSlotKind, 34> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm16Inverted, "imm16.inverted" },
     { EncodingSlotKind::Imm16Bytes,   "imm16.bytes"    },
     { EncodingSlotKind::Imm14,        "imm14"          },
+    { EncodingSlotKind::ElementIndex, "imm5.element"   },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -2428,7 +2480,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 34,
+static_assert(kEncodingSlotKindCount == 35,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -2504,6 +2556,9 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         // same reason Imm16 is (an x86-variable opcode wiring it would be a
         // cross-shape declaration and validate() rejects it).
         case EncodingSlotKind::Imm16Inverted:
+        // P68 round 8: the AdvSIMD element `imm5` is a bit-window inside a
+        // 32-bit word, a fixed32 slot like every other field of that word.
+        case EncodingSlotKind::ElementIndex:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -2598,6 +2653,7 @@ memoryDisplacementField(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm16Inverted:
         case EncodingSlotKind::Imm16Bytes:
         case EncodingSlotKind::Imm14:
+        case EncodingSlotKind::ElementIndex:
             return std::nullopt;
     }
     return std::nullopt;  // unreachable; satisfies non-exhaustive-switch rules
@@ -2890,6 +2946,9 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // is not either; a symbol-bearing complement form would need the
         // LINKER to invert and is not a shape any target declares).
         case EncodingSlotKind::Imm16Inverted:
+        // P68 round 8: an element's size and index — a literal the walker
+        // computes, never a relocated reference.
+        case EncodingSlotKind::ElementIndex:
             // D-AS4-1 / D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
@@ -2967,6 +3026,23 @@ struct DSS_EXPORT TargetEncodingWire {
     // against `addv b0, v1.8b` = 0x0E31B820), and then a spelling at any other
     // lane width elects nothing. validate() refuses it without `lanes`.
     std::uint8_t     laneBits        = 0;
+    // ── P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS): DOES
+    // THIS FIELD READ **ONE ELEMENT** OF ITS REGISTER, AND HOW WIDE — the JSON
+    // key `elementBits` (8, 16, 32 or 64). 0 = the field reads its register
+    // whole (as a scalar, or as lanes per `lanes`).
+    //
+    // ★★ A THIRD READING, NOT A LANE WIDTH: `umov x0, v1.d[1]` reads one
+    // 64-bit element while `mov v0.16b, v1.16b` reads every lane, and the two
+    // must not reach each other's instructions — they are different words in
+    // gas 2.42 and clang 18.1.3 alike. So an element operand elects only a field
+    // declaring `elementBits` at its width, and a field declaring it takes
+    // nothing else; the element's INDEX is the operand right after it, wired to
+    // `imm5.element` (validate() pairs the two).
+    // ⚠ A DECLARATION, NOT A GUARD — the `lanes` argument again: a LIR
+    // instruction carries no element shape, so the encoder re-selects by the
+    // OPCODE the election chose, which is why each element size is its own
+    // opcode on a target that encodes the size.
+    std::uint8_t     elementBits     = 0;
     // ── [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]:
     // WHICH **READING** OF A SHARED REGISTER ENCODING THIS FIELD HAS — the JSON
     // key `regRole`, matched against `TargetRegisterInfo::encodingRole`.
@@ -4244,12 +4320,19 @@ enum class TargetTerminatorKind : std::uint8_t {
     Return      = 4,    // 0 successors, may carry return-value ops (LirBuilder::addReturn)
     Unreachable = 5,    // 0 successors, 0 operands                 (LirBuilder::addUnreachable)
     IndirectBr  = 6,    // >=1 successors, 1 reg operand (the addr) (LirBuilder::addIndirectBr) — D-CSUBSET-COMPUTED-GOTO
+    // P68 round 8 part 4: ONE inline-asm `asm goto` STATEMENT while registers
+    // are allocated (`lir/lir_asm_region.hpp`). Operands = its SLOTS (registers,
+    // never a BlockRef — its edges ride the successor list alone, as
+    // `IndirectBr`'s do); successors = its labels in order, then its
+    // fall-through (>=1). Never encoded: `expandAsmRegions` replaces it with the
+    // template's own blocks. (LirBuilder::addAsmGoto)
+    AsmGoto     = 7,
 };
 
 // Canonical string form used by `.target.json` and `.dsslir` text.
 // Single source of truth for the loader (string → enum) and any future
 // emit-side serializer (enum → string).
-inline constexpr EnumNameTable<TargetTerminatorKind, 7> kTargetTerminatorKindTable{{{
+inline constexpr EnumNameTable<TargetTerminatorKind, 8> kTargetTerminatorKindTable{{{
     { TargetTerminatorKind::None,        "none"        },
     { TargetTerminatorKind::Br,          "br"          },
     { TargetTerminatorKind::CondBr,      "cond-br"     },
@@ -4257,6 +4340,7 @@ inline constexpr EnumNameTable<TargetTerminatorKind, 7> kTargetTerminatorKindTab
     { TargetTerminatorKind::Return,      "return"      },
     { TargetTerminatorKind::Unreachable, "unreachable" },
     { TargetTerminatorKind::IndirectBr,  "indirect-br" },
+    { TargetTerminatorKind::AsmGoto,     "asm-goto"    },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -4287,7 +4371,7 @@ struct TargetTerminatorShape {
     // treats `maxSuccessors == 255` as "no upper bound".
 };
 
-inline constexpr std::array<TargetTerminatorShape, 6> kTargetTerminatorShapes{{
+inline constexpr std::array<TargetTerminatorShape, 7> kTargetTerminatorShapes{{
     { TargetTerminatorKind::Br,          1, 1   },
     { TargetTerminatorKind::CondBr,      2, 2   },
     { TargetTerminatorKind::Switch,      2, 255 },  // 255 = unbounded sentinel
@@ -4295,6 +4379,8 @@ inline constexpr std::array<TargetTerminatorShape, 6> kTargetTerminatorShapes{{
     { TargetTerminatorKind::Unreachable, 0, 0   },
     // D-CSUBSET-COMPUTED-GOTO: >=1 address-taken successors (255 = unbounded).
     { TargetTerminatorKind::IndirectBr,  1, 255 },
+    // P68 round 8 part 4: the labels (possibly none) then the fall-through.
+    { TargetTerminatorKind::AsmGoto,     1, 255 },
 }};
 
 [[nodiscard]] constexpr TargetTerminatorShape const*
@@ -4655,6 +4741,23 @@ struct DSS_EXPORT TargetOpcodeInfo {
     // the index with `*`.
     std::optional<std::uint8_t> requires2Address;
 
+    // ★★ THE RESULT MUST BE A REGISTER THE INSTRUCTION DOES NOT READ (P68 round
+    // 8, the LL/SC pin of D-LIR-ASM-TEMPLATE-SPILL-CODE-LANDS-BETWEEN-TEMPLATE-INSTRUCTIONS).
+    // `true` ⇒ the result is written EARLY, exactly as an `"=&r"` asm output
+    // is: it may share a register with none of the instruction's register
+    // operands. 📄 Arm ARM, STLXR: `Rs` equal to `Rt`, or to `Rn` when `Rn` is
+    // not the stack pointer, is CONSTRAINED UNPREDICTABLE. ✔MEASURED 2026-09-23:
+    // gas 2.42 warns and assembles such an overlap, clang 18.1.3 refuses it —
+    // and an UNPREDICTABLE encoding is not a program that works, so DSS refuses
+    // it with clang. Identity is the REGISTER's, never the hardware field's:
+    // `stlxr wzr, w0, [sp]` puts 31 in both fields and names two different
+    // registers (clang accepts it). Two consumers read it: `LirBuilder::addInst`
+    // marks such an instruction's result early-clobber, so no allocation can
+    // produce the overlap; and every encoder refuses one it is handed anyway —
+    // a register written in assembly text, or an operand the allocator was
+    // free to share because the programmer omitted the `&`.
+    bool resultEarlyClobber = false;
+
     // Implicit-register constraint (cycle 10p substrate, 2026-06-04).
     // Optional per-opcode block describing fixed-register semantics
     // (e.g., x86 idiv ties RDX:RAX). See `ImplicitRegisterConstraint`
@@ -4691,70 +4794,112 @@ struct DSS_EXPORT TargetOpcodeInfo {
 // NOT that answer and must never be read as it: it describes CALLS, and a
 // JUMP26 sibcall is not one.
 //
-// ★★ THE BODY IS A DECLARED SEQUENCE OF THIS TARGET'S OWN OPCODES, which the
-// linker assembles through `assemble()` once per link; the scratch register
-// and the target symbol are the only operands a step may name. Each step also
-// declares the relocations its encoding carries, and the linker refuses a
-// template whose assembled relocations disagree — two declarations of one fact,
-// made to agree loudly. The body's REACH is derived from those relocations'
-// formulas, never declared a second time.
+// ★★ A BODY IS A DECLARED SEQUENCE OF THIS TARGET'S OWN OPCODES, which the
+// linker assembles through `assemble()` once per link. A step may name only
+// the granted scratch registers (by their register names), the symbol the
+// veneer stands in for, and the body's own data word. Each step also declares
+// the relocations its encoding carries, and the linker refuses a template
+// whose assembled relocations disagree — two declarations of one fact, made to
+// agree loudly. A body's REACH is derived from those relocations' formulas,
+// never declared a second time.
+//
+// ★★ A BODY MAY END IN ONE DATA WORD, after its closing branch — the 64-bit
+// PC-relative literal GNU ld's long-branch stub carries past the ADRP body's
+// ±4 GiB ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]). Its relocation
+// must be PC-RELATIVE: a veneer is built before anyone knows whether the image
+// will be relocated at load time, so an absolute word would be a text
+// relocation in every PIE and shared object.
 //
 // ⓘ ABSENT means this target declares no veneer, and an out-of-reach branch is
 // refused by name. x86-64 declares none on measured grounds: neither GNU ld
 // 2.42 nor ld.lld 18.1.3 extends an out-of-range `rel32`.
 
-// Which value a veneer step's operand names. Deliberately a closed pair: a
-// step that could name ANY register could clobber one the ABI does not grant.
-enum class LinkVeneerOperandRole : std::uint8_t {
-    Scratch = 0,  // the FIRST declared scratch register
-    Target  = 1,  // the symbol (plus addend) the veneer stands in for
+// How a veneer step names a value. Deliberately CLOSED: a register must be one
+// of the granted scratch registers, so no step can clobber a register the ABI
+// does not hand a linker.
+enum class LinkVeneerOperandKind : std::uint8_t {
+    Register = 0,  // a granted scratch register, spelled by its register name
+    Memory   = 1,  // `{"base": <granted register>, "offset": <int>}`
+    Target   = 2,  // `"target"`: the symbol (plus addend) the veneer stands in for
+    Literal  = 3,  // `"literal"`: the address of this body's own data word
 };
 
-inline constexpr EnumNameTable<LinkVeneerOperandRole, 2> kLinkVeneerOperandRoleTable{{{
-    { LinkVeneerOperandRole::Scratch, "scratch" },
-    { LinkVeneerOperandRole::Target,  "target"  },
+// The two operands spelled by KEYWORD. A register is spelled by its own name
+// and a memory operand as an object, so neither has a keyword row.
+inline constexpr EnumNameTable<LinkVeneerOperandKind, 2> kLinkVeneerOperandKeywordTable{{{
+    { LinkVeneerOperandKind::Target,  "target"  },
+    { LinkVeneerOperandKind::Literal, "literal" },
 }}};
 
-DSS_CHECK_ENUM_NAME_TABLE(kLinkVeneerOperandRoleTable);
+DSS_CHECK_ENUM_NAME_TABLE(kLinkVeneerOperandKeywordTable);
 
-[[nodiscard]] constexpr std::string_view
-linkVeneerOperandRoleName(LinkVeneerOperandRole r) noexcept {
-    return kLinkVeneerOperandRoleTable.name(r);
-}
-[[nodiscard]] constexpr std::optional<LinkVeneerOperandRole>
-linkVeneerOperandRoleFromName(std::string_view s) noexcept {
-    return kLinkVeneerOperandRoleTable.fromName(s);
+[[nodiscard]] constexpr std::optional<LinkVeneerOperandKind>
+linkVeneerOperandKindFromKeyword(std::string_view s) noexcept {
+    return kLinkVeneerOperandKeywordTable.fromName(s);
 }
 
-// One instruction of a veneer body.
+struct DSS_EXPORT LinkVeneerOperand {
+    LinkVeneerOperandKind kind = LinkVeneerOperandKind::Register;
+    std::string           registerName;  // Register, and a Memory operand's base
+    std::uint16_t         reg    = 0;    // `registerName`'s ordinal, resolved at load
+    std::int32_t          offset = 0;    // a Memory operand's displacement
+};
+
+// One step of a veneer body: an INSTRUCTION of this target, or — after the
+// body's closing branch — the DATA word its instructions read.
 struct DSS_EXPORT LinkVeneerStep {
-    std::string                        mnemonic;          // as declared
-    std::uint16_t                      opcode = 0;        // resolved at load
-    bool                               resultIsScratch = false;  // `"result": "scratch"`
-    std::vector<LinkVeneerOperandRole> operands;
+    std::string                    mnemonic;            // empty on a data step
+    std::uint16_t                  opcode = 0;          // resolved at load
+    std::string                    resultName;          // empty: writes no register
+    std::uint16_t                  resultRegister = 0;  // resolved at load
+    std::uint8_t                   dataBytes = 0;       // > 0 iff a DATA step
+    std::vector<LinkVeneerOperand> operands;
     // The relocations this step's ENCODING must carry, in emission order —
-    // checked against the assembled template, never used to build it.
-    std::vector<std::string>           relocationNames;   // as declared
-    std::vector<RelocationKind>        relocations;       // resolved at load
+    // checked against the assembled template, never used to build it. A data
+    // step's single relocation is the one its word is written through.
+    std::vector<std::string>       relocationNames;     // as declared
+    std::vector<RelocationKind>    relocations;         // resolved at load
+
+    [[nodiscard]] bool isData() const noexcept { return dataBytes != 0; }
+    [[nodiscard]] bool writesRegister() const noexcept { return !resultName.empty(); }
 };
 
 struct DSS_EXPORT LinkVeneerBody {
     std::string                 name;
-    std::vector<LinkVeneerStep> sequence;  // the last step, and only it, branches
+    // Instructions, the last of them the ONE branch that leaves the veneer;
+    // then at most one data word, which is never executed.
+    std::vector<LinkVeneerStep> sequence;
 };
 
 struct DSS_EXPORT LinkVeneerVocabulary {
     // The registers a linker-built veneer may clobber — the ABI's grant, and
-    // exactly the set the declared bodies use. A step's `"scratch"` role binds
-    // to the first.
+    // the only registers a step may name.
     std::vector<std::string>    scratchRegisterNames;
     std::vector<std::uint16_t>  scratchRegisters;          // resolved ordinals
     // The relocation kinds the ABI lets a linker route through a veneer.
     std::vector<std::string>    routableRelocationNames;
     std::vector<RelocationKind> routableRelocations;       // resolved
-    // Cheapest first: the linker elects the first whose reach covers the image.
+    // Cheapest first. The linker elects, PER VENEER, the first body that
+    // reaches that veneer's target from where it stands and whose relocations
+    // the output format declares.
     std::vector<LinkVeneerBody> bodies;
 };
+
+namespace detail {
+struct TargetSchemaData;
+
+// ★★ THE ONE RULE SET FOR A `linkVeneers` BLOCK'S SHAPE — every rule, each
+// problem at its JSON path. `TargetSchemaData::validate()` appends these at
+// load, so a document with any is refused there; the linker asks for the same
+// answer through `TargetSchema::linkVeneerProblems()` before it builds a body,
+// because a schema built IN MEMORY never passed through the loader. There is
+// no second copy of any rule: a copy drifts, and the last one did — the pass
+// used to re-check a hand-picked subset of these (lane `vn`, 2026-09-19).
+// Empty when the block is absent or well-formed.
+[[nodiscard]] DSS_EXPORT std::vector<ConfigDiagnostic>
+linkVeneerProblems(TargetSchemaData const& data);
+
+}  // namespace detail
 
 namespace detail {
 
@@ -5079,6 +5224,25 @@ struct DSS_EXPORT TargetSchemaData {
     std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormat{};
     std::array<bool, kObjectFormatKindCount> charIsUnsignedByFormatDeclared{};
 
+    // ── Platform ABI typedefs (P68 round 8, D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING)
+    //
+    // The integer type a PLATFORM ABI fixes for a C library typedef that no
+    // language rule derives — `wchar_t`, `wint_t` — as a (processor × platform)
+    // fact, in `charIsUnsigned`'s shape and for its reason: the same processor
+    // answers differently per platform (`wchar_t` is `unsigned int` on aarch64
+    // Linux, `int` on Apple arm64, `unsigned short` on Windows), and `elf`
+    // serves two processors that answer differently (x86_64 Linux `int`), so
+    // neither the format documents nor the language could hold it honestly.
+    // `defaultCore` is the processor's answer; `byFormat[kind]` overrides it
+    // where `byFormatDeclared[kind]` is set. Read through `abiTypedefCore`.
+    struct AbiTypedef {
+        std::string name;
+        TypeKind    defaultCore = TypeKind::Void;
+        std::array<TypeKind, kObjectFormatKindCount> byFormat{};
+        std::array<bool, kObjectFormatKindCount>     byFormatDeclared{};
+    };
+    std::vector<AbiTypedef> abiTypedefs;
+
     // D-CSUBSET-PACKED-ATOMIC-MEMBER: what this PROCESSOR's native inline
     // atomic load/store form does when the access is not naturally aligned
     // (`atomics.underAlignedNativeForm` in the `.target.json`). `None` = the
@@ -5134,6 +5298,15 @@ struct DSS_EXPORT TargetSchemaData {
     // explicitly. Building a `-masm=`-style flag before a second dialect ships
     // would be a knob with nothing to switch to.
     std::string defaultAssemblyLanguage;
+
+    // P68 round 8 (D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED): the ISA
+    // FEATURES this target's code may assume, by name, each ON or OFF — the one
+    // TARGET fact an inline-asm template form reads. ✔MEASURED 2026-09-23 on
+    // gcc 13.3.0: x86's `%~` expands to `f` and, under `-mavx2`, to `i`.
+    // OPTIONAL, and a name absent here is UNKNOWN rather than off: a consumer
+    // refuses an unknown feature by name, because reading it as "off" would make
+    // a target that has the feature silently name the other instruction.
+    std::vector<std::pair<std::string, bool>> isaFeatures;
 
     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
     // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
@@ -5356,6 +5529,29 @@ public:
         auto it = d_.registerIndex.find(name);
         if (it == d_.registerIndex.end()) return std::nullopt;
         return it->second;
+    }
+
+    // ★ THE FULL-WIDTH REGISTER A NAME DENOTES — `name` resolved, then its
+    // `subOf` chain followed to the row that declares none (`w9` → `x9`, `eax`
+    // → `rax`, `d8` → `v8`; a full register, or an `aliases` spelling of one,
+    // answers itself). The question two tiers ask of a GNU local register
+    // variable's binding (P68, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED):
+    // WHICH machine register does the label name, so that two labels, a
+    // clobber and a pinned constraint letter can be compared as one register
+    // however each was spelled. nullopt when the name is unknown, or when the
+    // chain does not terminate within the table (a malformed target —
+    // `validate()` refuses a cyclic chain at load, so a loaded schema never
+    // reaches that arm; the bound is the second line, not the first).
+    [[nodiscard]] std::optional<std::uint16_t> fullRegisterOf(
+            std::string_view name) const noexcept {
+        auto ord = registerByName(name);
+        for (std::size_t hops = 0; ord.has_value(); ++hops) {
+            auto const* info = registerInfo(*ord);
+            if (info == nullptr || hops > registerCount()) return std::nullopt;
+            if (info->subOf.empty()) return ord;
+            ord = registerByName(info->subOf);
+        }
+        return std::nullopt;
     }
 
     // ── GNU inline-asm constraint letters ───────────────────────
@@ -5663,6 +5859,35 @@ public:
         return d_.charIsUnsignedDefault;
     }
 
+    // P68 round 8: the integer core platform ABI typedef `name` has under
+    // `format` on this processor — the format's declared override, else the
+    // target's default — or nullopt when this target declares no such typedef.
+    // Like `charIsUnsigned`, the FORMAT is a required argument: the fact is per
+    // (processor × platform), and a format-less answer would be the
+    // processor's half alone. The typedef NAME is compared as data.
+    [[nodiscard]] std::optional<TypeKind>
+    abiTypedefCore(std::string_view name, ObjectFormatKind format) const noexcept {
+        auto const idx = static_cast<std::size_t>(format);
+        for (auto const& t : d_.abiTypedefs) {
+            if (t.name != name) continue;
+            if (idx < t.byFormatDeclared.size() && t.byFormatDeclared[idx]) {
+                return t.byFormat[idx];
+            }
+            return t.defaultCore;
+        }
+        return std::nullopt;
+    }
+
+    // The typedef names this target declares, in declaration order — so a
+    // caller can resolve the whole table for one format without knowing a
+    // single name (`applyTargetFormatPair`).
+    [[nodiscard]] std::vector<std::string_view> abiTypedefNames() const {
+        std::vector<std::string_view> out;
+        out.reserve(d_.abiTypedefs.size());
+        for (auto const& t : d_.abiTypedefs) out.push_back(t.name);
+        return out;
+    }
+
     // D-CSUBSET-PACKED-ATOMIC-MEMBER: what this processor's native inline
     // atomic form does under an under-aligned access. `None` when the target
     // declares no `atomics` block — the lowering then keeps the native form,
@@ -5699,6 +5924,18 @@ public:
     [[nodiscard]] std::string_view
     defaultAssemblyLanguage() const noexcept {
         return d_.defaultAssemblyLanguage;
+    }
+
+    // ── ISA features (P68 round 8) ─────────────────────────────────
+    // Whether this target declares the ISA feature `name` ON or OFF, or
+    // nullopt when it does not declare it at all — which a consumer refuses
+    // by name rather than reading as OFF (see the data member).
+    [[nodiscard]] std::optional<bool>
+    isaFeature(std::string_view name) const noexcept {
+        for (auto const& [n, on] : d_.isaFeatures) {
+            if (n == name) return on;
+        }
+        return std::nullopt;
     }
 
     // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────
@@ -5742,6 +5979,13 @@ public:
     // out-of-reach branch by name.
     [[nodiscard]] LinkVeneerVocabulary const* linkVeneers() const noexcept {
         return d_.linkVeneers.has_value() ? &*d_.linkVeneers : nullptr;
+    }
+    // The `linkVeneers` block's shape problems — `validate()`'s own rule set
+    // for it (`detail::linkVeneerProblems`), empty when there are none. A
+    // loaded schema has none by construction; the linker asks anyway, once per
+    // link, because a schema built in memory was never validated.
+    [[nodiscard]] std::vector<ConfigDiagnostic> linkVeneerProblems() const {
+        return detail::linkVeneerProblems(d_);
     }
 
     // ── Loaders ──────────────────────────────────────────────────

@@ -32,6 +32,9 @@ add_library(core OBJECT
     # REPEATED key can be noticed
     # (D-CONFIG-A-DUPLICATE-JSON-KEY-IS-DROPPED-WITHOUT-A-DIAGNOSTIC).
     types/config_document_parse.cpp
+    # The ONE expansion of an inline-asm template's TEXT forms (`%=`, the
+    # punctuation forms, the dialect alternatives) — the dialect declares them.
+    types/asm_template_text_forms.cpp
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp
@@ -43,6 +46,7 @@ add_library(core OBJECT
     # D-LSP-PROJECT-CONFIG-LIVES-ABOVE-ITS-CONSUMERS: moved down to the tier
     # both readers already depend on, so the dependency runs one way again.
     types/project_config.cpp
+    types/project_sources.cpp
     types/target_schema.cpp
     types/target_spec.cpp
     types/target_schema_json.cpp
@@ -52,6 +56,10 @@ add_library(core OBJECT
     types/tree.cpp
     types/tree_builder.cpp
     types/tree_cursor.cpp
+    # The ONE owner of what a struct/union DEFINITION carries for every text tier
+    # that spells composites in a `types` table (HIR `.dsshir` v5, MIR `.dssir` v2):
+    # the channels a writer reads, the combinations a reader refuses, the completion.
+    types/type_lattice/composite_definition.cpp
     types/type_lattice/type_lattice.cpp
     types/type_lattice/type_layout.cpp
     types/type_lattice/type_reintern.cpp

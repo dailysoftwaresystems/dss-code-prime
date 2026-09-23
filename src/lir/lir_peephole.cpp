@@ -112,24 +112,18 @@ isElidableFallthroughBranch(Lir const& src, LirBlockId blk, LirInstId inst,
                             std::optional<LirBlockId> nextBlock,
                             TargetSchema const& schema) {
     // The LAST block of a function has no next-laid-out block, so its
-    // fallthrough edge has nowhere to fall to and must stay materialized.
-    if (!nextBlock.has_value()) return false;
-    auto const* info = schema.opcodeInfo(src.instOpcode(inst));
-    if (info == nullptr || !info->isTerminator()) return false;
-
-    auto const ops   = src.instOperands(inst);
-    auto const succs = src.blockSuccessors(blk);
-    if (ops.empty() || ops.size() != succs.size()) return false;
-    for (std::size_t k = 0; k < ops.size(); ++k) {
-        if (ops[k].kind != LirOperandKind::BlockRef) return false;
-        if (ops[k].blockSlot != succs[k].v) return false;
-    }
-    if (succs.back().v != nextBlock->v) return false;
-
-    // ★★★ AND ONLY IF THE TARGET SAYS SO. One owner for that question, shared
-    // with the verifier arm that has to bless the result.
-    return lir_pass_util::declaresFallthroughBranchForm(
-        schema, src.instOpcode(inst), ops.size());
+    // fallthrough edge has nowhere to fall to and must stay materialized
+    // (`nextBlock` is nullopt there, which the shared predicate refuses).
+    //
+    // ★★★ AND ONLY IF THE TARGET SAYS SO. The whole question — the operand list
+    // agreeing with the successor list, the last successor being the next block,
+    // and the target declaring the shorter form — has ONE owner,
+    // `lir_pass_util::canElideFallthroughOperand`, shared with the verifier arm
+    // that has to bless the result and (P68 round 8 part 4) with the asm-region
+    // expansion, which lays out a template's blocks after this pass ran.
+    return lir_pass_util::canElideFallthroughOperand(
+        schema, src.instOpcode(inst), src.instOperands(inst),
+        src.blockSuccessors(blk), nextBlock);
 }
 
 // Rewrite ONE function into `b`, dropping the instructions R1 proves

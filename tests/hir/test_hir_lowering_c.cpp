@@ -124,7 +124,7 @@ namespace {
     // through the real pipeline. ELF is what every fixture in this file was
     // implicitly written against.
     return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
-                   std::nullopt, fixtureVaListStrategy(), ObjectFormatKind::Elf,
+                   std::nullopt, fixtureVaListStrategy(), SelectableObjectFormatKind::of(ObjectFormatKind::Elf),
                    std::nullopt, LongDoubleFormat::None, fixtureTarget());
 }
 
@@ -143,7 +143,7 @@ namespace {
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     return analyze(cu, DiagnosticBudget::libraryDefault(),
                    DataModel::Llp64, std::nullopt, std::nullopt,
-                   ObjectFormatKind::Pe);
+                   SelectableObjectFormatKind::of(ObjectFormatKind::Pe));
 }
 
 // Drive c → SemanticModel with the parser's expression-depth cap RAISED to
@@ -1195,20 +1195,30 @@ TEST(HirLoweringC, FuncNameReadsLowerThroughStringLiteralPaths) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
-// FC17.5 F1 (S_PredefinedIdentifierNotAddressable 0xE040): `++__func__`
-// reaches the HIR inc/dec classifier (SE4's const check does not model
-// inc/dec — the pre-existing D-CSUBSET-INCDEC-CONST-LVALUE class), where
-// the simpleLvalue chokepoint now rejects the predefined identifier with
-// a REAL diagnostic instead of the engine-level "no storage slot" MIR
-// failure it would otherwise dead-end at. Covers `--__func__` and the
-// postfix forms by construction (all three ++/-- sites share the
-// classifier, and the classifier's simple-lvalue probe IS the guard).
+// FC17.5 F1 (S_PredefinedIdentifierNotAddressable 0xE040): `++__func__` is
+// refused at TWO layers, and both are pinned. Since P68 round 8 the semantic
+// tier's const-write check covers `++` / `--` as well as assignment, so the
+// synthetic, `isConst` `__func__` is refused there first with
+// S_ConstViolation — which is what stops the build (the pipeline does not
+// lower a model with errors). Before that the semantic tier did not model
+// inc/dec at all, and this test asserted a CLEAN model. The HIR inc/dec
+// classifier stays the BACKSTOP for a build that got past semantic (a
+// suppressed S_ConstViolation): its simpleLvalue chokepoint rejects the
+// predefined identifier with a REAL diagnostic instead of the engine-level "no
+// storage slot" MIR failure it would otherwise dead-end at. `lowerToHir` runs
+// on a model with errors, so the backstop is pinned directly. Covers
+// `--__func__` and the postfix forms by construction (all three ++/-- sites
+// share the classifier, and the classifier's simple-lvalue probe IS the guard).
 TEST(HirLoweringC, FuncNameIncDecFailsLoudWithRealDiagnostic) {
     SemanticModel model = analyzeC(
         "int main() { ++__func__; return 0; }\n");
-    ASSERT_FALSE(model.hasErrors())
-        << "inc/dec const-ness is not modelled at semantic — the HIR "
-           "guard is the enforcement point";
+    bool constViolation = false;
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_ConstViolation) constViolation = true;
+    }
+    EXPECT_TRUE(constViolation)
+        << "`__func__` is a const object, so its increment is refused at "
+           "semantic by the same check an assignment to it meets";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok) << "++__func__ must fail loud";
@@ -9532,7 +9542,7 @@ namespace {
     }
     FormatRuntimeLibraryRoleResolver const roles{**formatSchema};
     return analyze(cu, DiagnosticBudget::libraryDefault(),
-                   dataModel, std::nullopt, std::nullopt, format, "x86_64",
+                   dataModel, std::nullopt, std::nullopt, SelectableObjectFormatKind::of(format), "x86_64",
                    LongDoubleFormat::None, nullptr, 0, &roles);
 }
 

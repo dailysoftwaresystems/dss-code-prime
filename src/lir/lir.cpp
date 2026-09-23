@@ -1,4 +1,5 @@
 #include "lir/lir.hpp"
+#include "lir/lir_asm_region.hpp"
 
 #include "core/substrate/mint_monotonic_id.hpp"
 
@@ -46,6 +47,29 @@ LirRegConstraintPool::at(std::uint32_t index) const {
     return pool_[index];
 }
 
+// ── LirAsmRegionPool (P68 round 8 part 4) ───────────────────────────
+
+std::uint32_t
+LirAsmRegionPool::add(std::shared_ptr<LirAsmRegion const> region) {
+    if (!region) lirFatal("LirAsmRegionPool::add: null region");
+    auto const idx = static_cast<std::uint32_t>(pool_.size());
+    pool_.push_back(std::move(region));
+    return idx;
+}
+
+LirAsmRegion const& LirAsmRegionPool::at(std::uint32_t index) const {
+    return *shared(index);
+}
+
+std::shared_ptr<LirAsmRegion const> const&
+LirAsmRegionPool::shared(std::uint32_t index) const {
+    if (index >= pool_.size()) {
+        lirFatal("LirAsmRegionPool::at: index out of range (an asm-region "
+                 "handle outlived its pool)");
+    }
+    return pool_[index];
+}
+
 // ── Lir ──────────────────────────────────────────────────────────
 
 Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
@@ -53,7 +77,8 @@ Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
          std::vector<LirBlockId> succPool,
          LirLiteralPool literalPool,
          LirRegConstraintPool regConstraintPool,
-         std::vector<LirStaticInitEntry> staticInit) noexcept
+         std::vector<LirStaticInitEntry> staticInit,
+         LirAsmRegionPool asmRegionPool) noexcept
     : target_(target),
       instArena_(std::move(instArena)),
       blockArena_(std::move(blockArena)),
@@ -62,7 +87,8 @@ Lir::Lir(TargetSchemaId target, InstArena instArena, BlockArena blockArena,
       succPool_(std::move(succPool)),
       literalPool_(std::move(literalPool)),
       regConstraintPool_(std::move(regConstraintPool)),
-      staticInit_(std::move(staticInit)) {
+      staticInit_(std::move(staticInit)),
+      asmRegionPool_(std::move(asmRegionPool)) {
     // Cross-arena module-id check — all four arenas must share one tag.
     if (instArena_.id() != blockArena_.id()
      || instArena_.id() != funcArena_.id()) {
@@ -293,8 +319,18 @@ LirInstId LirBuilder::addInst(std::uint16_t opcode, LirReg result,
     // outside the schema's opcode table silently freezes a mismatched
     // module today; the schema's `opcodeInfo` returns nullptr for
     // out-of-range opcodes.
-    if (target_.opcodeInfo(opcode) == nullptr) {
+    TargetOpcodeInfo const* const info = target_.opcodeInfo(opcode);
+    if (info == nullptr) {
         lirFatal("LirBuilder::addInst: opcode not registered for the active target schema");
+    }
+    // ★ A TARGET-DECLARED EARLY-CLOBBER RESULT IS MARKED HERE, ONCE, FOR EVERY
+    // PRODUCER (P68 round 8, `TargetOpcodeInfo::resultEarlyClobber`): liveness
+    // then puts the result's def at the instruction's EARLY slot, so the
+    // allocator can never hand it a register one of its operands still holds —
+    // the overlap the architecture makes UNPREDICTABLE (arm64 STLXR). A
+    // producer that knew nothing of the rule gets it all the same.
+    if (info->resultEarlyClobber && result.valid()) {
+        flags = static_cast<std::uint8_t>(flags | kLirInstFlagEarlyClobberResult);
     }
     detail::LirInst inst;
     inst.opcode       = opcode;
@@ -349,6 +385,25 @@ LirInstId LirBuilder::addIndirectBr(std::uint16_t opcode,
     // D-CSUBSET-COMPUTED-GOTO: operand[0] = address register; successors = all
     // address-taken blocks (variadic, like a Switch). Records them into the succ
     // pool exactly as addCondBr does for its two successors.
+    LirInstId const id = addInst(opcode, InvalidLirReg, operands, payload, flags);
+    recordSuccessors_(targets);
+    openBlockHasTerminator_ = true;
+    return id;
+}
+
+LirInstId LirBuilder::addAsmGoto(std::uint16_t opcode,
+                                 std::span<LirOperand const> operands,
+                                 std::span<LirBlockId const> targets,
+                                 std::uint32_t payload, std::uint8_t flags) {
+    auto const* info = target_.opcodeInfo(opcode);
+    if (info == nullptr || info->terminatorKind != TargetTerminatorKind::AsmGoto) {
+        lirFatal("LirBuilder::addAsmGoto: opcode is not an asm-goto terminator "
+                 "for this target");
+    }
+    if (targets.empty()) {
+        lirFatal("LirBuilder::addAsmGoto: an asm-goto statement always has its "
+                 "fall-through successor");
+    }
     LirInstId const id = addInst(opcode, InvalidLirReg, operands, payload, flags);
     recordSuccessors_(targets);
     openBlockHasTerminator_ = true;
@@ -560,6 +615,36 @@ void LirBuilder::setInstRegConstraints(LirInstId inst,
         lirRegConstraintHandleForIndex(poolIndex);
 }
 
+std::uint32_t
+LirBuilder::asmRegionPoolAdd(std::shared_ptr<LirAsmRegion const> region) {
+    if (!region) lirFatal("LirBuilder::asmRegionPoolAdd: null region");
+    if (auto const defect = lirAsmRegionShapeDefect(*region)) {
+        std::fputs("dss::Lir fatal: LirBuilder::asmRegionPoolAdd: the region "
+                   "is malformed — ", stderr);
+        std::fputs(defect->c_str(), stderr);
+        std::fputc('\n', stderr);
+        std::abort();
+    }
+    return asmRegionPool_.add(std::move(region));
+}
+
+void LirBuilder::setInstAsmRegion(LirInstId inst, std::uint32_t poolIndex) {
+    if (inst.arenaTag != moduleId_.v) {
+        lirFatal("LirBuilder::setInstAsmRegion: cross-module inst id");
+    }
+    if (poolIndex >= asmRegionPool_.size()) {
+        lirFatal("LirBuilder::setInstAsmRegion: pool index out of range "
+                 "(call asmRegionPoolAdd first)");
+    }
+    auto& node = instArena_.at(inst);
+    if (node.operandCount != asmRegionPool_.at(poolIndex).roles.size()) {
+        lirFatal("LirBuilder::setInstAsmRegion: the instruction's operand "
+                 "count differs from the region's slot count — the roles are "
+                 "read by position, so some operand would have none");
+    }
+    node.asmRegion = lirAsmRegionHandleForIndex(poolIndex);
+}
+
 void LirBuilder::orInstFlags(LirInstId inst, std::uint8_t flags) {
     if (inst.arenaTag != moduleId_.v) {
         lirFatal("LirBuilder::orInstFlags: cross-module inst id");
@@ -615,6 +700,8 @@ Lir LirBuilder::finish() && {
         std::move(regConstraintPool_),
         // D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN
         std::move(staticInit_),
+        // P68 round 8 part 4: the inline-asm bundle bodies.
+        std::move(asmRegionPool_),
     };
 }
 

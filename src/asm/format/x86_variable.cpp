@@ -418,6 +418,8 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         // (complement-immediate) slot is fixed32, like Imm16 whose window it
         // shares.
         case EncodingSlotKind::Imm16Inverted:
+        // P68 round 8: the AdvSIMD element `imm5` is a fixed32 bit-window.
+        case EncodingSlotKind::ElementIndex:
             // Other shapes — the fixed32 register/immediate slots plus
             // the symbol-bearing Disp32, none handled by the x86
             // register-wiring walker. slotShapeFor + validate's cross-

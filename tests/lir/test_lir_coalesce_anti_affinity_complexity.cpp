@@ -22,9 +22,9 @@
 // ★★★ WHY THIS PIN COUNTS OPERATIONS AND DOES NOT TIME THE CLOCK.
 // A wall-clock performance assertion is sized on the machine that wrote it and
 // reds on the slowest leg that runs it, NAMING THE WRONG EVENT —
-// `scripts/check-wall-clock-in-tests/` refuses new ones for exactly that
-// reason, and this repository has already paid for one
-// (D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED). What is asserted
+// `.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones for exactly that
+// reason, and this repository has already paid for one: a wall-clock literal
+// that entered a test before anything guarded against it. What is asserted
 // here is `LirFuncAllocation::coalesceAntiAffinity{Queries,Probes}`: THE
 // ALGORITHM'S OWN WORK. Those numbers are deterministic, host-independent,
 // load-independent and identical in Debug and Release, so a statement about

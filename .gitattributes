@@ -54,46 +54,18 @@ tests/lsp/sessions/** text eol=lf
 # been measured in this repo, which is why this is a pin and not a convention.
 *.probes text eol=lf
 
-# THE SCRIPTS IN scripts/ — including the twin `.sh`/`.ps1` guard pairs ctest runs
-# as `anchor_registry_guard`, `line_endings_guard` and `orphan_tests_guard`.
-# Pinned for the same reason `real-examples/**` is: these run on Windows, WSL,
-# macOS and arm64, and a CRLF `.sh` fails on a POSIX leg at the shebang with a
-# useless error. ★ THE SHARPER REASON IS SELF-REFERENCE: `check-line-endings.sh`
-# is itself one of these files, so an unpinned CRLF rewrite can break the very
-# guard that would have reported it — a guard that cannot run reads exactly like
-# a guard that found nothing. Left unpinned until now, so both orphan-guard
-# twins were LF by an author's care rather than by mechanism, which is the
-# distinction this repo's own wiring comment draws: "an invariant nothing
-# executes is a convention."
-# ⓘ 2026-08-19: these three globs said `tools/**` until the whole directory
-# was merged into `scripts/` (one directory per script, siblings inside).
-# Retargeting them WIDENED the pin: cmake-import, corpus-census and
-# pragma-profile-census already lived under scripts/ and had
-# never been pinned at all — they were LF by an author's care, which is the
-# exact distinction this comment draws against.
-scripts/**/*.sh  text eol=lf
-scripts/**/*.ps1 text eol=lf
-scripts/**/*.py  text eol=lf
-
-# The real-example HARNESS DRIVERS (real-examples/c/sqlite/). Their whole promise
-# is "clone the repo and run ONE command", on ANY host — so a fresh clone must
-# not be able to break them before they start. `core.autocrlf=true` is the
-# Git-for-Windows INSTALLER DEFAULT, and under it a Windows clone rewrites
-# `build-and-test.sh` / `check-source-coherence.sh` to CRLF; bash then fails on
-# the stray `\r` (classically `$'\r': command not found`) and the driver is dead
-# on arrival on the very host it was meant to run from. MEASURED here only as
-# the NEGATIVE: this workstation has `core.autocrlf=false` (both --local and
-# --global), which is exactly why the hazard has never been observed in-tree —
-# it is latent on a DIFFERENT machine, i.e. exactly the shape of a capability
-# that works on the host it was authored on and is dead on every other one.
-# Listed by EXTENSION rather than as `real-examples/** text eol=lf`, because the
-# broad form would also force text normalization onto any binary fixture added
-# later — the corruption the `examples/**/*.bin binary` rule above had to be
-# added to undo.
-real-examples/**/*.sh   text eol=lf
-real-examples/**/*.ps1  text eol=lf
-real-examples/**/*.py   text eol=lf
-real-examples/**/*.json text eol=lf
+# ⓘ 2026-09-18: TWO PATH-SCOPED BLOCKS STOOD HERE -- `scripts/**/*.{sh,ps1,py}` and
+# `real-examples/**/*.{sh,ps1,py,json}` -- and both directories stopped existing that
+# day, when every program in them moved under `.harness-config/runner/actions/`. They
+# were DELETED, not retargeted, because the `.harness-config/**` block further down
+# already pins every one of those extensions there (✔MEASURED: `git check-attr text eol`
+# answers `set` / `lf` for each moved file, and `git ls-files --eol` reported all 90
+# moved blobs `i/lf` before the move, so the move changed no stored byte). The REASONS
+# they carried moved with them into that block: a CRLF `.sh` dies at its shebang on
+# a POSIX leg; `check-line-endings.sh` is itself one of these files, so an unpinned
+# rewrite can break the guard that would report it; and the sqlite drivers promise
+# "clone and run ONE command", which `core.autocrlf=true` -- the Git-for-Windows
+# installer default -- would otherwise break on a fresh Windows clone.
 
 # ── EOL WAS PINNED FOR CONFIGS AND GOLDENS, AND NOT FOR SOURCES ────────────
 # THE SOURCE TREE ITSELF. Every rule above pins a CONFIG, a GOLDEN or a
@@ -229,7 +201,8 @@ src/dss-config/runtime/platform/dist/** binary
 # One directory per action holds its `.yml` and every supporting file, and the first such
 # file is a Python program the action's only `run` line starts - a `run` line being a
 # program and its arguments with no shell, anything that is not a one-liner must be a file.
-# `scripts/**/*.py` above is pinned already; a second home for repository Python that is NOT
+# `scripts/**/*.py` was pinned already (that directory is gone since 2026-09-18, and this rule
+# now covers every program it held); a second home for repository Python that is NOT
 # pinned would be the same defect in a new directory, and the comment above records that this
 # block has already been one commit late once. Named by EXTENSION, not as
 # `.harness-config/** text`, for the reason the `examples/**/*.bin binary` rule exists: a
@@ -237,21 +210,17 @@ src/dss-config/runtime/platform/dist/** binary
 # supporting files are exactly where a fixture blob will one day be added.
 .harness-config/**/*.py   text eol=lf
 
-# ⚠⚠ 2026-09-17, lane m2: `.sh` AND `.ps1` JOIN THEM, AND THE GAP WAS MEASURED BY FALLING
-# INTO IT. The shell pins in this file are PATH-SCOPED -- `scripts/**/*.sh` and
-# `real-examples/**/*.sh` -- not by extension. So the first supporting `.sh` to reach an
-# action directory arrived UNPINNED: ✔MEASURED, `git check-attr text eol` answered
-# `unspecified` for both attributes on
-# `.harness-config/runner/actions/macho-alias-ld64-matrix/macho-alias-ld64-matrix.remote.sh`
-# the moment it moved out of `scripts/`, and `DssHarness fix-line-endings --check --all`
-# counted it in the tier it CONSIDERS and does not JUDGE -- "with no declared ending",
-# 72 ⟶ 73. The bytes did not change; the RULE that keeps them did.
-# ★ A `.sh` checked out CRLF breaks at its own shebang, and this one runs on exactly one
-# host -- the Mac -- where no local run would ever have shown it.
-# ★★ The reasoning is the `.py` block's above, one extension over: an action directory
-# holds the `.yml` and EVERY supporting file, so every language an action can ship needs a
-# pin the day the layout allows it, not the day the file arrives. `.ps1` is pinned here
-# with no such file present for that reason -- the `.py` rule was written one commit late
-# once, and this block already records what that cost.
-.harness-config/**/*.sh   text eol=lf
-.harness-config/**/*.ps1  text eol=lf
+# ⓘ 2026-09-21 (lane mig, part 4): THE `.sh` AND `.ps1` PINS THAT STOOD HERE LEFT WITH THEIR SUBJECT.
+# They were added 2026-09-17 because an action directory holds every supporting file, so every
+# language an action could ship needed a pin the day the layout allowed it (a CRLF `.sh` dies at
+# its own shebang on a POSIX leg). The operator then ruled that an action ships NO `.sh` or `.ps1`
+# at all -- its entry point is its `.yml`, and what the `.yml` starts is Python -- and every such
+# file was ported and deleted; `check-scripts-index` now refuses one under the actions directory
+# by name. A pin for a file type the layout forbids would be a rule with nothing to govern.
+
+# ⓘ 2026-09-18: `.expected` JOINS THEM, the one extension the move of `scripts/` brought here
+# unpinned. `pragma-profile-census.expected` is the census's EXPECTED OUTPUT, compared line by
+# line against a fresh run; it was never pinned under `scripts/` either (✔MEASURED `git
+# check-attr`: `unspecified` for both attributes, stored `i/lf`). A CR in an expected file is a
+# census that differs from its own expectation on the one host whose checkout rewrote it.
+.harness-config/**/*.expected text eol=lf

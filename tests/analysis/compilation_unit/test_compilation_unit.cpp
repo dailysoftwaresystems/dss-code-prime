@@ -4,6 +4,7 @@
 // downstream phases — not just a local bug.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "analysis/semantic/target_format_analysis.hpp"   // analyzeForTargetFormat (the sentinel door)
 #include "analysis/syntactic/parser.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -11,7 +12,10 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/tree.hpp"
 #include "core/e2e_harness.hpp"
+#include "core/types/target_schema.hpp"
+#include "link/object_format_schema.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_schema_or_throw.hpp"
 
 #include <gtest/gtest.h>
 
@@ -352,6 +356,52 @@ TEST(CompilationUnitDeathTest, ReadingSchemaOnMovedFromCuAborts) {
     // must abort, not dereference null. (trees()/crossRefs() on a moved-from
     // CU return empty spans and are intentionally safe — not tested for death.)
     EXPECT_DEATH({ (void)cu.schema(); }, "no schema");  // NOLINT(bugprone-use-after-move)
+}
+
+// [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]: `ObjectFormatKind::Unknown` is the
+// invalid SENTINEL, and "this build has no format" is spelled by never calling
+// `setActiveFormat`. Handed the sentinel, the builder refuses at the door rather
+// than carry a second spelling of "no format" that every availability test
+// downstream would read as "unavailable everywhere". A real format kind is still
+// accepted — the refusal is of the sentinel, not of the setter.
+TEST(CompilationUnitDeathTest, SetActiveFormatRefusesTheSentinel) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto schema = loadToySchema();
+    UnitBuilder accepting{schema, DiagnosticBudget::libraryDefault()};
+    accepting.setActiveFormat(ObjectFormatKind::Pe);   // a real kind: no refusal
+    UnitBuilder b{schema, DiagnosticBudget::libraryDefault()};
+    EXPECT_DEATH({ b.setActiveFormat(ObjectFormatKind::Unknown); },
+                 "setActiveFormat was handed ObjectFormatKind::Unknown");
+}
+
+// [[D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY]]: the ANALYSIS half of the same door.
+// `ObjectFormatSchema::kind()` answers the sentinel for a schema with no resolved
+// backend, and `analyze()`'s tiers read an engaged sentinel two different ways
+// (✔MEASURED: the literal-prefix resolver as "no format", the availability gate as
+// a real format with nothing restricted on it). The one derivation of a pair's
+// analysis inputs refuses it at the door; a real pair analyzes.
+TEST(CompilationUnitDeathTest, AnalyzeForTargetFormatRefusesAFormatWithNoKind) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    auto const c = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder b{c, DiagnosticBudget::libraryDefault()};
+    b.addInMemory("int x;\n", "m.c");
+    auto const cu = std::make_shared<CompilationUnit const>(std::move(b).finish());
+    auto const target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(pe.has_value());
+
+    auto const real = analyzeForTargetFormat(cu, DiagnosticBudget::libraryDefault(),
+                                             **target, **pe, nullptr);
+    EXPECT_FALSE(real.model.diagnostics().hasErrors())
+        << "the control: a real pair analyzes `int x;` cleanly";
+
+    ObjectFormatSchema const noKind{detail::ObjectFormatData{}};
+    ASSERT_EQ(noKind.kind(), ObjectFormatKind::Unknown)
+        << "the fixture must be the schema shape that answers the sentinel";
+    EXPECT_DEATH({ (void)analyzeForTargetFormat(cu, DiagnosticBudget::libraryDefault(),
+                                                **target, noKind, nullptr); },
+                 "resolved no format kind");
 }
 
 // ── CU2: addFile / addInMemory ────────────────────────────────────────────

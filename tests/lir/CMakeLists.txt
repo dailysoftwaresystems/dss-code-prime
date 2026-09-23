@@ -38,6 +38,12 @@ dss_add_test(NAME lir/test_lir_asm_tied_operand SOURCES test_lir_asm_tied_operan
 # MIR → LIR lowering, because the property is a relation between what the front
 # end minted (the spellings) and what this tier bound (the blocks).
 dss_add_test(NAME lir/test_lir_asm_goto_labels SOURCES test_lir_asm_goto_labels.cpp)
+# P68 round 8 part 4: the inline-asm BUNDLE — one statement is one instruction
+# while registers are allocated (`lir/lir_asm_region.hpp`): its slots and roles,
+# nothing the allocator writes between a template's lines, the output that
+# avoids the statement's clobbers, the capacity refusal where the references
+# refuse, the one-block expansion, the verifier, the text codec.
+dss_add_test(NAME lir/test_lir_asm_region SOURCES test_lir_asm_region.cpp)
 # D-ASM-DUPLICATE-SYMBOLIC-NAME-BINDS-THE-WRONG-OPERAND (P20): the binding
 # builder's collision refusal, for BOTH row sets (operands and `asm goto`
 # labels). Hand-builds the descriptors, because the C front end now refuses the
@@ -384,6 +390,22 @@ dss_add_test(NAME lir/test_lir_apple_platform_register
 target_link_libraries(dss_lir_test_lir_apple_platform_register PRIVATE nlohmann_json::nlohmann_json)
 
 
+# D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED and
+# D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER: a GNU local register
+# variable binds the inline-asm operand whose value it is (the control: the same
+# label without `register` stays a warn-and-drop); a matching constraint ties
+# the input to its output at the input's own width; an unwritten variable is read
+# as it stands; a copy into a bound `sp` is the stack-pointer copy; a 16-byte
+# variable continues in the register its target declares, and one that
+# continues in nothing refuses by name; a leaf binding the link register saves
+# it (the emitted frame, beside a control that saves nothing); `svc #imm`; every
+# refusal the references share, by code; `continuesIn`'s load-time contract.
+# mutate_target_schema.hpp needs nlohmann_json.
+dss_add_test(NAME lir/test_lir_asm_register_variable
+             SOURCES test_lir_asm_register_variable.cpp)
+target_link_libraries(dss_lir_test_lir_asm_register_variable PRIVATE nlohmann_json::nlohmann_json)
+
+
 # D-LIR-AAPCS64-CALL-MIXING-LONG-DOUBLE-AND-DOUBLE-ARGS-REFUSED: an AArch64 call
 # passing a binary128 `long double` AND a `float`/`double` lowers through ONE
 # placer — the marshalled F128 keeps its position in the call's operand list as
@@ -391,7 +413,20 @@ target_link_libraries(dss_lir_test_lir_apple_platform_register PRIVATE nlohmann_
 # gives every later FP argument the next register, and the marshal loads carry
 # a constraint naming the registers they write. Arms over hand-built MIR: the
 # operand list and the constraint (both orders), the EMITTED call site through
-# allocation and callconv (both orders and an interleaved float/int mix), and a
-# binary128 past v7 refused by name, never '<deferred>'.
+# allocation and callconv (both orders and an interleaved float/int mix); and
+# (P68 round 8: D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED,
+# D-LIR-AAPCS64-COMPLEX-LONG-DOUBLE-RETURN-PIECE-REFUSED) a binary128 past v7
+# STORED on the stack 16-aligned and 16 wide, the cursor arithmetic for a scalar
+# wider than the slot, the callee's 128-bit `arg`, a `_Complex long double`
+# result captured from q0 and q1, and a refused piece naming its register.
 dss_add_test(NAME lir/test_lir_aapcs64_mixed_fp_call
              SOURCES test_lir_aapcs64_mixed_fp_call.cpp)
+
+# D-LIR-LONG-DOUBLE-LOAD-READ-THE-OBJECT-AFTER-IT-WAS-OVERWRITTEN and
+# D-LIR-VOLATILE-LONG-DOUBLE-ACCESS-MOVED-ITS-ADDRESS-INTO-A-FLOAT-REGISTER
+# (P68 round 8): a memory-resident `long double` (x87 F80 on x86_64, binary128
+# F128 on arm64) is a VALUE — over hand-built MIR, a swap never reads an object
+# after overwriting it, a volatile read's qualifier conversion defines no
+# floating-point register, and a bit-cast to another kind is refused by name.
+dss_add_test(NAME lir/test_lir_long_double_value_semantics
+             SOURCES test_lir_long_double_value_semantics.cpp)

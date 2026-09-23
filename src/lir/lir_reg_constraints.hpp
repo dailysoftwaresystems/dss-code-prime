@@ -95,4 +95,21 @@ appendEffectiveForbiddenOrdinals(Lir const& lir, TargetSchema const& schema,
 effectiveForbiddenOrdinals(Lir const& lir, TargetSchema const& schema,
                            LirInstId inst);
 
+// The CLOBBERED half alone, over both carriers, appended with the same dedup.
+//
+// ★ P68 round 8 part 4 — WHAT AN INLINE-ASM STATEMENT'S OWN OUTPUTS MUST
+// AVOID. An output of the `asm_region` bundle is defined at the bundle's LATE
+// slot, and the clobber position the covering-range rule consults is the EARLY
+// one, so that rule never reaches an output (the same gap the 2-address arm's
+// comment in `lir_regalloc` describes for its result). GCC forbids an operand
+// in a clobbered register outright — the template may overwrite a clobbered
+// register at any point, including after it wrote the output. The INPUT half
+// is deliberately not included: a plain output may share a register with an
+// input, pinned or not, which is GCC's documented default and what `"=&r"`
+// exists to refuse (an earlyclobber output is defined at the EARLY slot, where
+// the full union already reaches it).
+DSS_EXPORT void
+appendClobberedOrdinals(Lir const& lir, TargetSchema const& schema,
+                        LirInstId inst, std::vector<std::uint16_t>& out);
+
 } // namespace dss

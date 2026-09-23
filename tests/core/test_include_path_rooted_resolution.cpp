@@ -66,6 +66,31 @@ constexpr int kRepeats = 30;
 // same assertions; only WHERE the tree sits moved, and
 // `RootedIncludeFixture.EveryArmWalksATreeUnderTheTestsOwnDirectory` pins that.
 constexpr dss::test_support::Location kFixtureRoot = dss::test_support::Location::InsideRepo;
+
+// ★★★ AND EACH CASE IS ONE COMPILE, WHICH LISTS EACH DIRECTORY ONCE.
+// [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: the relocation above
+// removed the TEMP term, and the cost it left was the RESOLVER's — every resolution listed
+// every ancestor again, about twelve SMB round trips per resolution, so the UNC-name arms
+// still reached 39.92–208.97 s under a full gate load while the local control arms took
+// 0.1 s (✔MEASURED, lane cr, 2026-09-19). A compile now owns a `HeaderSearchCache` and
+// every resolution it makes reads through it, so a case — 30 repeats of one include, both
+// spellings — is what a compile including that header 30 times is: each ancestor listed
+// once. The repeats still assert every resolution; `expectEachDirectoryListedOnce` pins the
+// count, from a tally that sees listings made through ANY cache.
+void expectEachDirectoryListedOnce(dss::HeaderSearchTally const& tally) {
+    auto const listed = tally.listingsPerDirectory();
+    EXPECT_FALSE(listed.empty())
+        << "no directory listing reached the tally at all, so this pin measured nothing";
+    for (auto const& [dir, n] : listed) {
+        EXPECT_EQ(n, 1u) << "`" << dir.string() << "` was listed " << n
+                         << " times in ONE compile — the resolver is re-reading the tree per "
+                            "resolution instead of through the compile's cache";
+    }
+    for (auto const& [candidate, n] : tally.probesPerCandidate()) {
+        EXPECT_EQ(n, 1u) << "`" << candidate.string() << "` was probed " << n
+                         << " times in ONE compile";
+    }
+}
 }  // namespace
 
 // ── The predicate itself, on every host ────────────────────────────────────
@@ -108,13 +133,16 @@ TEST_P(RootedIncludeResolution, ALocalAbsoluteHeaderResolvesEveryTime) {
     { std::ofstream f{header}; f << "int rooted_marker = 7;\n"; }
     ASSERT_TRUE(fs::exists(header));
 
+    dss::HeaderSearchCache compile;
+    dss::HeaderSearchTally const tally;
     for (int i = 0; i < kRepeats; ++i) {
-        auto const r = resolveIncludePath(header.string(), {}, {}, GetParam());
+        auto const r = resolveIncludePath(header.string(), {}, {}, GetParam(), compile);
         ASSERT_EQ(r.status, HeaderSearchStatus::Found)
             << "iteration " << i << ": a local absolute include stopped "
                "resolving — this is the CONTROL arm and it must be inert in "
                "every state of the rooted-path code";
     }
+    expectEachDirectoryListedOnce(tally);
 }
 
 TEST_P(RootedIncludeResolution, AUncHeaderResolvesInBothSpellingsEveryTime) {
@@ -136,6 +164,8 @@ TEST_P(RootedIncludeResolution, AUncHeaderResolvesInBothSpellingsEveryTime) {
     // cannot drift apart.
     fs::path const preferred = fs::path{forward}.make_preferred();
 
+    dss::HeaderSearchCache compile;
+    dss::HeaderSearchTally const tally;
     for (fs::path const& spelling : {forward, preferred}) {
         ASSERT_GE(leadingSeparatorRun(spelling), 2u)
             << "the fixture stopped producing a multi-separator root, so this "
@@ -143,7 +173,7 @@ TEST_P(RootedIncludeResolution, AUncHeaderResolvesInBothSpellingsEveryTime) {
             << spelling.string();
         for (int i = 0; i < kRepeats; ++i) {
             auto const r =
-                resolveIncludePath(spelling.string(), {}, {}, GetParam());
+                resolveIncludePath(spelling.string(), {}, {}, GetParam(), compile);
             ASSERT_EQ(r.status, HeaderSearchStatus::Found)
                 << "iteration " << i << " of spelling '" << spelling.string()
                 << "': a header the OS opens without trouble was reported "
@@ -156,6 +186,7 @@ TEST_P(RootedIncludeResolution, AUncHeaderResolvesInBothSpellingsEveryTime) {
                    "asked for: " << r.path.string();
         }
     }
+    expectEachDirectoryListedOnce(tally);
 }
 
 // ── The UNC path as the SEARCH DIRECTORY, not as the include NAME ──────────
@@ -192,6 +223,8 @@ TEST_P(RootedIncludeResolution, AUncSearchDirectoryResolvesARelativeHeader) {
             << "', so the UNC-SEARCH-DIRECTORY arm WAS NOT MEASURED on this "
                "leg. This is an unmeasured property, NOT a passing one.";
 
+    dss::HeaderSearchCache compile;
+    dss::HeaderSearchTally const tally;
     for (fs::path const& spelling : {uncDir, fs::path{uncDir}.make_preferred()}) {
         ASSERT_GE(leadingSeparatorRun(spelling), 2u)
             << "the fixture stopped producing a multi-separator root, so this "
@@ -199,7 +232,7 @@ TEST_P(RootedIncludeResolution, AUncSearchDirectoryResolvesARelativeHeader) {
             << spelling.string();
         for (int i = 0; i < kRepeats; ++i) {
             // The RELATIVE name — the shape a quote include actually carries.
-            auto const r = resolveInDir(spelling, "rooted_probe.h", GetParam());
+            auto const r = resolveInDir(spelling, "rooted_probe.h", GetParam(), compile);
             ASSERT_EQ(r.status, HeaderSearchStatus::Found)
                 << "iteration " << i << " of search dir '" << spelling.string()
                 << "': a header sitting in a directory the OS enumerates was "
@@ -211,6 +244,7 @@ TEST_P(RootedIncludeResolution, AUncSearchDirectoryResolvesARelativeHeader) {
                    "asked for: " << r.path.string();
         }
     }
+    expectEachDirectoryListedOnce(tally);
 }
 
 // ── THE COST PIN: the tree every arm walks is the TEST's own ───────────────

@@ -341,6 +341,12 @@ private:
         SourceSpan           openerSpan = SourceSpan::empty(0);   // first source position seen at open() — used as opener for Missing diags
         std::uint32_t        pendingStart = 0; // index into pendingChildren_ where this frame's children begin
         std::uint32_t        cookie       = 0; // matches OpenScope::cookie_ (0 = reserved invalid)
+        // The scope stack's depth when this frame opened. Every scope a token
+        // inside the frame opens is the frame's to close: a shipped grammar
+        // keeps an opener and its closer in one rule. `closeFrame_` compares
+        // against it — see the note there
+        // ([[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]).
+        std::uint32_t        scopeDepth   = 0;
     };
 
     // ── speculative checkpoint state ──

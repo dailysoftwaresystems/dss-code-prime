@@ -183,6 +183,14 @@ struct DSS_EXPORT PredefinedMacroDumpRequest {
     // renders as `<none>` rather than being omitted — a MISSING field would be
     // read as an older build, while `<none>` is a fact.
     std::string_view configRoot;
+
+    // P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the pair's facts
+    // for the language's `type-size` rows (`predefinedTypeFactsFor`, the same
+    // computation `applyTargetFormatPair` hands the compile), forwarded to EVERY
+    // merge this dump runs — the full one and the per-family origin calls. Null
+    // ⇒ no pair ⇒ those rows are not in the effective set, exactly as a compile
+    // with no target would see.
+    PredefinedTypeFacts const* typeFacts = nullptr;
 };
 
 // Render ONE triple's effective set.

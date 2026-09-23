@@ -285,7 +285,7 @@ namespace {
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt,
-                   std::nullopt, fmt, arch);
+                   std::nullopt, SelectableObjectFormatKind::of(fmt), arch);
 }
 
 [[nodiscard]] SemanticModel analyzeDirentElf(std::string src) {

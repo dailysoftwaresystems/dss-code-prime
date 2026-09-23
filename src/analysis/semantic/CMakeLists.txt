@@ -3,6 +3,7 @@ add_library(analysis_semantic OBJECT
     semantic_analyzer.cpp
     semantic_model.cpp
     symbol_table.cpp
+    target_format_analysis.cpp
 )
 
 target_include_directories(analysis_semantic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
@@ -26,4 +27,10 @@ target_compile_definitions(analysis_semantic PRIVATE DSS_SHARED_BUILD DSS_BUILDI
 # analysis_semantic -> ffi_shipped is acyclic (ffi_shipped never reads the
 # SemanticModel). Declared to keep the dependency graph honest against the
 # include surface (this repo's OBJECT-lib discipline).
-target_link_libraries(analysis_semantic PRIVATE core analysis_compilation_unit ffi_shipped)
+#
+# link (D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE): `target_format_analysis.cpp`
+# derives `analyze()`'s inputs from a `<target>:<format>` pair, and the FORMAT
+# half of that pair is `ObjectFormatSchema` (with its
+# `FormatRuntimeLibraryRoleResolver`), which `link` owns. Acyclic: nothing
+# `link` depends on (core, asm, lir, mir) reaches this library.
+target_link_libraries(analysis_semantic PRIVATE core analysis_compilation_unit ffi_shipped link)

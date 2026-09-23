@@ -673,7 +673,7 @@ TEST(SemanticAnalyzerC, WideCharLiteralWidthIsFormatKeyed) {
         auto cu = buildShippedUnit("c", { "void f(){ L\"AB\"; }" });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                             ObjectFormatKind::Pe);
+                             SelectableObjectFormatKind::of(ObjectFormatKind::Pe));
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstStringLiteralType(model, *cu);
@@ -748,7 +748,7 @@ TEST(SemanticAnalyzerC, WideCharConstantWidthIsFormatKeyed) {
         auto cu = buildShippedUnit("c", { "void f(){ L'x'; }" });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                             ObjectFormatKind::Pe);
+                             SelectableObjectFormatKind::of(ObjectFormatKind::Pe));
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstCharLiteralType(model, *cu);
@@ -778,7 +778,7 @@ TEST(SemanticAnalyzerC, BadWideCharConstantLeavesBodyTokenUntyped) {
         auto cu = buildShippedUnit("c", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                             ObjectFormatKind::Pe);
+                             SelectableObjectFormatKind::of(ObjectFormatKind::Pe));
         TypeId const ty = firstCharLiteralType(model, *cu);
         EXPECT_FALSE(ty.valid())
             << "an astral L' char under pe (u16 wchar_t) must be left untyped";
@@ -4986,7 +4986,7 @@ TEST(SemanticAnalyzerC, ConcatConflictIsTokenKindNotCoreEvenOnPe) {
         auto cu = buildShippedUnit("c", { "void f(){ u\"a\" L\"b\"; }" });
         assertNoBuilderErrors(*cu);
         auto model = pe ? analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                                  ObjectFormatKind::Pe)
+                                  SelectableObjectFormatKind::of(ObjectFormatKind::Pe))
                         : analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_TRUE(model.hasErrors()) << (pe ? "pe" : "default");
         EXPECT_EQ(countCode(model.diagnostics(),
@@ -7013,8 +7013,11 @@ TEST(SemanticAnalyzerC, VoidParamListDeclaresZeroParams) {
     EXPECT_EQ(in.kind(in.fnResult(tf)), TypeKind::I32);
 }
 
-// A NAMED void param is ill-formed (C 6.7.6.3p10 admits only the sole
-// UNNAMED `(void)`): S_InvalidVoidParam, positioned ON the param node.
+// A NAMED void param in a function DEFINITION is ill-formed (C 6.7.6.3p4: a
+// definition's parameters are complete, and C 6.7.6.3p10's `(void)` is the sole
+// UNNAMED one): S_InvalidVoidParam, positioned ON the param node. (In a declaration
+// that is NOT a definition, a named void is gcc's ordinary parameter of an
+// incomplete type and is accepted — see `test_function_type_completeness.cpp`.)
 TEST(SemanticAnalyzerC, NamedVoidParamFiresInvalidVoidParamPositioned) {
     auto cu = buildShippedUnit("c", {
         "int g(void x) { return 1; }\n",
@@ -7639,8 +7642,9 @@ TEST(SemanticAnalyzerC, FnTypedefPointerObjectIsNotAPrototype) {
 // names it. That check also covers the INLINE spelling `int f(int)(int);`, which the
 // accident never reached at all.
 //
-// RED-ON-DISABLE (restated to match): remove the C 6.7.6.3p1 result-type check in
-// `resolveDeclTypes` (semantic_analyzer.cpp) → `f` is upgraded to a Function proto
+// RED-ON-DISABLE (restated to match): remove the C 6.7.6.3p1 return-type check at
+// the function suffix (`applyDeclaratorSuffix`, semantic_analyzer.cpp — its one
+// owner since P68 round 8, lane `ht`, part 2) → `f` is upgraded to a Function proto
 // and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
 TEST(SemanticAnalyzerC, FnTypedefParenGroupFnSuffixIsNotAPrototype) {
     auto model = analyzeShipped("c", {
@@ -14714,7 +14718,8 @@ namespace fs = std::filesystem;
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt, format, "x86_64");
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt,
+                   SelectableObjectFormatKind::of(format), "x86_64");
 }
 
 // The 17-function × {float,double,int} matrix. Every float-column result is
@@ -17884,7 +17889,7 @@ namespace {
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
                    AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
-                   std::nullopt, format, arch);
+                   std::nullopt, SelectableObjectFormatKind::of(format), arch);
 }
 
 // The symbol a SOURCE declaration minted (a valid `tree`), vs the one descriptor
@@ -18357,16 +18362,22 @@ namespace {
     }
     FormatRuntimeLibraryRoleResolver const roles{**formatSchema};
     return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt,
-                   std::nullopt, format, arch, LongDoubleFormat::None, nullptr, 0,
+                   std::nullopt, SelectableObjectFormatKind::of(format), arch, LongDoubleFormat::None, nullptr, 0,
                    &roles);
 }
 
-// The reproducer, verbatim: legal C that clang and GCC both accept, and the
-// single most-redeclared identifier in the language.
+// The reproducer: legal C that clang and GCC both accept, and the single
+// most-redeclared identifier in the language.
+// ⚠ THE `\\n` IS THE C ESCAPE, AND IT USED TO BE A REAL NEW-LINE. This literal
+// once read `printf(\"hi\n\")`, which puts an actual line break INSIDE the C
+// string — ✔MEASURED 2026-09-22, gcc 13.3.0 and clang 18.1.3 both REFUSE that
+// text ("missing terminating \" character"), while this escaped form compiles.
+// It stayed green only because DSS's lexer let a string literal run across
+// lines ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]).
 constexpr char const* kPrintfRedeclSrc =
     "#include <stdio.h>\n"
     "int printf(const char *fmt, ...);\n"
-    "int main(void) { return printf(\"hi\n\"); }\n";
+    "int main(void) { return printf(\"hi\\n\"); }\n";
 
 } // namespace
 
@@ -22915,4 +22926,321 @@ TEST(SemanticAnalyzerC, AnAtomicPointerRmwOperandIsPtrdiffNotThePointee) {
                             DiagnosticCode::S_TypeMismatch), 0u)
             << a.call << ": " << a.why;
     }
+}
+
+// ══ [[D-SEMANTIC-ANALYZE-ACTIVE-FORMAT-ADMITS-THE-UNKNOWN-SENTINEL]] ═══════════
+//
+// `dss::analyze`'s active format has ONE spelling of "no format". It was typed
+// `std::optional<ObjectFormatKind>`, so a direct caller could hand it an ENGAGED
+// `ObjectFormatKind::Unknown`: a value the literal-prefix resolver's bridge then
+// refused by aborting the process (C's wide openers resolve at analysis start),
+// the role-resolver agreement check compared by the sentinel's name, and the
+// shipped-header availability gates read as a REAL format on which nothing is
+// available. It is now `std::optional<SelectableObjectFormatKind>`, a type the
+// sentinel cannot inhabit, so that call does not compile.
+//
+// Asked of the CALL at run time, on purpose: a `static_assert` would turn a
+// regression into a build failure, which leaves ctest running the previous binary
+// green. And asked of the call EXPRESSION, so a convenience overload re-admitting
+// the wide type — the likeliest way it comes back — reds here instead of making
+// the call ambiguous.
+namespace {
+template <class Fmt>
+concept AnalyzeAcceptsFormat =
+    requires(std::shared_ptr<CompilationUnit const> cu, Fmt fmt) {
+        dss::analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                     std::nullopt, std::nullopt, fmt);
+    };
+} // namespace
+
+TEST(SemanticAnalyzerActiveFormat, TheSentinelCannotBeHandedToAnalyze) {
+    EXPECT_FALSE(AnalyzeAcceptsFormat<ObjectFormatKind>)
+        << "a bare ObjectFormatKind — `Unknown` among its values — must not reach "
+           "the analysis";
+    EXPECT_FALSE(AnalyzeAcceptsFormat<std::optional<ObjectFormatKind>>)
+        << "an optional<ObjectFormatKind> spells \"no format\" twice";
+    EXPECT_TRUE(AnalyzeAcceptsFormat<std::optional<SelectableObjectFormatKind>>);
+    EXPECT_TRUE(AnalyzeAcceptsFormat<std::nullopt_t>)
+        << "nullopt is THE spelling of \"no format\"";
+}
+
+// ONE SPELLING, observed through the analysis: the kind `of()` refuses is "no
+// format", and it analyses EXACTLY as `nullopt` does — while a real format still
+// reaches the per-format resolution (`wchar_t` is 16 bits on PE, 32 without a
+// format's override), so the type carries the kind it is given.
+TEST(SemanticAnalyzerActiveFormat, TheRefusedKindAnalysesAsNoFormatAndARealKindIsCarried) {
+    auto const wideCharKind = [](std::optional<SelectableObjectFormatKind> fmt) {
+        auto cu = buildShippedUnit("c", { "void f(){ L'x'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64,
+                             std::nullopt, std::nullopt, fmt);
+        EXPECT_FALSE(model.hasErrors());
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        EXPECT_TRUE(ty.valid());
+        return ty.valid() ? model.lattice().interner().kind(ty) : TypeKind::Void;
+    };
+    ASSERT_FALSE(SelectableObjectFormatKind::of(ObjectFormatKind::Unknown).has_value());
+    EXPECT_EQ(wideCharKind(std::nullopt), TypeKind::I32)
+        << "no format: the base wchar_t core";
+    EXPECT_EQ(wideCharKind(SelectableObjectFormatKind::of(ObjectFormatKind::Unknown)),
+              TypeKind::I32)
+        << "the kind `of()` refuses IS \"no format\" — there is no second reading";
+    EXPECT_EQ(wideCharKind(SelectableObjectFormatKind::of(ObjectFormatKind::Pe)),
+              TypeKind::U16)
+        << "a real kind reaches the per-format resolution (wchar_t is u16 on PE)";
+}
+
+// ══ [[D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED]] ═══════════════════════════════
+//
+// A parameter may DEFINE its struct, union or enum type, and C 6.2.1p4 scopes what
+// the list declares: visible to the rest of the list and, in a definition, to the
+// body — ONE scope with the body's outermost block — and to nothing after the
+// function. ✔MEASURED 2026-09-23, each reference separately: gcc 13.3.0 and clang
+// 18.1.3 (-std=c2x, -std=c17), MinGW gcc and MSVC 19.51 build and RUN every accepted
+// shape below and refuse every refused one; DSS refused them all P_UnexpectedToken
+// (`declHeadForParam` offered only the ref-only specifiers). The RUN witnesses are
+// examples/c/param_list_tag_definition and the two examples/c/param_scope_body_*
+// programs; these pins name the scope facts behind them, one arm per shape.
+//
+// RED-ON-DISABLE, per mechanism: (1) the ref-only arms back in `declHeadForParam`
+// → every accepted arm reds on its front-end error; (2) the parameter-list stop out
+// of `floatToNamespaceScope` → a definition's tag and enumerators leak to the file
+// scope and the after-the-function refusals are ACCEPTED; (3) the pair-aware
+// one-scope check off → the body-redeclaration refusals red and the two MSVC
+// exemptions stay green.
+namespace {
+struct ParamListProbe {
+    std::shared_ptr<CompilationUnit const> cu;
+    SemanticModel model;
+    [[nodiscard]] std::size_t frontEndErrors() const {
+        std::size_t n = 0;
+        for (auto const& t : cu->trees())
+            for (auto const& d : t.diagnostics().all())
+                if (d.severity == DiagnosticSeverity::Error) ++n;
+        return n;
+    }
+    [[nodiscard]] std::size_t count(DiagnosticCode c) const {
+        return countCode(model.diagnostics(), c);
+    }
+};
+
+[[nodiscard]] ParamListProbe analyseParamListShape(std::string const& src) {
+    auto cu = buildShippedUnit("c", {src});
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    return ParamListProbe{std::move(cu), std::move(model)};
+}
+
+struct ParamListArm {
+    char const* src;
+    std::size_t tagWarnings;   // S_TagDeclaredInParameterList expected
+    char const* why;
+};
+} // namespace
+
+// The census site `declHeadForParam`, switched to the unified specifiers: every
+// accepted shape analyses clean and draws ONE S_TagDeclaredInParameterList per tag
+// the list defines (gcc warns at the same positions), and a later `struct Cell`
+// REFERENCE draws none.
+TEST(SemanticAnalyzerCParamListTag, EveryAcceptedShapeIsCleanAndWarnsOncePerTag) {
+    std::array<ParamListArm, 10> const arms{{
+        {"int f(struct S { int a; int b; } *p) { struct S local = { 40, 2 };"
+         " if (p == 0) p = &local; return p->a + p->b; }\n",
+         1, "a struct defined in a definition's list, named again in the body"},
+        {"int f(union U { int i; char c; } *w) { union U local; local.i = 7;"
+         " if (w == 0) w = &local; return w->i; }\n",
+         1, "a union"},
+        {"int f(enum E { A = 40, B } e) { return e + (B - A) + 1; }\n",
+         1, "an enum whose enumerators the body uses"},
+        {"int f(struct { int a; int b; } *p) { return p ? p->a + p->b : 42; }\n",
+         1, "an anonymous struct"},
+        {"int f(struct A { struct B { int x; } b; } *p) { struct B q = { 42 };"
+         " (void)p; return q.x; }\n",
+         2, "a tag nested in a tag the list defines reaches the body too"},
+        {"int f(struct S { int a; } *p, struct S *q) { struct S t = { 42 };"
+         " if (p == 0) p = &t; if (q == 0) q = p; return q->a; }\n",
+         1, "a later parameter's `struct S` is a REFERENCE to the earlier definition"},
+        {"int g(struct T { int b; } *t);\n",
+         1, "a prototype's list: function-prototype scope"},
+        {"int apply(int (*cb)(struct T { int b; } *t)) { return cb ? 0 : 42; }\n",
+         1, "a function-pointer parameter's own list"},
+        {"int f(int a[sizeof(struct S { char x[10]; })]) { (void)a;"
+         " return (int)sizeof(struct S); }\n",
+         1, "a type name inside a parameter's declarator (the type-name base) "
+            "binds where the list's parameters bind"},
+        {"int main(void) { int g(struct T { int b; } *t); return 42; }\n",
+         1, "a block-scope prototype"},
+    }};
+    for (auto const& a : arms) {
+        auto const p = analyseParamListShape(a.src);
+        EXPECT_EQ(p.frontEndErrors(), 0u) << a.why << "\n" << a.src;
+        EXPECT_FALSE(p.model.hasErrors()) << a.why << "\n" << a.src;
+        EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), a.tagWarnings)
+            << a.why << "\n" << a.src;
+    }
+}
+
+// Refused by name: what a definition's list declares ends with the body. Before
+// the parameter-list stop the enumerator and the tag leaked to the FILE scope, so
+// the first two arms were ACCEPTED (✔MEASURED on the grammar swap alone).
+TEST(SemanticAnalyzerCParamListTag, AnEnumeratorOfTheListIsUndeclaredAfterTheFunction) {
+    auto const p = analyseParamListShape(
+        "int f(enum E { A = 40, B } e) { return e + 2; }\n"
+        "int main(void) { return f(A); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "`A` has the body's block scope (C 6.2.1p4); all four references refuse it "
+           "in main";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ATagOfADefinitionsListIsNotVisibleAfterIt) {
+    auto const p = analyseParamListShape(
+        "int f(struct S { int a; } *p) { return p ? p->a : 42; }\n"
+        "struct S y;\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "the file-scope `struct S` is a NEW tag, never completed";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ATagOfAPrototypesListIsNotVisibleAfterIt) {
+    auto const p = analyseParamListShape(
+        "void g(struct T { int b; } t);\n"
+        "struct T x;\n"
+        "int main(void) { return 42; }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "function-prototype scope ends with the declarator";
+}
+
+// A file-scope `struct S` whose members come in ANOTHER order is not the
+// parameter's type in any C (C23 6.2.7p1 requires the same order), so the call is
+// refused for the argument's type — not, as the swap alone reported it, as a
+// redeclaration of the tag.
+TEST(SemanticAnalyzerCParamListTag, AFileScopeTwinWithReorderedMembersIsAnotherType) {
+    auto const p = analyseParamListShape(
+        "struct S { int b; int a; };\n"
+        "int f(struct S { int a; int b; } s) { return s.a + s.b; }\n"
+        "int main(void) { struct S x = { 2, 40 }; return f(x); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "the list's tag is not declared where the file's lives";
+}
+
+// The ONE scope a definition's list shares with its body's outermost block. All
+// four references refuse every arm; DSS accepted the four parameter arms before
+// (the body shadowed the parameter), and the list-declared arms are new with the
+// grammar swap.
+TEST(SemanticAnalyzerCParamListTag, ABodyRedeclarationOfWhatTheListDeclaredIsRefused) {
+    std::array<std::pair<char const*, char const*>, 8> const arms{{
+        {"int f(int x) { int x = 42; return x; }\n", "an object vs a parameter"},
+        {"int f(int x) { static int x = 42; return x; }\n", "a static object vs a parameter"},
+        {"int f(int T) { typedef int T; T v = 42; return v; }\n", "a typedef vs a parameter"},
+        {"int g(void) { return 42; }\n"
+         "int f(int g) { extern int g(void); return g(); }\n",
+         "an extern function vs a parameter"},
+        {"int f(enum E { A = 1 } e) { int A = 42; (void)e; return A; }\n",
+         "an object vs an enumerator the list declared"},
+        {"int f(enum E { A = 1 } e) { typedef int A; A v = 42; (void)e; return v; }\n",
+         "a typedef vs an enumerator the list declared"},
+        {"int f(struct S { int a; } *p) { struct S { int b; } t = { 42 }; (void)p;"
+         " return t.b; }\n",
+         "a tag vs a tag the list defined"},
+        {"int f(struct S { int a; } *p) { union S { int a; } t = { 42 }; (void)p;"
+         " return t.a; }\n",
+         "a union tag vs a struct tag the list defined"},
+    }};
+    for (auto const& [src, why] : arms) {
+        auto const p = analyseParamListShape(src);
+        EXPECT_EQ(p.frontEndErrors(), 0u) << why;
+        EXPECT_EQ(p.count(DiagnosticCode::S_RedeclaredSymbol), 1u) << why << "\n" << src;
+    }
+}
+
+// The control: a NESTED block is a new scope, where every one of those names may
+// be declared again — legal in all four references.
+TEST(SemanticAnalyzerCParamListTag, ANestedBlockMayRedeclareWhatTheListDeclared) {
+    std::array<char const*, 3> const arms{{
+        "int f(int x) { { int x = 42; return x; } }\n",
+        "int f(enum E { A = 1 } e) { { int A = 42; (void)e; return A; } }\n",
+        "int f(struct S { int a; } *p) { { struct S { int b; } t = { 42 }; (void)p;"
+        " return t.b; } }\n",
+    }};
+    for (char const* src : arms) {
+        auto const p = analyseParamListShape(src);
+        EXPECT_EQ(p.frontEndErrors(), 0u) << src;
+        EXPECT_FALSE(p.model.hasErrors()) << src;
+    }
+}
+
+// The two body redeclarations a reference BUILDS AND RUNS (MSVC 19.51; gcc and
+// clang refuse), kept accepted with MSVC's meaning — the body's own entity. Their
+// RUN witnesses are the two examples/c/param_scope_body_* programs.
+TEST(SemanticAnalyzerCParamListTag, ABodyEnumeratorMayRepeatAParameterName) {
+    auto const p = analyseParamListShape(
+        "int f(int A) { enum E { A = 42 }; return A; }\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "MSVC builds it and runs it to 42 — the enumerator hides the parameter";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ABodyEnumeratorMayRepeatAnEnumeratorOfTheList) {
+    auto const p = analyseParamListShape(
+        "int f(enum E { A = 1 } e) { enum F { A = 42 }; (void)e; return A; }\n"
+        "int main(void) { return f(1); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors()) << "MSVC builds it and runs it to 42";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ABodyMayDeclareItsOwnFuncName) {
+    auto const p = analyseParamListShape(
+        "int f(void) { static const char __func__[] = \"g\";"
+        " return __func__[0] == 'g' ? 42 : 0; }\n"
+        "int main(void) { return f(); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "MSVC builds it and runs it to 42 — the body's array is the one named";
+}
+
+// A BARE tag reference in a DEFINITION's list keeps MSVC's reading — the file
+// scope — and draws no warning (see the forward-tag float's own comment for why it
+// cannot take C's block scope while DSS refuses an incompatible pointer): two
+// definitions naming the never-declared `struct Q` stay one type.
+TEST(SemanticAnalyzerCParamListTag, ABareTagReferenceInADefinitionsListKeepsItsReading) {
+    auto const p = analyseParamListShape(
+        "int g(struct Q *p) { return p == 0 ? 40 : 0; }\n"
+        "int f(struct Q *p) { return g(p) + 2; }\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "gcc 13.3, clang 18.1.3 and MSVC 19.51 all build and run it to 42";
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 0u);
+}
+
+// The census site `enumUnderlyingBase`, KEPT ref-only: C23 6.7.3.3p5 requires an
+// integer type there, so no composite of any form is valid and all four references
+// refuse a definition in the clause. It stays refused (at parse: the enum keeps its
+// own `{`), and nothing about it is a parameter list. The reference form's one
+// precise diagnostic is SemanticAnalyzerC.EnumUnderlyingStructFailsLoud's pin.
+TEST(SemanticAnalyzerCParamListTag, CensusTheEnumUnderlyingClauseStillRefusesADefinition) {
+    auto const p = analyseParamListShape(
+        "enum E : struct S { int a; } { X };\n"
+        "int main(void) { return 42; }\n");
+    EXPECT_GT(p.frontEndErrors() + (p.model.hasErrors() ? 1u : 0u), 0u)
+        << "a composite definition is never an enum's underlying type";
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 0u);
+}
+
+// The census site `castTypeBase`, unified since TF-C101: a tag DEFINED in a type
+// name binds in the enclosing BLOCK, so a later declaration of that block names it
+// (✔MEASURED, all four references build and run this to 42).
+TEST(SemanticAnalyzerCParamListTag, CensusATypeNameDefinitionBindsInTheEnclosingBlock) {
+    auto const p = analyseParamListShape(
+        "int main(void) { int n = (int)sizeof(struct S { int a; });"
+        " struct S s = { 42 }; return s.a + n - 4; }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors());
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 0u)
+        << "no parameter list is involved";
 }

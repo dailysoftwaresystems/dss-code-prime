@@ -10239,15 +10239,19 @@ struct Lowerer {
         if (abi.kind == AbiPassing::Kind::ByReference) {
             // The hidden pointer is GPR-class. If the GPR pool is already exhausted
             // (an INDEPENDENT-counter CC) the pointer itself rides the incoming stack
-            // — a stacked SCALAR; account it in the byte cursor + residual guard so
-            // va_start's overflow base skips it (D-FC12-...).
-            if (!config.argSlotAligned && ctr.gpr >= config.argGprCount
-                && !accountFixedStackScalar(anchor, interner.pointer(aggTy)))
-                return false;
+            // — a stacked SCALAR; account it in the byte cursor so va_start's
+            // overflow base skips it (D-FC12-...), and — after a stacked aggregate
+            // — read it at the offset that cursor gave it
+            // (D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED).
+            std::optional<std::uint32_t> stackedAt;
+            if (!config.argSlotAligned && ctr.gpr >= config.argGprCount)
+                stackedAt = accountFixedStackScalar(interner.pointer(aggTy));
             std::uint32_t const pos = ctr.nextPosition();  // one call operand
+            std::uint32_t const ord = ctr.next(AbiPieceClass::Gpr);
             MirInstId const ptr =
-                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.pointer(aggTy),
-                           pos);
+                (stackedAt.has_value() && currentFnSawStackedAggregate_)
+                    ? receiveStackedScalarAt(*stackedAt, interner.pointer(aggTy))
+                    : mir.addArg(ord, interner.pointer(aggTy), pos);
             if (!ptr.valid()) return false;
             addressableLocal[sym.v] = ptr;   // the caller's copy is the param
             return true;
@@ -10265,21 +10269,17 @@ struct Lowerer {
             && (ctr.gpr + numGp > config.argGprCount
                 || ctr.fpr + numFp > config.argFprCount);
         if (straddles) {
-            // Residual guard (NO silent miscompile): this aggregate is sited via the
-            // incoming-overflow BYTE cursor, but a stacked SCALAR is sited by
-            // lir_callconv from its per-class ordinal `(ord - pool)*slot` — the two
-            // agree ONLY when the aggregate is the FIRST/ONLY fixed param to overflow.
-            // A prior stacked fixed param (scalar OR a first aggregate) desyncs them →
-            // fail loud on the rare multi-overflow shapes (outside the deferral scope).
-            if (currentFnSawFixedStackParam_) {
-                unsupported(anchor,
-                    "a by-value aggregate parameter that straddles the register/stack "
-                    "boundary is only supported as the FIRST fixed parameter to "
-                    "overflow onto the incoming stack; a preceding stacked fixed "
-                    "parameter is not yet supported "
-                    "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
-                return false;
-            }
+            // ★ SITED BY THE BYTE CURSOR, WHATEVER WAS STACKED BEFORE IT (P68 round
+            // 8, D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED). This used
+            // to refuse an aggregate that followed ANY stacked fixed parameter, on
+            // the ground that a stacked scalar was sited `(ord - pool) * slot` per
+            // class. That siting is gone: lir_callconv's incoming `StackArgCursor`
+            // places the stacked `arg` ops in parameter order with the same
+            // `StackArgPackingRules` calls this tier's byte cursor makes, so after
+            // stacked scalars the cursor below names exactly the byte the caller
+            // wrote; after an earlier stacked aggregate both are this cursor; and a
+            // scalar AFTER this aggregate is read at its byte offset
+            // (`receiveStackedScalarAt`), never through an `arg`.
             StructLayout const* layout = cachedLayout(aggTy);
             MirInstId const slot = allocaForLocal(sym, aggTy, anchor);
             if (layout == nullptr || !slot.valid()) {
@@ -10298,10 +10298,10 @@ struct Lowerer {
                 return false;
             }
             // The incoming ADDRESS of this whole aggregate = the overflow base + its
-            // byte offset within the incoming overflow area (the byte cursor; 0 for
-            // the first/only overflowed fixed param, guaranteed by the guard above).
-            // Byte-copy it into the param's local slot (by-value semantics, the
-            // by-reference reception precedent but reading from the stack).
+            // byte offset within the incoming overflow area (the byte cursor, past
+            // every fixed param stacked before it). Byte-copy it into the param's
+            // local slot (by-value semantics, the by-reference reception precedent
+            // but reading from the stack).
             // The straddled aggregate rides ONE `ByValueStackArg` carrier
             // operand on the call side (no Arg here — RecvByValueStackParam) —
             // advance the flat position past that operand so later params stay
@@ -10315,8 +10315,9 @@ struct Lowerer {
             // layout engine, so the caller cannot state one and the callee must
             // therefore not USE one, or the two would round differently and the
             // caller would write where this read does not look. That symmetry is
-            // the load-bearing part; the round-up itself is inert today (an
-            // aggregate is the first/only stacked fixed param, guarded above).
+            // the load-bearing part: after a naturally-packed narrower datum
+            // stacked before it (Apple arm64), this round-up is what puts the
+            // aggregate on the boundary the caller's cursor chose.
             currentFnFixedStackBytes_ = roundUpToSlot(
                 currentFnFixedStackBytes_,
                 config.stackArgPacking.aggregateAlignment(0, stackSlotBytes()));
@@ -10397,10 +10398,25 @@ struct Lowerer {
 
     // D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS: account ONE stacked fixed
     // SCALAR (or a ByReference aggregate's stacked hidden pointer) in the byte cursor
-    // + residual guard. A stacked scalar AFTER a stacked aggregate desyncs the
-    // per-class-ordinal siting from the byte cursor (the AAPCS64 clamp strands it) →
-    // fail loud. Returns false (diagnostic emitted) on that residual. INDEPENDENT-
-    // counter CCs only (the caller gates on !argSlotAligned).
+    // and return the byte offset it occupies in the incoming overflow area.
+    // INDEPENDENT-counter CCs only (the caller gates on !argSlotAligned).
+    //
+    // ★★ THE OFFSET IS RETURNED BECAUSE A SCALAR AFTER A STACKED AGGREGATE IS READ
+    // AT IT (P68 round 8, D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED).
+    // This used to REFUSE that shape: a stacked scalar is normally received through
+    // an `Arg`, placed by lir_callconv's incoming `StackArgCursor`, which walks the
+    // `arg` ops alone — it never sees an aggregate received by
+    // `RecvByValueStackParam`, so a scalar after one would be read from the
+    // aggregate's own bytes. ✔MEASURED 2026-09-19: the refusal fired on every x86_64
+    // Linux function taking a `long double` (MEMORY class, always stacked) and then
+    // a stacked `double`, and on an AAPCS64 `_Complex long double` that no longer
+    // fits v0..v7 followed by a stacked argument, where gcc 13.3.0 and clang 18.1.3
+    // run both. THIS tier already computes every stacked parameter's byte offset
+    // for `va_start`, with the SAME `StackArgPackingRules` calls the LIR cursor
+    // makes, so the parameter-reception loop reads such a scalar at the offset
+    // returned here (`receiveStackedScalarAt`) instead of through an `Arg` — one
+    // placement model for everything after the first stacked aggregate, and the LIR
+    // cursor keeps only the prefix before it, where the two agree by construction.
     //
     // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: `ty` is the parameter's
     // TYPE, and it is a parameter rather than an assumption because under NATURAL
@@ -10415,19 +10431,32 @@ struct Lowerer {
     // at +16 (int@0, char@4, int@8, cursor 12, rounded to 16). Slot packing gives 16
     // and 24 for those, which is what DSS emitted and what made every `va_arg` on a
     // narrow-named-param Apple variadic read the wrong object.
-    [[nodiscard]] bool accountFixedStackScalar(HirNodeId anchor, TypeId ty) {
-        if (currentFnSawStackedAggregate_) {
-            unsupported(anchor,
-                "a fixed scalar parameter that overflows onto the incoming stack AFTER "
-                "a by-value aggregate parameter was placed there is not yet supported "
-                "(D-FC12-VARIADIC-OVERFLOW-FIXED-AGGREGATE-STACK-ARGS)");
-            return false;
-        }
+    [[nodiscard]] std::uint32_t accountFixedStackScalar(TypeId ty) {
         std::uint32_t const slot = stackSlotBytes();
         std::uint32_t const nat  = naturalStackArgBytes(ty, slot);
         bool const natural =
             config.stackArgPacking.namedScalars == StackArgPacking::Natural
             && nat != 0 && nat <= slot;
+        // ★★ A SCALAR WIDER THAN THE SLOT — AAPCS64's binary128 `long double`
+        // past v7 — occupies its own 16 bytes, aligned by the convention's
+        // SCALAR cap: the arithmetic `StackArgCursor::place` applies to the same
+        // argument, so this cursor (va_start's overflow base) and the LIR one
+        // that places the read agree (P68 round 8,
+        // D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED).
+        std::uint32_t const own =
+            ty.valid() ? static_cast<std::uint32_t>(
+                             scalarByteSize(interner.kind(ty), config.dataModel)
+                                 .value_or(0))
+                       : 0u;
+        if (!natural && own == 16 && own > slot) {
+            std::uint32_t const wideAlign =
+                config.stackArgPacking.scalarAlignment(own, slot);
+            std::uint32_t const wideOff =
+                roundUpToSlot(currentFnFixedStackBytes_, wideAlign);
+            currentFnFixedStackBytes_ = wideOff + own;
+            currentFnSawFixedStackParam_ = true;
+            return wideOff;
+        }
         std::uint32_t const size  = natural ? nat : slot;
         // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: the non-natural arm asks the
         // CC how much of the datum's own alignment it honours instead of assuming
@@ -10438,10 +10467,28 @@ struct Lowerer {
         // the previous arithmetic.
         std::uint32_t const align =
             natural ? nat : config.stackArgPacking.scalarAlignment(nat, slot);
-        currentFnFixedStackBytes_ =
-            roundUpToSlot(currentFnFixedStackBytes_, align) + size;
+        std::uint32_t const off = roundUpToSlot(currentFnFixedStackBytes_, align);
+        currentFnFixedStackBytes_ = off + size;
         currentFnSawFixedStackParam_  = true;
-        return true;
+        return off;
+    }
+
+    // A stacked fixed SCALAR read at the byte offset `accountFixedStackScalar`
+    // placed it at — the reception of every stacked scalar that FOLLOWS a stacked
+    // aggregate (see that function's docblock). The address of the incoming slot
+    // comes from `RecvByValueStackParam`, the op a stacked aggregate is received
+    // through, so both are sited by the one byte cursor. The read goes through
+    // `emitScalarLoad`, the one scalar-access funnel, so an `_Atomic` parameter is
+    // read the way every other `_Atomic` object is. A function holding one is
+    // not inlined — but it already held the aggregate's `RecvByValueStackParam`,
+    // which the inliner refuses for the same reason, so nothing that inlined
+    // before stops inlining. InvalidMirInst on failure (the builder reported).
+    [[nodiscard]] MirInstId receiveStackedScalarAt(std::uint32_t byteOff, TypeId ty) {
+        MirInstId const at = mir.addInst(MirOpcode::RecvByValueStackParam, {},
+                                         interner.pointer(ty), /*payload=*/byteOff);
+        if (!at.valid()) return InvalidMirInst;
+        std::array<MirInstId, 1> const ld{at};
+        return emitScalarLoad(ld, ty, HirNodeId{});
     }
 
     // D-CODEGEN-APPLE-ARM64-STACK-ARGS-NOT-NATURALLY-PACKED: the NATURAL byte size
@@ -12967,6 +13014,50 @@ struct Lowerer {
             // every real compile while hand-built unit tests, which construct
             // `MirAsmOperand` directly, keep passing.
             mo.spellings      = o.spellings;
+            // ★ P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the
+            // two local-register-variable facts, for the reason above — a
+            // field left out here would be silently false on every compile.
+            mo.pinnedByVariable   = o.pinnedByVariable;
+            mo.registerAsItStands = o.registerAsItStands;
+            // ★★ A GNU MATCHING CONSTRAINT (`"0"`) IS A TIE THE SOURCE WROTE
+            // (P68, D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER).
+            // GNU's `"+r"` IS `"=r"` plus a `"0"` input, and the `"+"` arm below
+            // already realizes exactly that pairing with `tiedOutput` — so a
+            // written `"0"` is the SAME fact arriving from the source: this
+            // input names the result piece of the output it matches, and that
+            // output becomes the read-write half of the pair. What the written
+            // form keeps that the synthesized one does not is its OWN width and
+            // its OWN spellings (`MirAsmOperand::matchesOutput`).
+            // ⚠ The match must land on a RESULT PIECE: a memory-form output has
+            // none (the semantic tier refuses that match, as both references
+            // do), and a value this lowering keeps in memory is carried by
+            // ADDRESS on either side, which the tie cannot express — refused by
+            // name rather than bound to a register nothing ties.
+            if (o.constraint.matchedOperand.has_value() && i >= src.outputCount) {
+                std::size_t k = regOutputKid.size();
+                for (std::size_t q = 0; q < regOutputKid.size(); ++q) {
+                    if (regOutputKid[q] == *o.constraint.matchedOperand) {
+                        k = q;
+                        break;
+                    }
+                }
+                if (k == regOutputKid.size() || carried) {
+                    unsupported(node, std::format(
+                        "inline-asm operand {} (matching constraint \"{}\") ties "
+                        "to operand {}, which is not a register-form output this "
+                        "lowering carries as a value — {}, so no single register "
+                        "location exists to share "
+                        "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)",
+                        i, o.constraint.raw, *o.constraint.matchedOperand,
+                        carried ? "this input is a value kept in memory"
+                                : "the output binds a memory form or is carried "
+                                  "through memory"));
+                    return false;
+                }
+                mo.tiedOutput    = static_cast<std::uint32_t>(k);
+                mo.matchesOutput = true;
+                desc.outputs[k].isReadWrite = true;
+            }
             if (i < src.outputCount && !memoryFormOutput && !carriedOutput) {
                 regOutputKid.push_back(i);
                 desc.outputs.push_back(std::move(mo));
@@ -15330,19 +15421,30 @@ struct Lowerer {
             // path keyed on currentFnFixedFlat_ — is independent of it, and that branch
             // never reaches here (the `!argSlotAligned` gate above excludes it), which
             // is why this cursor stays 0 on Win64.
+            std::optional<std::uint32_t> stackedAt;
             if (!config.argSlotAligned) {
                 std::uint32_t const ord =
                     (sCls == AbiPieceClass::Fpr) ? argCtr.fpr : argCtr.gpr;
                 std::uint32_t const pool =
                     (sCls == AbiPieceClass::Fpr) ? config.argFprCount
                                                  : config.argGprCount;
-                if (ord >= pool && !accountFixedStackScalar(p, ty)) {
-                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                    return false;
-                }
+                if (ord >= pool) stackedAt = accountFixedStackScalar(ty);
             }
             std::uint32_t const scalarPos = argCtr.nextPosition();  // one operand
-            MirInstId const arg = mir.addArg(argCtr.next(sCls), ty, scalarPos);
+            std::uint32_t const scalarOrd = argCtr.next(sCls);
+            // D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED: a stacked
+            // scalar AFTER a stacked aggregate is read at the byte offset the cursor
+            // above gave it — the one placement model past the first stacked
+            // aggregate (`accountFixedStackScalar`'s docblock); before one, the
+            // `Arg` and lir_callconv's cursor agree with that cursor by construction.
+            MirInstId const arg =
+                (stackedAt.has_value() && currentFnSawStackedAggregate_)
+                    ? receiveStackedScalarAt(*stackedAt, ty)
+                    : mir.addArg(scalarOrd, ty, scalarPos);
+            if (!arg.valid()) {
+                if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                return false;
+            }
             if (addressTaken.contains(sym.v)) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {
@@ -16568,14 +16670,22 @@ struct Lowerer {
     // conformance defect, and the rounding claim is PROVABLE rather than merely
     // assumed. See `foldComplexComponents` for the proof and the operand order.
     //
-    // ⚠ THE ELEMENT TYPE IS GATED TO F32/F64 for the same reason complex ARITHMETIC
-    // already walls at F80/F128 — a wide-float component has its own host
-    // representation (`WideFloatValue`) that a `double` pair structurally cannot
-    // carry, and folding through `double` would SILENTLY TRUNCATE an 80-bit
-    // initializer. A `long double _Complex` cannot reach here anyway: the
-    // `__builtin_complex` signature is `fn(f64,f64) -> complex<f64>`, the shipped
-    // F64 monomorph (D-CSUBSET-COMPLEX-MONOMORPH-F64), so that width is a
-    // pre-existing NAMED deferral and not a refusal this arm introduces.
+    // ★ THE ELEMENT MAY BE ANY OF THE FOUR REALIZED FLOAT KINDS (P68 round 8 —
+    // D-CSUBSET-COMPLEX-LONG-DOUBLE-STATIC-INITIALIZER-REFUSED). This arm was gated
+    // to F32/F64 because it carried every component as a host `double`, and folding
+    // an F80/F128 component through a `double` would SILENTLY TRUNCATE it. But the
+    // gate turned `static _Complex long double z = 40.0L;` into a RUNTIME
+    // initializer, which the static-data producer refuses whole
+    // (`D-LK4-RODATA-PRODUCER-RUNTIME-INIT`) — ✔MEASURED at the round-8 base on ELF
+    // x86_64 and ELF aarch64, debug and release, while gcc 13.3.0 and clang 18.1.3,
+    // each separately, fold it and run it. A component is now a `CxScalar`: a host
+    // `double` at F32/F64 exactly as before, a `WideFloatValue` at F80/F128 (the
+    // LD-3 kernel, correctly rounded at 64 / 113 significand bits — the rounding
+    // one x87 extended or binary128 operation performs), or a real integer operand
+    // not converted yet. ⓘ `__builtin_complex` is still `fn(f64,f64) ->
+    // complex<f64>` (the F64 monomorph, D-CSUBSET-COMPLEX-MONOMORPH-F64); a `long
+    // double _Complex` arrives through the real→complex conversion and the
+    // arithmetic below, which is what the references fold.
     // ⚠ AND `opts.allowFloat` IS HONOURED: a schema that declares its floats
     // non-IEEE (`hirLowering.globalsConstEval.allowFloat: false`) gets NO fold here,
     // exactly as it gets none from the engine.
@@ -16585,15 +16695,23 @@ struct Lowerer {
         if (!declaredTy.valid() || !isComplex(interner, declaredTy))
             return std::nullopt;
         if (!opts.allowFloat) return std::nullopt;
-        TypeId const elem = interner.complexElement(declaredTy);
-        if (!elem.valid()) return std::nullopt;
-        TypeKind const ek = interner.kind(elem);
-        if (ek != TypeKind::F32 && ek != TypeKind::F64) return std::nullopt;
+        auto const ekOpt = complexComponentKind(declaredTy);
+        if (!ekOpt.has_value()) return std::nullopt;
+        TypeKind const ek = *ekOpt;
         auto const parts = foldComplexComponents(initNode, env, opts);
         if (!parts.has_value()) return std::nullopt;
+        // The root is normally already at `ek` (the front end typed the
+        // initializer at the declared type), which makes this the identity; where
+        // it is not, it is the conversion the emitted store would perform.
+        auto const re = convertComponent(parts->re, ek);
+        auto const im = convertComponent(parts->im, ek);
+        if (!re.has_value() || !im.has_value()) return std::nullopt;
+        auto reLeaf = componentLeaf(*re, ek);
+        auto imLeaf = componentLeaf(*im, ek);
+        if (!reLeaf.has_value() || !imLeaf.has_value()) return std::nullopt;
         MirAggregateValue agg;
-        agg.fields.push_back(realComponentLeaf(parts->first, ek));
-        agg.fields.push_back(realComponentLeaf(parts->second, ek));
+        agg.fields.push_back(std::move(*reLeaf));
+        agg.fields.push_back(std::move(*imLeaf));
         MirLiteralValue out;
         out.value = std::move(agg);
         out.core  = TypeKind::Complex;
@@ -16614,7 +16732,8 @@ struct Lowerer {
     // single float op exactly. At F64 it is the identity. ⚠ It is applied to the
     // INPUTS too, not only to results: a source `0.1f` folds to the host double
     // `0.1`, while the runtime loads `(float)0.1` — round at production and the two
-    // chains start from the same value.
+    // chains start from the same value. ⓘ At F80/F128 no such step exists or is
+    // needed: the kernel rounds each operation to the element's own precision.
     //
     // ⚠⚠ THE PRECISION IS EACH NODE'S OWN, NEVER THE DECLARATION'S — a bug in this
     // arm's first draft, caught by re-reading it rather than by any test, because the
@@ -16646,48 +16765,172 @@ struct Lowerer {
         return ek == TypeKind::F32 ? static_cast<double>(static_cast<float>(v)) : v;
     }
 
-    // The element TypeKind a complex node's components are computed at, or nullopt
-    // for a non-complex / un-representable element (F80/F128 — see the scope note).
+    [[nodiscard]] static bool isWideComponentKind(TypeKind k) noexcept {
+        return WideFloatValue::isSupportedKind(k);   // F80 / F128
+    }
+
+    // The element TypeKind a complex node's components are computed at — F32, F64,
+    // F80 or F128 — or nullopt for a non-complex node or any other element.
     [[nodiscard]] std::optional<TypeKind> complexComponentKind(TypeId ty) const {
         if (!ty.valid() || !isComplex(interner, ty)) return std::nullopt;
         TypeId const elem = interner.complexElement(ty);
         if (!elem.valid()) return std::nullopt;
         TypeKind const k = interner.kind(elem);
-        if (k != TypeKind::F32 && k != TypeKind::F64) return std::nullopt;
+        if (k != TypeKind::F32 && k != TypeKind::F64 && !isWideComponentKind(k))
+            return std::nullopt;
         return k;
     }
 
-    // One complex COMPONENT as a MIR literal leaf at the element kind. The encoder's
-    // scalar arm widths it from `core` (F32 → 4 bytes, F64 → 8), exactly as every
-    // other float leaf in a static aggregate is widthed.
-    [[nodiscard]] static MirLiteralValue realComponentLeaf(double v, TypeKind ek) {
+    // ONE complex COMPONENT, carried EXACTLY until the node that converts it:
+    //   * `double`         — an F32/F64 value, already rounded to its node's kind;
+    //   * `WideFloatValue` — an F80/F128 value at its own precision;
+    //   * an integer       — a REAL integer operand the enclosing conversion has not
+    //                        converted yet (`_Complex long double z = 5;`), so a
+    //                        64-bit integer reaches an F80/F128 component EXACTLY
+    //                        rather than through a `double` that holds 53 bits.
+    using CxScalar = std::variant<double, WideFloatValue, std::int64_t, std::uint64_t>;
+    struct CxPair {
+        CxScalar re;
+        CxScalar im;
+    };
+
+    // `s` converted to element kind `to` exactly as the emitted conversion
+    // (`materializeComplexCast`'s `convertScalar`) converts it, or nullopt where no
+    // host path performs that conversion in ONE rounding:
+    //   * to F80/F128 — a `double` or an integer widens EXACTLY (64 significand
+    //     bits hold any binary64 and any 64-bit integer); a `WideFloatValue` must
+    //     already be of that kind (F80 and F128 never meet on one target).
+    //   * to F32/F64 — a `double` or an integer rounds through `roundToComponent`,
+    //     as this fold always has; a `WideFloatValue` narrows to F64 by `toDouble()`
+    //     (round-to-nearest-even: ONE rounding, as the target's own narrowing is)
+    //     and is REFUSED toward F32 — F80→F64→F32 is two roundings, which can differ
+    //     from the target's one, so the fold falls back to the loud refusal.
+    [[nodiscard]] static std::optional<CxScalar>
+    convertComponent(CxScalar const& s, TypeKind to) {
+        if (isWideComponentKind(to)) {
+            if (auto const* d = std::get_if<double>(&s))
+                return CxScalar{WideFloatValue::fromDouble(*d, to)};
+            if (auto const* w = std::get_if<WideFloatValue>(&s)) {
+                if (w->kind() != to) return std::nullopt;
+                return CxScalar{*w};
+            }
+            if (auto const* i = std::get_if<std::int64_t>(&s))
+                return CxScalar{WideFloatValue::fromInt64(*i, to)};
+            if (auto const* u = std::get_if<std::uint64_t>(&s))
+                return CxScalar{WideFloatValue::fromUint64(*u, /*sign=*/false, to)};
+            return std::nullopt;
+        }
+        if (to != TypeKind::F32 && to != TypeKind::F64) return std::nullopt;
+        if (auto const* d = std::get_if<double>(&s))
+            return CxScalar{roundToComponent(*d, to)};
+        if (auto const* i = std::get_if<std::int64_t>(&s))
+            return CxScalar{roundToComponent(static_cast<double>(*i), to)};
+        if (auto const* u = std::get_if<std::uint64_t>(&s))
+            return CxScalar{roundToComponent(static_cast<double>(*u), to)};
+        if (auto const* w = std::get_if<WideFloatValue>(&s)) {
+            if (to != TypeKind::F64) return std::nullopt;
+            return CxScalar{w->toDouble()};
+        }
+        return std::nullopt;
+    }
+
+    // `a op b` at element kind `k` — ONE target operation with its rounding: host
+    // IEEE double then `roundToComponent` at F32/F64, the LD-3 kernel at F80/F128.
+    // Both operands are at `k` (the callers convert them first). nullopt ⇐ an
+    // operation the kernel cannot represent the result of (a subnormal —
+    // D-CSUBSET-LONG-DOUBLE-CONSTFOLD-SUBNORMAL-RESULT) or an operand of another
+    // representation; the fold then falls back to the loud refusal.
+    [[nodiscard]] static std::optional<CxScalar>
+    componentOp(HirOpKind op, CxScalar const& a, CxScalar const& b, TypeKind k) {
+        if (isWideComponentKind(k)) {
+            auto const* x = std::get_if<WideFloatValue>(&a);
+            auto const* y = std::get_if<WideFloatValue>(&b);
+            if (x == nullptr || y == nullptr || x->kind() != k || y->kind() != k)
+                return std::nullopt;
+            std::optional<WideFloatValue> r;
+            switch (op) {
+                case HirOpKind::Add: r = WideFloatValue::add(*x, *y); break;
+                case HirOpKind::Sub: r = WideFloatValue::sub(*x, *y); break;
+                case HirOpKind::Mul: r = WideFloatValue::mul(*x, *y); break;
+                case HirOpKind::Div: r = WideFloatValue::div(*x, *y); break;
+                default: return std::nullopt;
+            }
+            if (!r.has_value()) return std::nullopt;
+            return CxScalar{*r};
+        }
+        auto const* x = std::get_if<double>(&a);
+        auto const* y = std::get_if<double>(&b);
+        if (x == nullptr || y == nullptr) return std::nullopt;
+        double v = 0.0;
+        switch (op) {
+            case HirOpKind::Add: v = *x + *y; break;
+            case HirOpKind::Sub: v = *x - *y; break;
+            case HirOpKind::Mul: v = *x * *y; break;
+            case HirOpKind::Div: v = *x / *y; break;
+            default: return std::nullopt;
+        }
+        return CxScalar{roundToComponent(v, k)};
+    }
+
+    // A SIGN FLIP, not arithmetic: exact at every precision (what FNeg does). Only
+    // a converted float component reaches it.
+    [[nodiscard]] static std::optional<CxScalar> negateComponent(CxScalar const& s) {
+        if (auto const* d = std::get_if<double>(&s)) return CxScalar{-*d};
+        if (auto const* w = std::get_if<WideFloatValue>(&s)) return CxScalar{w->negate()};
+        return std::nullopt;
+    }
+
+    // One converted COMPONENT as a MIR literal leaf at the element kind: a `double`
+    // at F32/F64 (the encoder's scalar arm widths it from `core`: F32 → 4 bytes, F64
+    // → 8), a `WideFloatValue` at F80/F128 (the encoder's 16-byte leaf arm,
+    // D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL). Anything else is nullopt.
+    [[nodiscard]] static std::optional<MirLiteralValue>
+    componentLeaf(CxScalar const& s, TypeKind ek) {
         MirLiteralValue leaf;
-        leaf.value = v;
-        leaf.core  = ek;
+        leaf.core = ek;
+        if (isWideComponentKind(ek)) {
+            auto const* w = std::get_if<WideFloatValue>(&s);
+            if (w == nullptr || w->kind() != ek) return std::nullopt;
+            leaf.value = *w;
+            return leaf;
+        }
+        auto const* d = std::get_if<double>(&s);
+        if (d == nullptr) return std::nullopt;
+        leaf.value = *d;
         return leaf;
     }
 
-    // The host `double` value of a REAL constant sub-expression, or nullopt. Routes
-    // through `evaluateConstant` — the one const-fold engine — and accepts the
-    // integer arms too (`_Complex double g = 1;` is legal C: the integer converts to
-    // the element type, which for F32/F64 is exact for every value this arm can see,
-    // and inexact only past 2^24/2^53 where the RUNTIME conversion rounds the same
-    // way the host `static_cast<double>` does).
-    [[nodiscard]] std::optional<double>
+    // The value of a REAL constant sub-expression at ITS OWN type, or nullopt.
+    // Routes through `evaluateConstant` — the one const-fold engine. An integer
+    // stays an integer until the enclosing conversion converts it (`_Complex double
+    // g = 1;` is legal C; for F32/F64 the conversion rounds past 2^24/2^53 exactly as
+    // the RUNTIME conversion does, and for F80/F128 it is exact). A `float`-typed
+    // value is rounded to `float` here, at production (see `roundToComponent`); an
+    // F80/F128 value stays at its own precision — a `double` arm under a wide kind is
+    // exactly that double (the pool's contract, the one the static-data encoder
+    // widens by), and a folded `WideFloatValue` must be of the node's own kind.
+    [[nodiscard]] std::optional<CxScalar>
     foldRealComponent(HirNodeId n, EvalEnvironment const& env, EvalOptions const& opts) {
         ConstEvalResult const r =
             evaluateConstant(hir, interner, literals, n, env, opts);
         if (!r.value.has_value()) return std::nullopt;
-        if (auto const* d = std::get_if<double>(&r.value->value))       return *d;
+        TypeId const ty = hir.typeId(n);
+        TypeKind const rk = ty.valid() ? interner.kind(ty) : TypeKind::F64;
+        if (auto const* d = std::get_if<double>(&r.value->value))
+            return CxScalar{isWideComponentKind(rk) ? *d : roundToComponent(*d, rk)};
+        if (auto const* w = std::get_if<WideFloatValue>(&r.value->value)) {
+            if (w->kind() != rk) return std::nullopt;
+            return CxScalar{*w};
+        }
         if (auto const* i = std::get_if<std::int64_t>(&r.value->value))
-            return static_cast<double>(*i);
+            return CxScalar{*i};
         if (auto const* u = std::get_if<std::uint64_t>(&r.value->value))
-            return static_cast<double>(*u);
-        return std::nullopt;   // BitIntValue / WideFloatValue / string / aggregate
+            return CxScalar{*u};
+        return std::nullopt;   // BitIntValue / string / aggregate
     }
 
     // (real, imaginary) of a constant expression, whether its type is complex or
-    // real, with every value rounded to THAT NODE'S OWN precision at the point it is
+    // real, with every value at THAT NODE'S OWN precision at the point it is
     // produced. A REAL expression is the pair (v, 0) — the C 6.3.1.7 promotion, and
     // the reason this recursion needs no separate real/complex entry points.
     //
@@ -16696,7 +16939,9 @@ struct Lowerer {
     // that emitter must be the SAME function of the source, because whichever one
     // runs, the other's result is what the program observes. Where the emitter
     // writes `FSub(FMul(ar,br), FMul(ai,bi))` this writes `rnd(rnd(ar*br) -
-    // rnd(ai*bi))` — same operands, same order, same per-op rounding.
+    // rnd(ai*bi))` — same operands, same order, same per-op rounding. The emitter
+    // uses the same formulas at every element kind (no library call at F80/F128),
+    // which is why one fold serves all four.
     // ⚠ Floating-point `+` and `*` are NOT associative, so "the same operations in a
     // different order" is a different answer; do not tidy these expressions.
     //
@@ -16724,11 +16969,11 @@ struct Lowerer {
         bool      combine = false;
     };
 
-    [[nodiscard]] std::optional<std::pair<double, double>>
+    [[nodiscard]] std::optional<CxPair>
     foldComplexComponents(HirNodeId root, EvalEnvironment const& env,
                           EvalOptions const& opts) {
-        std::vector<CxStep>                    work;
-        std::vector<std::pair<double, double>> vals;
+        std::vector<CxStep> work;
+        std::vector<CxPair> vals;
         work.push_back(CxStep{root, false});
         while (!work.empty()) {
             CxStep const step = work.back();
@@ -16747,25 +16992,35 @@ struct Lowerer {
     // never to a partial image.
     [[nodiscard]] bool
     foldComplexStep(HirNodeId n, bool combine, std::vector<CxStep>& work,
-                    std::vector<std::pair<double, double>>& vals,
+                    std::vector<CxPair>& vals,
                     EvalEnvironment const& env, EvalOptions const& opts) {
         if (!n.valid()) return false;
         TypeId const ty = hir.typeId(n);
         if (!isComplex(interner, ty)) {
-            // A REAL operand, rounded to ITS OWN type: a `float`-typed sub-expression
-            // is a float value even inside a wider complex, and an integer one is
-            // exact (`roundToComponent` is the identity at every non-F32 kind).
+            // A REAL operand at ITS OWN type: a `float`-typed sub-expression is a
+            // float value even inside a wider complex, and an integer one stays an
+            // integer until the conversion above it (`foldRealComponent`).
             auto const v = foldRealComponent(n, env, opts);
             if (!v.has_value()) return false;
-            TypeKind const rk = ty.valid() ? interner.kind(ty) : TypeKind::F64;
-            vals.emplace_back(roundToComponent(*v, rk), 0.0);
+            vals.push_back(CxPair{*v, CxScalar{0.0}});
             return true;
         }
         auto const ekOpt = complexComponentKind(ty);
-        if (!ekOpt.has_value()) return false;          // F80/F128 element → wall
+        if (!ekOpt.has_value()) return false;          // an element no arm folds
         TypeKind const ek = *ekOpt;
-        auto const pair = [&vals, ek](double re, double im) {
-            vals.emplace_back(roundToComponent(re, ek), roundToComponent(im, ek));
+        // Both components converted to THIS node's element kind — the identity when
+        // they already are (every operand of an arithmetic node is typed at its
+        // kind), and exactly what `materializeComplexCast` stores when not.
+        auto const toEk = [ek](CxPair const& p) -> std::optional<CxPair> {
+            auto const re = convertComponent(p.re, ek);
+            auto const im = convertComponent(p.im, ek);
+            if (!re.has_value() || !im.has_value()) return std::nullopt;
+            return CxPair{*re, *im};
+        };
+        auto const push = [&vals](std::optional<CxScalar> const& re,
+                                  std::optional<CxScalar> const& im) {
+            if (!re.has_value() || !im.has_value()) return false;
+            vals.push_back(CxPair{*re, *im});
             return true;
         };
         auto const kids = hir.children(n);
@@ -16809,27 +17064,32 @@ struct Lowerer {
                 // real→complex is (v, 0); complex→complex is a componentwise element
                 // convert. BOTH are what `materializeComplexCast` stores — the real
                 // arm's zero is its `elementZero(e)`. ★ THIS IS THE ONLY ARM THAT
-                // CHANGES PRECISION, and `pair`'s rounding to THIS node's `ek` is
-                // exactly the `convertScalar(srcElem → e)` that arm emits. The child
-                // is folded at the CHILD's precision first, which is what makes
-                // `float _Complex z = 0.1f + 0.2f*I;` compute its F64 sum before
-                // converting once, like the emitted code.
+                // CHANGES PRECISION, and `toEk` is exactly the `convertScalar(srcElem
+                // → e)` that arm emits. The child is folded at the CHILD's precision
+                // first, which is what makes `float _Complex z = 0.1f + 0.2f*I;`
+                // compute its F64 sum before converting once, like the emitted code.
                 if (kids.size() != 1 || vals.empty()) return false;
-                std::pair<double, double> const inner = vals.back();
+                CxPair const inner = vals.back();
                 vals.pop_back();
-                return pair(inner.first, inner.second);
+                auto const c = toEk(inner);
+                if (!c.has_value()) return false;
+                vals.push_back(*c);
+                return true;
             }
             case HirKind::UnaryOp: {
                 if (kids.size() != 1 || vals.empty()) return false;
-                std::pair<double, double> const inner = vals.back();
+                CxPair const inner = vals.back();
                 vals.pop_back();
                 // ⓘ There is no `Plus` member of `HirOpKind` to admit here: unary
                 // `+` is an identity the front end does not materialize as a node.
                 switch (decodeCoreOp(hir.payload(n))) {
-                    case HirOpKind::Neg:
+                    case HirOpKind::Neg: {
                         // A SIGN FLIP, not arithmetic: exact at every precision, and
                         // it is what `materializeComplexUnaryOp` emits.
-                        return pair(-inner.first, -inner.second);
+                        auto const c = toEk(inner);
+                        if (!c.has_value()) return false;
+                        return push(negateComponent(c->re), negateComponent(c->im));
+                    }
                     default:
                         return false;
                 }
@@ -16840,40 +17100,56 @@ struct Lowerer {
                 // lowering ever sees it, which is why `materializeComplexBinaryOp`
                 // can load both by address. So `ek` below is their precision too.
                 if (kids.size() != 2 || vals.size() < 2) return false;
-                std::pair<double, double> const b = vals.back();
+                CxPair const bRaw = vals.back();
                 vals.pop_back();
-                std::pair<double, double> const a = vals.back();
+                CxPair const aRaw = vals.back();
                 vals.pop_back();
-                double const ar = a.first, ai = a.second;
-                double const br = b.first, bi = b.second;
-                auto const r = [ek](double v) { return roundToComponent(v, ek); };
+                auto const a = toEk(aRaw);
+                auto const b = toEk(bRaw);
+                if (!a.has_value() || !b.has_value()) return false;
+                CxScalar const& ar = a->re;
+                CxScalar const& ai = a->im;
+                CxScalar const& br = b->re;
+                CxScalar const& bi = b->im;
+                auto const op = [ek](HirOpKind o, std::optional<CxScalar> const& x,
+                                     std::optional<CxScalar> const& y)
+                    -> std::optional<CxScalar> {
+                    if (!x.has_value() || !y.has_value()) return std::nullopt;
+                    return componentOp(o, *x, *y, ek);
+                };
                 switch (decodeCoreOp(hir.payload(n))) {
                     case HirOpKind::Add:
-                        return pair(ar + br, ai + bi);
+                        return push(op(HirOpKind::Add, ar, br), op(HirOpKind::Add, ai, bi));
                     case HirOpKind::Sub:
-                        return pair(ar - br, ai - bi);
+                        return push(op(HirOpKind::Sub, ar, br), op(HirOpKind::Sub, ai, bi));
                     case HirOpKind::Mul: {
                         // (a+bi)(c+di) = (ac - bd) + (ad + bc)i — the emitter's four
                         // FMul then FSub/FAdd, in its order.
-                        double const ac = r(ar * br), bd = r(ai * bi);
-                        double const ad = r(ar * bi), bc = r(ai * br);
-                        return pair(ac - bd, ad + bc);
+                        auto const ac = op(HirOpKind::Mul, ar, br);
+                        auto const bd = op(HirOpKind::Mul, ai, bi);
+                        auto const ad = op(HirOpKind::Mul, ar, bi);
+                        auto const bc = op(HirOpKind::Mul, ai, br);
+                        return push(op(HirOpKind::Sub, ac, bd), op(HirOpKind::Add, ad, bc));
                     }
                     case HirOpKind::Div: {
                         // (a+bi)/(c+di) = [(ac+bd) + (bc-ad)i] / (c² + d²) — the BASIC
                         // algebraic formula the emitter uses. ⓘ A ZERO denominator is
-                        // NOT special-cased and must not be: host IEEE division yields
-                        // the same inf/NaN the emitted FDiv produces, so folding and
+                        // NOT special-cased and must not be: IEEE division yields the
+                        // same inf/NaN the emitted FDiv produces, so folding and
                         // running agree. Annex-G infinity/NaN recovery is absent from
                         // BOTH sides — one deferral (D-CSUBSET-COMPLEX-ANNEX-G), not a
                         // new divergence between them.
-                        double const ac = r(ar * br), bd = r(ai * bi);
-                        double const bc = r(ai * br), ad = r(ar * bi);
-                        double const cc = r(br * br), dd = r(bi * bi);
-                        double const denom = r(cc + dd);
-                        double const numR  = r(ac + bd);
-                        double const numI  = r(bc - ad);
-                        return pair(numR / denom, numI / denom);
+                        auto const ac = op(HirOpKind::Mul, ar, br);
+                        auto const bd = op(HirOpKind::Mul, ai, bi);
+                        auto const bc = op(HirOpKind::Mul, ai, br);
+                        auto const ad = op(HirOpKind::Mul, ar, bi);
+                        auto const cc = op(HirOpKind::Mul, br, br);
+                        auto const dd = op(HirOpKind::Mul, bi, bi);
+                        auto const denom = op(HirOpKind::Add, cc, dd);
+                        auto const numR  = op(HirOpKind::Add, ac, bd);
+                        auto const numI  = op(HirOpKind::Sub, bc, ad);
+                        return push(op(HirOpKind::Div, numR, denom),
+                                    op(HirOpKind::Div, numI, denom));
                     }
                     default:
                         return false;
@@ -16888,7 +17164,10 @@ struct Lowerer {
                         auto const re = foldRealComponent(kids[0], env, opts);
                         auto const im = foldRealComponent(kids[1], env, opts);
                         if (!re.has_value() || !im.has_value()) return false;
-                        return pair(*re, *im);
+                        auto const c = toEk(CxPair{*re, *im});
+                        if (!c.has_value()) return false;
+                        vals.push_back(*c);
+                        return true;
                     }
                     case BuiltinLowering::ComplexConj: {
                         // ✔MEASURED: gcc 13.3.0 folds this in a static initializer and
@@ -16897,9 +17176,11 @@ struct Lowerer {
                         // the behaviour required — so it is folded, and DSS being
                         // BROADER than clang here is the correct outcome, not drift.
                         if (kids.size() != 1 || vals.empty()) return false;
-                        std::pair<double, double> const inner = vals.back();
+                        CxPair const inner = vals.back();
                         vals.pop_back();
-                        return pair(inner.first, -inner.second);
+                        auto const c = toEk(inner);
+                        if (!c.has_value()) return false;
+                        return push(c->re, negateComponent(c->im));
                     }
                     default:
                         return false;

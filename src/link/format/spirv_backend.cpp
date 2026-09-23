@@ -159,6 +159,13 @@ public:
         // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.
         return {};
     }
+    [[nodiscard]] std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept override {
+        // A SPIR-V module is consumed by a driver, not loaded by an OS loader
+        // that searches directories, and this walker records no runpath.
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.
+        return {};
+    }
 
     // Not a native image, not a program the OS starts, and not an `ar`
     // member — SPIR-V has no such shapes. `allowsUndefinedImports` is

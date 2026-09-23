@@ -7,13 +7,13 @@ Emit both tables. Never collapse them — they answer different questions.
 **Table 1 — host × leg**, one cell per (host, leg), each cell carrying four facts:
 
 ```
-| host (driver)      | leg            | BUILD | CLI run        | UNITS run                |
+| host               | leg            | BUILD | CLI run        | UNITS run                |
 |--------------------|----------------|-------|----------------|--------------------------|
-| Windows (.ps1)     | pe64-x86_64    | ✅    | ✅ 14/14       | ✅ 0 / 330,970           |
-| Windows (.ps1)     | elf64-x86_64   | ✅    | ✅ 14/14 (wsl) | ✅ 2 / 330,435 (2 conf.) |
-| Windows (.ps1)     | macho64-arm64  | ✅    | ⬛ structural  | ⬛ structural            |
-| macOS (.sh)        | macho64-arm64  | ✅    | ✅ 14/14       | ✅ 1 / 331,745 (1 conf.) |
-| arm64 VPS (.sh)    | pe64-x86_64    | ✅    | ⬜ no wine     | ⬜ no wine               |
+| Windows            | pe64-x86_64    | ✅    | ✅ 14/14       | ✅ 0 / 330,970           |
+| Windows            | elf64-x86_64   | ✅    | ✅ 14/14 (wsl) | ✅ 2 / 330,435 (2 conf.) |
+| Windows            | macho64-arm64  | ✅    | ⬛ structural  | ⬛ structural            |
+| macOS              | macho64-arm64  | ✅    | ✅ 14/14       | ✅ 1 / 331,745 (1 conf.) |
+| arm64 VPS          | pe64-x86_64    | ✅    | ⬜ no wine     | ⬜ no wine               |
 ```
 
 Legend, and use exactly these — the distinction is the point:

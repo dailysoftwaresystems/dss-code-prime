@@ -747,10 +747,14 @@ TEST(ElfHiddenVisibility, StaticPullTreatsAHiddenDefinitionAsSatisfying) {
                                           SymbolVisibility::Hidden});
 
     std::string const memberName = "pullhid.o";
-    auto const        archivePath =
-        fs::temp_directory_path() / "dss_p61_ef_hidden_pull.a";
+    // Per PROCESS (`ScratchDir`): the constant `temp/dss_p61_ef_hidden_pull.a`
+    // was one file per MACHINE, which a concurrent run from another build tree
+    // could remove or rewrite between this run's write and the pulls that read
+    // it (the P68 round 8 cross-tree temp race, measured on test_emit_hir_mode).
+    dss::test_support::ScratchDir const scratch{
+        dss::test_support::Location::Temp, "p61_elf_hidden_pull"};
+    auto const        archivePath = scratch.path() / "hidden_pull.a";
     std::error_code ec;
-    fs::remove(archivePath, ec);
     DiagnosticReporter wrep;
     ASSERT_TRUE(linkAndWriteStaticArchive(
         std::span<AssembledModule const>{&libMod, 1},

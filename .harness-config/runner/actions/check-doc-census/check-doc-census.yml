@@ -1,0 +1,20 @@
+# PURPOSE: refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place.
+name: check-doc-census
+description: >-
+  The action holds every documented figure to the census that measures it, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `doc_census_guard + doc_census_selftest_guard`.
+steps:
+  - name: verify
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-doc-census.py
+    successPattern: 'check-doc-census: OK'
+    requireInputsUnmoved: true
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-doc-census.py --selftest
+    successPattern: 'check-doc-census --selftest: PASS'
+    requireInputsUnmoved: true

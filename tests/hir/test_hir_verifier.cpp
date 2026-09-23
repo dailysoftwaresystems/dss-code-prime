@@ -28,6 +28,8 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 using dss::CompilationUnitId;
 // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): checkInlineAsm's vocabulary.
@@ -976,6 +978,99 @@ TEST(HirVerifier, NonVariadicFnSigStillRejectsExtraArgs) {
     DiagnosticReporter reporter;
     EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
     EXPECT_EQ(countCode(reporter, DiagnosticCode::H_VerifierFailure), 1u);
+}
+
+// ── P68 round 8 (lane `ht`, part 2): A `void` PARAMETER ENDS THE ARGUMENT LIST ──
+//
+// A C declaration that is not a definition may name a parameter of type void
+// (`void f(void v);`, `void f(int a, void v);` — gcc and mingw accept them, clang
+// and MSVC refuse), and gcc's measured meaning is that a call's arguments END at
+// it: `f()` and `f(42)` RUN against a `void f(void)` / `void f(int)` defined in
+// another translation unit. The semantic call check, THIS rule and the MIR
+// verifier's call gate ask ONE lattice helper which parameters take an argument —
+// `TypeInterner::fnArgumentParams` / `fnArgumentsVariadic` — so reverting it turns
+// these, the MIR twins, the C front end's pins
+// (`test_function_type_completeness.cpp`) and the runnable example
+// (`examples/c/named_void_param_prototype/`) red together.
+
+namespace {
+
+// One call of `sig` with `args` i32 literals, verified into `reporter`.
+void verifyCallWithI32Args(TypeInterner& ti, TypeId sig, std::size_t args,
+                           DiagnosticReporter& reporter) {
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    HirBuilder b{"c"};
+    std::vector<HirNodeId> lits;
+    for (std::size_t k = 0; k < args; ++k) lits.push_back(b.makeLiteral(i32));
+    HirNodeId const call = b.makeCall(b.makeRef(sig, /*symbol=*/1), lits, voidT);
+    Hir h = std::move(b).finish(call);
+    (void)HirVerifier{h, nullptr, &ti}.verify(reporter);
+}
+
+} // namespace
+
+TEST(HirVerifier, ACallsArgumentsEndAtAVoidParameter) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const onlyVoid = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const intThenVoid =
+        ti.fnSig(std::array{i32, voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const voidThenInt =
+        ti.fnSig(std::array{voidT, i32}, voidT, dss::CallConv::CcSysV);
+    TypeId const voidThenDots = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV,
+                                         /*isVariadic=*/true);
+    // The lattice's one answer, read directly: the list BEFORE the first void.
+    EXPECT_EQ(ti.fnArgumentParams(onlyVoid).size(), 0u);
+    EXPECT_EQ(ti.fnArgumentParams(intThenVoid).size(), 1u);
+    EXPECT_EQ(ti.fnArgumentParams(voidThenInt).size(), 0u);
+    EXPECT_FALSE(ti.fnArgumentsVariadic(voidThenDots))
+        << "a `...` after the void is unreachable (gcc: too many arguments)";
+    // …and the verifier agrees with it: each of these calls is clean.
+    for (auto const& [sig, args] : {std::pair{onlyVoid, std::size_t{0}},
+                                    std::pair{intThenVoid, std::size_t{1}},
+                                    std::pair{voidThenInt, std::size_t{0}},
+                                    std::pair{voidThenDots, std::size_t{0}}}) {
+        DiagnosticReporter r;
+        verifyCallWithI32Args(ti, sig, args, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+            << "a call passing " << args << " argument(s) to signature #" << sig.v
+            << " binds exactly the parameters before its void";
+    }
+}
+
+TEST(HirVerifier, AnArgumentAtOrPastTheVoidParameterStillFires) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32   = ti.primitive(TypeKind::I32);
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const onlyVoid = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const intThenVoid =
+        ti.fnSig(std::array{i32, voidT}, voidT, dss::CallConv::CcSysV);
+    TypeId const voidThenDots = ti.fnSig(std::array{voidT}, voidT, dss::CallConv::CcSysV,
+                                         /*isVariadic=*/true);
+    for (auto const& [sig, args] : {std::pair{onlyVoid, std::size_t{1}},     // at the void
+                                    std::pair{intThenVoid, std::size_t{2}},  // past it
+                                    std::pair{intThenVoid, std::size_t{0}},  // before it
+                                    std::pair{voidThenDots, std::size_t{1}}}) {
+        DiagnosticReporter r;
+        verifyCallWithI32Args(ti, sig, args, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+            << "a call passing " << args << " argument(s) to signature #" << sig.v;
+    }
+}
+
+// A QUALIFIED void is not the end (gcc: `f()` through `void f(volatile void v)` is
+// "too few arguments"), so the declared list is the argument list.
+TEST(HirVerifier, AQualifiedVoidParameterDoesNotEndTheList) {
+    TypeInterner ti = makeInterner();
+    TypeId const voidT = ti.primitive(TypeKind::Void);
+    TypeId const volVoid = ti.volatileQualified(voidT);
+    TypeId const sig = ti.fnSig(std::array{volVoid}, voidT, dss::CallConv::CcSysV);
+    EXPECT_EQ(ti.fnArgumentParams(sig).size(), 1u);
+    DiagnosticReporter r;
+    verifyCallWithI32Args(ti, sig, 0, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u);
 }
 
 // ── D-HIR-VERIFIER-POINTER-CONVERT-CONTRACT — the post-coerce pointer

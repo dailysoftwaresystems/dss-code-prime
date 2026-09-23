@@ -2,6 +2,7 @@
 
 #include "core/types/parse_diagnostic.hpp"
 #include "link/fresh_symbol_ids.hpp"
+#include "link/object_format_schema.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
@@ -41,6 +42,20 @@ void emit(DiagnosticReporter& reporter, std::string msg) {
                                   ? std::numeric_limits<std::int64_t>::max()
                                   : -r.minDelta;
     return std::min(r.maxDelta, back);
+}
+
+// A window narrowed by `m` on both sides — except a side that is unbounded,
+// which no amount of drift can bring into range.
+[[nodiscard]] link::RelocReach shrink(link::RelocReach r, std::int64_t m) noexcept {
+    return link::RelocReach{
+        r.minDelta == std::numeric_limits<std::int64_t>::min() ? r.minDelta
+                                                               : r.minDelta + m,
+        r.maxDelta == std::numeric_limits<std::int64_t>::max() ? r.maxDelta
+                                                               : r.maxDelta - m};
+}
+
+[[nodiscard]] constexpr std::uint64_t lowestSetBit(std::uint64_t v) noexcept {
+    return v & (~v + 1u);
 }
 
 // ── THE MODEL, BUILT FROM A MODULE ─────────────────────────────────────
@@ -176,106 +191,132 @@ collectLayout(AssembledModule const&            module,
     return out;
 }
 
-// ── THE BODY, ASSEMBLED ONCE FROM THE DECLARED SEQUENCE ────────────────
+// ── THE BODIES, ASSEMBLED ONCE FROM THE DECLARED SEQUENCES ─────────────
 //
 // ★★ BUILT, NOT QUOTED — AND BUILT BY THE SAME ASSEMBLER THAT BUILDS
-// EVERYTHING ELSE. The sequence names the target's own opcodes; the scratch
-// register and the target symbol are the only operands a step may name; the
-// result is a TEMPLATE whose relocations aim at a placeholder symbol and are
-// re-aimed per veneer. The entry trampoline mints a function at link time the
-// same way (`entry_trampoline.cpp`).
+// EVERYTHING ELSE. A sequence names the target's own opcodes; a step may name
+// only the granted scratch registers, the veneer's target and the body's own
+// data word. The result is a TEMPLATE whose relocations aim at two placeholder
+// symbols — the target, and the body's literal — re-aimed per veneer. The
+// entry trampoline mints a function at link time the same way
+// (`entry_trampoline.cpp`).
 //
 // ★★ AND THE TWO DECLARATIONS MUST AGREE. Each step also declares the
 // relocations its encoding carries, and the assembled template is checked
-// against that list: an opcode row edited so that `lea` stopped emitting its
-// page relocation would otherwise turn every veneer into a jump to page 0.
-constexpr std::uint32_t kTemplateSymbolV = 1;
+// against that list, placeholder by placeholder: an opcode row edited so that
+// `lea` stopped emitting its page relocation would otherwise turn every veneer
+// into a jump to page 0.
+//
+// ★★ A DATA WORD IS NOT ASSEMBLED — nothing executes it. The pass appends it
+// after the instructions, with slack enough to land it on its natural
+// alignment from any instruction boundary a veneer can stand at, and writes it
+// through the one PC-relative relocation the step declares
+// ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]).
+constexpr std::uint32_t kTemplateTargetV  = 1;  // relocations aimed at the veneer's target
+constexpr std::uint32_t kTemplateLiteralV = 2;  // relocations aimed at the body's data word
 
-struct ElectedBody {
-    std::string               name;
-    std::vector<std::uint8_t> bytes;
-    std::vector<Relocation>   relocations;  // target == kTemplateSymbolV
-    link::RelocReach          reach{};      // (target - veneer start) the body encodes
+struct BodyTemplate {
+    std::string                 name;
+    std::vector<std::uint8_t>   code;            // the assembled instructions
+    std::vector<Relocation>     relocations;     // aimed at the two placeholders
+    std::uint8_t                dataBytes = 0;   // 0: the body carries no data word
+    RelocationKind              dataRelocation{};
+    std::uint64_t               dataAlign = 1;   // the word's natural alignment
+    std::uint64_t               slack     = 0;   // bytes that let the word land aligned
+    std::uint64_t               size      = 0;   // code + slack + data: what a veneer occupies
+    link::RelocReach            reach{};         // (target - veneer start) every field encodes
+    std::vector<RelocationKind> kinds;           // every kind the body is written through
 };
 
-// The shape rules `TargetSchemaData::validate()` enforces at load, re-checked
-// here because a schema built in memory never passed through it — and the
-// builder below aborts the process on a malformed sequence, which is a worse
-// outcome than a diagnostic.
-[[nodiscard]] std::string bodyShapeProblem(LinkVeneerBody const& body,
-                                           TargetSchema const&   target) {
-    if (body.sequence.empty()) return "its sequence is empty";
-    for (std::size_t i = 0; i < body.sequence.size(); ++i) {
-        auto const& step = body.sequence[i];
-        auto const* info = target.opcodeInfo(step.opcode);
-        if (step.opcode == 0 || info == nullptr)
-            return std::format("step {} ('{}') names no opcode of this target",
-                               i, step.mnemonic);
-        if (info->isCall)
-            return std::format("step {} ('{}') is a CALL, which overwrites the "
-                               "return address a veneer must preserve", i,
-                               step.mnemonic);
-        bool const last = i + 1 == body.sequence.size();
-        if (last && info->terminatorKind != TargetTerminatorKind::IndirectBr)
-            return std::format("its last step ('{}') is not an indirect branch "
-                               "(terminatorKind: indirect-br)", step.mnemonic);
-        if (!last && info->isTerminator())
-            return std::format("step {} ('{}') is a terminator before the last "
-                               "step", i, step.mnemonic);
-    }
-    return {};
-}
-
-[[nodiscard]] std::optional<ElectedBody>
-assembleBody(LinkVeneerBody const&       body,
-             LinkVeneerVocabulary const& vocab,
-             TargetSchema const&         target,
-             DiagnosticReporter&         reporter) {
-    if (auto const problem = bodyShapeProblem(body, target); !problem.empty()) {
-        emit(reporter, std::format(
-            "branch-veneer: target '{}' declares veneer body '{}', but {} — a "
-            "veneer is a sequence that ends in the one indirect branch leaving it "
-            "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-            std::string{target.name()}, body.name, problem));
-        return std::nullopt;
-    }
-    auto const* scratchInfo = vocab.scratchRegisters.empty()
-                                  ? nullptr
-                                  : target.registerInfo(vocab.scratchRegisters.front());
-    if (scratchInfo == nullptr) {
-        emit(reporter, std::format(
-            "branch-veneer: target '{}' declares veneer body '{}' but no scratch "
-            "register resolves — a linker may clobber only what the ABI grants, "
-            "so the grant must be declared "
-            "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-            std::string{target.name()}, body.name));
-        return std::nullopt;
-    }
-    LirReg const scratch = makePhysicalReg(
-        vocab.scratchRegisters.front(),
-        static_cast<LirRegClass>(scratchInfo->regClass));
+// Builds the template for a body that ALREADY satisfies the linkVeneers shape
+// rules: `injectBranchVeneers` asks the schema for `linkVeneerProblems()` —
+// the one rule set `validate()` also applies at load — and refuses any
+// problem before a body gets here, so the builder never sees a malformed one.
+[[nodiscard]] std::optional<BodyTemplate>
+assembleBody(LinkVeneerBody const& body,
+             TargetSchema const&   target,
+             std::uint64_t         granule,
+             DiagnosticReporter&   reporter) {
+    // Every register a step names is a declared, granted scratch register: the
+    // shape rules the caller applied guarantee it. A register the target has
+    // no row for would therefore be an internal-invariant violation, refused
+    // below rather than dereferenced.
+    std::optional<std::string> badRegister;
+    auto const physical = [&](LinkVeneerOperand const& op) {
+        auto const* info = target.registerInfo(op.reg);
+        if (info == nullptr) {
+            badRegister = op.registerName;
+            return InvalidLirReg;
+        }
+        return makePhysicalReg(op.reg, static_cast<LirRegClass>(info->regClass));
+    };
 
     LirBuilder b{target};
-    (void)b.addFunction(SymbolId{kTemplateSymbolV});
+    (void)b.addFunction(SymbolId{kTemplateTargetV});
     auto const blk = b.createBlock();
     b.beginBlock(blk);
+    std::size_t lastInstruction = 0;
+    for (std::size_t i = 0; i < body.sequence.size(); ++i)
+        if (!body.sequence[i].isData()) lastInstruction = i;
+    // The declared relocations, in emission order, each with the placeholder
+    // its step's symbol operand stands for.
+    std::vector<std::pair<RelocationKind, std::uint32_t>> declared;
+    BodyTemplate tpl;
+    tpl.name = body.name;
     for (std::size_t i = 0; i < body.sequence.size(); ++i) {
         auto const& step = body.sequence[i];
-        std::vector<LirOperand> ops;
-        ops.reserve(step.operands.size());
-        for (auto const role : step.operands) {
-            ops.push_back(role == LinkVeneerOperandRole::Scratch
-                              ? LirOperand::makeReg(scratch)
-                              : LirOperand::makeSymbolRef(kTemplateSymbolV));
+        if (step.isData()) {
+            tpl.dataBytes      = step.dataBytes;
+            tpl.dataRelocation = step.relocations.front();
+            continue;
         }
-        if (i + 1 == body.sequence.size()) {
+        std::vector<LirOperand> ops;
+        ops.reserve(step.operands.size() + 2);
+        std::uint32_t placeholder = 0;
+        for (auto const& op : step.operands) {
+            switch (op.kind) {
+                case LinkVeneerOperandKind::Register:
+                    ops.push_back(LirOperand::makeReg(physical(op)));
+                    break;
+                case LinkVeneerOperandKind::Memory:
+                    ops.push_back(LirOperand::makeReg(physical(op)));
+                    ops.push_back(LirOperand::makeMemBase(1));
+                    ops.push_back(LirOperand::makeMemOffset(op.offset));
+                    break;
+                case LinkVeneerOperandKind::Target:
+                    placeholder = kTemplateTargetV;
+                    ops.push_back(LirOperand::makeSymbolRef(kTemplateTargetV));
+                    break;
+                case LinkVeneerOperandKind::Literal:
+                    placeholder = kTemplateLiteralV;
+                    ops.push_back(LirOperand::makeSymbolRef(kTemplateLiteralV));
+                    break;
+            }
+        }
+        for (auto const k : step.relocations) declared.emplace_back(k, placeholder);
+        if (i == lastInstruction) {
             // The branch LEAVES the function, so it has no in-function
             // successor; the assembler never reads successors.
             (void)b.addIndirectBr(step.opcode, ops, {});
         } else {
-            (void)b.addInst(step.opcode,
-                            step.resultIsScratch ? scratch : InvalidLirReg, ops);
+            LirReg result = InvalidLirReg;
+            if (step.writesRegister()) {
+                LinkVeneerOperand r;
+                r.reg          = step.resultRegister;
+                r.registerName = step.resultName;
+                result         = physical(r);
+            }
+            (void)b.addInst(step.opcode, result, ops);
         }
+    }
+    if (badRegister.has_value()) {
+        emit(reporter, std::format(
+            "branch-veneer: veneer body '{}' of target '{}' names register '{}', "
+            "which the target does not declare, although the shape rules were "
+            "applied before the body was built — an internal-invariant violation "
+            "(D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB)",
+            body.name, std::string{target.name()}, *badRegister));
+        return std::nullopt;
     }
     Lir lir = std::move(b).finish();
     std::vector<MirInstId> lirToMir(lir.instCount());
@@ -293,60 +334,100 @@ assembleBody(LinkVeneerBody const&       body,
     }
     auto& fn = am.functions[0];
 
-    // The declared relocations, in emission order, against the assembled ones.
-    std::vector<RelocationKind> declared;
-    for (auto const& step : body.sequence)
-        declared.insert(declared.end(), step.relocations.begin(),
-                        step.relocations.end());
+    // The declared relocations against the assembled ones: kind AND the
+    // placeholder each aims at, in emission order.
     bool agree = declared.size() == fn.relocations.size();
     for (std::size_t k = 0; agree && k < declared.size(); ++k) {
-        agree = fn.relocations[k].kind == declared[k]
-             && fn.relocations[k].target.v == kTemplateSymbolV
+        agree = fn.relocations[k].kind == declared[k].first
+             && fn.relocations[k].target.v == declared[k].second
              && fn.relocations[k].addend == 0;
     }
     if (!agree) {
-        auto const names = [&](std::vector<RelocationKind> const& kinds) {
+        auto const names = [&](auto const& list, auto kindOf) {
             std::string s;
-            for (auto const k : kinds) {
+            for (auto const& e : list) {
+                auto const k = kindOf(e);
                 auto const* row = target.relocationInfo(k);
                 if (!s.empty()) s += ", ";
                 s += row != nullptr ? row->name : std::to_string(k.v);
             }
             return s.empty() ? std::string{"none"} : s;
         };
-        std::vector<RelocationKind> got;
-        got.reserve(fn.relocations.size());
-        for (auto const& r : fn.relocations) got.push_back(r.kind);
         emit(reporter, std::format(
             "branch-veneer: veneer body '{}' of target '{}' declares the "
             "relocations [{}] but its opcodes assembled [{}]. The two "
-            "declarations have to agree, or every veneer would be patched through "
-            "fields nobody declared "
+            "declarations have to agree — each relocation aimed at the operand its "
+            "step names — or every veneer would be patched through fields nobody "
+            "declared "
             "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-            body.name, std::string{target.name()}, names(declared), names(got)));
+            body.name, std::string{target.name()},
+            names(declared, [](auto const& e) { return e.first; }),
+            names(fn.relocations, [](Relocation const& r) { return r.kind; })));
         return std::nullopt;
     }
+    tpl.code        = std::move(fn.bytes);
+    tpl.relocations = std::move(fn.relocations);
+    for (auto const& r : tpl.relocations) tpl.kinds.push_back(r.kind);
 
-    // The body's reach: the window EVERY one of its PC-relative fields can
-    // encode, measured from the veneer's own start. An absolute field (the
-    // low-12 half of the pair) is not bounded by distance and adds nothing.
+    // The data word's slot. A veneer starts on some multiple of `granule`, so
+    // the word's distance from alignment depends on WHERE the veneer lands;
+    // `slack` is the most that distance can be, and every veneer of this body
+    // reserves it (the slot is picked per veneer at materialization).
+    std::uint64_t const c = tpl.code.size();
+    if (tpl.dataBytes != 0) {
+        tpl.kinds.push_back(tpl.dataRelocation);
+        tpl.dataAlign = tpl.dataBytes;
+        std::uint64_t const a = tpl.dataAlign;
+        std::uint64_t const step = std::min(granule, a);
+        for (std::uint64_t j = 0; j * step < a; ++j) {
+            std::uint64_t const r = (c + j * granule) % a;
+            tpl.slack = std::max(tpl.slack, (a - r) % a);
+        }
+    }
+    tpl.size = c + tpl.slack + tpl.dataBytes;
+
+    // The body's reach: the window EVERY field aimed at the target can encode,
+    // measured from the veneer's own start. An absolute field (the low-12 half
+    // of the pair) is not bounded by distance and adds nothing. The data word
+    // may sit anywhere in [c, c + slack], so its window is taken at both ends.
     link::RelocReach reach{std::numeric_limits<std::int64_t>::min(),
                            std::numeric_limits<std::int64_t>::max()};
-    for (auto const& r : fn.relocations) {
-        auto const* row = target.relocationInfo(r.kind);
-        if (row == nullptr) continue;
+    auto const narrow = [&](RelocationKind kind, std::int64_t lo, std::int64_t hi) {
+        auto const* row = target.relocationInfo(kind);
+        if (row == nullptr) return;
         auto const w = link::relocFieldReach(*row);
-        if (!w.has_value()) continue;
+        if (!w.has_value()) return;
+        reach.minDelta = std::max(reach.minDelta, w->minDelta + hi);
+        reach.maxDelta = std::min(reach.maxDelta, w->maxDelta + lo);
+    };
+    for (auto const& r : tpl.relocations) {
         auto const off = static_cast<std::int64_t>(r.offset);
-        reach.minDelta = std::max(reach.minDelta, w->minDelta + off);
-        reach.maxDelta = std::min(reach.maxDelta, w->maxDelta + off);
+        if (r.target.v == kTemplateTargetV) {
+            narrow(r.kind, off, off);
+            continue;
+        }
+        // Aimed at the body's own literal: a fixed, tiny distance, which the
+        // field must hold wherever the slot lands.
+        auto const* row = target.relocationInfo(r.kind);
+        auto const w = row != nullptr ? link::relocFieldReach(*row) : std::nullopt;
+        std::int64_t const nearest  = static_cast<std::int64_t>(c) - off;
+        std::int64_t const farthest = static_cast<std::int64_t>(c + tpl.slack) - off;
+        if (w.has_value() && !(inWindow(*w, nearest) && inWindow(*w, farthest))) {
+            emit(reporter, std::format(
+                "branch-veneer: veneer body '{}' of target '{}' addresses its own "
+                "data word through relocation '{}', which cannot reach it "
+                "({}..{} bytes away) "
+                "(D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB)",
+                body.name, std::string{target.name()},
+                row != nullptr ? row->name : std::string{"?"}, nearest, farthest));
+            return std::nullopt;
+        }
     }
-    ElectedBody elected;
-    elected.name        = body.name;
-    elected.bytes       = std::move(fn.bytes);
-    elected.relocations = std::move(fn.relocations);
-    elected.reach       = reach;
-    return elected;
+    if (tpl.dataBytes != 0)
+        narrow(tpl.dataRelocation, static_cast<std::int64_t>(c),
+               static_cast<std::int64_t>(c + tpl.slack));
+    tpl.reach = reach;
+    return tpl;
 }
 
 }  // namespace
@@ -395,11 +476,12 @@ VeneerPlan planBranchVeneers(VeneerLayout const& in) {
     };
 
     // (1) THE MARGIN. Only a site farther than half its reach can ever receive
-    //     a veneer, so the F far ones together add at most F × veneerSize bytes
-    //     anywhere in the image. Taking every decision against the reach minus
-    //     that much makes each one immune to every insertion that follows it.
-    //     Past half the narrowest reach the margin is CAPPED there, and the
-    //     exact check the caller runs on the plan decides (see the header).
+    //     a veneer, so the F far ones together add at most F × (the largest
+    //     candidate body) bytes anywhere in the image. Taking every decision
+    //     against the reach minus that much makes each one immune to every
+    //     insertion that follows it. Past half the narrowest reach the margin
+    //     is CAPPED there, and the exact check the caller runs on the plan
+    //     decides (see the header).
     std::int64_t halfMin = std::numeric_limits<std::int64_t>::max();
     for (auto const& r : in.reaches) halfMin = std::min(halfMin, symmetricReach(r) / 2);
     std::uint64_t far = 0;
@@ -410,22 +492,30 @@ VeneerPlan planBranchVeneers(VeneerLayout const& in) {
     }
     plan.work.farSites = far;
     if (far == 0) return plan;  // nothing can be out of reach
-    if (halfMin <= 0 || in.veneerSize == 0) {
+    std::uint64_t largestBody = 0;
+    for (auto const& body : in.bodies) {
+        if (body.size == 0) {
+            plan.status = VeneerPlanStatus::Malformed;
+            return plan;
+        }
+        largestBody = std::max(largestBody, body.size);
+    }
+    if (halfMin <= 0 || largestBody == 0) {
         plan.status = VeneerPlanStatus::Malformed;
         return plan;
     }
-    std::uint64_t margin = far * in.veneerSize;
+    std::uint64_t margin = far * largestBody;
     if (margin > static_cast<std::uint64_t>(halfMin)) {
         margin = static_cast<std::uint64_t>(halfMin);
         plan.marginCapped = true;
     }
     plan.margin = margin;
     auto const m = static_cast<std::int64_t>(margin);
-    link::RelocReach const bodyWindow{
-        in.veneerReach.minDelta == std::numeric_limits<std::int64_t>::min()
-            ? in.veneerReach.minDelta : in.veneerReach.minDelta + m,
-        in.veneerReach.maxDelta == std::numeric_limits<std::int64_t>::max()
-            ? in.veneerReach.maxDelta : in.veneerReach.maxDelta - m};
+    // Each body's window, shrunk by the same margin: the distance from a veneer
+    // to its target moves by at most `m` as later veneers are inserted.
+    std::vector<link::RelocReach> bodyWindow;
+    bodyWindow.reserve(in.bodies.size());
+    for (auto const& body : in.bodies) bodyWindow.push_back(shrink(body.reach, m));
 
     // (2) THE SWEEP. One visit per site, in text order.
     std::vector<std::int32_t>  latest(in.targets.size(), -1);  // highest-boundary veneer per target
@@ -478,15 +568,27 @@ VeneerPlan planBranchVeneers(VeneerLayout const& in) {
             plan.failedDelta = d;
             return plan;
         }
+        // THE BODY: the first candidate that reaches the target from there —
+        // GNU ld's per-stub rule (the long form only where the ADRP one can't).
         std::int64_t const vd = posOf(tgt) - static_cast<std::int64_t>(start[boundary]);
-        if (!inWindow(bodyWindow, vd)) {
-            plan.status      = VeneerPlanStatus::BodyOutOfReach;
-            plan.failedSite  = static_cast<std::uint32_t>(si);
-            plan.failedDelta = vd;
+        std::size_t body = in.bodies.size();
+        for (std::size_t k = 0; k < in.bodies.size(); ++k) {
+            ++plan.work.bodyProbes;
+            if (inWindow(bodyWindow[k], vd)) {
+                body = k;
+                break;
+            }
+        }
+        if (body == in.bodies.size()) {
+            plan.status            = VeneerPlanStatus::BodyOutOfReach;
+            plan.failedSite        = static_cast<std::uint32_t>(si);
+            plan.failedDelta       = d;
+            plan.failedVeneerDelta = vd;
             return plan;
         }
         auto const idx = static_cast<std::int32_t>(plan.veneers.size());
-        plan.veneers.push_back(PlannedVeneer{boundary, s.target});
+        plan.veneers.push_back(PlannedVeneer{boundary, s.target,
+                                             static_cast<std::uint32_t>(body)});
         plan.siteVeneer[si] = idx;
         ++plan.work.veneersPlaced;
         if (latest[s.target] < 0
@@ -501,24 +603,33 @@ std::optional<VeneerMisfit>
 findVeneerPlanMisfit(VeneerLayout const& in, VeneerPlan const& plan,
                      BranchVeneerWork* work) {
     std::size_t const n = in.functionSizes.size();
-    std::vector<std::uint64_t> islandCount(n + 1, 0);
-    for (auto const& v : plan.veneers) ++islandCount[v.boundary];
+    // A veneer of an unknown body, or at a boundary past the last, is not a
+    // plan for this layout; say where rather than index past the end.
+    for (std::size_t i = 0; i < plan.veneers.size(); ++i) {
+        if (plan.veneers[i].body >= in.bodies.size() || plan.veneers[i].boundary > n)
+            return VeneerMisfit{true, static_cast<std::uint32_t>(i), 0};
+    }
+    auto const sizeOf = [&](PlannedVeneer const& v) { return in.bodies[v.body].size; };
+    std::vector<std::uint64_t> islandBytes(n + 1, 0);
+    for (auto const& v : plan.veneers) islandBytes[v.boundary] += sizeOf(v);
     // islandBase[b]: where boundary b's island begins; fstart[k]: function k's
     // final start, after its own boundary's island.
     std::vector<std::uint64_t> islandBase(n + 1, 0), fstart(n + 1, 0);
     std::uint64_t before = 0, inserted = 0;
     for (std::size_t b = 0; b <= n; ++b) {
         islandBase[b] = before + inserted;
-        inserted += islandCount[b] * in.veneerSize;
+        inserted += islandBytes[b];
         fstart[b] = before + inserted;
         if (b < n) before += in.functionSizes[b];
     }
     std::uint64_t const textEnd = fstart[n];
-    std::vector<std::uint64_t> slot(n + 1, 0);
+    // Within an island, veneers stand in placement order.
+    std::vector<std::uint64_t> filled(n + 1, 0);
     std::vector<std::uint64_t> vpos(plan.veneers.size(), 0);
     for (std::size_t i = 0; i < plan.veneers.size(); ++i) {
         auto const b = plan.veneers[i].boundary;
-        vpos[i] = islandBase[b] + in.veneerSize * slot[b]++;
+        vpos[i] = islandBase[b] + filled[b];
+        filled[b] += sizeOf(plan.veneers[i]);
     }
     auto const posOf = [&](VeneerLayoutTarget const& t) -> std::int64_t {
         std::uint64_t const base = t.function == kVeneerTargetIsStub
@@ -541,7 +652,7 @@ findVeneerPlanMisfit(VeneerLayout const& in, VeneerPlan const& plan,
         if (work != nullptr) ++work->sitesVerified;
         std::int64_t const d = posOf(in.targets[plan.veneers[i].target])
                              - static_cast<std::int64_t>(vpos[i]);
-        if (!inWindow(in.veneerReach, d))
+        if (!inWindow(in.bodies[plan.veneers[i].body].reach, d))
             return VeneerMisfit{true, static_cast<std::uint32_t>(i), d};
     }
     return std::nullopt;
@@ -558,6 +669,7 @@ bool branchVeneersNeeded(AssembledModule const&            module,
 
 bool injectBranchVeneers(AssembledModule&                  module,
                          TargetSchema const&               target,
+                         ObjectFormatSchema const&         format,
                          link::ImportCallStubLayout const& stubs,
                          DiagnosticReporter&               reporter,
                          BranchVeneerWork*                 work) {
@@ -596,52 +708,123 @@ bool injectBranchVeneers(AssembledModule&                  module,
         return false;
     }
 
-    // ── ELECT THE BODY: the first declared (cheapest) whose reach covers the
-    //    whole image; failing that the widest, and the planner then decides
-    //    veneer by veneer whether it reaches.
+    // ── THE SHAPE RULES, ONCE PER LINK ─────────────────────────────────────
+    //
+    // The same rule set `validate()` applies at load — one function, asked of
+    // the schema. A schema the JSON loader built has passed it already; one
+    // built in memory never went through the loader. Every problem is reported
+    // at its JSON path, and no body is built from a vocabulary that has one.
+    if (auto const problems = target.linkVeneerProblems(); !problems.empty()) {
+        for (auto const& p : problems) {
+            emit(reporter, std::format(
+                "branch-veneer: target '{}' declares a `linkVeneers` block that "
+                "breaks its shape rules at {}: {} — no veneer is built from it, "
+                "so this branch cannot be carried: {} "
+                "(D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB)",
+                std::string{target.name()}, p.path, p.message,
+                describeSite(initialMisfit->index, initialMisfit->delta)));
+        }
+        return false;
+    }
+
+    // ── THE BODIES: assemble every declared one, keep the USABLE ones ──────
+    //
+    // A veneer starts on an instruction boundary — the branch fields' own
+    // alignment, which every function and every body preserves.
+    std::uint64_t granule = 1;
+    for (auto const kind : collected.reachKind) {
+        auto const* row = target.relocationInfo(kind);
+        granule = std::max<std::uint64_t>(
+            granule, std::uint64_t{1} << link::branchRelocGeometry(row->formulaKind).scaleLog2);
+    }
+    // What the output format promises for `.text`'s first byte: its declared
+    // alignment, and never more than its declared address actually has.
+    std::uint64_t textStartAlign = 1;
+    if (auto const* text = format.sectionByKind(SectionKind::Text)) {
+        textStartAlign = std::max<std::uint64_t>(1, text->addrAlign);
+        if (text->virtualAddress != 0)
+            textStartAlign = std::min(textStartAlign, lowestSetBit(text->virtualAddress));
+    }
+    std::vector<BodyTemplate> usable;
+    std::vector<std::string>  unusable;  // "'<body>': <why not in this output>"
+    for (auto const& body : vocab->bodies) {
+        auto tpl = assembleBody(body, target, granule, reporter);
+        if (!tpl.has_value()) return false;
+        // A veneer is inserted between functions, so its size must keep every
+        // following function on the branch fields' own instruction alignment.
+        if (tpl->size % granule != 0) {
+            emit(reporter, std::format(
+                "branch-veneer: veneer body '{}' is {} bytes, which is not a "
+                "multiple of the {}-byte instruction alignment of the branches it "
+                "carries, so inserting it would misalign every function after it "
+                "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
+                tpl->name, tpl->size, granule));
+            return false;
+        }
+        // USABLE IN THIS OUTPUT: the format must declare every relocation the
+        // body is written through (the linker's unifier refuses any other), and
+        // a data word needs `.text` to start at least as aligned as the word.
+        std::string why;
+        for (auto const k : tpl->kinds) {
+            if (format.relocationByKind(k) != nullptr) continue;
+            auto const* row = target.relocationInfo(k);
+            why = std::format("object format '{}' declares no relocation '{}' "
+                              "(kind {}), which the body is written through",
+                              std::string{format.name()},
+                              row != nullptr ? row->name : std::string{"?"}, k.v);
+            break;
+        }
+        if (why.empty() && tpl->dataBytes != 0 && tpl->dataAlign > textStartAlign) {
+            why = std::format("its {}-byte data word must land {}-aligned, and object "
+                              "format '{}' places `.text` only {}-aligned",
+                              tpl->dataBytes, tpl->dataAlign,
+                              std::string{format.name()}, textStartAlign);
+        }
+        if (!why.empty()) {
+            unusable.push_back(std::format("'{}': {}", tpl->name, why));
+            continue;
+        }
+        usable.push_back(std::move(*tpl));
+    }
+    auto const unusableText = [&] {
+        std::string s;
+        for (auto const& u : unusable) {
+            if (!s.empty()) s += "; ";
+            s += u;
+        }
+        return s;
+    };
+    if (usable.empty()) {
+        emit(reporter, std::format(
+            "branch-veneer: {}, and no veneer body target '{}' declares can be "
+            "built in object format '{}': {} "
+            "(D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB)",
+            describeSite(initialMisfit->index, initialMisfit->delta),
+            std::string{target.name()}, std::string{format.name()}, unusableText()));
+        return false;
+    }
+
+    // ── THE CANDIDATES: the usable bodies up to the first whose reach covers
+    //    the whole image. A body past it would never be elected (every veneer
+    //    tries the cheaper ones first and that one always reaches), so it
+    //    would only inflate the margin — and an image under ~4 GiB therefore
+    //    plans exactly as it did when the ADRP body was the only one.
     std::uint64_t maxPast = 0;
     for (auto const& t : L.targets)
         if (t.function == kVeneerTargetIsStub) maxPast = std::max(maxPast, t.pastTextEnd);
     std::uint64_t textSize = 0;
     for (auto const s : L.functionSizes) textSize += s;
-    std::optional<ElectedBody> elected;
-    for (auto const& body : vocab->bodies) {
-        auto candidate = assembleBody(body, *vocab, target, reporter);
-        if (!candidate.has_value()) return false;
+    std::vector<std::size_t> candidate;  // indices into `usable`, cheapest first
+    std::uint64_t largest = 0;
+    for (std::size_t i = 0; i < usable.size(); ++i) {
+        candidate.push_back(i);
+        largest = std::max(largest, usable[i].size);
         auto const span = static_cast<std::int64_t>(
-            textSize + maxPast + L.sites.size() * candidate->bytes.size());
-        bool const covers = symmetricReach(candidate->reach) >= span;
-        if (!elected.has_value()
-            || symmetricReach(candidate->reach) > symmetricReach(elected->reach))
-            elected = std::move(candidate);
-        if (covers) break;
+            textSize + maxPast + L.sites.size() * largest);
+        if (symmetricReach(usable[i].reach) >= span) break;
     }
-    if (!elected.has_value()) {
-        emit(reporter, std::format(
-            "branch-veneer: target '{}' declares a `linkVeneers` vocabulary with "
-            "no body "
-            "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-            std::string{target.name()}));
-        return false;
-    }
-    // A veneer is inserted between functions, so its size must keep every
-    // following function on the branch fields' own instruction alignment.
-    for (std::size_t r = 0; r < L.reaches.size(); ++r) {
-        auto const* row = target.relocationInfo(collected.reachKind[r]);
-        auto const g = link::branchRelocGeometry(row->formulaKind);
-        std::size_t const align = std::size_t{1} << g.scaleLog2;
-        if (elected->bytes.size() % align != 0) {
-            emit(reporter, std::format(
-                "branch-veneer: veneer body '{}' is {} bytes, which is not a "
-                "multiple of relocation '{}''s {}-byte instruction alignment, so "
-                "inserting it would misalign every function after it "
-                "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-                elected->name, elected->bytes.size(), row->name, align));
-            return false;
-        }
-    }
-    L.veneerSize  = elected->bytes.size();
-    L.veneerReach = elected->reach;
+    for (auto const i : candidate)
+        L.bodies.push_back(VeneerBodyModel{usable[i].size, usable[i].reach});
 
     // ── PLAN, THEN MEASURE THE PLAN EXACTLY ──────────────────────────
     VeneerPlan plan = planBranchVeneers(L);
@@ -681,22 +864,29 @@ bool injectBranchVeneers(AssembledModule&                  module,
                 L.functionSizes[s.function], s.offset));
             return false;
         }
-        case VeneerPlanStatus::BodyOutOfReach:
+        case VeneerPlanStatus::BodyOutOfReach: {
+            std::size_t widest = 0;
+            for (std::size_t k = 1; k < L.bodies.size(); ++k)
+                if (symmetricReach(L.bodies[k].reach) > symmetricReach(L.bodies[widest].reach))
+                    widest = k;
+            auto const& wb = usable[candidate[widest]];
             emit(reporter, std::format(
-                "branch-veneer: {}, and veneer body '{}', the widest this target "
-                "declares, encodes only [{}, {}] bytes from where the veneer must "
-                "stand while its target is {} bytes away. ld.lld 18.1.3 refuses "
-                "the same span in PIE and shared output (MEASURED: 'relocation "
-                "R_AARCH64_ADR_PREL_PG_HI21 out of range'); GNU ld 2.42 links it "
-                "with a PC-relative literal body (ldr x16, lit; adr x17, 0; add "
-                "x16, x16, x17; br x16; .xword), which needs a 64-bit PC-relative "
-                "data relocation. Declaring one and a body built on it is what "
-                "goes further "
-                "(D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH)",
-                describeSite(plan.failedSite, plan.failedDelta), elected->name,
-                elected->reach.minDelta, elected->reach.maxDelta,
-                plan.failedDelta));
+                "branch-veneer: {}, and no veneer body this output can carry reaches "
+                "the target from where the veneer must stand: the widest, '{}', "
+                "encodes [{}, {}] bytes from the veneer and the target is {} bytes "
+                "away. {} "
+                "(D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB)",
+                describeSite(plan.failedSite, plan.failedDelta), wb.name,
+                wb.reach.minDelta, wb.reach.maxDelta, plan.failedVeneerDelta,
+                unusable.empty()
+                    ? std::string{"GNU ld 2.42 goes further with a PC-relative "
+                                  "literal body; a target that declares one, in a "
+                                  "format that declares the relocation its word is "
+                                  "written through, goes further here too."}
+                    : "Declared by the target but not usable in this output: "
+                          + unusableText() + "."));
             return false;
+        }
         case VeneerPlanStatus::Malformed:
             emit(reporter, std::format(
                 "branch-veneer: the placement model is inconsistent at site {} — "
@@ -738,17 +928,6 @@ bool injectBranchVeneers(AssembledModule&                  module,
     }
     std::uint32_t const firstId = maxV + 1u;
 
-    // Re-aim every routed branch at its veneer. The addend moves INTO the
-    // veneer, which aims at target+addend; the branch aims at the veneer's start.
-    for (std::size_t si = 0; si < L.sites.size(); ++si) {
-        std::int32_t const v = plan.siteVeneer[si];
-        if (v < 0) continue;
-        auto const& ref = collected.refs[si];
-        auto& rel = module.functions[ref.function].relocations[ref.relocation];
-        rel.target = SymbolId{firstId + static_cast<std::uint32_t>(v)};
-        rel.addend = 0;
-    }
-
     // Bucket the veneers by boundary — stable, so the order within an island is
     // the placement order the exact check measured.
     std::size_t const n = module.functions.size();
@@ -761,17 +940,80 @@ bool injectBranchVeneers(AssembledModule&                  module,
         for (std::size_t i = 0; i < plan.veneers.size(); ++i)
             order[fill[plan.veneers[i].boundary]++] = static_cast<std::uint32_t>(i);
     }
+    auto const templateOf = [&](PlannedVeneer const& pv) -> BodyTemplate const& {
+        return usable[candidate[pv.body]];
+    };
+
+    // WHERE EACH VENEER LANDS — the merge below, walked once without moving
+    // anything, so a veneer that could not land its data word aligned is
+    // refused before the module is touched. `.text` starts `textStartAlign`-
+    // aligned, so a word's text offset decides its address's alignment.
+    std::vector<std::uint64_t> literalAt(plan.veneers.size(), 0);
+    {
+        std::uint64_t at = 0;
+        for (std::size_t b = 0; b <= n; ++b) {
+            for (std::uint32_t k = firstAt[b]; k < firstAt[b + 1]; ++k) {
+                auto const v   = order[k];
+                auto const& tp = templateOf(plan.veneers[v]);
+                if (tp.dataBytes != 0) {
+                    std::uint64_t const c = tp.code.size();
+                    std::uint64_t const lit =
+                        c + (tp.dataAlign - (at + c) % tp.dataAlign) % tp.dataAlign;
+                    if (lit - c > tp.slack) {
+                        emit(reporter, std::format(
+                            "branch-veneer: veneer {} ('{}') lands at text offset "
+                            "{}, which leaves its data word {} bytes from "
+                            "alignment and only {} bytes of slack — every function "
+                            "before it should be a whole number of {}-byte "
+                            "instructions, so this is an internal-invariant "
+                            "violation (D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB)",
+                            v, tp.name, at, lit - c, tp.slack, granule));
+                        return false;
+                    }
+                    literalAt[v] = lit;
+                }
+                at += tp.size;
+            }
+            if (b < n) at += module.functions[b].bytes.size();
+        }
+    }
+
+    // Re-aim every routed branch at its veneer. The addend moves INTO the
+    // veneer, which aims at target+addend; the branch aims at the veneer's start.
+    for (std::size_t si = 0; si < L.sites.size(); ++si) {
+        std::int32_t const v = plan.siteVeneer[si];
+        if (v < 0) continue;
+        auto const& ref = collected.refs[si];
+        auto& rel = module.functions[ref.function].relocations[ref.relocation];
+        rel.target = SymbolId{firstId + static_cast<std::uint32_t>(v)};
+        rel.addend = 0;
+    }
 
     auto const makeVeneer = [&](std::uint32_t i) {
-        auto const& pv = plan.veneers[i];
+        auto const& pv  = plan.veneers[i];
+        auto const& tp  = templateOf(pv);
+        SymbolId const self{firstId + i};
+        SymbolId const aim         = collected.targetSymbol[pv.target];
+        std::int64_t const aimPlus = L.targets[pv.target].addend;
         AssembledFunction vf;
-        vf.symbol = SymbolId{firstId + i};
-        vf.bytes  = elected->bytes;
-        vf.relocations.reserve(elected->relocations.size());
-        for (auto r : elected->relocations) {
-            r.target = collected.targetSymbol[pv.target];
-            r.addend = L.targets[pv.target].addend;
+        vf.symbol = self;
+        vf.bytes  = tp.code;
+        vf.bytes.resize(tp.size, 0u);  // the slack and the word; the word is relocated
+        vf.relocations.reserve(tp.relocations.size() + 1);
+        for (auto r : tp.relocations) {
+            if (r.target.v == kTemplateTargetV) {
+                r.target = aim;
+                r.addend = aimPlus;
+            } else {
+                // The body's own literal: this veneer's symbol, plus the slot.
+                r.target = self;
+                r.addend = static_cast<std::int64_t>(literalAt[i]);
+            }
             vf.relocations.push_back(r);
+        }
+        if (tp.dataBytes != 0) {
+            vf.relocations.push_back(Relocation{
+                static_cast<std::uint32_t>(literalAt[i]), aim, tp.dataRelocation, aimPlus});
         }
         return vf;
     };

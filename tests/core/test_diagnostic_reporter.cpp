@@ -13,6 +13,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -755,6 +757,105 @@ TEST(Reporter, PolicySuppressDropsSilently) {
     r.report(makeDiag(DiagnosticCode::P_UnexpectedToken,  DiagnosticSeverity::Error,   b, 1, 2));
     EXPECT_EQ(r.all().size(), 1u);
     EXPECT_EQ(r.all()[0].code, DiagnosticCode::P_UnexpectedToken);
+}
+
+// ── --suppress NEVER SILENCES AN ERROR ─────────────────────────────────────
+//
+// [[D-DIAG-SUPPRESSING-AN-ERROR-REPORTS-A-FALSE-INTERNAL-FAILURE]]. Each tier
+// judges its own unpolicied reporter, so a suppressed Error still stopped its
+// stage and only its report vanished — ✔MEASURED through the CLI, the build then
+// failed with the driver's "internal … substrate-contract violation", or with
+// nothing but an info line. Suppression now silences warnings and notes only,
+// judged per EMISSION, and the refused request is announced once per code.
+// RED-ON-DISABLE: drop the severity test in `effectiveSeverity` and the first two
+// pins red (the Error vanishes); drop the announcement and the notice pins red.
+
+namespace {
+[[nodiscard]] std::size_t countCodeIn(std::span<ParseDiagnostic const> all,
+                                      DiagnosticCode code) {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        all, [code](ParseDiagnostic const& d) { return d.code == code; }));
+}
+} // namespace
+
+TEST(Reporter, SuppressNeverSilencesAnErrorAndSaysSoOnce) {
+    // S_ArgCountMismatch is outside the protected table: before this rule a
+    // `--suppress` of it dropped the Error.
+    ASSERT_FALSE(isUnsuppressable(DiagnosticCode::S_ArgCountMismatch));
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::S_ArgCountMismatch);
+    // The dedup window OFF: a repeated identical notice would otherwise be
+    // folded by it, and "once" would hold here only because the two errors sit
+    // close together — ✔MEASURED, the once-off mutant stayed green without this.
+    cfg.dedupWindow = 0;
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+    r.report(makeDiag(DiagnosticCode::S_ArgCountMismatch, DiagnosticSeverity::Error, b, 0, 1));
+    r.report(makeDiag(DiagnosticCode::S_ArgCountMismatch, DiagnosticSeverity::Error, b, 5, 6));
+
+    EXPECT_EQ(countCodeIn(r.all(), DiagnosticCode::S_ArgCountMismatch), 2u)
+        << "an Error is reported whatever --suppress says";
+    EXPECT_EQ(r.errorCount(), 2u);
+    ASSERT_EQ(countCodeIn(r.all(), DiagnosticCode::D_SuppressRequestIgnored), 1u)
+        << "the refused request is announced ONCE per code, not per error";
+    EXPECT_EQ(r.all().front().code, DiagnosticCode::D_SuppressRequestIgnored)
+        << "and before the first error it concerns";
+    EXPECT_EQ(r.all().front().severity, DiagnosticSeverity::Warning);
+    EXPECT_TRUE(r.all().front().actual.starts_with(
+        "--suppress=S_ArgCountMismatch had no effect on an ERROR"))
+        << r.all().front().actual;
+}
+
+// (ii) The rule follows each EMISSION's severity, not the code: the same code
+// emitted as a Warning is silenced and emitted as an Error is not.
+TEST(Reporter, SuppressFollowsEachEmissionsOwnSeverity) {
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::P_DeprecatedSyntax);
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+    r.report(makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning, b, 0, 1));
+    EXPECT_TRUE(r.all().empty()) << "a warning emission is silenced, and nothing is announced";
+    r.report(makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Error, b, 3, 4));
+    EXPECT_EQ(countCodeIn(r.all(), DiagnosticCode::P_DeprecatedSyntax), 1u)
+        << "an error emission of the same code is reported";
+    EXPECT_EQ(countCodeIn(r.all(), DiagnosticCode::D_SuppressRequestIgnored), 1u);
+}
+
+// (i) The EMITTED severity decides, not the promoted one: `--warnings-as-errors`
+// promotes AFTER suppression, so a suppressed warning stays silenced (gcc's
+// `-Werror -Wno-x`), and nothing is announced for it.
+TEST(Reporter, WarningsAsErrorsDoesNotDefeatASuppressedWarning) {
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::P_DeprecatedSyntax);
+    cfg.policy.warningsAsErrors = true;
+    DiagnosticReporter r{cfg};
+    EXPECT_FALSE(r.effectiveSeverity(DiagnosticCode::P_DeprecatedSyntax,
+                                     DiagnosticSeverity::Warning).has_value());
+    EXPECT_EQ(r.effectiveSeverity(DiagnosticCode::P_DeprecatedSyntax,
+                                  DiagnosticSeverity::Error),
+              DiagnosticSeverity::Error);
+    r.report(makeDiag(DiagnosticCode::P_DeprecatedSyntax, DiagnosticSeverity::Warning, BufferId{1}));
+    EXPECT_TRUE(r.all().empty());
+    EXPECT_EQ(r.errorCount(), 0u);
+}
+
+// (iii) "Once" is read off the stored diagnostics, so a speculative rollback that
+// removes the notice also removes the record of it — and the next such Error
+// announces again: exactly one notice survives, never zero, never two.
+TEST(Reporter, TheRefusalNoticeSurvivesARollbackExactlyOnce) {
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::S_ArgCountMismatch);
+    DiagnosticReporter r{cfg};
+    BufferId b{1};
+    auto const snap = r.snapshotForRollback();
+    r.report(makeDiag(DiagnosticCode::S_ArgCountMismatch, DiagnosticSeverity::Error, b, 0, 1));
+    ASSERT_EQ(countCodeIn(r.all(), DiagnosticCode::D_SuppressRequestIgnored), 1u);
+    r.truncateTo(snap);
+    ASSERT_TRUE(r.all().empty()) << "the rollback took the notice with the error";
+    r.report(makeDiag(DiagnosticCode::S_ArgCountMismatch, DiagnosticSeverity::Error, b, 7, 8));
+    EXPECT_EQ(countCodeIn(r.all(), DiagnosticCode::D_SuppressRequestIgnored), 1u)
+        << "the notice is said again after the rollback removed it";
+    EXPECT_EQ(countCodeIn(r.all(), DiagnosticCode::S_ArgCountMismatch), 1u);
 }
 
 TEST(Reporter, PolicyOverrideRemapsSeverity) {

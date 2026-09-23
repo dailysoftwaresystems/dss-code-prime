@@ -62,4 +62,20 @@ effectiveForbiddenOrdinals(Lir const& lir, TargetSchema const& schema,
     return out;
 }
 
+void appendClobberedOrdinals(Lir const& lir, TargetSchema const& schema,
+                             LirInstId inst, std::vector<std::uint16_t>& out) {
+    if (auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+        info != nullptr && info->implicitRegisters.has_value()) {
+        for (std::uint16_t const o : info->implicitRegisters->clobberedOrdinals) {
+            appendDedup(out, o);
+        }
+    }
+    if (auto const* perInst = lir.instRegConstraints(inst);
+        perInst != nullptr) {
+        for (std::uint16_t const o : perInst->clobberedOrdinals) {
+            appendDedup(out, o);
+        }
+    }
+}
+
 } // namespace dss

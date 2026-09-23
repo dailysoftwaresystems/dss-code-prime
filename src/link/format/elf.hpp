@@ -4,6 +4,7 @@
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/image_request.hpp"      // ImageRequest — the per-EMISSION request (runpaths)
 #include "link/import_call_stub_layout.hpp"
 #include "link/object_format_schema.hpp"
 
@@ -36,11 +37,17 @@
 
 namespace dss::elf {
 
+// `request` carries the per-PROGRAM asks of the image. The ELF writer reads its
+// `runpaths` (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): a dynamic image records them
+// as the format's declared `runpath` entry; an image with no dynamic section
+// records nothing and says so. It runs `enforceImageRequest` itself, because
+// this is a public entry point reachable without the linker's gate.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
-       DiagnosticReporter&       reporter);
+       DiagnosticReporter&       reporter,
+       ImageRequest const&       request = {});
 
 // [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]
 // Where `encode` will put each FUNCTION import's `.plt` stub for this module

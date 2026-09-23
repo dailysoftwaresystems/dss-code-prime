@@ -1,0 +1,14 @@
+# PURPOSE: census the real-example corpus into a run-identified report instead of one overwritten log.
+name: corpus-census
+description: >-
+  The action proves the census names its own tree and run under a steering git environment; the census itself needs a staged sqlite corpus and a dsscp, and refuses by name without them.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `corpus_census_git_environment_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./test-corpus-census.py
+    successPattern: 'test-corpus-census: OK'
+    requireInputsUnmoved: true

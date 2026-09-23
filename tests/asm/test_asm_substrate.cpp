@@ -1622,26 +1622,58 @@ TEST(AsmDataSection, Int128GlobalEmitsSixteenLittleEndianBytes) {
            "turn -3 into 2^128-3 with no diagnostic anywhere";
 }
 
-// ── TF-C94: the 128-bit wall holds at the AGGREGATE-LEAF recursion too ──
-// A `struct { __uint128_t x; }` global does NOT reach the scalar arm above — it
-// routes through the aggregate-leaf recursion, whose sole scalar encoder is
-// `decodeScalarLiteralBits`. That chokepoint must return nullopt for I128/U128
-// (the 16-byte value cannot pass through a u64), exactly as it does for F80/F128.
-// Without it the leaf writes the low 8 bytes as though they were the whole value.
-TEST(AsmDataSection, Int128AggregateMemberFailsLoud) {
+// ── The 128-bit MEMBER now EMITS (P68 round 8 —
+// D-CSUBSET-INT128-AGGREGATE-MEMBER-STATIC-INITIALIZER-REFUSED) ──
+// This pin used to be `Int128AggregateMemberFailsLoud` and asserted the REFUSAL:
+// the leaf's only encoder was the u64 `decodeScalarLiteralBits`, so a 16-byte
+// member walled while the same value as a whole global was emitted. ✔MEASURED at
+// the round-8 base: `struct { char c; __int128 v; unsigned __int128 u; }` with a
+// static initializer was refused on all four shipped formats, debug and release;
+// gcc 13.3.0 and clang 18.1.3 run it. The leaf now asks the SAME producer as the
+// scalar arm (`appendSixteenByteScalarImage`), so the three failure modes the
+// scalar pin above separates are separated here too, AT A NON-ZERO OFFSET:
+//   * a NEGATIVE `std::int64_t` — the high limb must be SIGN-extended;
+//   * a wide `BitIntValue` — every byte distinct in position, so a limb swap or
+//     a byte reversal shows;
+//   * an ENUM member whose underlying type is `__int128` — `materialScalarKind`
+//     projects it to I128, so it takes the same arm (the claim its comment makes).
+// RED-ON-DISABLE: delete the leaf's 16-byte arm in `encodeAggregateValue` and the
+// global is refused (0 items); give the leaf a zero-filling high limb and only the
+// negative member changes; the `c` byte and the padding pin the offsets.
+TEST(AsmDataSection, Int128AggregateMemberEmitsItsSixteenBytesAtItsOffset) {
     TypeInterner ti{CompilationUnitId{1}};
-    std::array<TypeId, 1> const f{ti.primitive(TypeKind::U128)};
-    TypeId const st = ti.structType("S128", f);
+    TypeId const e128 = ti.enumType("E128", TypeKind::I128);
+    std::array<TypeId, 4> const f{ti.primitive(TypeKind::I8),
+                                  ti.primitive(TypeKind::I128),
+                                  ti.primitive(TypeKind::U128), e128};
+    TypeId const st = ti.structType("W128", f);
+    MirLiteralValue wide;
+    wide.core  = TypeKind::U128;
+    wide.value = BitIntValue{
+        std::vector<std::uint64_t>{0x99aabbccddeeff00ull, 0x1122334455667788ull},
+        128, /*isSigned=*/false};
     auto const r = lowerOneAggGlobal(
-        ti, st, aggOf({intField(9, TypeKind::U128)}, TypeKind::Struct),
+        ti, st,
+        aggOf({intField('x', TypeKind::I8), intField(-3, TypeKind::I128),
+               std::move(wide), intField(5, TypeKind::I128)},
+              TypeKind::Struct),
         kNatural16, DataModel::Lp64);
-    EXPECT_GE(r.errors, 1u)
-        << "a struct with a 128-bit integer member must fail loud at the "
-           "aggregate-leaf recursion (D-CSUBSET-INT128-DATA-GLOBAL)";
-    EXPECT_TRUE(r.items.empty())
-        << "red-on-disable: drop the I128/U128 arm from decodeScalarLiteralBits "
-           "and this emits a struct whose 16-byte member holds 8 value bytes "
-           "plus 8 bytes of whatever the encoder produced";
+    ASSERT_EQ(r.errors, 0u) << r.messages;
+    ASSERT_EQ(r.items.size(), 1u);
+    std::vector<std::uint8_t> const want{
+        // c = 'x' at 0, then padding to the 16-aligned member
+        0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        // v = -3 at 16 — the high limb SIGN-extended
+        0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        // u at 32 — low limb then high limb, little-endian
+        0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        // e = 5 at 48 — the enum takes its underlying `__int128`'s image
+        0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(r.items[0].bytes, want);
+    EXPECT_EQ(r.items[0].alignment.bytes(), 16u)
+        << "the struct aligns as its 16-byte members do";
 }
 
 // ── LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): folded F80/F128 global
@@ -1698,6 +1730,142 @@ TEST(AsmDataSection, UnfoldedDoubleF80GlobalStillWidens) {
     ASSERT_EQ(r.items.size(), 1u);
     std::vector<std::uint8_t> const expect{0,0,0,0,0,0,0,0xa8,0x04,0x40,0,0,0,0,0,0};
     EXPECT_EQ(r.items[0].bytes, expect) << "unfolded double-arm F80 still widens (appendF80Extended)";
+}
+
+// ── D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL (closed P68 round 8): a `long double`
+// LEAF inside a static aggregate ──
+// The three pins above cover a WHOLE `long double` global. A MEMBER used to take
+// the aggregate-leaf recursion, whose only encoder was the u64
+// `decodeScalarLiteralBits` — so `struct S { char c; long double x; int tail; }`,
+// `static long double t[3]`, a union's `long double` member and a
+// `_Complex long double` were REFUSED ("aggregate initializer could not be
+// encoded … f16/f80/f128"). ✔MEASURED at the round-8 base on ELF x86_64 and ELF
+// aarch64, debug and release; gcc 13.3.0 and clang 18.1.3 run the same source
+// (`examples/c/static_aggregates_with_sixteen_byte_leaves`). Every case below puts
+// a leaf at a NON-zero offset or beside another leaf, mixes the `double` arm with
+// the folded `WideFloatValue` arm, and spells the expected bytes out:
+//   40.5 x87 = significand A2.. (1.265625), exponent 0x4004;
+//   1.25 x87 = A0.., 0x3FFF;  2.0 x87 = 80.., 0x4000;
+//   40.0 binary128 = fraction top byte 0x40, 0x4004;  1.5 = 0x80, 0x3FFF;
+//   0.5 binary128 = fraction 0, exponent 0x3FFE.
+// RED-ON-DISABLE: delete the leaf's 16-byte arm in `encodeAggregateValue` and all
+// four refuse (0 items); widen every `double` leaf as F80 regardless of kind and
+// the binary128 array changes bytes.
+TEST(AsmAggregateGlobal, LongDoubleLeavesEncodeTheirSixteenBytesAtTheirOffsets) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const dbl = [](double v, TypeKind k) {
+        MirLiteralValue l;
+        l.value = v;
+        l.core  = k;
+        return l;
+    };
+    auto const folded = [](double v, TypeKind k) {
+        MirLiteralValue l;
+        l.value = WideFloatValue::fromDouble(v, k);
+        l.core  = k;
+        return l;
+    };
+
+    // (a) x87 F80 between narrower members: 'a' at 0, 40.5 at 16, 7 at 32; 48 bytes.
+    {
+        std::array<TypeId, 3> const f{ti.primitive(TypeKind::I8),
+                                      ti.primitive(TypeKind::F80),
+                                      ti.primitive(TypeKind::I32)};
+        TypeId const s = ti.structType("SF80", f);
+        auto const r = lowerOneAggGlobal(
+            ti, s,
+            aggOf({intField('a', TypeKind::I8), dbl(40.5, TypeKind::F80),
+                   intField(7, TypeKind::I32)},
+                  TypeKind::Struct),
+            kNatural16, DataModel::Lp64);
+        ASSERT_EQ(r.errors, 0u) << r.messages;
+        ASSERT_EQ(r.items.size(), 1u);
+        std::vector<std::uint8_t> const want{
+            0x61, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0xa2, 0x04, 0x40, 0, 0, 0, 0, 0, 0,
+            0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        EXPECT_EQ(r.items[0].bytes, want) << "struct { char; long double; int }";
+    }
+
+    // (b) binary128 F128 array, the `double` and the folded arm mixed; stride 16.
+    {
+        TypeId const a = ti.array(ti.primitive(TypeKind::F128), 3);
+        auto const r = lowerOneAggGlobal(
+            ti, a,
+            aggOf({dbl(40.0, TypeKind::F128), folded(1.5, TypeKind::F128),
+                   dbl(0.5, TypeKind::F128)},
+                  TypeKind::Array),
+            kNatural16, DataModel::Lp64);
+        ASSERT_EQ(r.errors, 0u) << r.messages;
+        ASSERT_EQ(r.items.size(), 1u);
+        std::vector<std::uint8_t> const want{
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40, 0x04, 0x40,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0xfe, 0x3f};
+        EXPECT_EQ(r.items[0].bytes, want) << "long double t[3] (binary128)";
+    }
+
+    // (c) a union's first member, folded: 2.0 x87 at 0; 16 bytes.
+    {
+        std::array<TypeId, 2> const f{ti.primitive(TypeKind::F80),
+                                      ti.primitive(TypeKind::I32)};
+        TypeId const u = ti.unionType("UF80", f);
+        auto const r = lowerOneAggGlobal(
+            ti, u, aggOf({folded(2.0, TypeKind::F80)}, TypeKind::Union),
+            kNatural16, DataModel::Lp64);
+        ASSERT_EQ(r.errors, 0u) << r.messages;
+        ASSERT_EQ(r.items.size(), 1u);
+        std::vector<std::uint8_t> const want{
+            0, 0, 0, 0, 0, 0, 0, 0x80, 0x00, 0x40, 0, 0, 0, 0, 0, 0};
+        EXPECT_EQ(r.items[0].bytes, want) << "union { long double; int }";
+    }
+
+    // (d) `_Complex long double` (x87): real 40.5 at 0, imaginary 1.25 at 16 — the
+    //     Complex arm places the imaginary part at `elemLay->size`, and the leaf
+    //     fills that whole 16-byte slot.
+    {
+        TypeId const c = ti.complex(ti.primitive(TypeKind::F80));
+        auto const r = lowerOneAggGlobal(
+            ti, c,
+            aggOf({dbl(40.5, TypeKind::F80), folded(1.25, TypeKind::F80)},
+                  TypeKind::Complex),
+            kNatural16, DataModel::Lp64);
+        ASSERT_EQ(r.errors, 0u) << r.messages;
+        ASSERT_EQ(r.items.size(), 1u);
+        std::vector<std::uint8_t> const want{
+            0, 0, 0, 0, 0, 0, 0, 0xa2, 0x04, 0x40, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0xa0, 0xff, 0x3f, 0, 0, 0, 0, 0, 0};
+        EXPECT_EQ(r.items[0].bytes, want) << "_Complex long double (x87)";
+    }
+}
+
+// FAIL LOUD, never a reinterpretation: a folded value of the OTHER wide kind — an
+// F128 pattern — where an F80 is declared, as a member and as a whole global. The
+// two formats share no bit layout, so writing it would store a different number.
+// RED-ON-DISABLE: drop the `wf->kind() != k` refusal in
+// `appendSixteenByteScalarImage` and both emit 16 wrong bytes with no error.
+TEST(AsmAggregateGlobal, AWideFloatOfTheOtherKindIsRefusedNotReinterpreted) {
+    TypeInterner ti{CompilationUnitId{1}};
+    MirLiteralValue wrong;
+    wrong.value = WideFloatValue::fromDouble(1.5, TypeKind::F128);
+    wrong.core  = TypeKind::F80;
+    std::array<TypeId, 1> const f{ti.primitive(TypeKind::F80)};
+    TypeId const s = ti.structType("SMismatch", f);
+    auto const rm = lowerOneAggGlobal(ti, s, aggOf({wrong}, TypeKind::Struct),
+                                      kNatural16, DataModel::Lp64);
+    EXPECT_GE(rm.errors, 1u) << "a member of the other wide kind is refused";
+    EXPECT_TRUE(rm.items.empty());
+    EXPECT_NE(rm.messages.find("D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL"),
+              std::string::npos)
+        << "the refusal names its own anchor: " << rm.messages;
+    ASSERT_FALSE(rm.codes.empty());
+    EXPECT_EQ(rm.codes.front(), DiagnosticCode::K_StaticDataEncoderInvariantBreach)
+        << "two parts of the compiler disagree — nobody's input is at fault";
+
+    auto const rs = lowerOneAggGlobal(ti, ti.primitive(TypeKind::F80), wrong,
+                                      kNatural16, DataModel::Lp64);
+    EXPECT_GE(rs.errors, 1u) << "the same value as a whole global is refused too";
+    EXPECT_TRUE(rs.items.empty());
 }
 
 // A CONST initialized global stays read-only `.rodata`. RED if the section
@@ -2212,7 +2380,7 @@ TEST(AsmAggregateGlobal, DisjointExplicitOffsetStructEncodesAtDeclaredOffsets) {
 //   * the REFUSAL — drop the `!isAllZeroMirLiteral(v)` test (make the overlap arm
 //     `return true`) and this emits 8 wrong bytes with 0 errors;
 //   * the DIAGNOSTIC — drop the `why = …` assignment and the caller falls back to
-//     its generic text, which names f16/f80/f128 and address-relocated leaves,
+//     its generic text, which names an f16 leaf and address-relocated leaves,
 //     none of which is the cause; the three message assertions below then fail.
 TEST(AsmAggregateGlobal, NonZeroInitIntoOverlappingStructFailsLoudWithOverlapReason) {
     TypeInterner ti{CompilationUnitId{1}};

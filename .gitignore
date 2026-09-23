@@ -134,7 +134,7 @@ target/
 # project must never write inside this repo.
 #
 # The entry is here only because THIS repo also contains `.dss-project.json`
-# manifests of its own (examples/, real-examples/, and the runners' scratch
+# manifests of its own (examples/, the sqlite corpus action's generated ones, and the runners' scratch
 # trees), so a `dependsOn` example compiled in place would drop the cache
 # inside our working tree. It is ACQUIRED content, never source: reproducible
 # from the manifest's pins, and committing it would vendor someone else's
@@ -156,7 +156,7 @@ Testing/
 # happen to land at repo-root when ctest runs without a build-dir cwd.
 test-scratch/
 
-# Python bytecode cache (e.g. scripts/refresh_landing_log/refresh_landing_log.py)
+# Python bytecode cache (e.g. .harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py)
 __pycache__/
 *.pyc
 
@@ -215,7 +215,10 @@ __pycache__/
 # ⚠ `git clean -fd` (what a tree restore runs) does NOT delete
 # ignored paths, so a live worktree survives a leg restore. `-fdx` WOULD destroy
 # it mid-build; the dss-cycle skill forbids `-fdx` for exactly this reason.
-/.worktrees/
+# ⓘ THE RULE ITSELF, `/.worktrees/`, NOW LIVES IN THE repo-harness MANAGED BLOCK AT THE END
+# OF THIS FILE (2026-09-18): `dssharness init` derives it from `worktrees.root` in
+# `.harness-config/config.json`, so the directory and the rule cannot name two places. One
+# statement of the rule, not two -- the reasons above still apply to that line.
 
 # Agent-manager tooling and third-party dependency trees. THE SAME SHAPE AS THE
 # RULE ABOVE, and it cost the same way: `.kilo/` was covered only by
@@ -238,7 +241,7 @@ node_modules/
 
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
 
-# Operator connection data for scripts/ssh-*/ — hosts, logins, key PATHS.
+# Operator connection data (first for the retired scripts/ssh-*/ carriages) — hosts, logins, key PATHS.
 # NEVER tracked: this repo is slated to go public (PR #37) and these name real machines.
 # ★ Connection data + key material for the cross-host tooling.
 #   ⚠ THE ORIGINAL RULE HERE WAS "PATHS ONLY, no private key material" — that changed
@@ -274,46 +277,56 @@ id_ed25519
 # ── DssHarness ────────────────────────────────────────────────────────────────
 # The tool's own state, its per-host connection data and its runner inputs are
 # ignored; the contract (`config.json`) and the runner ACTIONS are tracked, because
-# they describe what this repository does and must travel with a clone. `init`
-# writes rules of this shape itself — they are kept here so a fresh clone is right
-# before the tool has ever run.
+# they describe what this repository does and must travel with a clone.
+#
+# ★★ TWO HALVES, AND THE ORDER IS LOAD-BEARING. The tool's own rules are the MANAGED
+# BLOCK at the end of this file, written and rewritten by `dssharness init` (marked
+# `>>> repo-harness managed block >>>`, derived from `.harness-config/config.json`).
+# ✔MEASURED 2026-09-18 in a throwaway repository: `init` writes exactly the lines below
+# that block's markers, and a second `init` answers `kept .gitignore (rules already
+# current)`. Until then this section was a HAND-WRITTEN copy of an older block, and it
+# had not kept up: it did not ignore `<action>/artifacts/` at all (a persisted output
+# would have ridden every sync and been committable), and `<action>/build/` was ignored
+# only by the unrelated repository-wide `build/` rule near the top of this file.
+# ⇒ what stays HERE is only what the block does not say: an ALLOWLIST that ignores
+# everything at `.harness-config/` and `.harness-config/runner/` the tool may ever
+# write, then re-includes the four places this repository tracks. It must come FIRST:
+# the block's contents rules re-include the placeholders, and git cannot re-include a
+# file whose parent directory a LATER rule excludes. No rule is stated twice.
+# ⚠ `init` (0.5.8) NOTES each `!…/` re-include below as doing "nothing there" for the
+# paths BELOW its directory. True of those paths, and still no reason to drop one: each
+# re-includes its DIRECTORY, without which the block's `!…/.gitkeep` is unreachable.
+# ✔MEASURED 2026-09-21 in a throwaway repository: without `!/.harness-config/sshItems/`,
+# `git add --all` never reaches `sshItems/.gitkeep` and `check-ignore` names line 1.
+# ⚠ THE WORKTREES ROOT is ignored WHOLE, never by the contents shape: the block names it
+# (`/.worktrees`, like `/.harness-config/runs`) -- by NAME since 0.5.8, so a root kept on
+# another disk through a link is ignored as surely as a directory. The contents shape
+# `/x/* + !/x/.gitkeep` answers NOT-IGNORED to `check-ignore x` without the slash,
+# which costs nothing on a slot holding an address and a key and, on a root holding
+# entire working trees, is the difference between a clean sync and shipping N
+# checkouts -- which this repository has already paid for once.
 /.harness-config/*
 !/.harness-config/config.json
-
-# ★ THE PLACEHOLDERS ARE TRACKED SO THE DIRECTORIES SURVIVE A CLONE. git stores no
-# directory, so without these a fresh checkout has nowhere to put its connection
-# data and nothing says the slots exist — the tool's `init` creates each directory
-# WITH its `.gitkeep`, and the rule above would then ignore the placeholder it just
-# wrote. Contents are excluded rather than the directory, because git cannot
-# re-include a file whose parent directory is itself excluded.
-# ⚠ The negation names ONE file. `sshItems/*` still excludes every per-host
-# directory and everything inside it — a key, an address, a user — and a `.gitkeep`
-# deeper down is not what `!/.harness-config/sshItems/.gitkeep` matches.
-# ⚠ THE WORKTREES ROOT IS DELIBERATELY NOT IN THIS LIST. `worktrees.root` is
-# `.worktrees`, resolved against the checkout root, and it stays ignored as a
-# DIRECTORY — the one rule that keeps N lane checkouts off every gate host.
-# ✔MEASURED, because the reason is NOT the one it looks like: the contents shape
-# used here still answers IGNORED to `check-ignore '.worktrees/'`, absent or
-# present, so the four guards that ask with the trailing slash would survive it.
-# What changes is the spelling WITHOUT the slash — `/x/` answers IGNORED for an
-# existing directory, `/x/* + !/x/.gitkeep` answers NOT-IGNORED — and it fails
-# toward not-ignored. That costs nothing on a slot holding an address and a key;
-# on a root holding entire working trees it is the difference between a clean sync
-# and shipping N checkouts, which this repository has already paid for once. The
-# root needs no placeholder anyway: `lane-worktree` creates it on demand.
 !/.harness-config/sshItems/
-/.harness-config/sshItems/*
-!/.harness-config/sshItems/.gitkeep
 !/.harness-config/wslDistros/
-/.harness-config/wslDistros/*
-!/.harness-config/wslDistros/.gitkeep
-
 !/.harness-config/runner/
 /.harness-config/runner/*
 !/.harness-config/runner/actions/
 !/.harness-config/runner/.env/
+!/.harness-config/runner/.secrets/
+
+# >>> repo-harness managed block >>>
+/.harness-config/lock.json
+/.harness-config/runs
+/.worktrees
+/.harness-config/sshItems/*
+!/.harness-config/sshItems/.gitkeep
+/.harness-config/wslDistros/*
+!/.harness-config/wslDistros/.gitkeep
 /.harness-config/runner/.env/*
 !/.harness-config/runner/.env/.gitkeep
-!/.harness-config/runner/.secrets/
 /.harness-config/runner/.secrets/*
 !/.harness-config/runner/.secrets/.gitkeep
+/.harness-config/runner/actions/**/build/
+/.harness-config/runner/actions/**/artifacts/
+# <<< repo-harness managed block <<<

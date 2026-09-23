@@ -37,6 +37,7 @@
 #include "mir/summary/mir_summary.hpp"
 #include "mir/summary/summary_index.hpp"
 #include "lir/lir_2addr_legalize.hpp"
+#include "lir/lir_asm_region.hpp"      // expandAsmRegions — the inline-asm bundles
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_peephole.hpp"
@@ -93,49 +94,6 @@ void copyDiagnostics(DiagnosticReporter const& src,
     dst.sourceBuffers().addAll(src.sourceBuffers());
     for (auto const& d : src.all()) dst.report(d);
 }
-
-BitFieldStrategy
-effectiveBitFieldStrategy(TargetSchema const&       target,
-                          ObjectFormatSchema const& format) noexcept {
-    // FORMAT wins (the strategy is OS/format-determined); fall back to the
-    // target's declared value when the format declared none. Selects on the
-    // config-declared enum only — no target/format identity branch.
-    if (format.bitFieldStrategy() != BitFieldStrategy::None) {
-        return format.bitFieldStrategy();
-    }
-    return target.aggregateLayout().bitFieldStrategy;
-}
-
-LongDoubleFormat
-effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
-                          ObjectFormatSchema const&            format) noexcept {
-    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): FORMAT-only — no target-side field
-    // exists to fall back to (see the header docblock). `None` propagates as
-    // the honest undeclared state; the semantic bind fails loud on it.
-    return format.longDoubleFormat();
-}
-
-UnnamedBitFieldAlignment
-effectiveUnnamedBitFieldAlignment([[maybe_unused]] TargetSchema const& target,
-                                  ObjectFormatSchema const&            format) noexcept {
-    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: FORMAT-only — no target-side field
-    // exists to fall back to (see the header docblock). `None` propagates as the
-    // honest undeclared state; the layout engine fails loud on it, and only when an
-    // unnamed bit-field actually needs the rule.
-    return format.unnamedBitFieldAlignment();
-}
-
-// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
-// ──────────────────────────────────────────────────────────────
-// There is deliberately no third member of the `effective*` family for
-// bare-`char` signedness. This family exists because those axes have
-// contributions from BOTH schemas that must be RECONCILED — a genuine
-// two-sided negotiation. Char signedness has exactly ONE contributor: the
-// target declares the whole (processor × platform) fact in its single
-// `charIsUnsigned` key. An `effectiveCharIsUnsigned(target, format)` wrapper
-// would advertise a negotiation that no longer happens, and would be a second
-// place the fact is "about" — the exact duplication this reshape removed.
-// The call site asks the owner directly: `target.charIsUnsigned(format.kind())`.
 
 namespace {
 
@@ -1095,94 +1053,29 @@ static std::optional<CuHirModule> buildCuHirImpl(
     //    `copyDiagnostics` helper to eliminate the inline-drain
     //    duplicate.)
     auto const semEntry = reporter.errorCount();
-    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
-    // `dataModel` field) into the per-(CU × target) analysis — the
-    // single source for every width-dependent resolution downstream
-    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
-    // literal ladder, descriptor `signatureByDataModel`). The HIR
-    // lowering reads the SAME value back off the SemanticModel.
-    // FC6 deferral-close: also thread the target's aggregate-layout params so a
-    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
-    // through the same `computeLayout` engine MIR uses — `nullopt` when the
-    // target declared no block (the fold then fails loud, never a wrong size).
-    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
-    // onto the target's params (the strategy is OS/format-determined; the target
-    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
-    // array dimension then folds with the byte-ABI-exact layout.
-    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
-    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
-    // overlaid at the SAME three consumer sites, because the two axes are read by one
-    // packer and a site that got one without the other would lay out to a mixture of
-    // two ABIs.
-    auto const effectiveUnnamedBfAlign =
-        effectiveUnnamedBitFieldAlignment(target, format);
-    std::optional<AggregateLayoutParams> analyzeLayout;
-    if (target.aggregateLayoutLoaded()) {
-        analyzeLayout = target.aggregateLayout();
-        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
-        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
-    }
-    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
-    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
-    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
-    // variadic-callee ABI.
-    //
-    // TWO consumers, each taking the part it needs from this ONE lookup:
-    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
-    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
-    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
-    //     variadic-callee surface at all).
-    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
-    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
-    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
-    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
-    std::optional<VaListLayout> analyzeVaLayout;
-    if (auto const* cc = target.callingConvention(callingConventionIndex);
-        cc != nullptr && cc->vaListLayout.has_value()) {
-        analyzeVaLayout = *cc->vaListLayout;
-    }
-    std::optional<VaListStrategy> const analyzeVaStrategy =
-        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
-                                    : std::nullopt;
     // c97: sequential per-phase scoping via optional emplace — emplace
     // destroys the prior Scope (closing its accumulation window) BEFORE
     // opening the next, and any early return closes the live one.
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Semantic);
-    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
-    // producer BINDS imports, so it answers descriptor role entries — from the
-    // active format's own row, or its shipped flavour family's.
-    FormatRuntimeLibraryRoleResolver const roleResolver{format};
-    auto model = analyze(
-        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
-        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
-        // is the relaxed per-target scratch.
-        std::move(borrowed), diagBudget,
-        format.dataModel(), analyzeLayout, analyzeVaStrategy,
-        format.kind(),       // c8: the active object-format → per-target availability gate
-        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
-        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
-        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
-        // spirv) leaves `long double` rows unrealized (loud on use).
-        effectiveLongDoubleFormat(target, format),
-        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
-        // Without it `analyze` runs with `target == nullptr`, and its two
-        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
-        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
-        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
-        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
-        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
-        // only in a unit test that passes its own schema is not a shipped
-        // diagnostic. `target` is the driver's own long-lived schema and
-        // outlives `model`, which is the lifetime the parameter requires.
-        &target,
-        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
-        // because the resolver behind it is positional.
-        /*deepRecursionReserveBytes=*/0,
-        // Consulted during analysis only, never republished by the model, so a
-        // reference to a local outlives every read of it.
-        &roleResolver);
+    // ★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: what this pair means to
+    // `analyze()` — the data model, the aggregate layout with the format's two
+    // bit-field overlays, the `va_list` strategy of the resolved calling
+    // convention, the availability gate, the shipped-struct variant selector,
+    // `long double`, the target and the runtime-library role resolver — is
+    // derived in ONE place, `analyzeForTargetFormat`
+    // (`analysis/semantic/target_format_analysis.hpp`). This site used to derive
+    // it inline and was the only channel that did: the LSP and the FFI header
+    // parser analyzed under defaults and disagreed with this build about every
+    // header, `long double` and `sizeof` the pair decides. The budget is the
+    // operator's (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: carried on
+    // `opts` from `rep`, never the relaxed per-target scratch), and `target` is
+    // the driver's own long-lived schema, which outlives the model.
+    auto analysis = analyzeForTargetFormat(
+        std::move(borrowed), diagBudget, target, format,
+        target.callingConvention(callingConventionIndex));
     phase.reset();
+    SemanticModel& model = analysis.model;
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
@@ -1198,11 +1091,11 @@ static std::optional<CuHirModule> buildCuHirImpl(
     }
 
     // Both products of the front half, plus the ONE derived fact the lower half
-    // still needs from step 1 (`analyzeVaLayout` — resolved from the same CC the
-    // MIR lowering config reads, so resolving it twice could disagree).
+    // still needs from step 1 (`analysis.vaListLayout` — resolved from the same
+    // CC the MIR lowering config reads, so resolving it twice could disagree).
     return CuHirModule{.model        = std::move(model),
                        .hir          = std::move(hir),
-                       .vaListLayout = analyzeVaLayout};
+                       .vaListLayout = analysis.vaListLayout};
 }
 
 // LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →
@@ -1540,6 +1433,34 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         return std::nullopt;
     }
 
+    // 8b. P68 round 8 part 4 — THE INLINE-ASM BUNDLES BECOME THEIR BODIES.
+    //     Every inline-asm statement has been ONE instruction (`asm_region`)
+    //     through allocation, rewrite, two-address legalization and the
+    //     peephole, so nothing those passes generate can land between a
+    //     template's lines. Its body replaces it HERE: after the peephole (which
+    //     must see the statement as the opaque instruction it is) and BEFORE
+    //     callconv (whose per-function CFI is keyed by `LirInstId`, so a rebuild
+    //     after it would renumber every CFI subject — the peephole's own reason
+    //     for running where it does). A module with no statement carries an
+    //     empty region pool and skips the pass: nothing to expand, no rebuild.
+    //     ⚠ The paired check is the CONSUMING one: the pool must come out
+    //     empty and every other side structure carried as by any rebuild.
+    std::optional<LirAsmRegionExpansionResult> expanded;
+    Lir const* ccInput = &peeped.lir;
+    if (peeped.lir.asmRegionPool().size() != 0) {
+        auto const expandEntry = reporter.errorCount();
+        expanded = expandAsmRegions(peeped.lir, target, reporter);
+        if (!expanded->ok || !tierClean(reporter, expandEntry)) {
+            return std::nullopt;
+        }
+        if (!verifyLirAsmRegionExpansion(peeped.lir, expanded->lir, target,
+                                         reporter)
+            || !verifyLirPostRegalloc(expanded->lir, target, reporter)) {
+            return std::nullopt;
+        }
+        ccInput = &expanded->lir;
+    }
+
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
     //    ML7 cycle 2 gap — anchored D-LK10-2 for caller awareness).
@@ -1568,7 +1489,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
                                   a.perAllocaAlignBytes});
     }
-    auto cc = materializeCallingConvention(peeped.lir, target, alloc, reporter,
+    auto cc = materializeCallingConvention(*ccInput, target, alloc, reporter,
                                            sehFuncletParents,
                                            funcLocalAligns);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
@@ -1579,7 +1500,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // same reason: callconv materializes the frame ops and the arg/return
     // moves, so it is the pass with the most opportunities to mint a register
     // operand, and after `assemble()` there is no LIR left to check.
-    if (!verifyLirRebuild(peeped.lir, cc.lir, "callconv", reporter)
+    if (!verifyLirRebuild(*ccInput, cc.lir, "callconv", reporter)
         || !verifyLirPostRegalloc(cc.lir, target, reporter)) {
         return std::nullopt;
     }
@@ -3762,6 +3683,17 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     // both toolchains, with the boundary held at Local.
     std::vector<link::format::ArMemberInput> members;
     members.reserve(modules.size());
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a runpath request against an archive
+    // is ACCEPTED and recorded nowhere (no loader loads an `ar` member), and it
+    // is reported ONCE, for the ARCHIVE, through the gate's own function. The
+    // member links below then get a request WITHOUT runpaths: `linker::link`
+    // reports once per link, and one archive of N members is still ONE artifact
+    // — N identical warnings would bury the one that matters. Everything else
+    // in the request still rides every member link, unchanged.
+    (void)reportUnrecordedRunpaths(request, format, "linkAndWriteStaticArchive",
+                                   reporter);
+    ImageRequest memberRequest = request;
+    memberRequest.runpaths.clear();
     for (std::size_t i = 0; i < modules.size(); ++i) {
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `request` rides each member link
         // so the capability gate fires on the archive path too. No archive
@@ -3769,7 +3701,7 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
         // image headers), so a request here is REFUSED on the first member —
         // never silently swallowed by a build that reports success.
         auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
-                                  target, format, reporter, request);
+                                  target, format, reporter, memberRequest);
         if (!image.ok() || !tierClean(reporter, entry)) {
             return false;
         }

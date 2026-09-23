@@ -195,7 +195,7 @@ void writeFile(fs::path const& p, std::string_view text) {
 // named parts.
 //
 // ★★ WHY COMPOSED AND NOT SPELLED OUT AS A LITERAL. Written out, every
-// expectation in this file reads to `scripts/check-plan-citations` as a
+// expectation in this file reads to `.harness-config/runner/actions/check-plan-citations` as a
 // POSITIONAL CITATION, and that guard is right to be blunt about the shape: a
 // `path:line` written into a source file is a claim about a file that nothing
 // rechecks, and it stays plausible after it becomes wrong. These are the exact

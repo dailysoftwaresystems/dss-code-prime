@@ -139,7 +139,7 @@ production row like any other. Its 187 open rows and the archive's 544 closed on
 at the parent of the commit that deleted them. **What did not change is the priority**: a defect a
 user of the compiler could hit outranks one only we can hit, every time — the registry simply stopped
 being where that distinction is recorded. See `references/dss-harness.md` for the tool, its verbs,
-this repository's configuration, and which scripts are still the only way to do their job.
+this repository's configuration, and which of this repository's own programs (its ACTIONS) are still the only way to do their job.
 
 ### ★★★ MOVE ON CLOSE — a closed row does not stay where it was
 
@@ -149,7 +149,7 @@ this repository's configuration, and which scripts are still the only way to do 
 
 - **Closing a row MOVES it.** It is deleted from its working registry and appended to the archive's
   matching table. Reopening moves it BACK. Neither is an edit in place.
-- **You do not do this by hand.** `scripts/anchors/anchors.py` performs the move as part of writing
+- **You do not do this by hand.** `.harness-config/runner/actions/anchors/anchors.py` performs the move as part of writing
   the row, and `apply-registry-row` delegates to it. Hand-editing the tables is how the two halves
   drift.
 - **`check-anchor-balance` refuses both directions** (ARM 6's sibling, the partition arm): a CLOSED
@@ -173,7 +173,9 @@ IS the compiler's behaviour, and a diagnostic IS its output to a user.
 
 Operator, 2026-09-01: *"add columns for priority and status ... then the write explicitly writes it
 correctly, this way we always have clean statuses."* `Priority` is `P0`..`P5`; `Status` is a
-controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 🟠 OPEN (DISCLOSED)`.
+controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCLOSED`. `--status` or a
+`--status-file` holds one of those cells or its bare word (`closed`, `open`, `gated`, `disclosed`);
+`DssHarness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)` included.
 
 - ★★★ **`DISCLOSED` is for debt this cycle FOUND, not debt it CREATED, and it exists to remove an
   incentive rather than to grant an excuse.** The balance gate forbids a cycle that OPENS new debt;
@@ -199,17 +201,20 @@ controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 🟠 
 - ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
   recognized; only the registry documents changed.
 
-### The four verbs — `scripts/anchors/`
+### The four verbs — `.harness-config/runner/actions/anchors/`
 
-Each has a `.sh` and a `.ps1` launcher over one implementation (`anchors.py`), so the pair cannot
-drift. Every verb takes **`--production` / `--done`, and those are the only two.**
+They are verbs of ONE program, `anchors.py` (`python3 .harness-config/runner/actions/anchors/anchors.py
+write|set|read|list`); the `.sh`/`.ps1` launchers that once fronted it are retired, and the door in
+daily use is DssHarness's own `write-anchor` / `set-anchor` / `read-anchor` / `read-anchors`
+(`references/anchors-and-deferrals.md`). Every `anchors.py` verb takes **`--production` / `--done`,
+and those are the only two.**
 ⚠ **`--harness` NO LONGER EXISTS and is refused** — the harness registry retired on 2026-09-16.
 ✔MEASURED 2026-09-16 at `305604f1`: `write-anchor`, `set-anchor` and `read-anchors` each print
 `(--production | --done)` in their own usage line. A command still typing `--harness` fails.
 
 ```
 DssHarness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
-                                 --trigger '...' --closing '...' --cross-refs '...' --apply
+                                 --trigger '...' --closing '...' --cross-refs '...'   # writes; --anchor-dry-run previews
 DssHarness set-anchor    D-<AREA>-<NAME> --status closed --closing '...'           # MOVES it
 DssHarness read-anchor   D-<AREA>-<NAME>                    # the full row, field by field
 DssHarness read-anchors  --pending --band P0       # name + priority + status only
@@ -244,7 +249,7 @@ neither was detectable downstream: an author PRE-ESCAPING by hand, and the raw-l
 **How the ruling binds this loop, clause by clause:**
 
 1. **Step 1 picks from PRODUCTION.** A harness row is never picked *because it is next*. If §0.1 is
-   dry, promote an eligible **production** anchor. `scripts/burndown-queue/burndown-queue.py`
+   dry, promote an eligible **production** anchor. `.harness-config/runner/actions/burndown-queue/burndown-queue.py`
    already bands production errors highest — the ruling makes the FILE the outer sort key, above
    any band.
 2. **"NEVER LATER" is the load-bearing half.** A harness defect is fixed **at the moment it is
@@ -273,7 +278,7 @@ neither was detectable downstream: an author PRE-ESCAPING by hand, and the raw-l
 rather than re-typing the "is this row open" vocabulary:
 
 ```
-python scripts/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry
+python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py --breakdown --denominator registry
 ```
 
 ⚠ That gate canonicalises BOTH registry files to ONE key — deliberately, so that MOVING a row
@@ -308,13 +313,13 @@ the decision. The absence of this section IS the defect this section closes.**
 
 ### The gate — this is measured, not asserted
 
-`scripts/check-anchor-balance/check-anchor-balance.py` **already** implements
+`.harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` **already** implements
 *"a cycle may not end with more OPEN deferral rows than it began"*, comparing **by row name**
 across every sanctioned home. Run it against the cycle's OWN start commit and treat a rise as a
 **HARD STOP**, not a note:
 
 ```
-python scripts/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown
+python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown
 ```
 
 ⚠ **The delta the operator cares about is NET OPEN, and it must be ≤ 0.** A cycle that closes
@@ -361,7 +366,7 @@ naming them explicitly. "Next cycle will notice" is the follow-up culture this s
 ⚠⚠ **AND THE BALANCE GATE IS BLIND TO HALF OF IT. `check-anchor-balance` COUNTS *ROWS*, so an
 anchor cited in source with NO ROW IS INVISIBLE TO IT.** ✔MEASURED P40: it reported **"opened 0"**
 while a finished lane had cited a minted anchor id across **six** files with
-no row anywhere in `.plans/`. Only `scripts/check-anchor-registry/check-anchor-registry.sh` catches
+no row anywhere in `.plans/`. Only `.harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py` catches
 that class, and there it is the one telling the truth.
 ⇒ **Run BOTH before calling a cycle clean. A green balance is NOT evidence that nothing was
 opened.**
@@ -440,11 +445,11 @@ do it — `dssharness sync` today.**
 4. **RESTORE** — `git reset --hard`, `git clean -fd`, `git worktree prune`. On **every** exit
    path, `die` included.
 
-★ **ONE OWNER: `scripts/leg-tree/leg-tree.sh`.** Both verbs, all three hosts. The two remote legs
-inline its text into their payload (`"$(cat …)"` — command-substitution output is not re-expanded,
-so the script's own `$` and quotes arrive verbatim); the WSL leg sources it. **Never hand-roll
-these git commands in a leg** — that is the four-hand-written-exclude-lists mistake with a
-destructive verb attached.
+★ **THE CARRIAGE IS `dssharness sync`.** The repository's own shell owner of these steps,
+`leg-tree` (its prepare and restore verbs inlined into each remote leg's payload), was retired on
+2026-09-21, when no leg called it any more; its tree half lives on in
+`.harness-config/runner/actions/owning-tree/owning-tree.py`. **Never hand-roll these git commands in
+a leg** — that is the four-hand-written-exclude-lists mistake with a destructive verb attached.
 
 ⚠ **`-fd`, NEVER `-fdx`.** Ignored paths (`build/`, the ccache) are the leg's own working state;
 deleting them buys tidiness and costs every leg a cold rebuild.
@@ -460,7 +465,7 @@ on the staged tree. ⇒ the three shapes must stay distinct. Today they are `dss
 `…-3` at `8cb9afbd` (**three commits back**) with a **2,696-path index under a 2,759-path working
 tree**, while two carriages withheld `.git` and one shipped it. ★ **The cost is not the disk — it
 is that guards ask git questions.** `check-line-endings` reads `git ls-files --eol`;
-`check-shell-portability` had ALREADY been rewritten in 2026-08-22 to stop asking `git ls-files`
+`check-shell-portability` (retired since, with the shell programs) had ALREADY been rewritten in 2026-08-22 to stop asking `git ls-files`
 because this very host answered about a commit that deleted `tools/*.sh` in P17 and produced
 **seven violations against files that do not exist**. A host whose git disagrees with its files
 makes every git-reading guard a coin flip, and the flip is invisible from the driver.
@@ -474,8 +479,8 @@ removing it.
 
 ⚠ **AND THE TILDE DOES NOT EXPAND.** ✔MEASURED against the live VPS on the first run: every leg
 names its repo `~/src/…`, and `cd "$var"` does **not** expand a tilde held in a variable — `~` is
-expanded only where it appears unquoted in the source text. `leg-tree` normalises the path once,
-where both verbs share it. ★ The dangerous half was not the failed `cd`: `restore` returns 0 when
+expanded only where it appears unquoted in the source text. The retired `leg-tree` normalised the
+path once, where both of its verbs shared it. ★ The dangerous half was not the failed `cd`: `restore` returned 0 when
 the directory is missing, so an unexpanded path would have left every host dirty forever while
 every leg reported success.
 
@@ -518,7 +523,7 @@ at the end.
    worktree that may no longer exist. A lane that exited without discharging its rows is not "done"
    either — spawn its remnant lane first (see the no-follow-ups ruling above).
 2. Apply every lane's ROWS, then re-derive the balance with
-   `check-anchor-balance --base <cycle-start-sha>` and run `check-anchor-registry.sh`. **Both**, for
+   `check-anchor-balance --base <cycle-start-sha>` and run `check-anchor-registry.py`. **Both**, for
    the reason that section gives: a green balance is not evidence that nothing was opened.
 3. The full gate on the FOLDED tree — the leg matrix, not one host.
 4. `.plans/_handoff.md` rewritten in the SAME commit.
@@ -641,13 +646,13 @@ guard can see. ✔MEASURED 2026-08-26: the tree was already carrying **9,661 fil
 orphaned checkouts under `.claude/worktrees/`, three full copies, one of them 287 MB, and
 **`git worktree list` knew about none of them**.
 
-**★ ONE OWNER: `scripts/lane-worktree/lane-worktree.sh`** (`add` / `remove` / `list`) — the same
-shape as `scripts/leg-tree/`, and binding for the same reason: **never hand-roll `git worktree add`
-in a lane.**
+**★ ONE OWNER: `.harness-config/runner/actions/lane-worktree/lane-worktree.py`** (`add` / `remove` / `list`), one
+Python program on every host: **never hand-roll `git worktree add` in a lane.** Every directory it
+and `lane-fold.py` use is read from configuration (`references/worktrees.md`).
 
 ```bash
-bash scripts/lane-worktree/lane-worktree.sh add k      # -> <repo>/.worktrees/k
-bash scripts/lane-worktree/lane-worktree.sh remove k   # removes AND prunes
+python3 .harness-config/runner/actions/lane-worktree/lane-worktree.py add k      # -> <repo>/.worktrees/k
+python3 .harness-config/runner/actions/lane-worktree/lane-worktree.py remove k   # removes AND prunes
 ```
 
 Four clauses, and each is measured rather than asserted — detail in `references/worktrees.md` §H.0b:
@@ -655,15 +660,16 @@ Four clauses, and each is measured rather than asserted — detail in `reference
 1. **`.gitignore`'s `/.worktrees/` rule is what satisfies the "ALL host copies" clause.** The
    transport derives what it carries from git, so that one line is what stops four full repo copies
    riding to macOS and the arm64 VPS on every push. ★ It is ALSO declared independently of git:
-   ✔MEASURED 2026-09-17, `.harness-config/config.json`'s `sync.neverTransfer` names `.worktrees`,
-   `.claude/worktrees`, `.secrets`, `.temp`, `build`, `scratchpad` and `test-scratch` — once, for
-   every host. `dssharness sync --dry-run` lists every path it would write, which is how to CHECK
+   ✔MEASURED 2026-09-23, `.harness-config/config.json`'s `sync.neverTransfer` names `.worktrees`,
+   `.claude/worktrees`, `.temp`, `build`, `scratchpad` and `test-scratch`, and `.secrets` at any
+   depth (`**/.secrets`, which covers the root one too) — once, for every host. `dssharness sync --dry-run` lists every path it would write, which is how to CHECK
    this rather than trust it.
 2. ⚠ **The MAX_PATH budget is now SPENT, not slack.** The move costs **46 characters** on every
    build path: longest build-relative suffix **163**, so `C:/dssp40k` had **87 spare** and
-   `.worktrees/k` has **46**. `lane-worktree.sh` refuses by arithmetic any root leaving under 20,
-   naming in the refusal the anchor for a worktree root that cannot be built on Windows — the defect
-   whose failure mode is a per-TU compile error in files the lane never touched.
+   `.worktrees/k` has **46**. `lane-worktree.py` refuses by arithmetic (exit 3) a name whose longest
+   build path would not stay under `worktrees.pathLimit`, every term read from
+   `.harness-config/config.json` and named in the refusal — the defect it prevents fails as a per-TU
+   compile error in files the lane never touched.
    ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
 3. **The lane that takes a worktree owns removing it**, via `remove` — which prunes, because a stale
    registration lives in `.git/worktrees/` and **never appears in `git status`**.
@@ -1078,17 +1084,17 @@ hand-typing every edit or reading every subsystem.
    baseline presented as the prior lane's** — a byte-identity claim with no provenance, which is
    evidence-shaped and worth nothing.
 6. **Review and fold** — `/pr-review-toolkit:review-pr`, plus the agnosticism pass and the CI-hazard
-   screen. ★★ **If this cycle created or modified a `.sh`/`.ps1` pair, TWIN PARITY IS PART OF THIS
-   STEP** — same inputs, same properties, same flags, same exit codes, both siblings changed in this
-   commit. It is a review obligation because it is not decidable by a script; see the pairing section
-   below. **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
+   screen. ⓘ There is no twin parity to review any more: a program under
+   `.harness-config/runner/actions` is ONE `.py`, and `scripts_index_guard` refuses a `.sh` or `.ps1`
+   there (see the layout section below). **Re-review the fold** if folding changed logic; iterate to a fixed point. Passes that
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
 8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
    in place. `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` rewrites
    the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
    handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
-   writer. A NEW row is `write-anchor.sh --production|--done ... --insert --apply`. ⚠ Never
+   writer. A NEW row is `DssHarness write-anchor <ID> ...` (it WRITES unless given
+   `--anchor-dry-run`). ⚠ Never
    hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
    behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that
    contradicts its own `Trigger` prose.
@@ -1198,8 +1204,9 @@ comes next, fix the handoff: it is the one a future reader will find.
 **Operator instruction 2026-08-19, verbatim:** *"if a tool has a problem, fix before using again, not
 workaround an own tool. reusable tools exists to avoid bunch of problems like mangling or edge cases"*.
 
-- **Look in `references/scripts.md` first.** It indexes every script under `scripts/`, each with its
-  purpose. If one covers the job, invoke it — not "something like it" typed inline.
+- **Look in `references/actions.md` first.** It indexes every program this repository ships — each a
+  DssHarness action under `.harness-config/runner/actions/` — with its purpose. If one covers the
+  job, invoke it — not "something like it" typed inline.
 - **A defect in one of them is FIXED in the cycle that hits it.** A workaround at the call site leaves
   the defect for the next caller and forks the behaviour silently. This is a FIX, so by the 2026-08-15
   ruling **no hard stop gates it**, whatever subsystem it lands in.
@@ -1211,63 +1218,51 @@ workaround an own tool. reusable tools exists to avoid bunch of problems like ma
     well-written one exits **2** with a named refusal that identifies the shell.
   * `bash <C:/.../script.sh>` — bash cannot open the SCRIPT, so **it never executes**.
     Exit **127**, empty log, and **no edit inside any script can ever improve this shape**.
-    The only fix is at the CALL SITE: invoke it as a relative path from Git Bash, or run the
-    `.ps1` twin. ⓘ The root `CMakeLists.txt` asks this same question once, by EXECUTION, before
-    registering any bash-driven entry — that probe is where the rule is enforced now.
+    The only fix is at the CALL SITE: invoke it as a relative path from Git Bash. ⓘ No
+    repository program is a shell script any more (2026-09-21), so this bites only a hand-typed
+    command; the root `CMakeLists.txt`'s bash probe retired with the last bash-driven ctest entry.
   ★ Worth stating because the second shape reads as *"the gate refused"* when what happened
   is *"the wrong bash ran"* — an instrument that misattributes is the failure this project
   cares most about.
-- ⚠ **The reason is measured, not aesthetic.** These scripts hold this project's accumulated edge
+- ⚠ **The reason is measured, not aesthetic.** These programs hold this project's accumulated edge
   cases: a `wsl.exe bash -c` with a variable that once became `rsync -a --delete / /` and reported
   exit 0; quoted heredocs eating backslashes; unanchored rsync excludes that silently skipped a
   changed `.cpp`; `command -v` lying over non-interactive ssh on macOS. Re-typing the pipeline inline
   re-opens all of them at once.
 
-### ★★ MANDATORY: a script added, renamed, deleted, or REPURPOSED updates the reference
+### ★★ MANDATORY: an action added, renamed, deleted, or REPURPOSED updates the reference
 
 In the **same commit**, exactly like `.plans/_handoff.md` — a reference that ships one commit late is
-a reference the next reader cannot trust. This is enforced rather than asked: each script declares its
-purpose once in a `PURPOSE:` line in its own header, both indexes (`scripts/README.md` and
-`references/scripts.md`) are generated from those declarations, and the `scripts_index_guard` ctest
-entry reds when the tree and the indexes disagree.
+a reference the next reader cannot trust. This is enforced rather than asked: each action declares its
+purpose once in a `PURPOSE:` comment line in its own `<name>.yml`, both indexes
+(`.harness-config/runner/actions/README.md` and `references/actions.md`) are generated from those
+declarations, and the `scripts_index_guard` ctest entry reds when the tree and the indexes disagree —
+and when an action has no runner in `.harness-config/config.json`, or a runner names no action.
 
 ```bash
-python scripts/check-scripts-index/check-scripts-index.py --write
+python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py --write
 ```
 
-⚠ A new script also inherits the repository's layout, and the guard checks it: one directory per
-script named for the script, every sibling implementation inside it (`scripts/<name>/<name>.{sh,ps1,py}`),
-assets alongside, and no script loose at the top or buried in a subdirectory.
-### `.sh`/`.ps1` pairing is a JUDGEMENT THE AUTHOR MAKES AND WRITES DOWN — never a gate
+⚠ A new program also inherits the repository's layout, and the guard checks it: one ACTION directory
+per program, named for it, holding its `<name>.yml` and every sibling implementation
+(`.harness-config/runner/actions/[<group>/...]<name>/<name>.{yml,py}`), assets alongside, and
+nothing loose in a group directory, buried in a subdirectory, or nested inside another action. A
+program finds the tree it lives in through the one owner, `owning-tree`, never by counting `..` —
+the move out of `scripts/` broke every count at once.
+### No `.sh` and no `.ps1` under the actions directory — one Python program per action
 
-**Operator ruling 2026-08-19:** *"some scripts are posix executed only, and don't have a .ps1 pair. so
-we must just enforce the dss cycle and dss code prime skills to always create the pair, except when the
-execution is posix only."*
+**Operator ruling 2026-09-21:** *"I don't want .sh/.ps1 files inside .harness-config\runner\actions.
+entrypoint is .yml, you can call .py files, BUT NOT .sh/.ps1 please. They are specific per OS. I don't
+want this anymore"*.
 
-- **Create the `.ps1` twin whenever the capability must reach the Windows leg.** That leg is where this
-  project's primary ctest runs; a bash-only capability is one the main gate cannot use.
-- **Omit it — and say so in the header — when either holds:** the script is already cross-platform (a
-  `.py` runs on both hosts, so a twin would be a second implementation of something never split), or
-  execution is POSIX-ONLY BY NATURE (a driver that runs inside a WSL distro where PowerShell is not
-  the shell; `profile-compile` drives a POSIX toolchain over a carriage).
-- **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
-  script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
-  review, before the commit, when the script is being created or modified. Not after and not a script
-  to it. After committed it must be already working."*
-  ⚠ **Not automatable, and the reason is not laziness:** a script can do literally anything, so
-  equivalence of two arbitrary programs is not a property a detector can decide. What a gate CAN see is
-  existence and metadata — which is why `scripts_index_guard` refuses a sibling whose `PURPOSE:`
-  contradicts its primary, and stops exactly there.
-  **What the reviewer owes when a `.sh`/`.ps1` pair is touched:** the two scan the same inputs, check
-  the same properties, accept the same flags, and return the same exit codes for the same conditions —
-  and a change to one landed in the other in the SAME commit. Pairing by EXISTENCE is not pairing by
-  BEHAVIOUR.
-
-⚠ **This is deliberately NOT enforced by a guard, and the reason is measured:** ✔11 of 21 script
-directories carry no `.ps1` and every one is correct. A gate cannot tell a deliberate POSIX-only script
-from a forgotten twin, so it would need an allowlist of eleven exceptions — the convention written twice,
-in the place least likely to be read, reddening honest work by default. The anchor that demanded such a
-gate was WITHDRAWN on that ruling.
+- Every step of every action starts `python3 <file>.py`; one program runs on every host, so there is
+  no twin to write and no parity to keep. Where a host cannot run a half natively, the program says
+  where it runs (the sqlite driver's POSIX half runs inside WSL through `wsl.exe -e` on Windows).
+- **A gate, not a convention:** `scripts_index_guard` refuses a `.sh` or `.ps1` anywhere under the
+  actions root, by name (the tool's own run directories excepted).
+- The 2026-08-19 convention this replaced — a `.ps1` twin for every `.sh` that had to reach the
+  Windows leg, the pair's parity checked in review — retired with the last pair on 2026-09-21; what
+  each twin became is recorded in `cmake/DssHarnessDeletionInventory.md`.
 
 ## ★★★ NEVER CITE A LINE NUMBER — CITE SOMETHING THE FILE CARRIES
 
@@ -1301,7 +1296,7 @@ the ~2365 pre-existing citations sit in a per-document inventory whose ceilings 
 commit, because unclaimed headroom is where the next one hides.
 
 ```bash
-python scripts/check-plan-citations/check-plan-citations.py --write
+python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --write
 ```
 
 ⚠ **Green there means no NEW positional citation landed — never that the plans cite stably.** The
@@ -1376,12 +1371,13 @@ never lowers the bar.
   the operator, not only to the code, and it opens with the **never-cite-a-line-number** rule.
 - Read `references/dss-harness.md` **before running anything that touches a leg, a worktree or an
   anchor** — `DssHarness` is the tool this repository's harness is moving to, and that file says which
-  of its verbs exist today, which scripts are still the only way to do their job, what this
+  of its verbs exist today, which of this repository's own programs are still the only way to do
+  their job, what this
   repository's `.harness-config/config.json` declares, and the exit codes to act on. ⛔ A defect in
   the tool is a repo-harness issue, never a local workaround, **and it is REPORTED TO THE OPERATOR in
   the cycle that finds it** (ruling 2026-09-16) — see output-contract item 6.
-- Read `references/scripts.md` **before writing any script, probe, or one-off shell pipeline** —
-  the index of every script this repository already ships, each with its purpose. Most of what a
+- Read `references/actions.md` **before writing any script, probe, or one-off shell pipeline** —
+  the index of every program this repository already ships, each with its purpose. Most of what a
   cycle needs is already there, and re-typing it inline re-opens the edge cases it was taught
   (`wsl.exe` quoting, heredocs eating backslashes, unanchored rsync excludes, ssh dropping PATH).
 - Read `references/worktrees.md` before any byte-changing measurement or agent worktree operation.

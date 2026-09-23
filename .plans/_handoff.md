@@ -77,6 +77,110 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ P68 ROUND 8 — READ THIS FIRST: DssHarness 0.5.8 runs all eight legs, no `.sh`/`.ps1` is left in the actions tree, and five lanes landed
+
+**THE LANES THIS COMMIT CARRIES**, each folded md5-verified against its lane (a 3-way merge wherever main had
+moved), its rows applied through `dssharness {write,set}-anchor` and read back identical, and main's own build +
+`repo-guard` label + full ctest run after every fold:
+
+| lane | subject | what landed |
+|---|---|---|
+| `mig` | the migration's last wave (parts 1–5) | every `scripts/` action lives under `.harness-config/runner/actions`, started by its `.yml`. ★ Operator 2026-09-21: *"entrypoint is .yml, you can call .py files, BUT NOT .sh/.ps1"* — all 34 shell programs ported to Python (each twin pair → ONE `.py` holding the stricter of the two rules), and `check-scripts-index` now REFUSES a `.sh`/`.ps1` there by name. The line-endings guard's timeout, red on main every round since 2026-09-07, did not recur in 14 label runs. The sqlite driver is one Python program (Windows and WSL: 3 of 5 legs verified, the two Mach-O legs `runOn=[darwin]`). Found and fixed on the way: the clone lock judged a holder by `ps lstart`, which flips ±26 s on WSL2 (a live holder read as dead); `make -n -B` re-ran configure in the sqlite checkout; `-D`/`-I` were read from inside a token; `lane-worktree.sh` deleted an uncommitted edit under an exported `GIT_DIR`. Part 5: the `windows` test set, the `pwsh`/`bash` tool entries and the bare `.secrets` entry removed (each measured or cited to DssHarness's source); lane-fold's directories read from config; `plan_citations_guard` 99 → 24 s; the host compiler's identity is now a declared precompiled-header input (below) |
+| `fo` | AArch64/asm conformance (parts 3–4) | `register` locals bound to a register, a stack-passed `long double`, a `_Complex long double` return, `__SIZEOF_*__` derived from the type table; **an inline-asm statement is ONE allocation unit** — today's allocator put spill code BETWEEN a template's instructions, and an `ldaxr`/`stlxr` pair with 28 live values LIVELOCKED (P1, born closed); numeric local labels, labels inside a template and the template forms (`%=`, `%{ %}`, x86 punctuation, `%~` through a declared target feature set); the end of input as a declared policy (a `.s` whose last line has no newline, a line or block comment ending the file); `__BITINT_MAXWIDTH__`; a `.s` function's blocks in TEXT order (x86_64 `main` of the numeric-labels example 139 → 109 bytes; gas's is 52, and the remaining gap is five round-9 rows) |
+| `cr` | the driver, the editor and the preprocessor (parts 4–6) | the include resolver's directory listings cached per compile (speedtest1: 11,204 → 826 listings); the editor runs every `target:format` pair and reads manifests by membership; **ONE manifest-relative resolver for every path in a manifest** — a root build started from another directory read the WRONG files and exited 0 (CMake, Cargo, Meson and MSBuild are all manifest-relative); a dependency's includes, defines and hook program resolve against the dependency; a lone `'` in a skipped `#if` group swallowed every directive up to the next one (`#error` never fired; P1); `$` in identifiers; `--suppress` silences Warnings and Notes, never an Error; a tag defined in a parameter list, and C 6.2.1p4's one scope for a definition's parameters and its body (`int f(int x){ int x; }` was ACCEPTED; all four references refuse it) |
+| `ht` | the IR text formats and the front end | composites defined ONCE and referenced (HIR v5, `.dssir` v2's `types` table — `emitMir` on sqlite3.c went from 30 GB RSS and `std::bad_alloc` to 30 MB in 223 ms); the MIR text reader never aborts, hangs or cascades on malformed text (P0, born closed: 17 aborts and 3 hangs measured); every slot and handle table sized by the text's entries, never by a number written in it (`%4000000000` was `bad_alloc`); function signatures with incomplete or named-`void` parameters; **`const`/`restrict` spelled in a typedef reach every declaration** (a `const` global declared through a typedef sat in writable `.data`); `++`/`--` on a `const` lvalue refused through the assignment's own check |
+| `vn` | the linker (parts 2–3) | the ±4 GiB veneer (GNU ld's long-branch stub as the target's verbs; Mach-O refused by name — ld64.lld mislinks it); a runpath (`--rpath`, a manifest's `runpaths`, DT_RUNPATH / LC_RPATH with `$ORIGIN` / `@loader_path`; PE accepts it with the warning `K_FormatLacksRunpath`) |
+
+**Also (orchestrator).**
+- **The fold tool's defects**, each found by a fold and fixed:
+  - a rename merged across the move dropped main's edit to the old path;
+  - a lane change that put a file back to HEAD's bytes was invisible to `git status`, so the fold kept main's stale copy. fo's nine format documents kept a `__SIZEOF_LONG_DOUBLE__` row that `c.lang.json` also declared, and **1457 of 2324 tests went red on main** (`C_ConflictingPredefinedMacro` on every C compile) until they were folded. Folds now diff against the lane's last-fold snapshot;
+  - a path staged as added and then deleted stayed in the index;
+  - the row apply now dry-runs every row through the door before writing any.
+- **The machine lost power at 04:30** mid-round. Recovery was verified before any work resumed: no git lock files, no crash-zeroed file among the 957 touched after 04:00, and every fold re-verified on disk.
+- **Visual Studio updated MSVC in place at 07:58** (`cl` 19.51.36257 → .36260 under the same `14.51.36231` path). Every tree configured before then failed C1853 on every precompiled-header consumer, and neither CMake nor ninja could see why. The fix is ours: a build-time stamp of the host compiler binary is now a declared input of every precompiled header (`cmake/DssHostCompilerStamp.cmake`; proven on a real stale tree).
+- **The registry's status vocabulary:** both registry headers and three skills still taught `🔵 🟠 OPEN (DISCLOSED)`, which `dssharness` REFUSES. The cells and the tool use `🔵 DISCLOSED`. The docs are corrected.
+- **14 rows that lanes had born "created" were relabelled DISCLOSED.** Each describes behaviour HEAD already had, which is the registry's own definition of a disclosure. Only the status and the trigger's opening words changed, and every trigger's tail was verified byte-identical.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **590 open against 580 at HEAD**, "12 closed, 22
+opened (2 created, 20 disclosed); counted −10"; banding **P0 0 · P1 62 · P2 185 · P3 328 · P4 11 · P5 4**;
+`read-anchors --lint` 0 findings. The two rows created (not disclosed): `D-ASM-UNREACHABLE-TAIL-EMITS-A-TRAP` (this
+round's own emission) and `D-LSP-UNLISTED-HEADER-CHECKED-UNDER-EVERY-MANIFEST-NOT-ITS-INCLUDERS` (the residual part 5
+left on purpose). ✔MEASURED against HEAD: **91 new rows** — 69 born closed, 22 born open (2 created, 20 disclosed) — and 12
+rows open at HEAD closed (the done registry 1488 → 1569 rows).
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.8) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2 · **2343 / 2343** | **MSVC 19.51.36260** (read from the tree's own `CMakeCXXCompiler.cmake`; VS 18.10.12217.157) · **2343 / 2343** |
+| WSL x86_64, gcc 13.3 | **2312 / 2312** | **2312 / 2312** |
+| arm64 VPS, gcc 13.3 | **2312 / 2312** | **2312 / 2312** |
+| macOS arm64, AppleClang 21.0 | **2311 / 2312** — the one red: `harness/sqlite_driver_selftest` | **2311 / 2312** — the same one |
+
+- **2312 = 2343 minus the 31-entry `repo-guard` label.** An indirect leg (WSL, ssh) does not run it, by the operator's
+  2026-08-25 ruling recorded in the root `CMakeLists.txt`: a repository guard checks the source tree, and the tree is
+  byte-identical everywhere. 0.5.8 has no per-leg exclusion, so the gate is two invocations. The first, over all eight
+  legs, ran the label on WSL and the VPS too, and each leg's ONE red was `line_endings_guard` arm S8b. That arm asserts
+  its own (new) file is in the git INDEX, and a synced leg's index is the remote clone's own (reported). Every product
+  test passed there too.
+- **WSL:** one leg was lost to a DssHarness start-up race (two legs starting on a VM with a fresh `/tmp` →
+  `mkdir("/tmp/.dotnet/shm/global") … EEXIST`, exit 70), twice. That leg ran alone.
+- **The VPS counts were READ from the host:** `.harness-config/runner/actions/read-leg-path/`, new this round, reads a
+  path inside a leg's tree on its own host, redacted, and keeps it for `sync --pull`. DssHarness keeps a remote leg's
+  logs on the host and has no verb to read them (reported).
+- **macOS:** the first run failed at BUILD on both configurations. The runner read the error:
+  `tests/harness/test_sqlite_harness_legs.cpp` passed `fs::last_write_time(p).time_since_epoch().count()` to
+  `std::to_string`, and libc++'s `file_time_type` counts in `__int128`, which no overload takes. libstdc++ and MSVC
+  count in 64 bits, so only the Mac saw it. Fixed: the count goes through `duration_cast<nanoseconds>`.
+  Re-run from PowerShell after the fix: both legs BUILD, and every product test passes on macOS. Each leg's
+  ONE red is `harness/sqlite_driver_selftest`, the Python sqlite driver's first contact with macOS (`mig`
+  proved it on Windows and WSL; the Mac was never available to it). Four arms fail: n28 (a Python-written
+  archive's members listed through the HOST `ar`), sh39 and sh40 (both built on that listing), and n38
+  (the exact `make -n -B -o Makefile` argv). The self-test prints only the arms' names, so the cause on the
+  Mac's own `ar` and `make` is unread. The driver must work there for the Mach-O sqlite legs: the FIRST item
+  after this commit.
+- **Two changes landed after the six non-Mac legs ran:** that one test line, and the `read-leg-path` action. On the
+  final tree: the `repo-guard` label 31/31 (after the encoding guard made the new script set UTF-8 at import), and the
+  changed test passed on MinGW.
+- **Reaching the Mac from this machine:** run DssHarness from POWERSHELL. From Git Bash, PATH puts Git's msys
+  `ssh.exe` first, and it failed to resolve the Mac's `.local` name one second after DssHarness's own probe resolved
+  it. PowerShell's `ssh` is Win32-OpenSSH, which asks the Windows resolver.
+
+**DssHarness.** Sent to repo-harness this round (session `Implementation Loop`):
+- #1: `init` notes our load-bearing `!…/` re-includes as "does nothing there";
+- #1: an id-less toolchain entry in CMake's file-API reply (googletest's C) → `CompilerFacts.HeldTo` → every leg Unwitnessed (worked around on our side by CXX-only `compilerId`, and reported);
+- #2: `build` DELETES the whole build directory whenever any build input changed (a budget-table edit → a 1,186-step rebuild);
+- #2: the sync walk's depth check, second symptom;
+- #2: a label can be excluded but never selected;
+- #2: `successPattern` is undocumented;
+- #2: `delete-worktree` and the path budget differ from our old tool's policy;
+- #3: a compiler updated in place is invisible to a leg tree (compare the recorded compiler VERSION).
+<gate summary + survey + MSVC verdict line — TBD>
+
+**FIRST, BEFORE ROUND 9's LANES — the sqlite driver on macOS (harness, fixed when faced).** Four
+`harness/sqlite_driver_selftest` arms fail on the Mac and nowhere else:
+- n28: the host `ar` lists a Python-written archive's members;
+- sh39 and sh40: both built on that listing;
+- n38: `make`'s exact argv.
+Measure the Mac's `ar` and `make` through `read-leg-path` (and a filtered `dssharness test --legs macos-arm64-debug
+--filter harness/sqlite_driver_selftest --exclude repo-guard`) FROM POWERSHELL, fix the driver, and re-run the Mac pair.
+
+**NEXT — P68 ROUND 9.** Every item below is a row with its measurement, its references' behaviour and its owner:
+- P1 `D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS`: all four references build and run with a warning. gcc 14 made it an error by default; our pinned references are gcc 13, clang 18 and MSVC 19.51.
+- P1 `D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS`: the owner is `SynthBuilder`, which gets no target and spells a constant's type by signedness alone. Mach-O's `INT64_MAX` is not `long long` today for the same reason.
+- P1 `D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX`: a silent wrong result.
+- P1 `D-C-A-WRITE-TO-AN-ELEMENT-OF-FUNC-IS-ACCEPTED-INTO-READ-ONLY-DATA`: DSS's x86_64 image segfaults. No reference makes it work, so the refusal is owed.
+- P2 "x86 encodings pick the shortest form the operand fits": `D-ASM-X86-BRANCHES-ARE-ALWAYS-REL32` + `D-ASM-X86-SMALL-IMMEDIATES-TAKE-THE-WIDE-FORM`, as one piece of work. Every x86 program DSS emits pays for both, C included.
+- P2: C23 tag compatibility (N3037), typeof's qualifiers, a const pointee reached through a call, `<wchar.h>`, `__float128`/`__float80`, the template's own label address (F-a), an operand inside a dropped `{att|intel}` arm (F-b), and the editor's dependency manifests.
+- P3: the `cbz`/`cbnz` second word, a fall-through into a label written as a jump, the unreachable tail's trap, a function typedef's parameter qualifiers, `void f(const void v)`, and the editor's unlisted header.
+- HARNESS: `anchors.py` is a LIVE second row writer (`lane-fold land`, `check-stale-blockers`, `apply-registry-row`). It builds the old DISCLOSED spelling and refuses the canonical one. The question is whether one door (`dssharness write-anchor`) can serve every writer.
+- HARNESS: the sqlite driver's Step 5 without `DSS_BIN` needs the Visual Studio environment.
+- HARNESS: Step 9 prints the launcher's mtime, not the compiler's. `dsscp` should report its build stamp.
+- HARNESS: a `std::to_array` sweep of hand-sized key vocabularies.
+
+---
+
 ### ★ P68 ROUND 7 — READ THIS FIRST: six lanes folded, the "MSVC" leg is MSVC again, and the migration's last wave waits for repo-harness round four
 
 ⚠ **ROUND 6's GATE TABLE BELOW MISLABELS ITS WINDOWS RELEASE LEG.** It says *"MSVC Release"*; it was

@@ -59,13 +59,16 @@ namespace dss {
 // working as designed, and a diagnostic there would make every cross-platform
 // project noisy on two hosts out of three.
 //
-// `cwd` is the directory the child is spawned in. It is a PARAMETER rather than
-// "the process working directory" because this one function serves two callers
-// with two different answers: the ROOT manifest's scripts run in the process
-// working directory, and a DEPENDENCY manifest's scripts must run in THAT
-// dependency's own directory — a `dependsOn` project whose codegen step ran in
-// the depender's directory would generate its files into the wrong tree, and
-// would do so silently. One function, one parameter; no caller-kind branch.
+// `cwd` is THE MANIFEST'S OWN DIRECTORY (`manifestDirectoryOf`) — the root
+// manifest's and a dependency manifest's alike
+// ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]).
+// Two things take it as their base: the directory the child is spawned in, so a
+// hook that writes `generated/main.c` and a manifest that reads
+// `generated/*.c` name the same place; and a `run[0]` spelled as a PATH, which
+// is re-based onto it before the spawn (a BARE `run[0]` stays a PATH lookup).
+// EMPTY — a manifest named with no directory component — means the process
+// working directory, which is that manifest's directory, and the spawn layer's
+// empty-path sentinel says "inherit" rather than materializing a cwd.
 //
 // STOP AT THE FIRST FAILURE. Build hooks are ORDERED work — entry 2 routinely
 // consumes what entry 1 produced — so continuing past a failure runs steps

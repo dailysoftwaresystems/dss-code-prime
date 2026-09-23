@@ -3850,6 +3850,7 @@ void forEachDescriptorInClosure(
     std::filesystem::path const&                             startPath,
     std::span<std::filesystem::path const>                   systemDirs,
     HeaderNameMatching                                       matching,
+    HeaderSearchCache&                                       cache,
     std::optional<ObjectFormatKind>                          activeFormat,
     std::unordered_set<core::PathIdentity>&                  visited,
     std::function<void(std::filesystem::path const&)> const& visit,
@@ -3897,7 +3898,7 @@ void forEachDescriptorInClosure(
             // spelling gets — a `includes:["Windows.h"]` edge must reach
             // `windows.json` on a pe build from ANY host, and must NOT on an elf one.
             HeaderSearchResult child =
-                resolveSystemDescriptor(edge.headerName, systemDirs, matching);
+                resolveSystemDescriptor(edge.headerName, systemDirs, matching, cache);
             if (child.status != HeaderSearchStatus::Found) {
                 onUnresolvedInclude(edge.headerName, child);
                 continue;
@@ -3988,7 +3989,10 @@ void forEachDescriptorInClosure(
     // SAFE BY CONSTRUCTION, not by hope: the only site that invokes it is guarded
     // on `activeFormat.has_value()`, and this overload passes nullopt. See the
     // header for why this is an overload rather than a default argument.
-    forEachDescriptorInClosure(startPath, systemDirs, matching,
+    // No compile around this walk, so it lists for itself — once per directory
+    // for the one walk (see the header).
+    HeaderSearchCache walkOwn;
+    forEachDescriptorInClosure(startPath, systemDirs, matching, walkOwn,
                                /*activeFormat=*/std::nullopt, visited, visit,
                                onUnresolvedInclude,
                                [](std::string const&,
@@ -4406,6 +4410,46 @@ realizeRow(ShippedLibDescriptor const& desc, ShippedSymbol const& sym,
 }
 
 } // namespace
+
+// ── D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION ──────
+// See the header. Built on `realizeRow` — the kernel the corpus oracle and the
+// descriptor-surface realization already share — so "does this row have a body
+// on this format" has ONE answer however it is asked.
+std::optional<ParseDiagnostic>
+refuseShippedSymbolWithoutABody(ShippedLibDescriptor const&  desc,
+                                ShippedSymbol const&         sym,
+                                ObjectFormatKind             activeFormat,
+                                std::filesystem::path const& descriptorPath) {
+    std::string const formatKey{objectFormatKindName(activeFormat)};
+    bool const docAvailableHere =
+        objectFormatInAvailabilitySet(desc.availableObjectFormats, activeFormat);
+    ShippedSymbolRealization const real =
+        realizeRow(desc, sym, activeFormat, formatKey, docAvailableHere);
+    if (real.status != ShippedRealizationStatus::NoLibraryForFormat) {
+        return std::nullopt;
+    }
+    // A `library` entry naming a ROLE is a body declared THROUGH the format's
+    // runtime-library table: a caller that resolves no roles (no resolver — the
+    // direct-API and layout tests) sees no image for it, and that is its own
+    // choice to bind nothing, not a descriptor without a body. The declared roles
+    // are recorded whether or not a resolver answered them, which is what makes
+    // the two cases tellable apart here.
+    if (sym.libraryRoles.contains(formatKey) || desc.libraryRoles.contains(formatKey)) {
+        return std::nullopt;
+    }
+    ParseDiagnostic d;
+    d.code     = DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = "shipped descriptor `" + core::genericSpelling(descriptorPath)
+               + "` (`<" + desc.header + ">`) declares `" + sym.name
+               + "` available on object format `" + formatKey
+               + "` but names no body for it there: no `library` image, no "
+                 "`realization` source and no `synthesize` recipe for `"
+               + formatKey + "`. Give the row one of the three for `" + formatKey
+               + "`, or leave `" + formatKey + "` out of its "
+                 "`availableObjectFormats`";
+    return d;
+}
 
 std::optional<std::unordered_map<std::string, std::vector<std::string>>>
 collectShippedExternSymbolFormats() {
@@ -5218,7 +5262,8 @@ struct ClosureSurfaceOnFormat {
 [[nodiscard]] ClosureSurfaceOnFormat
 closureSurfaceOnFormat(std::filesystem::path const&           startPath,
                        std::span<std::filesystem::path const> systemDirs,
-                       ObjectFormatKind                       fmt) {
+                       ObjectFormatKind                       fmt,
+                       HeaderSearchCache&                     cache) {
     ClosureSurfaceOnFormat outS;
     std::unordered_set<core::PathIdentity> visited;
     // Case-SENSITIVE resolution, and the choice is load-bearing rather than
@@ -5230,7 +5275,7 @@ closureSurfaceOnFormat(std::filesystem::path const&           startPath,
     // claim or an edge that resolves here resolves on every format — and one that
     // does not is refused with a spelling the author can fix in one place.
     forEachDescriptorInClosure(
-        startPath, systemDirs, kDefaultHeaderNameMatching, fmt, visited,
+        startPath, systemDirs, kDefaultHeaderNameMatching, cache, fmt, visited,
         [&](std::filesystem::path const& p) {
             DiagnosticReporter throwaway;
             auto names = shippedSurfaceNamesForFormat(p, fmt, throwaway);
@@ -5364,6 +5409,10 @@ bool validateShippedIncludeClosure(
     // filesystem's, and a sweep that reports its failures in a host-dependent
     // order is a sweep whose output cannot be diffed).
     std::sort(descriptors.begin(), descriptors.end());
+    // One view of the corpus for the whole sweep: every closure it walks lists
+    // the search directories once, not once per edge per descriptor per format
+    // ([[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]).
+    HeaderSearchCache sweepOwn;
 
     std::span<std::filesystem::path const> const searchDirs{&descriptorDir, 1};
 
@@ -5385,7 +5434,7 @@ bool validateShippedIncludeClosure(
         for (ObjectFormatKind const fmt : declaredFormatsOf(*avail, servedFormats)) {
             std::string const fmtName{objectFormatKindName(fmt)};
             ClosureSurfaceOnFormat const cs =
-                closureSurfaceOnFormat(p, searchDirs, fmt);
+                closureSurfaceOnFormat(p, searchDirs, fmt, sweepOwn);
 
             // (i) — the two ways an active edge fails to land.
             for (std::string const& h : cs.unresolvedEdges) {
@@ -5438,6 +5487,19 @@ bool validateShippedSurfaceRequirements(
     std::span<std::filesystem::path const> systemDirs,
     std::optional<ObjectFormatKind>        activeFormat,
     DiagnosticReporter&                    reporter) {
+    // No compile around this check: it lists for itself (see the header).
+    HeaderSearchCache checkOwn;
+    return validateShippedSurfaceRequirements(macros, declaringDocument, systemDirs,
+                                              activeFormat, reporter, checkOwn);
+}
+
+bool validateShippedSurfaceRequirements(
+    std::span<PredefinedMacroDef const>    macros,
+    std::string_view                       declaringDocument,
+    std::span<std::filesystem::path const> systemDirs,
+    std::optional<ObjectFormatKind>        activeFormat,
+    DiagnosticReporter&                    reporter,
+    HeaderSearchCache&                     cache) {
     // ═══ D-LANG-PREDEFINED-MACRO-REQUIRES-REALIZED-SURFACE — SATISFACTION ═══
     //
     // The SHAPE of the predicate is core's (`ShippedSurfaceClaim`); this
@@ -5519,7 +5581,7 @@ bool validateShippedSurfaceRequirements(
                 // active one, and a per-format case policy cannot answer a
                 // cross-format question.
                 HeaderSearchResult const hit = resolveSystemDescriptor(
-                    claim.header, systemDirs, kDefaultHeaderNameMatching);
+                    claim.header, systemDirs, kDefaultHeaderNameMatching, cache);
                 if (hit.status != HeaderSearchStatus::Found) {
                     emitUnbackedPredefine(reporter,
                         std::string{"predefined macro '"} + pm.name + "' ("
@@ -5543,7 +5605,7 @@ bool validateShippedSurfaceRequirements(
                     continue;
                 }
                 ClosureSurfaceOnFormat const cs =
-                    closureSurfaceOnFormat(hit.path, systemDirs, fmt);
+                    closureSurfaceOnFormat(hit.path, systemDirs, fmt, cache);
                 if (!cs.undecodable.empty()) {
                     emitUnbackedPredefine(reporter,
                         std::string{"predefined macro '"} + pm.name + "' ("

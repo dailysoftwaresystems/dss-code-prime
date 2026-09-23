@@ -106,6 +106,14 @@ target_include_directories(
 dss_add_test(NAME analysis/preprocess/test_skipped_group_not_otherwise_processed
              SOURCES test_skipped_group_not_otherwise_processed.cpp)
 
+# D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ + D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED:
+# a character constant, string literal or header name ENDS AT ITS LINE (the
+# tokenizer honours `stringStyle.multiline`), and a conversion diagnostic is
+# delivered only for a token phase 7 converts. Tokenizer and preprocessor pins
+# in one binary because the second defect was hidden behind the first.
+dss_add_test(NAME analysis/preprocess/test_literal_ends_at_its_line
+             SOURCES test_literal_ends_at_its_line.cpp)
+
 # [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the include PRE-SCAN's macro state IS
 # the authoritative `MacroExpander`, hosted as an oracle — so the guard that
 # decides whether a quote-`#include` is spliced is evaluated by the same engine
@@ -140,3 +148,37 @@ dss_add_test(NAME analysis/preprocess/test_feature_query_operator_family
 target_include_directories(
     dss_analysis_preprocess_test_feature_query_operator_family
     PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 8 (D-C-SIZEOF-LONG-DOUBLE-NOT-PREDEFINED, then
+# D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): `__SIZEOF_LONG_DOUBLE__`, the C
+# language's `type-size` row, realized on every (target x format) pair and
+# pinned against the size `sizeof(long double)` has there — derived from the
+# grammar's own `long double` row, never a table of numbers — and absent where
+# the format refuses the type or no pair was named. A separate binary rather
+# than more cases in test_preprocessor.cpp because it is a sweep over every
+# SHIPPED document on disk, which that file's in-memory fixtures deliberately
+# do not load.
+dss_add_test(NAME analysis/preprocess/test_sizeof_long_double_macro
+             SOURCES test_sizeof_long_double_macro.cpp)
+
+# P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the whole
+# `__SIZEOF_*__` family — every member a `type-size` row of the language, the
+# targets' platform ABI typedefs behind `wchar_t`/`wint_t`, and a translation
+# unit of `_Static_assert(sizeof(T) == __SIZEOF_T__)` COMPILED FOR EVERY REAL
+# PAIR (through `applyTargetFormatPair` and `analyzeForTargetFormat`, the
+# driver's own two halves), so DSS's preprocessor and DSS's `sizeof` must give
+# one answer. Separate from the `long double` pin above because that one sweeps
+# the merge over every pair, plausible or not, while this one compiles C.
+dss_add_test(NAME analysis/preprocess/test_sizeof_macro_family
+             SOURCES test_sizeof_macro_family.cpp)
+
+# P68 round 8 (D-C-BITINT-MAXWIDTH-MACRO-RESTATES-THE-MODEL-BOUND): a predefined
+# macro whose value is a limit of DSS's own model — `__BITINT_MAXWIDTH__`, named
+# by `kind: model-limit` and written by the loader from `kBitIntMaxWidth`. Pins
+# the document (no number), the loaded value, the width check reading the same
+# number through the driver's two halves, and the loader's refusals. Reads the
+# shipped config, so it MUST run through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_model_limit_macros
+             SOURCES test_model_limit_macros.cpp)
+target_link_libraries(dss_analysis_preprocess_test_model_limit_macros
+    PRIVATE nlohmann_json::nlohmann_json)

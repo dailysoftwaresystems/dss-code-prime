@@ -13,6 +13,7 @@
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
 #include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
 #include "link/object_format_backend.hpp"     // D-LINK-…-KIND-IDENTITY-BRANCHES: the format-identity SEAM
+#include "link/runpath.hpp"                   // RunpathDeclaration (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH)
 
 #include <array>
 #include <cstdint>
@@ -1995,6 +1996,33 @@ struct DSS_EXPORT ObjectFormatData {
     // why each of the four verbs exists and what it tells the user to do.
     std::optional<StackReserveUnsupportedReason> stackReserveUnsupportedReason;
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: where an image of this format
+    //    records the directories its loader searches for its libraries ──────
+    //
+    // `"runpath"` in the JSON: the closed CARRIER verb naming the structure
+    // (`elf-dynamic-entry`, `macho-load-command`), its parameters, and this
+    // format's spelling of the image's own directory. See `link/runpath.hpp`
+    // for the measured reference behaviour each part of it transcribes.
+    //
+    // `std::nullopt` = an image of this format records no runpath, and that is
+    // NOT a refusal: both PE references ACCEPT an rpath request and emit
+    // nothing (the Windows loader searches the application's directory), so a
+    // request against such a format is accepted, recorded nowhere, and reported
+    // by a WARNING (`K_FormatLacksRunpath`) rather than dropped in silence.
+    // Declared by the six ELF exec/pie/dyn documents and the four Mach-O
+    // exec/dylib documents; `validate()` refuses it on a format that is not an
+    // image flavor (nothing would ever read it) or whose backend's walker does
+    // not write the declared carrier.
+    std::optional<RunpathDeclaration> runpath;
+
+    // The REMEDY axis of the same row (`"runpathUnsupportedReason"`): WHERE the
+    // loader of an image format that records no runpath finds a library
+    // instead, as a closed verb the warning turns into a sentence. Mutually
+    // exclusive with `runpath`; refused on a non-image flavor, whose answer is
+    // derived (nothing loads it). OPTIONAL. Declared by the two PE image
+    // documents. See `RunpathUnsupportedReason` (link/runpath.hpp).
+    std::optional<RunpathUnsupportedReason> runpathUnsupportedReason;
+
     // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the weak-DEFINITION
     //    spelling this format uses (`"weakDefinition"` in the JSON) ────────
     //
@@ -2820,6 +2848,24 @@ public:
     [[nodiscard]] std::optional<StackReserveUnsupportedReason>
     stackReserveUnsupportedReason() const noexcept {
         return d_.stackReserveUnsupportedReason;
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: how an image of this format records
+    // a runpath, or `std::nullopt` if it records none. Presence is the
+    // capability — the question the gate and both writers ask, never a format
+    // identity. Returned by reference: the declaration carries strings.
+    [[nodiscard]] std::optional<RunpathDeclaration> const&
+    runpath() const noexcept {
+        return d_.runpath;
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: WHERE this image format's loader
+    // finds a library instead, when it records no runpath; `std::nullopt` ⇒
+    // not declared (the warning then says so). Never has a value when
+    // `runpath()` does — exclusive by load-time validation.
+    [[nodiscard]] std::optional<RunpathUnsupportedReason>
+    runpathUnsupportedReason() const noexcept {
+        return d_.runpathUnsupportedReason;
     }
 
     // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the dialect this format

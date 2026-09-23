@@ -1525,6 +1525,93 @@ TEST(MirVerifier, VariadicCallWithFewerThanFixedArgumentsRejected) {
         << allActuals(r);
 }
 
+// ── P68 round 8 (lane `ht`, part 2): A `void` PARAMETER ENDS THE ARGUMENT LIST ──
+//
+// The MIR twin of `HirVerifier.ACallsArgumentsEndAtAVoidParameter`: a C
+// declaration that is not a definition may name a parameter of type void, and
+// gcc's measured meaning is that a call's arguments END at it (`f()` / `f(42)` RUN
+// against `void f(void)` / `void f(int)` defined in another translation unit). The
+// gate asks the SAME lattice helper as the semantic call check and the HIR verifier
+// — `fnArgumentParams` / `fnArgumentsVariadic` — so reverting it turns all three
+// red together.
+
+namespace {
+
+// A caller whose one `Call` passes `args` i32 constants to a callee typed `sig`,
+// verified into `r`; returns the verdict.
+bool verifyVoidTerminatedCall(TypeInterner& in, TypeId sig, std::size_t args,
+                              DiagnosticReporter& r) {
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const callerSig = in.fnSig({}, voidTy, CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(callerSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    std::vector<MirInstId> ops{b.addGlobalAddr(SymbolId{2}, in.pointer(sig))};
+    for (std::size_t k = 0; k < args; ++k)
+        ops.push_back(b.addConst(litOf(static_cast<std::int64_t>(k), TypeKind::I32), i32));
+    b.addInst(MirOpcode::Call, ops, voidTy);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+    MirVerifier v{m, &in};
+    return v.verify(r);
+}
+
+} // namespace
+
+TEST(MirVerifier, ACallsArgumentOperandsEndAtAVoidParameter) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const onlyVoidPs{voidTy};
+    std::array<TypeId, 2> const intThenVoidPs{i32, voidTy};
+    TypeId const onlyVoid    = in.fnSig(onlyVoidPs, voidTy, CallConv::CcSysV);
+    TypeId const intThenVoid = in.fnSig(intThenVoidPs, voidTy, CallConv::CcSysV);
+    TypeId const voidThenDots =
+        in.fnSig(onlyVoidPs, voidTy, CallConv::CcSysV, /*isVariadic=*/true);
+    for (auto const& [sig, args] : {std::pair{onlyVoid, std::size_t{0}},
+                                    std::pair{intThenVoid, std::size_t{1}},
+                                    std::pair{voidThenDots, std::size_t{0}}}) {
+        DiagnosticReporter r;
+        EXPECT_TRUE(verifyVoidTerminatedCall(in, sig, args, r)) << allActuals(r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 0u)
+            << args << " operand(s) to signature #" << sig.v << allActuals(r);
+    }
+}
+
+TEST(MirVerifier, AnArgumentOperandAtOrPastTheVoidParameterStillFires) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const onlyVoidPs{voidTy};
+    std::array<TypeId, 2> const intThenVoidPs{i32, voidTy};
+    TypeId const onlyVoid    = in.fnSig(onlyVoidPs, voidTy, CallConv::CcSysV);
+    TypeId const intThenVoid = in.fnSig(intThenVoidPs, voidTy, CallConv::CcSysV);
+    TypeId const voidThenDots =
+        in.fnSig(onlyVoidPs, voidTy, CallConv::CcSysV, /*isVariadic=*/true);
+    for (auto const& [sig, args] : {std::pair{onlyVoid, std::size_t{1}},      // at the void
+                                    std::pair{intThenVoid, std::size_t{2}},   // past it
+                                    std::pair{intThenVoid, std::size_t{0}},   // before it
+                                    std::pair{voidThenDots, std::size_t{1}}}) {
+        DiagnosticReporter r;
+        EXPECT_FALSE(verifyVoidTerminatedCall(in, sig, args, r));
+        EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u)
+            << args << " operand(s) to signature #" << sig.v << allActuals(r);
+    }
+}
+
+// A QUALIFIED void is not the end: the declared list is the argument list.
+TEST(MirVerifier, AQualifiedVoidParameterDoesNotEndTheOperandList) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const ps{in.volatileQualified(voidTy)};
+    TypeId const sig = in.fnSig(ps, voidTy, CallConv::CcSysV);
+    DiagnosticReporter r;
+    EXPECT_FALSE(verifyVoidTerminatedCall(in, sig, 0, r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_CallSignatureMismatch), 1u) << allActuals(r);
+}
+
 // Positive: an INDIRECT call — the callee is a register value (here an `Arg`
 // holding a function pointer, the synth_threads_shim once-adapter shape) — has
 // NO static callee, so there is no signature to check against. It must be
@@ -2476,4 +2563,175 @@ TEST(MirVerifier, InlineAsmGotoWithAStalePoolIndexIsReportedRatherThanAborting) 
                             "descriptor-pool range [0, 0)")) << said(r);
     // The label-arity rule must have SKIPPED rather than read the stale index.
     EXPECT_FALSE(saidThat(r, "inlineasmgoto declares")) << said(r);
+}
+
+// ── THE VERIFIER'S VERDICT IS ITS OWN COUNT, AND NO SUPPRESS LIST SILENCES IT ─
+//
+// ✔MEASURED P68 round 8 (lane `ht`, part 1b): `MirVerifier::verify` answered
+// "clean" from the reporter's error delta, and five of its codes were not in
+// `kUnsuppressableCodes` — so a module refused for `I_AllocaAlignmentNotPowerOfTwo`
+// or `I_LayoutUseBeforeDef`, verified twice into ONE reporter, PASSED the second
+// time (the repeat dropped as a recent duplicate), and a suppress list naming the
+// code passed it outright with nothing printed. Every arm below builds a module
+// carrying exactly one of those five violations; the first three codes it names
+// had NO test at all before this one.
+namespace {
+
+struct FiveViolation {
+    char const*    what;
+    DiagnosticCode code;
+    Mir (*build)(TypeInterner&);
+};
+
+Mir badAllocaAlignment(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder b;
+    (void)b.addFunction(in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV),
+                        SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    b.addInst(MirOpcode::Alloca, {}, in.pointer(i32), 0, MirInstFlags::None,
+              /*payload2=*/3);   // alignment 3 — not a power of two
+    b.addReturn();
+    return std::move(b).finish();
+}
+
+Mir layoutInverted(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder b;
+    (void)b.addFunction(in.fnSig({}, i32, CallConv::CcSysV), SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const cUse  = b.createBlock(StructCfMarker::Linear);   // laid out BEFORE…
+    MirBlockId const bDef  = b.createBlock(StructCfMarker::Linear);   // …the def it uses
+    b.beginBlock(entry);
+    b.addBr(bDef);
+    b.beginBlock(bDef);
+    MirInstId const tv = b.addConst(intLit(10), i32);
+    b.addBr(cUse);
+    b.beginBlock(cUse);
+    std::array<MirInstId, 2> const useOps{tv, tv};
+    b.addReturn(b.addInst(MirOpcode::Add, useOps, i32));
+    return std::move(b).finish();
+}
+
+Mir bitIntWidthMismatch(TypeInterner& in) {
+    TypeId const bi8  = in.bitInt(8, true);
+    TypeId const bi16 = in.bitInt(16, true);
+    MirBuilder b;
+    (void)b.addFunction(in.fnSig({}, bi8, CallConv::CcSysV), SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const x = b.addConst(intLit(1), bi16);
+    std::array<MirInstId, 2> const ops{x, x};
+    b.addReturn(b.addInst(MirOpcode::Add, ops, bi8));   // a _BitInt(8) add of two _BitInt(16)s
+    return std::move(b).finish();
+}
+
+// A well-formed SEH region 1 (the structure rule runs only in a module that has a
+// SehTryBegin) whose guarded body closes region 9 — which no SehTryBegin opened.
+Mir sehTryEndOfAnUnopenedRegion(TypeInterner& in) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder b;
+    (void)b.addFunction(in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV),
+                        SymbolId{1});
+    MirBlockId const entry   = b.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const guarded = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const filter  = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const handler = b.createBlock(StructCfMarker::Linear);
+    MirBlockId const join    = b.createBlock(StructCfMarker::Linear);
+    b.beginBlock(entry);
+    b.addSehTryBegin(guarded, filter, /*region=*/1);
+    b.beginBlock(guarded);
+    b.addInst(MirOpcode::SehTryEnd, {}, InvalidType, /*region=*/9);   // opened by nobody
+    b.addBr(join);
+    b.beginBlock(filter);
+    b.addSehFilterReturn(b.addConst(intLit(1), i32), handler, /*region=*/1);
+    b.beginBlock(handler);
+    b.addBr(join);
+    b.beginBlock(join);
+    b.addReturn();
+    return std::move(b).finish();
+}
+
+Mir stackRestoreScopeMismatch(TypeInterner& in) {
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    MirBuilder b;
+    (void)b.addFunction(in.fnSig({}, in.primitive(TypeKind::Void), CallConv::CcSysV),
+                        SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const saved = b.addInst(MirOpcode::StackSave, {}, voidPtr, /*scope=*/1);
+    std::array<MirInstId, 1> const restoreOps{saved};
+    b.addInst(MirOpcode::StackRestore, restoreOps, InvalidType, /*scope=*/2);   // pairs scope 1
+    b.addReturn();
+    return std::move(b).finish();
+}
+
+constexpr std::array<FiveViolation, 5> kFiveViolations{{
+    {"an alloca aligned to 3", DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo,
+     &badAllocaAlignment},
+    {"a def laid out after its use", DiagnosticCode::I_LayoutUseBeforeDef, &layoutInverted},
+    {"a _BitInt(8) add of _BitInt(16) operands", DiagnosticCode::I_BitIntWidthInconsistent,
+     &bitIntWidthMismatch},
+    {"a __try region closed under an id no SehTryBegin opened", DiagnosticCode::I_SehStructure,
+     &sehTryEndOfAnUnopenedRegion},
+    {"a stack restore paired with another scope's save",
+     DiagnosticCode::I_VlaStackRestorePairing, &stackRestoreScopeMismatch},
+}};
+
+} // namespace
+
+// Each of the five is REFUSED, by its own code — the unit pin each of
+// I_BitIntWidthInconsistent, I_SehStructure and I_VlaStackRestorePairing never had.
+TEST(MirVerifierVerdict, EachOfTheFiveLateCodesRefusesItsViolationByName) {
+    for (FiveViolation const& v : kFiveViolations) {
+        SCOPED_TRACE(v.what);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir const m = v.build(in);
+        DiagnosticReporter r;
+        EXPECT_FALSE((MirVerifier{m, &in}.verify(r)));
+        EXPECT_EQ(countCode(r, v.code), 1u) << diagnosticCodeName(v.code);
+    }
+}
+
+// Verified twice into ONE reporter, each is refused BOTH times.
+TEST(MirVerifierVerdict, ARefusalFailsEveryVerifyIntoOneReporter) {
+    for (FiveViolation const& v : kFiveViolations) {
+        SCOPED_TRACE(v.what);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir const m = v.build(in);
+        DiagnosticReporter shared;
+        MirVerifier const verifier{m, &in};
+        EXPECT_FALSE(verifier.verify(shared)) << "the control: the first verify must refuse";
+        EXPECT_FALSE(verifier.verify(shared))
+            << diagnosticCodeName(v.code) << ": a module the verifier refused passed the "
+               "second verify into the same reporter";
+    }
+}
+
+// A suppress list naming the code cannot silence it: the refusal is still printed
+// and the verdict still fails.
+TEST(MirVerifierVerdict, ASuppressListCannotSilenceAnyOfTheFive) {
+    for (FiveViolation const& v : kFiveViolations) {
+        SCOPED_TRACE(v.what);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir const m = v.build(in);
+        DiagnosticReporter::Config cfg;
+        cfg.policy.suppress.insert(v.code);
+        DiagnosticReporter r{cfg};
+        EXPECT_FALSE((MirVerifier{m, &in}.verify(r)))
+            << diagnosticCodeName(v.code) << ": a suppress list let the module verify clean";
+        EXPECT_EQ(countCode(r, v.code), 1u)
+            << diagnosticCodeName(v.code) << ": the refusal was silenced by the suppress list";
+    }
+}
+
+// The control: a CLEAN module verified twice into one reporter passes both times.
+TEST(MirVerifierVerdict, ACleanModuleVerifiedTwiceIntoOneReporterPassesBothTimes) {
+    Mir const m = buildMinimalModule();
+    DiagnosticReporter shared;
+    MirVerifier const verifier{m};
+    EXPECT_TRUE(verifier.verify(shared));
+    EXPECT_TRUE(verifier.verify(shared));
+    EXPECT_EQ(shared.errorCount(), 0u);
 }

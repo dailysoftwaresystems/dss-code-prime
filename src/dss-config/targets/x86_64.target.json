@@ -15,6 +15,11 @@
   "defaultAssemblyLanguage": "asm-x86_64-att",
   "$atomicsComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER — the arm64 twin carries the fault half of this argument; read that file's copy. ★★ THIS PROCESSOR'S ANSWER IS `losesAtomicity`, AND IT IS A DIFFERENT FACT FROM arm64's, WHICH IS THE WHOLE REASON THIS KEY IS A THREE-WAY ENUM AND NOT A BOOLEAN. ✔MEASURED 2026-09-02, one `_Atomic int` at byte offset 1 of a packed struct: gcc 13.3.0 INLINES `xchgl 1+g(%rip)` for the store and a PLAIN `movl 1+g(%rip)` for the load, and DSS's own x86_64 output (pe64 on Windows, elf64 in WSL) runs `rc 42` on both — so the native form does NOT fault here. ⚠ THAT rc 42 IS A TRUE ANSWER TO THE NARROWER QUESTION ONLY: it proves no FAULT, never ATOMICITY ([[feedback-an-instrument-that-answers-an-adjacent-question]]). The two halves of gcc's sequence are not equally safe — `xchg` with a memory operand carries x86's implicit LOCK and stays atomic misaligned, while the paired plain `movl` is NOT architecturally atomic when the four bytes straddle a cache line. clang 18.1.3 measured on the same source emits `callq __atomic_store@PLT` / `callq __atomic_load@PLT` for the packed member and inlines only for an aligned control, i.e. clang's rule is IDENTICAL on x86-64 and aarch64. MSVC casts no vote: `cl.exe` 14.51.36231 refuses `_Atomic` as a type qualifier under both /std:c11 and /std:c17, including the ALIGNED control, so it is a missing feature and not an opinion. ⇒ ORCHESTRATOR RULING (P53, judgement not measurement, recorded so it can be overruled without archaeology): route the under-aligned access through the runtime here TOO, because a silent loss of atomicity is the same defect shape as arm64's SIGBUS with a quieter failure mode, and one working reference makes the safe route required. ⚠ THE RULING IS HONOURED WHEREVER A RUNTIME IMAGE EXISTS AND CANNOT BE ON pe64: ✔MEASURED — `libatomic.so.1` exports the generic entries on x86_64 Linux (`T __atomic_load@@LIBATOMIC_1.0`) and libSystem carries them on darwin, so elf64 and macho64 declare the `atomicsRuntime` role; UCRT exports NO `__atomic_*` symbol and there is no PE atomics image to name, so pe64 declares none and the `losesAtomicity` arm deliberately KEEPS the native form there — refusing would put DSS below the union on the one platform whose only C reference (mingw-w64 gcc) inlines and works. That per-format difference is expressible only because the FORMAT declares the image and the TARGET declares the hardware fact; a single boolean here could not have said it.",
   "atomics": { "underAlignedNativeForm": "losesAtomicity" },
+  "$abiTypedefsComment": "P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the integer type a PLATFORM ABI fixes for a C library typedef no language rule derives, per object format, in `charIsUnsigned`'s shape and for its reason: the fact is per (processor x platform), `elf` serves processors that answer differently, and the format documents carry no processor. `default` is this processor's answer; `byObjectFormat` overrides it where the platform decides. Values are integer cores. The C language's `__SIZEOF_WCHAR_T__` and `__SIZEOF_WINT_T__` (`type-size` rows naming `{\"abiTypedef\": ...}`) read their SIZE from here, per build pair. ✔MEASURED 2026-09-21 (`-dM -E`, gcc 13.3.0 / clang 18.1.3 / mingw gcc 13.2.0 / Apple clang): `__WCHAR_TYPE__` is `int` on x86_64 Linux and on Apple (both processors), `unsigned int` on aarch64 Linux (`__WCHAR_UNSIGNED__` defined), `unsigned short` on Windows; `__WINT_TYPE__` is `unsigned int` on Linux (both processors), `int` on Apple, `unsigned short` on Windows. `wint_t` is here, beside `wchar_t`, whether or not `<wchar.h>` ships: the macro states an ABI fact the target owns (the P68 ruling). `wchar_t` here agrees with its other carriers on every x86_64 format (✔MEASURED 2026-09-22: a `_Generic` probe selects `int` on ELF and `unsigned short` on PE, for the typedef and for `L'a'`, in DSS and in the references).",
+  "abiTypedefs": {
+    "wchar_t": { "default": "I32", "byObjectFormat": { "pe": "U16" } },
+    "wint_t":  { "default": "U32", "byObjectFormat": { "macho": "I32", "pe": "U16" } }
+  },
   "$predefinedMacrosComment": "TF-C74: the per-ARCHITECTURE identity macros this CPU predefines, merged with the language's `preprocess.predefinedMacros` at preprocess time. Declared on the TARGET (like aggregateLayout/tls below) because they are per-CPU facts; putting them on the language would force c.lang.json to enumerate CPU architectures. COLLISION POLICY: a name declared by BOTH this file and the language config is FATAL (C_ConflictingPredefinedMacro) — neither side silently wins. GATING (MEASURED 2026-07-28 with `clang -dM -E -x c /dev/null -target <triple>`): all four spellings are defined identically by x86_64-linux-gnu, x86_64-apple-darwin AND x86_64-pc-windows-msvc, so all four are UNGATED — unlike the arm64 twin, where `__arm64__`/`__arm64` are Apple-only and must carry availableObjectFormats. DELIBERATELY NOT SHIPPED: `_M_X64` (an MSVC TOOLCHAIN-profile macro, not a CPU fact — it belongs with the pe-gated `_MSC_VER` family on the language side); SHIPPED, BUT NOT HERE -- LANDED ON THE OBJECT FORMAT (TF-C97, D-PP-FORMAT-DATA-MODEL-PREDEFINES): `__LP64__`/`_LP64` are a DATA MODEL, not an architecture -- x86_64:pe64 is LLP64 while the SAME CPU is LP64 under elf64/macho64 -- so a row here would be wrong on one of this target's own formats. This note used to read 'DELIBERATELY NOT SHIPPED' and was a HANDOFF that went four cycles uncompleted; it is now DONE: every LP64 `*.format.json` declares both spellings through the format schema's own `predefinedMacros` key (the same key name, the same shared entry grammar, the same C_ConflictingPredefinedMacro collision policy as this file's), and every LLP64/ILP32 one declares NEITHER -- the negative being the whole reason the channel sits at the format layer. Do not add them here. ★ `__BYTE_ORDER__` USED TO BE LISTED HERE AS 'DELIBERATELY NOT SHIPPED (its value must be a macro REFERENCE, e.g. `__ORDER_LITTLE_ENDIAN__`, which needs a different mechanism than a literal Constant body)'. THAT CLAIM WAS FALSE AND IS NOW REFUTED BY MEASUREMENT (TF-C115, D-PP-ENDIANNESS-PREDEFINES): the `constant` kind ALREADY carries a macro-reference body, because a materialized predefine is spliced over its invocation and RESCANNED like any other replacement (`preprocessor.cpp` — `spliceOver(...); continue;   // rescan from the materialized value`). MEASURED 2026-08-04 against a patched config copy reached through DSS_CONFIG_ROOT: with `__BYTE_ORDER__` = `__ORDER_LITTLE_ENDIAN__`, all of `defined(__BYTE_ORDER__)`, `__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__`, `__BYTE_ORDER__ == 1234` and `!(__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)` hold; the same probe against the UNPATCHED config fired 6 of its 8 `#error` legs (A/B/C/E/F/G; 6 x P001E), INCLUDING the one asserting `__BYTE_ORDER__ != __ORDER_BIG_ENDIAN__` — i.e. the unshipped state was not merely silent, it selected the BIG-ENDIAN arm of any such ladder (`0 == 0`, C 6.10.1p4). No engine change was needed; the note had never been tested. The two endianness rows are now SHIPPED below. Still DELIBERATELY NOT SHIPPED: toolchain identity (`__GNUC__`/`__clang__`) which is a COMPILER profile, not a CPU.",
   "$endiannessPredefinesComment": "TF-C115 (D-PP-ENDIANNESS-PREDEFINES). ★ THIS IS A DOCUMENTATION KEY ONLY — there is deliberately NO `endianness` root key (see below); it annotates the two endianness rows in `predefinedMacros`. THE LAYER, ARGUED FROM THE SAME RULE `__LP64__` LOST ON: a fact belongs on the layer where it does not vary. Endianness DOES vary by CPU (MEASURED: clang defines `__BIG_ENDIAN__` and `__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__` for aarch64_be-linux-gnu, `__LITTLE_ENDIAN__` for aarch64-linux-gnu) and does NOT vary across the object formats a single DSS target serves — x86_64 is little-endian under elf64, macho64 AND pe64, and arm64 is little-endian under elf64 and macho64 — which is precisely the test `__LP64__` FAILED (x86_64 is LP64 on elf/macho and LLP64 on pe, so its row had to move to the format). So these belong HERE, per-CPU, exactly like `__x86_64__`. NO SEPARATE `endianness` KEY IS DECLARED alongside them: the `charIsUnsigned` precedent (arm64.target.json) shows that a second notation of one fact is a DRIFT SOURCE requiring its own coherence test, and unlike `charIsUnsigned` — which HIR→MIR genuinely reads for the char→int promotion — nothing in the engine consumes an endianness value today (`bitFieldStrategy` already carries the LSB-first bit-field rule these targets need). A key with no consumer is dead config that can silently disagree with the macro; the day a consumer exists, it gets declared and THEN gets its coherence example. GATING (MEASURED 2026-08-04, `clang-19 -dM -E -x c /dev/null -target <triple>`, Ubuntu clang 19.1.1): `__LITTLE_ENDIAN__` is defined as 1 on ALL FIVE little-endian triples DSS targets — arm64-apple-darwin, x86_64-apple-darwin, aarch64-linux-gnu, x86_64-unknown-linux-gnu AND x86_64-pc-windows-msvc — so it is UNGATED, like the four x86_64 identity spellings above and unlike arm64's Apple-only `__arm64__`. Same for `__BYTE_ORDER__`. ★ `__BIG_ENDIAN__` IS DELIBERATELY ABSENT, AND THE ABSENCE IS THE DECLARATION: MEASURED, clang defines it ONLY on a big-endian triple (aarch64_be-linux-gnu), so shipping it anywhere here would be a lie about the machine, and Apple's `libkern/OSByteOrder.h` selects its swap-macro family on `defined(__BIG_ENDIAN__)` FIRST — a stray row would silently pick byte-swapping macros on a little-endian host. The negative is asserted by examples/c/endianness_predefines, which is red if `__BIG_ENDIAN__` ever appears on any leg. ★ NOT A GCC PROFILE: MEASURED, gcc 13.3.0 (native x86_64 and the aarch64-linux-gnu cross) defines `__BYTE_ORDER__` and the `__ORDER_*` triple but NOT `__LITTLE_ENDIAN__` — that spelling is a clang/Apple-toolchain one. Shipping it is consistent with the identity this compiler already claims unconditionally (`__clang__` in c.lang.json), and it is what unblocks the Apple SDK: `libkern/OSByteOrder.h:314` is a bare `#error Unknown endianess.` when neither spelling is defined. THE `__ORDER_*` CONSTANTS THIS ROW'S VALUE NAMES ARE NOT HERE — they are invariant across every triple and live on the LANGUAGE (c.lang.json); see that row's comment for the argument.",
   "predefinedMacros": [
@@ -29,6 +34,8 @@
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "maxRequestedAlignment": 268435456, "bitFieldStrategy": "gnu_packed" },
   "$tlsComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (x86_64 is Variant II under EVERY OS, so it lives on the TARGET, not the format). variant2 = the thread pointer points ONE PAST the TLS block's end (fs:[0] holds tp itself); a symbol's link-time thread-pointer offset is NEGATIVE: tpoff = templateOffset − alignUp(blockSize, p_align). tcbHeaderBytes = 0 (a Variant-I-only input — arm64 declares 16 with its own block at TLS C2). Consumed ONLY by the walker's tpoff helper when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
   "tls": { "variant": "variant2", "tcbHeaderBytes": 0 },
+  "$isaFeaturesComment": "P68 round 8 (D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED): the ISA features this target's code may assume, each ON or OFF — the one TARGET fact an inline-asm template form reads. gcc's x86 `%~` expands to `i` under `-mavx2` and to `f` without it (✔MEASURED 2026-09-23, gcc 13.3.0). This target emits baseline x86-64 and assumes no AVX2 — also the x86_64 default of gcc and clang (`-march=x86-64`, 📄DOCUMENTED). A feature absent here is UNKNOWN, and a form asking about one is refused by name, never read as off.",
+  "isaFeatures": { "avx2": false },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
@@ -2602,6 +2609,7 @@
             "$comment": "3-op no-index form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `movzx reg, byte [base + disp32]` (REX.W 0F B6 /r). A char/byte memory access MUST be byte-EXACT — a 64-bit read of a 1-byte string/array element reads 7 bytes past it (a fault at a section/page edge). ZERO-extend (movzx) is deliberate: the load is a SIGNEDNESS-AGNOSTIC byte fetch — sign semantics live in the explicit cast that follows (SExt for signed `char`, ZExt for unsigned `byte`), each of which re-reads the low byte, so the load's upper bits never reach a consumer un-recast (C integer-promotion always widens a char operand before arithmetic). REX.W sets the r64 dest (its low 8 hold the byte); the memory source has no high-byte-alias hazard (that is a register-source-only concern). Selected when the Load's result type is Char (width 8 on the LIR inst, via memAccessWidthFlags).",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 8 },
             "resultSlot": "modrm.reg",
+            "destWidth":  64,
             "template":   { "rexW": true, "opcode": [15, 182] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
@@ -2624,6 +2632,7 @@
             "$comment": "3-op no-index form, width 16 (D-LIR-INT-MEMORY-WIDTH-EXACT): `movzx r32, word [base + disp32]` (0F B7 /r, no REX.W). A 2-byte short load must be half-word-exact — a wider read of a packed short reads past it. ZERO-extend (movzx) is the signedness-agnostic half-word fetch (the width-8 char movzx peer at 0F B6); the short→int promote cast that follows re-reads the low 16 bits (SExt/ZExt-16 = D-CSUBSET-SUBNATIVE-ALU-FORMS, not yet encoded ⇒ short VALUE use fails loud, never silently miscompiles). Selected when the Load's result type is I16/U16 — width 16 via memAccessWidthFlags.",
             "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
             "resultSlot": "modrm.reg",
+            "destWidth":  32,
             "template":   { "opcode": [15, 183] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
@@ -2647,6 +2656,7 @@
             "$comment": "4-op indexed form, width 8 (D-CSUBSET-CHAR-STRING-VALUE-CODEGEN): `movzx reg, byte [base + index*scale + disp32]` (REX.W 0F B6 /r + SIB). The byte-exact + signedness-agnostic rationale is the 3-op width-8 form's; this arm serves a runtime-index char-array access (`arr[i]`, scale 1 since sizeof(char)==1).",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
             "resultSlot": "modrm.reg",
+            "destWidth":  64,
             "template":   { "rexW": true, "opcode": [15, 182] },
             "wires":      [
               { "index": 0, "slotKind": "modrm.rm.mem"  },
@@ -2691,6 +2701,30 @@
               { "index": 0, "slotKind": "modrm.rm.mem"  },
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "mov r8, [base + index*scale + disp32] — 0x8A /r with a SIB (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The indexed twin of the byte form above, which an unsuffixed `mov (%rdi,%rsi), %cl` needs as much as `movb` does. ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 both assemble the indexed byte move to 8a /r with a SIB byte.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [138], "forceRexPrefix": true },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "mov r16, [base + index*scale + disp32] — 0x66 0x8B /r with a SIB (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS).",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
             ]
           }
         ]
@@ -2878,6 +2912,29 @@
               { "index": 0, "slotKind": "modrm.rm.mem"  },
               { "index": 1, "slotKind": "membase.scale" },
               { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "The 16-bit form — `leaw 2(%rdi), %ax` = 66 8D /r (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 assemble `leaw 2(%rdi), %ax` and the unsuffixed `lea 2(%rdi), %ax` to 66 8d 47 02.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "The indexed 16-bit form — `leaw 2(%rdi,%rsi,4), %ax`.",
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "resultSlot": "modrm.reg",
+            "template":   { "mandatoryPrefix": [102], "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "sib.index"     },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
             ]
           },
           {
@@ -4406,6 +4463,212 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (P68 round 8 part 4): ONE inline-asm STATEMENT while registers are allocated — the asm-region BUNDLE (`lir/lir_asm_region.hpp`). Operands = the statement's operand registers, one per slot, each with a ROLE in the module's asm-region side record (read at the early slot / written at the late slot / both / written at the early slot); the template's own instructions, labels as blocks, live in that record. `expandAsmRegions` replaces it with its body once allocation is final, so it is never encoded — which is the point: the allocator's spill and reload code can no longer land BETWEEN a template's lines (an LL/SC pair with a store between them never succeeds). side-effecting so no pass drops, merges or reorders it. maxOperands 255 is the operand-pool bound, not a GNU limit (GCC allows 30 operands; a pair-carried one takes two slots).",
+      "mnemonic": "asm_region", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 255,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (P68 round 8 part 4): ONE inline-asm `asm goto` STATEMENT while registers are allocated — the TERMINATOR form of `asm_region` (terminatorKind asm-goto). Operands = the statement's slots, with roles in the module's asm-region side record; successors = its goto labels in order, then its fall-through. `expandAsmRegions` replaces it with the template's own blocks, whose branches to a label go to that successor, so it is never encoded.",
+      "mnemonic": "asm_region_goto", "result": "none",
+      "terminatorKind": "asm-goto",
+      "hasSideEffects": true,
+      "minOperands": 0, "maxOperands": 255,
+      "minSuccessors": 1, "maxSuccessors": 255
+    },
+    {
+      "$comment": "★★ `test` — AND WITHOUT A RESULT, FLAGS ONLY (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The sibling of `cmp` in every shape: register-register (85 /r; 84 /r for bytes), register-immediate (F7 /0; F6 /0), immediate-memory, and register-memory. ✔MEASURED 2026-09-21, GNU as 2.42 and clang 18.1.3 agreeing on every byte: `testq %rax, %rcx` = 48 85 c1, `testl %eax, %ecx` = 85 c1, `testw %ax, %cx` = 66 85 c1, `testb %al, %cl` = 84 c1, `testq $1, %rcx` = 48 f7 c1 01 00 00 00, `testw $300, %cx` = 66 f7 c1 2c 01, `testb $1, %cl` = f6 c1 01, `testl $1, (%rdi)` = f7 07 01 00 00 00. ★ ONE register-memory variant per width, with NO `memoryDestination` guard, and that is a measurement rather than a shortcut: `testl %eax, (%rdi)` and `testl (%rdi), %eax` are the SAME bytes (85 07) on both references — TEST is commutative, so unlike `cmp` (39 /r vs 3B /r) there is no direction for a guard to separate. ⓘ The references pick the short `a9 id` form for `test $imm, %eax`; this table encodes the general F7 /0 form there, the same instruction.",
+      "mnemonic":      "test",
+      "result":        "none",
+      "hasSideEffects": false,
+      "minOperands":   2,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template": { "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 8 },
+            "template": { "opcode": [132], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm32" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm16.bytes" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "imm32"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 0, "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "imm8" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm32" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [247], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm16.bytes" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["imm32", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [246], "modrmRegExt": 0 },
+            "wires":    [
+              { "index": 0, "slotKind": "imm8" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16 },
+            "template": { "mandatoryPrefix": [102], "opcode": [133] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8 },
+            "template": { "opcode": [132], "forceRexPrefix": true },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "modrm.rm.mem" },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "★★ `movapd` — the packed-DOUBLE register move, 66 0F 28 /r (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). The same data movement as `movaps` (0F 28 /r) under the operand-size prefix; ✔MEASURED 2026-09-21, GNU as 2.42 and clang 18.1.3 both assemble `movapd %xmm1, %xmm0` to 66 0f 28 c1 and `movaps` to 0f 28 c1 — so the two are two encodings a programmer chooses between, and each spelling gets its own. Widths as `movaps` declares them, for the same reason.",
+      "mnemonic": "movapd", "result": "value",
+      "hasSideEffects": false,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "registerClass": "fpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 128 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 40] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR. ★★ KEYED AT 32, 64 AND 128 BITS — THE SAME BYTES THREE TIMES, AND THE KEYS ARE THE FACT, NOT THE BYTES (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS). MOVAPS copies the whole register, so it moves an F32, an F64 and a 128-bit value alike; the ONE width-agnostic variant it used to carry made the asm engine's width-honesty gate (`variantHonorsDeclaredWidth`: an agnostic variant is honest only at the width-default, 64) refuse every 128-bit use — ✔MEASURED at `7df54cc1`, `__asm__ volatile(\"movaps %%xmm1, %%xmm2\" ::: \"xmm2\")` refused A_AsmTextUnsupported ('movaps' operates on 128 bits … declares no width-keyed encoding variant), the registers written in the text deriving 128 — and a 16-byte value carried into an `\"x\"` operand (gcc and clang carry an `__int128` there) had no instruction that could name it. The loader refuses a keyed variant beside an agnostic one of the same `operandKinds` (D-CSUBSET-32BIT-ALU-FORMS), so every width an FPR value occupies is keyed: 32 (F32 plumbing), 64 (F64 and the width-default), 128 (a full-register spill or carried value). Sub-32 plumbing promotes to 32 (`lirWidthFlagsForBits`), so no narrower key is needed.",
       "mnemonic": "movaps", "result": "value",
       "hasSideEffects": false,
@@ -4573,39 +4836,41 @@
   ],
   "$registersComment": "Physical register file. Ordinal = position in this array (consumed by `LirReg::id` post-regalloc). Only the registers ML6 regalloc + ML7 callconv reference are declared here — sub-byte aliases (al/ah/bl/...) are omitted until a real consumer needs them. Width is in bytes (8/4/2/1). hwEncoding = ModR/M ordinal the assembler/encoder will read.",
   "registers": [
-    { "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 0 },
-    { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1, "dwarfNumber": 2 },
-    { "name": "rdx", "class": "gpr", "widthBytes": 8, "hwEncoding": 2, "dwarfNumber": 1 },
-    { "name": "rbx", "class": "gpr", "widthBytes": 8, "hwEncoding": 3, "dwarfNumber": 3 },
+    { "$comment": "★★ `continuesIn` — THE REGISTER A VALUE TOO WIDE FOR THIS ONE CONTINUES IN, when a GNU local register variable binds it here (P68 round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). ✔MEASURED 2026-09-19 with gcc 13.3.0 at -O0 and -O2: `register __int128 v asm(R)` on an `\"r\"` input binds R and then gcc's own hard-register order — rax:rdx, rdx:rcx, rcx:rbx, rbx:rsi, rsi:rdi, rdi:rbp (-O2; -O0 refuses \"bp cannot be used in 'asm' here\"), and r8:r9 through r14:r15 — which is NOT the encoding order (rdx follows rax, yet its hwEncoding is 2 and rcx's is 1). clang 18.1.3 cannot allocate any of them (\"couldn't allocate input reg for constraint '{rax}'\"). rbp, rsp and r15 continue in nothing: both references refuse them.",
+      "name": "rax", "class": "gpr", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 0, "continuesIn": "rdx" },
+    { "name": "rcx", "class": "gpr", "widthBytes": 8, "hwEncoding": 1, "dwarfNumber": 2, "continuesIn": "rbx" },
+    { "name": "rdx", "class": "gpr", "widthBytes": 8, "hwEncoding": 2, "dwarfNumber": 1, "continuesIn": "rcx" },
+    { "name": "rbx", "class": "gpr", "widthBytes": 8, "hwEncoding": 3, "dwarfNumber": 3, "continuesIn": "rsi" },
     { "name": "rsp", "class": "gpr", "widthBytes": 8, "hwEncoding": 4, "dwarfNumber": 7 },
     { "name": "rbp", "class": "gpr", "widthBytes": 8, "hwEncoding": 5, "dwarfNumber": 6 },
-    { "name": "rsi", "class": "gpr", "widthBytes": 8, "hwEncoding": 6, "dwarfNumber": 4 },
-    { "name": "rdi", "class": "gpr", "widthBytes": 8, "hwEncoding": 7, "dwarfNumber": 5 },
-    { "name": "r8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8, "dwarfNumber": 8 },
-    { "name": "r9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9, "dwarfNumber": 9 },
-    { "name": "r10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10, "dwarfNumber": 10 },
-    { "name": "r11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11, "dwarfNumber": 11 },
-    { "name": "r12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12, "dwarfNumber": 12 },
-    { "name": "r13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13, "dwarfNumber": 13 },
-    { "name": "r14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14, "dwarfNumber": 14 },
+    { "name": "rsi", "class": "gpr", "widthBytes": 8, "hwEncoding": 6, "dwarfNumber": 4, "continuesIn": "rdi" },
+    { "name": "rdi", "class": "gpr", "widthBytes": 8, "hwEncoding": 7, "dwarfNumber": 5, "continuesIn": "rbp" },
+    { "name": "r8",  "class": "gpr", "widthBytes": 8, "hwEncoding": 8, "dwarfNumber": 8, "continuesIn": "r9" },
+    { "name": "r9",  "class": "gpr", "widthBytes": 8, "hwEncoding": 9, "dwarfNumber": 9, "continuesIn": "r10" },
+    { "name": "r10", "class": "gpr", "widthBytes": 8, "hwEncoding": 10, "dwarfNumber": 10, "continuesIn": "r11" },
+    { "name": "r11", "class": "gpr", "widthBytes": 8, "hwEncoding": 11, "dwarfNumber": 11, "continuesIn": "r12" },
+    { "name": "r12", "class": "gpr", "widthBytes": 8, "hwEncoding": 12, "dwarfNumber": 12, "continuesIn": "r13" },
+    { "name": "r13", "class": "gpr", "widthBytes": 8, "hwEncoding": 13, "dwarfNumber": 13, "continuesIn": "r14" },
+    { "name": "r14", "class": "gpr", "widthBytes": 8, "hwEncoding": 14, "dwarfNumber": 14, "continuesIn": "r15" },
     { "name": "r15", "class": "gpr", "widthBytes": 8, "hwEncoding": 15, "dwarfNumber": 15 },
 
-    { "name": "xmm0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0, "dwarfNumber": 17 },
-    { "name": "xmm1",  "class": "fpr", "widthBytes": 16, "hwEncoding": 1, "dwarfNumber": 18 },
-    { "name": "xmm2",  "class": "fpr", "widthBytes": 16, "hwEncoding": 2, "dwarfNumber": 19 },
-    { "name": "xmm3",  "class": "fpr", "widthBytes": 16, "hwEncoding": 3, "dwarfNumber": 20 },
-    { "name": "xmm4",  "class": "fpr", "widthBytes": 16, "hwEncoding": 4, "dwarfNumber": 21 },
-    { "name": "xmm5",  "class": "fpr", "widthBytes": 16, "hwEncoding": 5, "dwarfNumber": 22 },
-    { "name": "xmm6",  "class": "fpr", "widthBytes": 16, "hwEncoding": 6, "dwarfNumber": 23 },
-    { "name": "xmm7",  "class": "fpr", "widthBytes": 16, "hwEncoding": 7, "dwarfNumber": 24 },
-    { "name": "xmm8",  "class": "fpr", "widthBytes": 16, "hwEncoding": 8, "dwarfNumber": 25 },
-    { "name": "xmm9",  "class": "fpr", "widthBytes": 16, "hwEncoding": 9, "dwarfNumber": 26 },
-    { "name": "xmm10", "class": "fpr", "widthBytes": 16, "hwEncoding": 10, "dwarfNumber": 27 },
-    { "name": "xmm11", "class": "fpr", "widthBytes": 16, "hwEncoding": 11, "dwarfNumber": 28 },
-    { "name": "xmm12", "class": "fpr", "widthBytes": 16, "hwEncoding": 12, "dwarfNumber": 29 },
-    { "name": "xmm13", "class": "fpr", "widthBytes": 16, "hwEncoding": 13, "dwarfNumber": 30 },
-    { "name": "xmm14", "class": "fpr", "widthBytes": 16, "hwEncoding": 14, "dwarfNumber": 31 },
-    { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15, "dwarfNumber": 32 },
+    { "name": "xmm0",  "class": "fpr", "widthBytes": 16, "hwEncoding": 0, "dwarfNumber": 17, "nameStatesNoWidth": true,
+      "$comment": "★★ `nameStatesNoWidth` ON ALL SIXTEEN xmm ROWS (P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS): x86 names the WHOLE xmm register for a scalar-double (`addsd`, 64), a scalar-single (`addss`, 32) and a packed (`movaps`, 128) operation alike — no narrower xmm spelling exists, so the mnemonic states the width. ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 assemble `addsd %xmm1, %xmm0` (f2 0f 58 c1), `movq %xmm0, %rax` (66 48 0f 7e c0) and `movd %xmm0, %eax` (66 0f 7e c0); DSS refused each, reading the 128 of every xmm name as a width statement." },
+    { "name": "xmm1",  "class": "fpr", "widthBytes": 16, "hwEncoding": 1, "dwarfNumber": 18, "nameStatesNoWidth": true },
+    { "name": "xmm2",  "class": "fpr", "widthBytes": 16, "hwEncoding": 2, "dwarfNumber": 19, "nameStatesNoWidth": true },
+    { "name": "xmm3",  "class": "fpr", "widthBytes": 16, "hwEncoding": 3, "dwarfNumber": 20, "nameStatesNoWidth": true },
+    { "name": "xmm4",  "class": "fpr", "widthBytes": 16, "hwEncoding": 4, "dwarfNumber": 21, "nameStatesNoWidth": true },
+    { "name": "xmm5",  "class": "fpr", "widthBytes": 16, "hwEncoding": 5, "dwarfNumber": 22, "nameStatesNoWidth": true },
+    { "name": "xmm6",  "class": "fpr", "widthBytes": 16, "hwEncoding": 6, "dwarfNumber": 23, "nameStatesNoWidth": true },
+    { "name": "xmm7",  "class": "fpr", "widthBytes": 16, "hwEncoding": 7, "dwarfNumber": 24, "nameStatesNoWidth": true },
+    { "name": "xmm8",  "class": "fpr", "widthBytes": 16, "hwEncoding": 8, "dwarfNumber": 25, "nameStatesNoWidth": true },
+    { "name": "xmm9",  "class": "fpr", "widthBytes": 16, "hwEncoding": 9, "dwarfNumber": 26, "nameStatesNoWidth": true },
+    { "name": "xmm10", "class": "fpr", "widthBytes": 16, "hwEncoding": 10, "dwarfNumber": 27, "nameStatesNoWidth": true },
+    { "name": "xmm11", "class": "fpr", "widthBytes": 16, "hwEncoding": 11, "dwarfNumber": 28, "nameStatesNoWidth": true },
+    { "name": "xmm12", "class": "fpr", "widthBytes": 16, "hwEncoding": 12, "dwarfNumber": 29, "nameStatesNoWidth": true },
+    { "name": "xmm13", "class": "fpr", "widthBytes": 16, "hwEncoding": 13, "dwarfNumber": 30, "nameStatesNoWidth": true },
+    { "name": "xmm14", "class": "fpr", "widthBytes": 16, "hwEncoding": 14, "dwarfNumber": 31, "nameStatesNoWidth": true },
+    { "name": "xmm15", "class": "fpr", "widthBytes": 16, "hwEncoding": 15, "dwarfNumber": 32, "nameStatesNoWidth": true },
 
     { "name": "rflags", "class": "flags", "widthBytes": 8, "hwEncoding": 0, "dwarfNumber": 49 },
 

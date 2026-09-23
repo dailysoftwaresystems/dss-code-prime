@@ -1,0 +1,13 @@
+# PURPOSE: census `#pragma` usage across the corpus and hold the profile to its expected shape.
+name: pragma-profile-census
+description: >-
+  The action censuses the reached #pragma vocabulary over the staged corpus against its expected shape; it refuses by name without a staged corpus and a dsscp.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+steps:
+  - name: census
+    workingDirectoryRoot: action
+    run: |
+      python3 ./pragma-profile-census.py
+    successPattern: 'census MATCHES the checked-in expected set'
+    requireInputsUnmoved: true

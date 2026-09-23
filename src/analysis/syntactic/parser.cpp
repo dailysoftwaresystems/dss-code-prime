@@ -2411,6 +2411,15 @@ struct Parser::Impl {
                             tokens.peek().span,
                             "'<eof>'",
                             walker.expectedSet());
+            // The Error leaf the two expression-level missing-child sites
+            // already drop, and for the same reason: the frame IS missing a
+            // required child, and the tree has to say so, not only the
+            // diagnostic. Without it a block whose `}` never came closed as a
+            // well-formed block — and the scope its `{` opened stayed behind
+            // to be reported as a builder invariant
+            // ([[D-PARSE-BUILDER-INVARIANT-PRINTED-AFTER-A-CORRECT-REFUSAL]]).
+            // Silent: the diagnostic above is the one the user reads.
+            builder->pushErrorNode(tokens.peek().span);
             closeFrameOnce();
             return StepOutcome::Continue;
         }

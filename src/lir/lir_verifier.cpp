@@ -1,6 +1,7 @@
 #include "lir/lir_verifier.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
+#include "lir/lir_asm_region.hpp"
 #include "lir/lir_pass_util.hpp"
 
 #include <algorithm>
@@ -14,13 +15,39 @@ namespace dss {
 
 namespace {
 
-void report(DiagnosticReporter& reporter, std::string actual,
+// ★★ THE VERDICT OF ONE PUBLIC VERIFY CALL (P68, lane `ht` — the `HirVerifier` /
+// `MirVerifier` template, for free functions). Every rule reports through
+// `report(verdict, …)`, which COUNTS the finding before the reporter decides
+// anything — whether `report` keeps it, drops it as a recent duplicate or past a
+// cap, is the reporter's business and must not become the verdict's. What counts
+// is the POLICY's answer (`effectiveSeverity`, the one owner the reporter's own
+// `report` asks), so a finding the operator suppressed does not count. Every code
+// this verifier emits is a `kUnsuppressableCodes` member today, and members
+// bypass dedup and the caps — so the count changes no verdict now; it is what
+// keeps the verdict right for the NEXT code added without joining that table,
+// which is how nine `HirVerifier` codes and five `MirVerifier` codes went missing.
+struct LirVerdict {
+    DiagnosticReporter& reporter;
+    std::size_t         errorsFound = 0;
+
+    // The call's verdict: nothing the policy makes an Error was found, AND the
+    // reporter's error count did not move.
+    [[nodiscard]] bool clean(std::size_t baseline) const {
+        return errorsFound == 0 && reporter.errorCount() == baseline;
+    }
+};
+
+void report(LirVerdict& verdict, std::string actual,
             DiagnosticCode code = DiagnosticCode::L_UnsupportedLoweringForOpcode) {
+    if (verdict.reporter.effectiveSeverity(code, DiagnosticSeverity::Error)
+        == DiagnosticSeverity::Error) {
+        ++verdict.errorsFound;
+    }
     ParseDiagnostic d;
     d.code     = code;
     d.severity = DiagnosticSeverity::Error;
     d.actual   = std::move(actual);
-    reporter.report(std::move(d));
+    verdict.reporter.report(std::move(d));
 }
 
 // Spell an operand KIND for a diagnostic. ⚠ A TOTAL SWITCH WITH NO
@@ -146,7 +173,7 @@ classifyMemAddressForm(std::span<LirOperand const> ops) {
 }
 
 void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
-                            DiagnosticReporter& reporter) {
+                            LirVerdict& verdict) {
     auto const mem = resolveMemOpcodes(sch);
     std::size_t const fnCount = lir.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
@@ -167,7 +194,7 @@ void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
                     continue;
                 }
                 auto const* info = sch.opcodeInfo(op);
-                report(reporter, std::format(
+                report(verdict, std::format(
                     "LirVerifier: memory inst {} ('{}') carries no well-formed "
                     "addressing mode — its operands are {}. A LIR "
                     "load/store/lea must carry EITHER a base+displacement "
@@ -244,7 +271,7 @@ void checkMemOperandPairing(Lir const& lir, TargetSchema const& sch,
 // the previous defect.
 void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                                              TargetSchema const& sch,
-                                             DiagnosticReporter& reporter) {
+                                             LirVerdict& verdict) {
     // ⓘ HOISTED, and only because this rule's DUTY CYCLE changed. It used to
     // run once per compile (`verifyLir`); since D-OPT-JCC-FALLTHROUGH it also
     // runs from `verifyLirPostRegalloc`, which the pipeline calls three times.
@@ -284,6 +311,9 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                         break;
                     case TargetTerminatorKind::Switch:
                     case TargetTerminatorKind::IndirectBr:
+                    // P68 round 8 part 4: an `asm goto` bundle's operands are
+                    // its slots; its edges ride the successor list alone.
+                    case TargetTerminatorKind::AsmGoto:
                         refsRequired = false;
                         break;
                     case TargetTerminatorKind::None:
@@ -379,7 +409,7 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
                           "target to encode, which is what a dropped-operand "
                           "round trip looks like";
                 }
-                report(reporter, std::format(
+                report(verdict, std::format(
                     "LirVerifier: terminator inst {} ('{}', {}) declares "
                     "successors [{}] but its BlockRef operands are [{}] — the "
                     "CFG edge list and the operand list the ENCODER turns into "
@@ -429,9 +459,15 @@ void checkTerminatorBlockRefsMatchSuccessors(Lir const& lir,
 // producer does not hold would trade a real net for a false red. The
 // literal pool's real exposure — a dangling `litIndex`, and a pool that
 // shrank across a rebuild — IS covered, here and in `verifyLirRebuild`.
-void checkSideStructureIntegrity(Lir const& lir, DiagnosticReporter& reporter) {
+void checkSideStructureIntegrity(Lir const& lir, LirVerdict& verdict) {
     // Which constraint-pool entries did we actually see referenced?
     std::vector<bool> referenced(lir.regConstraintPool().size(), false);
+    // P68 round 8 part 4: and which asm-region entries — the FOURTH side
+    // structure, referenced by index from `detail::LirInst::asmRegion` exactly
+    // as the constraint pool is from `regConstraints`, so it gets the same two
+    // rules (a dangling handle; an entry nothing references), plus the
+    // bundle's own bookkeeping, which only this pairing can see.
+    std::vector<bool> referencedRegions(lir.asmRegionPool().size(), false);
 
     std::size_t const fnCount = lir.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
@@ -442,10 +478,57 @@ void checkSideStructureIntegrity(Lir const& lir, DiagnosticReporter& reporter) {
             std::uint32_t const n = lir.blockInstCount(bb);
             for (std::uint32_t i = 0; i < n; ++i) {
                 LirInstId const inst = lir.blockInstAt(bb, i);
+                if (std::uint32_t const rh = lir.instAsmRegionHandle(inst);
+                    rh != kLirNoAsmRegion) {
+                    std::uint32_t const ridx = lirAsmRegionIndexForHandle(rh);
+                    if (ridx < lir.asmRegionPool().size()) {
+                        referencedRegions[ridx] = true;
+                        // The roles are read BY POSITION, so every operand
+                        // must have one, and every role-bearing operand must
+                        // be a register — otherwise `lirForEachInstDef` would
+                        // silently skip a write.
+                        LirAsmRegion const& region = lir.asmRegionPool().at(ridx);
+                        auto const ops = lir.instOperands(inst);
+                        if (ops.size() != region.roles.size()) {
+                            report(verdict, std::format(
+                                "LirVerifier: asm-region bundle inst {} has {} "
+                                "operand(s) but its region (ar#{}) declares {} "
+                                "slot(s) — a role is read by position, so an "
+                                "operand past the slot list has none and its "
+                                "write would be invisible to register "
+                                "allocation",
+                                inst.v, ops.size(), ridx, region.roles.size()),
+                                DiagnosticCode::L_AsmRegionMalformed);
+                        } else {
+                            for (std::size_t k = 0; k < ops.size(); ++k) {
+                                if (ops[k].kind == LirOperandKind::Reg
+                                    && ops[k].reg.valid()) {
+                                    continue;
+                                }
+                                report(verdict, std::format(
+                                    "LirVerifier: asm-region bundle inst {} "
+                                    "operand {} ({} slot) is not a register — "
+                                    "every bundle operand stands for a register "
+                                    "the template names",
+                                    inst.v, k, lirAsmRoleName(region.roles[k])),
+                                    DiagnosticCode::L_AsmRegionMalformed);
+                            }
+                        }
+                    } else {
+                        report(verdict, std::format(
+                            "LirVerifier: inst {} carries asm-region handle {} "
+                            "(pool index {}) but the module's asm-region pool "
+                            "holds {} entries — the handle outlived the pool it "
+                            "names (a rebuild that did not carry the pool "
+                            "across)",
+                            inst.v, rh, ridx, lir.asmRegionPool().size()),
+                            DiagnosticCode::L_SideStructureIndexDangling);
+                    }
+                }
                 for (auto const& o : lir.instOperands(inst)) {
                     if (o.kind != LirOperandKind::LiteralIndex) continue;
                     if (o.litIndex >= lir.literalPool().size()) {
-                        report(reporter, std::format(
+                        report(verdict, std::format(
                             "LirVerifier: inst {} references literal pool entry "
                             "lit#{} but the module's literal pool holds {} "
                             "entries — the index outlived the pool it names "
@@ -470,7 +553,7 @@ void checkSideStructureIntegrity(Lir const& lir, DiagnosticReporter& reporter) {
                     referenced[idx] = true;
                     continue;
                 }
-                report(reporter, std::format(
+                report(verdict, std::format(
                     "LirVerifier: inst {} carries register-constraint "
                     "handle {} (pool index {}) but the module's "
                     "register-constraint pool holds {} entries — the "
@@ -484,7 +567,7 @@ void checkSideStructureIntegrity(Lir const& lir, DiagnosticReporter& reporter) {
 
     for (std::size_t i = 0; i < referenced.size(); ++i) {
         if (referenced[i]) continue;
-        report(reporter, std::format(
+        report(verdict, std::format(
             "LirVerifier: register-constraint pool entry rc#{} is referenced "
             "by NO instruction ({} entries in the pool). A constraint set "
             "exists only because some instruction declared it, so an "
@@ -497,6 +580,71 @@ void checkSideStructureIntegrity(Lir const& lir, DiagnosticReporter& reporter) {
             i, lir.regConstraintPool().size()),
             DiagnosticCode::L_SideStructureReferenceLost);
     }
+
+    for (std::size_t i = 0; i < referencedRegions.size(); ++i) {
+        // Each entry's own shape — the one statement the builder aborts on,
+        // REPORTED here for a module that reached the verifier some other way
+        // (the `.dsslir` reader).
+        if (auto const defect = lirAsmRegionShapeDefect(
+                lir.asmRegionPool().at(static_cast<std::uint32_t>(i)))) {
+            report(verdict, std::format(
+                "LirVerifier: asm-region pool entry ar#{} is malformed: {}",
+                i, *defect),
+                DiagnosticCode::L_AsmRegionMalformed);
+        }
+        if (referencedRegions[i]) continue;
+        report(verdict, std::format(
+            "LirVerifier: asm-region pool entry ar#{} is referenced by NO "
+            "instruction ({} entries in the pool). A region exists only because "
+            "an inline-asm statement's bundle declared it, so an unreferenced "
+            "entry means a bundle LOST its handle — a rebuild that carried the "
+            "pool but not the per-instruction `asmRegion` field (call "
+            "`lir_pass_util::carryInstSideData` for every rebuilt instruction), "
+            "or a pass that deleted the statement",
+            i, lir.asmRegionPool().size()),
+            DiagnosticCode::L_SideStructureReferenceLost);
+    }
+}
+
+// P68 round 8 part 4 — THE BUNDLE IS THE OPCODE AND THE HANDLE, TOGETHER. An
+// instruction carrying a region handle must be the target's `asm_region` op,
+// and that op must carry one: a handle on any other instruction would make
+// `lirForEachInstDef` read its operands through roles they were never given,
+// and a bundle without one is a statement with operands and no template.
+void checkAsmRegionOpcodes(Lir const& lir, TargetSchema const& sch,
+                           LirVerdict& verdict) {
+    auto const bundleOp     = sch.opcodeByMnemonic(kLirAsmRegionMnemonic);
+    auto const bundleGotoOp = sch.opcodeByMnemonic(kLirAsmRegionGotoMnemonic);
+    std::size_t const fnCount = lir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+        LirFuncId const fn = lir.funcAt(fi);
+        std::uint32_t const blockCount = lir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+            LirBlockId const bb = lir.funcBlockAt(fn, bi);
+            std::uint32_t const n = lir.blockInstCount(bb);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                LirInstId const inst = lir.blockInstAt(bb, i);
+                std::uint16_t const op = lir.instOpcode(inst);
+                bool const isBundleOp =
+                    (bundleOp.has_value() && op == *bundleOp)
+                    || (bundleGotoOp.has_value() && op == *bundleGotoOp);
+                bool const hasRegion =
+                    lir.instAsmRegionHandle(inst) != kLirNoAsmRegion;
+                if (isBundleOp == hasRegion) continue;
+                report(verdict, std::format(
+                    "LirVerifier: inst {} {} — an asm-region bundle is a "
+                    "'{}' or '{}' opcode AND a region handle, never one "
+                    "without the other",
+                    inst.v,
+                    hasRegion ? "carries an asm-region handle but is not a "
+                                "bundle opcode"
+                              : "is a bundle opcode but carries no "
+                                "asm-region handle",
+                    kLirAsmRegionMnemonic, kLirAsmRegionGotoMnemonic),
+                    DiagnosticCode::L_AsmRegionMalformed);
+            }
+        }
+    }
 }
 
 // Count the side-structure REFERENCES a module makes. Used only by the
@@ -508,6 +656,7 @@ void checkSideStructureIntegrity(Lir const& lir, DiagnosticReporter& reporter) {
 struct SideStructureCensus {
     std::size_t literalRefs    = 0;  // `LiteralIndex` operands
     std::size_t constraintRefs = 0;  // insts with a non-zero handle
+    std::size_t regionRefs     = 0;  // asm-region bundles (P68 round 8 part 4)
 };
 
 [[nodiscard]] SideStructureCensus censusSideStructures(Lir const& lir) {
@@ -526,6 +675,9 @@ struct SideStructureCensus {
                 }
                 if (lir.instRegConstraintHandle(inst) != kLirNoRegConstraints) {
                     ++c.constraintRefs;
+                }
+                if (lir.instAsmRegionHandle(inst) != kLirNoAsmRegion) {
+                    ++c.regionRefs;
                 }
             }
         }
@@ -554,7 +706,7 @@ struct SideStructureCensus {
 void checkStoreRegClassMatchesMirType(
     Lir const& lir, Mir const& mir, TypeInterner const& interner,
     TargetSchema const& sch, std::span<MirInstId const> map,
-    DiagnosticReporter& reporter) {
+    LirVerdict& verdict) {
     auto const storeOp = sch.opcodeByMnemonic("store");
     if (!storeOp.has_value()) {
         // Schema lacks `store` — non-register-machine target. Skip
@@ -607,7 +759,7 @@ void checkStoreRegClassMatchesMirType(
                 LirRegClass const actual = lops[0].reg.regClass();
                 if (expected != actual && actual != LirRegClass::None) {
                     auto const* linfo = sch.opcodeInfo(lir.instOpcode(li));
-                    report(reporter, std::format(
+                    report(verdict, std::format(
                         "LirVerifier: store LIR inst {} ('{}') takes a {} value "
                         "operand but its source MIR Store %{} stores a value of "
                         "type kind {}, which belongs in a {} register — a store "
@@ -671,7 +823,7 @@ void checkStoreRegClassMatchesMirType(
 void checkVregClassMatchesMirType(
     Lir const& lir, Mir const& mir, TypeInterner const& interner,
     TargetSchema const& sch,
-    std::span<MirInstId const> map, DiagnosticReporter& reporter) {
+    std::span<MirInstId const> map, LirVerdict& verdict) {
     std::size_t const fnCount = lir.moduleFuncCount();
     for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
         LirFuncId const fn = lir.funcAt(fi);
@@ -700,7 +852,7 @@ void checkVregClassMatchesMirType(
                 LirRegClass const actual = result.regClass();
                 if (expected != actual && actual != LirRegClass::None) {
                     auto const* linfo = sch.opcodeInfo(lir.instOpcode(li));
-                    report(reporter, std::format(
+                    report(verdict, std::format(
                         "LirVerifier: LIR inst {} ('{}') produced a {} result "
                         "but its source MIR inst %{} ('{}', type kind {}) "
                         "expects class {}",
@@ -723,7 +875,7 @@ void checkIntrinsicCallResultValidity(Lir const& lir, Mir const& mir,
                                       TypeInterner const& interner,
                                       TargetSchema const& schema,
                                       std::span<MirInstId const> map,
-                                      DiagnosticReporter& reporter) {
+                                      LirVerdict& verdict) {
     auto const icOp = schema.opcodeByMnemonic("intrinsic_call");
     if (!icOp.has_value()) return;
     std::size_t const fnCount = lir.moduleFuncCount();
@@ -744,13 +896,13 @@ void checkIntrinsicCallResultValidity(Lir const& lir, Mir const& mir,
                     || interner.kind(mty) == TypeKind::Void;
                 bool const lirHasResult = lir.instResult(li).valid();
                 if (mirVoid && lirHasResult) {
-                    report(reporter, std::format(
+                    report(verdict, std::format(
                         "LirVerifier: intrinsic_call LIR inst {} produced a "
                         "result reg but MIR inst %{} has Void type",
                         li.v, src.v));
                 }
                 if (!mirVoid && !lirHasResult) {
-                    report(reporter, std::format(
+                    report(verdict, std::format(
                         "LirVerifier: intrinsic_call LIR inst {} has no "
                         "result reg but MIR inst %{} has a non-Void type",
                         li.v, src.v));
@@ -769,10 +921,12 @@ LirVerifyResult verifyLir(Lir const&                  lir,
                           std::span<MirInstId const>  lirToMirMap,
                           DiagnosticReporter&         reporter) {
     auto const baseline = reporter.errorCount();
-    checkMemOperandPairing(lir, schema, reporter);
-    checkTerminatorBlockRefsMatchSuccessors(lir, schema, reporter);
-    checkSideStructureIntegrity(lir, reporter);
-    checkStoreRegClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, reporter);
+    LirVerdict verdict{reporter};
+    checkMemOperandPairing(lir, schema, verdict);
+    checkTerminatorBlockRefsMatchSuccessors(lir, schema, verdict);
+    checkSideStructureIntegrity(lir, verdict);
+    checkAsmRegionOpcodes(lir, schema, verdict);
+    checkStoreRegClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, verdict);
     // ⚠ `checkVregClassMatchesMirType` (Rule 3) is ABSENT ON PURPOSE — it is
     // measured false about the shipped lowering (see the long note over it)
     // and reds 31 of 594 `examples/`. It is reachable through
@@ -781,8 +935,8 @@ LirVerifyResult verifyLir(Lir const&                  lir,
     // compile. Rules 2 and 4 below use the SAME map and are measured CLEAN
     // across all 594, so the map is not uniformly unusable — only this rule's
     // one-to-one assumption is wrong.
-    checkIntrinsicCallResultValidity(lir, mir, interner, schema, lirToMirMap, reporter);
-    return {reporter.errorCount() == baseline};
+    checkIntrinsicCallResultValidity(lir, mir, interner, schema, lirToMirMap, verdict);
+    return {verdict.clean(baseline)};
 }
 
 bool verifyLirVregClassesAgainstMir(Lir const&                 lir,
@@ -792,8 +946,9 @@ bool verifyLirVregClassesAgainstMir(Lir const&                 lir,
                                     std::span<MirInstId const> lirToMirMap,
                                     DiagnosticReporter&        reporter) {
     auto const baseline = reporter.errorCount();
-    checkVregClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, reporter);
-    return reporter.errorCount() == baseline;
+    LirVerdict verdict{reporter};
+    checkVregClassMatchesMirType(lir, mir, interner, schema, lirToMirMap, verdict);
+    return verdict.clean(baseline);
 }
 
 // ── post-regalloc verifier ─────────────────────────────────────────
@@ -801,18 +956,16 @@ bool verifyLirVregClassesAgainstMir(Lir const&                 lir,
 bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
                            DiagnosticReporter& reporter) {
     auto const baseline = reporter.errorCount();
+    LirVerdict verdict{reporter};
     auto const frameLoadOp  = schema.opcodeByMnemonic(schema.frameLoadMnemonic());
     auto const frameStoreOp = schema.opcodeByMnemonic(schema.frameStoreMnemonic());
     auto checkPhys = [&](LirReg r, char const* what, std::uint32_t instV) {
         if (r.valid() && r.isPhysical == 0) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::L_VirtualRegInPostRegalloc;
-            d.severity = DiagnosticSeverity::Error;
-            d.actual   = std::format("verifyLirPostRegalloc: inst {} has a "
-                                     "virtual {} reg (vreg id {})",
-                                     instV, what,
-                                     static_cast<std::uint32_t>(r.id));
-            reporter.report(std::move(d));
+            report(verdict,
+                   std::format("verifyLirPostRegalloc: inst {} has a "
+                               "virtual {} reg (vreg id {})",
+                               instV, what, static_cast<std::uint32_t>(r.id)),
+                   DiagnosticCode::L_VirtualRegInPostRegalloc);
         }
     };
     std::size_t const fnCount = lir.moduleFuncCount();
@@ -839,13 +992,11 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
                     (frameLoadOp.has_value()  && op == *frameLoadOp)
                  || (frameStoreOp.has_value() && op == *frameStoreOp);
                 if (isFrame && lir.instPayload(inst) == 0) {
-                    ParseDiagnostic d;
-                    d.code     = DiagnosticCode::L_InvalidSpillSlotSentinel;
-                    d.severity = DiagnosticSeverity::Error;
-                    d.actual   = std::format(
-                        "verifyLirPostRegalloc: inst {} (frame_load/frame_store) "
-                        "has payload 0 — invalid LirSpillSlot sentinel", inst.v);
-                    reporter.report(std::move(d));
+                    report(verdict,
+                           std::format(
+                               "verifyLirPostRegalloc: inst {} (frame_load/frame_store) "
+                               "has payload 0 — invalid LirSpillSlot sentinel", inst.v),
+                           DiagnosticCode::L_InvalidSpillSlotSentinel);
                 }
             }
         }
@@ -854,7 +1005,8 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
     // the pipeline (`rewriteWithAllocation`), so this is the checkpoint
     // where a dropped side-structure reference is both most likely and
     // most expensive — everything downstream of here turns into bytes.
-    checkSideStructureIntegrity(lir, reporter);
+    checkSideStructureIntegrity(lir, verdict);
+    checkAsmRegionOpcodes(lir, schema, verdict);
     // ★★★ D-OPT-JCC-FALLTHROUGH — THE PIN, AND THIS IS THE CHECKPOINT THAT
     // MATTERS FOR IT. `lir_peephole`'s R2 elides a branch's trailing
     // fallthrough operand on the strength of a LAYOUT claim, and this
@@ -865,8 +1017,8 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
     // CHECKED rather than believed, and any future pass that reorders blocks
     // after the peephole fails the build instead of shipping a branch that
     // falls into the wrong one.
-    checkTerminatorBlockRefsMatchSuccessors(lir, schema, reporter);
-    return reporter.errorCount() == baseline;
+    checkTerminatorBlockRefsMatchSuccessors(lir, schema, verdict);
+    return verdict.clean(baseline);
 }
 
 // ── text-load verifier (ML8 cycle 2) ─────────────────────────────────
@@ -874,6 +1026,7 @@ bool verifyLirPostRegalloc(Lir const& lir, TargetSchema const& schema,
 bool verifyLirText(Lir const& lir, TargetSchema const& schema,
                    DiagnosticReporter& reporter) {
     auto const baseline = reporter.errorCount();
+    LirVerdict verdict{reporter};
     // The LIR-only rules; future LIR-only rules added to `verifyLir` should
     // join here too. The text-load path has no MIR cross-reference (the source
     // MIR isn't part of `.dsslir`), so MIR-dependent rules (2–4) are
@@ -883,24 +1036,29 @@ bool verifyLirText(Lir const& lir, TargetSchema const& schema,
     // terminator whose two CFG channels disagreed, and it did so silently with
     // `ok == true`. A rule that runs only where the bug cannot occur is not a
     // net.
-    checkMemOperandPairing(lir, schema, reporter);
-    checkTerminatorBlockRefsMatchSuccessors(lir, schema, reporter);
+    checkMemOperandPairing(lir, schema, verdict);
+    checkTerminatorBlockRefsMatchSuccessors(lir, schema, verdict);
     // ★ Rule 1c matters on this path for the same reason 1b does: the text
     // reader is a PRODUCER of `regConstraints` handles and of literal-pool
     // entries, and it writes the two halves from two different sections of
     // the file. A `reg_constraints` block whose entries no instruction
     // names is exactly what a hand-edited or truncated `.dsslir` looks
     // like.
-    checkSideStructureIntegrity(lir, reporter);
-    return reporter.errorCount() == baseline;
+    checkSideStructureIntegrity(lir, verdict);
+    checkAsmRegionOpcodes(lir, schema, verdict);
+    return verdict.clean(baseline);
 }
 
 // ── paired rebuild verifier ──────────────────────────────────────────
 
-bool verifyLirRebuild(Lir const& before, Lir const& after,
-                      std::string_view passName,
-                      DiagnosticReporter& reporter) {
-    auto const baseline = reporter.errorCount();
+namespace {
+// The asm-region pool's treatment in a paired check: CARRIED by every rebuild
+// but one, CONSUMED by `expandAsmRegions`.
+enum class AsmRegionCarry : std::uint8_t { Carried, Consumed };
+
+void checkRebuildPair(Lir const& before, Lir const& after,
+                      std::string_view passName, AsmRegionCarry regions,
+                      LirVerdict& verdict) {
 
     // (1) A pool that SHRANK is a forgotten `copyModuleSideStructures`.
     // Checked first because it EXPLAINS the dangling references that
@@ -908,7 +1066,7 @@ bool verifyLirRebuild(Lir const& before, Lir const& after,
     // its own symptoms.
     auto poolShrank = [&](char const* what, std::size_t b, std::size_t a) {
         if (a >= b) return;
-        report(reporter, std::format(
+        report(verdict, std::format(
             "verifyLirRebuild: pass '{}' produced a module whose {} holds {} "
             "entries, down from {} — a rebuild must carry every module side "
             "structure across index-for-index (one call: "
@@ -930,10 +1088,22 @@ bool verifyLirRebuild(Lir const& before, Lir const& after,
     poolShrank("static-initializer schedule",
                before.staticInitSchedule().size(),
                after.staticInitSchedule().size());
+    if (regions == AsmRegionCarry::Carried) {
+        poolShrank("asm-region pool", before.asmRegionPool().size(),
+                   after.asmRegionPool().size());
+    } else if (after.asmRegionPool().size() != 0) {
+        report(verdict, std::format(
+            "verifyLirRebuild: pass '{}' consumes the asm-region pool, yet its "
+            "output still holds {} region(s) — a consumed structure that "
+            "survives is a body some later pass could still attach to an "
+            "instruction",
+            passName, after.asmRegionPool().size()),
+            DiagnosticCode::L_AsmRegionMalformed);
+    }
 
     // (2) The module-local rules on the OUTPUT — dangling indices, and
     // constraint entries nothing references.
-    checkSideStructureIntegrity(after, reporter);
+    checkSideStructureIntegrity(after, verdict);
 
     // (3) References that vanished. ★ This is the only instrument that
     // catches a LITERAL reference dropped by a rebuild: a `LiteralIndex`
@@ -946,7 +1116,7 @@ bool verifyLirRebuild(Lir const& before, Lir const& after,
     auto const a = censusSideStructures(after);
     auto refsLost = [&](char const* what, std::size_t bn, std::size_t an) {
         if (an >= bn) return;
-        report(reporter, std::format(
+        report(verdict, std::format(
             "verifyLirRebuild: pass '{}' produced a module making {} {} "
             "references, down from {} — an instruction lost its reference to "
             "a module side structure. The pool still holds the entry and "
@@ -957,8 +1127,40 @@ bool verifyLirRebuild(Lir const& before, Lir const& after,
     };
     refsLost("literal-pool", b.literalRefs, a.literalRefs);
     refsLost("register-constraint", b.constraintRefs, a.constraintRefs);
+    if (regions == AsmRegionCarry::Carried) {
+        refsLost("asm-region", b.regionRefs, a.regionRefs);
+    } else if (a.regionRefs != 0) {
+        report(verdict, std::format(
+            "verifyLirRebuild: pass '{}' consumes the asm-region pool, yet {} "
+            "instruction(s) of its output still carry a region handle — an "
+            "inline-asm bundle survived its own expansion and would reach the "
+            "encoder, which has no bytes for it",
+            passName, a.regionRefs),
+            DiagnosticCode::L_AsmRegionMalformed);
+    }
+}
+} // namespace
 
-    return reporter.errorCount() == baseline;
+bool verifyLirRebuild(Lir const& before, Lir const& after,
+                      std::string_view passName,
+                      DiagnosticReporter& reporter) {
+    auto const baseline = reporter.errorCount();
+    LirVerdict verdict{reporter};
+    checkRebuildPair(before, after, passName, AsmRegionCarry::Carried, verdict);
+    return verdict.clean(baseline);
+}
+
+bool verifyLirAsmRegionExpansion(Lir const& before, Lir const& after,
+                                 TargetSchema const& schema,
+                                 DiagnosticReporter& reporter) {
+    auto const baseline = reporter.errorCount();
+    LirVerdict verdict{reporter};
+    checkRebuildPair(before, after, "asm-region-expansion",
+                     AsmRegionCarry::Consumed, verdict);
+    // No instruction of the output is the bundle opcode either (a bundle that
+    // lost its handle on the way out would pass the handle count above).
+    checkAsmRegionOpcodes(after, schema, verdict);
+    return verdict.clean(baseline);
 }
 
 } // namespace dss

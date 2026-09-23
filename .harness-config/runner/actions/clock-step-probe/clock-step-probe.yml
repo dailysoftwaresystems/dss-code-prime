@@ -1,3 +1,4 @@
+# PURPOSE: count the intervals in which this host's CLOCK_REALTIME diverged from CLOCK_MONOTONIC beyond the tolerance, so a failure blamed on a clock step has something that can refuse to confirm it.
 name: clock-step-probe
 description: >-
   Counts the intervals in which this host's CLOCK_REALTIME diverged from CLOCK_MONOTONIC by more

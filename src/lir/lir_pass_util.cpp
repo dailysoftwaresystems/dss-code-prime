@@ -149,6 +149,16 @@ emitTerminatorDispatch(LirBuilder& b, std::uint16_t op,
                                "Switch lowering)",
                                passName, static_cast<unsigned>(op)));
             return false;
+        case TargetTerminatorKind::AsmGoto: {
+            // P68 round 8 part 4: an `asm goto` bundle — its labels, then its
+            // fall-through; the operands (already in `newOps`) are its slots.
+            if (succs.empty()) break;
+            std::vector<LirBlockId> targets;
+            targets.reserve(succs.size());
+            for (std::size_t i = 0; i < succs.size(); ++i) targets.push_back(resolveAt(i));
+            b.addAsmGoto(op, newOps, targets, payload, flags);
+            return true;
+        }
         case TargetTerminatorKind::IndirectBr: {
             // D-CSUBSET-COMPUTED-GOTO: re-map the address operand(s) (already in
             // `newOps`) AND resolve EVERY address-taken successor through srcToDst.
@@ -219,8 +229,11 @@ bool emitTerminator(LirBuilder& b, std::uint16_t op,
     return false;
 }
 
-void
-copyModuleSideStructures(Lir const& src, LirBuilder& dst) {
+namespace {
+// The side structures EVERY rebuild carries — the one list both public copy
+// functions share (`copyModuleSideStructures` and the consuming variant the
+// asm-region expansion uses), so neither can drift from the other.
+void copyCarriedSideStructures(Lir const& src, LirBuilder& dst) {
     // Append every source pool entry in index order. The destination
     // builder is freshly constructed (empty pools), so the `*Add` calls
     // return 0, 1, 2, ... — reproducing the source indices that the
@@ -253,10 +266,53 @@ copyModuleSideStructures(Lir const& src, LirBuilder& dst) {
         dst.staticInitAdd(e.symbol, e.schedule);
     }
 }
+} // namespace
+
+bool
+canElideFallthroughOperand(TargetSchema const&        schema,
+                           std::uint16_t              opcode,
+                           std::span<LirOperand const> ops,
+                           std::span<LirBlockId const> succs,
+                           std::optional<LirBlockId>  nextBlock) noexcept {
+    if (!nextBlock.has_value()) return false;
+    auto const* info = schema.opcodeInfo(opcode);
+    if (info == nullptr || !info->isTerminator()) return false;
+    if (ops.empty() || ops.size() != succs.size()) return false;
+    for (std::size_t k = 0; k < ops.size(); ++k) {
+        if (ops[k].kind != LirOperandKind::BlockRef) return false;
+        if (ops[k].blockSlot != succs[k].v) return false;
+    }
+    if (succs.back().v != nextBlock->v) return false;
+    return declaresFallthroughBranchForm(schema, opcode, ops.size());
+}
+
+void
+copyModuleSideStructures(Lir const& src, LirBuilder& dst) {
+    copyCarriedSideStructures(src, dst);
+    // P68 round 8 part 4: the FOURTH side structure, the inline-asm bundle
+    // bodies. SHARED rather than deep-copied — a region is immutable once
+    // pooled, so every rebuild's pool points at the same bodies — and in index
+    // order, for the pools' reason: the per-instruction handle is an index.
+    auto const& regions = src.asmRegionPool();
+    for (std::uint32_t i = 0; i < regions.size(); ++i) {
+        (void)dst.asmRegionPoolAdd(regions.shared(i));
+    }
+}
+
+void
+copyModuleSideStructuresConsumingAsmRegions(Lir const& src, LirBuilder& dst) {
+    copyCarriedSideStructures(src, dst);
+}
 
 void
 carryInstSideData(Lir const& src, LirInstId srcInst,
                   LirBuilder& dst, LirInstId dstInst) {
+    std::uint32_t const region = src.instAsmRegionHandle(srcInst);
+    if (region != kLirNoAsmRegion) {
+        // P68 round 8 part 4: an asm-region bundle's body. Same index-preserving
+        // copy, same range check (plus the builder's slot-count check).
+        dst.setInstAsmRegion(dstInst, lirAsmRegionIndexForHandle(region));
+    }
     std::uint32_t const handle = src.instRegConstraintHandle(srcInst);
     if (handle == kLirNoRegConstraints) return;
     // The pools were copied index-preservingly by

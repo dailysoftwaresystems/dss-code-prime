@@ -1,0 +1,14 @@
+# PURPOSE: refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells.
+name: check-anchor-registry
+description: >-
+  The action verifies anchor citations and the plans' table cells, then proves every refusal can fire.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `anchor_registry_guard`.
+steps:
+  - name: self-test-then-verify
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-anchor-registry.py
+    successPattern: 'anchor-registry: OK \('
+    requireInputsUnmoved: true

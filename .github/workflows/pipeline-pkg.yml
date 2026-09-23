@@ -22,7 +22,7 @@ name: Package
 # the .deb/.rpm step in publish-packages.yml already chmod'd bin/dsscp, so no Debian
 # or RPM package could be produced at all -- and nothing saw it, because that step
 # runs only on a v* tag and no tag had been pushed. A half-migration behind a green
-# suite (D-PKG-PUBLISH-PATH-NAMES-THE-POST-RENAME-BINARY).
+# suite.
 #
 # Flow (immutable-release-safe): create a DRAFT release, build the shippable
 # artifact on each platform leg in parallel, PERSIST it as a run artifact and
@@ -46,9 +46,9 @@ name: Package
 # ⛔ THE MODE IS THREE `if:` CONDITIONS, NEVER A SECOND COPY OF ANYTHING. Adding a
 # mode to a workflow is cheapest by forking the packaging steps into a second job,
 # and a forked copy is two owners of one shape — the drift this repository already
-# carries an open row about for the sibling pipeline
-# (D-CI-PR-PIPELINE-IS-VENDORED-AND-ITS-SYNC-IS-UNCHECKED). `pkg_pipeline_modes_guard`
-# (`scripts/check-pkg-pipeline/`) refuses a tree where that stops being true, and
+# filed once for the sibling pipeline (a vendored copy whose sync nothing checks).
+# `pkg_pipeline_modes_guard`
+# (`.harness-config/runner/actions/check-pkg-pipeline/`) refuses a tree where that stops being true, and
 # pins the release path's job and step sequence besides.
 #
 # ── THE RELEASE PATH: WHAT WAS FROZEN, AND WHAT WAS THEN AUTHORISED ─────────
@@ -420,7 +420,7 @@ jobs:
         timeout-minutes: 90
 
       # ── Stage the INSTALL SET, and tar THAT ───────────────────────────────
-      # D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE. This step used to be
+      # This step used to be
       # absent and the packaging step below tarred `bin` straight out of the
       # build directory — so every release shipped a bare executable with NO
       # `src/dss-config/`, and a packaged compiler could not resolve a single

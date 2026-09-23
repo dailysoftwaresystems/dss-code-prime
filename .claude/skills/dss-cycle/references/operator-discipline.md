@@ -18,7 +18,7 @@ reads as evidence, and now points at unrelated prose.
 
 ⚠ **✔MEASURED twice in one cycle (P17), which is why this is a rule and not advice.** Inserting a
 `# PURPOSE:` line at the top of eighteen scripts moved **16** citations off their subjects —
-one citation into `check-anchor-registry.sh` had pointed at *"…staleness sweep commit message…"*
+one citation into `check-anchor-registry.sh` (the shell guard of the time) had pointed at *"…staleness sweep commit message…"*
 and pointed instead at *"Same pattern the developer-side audit grep uses…"*. Then the rows written to RECORD
 that defect shipped **three more** wrong numbers of their own, each naming the first line of an
 explanatory comment rather than the code it explains. Both were caught by independent audit; no
@@ -29,7 +29,7 @@ gate saw either.
 A new one reds immediately. Converting one reds until its ceiling is lowered in the same commit:
 
 ```bash
-python scripts/check-plan-citations/check-plan-citations.py --write
+python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --write
 ```
 
 

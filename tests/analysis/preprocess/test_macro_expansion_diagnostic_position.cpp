@@ -36,12 +36,12 @@
 // takes clang's shape — primary at the EXPANSION SITE, `note: expanded from macro
 // 'X'` at the `#define` — which is also what the row prescribes in words.
 // (Both renderings are described in prose, never transcribed: a `file:line:col`
-//  in a source file reads to `scripts/check-plan-citations` as a positional
+//  in a source file reads to `.harness-config/runner/actions/check-plan-citations` as a positional
 //  citation, and it is right to be blunt about that shape.)
 //
 // ── WHY THE ASSERTIONS ARE COMPOSED AND NOT SPELLED OUT ────────────────────
 // Same reason as `tests/analysis/test_diagnostic_position_origin_coordinates`: a
-// `path:line` literal in a source file reads to `scripts/check-plan-citations` as
+// `path:line` literal in a source file reads to `.harness-config/runner/actions/check-plan-citations` as
 // a positional citation, and a guard that learns exceptions is a guard nobody
 // reads. Every number below arrives through a named constant that says what it IS
 // (which line the invocation is on; which line the `#define` is on) about a
@@ -96,7 +96,7 @@ namespace fs = std::filesystem;
         if (!loaded.has_value()) {
             // THROW, never `std::abort()`: abort kills the whole test BINARY, so
             // every sibling test loses its verdict (machine-checked by
-            // scripts/check-no-abort-in-tests).
+            // .harness-config/runner/actions/check-no-abort-in-tests).
             throw std::runtime_error{"loadShipped(c) failed"};
         }
         return *loaded;

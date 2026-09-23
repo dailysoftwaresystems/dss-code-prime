@@ -1,5 +1,6 @@
 #include "program/dump_predefined_macros.hpp"
 
+#include "analysis/compilation_unit/compilation_unit.hpp"  // predefinedTypeFactsFor — the pair's `type-size` facts, one computation
 #include "analysis/preprocess/preprocessor.hpp"   // mergePredefinedMacros — THE owner
 #include "core/substrate/path_identity.hpp"  // genericSpelling — the UNC-safe path spelling
 #include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk;
@@ -150,6 +151,12 @@ void appendLine(std::string&          out,
             // `__stdcall` → empty erase). An empty `value=` field is therefore
             // meaningful output, not a missing one.
             return pm.value;
+        case PredefinedMacroKind::TypeSize:
+            // P68 round 8: the size the merge REALIZED for this pair — the only
+            // way a `type-size` row reaches `effective` — printed as the token
+            // the preprocessor will see; `kind=type-size` beside it says the
+            // number was derived from a type, not declared.
+            return pm.value;
         case PredefinedMacroKind::Date:
             // Quoted exactly as the materializer quotes it, so the dumped
             // spelling is the token the parser would see.
@@ -201,7 +208,7 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     // order, and whether the three families collide, comes from this one call.
     MergedPredefinedMacros const merged = mergePredefinedMacros(
         req.languageMacros, req.targetMacros, req.formatMacros,
-        req.activeFormat, req.exclusiveGroups);
+        req.activeFormat, req.exclusiveGroups, req.typeFacts);
     // `conflicts` non-empty ⇒ `effective` is documented UNUSABLE. Return the
     // merge's own messages and NOTHING else — no header, no partial list.
     if (!merged.conflicts.empty()) return std::unexpected(merged.conflicts);
@@ -267,16 +274,23 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
         PredefinedMacroOrigin origin;
         MergedPredefinedMacros merged;
     };
+    // ★ `req.typeFacts` goes to every per-family call too (P68 round 8): a
+    // `type-size` row survives the full merge only when the pair realizes it,
+    // so a per-family call without the facts would drop it and the name-for-name
+    // check below would refuse a correct dump.
     std::array<FamilySurvivors, 3> const families{
         FamilySurvivors{PredefinedMacroOrigin::Language,
                         mergePredefinedMacros(req.languageMacros, {}, {},
-                                              req.activeFormat)},
+                                              req.activeFormat, {},
+                                              req.typeFacts)},
         FamilySurvivors{PredefinedMacroOrigin::Target,
                         mergePredefinedMacros(req.targetMacros, {}, {},
-                                              req.activeFormat)},
+                                              req.activeFormat, {},
+                                              req.typeFacts)},
         FamilySurvivors{PredefinedMacroOrigin::Format,
                         mergePredefinedMacros(req.formatMacros, {}, {},
-                                              req.activeFormat)}};
+                                              req.activeFormat, {},
+                                              req.typeFacts)}};
 
     std::size_t i = 0;
     for (FamilySurvivors const& fam : families) {
@@ -541,6 +555,12 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         // path passes, so this instrument and the compiler agree about which
         // identities are presentable.
         req.exclusiveGroups = grammar->preprocess().mutuallyExclusivePredefinedMacros;
+        // P68 round 8: the pair's facts, by the same function the compile's
+        // `applyTargetFormatPair` uses, so the `type-size` rows print the sizes
+        // this triple's compile would define.
+        PredefinedTypeFacts const typeFacts =
+            predefinedTypeFactsFor(**targetR, **formatR);
+        req.typeFacts      = &typeFacts;
         req.userDefines    = args.defines;
         // WHICH TREE ANSWERED — from the LANGUAGE document that actually
         // loaded, never from a fresh precedence walk. See the field's docblock.

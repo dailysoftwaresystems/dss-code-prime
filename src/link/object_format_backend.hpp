@@ -5,6 +5,7 @@
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (the BRIDGE type — see the tier note)
 #include "core/types/strong_ids.hpp"          // CompilationUnitId — by VALUE in readRelocatableObject
 #include "link/import_call_stub_layout.hpp"  // link::ImportCallStubLayout — by VALUE in importCallStubLayout
+#include "link/runpath.hpp"                  // RunpathCarrier — `std::span<RunpathCarrier const>` needs the complete type
 
 #include <cstdint>
 #include <functional>
@@ -226,6 +227,21 @@ public:
     [[nodiscard]] virtual std::span<WeakDefinitionDialect const>
     weakDefinitionDialects() const noexcept = 0;
 
+    // The `runpath.carrier` verbs this backend's WALKER records
+    // (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — the third config vocabulary whose
+    // rows name an encoder, asked the same way as the two above: `validate()`
+    // refuses a document declaring a carrier no walker writes, or one written
+    // by a DIFFERENT backend, so a runpath can never be declared, accepted and
+    // then dropped by the walker that was handed it. Empty for every backend
+    // whose walker records none — which is not a refusal of the request: a
+    // format with no declaration accepts it with a warning (see
+    // `link/runpath.hpp` for the PE measurement that decided that).
+    //
+    // ★ PURE, like its two siblings: every backend must ANSWER, so a new
+    // format cannot inherit a silent "records nothing" it never chose.
+    [[nodiscard]] virtual std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept = 0;
+
     // ── Capability predicates (NEVER identity predicates) ───────────────
 
     // Does this schema describe a LOAD-TIME-BOUND image (ELF ET_EXEC/ET_DYN,
@@ -395,9 +411,12 @@ public:
     // the linker's pre-walker gate refuses any request whose vehicle this
     // schema does not declare, and `stackReserveVehicles()` above is what the
     // load-time rule checks that declaration against. A backend with no
-    // vehicle can only ever be handed an EMPTY request. "Declared but
-    // silently dropped" stays unreachable, now by a capability chain rather
-    // than by a hand-maintained argument list.
+    // vehicle can only ever be handed a request with no stack reserve.
+    // "Declared but silently dropped" stays unreachable, now by a capability
+    // chain rather than by a hand-maintained argument list. The request's
+    // RUNPATHS do reach every backend (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH):
+    // a backend whose walker records none was reported by the gate's warning,
+    // and one that records them does so from the format's declaration.
     [[nodiscard]] virtual std::vector<std::uint8_t>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,

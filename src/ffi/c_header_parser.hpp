@@ -25,7 +25,35 @@
 // substrate remains compiled and tested as anchored future
 // capability (D-FF2 in plan 11).
 
+namespace dss {
+class TargetSchema;              // core/types/target_schema.hpp
+class ObjectFormatSchema;        // link/object_format_schema.hpp
+struct TargetCallingConvention;  // core/types/target_schema.hpp
+} // namespace dss
+
 namespace dss::ffi {
+
+// The `<target>:<format>` pair a header is read under, with the calling
+// convention the build resolves for it — [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]].
+//
+// ★ A HEADER MEANS WHAT IT MEANS FOR A PAIR. `#ifdef _WIN32`, `__LP64__`,
+// `__has_include(<Windows.h>)` under the format's header-name case rule,
+// `sizeof(long)`, `long double`, a descriptor available on one format only: each
+// is decided by the pair a build compiles for, and this reader used to decide
+// every one of them with no pair at all (language predefines only, POSIX case
+// rule, LP64 analysis defaults, no availability gate) — so it could read a
+// header differently from the build that uses its rows. It now declares the pair
+// through the build's own two calls (`applyTargetFormatPair`,
+// `analyzeForTargetFormat`), and a caller cannot read a header without naming
+// one: the parameter has no default.
+//
+// `callingConvention` is `ffi::resolveAbi(target, format, …)`'s answer (an entry
+// of `target`); `ingest()` resolves it once, before any source is read.
+struct DSS_EXPORT HeaderReadPair {
+    TargetSchema const&            target;
+    ObjectFormatSchema const&      format;
+    TargetCallingConvention const* callingConvention = nullptr;
+};
 
 // Closed-set FF2 failure modes — distinct remediations → distinct
 // kinds. 1:1 with `F_Header*` diagnostic codes via the
@@ -88,15 +116,17 @@ struct DSS_EXPORT HeaderReadError {
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeader(std::filesystem::path const& headerPath,
             std::string_view             importLibrary,
+            HeaderReadPair const&        pair,
             DiagnosticReporter&          reporter);
 
 // In-memory variant. `headerPathLabel` names the buffer for diagnostics
 // (e.g. a synthetic URI or `<test>` for fixtures).
 [[nodiscard]] DSS_EXPORT
 std::expected<std::vector<ImportSurface>, HeaderReadError>
-readCHeaderFromText(std::string_view    text,
-                    std::string_view    headerPathLabel,
-                    std::string_view    importLibrary,
-                    DiagnosticReporter& reporter);
+readCHeaderFromText(std::string_view      text,
+                    std::string_view      headerPathLabel,
+                    std::string_view      importLibrary,
+                    HeaderReadPair const& pair,
+                    DiagnosticReporter&   reporter);
 
 } // namespace dss::ffi

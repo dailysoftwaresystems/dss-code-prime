@@ -37,6 +37,7 @@
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
 // through ctest and never as a bare `.exe`.
 
+#include "asm_region_test_support.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/target_schema.hpp"
@@ -241,6 +242,26 @@ struct Placed { LirInstId id; LirBlockId block; };
 }
 
 // The last instruction strictly before `before` whose result is `reg`.
+// P68 round 8 part 4 — a TEMPLATE LINE: an instruction of some statement's
+// bundle BODY, with the bundle it belongs to (the statement's position in the
+// function, for a search that runs before or after it).
+struct TemplateLine {
+    Lir const* body   = nullptr;
+    LirInstId  id{};
+    LirInstId  bundle{};
+};
+[[nodiscard]] std::vector<TemplateLine>
+templateWithOpcode(Lir const& lir, std::uint16_t op) {
+    std::vector<TemplateLine> out;
+    for (LirInstId const b : dss::test_support::asmRegionBundles(lir)) {
+        LirAsmRegion const& r = *lir.instAsmRegion(b);
+        for (LirInstId const i : dss::test_support::asmRegionBodyInsts(r)) {
+            if (r.body.instOpcode(i) == op) out.push_back({&r.body, i, b});
+        }
+    }
+    return out;
+}
+
 [[nodiscard]] std::optional<LirInstId>
 defBefore(Lir const& lir, LirReg reg, LirInstId before) {
     std::optional<LirInstId> found;
@@ -330,19 +351,20 @@ TEST(LirAsmHomeCarriage, ALongDoubleBoundToAnFpRegisterTravelsByItsHome) {
            "18.1.3 both compile and run it: " << inventory(L.reporter);
     Lir const& lir = L.result.lir;
 
-    auto const templ = withOpcode(lir, opOf(t, "move_bytes"));
+    auto const templ = templateWithOpcode(lir, opOf(t, "move_bytes"));
     ASSERT_EQ(templ.size(), 1u)
         << "the template `mov %0.16b, %1.16b` is ONE 128-bit register move";
-    LirInstId const T = templ[0];
-    auto const tops = lir.instOperands(T);
+    TemplateLine const T = templ[0];
+    auto const tops = T.body->instOperands(T.id);
     ASSERT_GE(tops.size(), 1u);
     ASSERT_EQ(tops[0].kind, LirOperandKind::Reg);
     LirReg const in  = tops[0].reg;
-    LirReg const out = lir.instResult(T);
+    LirReg const out = T.body->instResult(T.id);
 
     // (a) ★★ THE REGISTER THE TEMPLATE READS HOLDS THE VALUE: it is defined by
-    // the SIMD&FP class's load, at the full 128 bits, from a GPR-held address.
-    auto const def = defBefore(lir, in, T);
+    // the SIMD&FP class's load, at the full 128 bits, from a GPR-held address —
+    // before the statement's bundle (P68 round 8 part 4).
+    auto const def = defBefore(lir, in, T.bundle);
     ASSERT_TRUE(def.has_value())
         << "nothing defines the register the template reads";
     EXPECT_EQ(lir.instOpcode(*def), opOf(t, "fldur"))
@@ -382,11 +404,11 @@ TEST(LirAsmHomeCarriage, ADoubleBoundToAnFpRegisterKeepsItsMove) {
     L.result = lowerToLir(m, t, L.interner, L.reporter);
     ASSERT_TRUE(L.result.ok) << inventory(L.reporter);
     Lir const& lir = L.result.lir;
-    auto const templ = withOpcode(lir, opOf(t, "move_bytes"));
+    auto const templ = templateWithOpcode(lir, opOf(t, "move_bytes"));
     ASSERT_EQ(templ.size(), 1u);
-    LirReg const in  = lir.instOperands(templ[0])[0].reg;
-    LirReg const out = lir.instResult(templ[0]);
-    auto const def = defBefore(lir, in, templ[0]);
+    LirReg const in  = templ[0].body->instOperands(templ[0].id)[0].reg;
+    LirReg const out = templ[0].body->instResult(templ[0].id);
+    auto const def = defBefore(lir, in, templ[0].bundle);
     ASSERT_TRUE(def.has_value());
     EXPECT_EQ(lir.instOpcode(*def), opOf(t, "fmov"))
         << "a double lives in a register at this tier: its operand is MOVED "
@@ -408,10 +430,10 @@ TEST(LirAsmHomeCarriage, EveryOutputRouteStoresIntoAHome) {
            "gcc and clang run the C twin to the right answer: "
         << inventory(L.reporter);
     Lir const& lir = L.result.lir;
-    auto const templ = withOpcode(lir, opOf(t, "move_bytes"));
+    auto const templ = templateWithOpcode(lir, opOf(t, "move_bytes"));
     ASSERT_EQ(templ.size(), 2u) << "two `mov Vd.16b, Vn.16b` lines";
-    LirReg const x = lir.instResult(templ[0]);
-    LirReg const y = lir.instResult(templ[1]);
+    LirReg const x = templ[0].body->instResult(templ[0].id);
+    LirReg const y = templ[1].body->instResult(templ[1].id);
     EXPECT_FALSE(x == y) << "two early-clobber outputs in one register";
     EXPECT_EQ(storesOf(lir, opOf(t, "fstur"), x, 128).size(), 1u)
         << "output 0 (the asm's own value) must be stored into its home";
@@ -446,9 +468,9 @@ TEST(LirAsmHomeCarriage, AnAsmGotoOutputIsStoredOnEveryEdge) {
         << "an `asm goto` with a long double output must lower — gcc and "
            "clang run the C twin: " << inventory(L.reporter);
     Lir const& lir = L.result.lir;
-    auto const templ = withOpcode(lir, opOf(t, "move_bytes"));
+    auto const templ = templateWithOpcode(lir, opOf(t, "move_bytes"));
     ASSERT_EQ(templ.size(), 1u);
-    LirReg const out = lir.instResult(templ[0]);
+    LirReg const out = templ[0].body->instResult(templ[0].id);
     auto const stores = storesOf(lir, opOf(t, "fstur"), out, 128);
     ASSERT_EQ(stores.size(), 2u)
         << "one 128-bit store per edge — the fall-through AND the label — "
@@ -487,12 +509,20 @@ TEST(LirAsmHomeCarriage, ALongDoubleOnAGeneralRegisterTravelsAsAPair) {
         << "the input pair is TWO 64-bit loads out of the value's home";
     ASSERT_EQ(stores.size(), 2u)
         << "the output pair is TWO 64-bit stores into its home";
+    auto const bundle = dss::test_support::onlyAsmRegion(lir);
+    ASSERT_TRUE(bundle.has_value());
+    Lir const& body = bundle->region->body;
     for (auto const& s : stores) {
-        // the template instruction that wrote this half ...
-        auto const def = defBefore(lir, s.reg, s.id);
+        // the template instruction that wrote this half (a line of the
+        // statement's bundle BODY, P68 round 8 part 4) ...
+        std::optional<LirInstId> def;
+        for (LirInstId const i :
+             dss::test_support::asmRegionBodyInsts(*bundle->region)) {
+            if (body.instResult(i) == s.reg) def = i;
+        }
         ASSERT_TRUE(def.has_value()) << "nothing wrote the half stored at +"
                                      << s.offset;
-        auto const dops = lir.instOperands(*def);
+        auto const dops = body.instOperands(*def);
         ASSERT_FALSE(dops.empty());
         ASSERT_EQ(dops[0].kind, LirOperandKind::Reg);
         // ... read the input half loaded from the SAME displacement.

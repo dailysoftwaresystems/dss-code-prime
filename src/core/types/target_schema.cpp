@@ -700,6 +700,83 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                 vi, wi),
                     w.regRole);
             }
+            // ★★ AN ELEMENT AND ITS INDEX ARE ONE OPERAND PAIR (P68 round 8,
+            // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS): a field that
+            // reads ONE element (`elementBits`) is a register, the operand right
+            // after it is that element's index, and the index is wired to
+            // `imm5.element`, which reads the size off exactly that field. Each
+            // half without the other is refused — an index field with no sized
+            // element would write a size it cannot know, and an element with no
+            // index field would read one lane of a register whose lane no field
+            // names.
+            for (std::size_t wi = 0; wi < v.wires.size(); ++wi) {
+                auto const& w = v.wires[wi];
+                if (w.index >= v.operandKinds.size()) continue;
+                auto const path = std::format(
+                    "/opcodes/{}/encoding/variants/{}/wires/{}", i, vi, wi);
+                auto const elementAt = [&](std::size_t idx) {
+                    for (auto const& x : v.wires) {
+                        if (x.index == idx && x.elementBits != 0) return true;
+                    }
+                    return false;
+                };
+                auto const indexAt = [&](std::size_t idx) {
+                    for (auto const& x : v.wires) {
+                        if (x.index == idx
+                            && x.slotKind == EncodingSlotKind::ElementIndex) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (w.elementBits != 0) {
+                    if (v.operandKinds[w.index] != OperandKindFilter::Reg) {
+                        fail(path + "/elementBits",
+                             std::format("opcode '{}' variant {}: wire {} reads "
+                                         "one element (`elementBits`) of guard "
+                                         "operand {}, which is '{}', not a "
+                                         "register",
+                                         o.mnemonic, vi, wi, w.index,
+                                         operandKindFilterName(
+                                             v.operandKinds[w.index])));
+                    } else if (!indexAt(static_cast<std::size_t>(w.index) + 1u)) {
+                        fail(path + "/elementBits",
+                             std::format("opcode '{}' variant {}: wire {} reads "
+                                         "one element of operand {}, but no "
+                                         "wire takes operand {} into an "
+                                         "'imm5.element' field — the element's "
+                                         "INDEX is the next operand, and without "
+                                         "a field for it the instruction reads "
+                                         "a lane nothing names",
+                                         o.mnemonic, vi, wi, w.index,
+                                         w.index + 1));
+                    }
+                }
+                if (w.slotKind == EncodingSlotKind::ElementIndex) {
+                    if (v.operandKinds[w.index] != OperandKindFilter::ImmInt) {
+                        fail(path,
+                             std::format("opcode '{}' variant {}: wire {} writes "
+                                         "an element index from guard operand "
+                                         "{}, which is '{}' — an index is an "
+                                         "immediate",
+                                         o.mnemonic, vi, wi, w.index,
+                                         operandKindFilterName(
+                                             v.operandKinds[w.index])));
+                    } else if (w.index == 0 || !elementAt(w.index - 1u)) {
+                        fail(path,
+                             std::format("opcode '{}' variant {}: wire {} writes "
+                                         "an 'imm5.element' field from operand "
+                                         "{}, but no wire reads operand {} as "
+                                         "ONE element (`elementBits`) — the "
+                                         "field holds the element's SIZE as well "
+                                         "as its index, and the size is read off "
+                                         "that field",
+                                         o.mnemonic, vi, wi, w.index,
+                                         w.index == 0 ? 0u
+                                                      : w.index - 1u));
+                    }
+                }
+            }
             // ★ THE RESULT FIELD'S TWO ROLE KEYS, checked against the same
             // declared vocabulary. A typo here would not fail the document, it
             // would make the variant unreachable — an encoding silently absent
@@ -1777,6 +1854,29 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "as an alias, or drop the key",
                              r.name));
         }
+        // ★★ A NAME STATES NO WIDTH ONLY WHERE NO NAME STATES ONE (P68 round 8,
+        // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). A width VIEW (`eax`,
+        // `d0`) exists to state a width, and a register that HAS views is named
+        // at its own width by contrast with them — so on either kind of row the
+        // key would make one width-stating name silent and let an instruction
+        // mixing it with a narrower view encode at whichever width won.
+        if (r.nameStatesNoWidth) {
+            bool hasView = !r.subOf.empty();
+            for (auto const& other : registers) {
+                if (other.subOf == r.name) { hasView = true; break; }
+            }
+            if (hasView) {
+                fail(std::format("/registers/{}/nameStatesNoWidth", i),
+                     std::format("register '{}': 'nameStatesNoWidth' says its "
+                                 "names state no operation width, but it {} — "
+                                 "where width views exist, every name states a "
+                                 "width",
+                                 r.name,
+                                 r.subOf.empty() ? "has a narrower width view "
+                                                   "('subOf' names it)"
+                                                 : "IS a width view ('subOf')"));
+            }
+        }
         // ★★★ A DEFAULT READING IS A PROPERTY **OF** A ROLE, so a row claiming
         // one without naming a role is stating half a sentence.
         // [[D-ASM-ARM64-SP-AND-XZR-SHARE-ENCODING-31-SO-MOV-SP-SILENTLY-BECOMES-ZERO]]
@@ -1788,6 +1888,34 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "'encodingRole' — there is no role for it to be "
                              "the default of",
                              r.name));
+        }
+        // ★★ `continuesIn` NAMES A FULL REGISTER OF THIS ROW'S OWN CLASS AND
+        // WIDTH (P68 round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the
+        // two halves of one value are loaded and stored by one class's verbs at
+        // one width, so a partner in another file or of another width would be
+        // encoded into the wrong one; a sub-register view (`w5`) would pin the
+        // half's register under a name the allocator holds no pool for.
+        if (!r.continuesIn.empty()) {
+            TargetRegisterInfo const* next = nullptr;
+            for (auto const& cand : registers) {
+                if (cand.name == r.continuesIn) { next = &cand; break; }
+            }
+            if (next == nullptr) {
+                fail(std::format("/registers/{}/continuesIn", i),
+                     std::format("register '{}': 'continuesIn' names '{}', which "
+                                 "this target does not declare",
+                                 r.name, r.continuesIn));
+            } else if (!next->subOf.empty() || !r.subOf.empty()
+                       || next->regClass != r.regClass
+                       || next->widthBytes != r.widthBytes
+                       || next->name == r.name) {
+                fail(std::format("/registers/{}/continuesIn", i),
+                     std::format("register '{}': 'continuesIn' names '{}', which "
+                                 "is not another FULL register of the same class "
+                                 "and width — the second half of a value is "
+                                 "carried by the first half's own verbs",
+                                 r.name, r.continuesIn));
+            }
         }
         if (anyX86VariableOpcode
             && (r.regClass == TargetRegClass::GPR
@@ -3120,6 +3248,35 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
     }
 
+    // ── linkVeneers — its rules are ONE function, `linkVeneerProblems` below,
+    // which the linker also calls for a schema built in memory
+    // ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]).
+    for (auto& p : linkVeneerProblems(*this)) problems.push_back(std::move(p));
+
+    return problems;
+}
+
+// ── THE linkVeneers RULE SET — one function, two callers ────────────────────
+//
+// `validate()` above appends these at load; the linker's veneer pass asks for
+// them through `TargetSchema::linkVeneerProblems()` before it builds a body,
+// because a schema built in memory never passed through the loader
+// ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]). It used to be the
+// last block of `validate()`, and the pass kept its own hand-copied subset of
+// it; the subset had drifted, so there is now exactly one copy.
+std::vector<ConfigDiagnostic> linkVeneerProblems(TargetSchemaData const& data) {
+    std::vector<ConfigDiagnostic> problems;
+    auto fail = [&](std::string path, std::string msg) {
+        problems.push_back(makeProblem(std::move(path), std::move(msg)));
+    };
+    // The five parts of the schema the rules read, named as `validate()`
+    // names them, so the rules below are the text they were there.
+    auto const& registers           = data.registers;
+    auto const& opcodes             = data.opcodes;
+    auto const& relocations         = data.relocations;
+    auto const& relocationKindIndex = data.relocationKindIndex;
+    auto const& linkVeneers         = data.linkVeneers;
+
     // ── linkVeneers ([[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]])
     //
     // The SHAPE a veneer body must have, checked on the RESOLVED fields so a
@@ -3127,15 +3284,20 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
     // rule is a consequence of the ABI sentence the block encodes — a veneer
     // may change only the scratch registers and the flags, and must hand
     // control to its target:
-    //   * no step may be a CALL (it writes the link register, which the veneer
-    //     must preserve — the branch that reached it set it);
-    //   * the last step, and only the last, is a terminator, and it is an
+    //   * no step may be a CALL (it would overwrite the return address the
+    //     branch into the veneer established);
+    //   * the last INSTRUCTION, and only it, is a terminator, and it is an
     //     INDIRECT branch — the one shape whose destination comes from an
     //     operand the body itself computed;
-    //   * a step writes a result iff its opcode produces one, and then only
-    //     into the scratch register;
+    //   * a step writes a register iff its opcode produces a value, and every
+    //     register a step names is a granted scratch register;
     //   * no step may carry an implicit-register constraint, which is how an
-    //     opcode declares that it writes registers it does not name.
+    //     opcode declares that it writes registers it does not name;
+    //   * ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]) at most one DATA
+    //     word, after the branch, written through one PC-RELATIVE data
+    //     relocation exactly as wide as the word, holding the target;
+    //     `"literal"` only in a body that has one, and a word only in a body
+    //     where some instruction names `"literal"` to read it.
     if (linkVeneers.has_value()) {
         auto const& lv = *linkVeneers;
         if (lv.scratchRegisters.empty()) {
@@ -3168,6 +3330,10 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             fail("/linkVeneers/bodies",
                  "'linkVeneers' declares no body — nothing to build a veneer from");
         }
+        auto const isGranted = [&](std::uint16_t reg) {
+            return std::find(lv.scratchRegisters.begin(), lv.scratchRegisters.end(),
+                             reg) != lv.scratchRegisters.end();
+        };
         for (std::size_t b = 0; b < lv.bodies.size(); ++b) {
             auto const& body = lv.bodies[b];
             std::string const bp = std::format("/linkVeneers/bodies/{}", b);
@@ -3179,12 +3345,96 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      body.name));
                 }
             }
-            if (body.sequence.empty()) {
-                fail(bp + "/sequence", "a veneer body's sequence is empty");
+            // Instructions first, the last of them the one branch out; then at
+            // most one data word, which nothing executes.
+            std::size_t lastInstruction = body.sequence.size();
+            std::size_t dataSteps = 0;
+            for (std::size_t s = 0; s < body.sequence.size(); ++s) {
+                if (body.sequence[s].isData()) ++dataSteps;
+                else lastInstruction = s;
             }
+            if (lastInstruction == body.sequence.size()) {
+                fail(bp + "/sequence",
+                     "a veneer body needs at least one instruction — the branch "
+                     "that leaves it");
+            }
+            if (dataSteps > 1) {
+                fail(bp + "/sequence",
+                     std::format("a veneer body may carry ONE data word; this one "
+                                 "carries {} ('literal' names the one)", dataSteps));
+            }
+            bool literalNamed = false;
             for (std::size_t s = 0; s < body.sequence.size(); ++s) {
                 auto const& step = body.sequence[s];
                 std::string const sp = std::format("{}/sequence/{}", bp, s);
+                for (std::size_t r = 0; r < step.relocations.size(); ++r) {
+                    if (!relocationKindIndex.contains(step.relocations[r])) {
+                        fail(std::format("{}/relocations/{}", sp, r),
+                             "a veneer step's relocation must name a declared "
+                             "relocation row");
+                    }
+                }
+                std::size_t symbolOperands = 0;
+                for (std::size_t o = 0; o < step.operands.size(); ++o) {
+                    auto const& operand = step.operands[o];
+                    bool const namesRegister =
+                        operand.kind == LinkVeneerOperandKind::Register
+                        || operand.kind == LinkVeneerOperandKind::Memory;
+                    if (namesRegister && !isGranted(operand.reg)) {
+                        fail(std::format("{}/operands/{}", sp, o),
+                             std::format("veneer operand register '{}' is not in "
+                                         "scratchRegisters — a veneer may touch only "
+                                         "the registers the ABI grants a linker",
+                                         operand.registerName));
+                    }
+                    if (operand.kind == LinkVeneerOperandKind::Target
+                        || operand.kind == LinkVeneerOperandKind::Literal)
+                        ++symbolOperands;
+                    if (operand.kind == LinkVeneerOperandKind::Literal && !step.isData())
+                        literalNamed = true;
+                }
+                if (step.isData()) {
+                    // The data word: never executed, written through exactly one
+                    // PC-relative relocation to the veneer's target.
+                    if (s < lastInstruction) {
+                        fail(sp + "/data",
+                             "a data word must follow the body's closing branch — "
+                             "anything before it would be executed");
+                    }
+                    bool const aimsAtTarget =
+                        step.operands.size() == 1
+                        && step.operands[0].kind == LinkVeneerOperandKind::Target;
+                    if (!aimsAtTarget) {
+                        fail(sp + "/operands",
+                             "a data word's one operand is \"target\" — the value "
+                             "it holds is the veneer's destination");
+                    }
+                    if (step.relocations.size() != 1) {
+                        fail(sp + "/relocations",
+                             "a data word is written through exactly one "
+                             "relocation");
+                        continue;
+                    }
+                    auto const rowIt = relocationKindIndex.find(step.relocations[0]);
+                    if (rowIt == relocationKindIndex.end()) continue;
+                    auto const& row = relocations[rowIt->second];
+                    if (row.formulaKind != RelocFormulaKind::Linear || !row.pcRelative) {
+                        fail(sp + "/relocations/0",
+                             std::format("a veneer's data word must be written "
+                                         "through a PC-RELATIVE data relocation; "
+                                         "'{}' is not one — a veneer is built before "
+                                         "anyone knows whether the image will be "
+                                         "relocated at load time, and an absolute "
+                                         "word would then be a text relocation",
+                                         row.name));
+                    } else if (row.widthBytes != step.dataBytes) {
+                        fail(sp + "/data",
+                             std::format("a data word of {} byte(s) is written "
+                                         "through '{}', which writes {}",
+                                         step.dataBytes, row.name, row.widthBytes));
+                    }
+                    continue;
+                }
                 if (step.opcode == 0 || step.opcode >= opcodes.size()) {
                     fail(sp + "/mnemonic",
                          std::format("veneer step '{}' names no declared opcode",
@@ -3192,7 +3442,7 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     continue;
                 }
                 auto const& op = opcodes[step.opcode];
-                bool const last = s + 1 == body.sequence.size();
+                bool const last = s == lastInstruction;
                 if (op.isCall) {
                     fail(sp + "/mnemonic",
                          std::format("veneer step '{}' is a CALL — it would "
@@ -3203,32 +3453,51 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 }
                 if (last && op.terminatorKind != TargetTerminatorKind::IndirectBr) {
                     fail(sp + "/mnemonic",
-                         std::format("a veneer body must END in an indirect "
-                                     "branch (terminatorKind: indirect-br); '{}' "
-                                     "is not one", step.mnemonic));
+                         std::format("a veneer body's last instruction must be an "
+                                     "indirect branch (terminatorKind: indirect-br); "
+                                     "'{}' is not one", step.mnemonic));
                 }
                 if (!last && op.isTerminator()) {
                     fail(sp + "/mnemonic",
                          std::format("veneer step '{}' is a terminator before the "
-                                     "body's last step", step.mnemonic));
+                                     "body's last instruction", step.mnemonic));
                 }
-                if (step.resultIsScratch != (op.result != TargetResultRule::None)) {
+                if (step.writesRegister() != (op.result != TargetResultRule::None)) {
                     fail(sp + "/result",
-                         step.resultIsScratch
+                         step.writesRegister()
                              ? std::format("veneer step '{}' names a result but its "
                                            "opcode produces none", step.mnemonic)
                              : std::format("veneer step '{}' produces a value and "
-                                           "must write it to the scratch register "
-                                           "(\"result\": \"scratch\")",
-                                           step.mnemonic));
+                                           "must name the granted scratch register it "
+                                           "writes (\"result\")", step.mnemonic));
                 }
-                if (step.operands.size() < op.minOperands
-                    || step.operands.size() > op.maxOperands) {
+                if (step.writesRegister() && !isGranted(step.resultRegister)) {
+                    fail(sp + "/result",
+                         std::format("veneer step '{}' writes '{}', which is not in "
+                                     "scratchRegisters", step.mnemonic,
+                                     step.resultName));
+                }
+                // The LIR operand count: a memory operand is three (base, scale,
+                // displacement), every other operand one.
+                std::size_t lirOperands = 0;
+                for (auto const& operand : step.operands)
+                    lirOperands += operand.kind == LinkVeneerOperandKind::Memory ? 3 : 1;
+                if (lirOperands < op.minOperands || lirOperands > op.maxOperands) {
                     fail(sp + "/operands",
-                         std::format("veneer step '{}' names {} operand(s); its "
+                         std::format("veneer step '{}' names {} LIR operand(s); its "
                                      "opcode takes {}..{}", step.mnemonic,
-                                     step.operands.size(), op.minOperands,
-                                     op.maxOperands));
+                                     lirOperands, op.minOperands, op.maxOperands));
+                }
+                if (symbolOperands > 1) {
+                    fail(sp + "/operands",
+                         std::format("veneer step '{}' names {} symbols; a step's "
+                                     "relocations aim at its ONE symbol operand",
+                                     step.mnemonic, symbolOperands));
+                }
+                if (!step.relocations.empty() && symbolOperands == 0) {
+                    fail(sp + "/relocations",
+                         std::format("veneer step '{}' declares relocations but names "
+                                     "no symbol for them to aim at", step.mnemonic));
                 }
                 if (op.implicitRegisters.has_value()) {
                     fail(sp + "/mnemonic",
@@ -3237,13 +3506,20 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      "name, which the ABI does not grant a veneer",
                                      step.mnemonic));
                 }
-                for (std::size_t r = 0; r < step.relocations.size(); ++r) {
-                    if (!relocationKindIndex.contains(step.relocations[r])) {
-                        fail(std::format("{}/relocations/{}", sp, r),
-                             "a veneer step's relocation must name a declared "
-                             "relocation row");
-                    }
-                }
+            }
+            if (literalNamed && dataSteps == 0) {
+                fail(bp + "/sequence",
+                     "a step names \"literal\", but this body declares no data word "
+                     "for it to address");
+            }
+            // The converse: a word no instruction addresses is never read, and
+            // the body then branches through whatever the steps computed without
+            // it — `lea x17, target` in place of `lea x17, literal` would load the
+            // target's own code bytes as an address.
+            if (dataSteps == 1 && !literalNamed) {
+                fail(bp + "/sequence",
+                     "this body declares a data word, but no instruction names "
+                     "\"literal\" to read it");
             }
         }
     }

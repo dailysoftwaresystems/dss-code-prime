@@ -741,7 +741,23 @@ private:
         // `lir_wide_call_args::lowerOneFunc`.
         bool const natural = rule == StackArgPacking::Natural
                              && naturalBytes != 0 && naturalBytes <= slot_;
-        std::uint32_t const size  = natural ? naturalBytes : slot_;
+        // ★★ A SCALAR WIDER THAN THE SLOT OCCUPIES ITS OWN SIZE, IN WHOLE SLOTS,
+        // AND IS MOVED AT ITS OWN WIDTH (P68 round 8,
+        // D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED). The slot rule below
+        // used to give it ONE slot: a binary128 `long double` past v7 would have
+        // been placed as 8 bytes, the next stacked argument written over its
+        // high half, and the access moved at the 64-bit default. ✔MEASURED
+        // 2026-09-19, aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 agreeing: a
+        // stacked binary128 after one stacked `double` is at +16, the `double`
+        // after a stacked binary128 at +16, and each is read with one 16-byte
+        // `ldr q`. Only a width the LIR instruction model states (16 → 128 bits)
+        // qualifies; every size a producer states today is 1/2/4/8 or 16, so
+        // every previously-reachable placement is byte-for-byte unchanged.
+        bool const wide = naturalBytes > slot_
+                          && widthFlagsForBytes(naturalBytes) != 0;
+        std::uint32_t const size  = natural ? naturalBytes
+                                  : wide    ? alignUp(naturalBytes, slot_)
+                                            : slot_;
         // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: a scalar's own alignment IS
         // its natural size, and the CC's scalar cap decides how much of it
         // survives above the slot. For every naturalBytes a producer states today
@@ -755,8 +771,8 @@ private:
             natural ? naturalBytes : rules_.scalarAlignment(naturalBytes, slot_);
         std::uint32_t const off   = alignUp(cursor_, align);
         cursor_ = off + size;
-        return Placement{off, natural ? widthFlagsForBytes(naturalBytes)
-                                      : std::uint8_t{0}};
+        return Placement{off, (natural || wide) ? widthFlagsForBytes(naturalBytes)
+                                                : std::uint8_t{0}};
     }
 
     [[nodiscard]] static constexpr std::uint8_t
@@ -765,6 +781,7 @@ private:
             case 1:  return kLirInstFlagWidth8;
             case 2:  return kLirInstFlagWidth16;
             case 4:  return kLirInstFlagWidth32;
+            case 16: return kLirInstFlagWidth128;   // a >slot scalar (see `place`)
             default: return 0;   // 8 (and anything else) ⇒ the 64-bit access
         }
     }

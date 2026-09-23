@@ -21,6 +21,7 @@
 #include "lsp/lsp_coordinates.hpp"
 #include "lsp/workspace_project.hpp"   // fileUriFromPath
 #include "test_support/repo_root.hpp"
+#include "test_support/scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -133,33 +134,28 @@ struct Built {
 }
 
 // A temp directory that cleans itself up, so a fixture with real `#include`
-// files never accumulates in the tree.
+// files never accumulates in the tree. Claimed per PROCESS by `ScratchDir`: the
+// old name was keyed on this object's ADDRESS, which two processes (two build
+// trees' copies of this binary) can share, and `create_directories` accepts a
+// directory that already exists, so both would have written into one (the P68
+// round 8 cross-tree temp race, measured on test_emit_hir_mode).
 class TempDir {
 public:
-    TempDir() {
-        dir_ = fs::temp_directory_path()
-             / ("dss-lspcoord-" + std::to_string(
-                    reinterpret_cast<std::uintptr_t>(this)));
-        fs::create_directories(dir_);
-    }
-    ~TempDir() {
-        std::error_code ec;
-        fs::remove_all(dir_, ec);
-    }
+    TempDir() : scratch_(dss::test_support::Location::Temp, "lsp-coordinates") {}
     TempDir(TempDir const&) = delete;
     TempDir& operator=(TempDir const&) = delete;
 
     [[nodiscard]] fs::path write(std::string const& name,
                                  std::string_view text) const {
-        const fs::path p = dir_ / name;
+        const fs::path p = scratch_.path() / name;
         std::ofstream out(p, std::ios::binary);
         out << text;
         return p;
     }
-    [[nodiscard]] fs::path const& path() const noexcept { return dir_; }
+    [[nodiscard]] fs::path const& path() const noexcept { return scratch_.path(); }
 
 private:
-    fs::path dir_;
+    dss::test_support::ScratchDir scratch_;
 };
 
 } // namespace

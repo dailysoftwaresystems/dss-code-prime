@@ -40,6 +40,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -1230,4 +1231,216 @@ TEST(WorkspaceProject, TheSplitterStillSplitsFromCore) {
               dss::TargetSpecError::EmptyFormatName);
     EXPECT_EQ(dss::TargetSpec::parse("tg t:fmt").error(),
               dss::TargetSpecError::WhitespaceInName);
+}
+
+// ══ THE BUILD'S CONFIGURATIONS, READ BY THE EDITOR ═══════════════════════════
+// [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]. `resolveWorkspaceBuild` reads a
+// manifest through the build's own readers, and `selectDocumentConfigurations`
+// decides which of them build a document. The end-to-end agreement with the
+// build is `lsp/test_lsp_workspace_build_agreement`; these pin the two functions'
+// own contract.
+
+namespace {
+
+constexpr std::string_view kPe = "x86_64:pe64-x86_64-windows-exec";
+constexpr std::string_view kElf = "x86_64:elf64-x86_64-linux-exec";
+
+// A manifest with every field this section reads.
+[[nodiscard]] std::string buildManifest(std::vector<std::string_view> const& targets,
+                                        std::vector<std::string_view> const& sources,
+                                        std::vector<std::string_view> const& includes = {},
+                                        std::vector<std::string_view> const& defines = {}) {
+    json doc;
+    doc["language"]        = "c";
+    doc["artifactProfile"] = "cli";
+    doc["targets"]         = json::array();
+    for (auto t : targets) doc["targets"].push_back(std::string{t});
+    doc["sources"] = json::array();
+    for (auto s : sources) doc["sources"].push_back(std::string{s});
+    if (!includes.empty()) {
+        doc["includes"] = json::array();
+        for (auto i : includes) doc["includes"].push_back(std::string{i});
+    }
+    if (!defines.empty()) {
+        doc["defines"] = json::array();
+        for (auto d : defines) doc["defines"].push_back(std::string{d});
+    }
+    return doc.dump(2);
+}
+
+[[nodiscard]] std::vector<std::string> specsOf(
+    std::vector<dss::lsp::DocumentBuildConfiguration> const& configs) {
+    std::vector<std::string> out;
+    for (auto const& c : configs) out.push_back(c.label);
+    return out;
+}
+
+} // namespace
+
+// A manifest is read the way the build reads it: every pair LOADED (target and
+// format documents, and the calling convention the pair resolves), relative
+// `includes` joined to the manifest's directory, `defines` verbatim, and
+// `sources[]` through the build's own expansion — a glob included.
+TEST(WorkspaceBuild, AManifestIsReadTheWayTheBuildReadsIt) {
+    ScratchDir ws{Location::Temp, "lsp-wb-read"};
+    writeFile(ws.path(), "main.c", "int main(void) { return 0; }\n");
+    writeFile(ws.path(), "util.c", "int util(void) { return 1; }\n");
+    writeFile(ws.path(), "app.dss-project.json",
+              buildManifest({kPe, kElf}, {"*.c"}, {"inc"}, {"A=1"}));
+    const std::array<fs::path, 1> roots{ws.path()};
+
+    auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+    ASSERT_TRUE(build.has_value())
+        << dss::lsp::workspaceProjectErrorName(build.error().kind) << ": "
+        << build.error().detail;
+    ASSERT_EQ(build->manifests.size(), 1u);
+    auto const& m = build->manifests[0];
+    EXPECT_EQ(m.language, "c");
+    ASSERT_EQ(m.targets.size(), 2u);
+    EXPECT_EQ(m.targets[0].spec, kPe);
+    EXPECT_EQ(m.targets[1].spec, kElf);
+    for (auto const& t : m.targets) {
+        EXPECT_NE(t.target, nullptr) << t.spec << ": the target document was not loaded";
+        EXPECT_NE(t.format, nullptr) << t.spec << ": the format document was not loaded";
+        EXPECT_NE(t.callingConvention, nullptr)
+            << t.spec << ": the pair's calling convention was not resolved";
+    }
+    ASSERT_EQ(m.includeDirs.size(), 1u);
+    EXPECT_EQ(dss::core::PathIdentity::of(m.includeDirs[0]),
+              dss::core::PathIdentity::of(ws.path() / "inc"))
+        << "a relative `includes` entry is joined to the manifest's directory";
+    EXPECT_EQ(m.defines, (std::vector<std::string>{"A=1"}));
+    EXPECT_EQ(m.sources.size(), 2u) << "the `*.c` glob names both files";
+    EXPECT_NE(std::find(m.sources.begin(), m.sources.end(),
+                        dss::core::PathIdentity::of(ws.path() / "util.c")),
+              m.sources.end());
+}
+
+// A manifest the BUILD refuses is refused here too, under the build's own code —
+// the code the editor then publishes on the document.
+TEST(WorkspaceBuild, AManifestTheBuildRefusesIsRefusedUnderTheBuildsCode) {
+    struct Case {
+        std::string_view                 name;
+        std::string                      body;
+        WorkspaceProjectErrorKind        kind;
+        dss::DiagnosticCode              code;
+    };
+    std::vector<Case> const cases{
+        {"malformed-spec", buildManifest({"x86_64"}, {"main.c"}),
+         WorkspaceProjectErrorKind::TargetSpecMalformed,
+         dss::DiagnosticCode::D_InvalidTargetSpec},
+        {"unknown-target", buildManifest({"no_such_cpu:elf64-x86_64-linux-exec"}, {"main.c"}),
+         WorkspaceProjectErrorKind::TargetConfigLoadFailed,
+         dss::DiagnosticCode::D_SchemaLoadFailed},
+        {"unknown-format", buildManifest({"x86_64:no-such-format"}, {"main.c"}),
+         WorkspaceProjectErrorKind::FormatConfigLoadFailed,
+         dss::DiagnosticCode::D_SchemaLoadFailed},
+        {"empty-glob", buildManifest({kElf}, {"src/*.c"}),
+         WorkspaceProjectErrorKind::SourcesUnresolved,
+         dss::DiagnosticCode::D_FileNotFound},
+    };
+    for (auto const& c : cases) {
+        ScratchDir ws{Location::Temp, std::string{"lsp-wb-refuse-"} + std::string{c.name}};
+        writeFile(ws.path(), "main.c", "int main(void) { return 0; }\n");
+        writeFile(ws.path(), "app.dss-project.json", c.body);
+        const std::array<fs::path, 1> roots{ws.path()};
+        auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+        ASSERT_FALSE(build.has_value()) << c.name << ": the manifest must be refused";
+        EXPECT_EQ(build.error().kind, c.kind)
+            << c.name << ": got " << dss::lsp::workspaceProjectErrorName(build.error().kind);
+        EXPECT_EQ(build.error().code, c.code)
+            << c.name << ": got " << dss::diagnosticCodeName(build.error().code);
+    }
+}
+
+// "There is no build" is not a refusal: an empty root has no manifest to agree
+// with, and its documents are analyzed under their language alone.
+TEST(WorkspaceBuild, NoManifestIsNoBuildRatherThanARefusal) {
+    ScratchDir ws{Location::Temp, "lsp-wb-empty"};
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+    ASSERT_FALSE(build.has_value());
+    EXPECT_EQ(build.error().kind, WorkspaceProjectErrorKind::ProjectFileNotFound);
+}
+
+// A document a manifest LISTS is analyzed under exactly the manifests that list
+// it; one no manifest lists, under every manifest of its language, and the
+// selection says which case applied.
+TEST(WorkspaceBuild, ADocumentGetsTheManifestsThatListIt) {
+    ScratchDir ws{Location::Temp, "lsp-wb-select"};
+    writeFile(ws.path(), "a.c", "int a(void) { return 0; }\n");
+    writeFile(ws.path(), "b.c", "int b(void) { return 0; }\n");
+    writeFile(ws.path(), "shared.h", "int shared(void);\n");
+    writeFile(ws.path(), "a.dss-project.json", buildManifest({kPe}, {"a.c"}));
+    writeFile(ws.path(), "b.dss-project.json", buildManifest({kElf}, {"b.c"}));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+    ASSERT_TRUE(build.has_value()) << build.error().detail;
+
+    auto const a = dss::lsp::selectDocumentConfigurations(*build, ws.path() / "a.c", "c");
+    EXPECT_TRUE(a.listed);
+    EXPECT_EQ(specsOf(a.configurations), (std::vector<std::string>{std::string{kPe}}));
+
+    auto const b = dss::lsp::selectDocumentConfigurations(*build, ws.path() / "b.c", "c");
+    EXPECT_TRUE(b.listed);
+    EXPECT_EQ(specsOf(b.configurations), (std::vector<std::string>{std::string{kElf}}));
+
+    // A spelling of the same file that differs by `.`/`..` segments is the same
+    // identity — membership is never decided on a spelling.
+    auto const spelled = dss::lsp::selectDocumentConfigurations(
+        *build, ws.path() / "sub" / ".." / "a.c", "c");
+    EXPECT_TRUE(spelled.listed);
+
+    auto const h = dss::lsp::selectDocumentConfigurations(*build, ws.path() / "shared.h", "c");
+    EXPECT_FALSE(h.listed) << "no manifest lists the header";
+    EXPECT_EQ(specsOf(h.configurations),
+              (std::vector<std::string>{std::string{kPe}, std::string{kElf}}))
+        << "an unlisted file of the manifests' language is analyzed under all of them";
+
+    auto const other = dss::lsp::selectDocumentConfigurations(
+        *build, ws.path() / "shared.h", "asm-x86_64-att");
+    EXPECT_TRUE(other.configurations.empty())
+        << "a manifest never builds a file of another language it does not list";
+}
+
+// Two manifests building one file under the SAME pair with DIFFERENT settings are
+// two configurations, told apart by manifest; two that agree on everything are
+// one.
+TEST(WorkspaceBuild, IdenticalConfigurationsCollapseAndSharedSpecsAreTold) {
+    ScratchDir ws{Location::Temp, "lsp-wb-dedupe"};
+    writeFile(ws.path(), "main.c", "int main(void) { return 0; }\n");
+    writeFile(ws.path(), "a.dss-project.json", buildManifest({kElf}, {"main.c"}, {}, {"MODE=1"}));
+    writeFile(ws.path(), "b.dss-project.json", buildManifest({kElf}, {"main.c"}, {}, {"MODE=2"}));
+    writeFile(ws.path(), "c.dss-project.json", buildManifest({kElf}, {"main.c"}, {}, {"MODE=1"}));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto const build = dss::lsp::resolveWorkspaceBuild(roots);
+    ASSERT_TRUE(build.has_value()) << build.error().detail;
+
+    auto const sel = dss::lsp::selectDocumentConfigurations(*build, ws.path() / "main.c", "c");
+    EXPECT_EQ(specsOf(sel.configurations),
+              (std::vector<std::string>{std::string{kElf} + " (a.dss-project.json)",
+                                        std::string{kElf} + " (b.dss-project.json)"}))
+        << "`c` repeats `a` exactly and collapses into it; `b` differs and stays";
+}
+
+// The refresh republishes only when a configuration's ingredients moved.
+TEST(WorkspaceBuild, SameConfigurationsSeesEveryIngredient) {
+    ScratchDir ws{Location::Temp, "lsp-wb-same"};
+    writeFile(ws.path(), "main.c", "int main(void) { return 0; }\n");
+    writeFile(ws.path(), "app.dss-project.json", buildManifest({kElf}, {"main.c"}, {}, {"A=1"}));
+    const std::array<fs::path, 1> roots{ws.path()};
+    auto const first  = dss::lsp::resolveWorkspaceBuild(roots);
+    auto const second = dss::lsp::resolveWorkspaceBuild(roots);
+    ASSERT_TRUE(first.has_value() && second.has_value());
+    EXPECT_TRUE(dss::lsp::sameConfigurations(first, second))
+        << "two reads of an unchanged workspace are the same configurations, "
+           "though every schema object is freshly loaded";
+
+    writeFile(ws.path(), "app.dss-project.json", buildManifest({kElf}, {"main.c"}, {}, {"A=2"}));
+    auto const edited = dss::lsp::resolveWorkspaceBuild(roots);
+    EXPECT_FALSE(dss::lsp::sameConfigurations(first, edited)) << "a define changed";
+
+    writeFile(ws.path(), "app.dss-project.json", buildManifest({kElf, kPe}, {"main.c"}, {}, {"A=1"}));
+    auto const widened = dss::lsp::resolveWorkspaceBuild(roots);
+    EXPECT_FALSE(dss::lsp::sameConfigurations(first, widened)) << "a pair was added";
 }

@@ -1,0 +1,22 @@
+{
+  "$comment": "★★ GNU as's NUMERIC LOCAL LABELS ON arm64 (P68 round 8, D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED) — the AT&T sibling's claim on the second dialect. ✔MEASURED 2026-09-23: aarch64-linux-gnu-as 2.42 and clang 18.1.3 (`--target=aarch64-linux-gnu`) run this file to 42 under qemu-aarch64; DSS refused it at the parser until the shared grammar gained `asmNumericLabel` and this dialect declared its `numericLabelRule`, `localLabelSuffixes` and the two integer suffixes. ★ RED-ON-DISABLE: drop `localLabelSuffixes` + `numericLabelRule` from THIS dialect and the file is refused. The `release` arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

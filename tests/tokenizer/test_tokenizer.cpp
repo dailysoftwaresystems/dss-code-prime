@@ -216,6 +216,45 @@ TEST(Tokenizer, DeclaredIdentifierClassIsAdditiveNotReplacing) {
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "_a9.b_2");
 }
 
+// ★★ C's `$` STARTS A NAME — [[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]. The shipped
+// C document declares `identifierClass.extraStart: "$"`, and the tokenizer's
+// first-byte test is `IdentifierClass::startsIdentifier`. ✔MEASURED 2026-09-22:
+// gcc 13.3.0, clang 18.1.3, MinGW gcc and MSVC VS 18 all accept `$a`, a lone
+// `$` and `$1` as names. RED-ON-DISABLE: put the first-byte test back on the
+// universal rule alone and each of these becomes an illegal byte followed by
+// the rest, while `ShippedCDollarContinuesAName` below — the control — stays
+// green.
+TEST(Tokenizer, ShippedCDollarStartsAName) {
+    for (std::string const name : {"$a", "$", "$1"}) {
+        auto h      = loadC(name + ";");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 2u)
+            << "`" << name << "` must be ONE Word plus the `;`";
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word) << name;
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), name);
+        EXPECT_TRUE(result.diags.empty()) << name;
+    }
+}
+
+// THE CONTROL: after a name's first byte `$` CONTINUES it (`extraContinue`),
+// which the start rule does not touch — and `@`, which C declares nowhere, is
+// still an illegal character, so the class did not widen past what was asked.
+TEST(Tokenizer, ShippedCDollarContinuesAName) {
+    for (std::string const name : {"a$b", "ab$"}) {
+        auto h      = loadC(name + ";");
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 2u)
+            << "`" << name << "` must be ONE Word plus the `;`";
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word) << name;
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), name);
+        EXPECT_TRUE(result.diags.empty()) << name;
+    }
+    auto h      = loadC("@;");
+    auto result = lex(h);
+    ASSERT_FALSE(result.diags.empty()) << "`@` must still be refused in C";
+    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_IllegalChar);
+}
+
 TEST(Tokenizer, IdentifiersAcceptUnderscoreAndDigits) {
     auto h      = loadToy("_x9");
     auto result = lex(h);
@@ -1101,23 +1140,42 @@ TEST(Tokenizer, BlockCommentEmitsOpenerCharsAndClosing) {
     EXPECT_TRUE(result.diags.empty());
 }
 
-TEST(Tokenizer, UnterminatedLineCommentEmitsDiagnostic) {
-    // Line comment that runs to EOF without a newline. Tokenizer
-    // emits the opener + 11 body chars (` no newline` = 11 bytes) +
-    // a P_UnterminatedComment when EOF is reached with the frame
-    // stack still open.
-    auto h      = loadC("// no newline");
-    auto result = lex(h);
-    ASSERT_EQ(result.tokens.size(), 12u);
-    EXPECT_EQ(result.tokens[0].schemaKind,
+TEST(Tokenizer, LineCommentEndingTheInputClosesSilently) {
+    // ★★ THIS TEST WAS INVERTED ON PURPOSE (P68 round 8,
+    // D-C-LINE-COMMENT-AT-END-OF-FILE-REFUSED). It used to be
+    // `UnterminatedLineCommentEmitsDiagnostic` and it pinned a
+    // `P_UnterminatedComment` for a C `//` comment that runs to the end of the
+    // input with no newline — i.e. it pinned the DIVERGENCE. ✔MEASURED
+    // 2026-09-23: gcc 13.3.0, clang 18.1.3, aarch64 gcc, mingw-w64 gcc 13.2.0
+    // and MSVC 19.51 ALL accept such a file (clang warns only under
+    // `-pedantic`). C's `line-comment` mode now declares `atEndOfInput: closes`,
+    // so the end of the input closes the comment silently.
+    // The neighbour `UnterminatedBlockCommentEmitsDiagnostic` is the control:
+    // every reference refuses a `/*` the file never closes, and DSS still does.
+    auto h = loadC("// no newline");
+    Tokenizer t{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    auto [stream, reporter] = std::move(t).tokenize();
+    // (a) no diagnostic at all
+    EXPECT_TRUE(reporter->all().empty());
+    // (b) the comment's tokens intact — the opener + the 11 body chars
+    // (` no newline`) — and the stream ends in exactly ONE Eof, zero-width at
+    // the end of the buffer: nothing lost or doubled at the boundary.
+    ASSERT_EQ(stream.size(), 13u);
+    EXPECT_EQ(stream.peek(0).schemaKind,
               h.schema->schemaTokens().find("LineCommentStart"));
     const auto commentCharKind = h.schema->schemaTokens().find("CommentChar");
-    for (std::size_t i = 1; i < result.tokens.size(); ++i) {
-        EXPECT_EQ(result.tokens[i].schemaKind, commentCharKind)
+    for (std::size_t i = 1; i < 12; ++i) {
+        EXPECT_EQ(stream.peek(i).schemaKind, commentCharKind)
             << "token " << i << " should be CommentChar";
     }
-    ASSERT_EQ(result.diags.size(), 1u);
-    EXPECT_EQ(result.diags[0].code, DiagnosticCode::P_UnterminatedComment);
+    EXPECT_EQ(stream.peek(12).coreKind, CoreTokenKind::Eof);
+    EXPECT_EQ(stream.peek(12).span.start(), 13u);
+    EXPECT_EQ(stream.peek(12).span.end(), 13u);
+    std::size_t eofs = 0;
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        if (stream.peek(i).coreKind == CoreTokenKind::Eof) ++eofs;
+    }
+    EXPECT_EQ(eofs, 1u);
 }
 
 TEST(Tokenizer, UnterminatedBlockCommentEmitsDiagnostic) {

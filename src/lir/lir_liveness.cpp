@@ -1,5 +1,6 @@
 #include "lir/lir_liveness.hpp"
 
+#include "lir/lir_asm_region.hpp"
 #include "lir/lir_node.hpp"
 
 #include <algorithm>
@@ -40,20 +41,26 @@ namespace {
 // (post-regalloc) are intentionally NOT tracked: this substrate is
 // pre-regalloc-only; physical-reg liveness for clobber tracking
 // (calls, fixed assignments) belongs in a separate pass.
+// ★ P68 round 8 part 4: WHICH operands are read, and which registers an
+// instruction writes, is asked of `lirForEachInstUse` / `lirForEachInstDef`
+// (`lir_asm_region.hpp`), the ONE reader of both — an inline-asm bundle writes
+// several registers through operand ROLES, and its write-only operands are
+// not uses. Reading `instResult` here instead would give every statement
+// output no definition at all: a range starting at 0, live across the whole
+// function above the statement.
 template <class OnUse>
 void forEachUse(Lir const& lir, LirInstId id, OnUse&& onUse) {
-    auto const ops = lir.instOperands(id);
-    for (auto const& op : ops) {
-        if (op.kind == LirOperandKind::Reg && op.reg.valid()
-            && op.reg.isPhysical == 0) {
-            onUse(op.reg);
-        }
-    }
+    lirForEachInstUse(lir, id, [&](LirReg r) {
+        if (r.isPhysical == 0) onUse(r);
+    });
 }
 
-[[nodiscard]] bool hasDef(Lir const& lir, LirInstId id) noexcept {
-    auto const r = lir.instResult(id);
-    return r.valid() && r.isPhysical == 0;
+// `onDef(reg, early)` for every VIRTUAL register the instruction defines.
+template <class OnDef>
+void forEachDef(Lir const& lir, LirInstId id, OnDef&& onDef) {
+    lirForEachInstDef(lir, id, [&](LirReg r, bool early) {
+        if (r.isPhysical == 0) onDef(r, early);
+    });
 }
 
 // Compute reverse post-order of blocks reachable from `entry`. Any
@@ -265,11 +272,10 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
             forEachUse(lir, inst, [&](LirReg r) {
                 if (!killedLocally.contains(r.id)) use[bi].insert(r.id);
             });
-            if (hasDef(lir, inst)) {
-                auto const r = lir.instResult(inst);
+            forEachDef(lir, inst, [&](LirReg r, bool) {
                 def[bi].insert(r.id);
                 killedLocally.insert(r.id);
-            }
+            });
         });
     }
 
@@ -357,8 +363,7 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
                 s.cls      = r.regClass();
                 if (earlyPos > s.lastUse) s.lastUse = earlyPos;
             });
-            if (hasDef(lir, inst)) {
-                auto const r = lir.instResult(inst);
+            forEachDef(lir, inst, [&](LirReg r, bool early) {
                 if (r.id >= state.size()) state.resize(r.id + 1);
                 auto& s = state[r.id];
                 s.everSeen = true;
@@ -384,11 +389,12 @@ LirFuncLiveness analyzeFuncLiveness(Lir const& lir, LirFuncId fn) {
                 // computes `end = max(lastUse + 1, start + 1)`, so
                 // `LirLiveRange::make`'s `start < end` holds even when the
                 // result is never used.
-                std::uint32_t const defPos =
-                    lirInstResultIsEarlyClobber(lir.instFlags(inst))
-                        ? earlyPos : latePos;
+                // ★ `early` comes from the one helper: the flag above on an
+                // ordinary result, the `EarlyDef` role on a bundle operand
+                // (P68 round 8 part 4) — the same slot rule, two carriers.
+                std::uint32_t const defPos = early ? earlyPos : latePos;
                 if (defPos < s.firstDef) s.firstDef = defPos;
-            }
+            });
         });
         // Vregs live-out of this block extend their `lastUse` to the
         // LAST position the value is live AT inside this block — the

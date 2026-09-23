@@ -15,9 +15,11 @@
 // hooks. Three consequences are handled explicitly and are documented at their
 // sites: the project manifest's own `targets[]` is the build authority (a
 // corpus target's `spec` is a MIRROR, cross-checked); the artifact lands under
-// a per-format subdirectory; and the compile must run with the mirrored scratch
-// dir as the PROCESS working directory, because that is what a generated source
-// resolves against. The CLI-subprocess sibling implements the same three.
+// a per-format subdirectory; and the compile runs with the mirrored scratch dir
+// as the process working directory — no longer because anything resolves
+// against it (a manifest's paths and hooks resolve against the manifest's own
+// directory), but so that both runners compile in the same environment. The
+// CLI-subprocess sibling implements the same three.
 //
 // User invariant (verbatim, 2026-06-02): "please don't forget to
 // perform strict asserts on the example harness run results....
@@ -323,6 +325,14 @@ struct ExampleTarget {
     // child's environment is the runner's, exactly as before the key existed.
     // A declaration that could never act is refused at LOAD (`readManifest`).
     std::string                  loaderSearchPathVariable;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the directories this target's image
+    // records for its loader (`Program::setRunpaths` here, one `--rpath` per
+    // entry in the CLI-subprocess sibling), in order. Unlike
+    // `loaderSearchPathVariable` above — which the RUNNER sets for one spawn —
+    // this is a property of the IMAGE: an example that declares it runs with no
+    // loader variable at all, which is the whole witness. Empty (the default) ⇒
+    // the build records none, exactly as before the key existed.
+    std::vector<std::string>     runpaths;
 };
 
 // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): a per-manifest
@@ -1057,7 +1067,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             if (k == "spec" || k == "artifact" || k == "runOn"
                 || k == "emulator" || k == "expectedStdout" || k == "exitCode"
                 || k == "dependsOn" || k == "prebuiltLibraries"
-                || k == "loaderSearchPathVariable"
+                || k == "loaderSearchPathVariable" || k == "runpaths"
                 || k.starts_with("$")) {
                 continue;
             }
@@ -1067,7 +1077,8 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                           << "' — the runner reads spec / artifact / runOn /"
                              " emulator / expectedStdout / exitCode /"
                              " dependsOn / prebuiltLibraries /"
-                             " loaderSearchPathVariable (plus $comment keys)."
+                             " loaderSearchPathVariable / runpaths (plus"
+                             " $comment keys)."
                              " An expectation the runner does not read is an"
                              " assertion that never fires.";
             return m;
@@ -1152,6 +1163,36 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             }
             et.loaderSearchPathVariable = v.get<std::string>();
         }
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the image's own runpaths — a
+        // NON-EMPTY array of NON-EMPTY strings, passed through verbatim (the
+        // CLI's literal semantics; a leading `${ORIGIN}` is the portable token
+        // the format's document spells). Empty entries are refused HERE rather
+        // than handed to the build: the CLI-subprocess sibling cannot pass one
+        // at all (`--rpath ""` is refused by the CLI's generic non-empty rule),
+        // so an empty entry would make the two runners build different things
+        // from one manifest.
+        if (t.contains("runpaths")) {
+            auto const& v = t.at("runpaths");
+            bool ok = v.is_array() && !v.empty();
+            if (ok) {
+                for (auto const& e : v) {
+                    if (!e.is_string() || e.get<std::string>().empty()) {
+                        ok = false;
+                        break;
+                    }
+                    et.runpaths.push_back(e.get<std::string>());
+                }
+            }
+            if (!ok) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target '" << et.spec
+                              << "' 'runpaths' must be a NON-EMPTY array of"
+                                 " non-empty strings — an empty array declares a"
+                                 " request the build never makes, and an empty"
+                                 " entry is one the CLI runner cannot pass";
+                return m;
+            }
+        }
         m.targets.push_back(std::move(et));
     }
     // ── A LOADER SEARCH PATH THAT COULD NEVER REACH A LOADER, REFUSED BY NAME ──
@@ -1216,6 +1257,18 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             return m;
         }
         for (auto const& t : m.targets) {
+            // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a refusal arm links no image,
+            // so an image's runpaths would be read by nothing — the same
+            // "parsed and then silently dropped" shape as the two keys here.
+            if (!t.runpaths.empty()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target '" << t.spec
+                              << "' declares 'runpaths' beside"
+                                 " 'expectDiagnostics'. A refusal arm links no"
+                                 " image, so the runpaths would be parsed and"
+                                 " then silently dropped.";
+                return m;
+            }
             if (t.dependsOn.empty()) continue;
             ADD_FAILURE() << "manifest " << path.generic_string()
                           << " target '" << t.spec
@@ -2270,14 +2323,16 @@ compileAndRunArm(fs::path const& exampleDir,
 
     // ── PROJECT MODE: resolve + validate the `.dss-project.json` ────────────
     //
-    // The scratch dir is ALREADY the process cwd (the `useAsCwd()` above), and
-    // that is load-bearing for a project build rather than incidental: the
-    // manifest's `sources[]` globs expand against the PROCESS working directory
-    // (Program::compileProject, D-AP2-SOURCES-GLOB), and a `preBuildScripts`
-    // hook that GENERATES a source writes it into the directory the driver
-    // spawns it in. Both must be this scratch dir, or the generator writes into
-    // one tree and the glob searches another. The CLI-subprocess sibling had to
-    // GROW this (its CwdGuard wrapped only the RUN) — see the note there.
+    // The scratch dir is ALREADY the process cwd (the `useAsCwd()` above). That
+    // used to be load-bearing for a project build: the manifest's `sources[]`
+    // globs expanded against the PROCESS working directory, and a
+    // `preBuildScripts` hook that GENERATES a source wrote it into the directory
+    // the driver spawned it in, so both had to be this scratch dir. Since
+    // [[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]
+    // both resolve against the MANIFEST's own directory — which lies in this
+    // scratch mirror because the manifest is staged in it, whatever the cwd is.
+    // The cwd is kept for parity with the CLI-subprocess sibling (see the note
+    // there).
     fs::path projectPath;
     if (m.project.has_value()) {
         projectPath = scratch.path() / *m.project;
@@ -2396,6 +2451,11 @@ compileAndRunArm(fs::path const& exampleDir,
     prog.setOutputDir(outDir);
     if (!resolveLibs.empty()) {
         prog.setResolveLibraries(resolveLibs);
+    }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the image's own runpaths — the
+    // in-process spelling of the CLI sibling's `--rpath` per entry.
+    if (!t.runpaths.empty()) {
+        prog.setRunpaths(t.runpaths);
     }
     if (pipelineOverride != nullptr) {
         prog.setOptimizerPipelineOverride(*pipelineOverride);
@@ -2693,12 +2753,11 @@ compileAndRunArm(fs::path const& exampleDir,
     // ✔MEASURED 2026-08-12 on this project's WSL leg: a raw `ctest` with
     // QEMU_LD_PREFIX unset reported 468 of 826 failing; with
     // `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` exported, 826 of 826 passed. The
-    // repo already knew — `real-examples/c/sqlite/build-and-test.sh` sets it
-    // per-leg and its own comment says "without it qemu cannot find the guest
-    // loader and EVERY exec dies at exit 255, which would read as 14 DSS
-    // failures on a binary that is completely fine", and notes the variable
-    // "lived for months as an operational workaround rather than as a checked
-    // prerequisite". The ctest corpus runner never got that treatment.
+    // sqlite harness already treats it as a DECLARED per-leg setting: its leg
+    // table (`real-examples/c/sqlite/legs.json`) gives each qemu launcher the
+    // guest sysroot in `launchers[].env`, and `harness_legs.py` hands that
+    // environment to the launcher and checks the directory exists before a run.
+    // The ctest corpus runner never got that treatment.
     //
     // ★ THIS DELIBERATELY DOES NOT SKIP, SUPPRESS OR AUTO-SET ANYTHING. The
     // arm still runs and still reds — masking a cross-arch failure is exactly

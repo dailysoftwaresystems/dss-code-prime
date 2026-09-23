@@ -20,12 +20,13 @@
 //
 // ★★★ WHY THIS PIN COUNTS AND DOES NOT TIME. A stopwatch assertion is sized on
 // the machine that wrote it and reds on the slowest leg that runs it —
-// `scripts/check-wall-clock-in-tests/` refuses new ones. What is asserted here
-// is `mirDomSlotsSweptTake()`: the block slots the forward-dominator helpers
-// swept on this thread while the pass ran. It is deterministic, identical in
-// Debug and Release, and independent of load. It is counted INSIDE the shared
-// helpers, so it sees whatever a caller does with them — a caller that goes
-// back to the fresh overloads per function cannot hide from it.
+// `.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones.
+// What is asserted here is `mirDomSlotsSweptTake()`: the block slots the
+// forward-dominator helpers swept on this thread while the pass ran. It is
+// deterministic, identical in Debug and Release, and independent of load. It
+// is counted INSIDE the shared helpers, so it sees whatever a caller does with
+// them — a caller that goes back to the fresh overloads per function cannot
+// hide from it.
 //
 // ★★ THE ARMS, AND WHY NONE OF THEM CAN GO VACUOUS.
 //   * PREMISE — every function really reaches the dominance step. Re-derived

@@ -78,7 +78,7 @@ constexpr std::string_view kHangFlag = "--dss-hang-ms=";
 // ══ THE DURATIONS BELOW ARE THIS FILE'S SUBJECT, NOT ITS BUDGETS ══════════════
 //
 // ★★★ EVERY ONE OF THEM IS AN `ALLOWLIST`-BY-PROOF ENTRY IN
-// `scripts/check-wall-clock-in-tests/check-wall-clock-in-tests.py`, KEYED BY
+// `.harness-config/runner/actions/check-wall-clock-in-tests/check-wall-clock-in-tests.py`, KEYED BY
 // `path::symbol`, and the proof each entry carries is the sentence beside it
 // here. They are NOT routed through `test_wait_budget.hpp`, and routing them
 // there would destroy the tests: a test OF a deadline clock has to name

@@ -38,6 +38,14 @@ dss_add_test(NAME hir/test_hir_lowering_multi_lang SOURCES test_hir_lowering_mul
 # VOCABULARY and the two capability gaps.
 dss_add_test(NAME hir/test_hir_text_vocabulary_and_capability SOURCES test_hir_text_vocabulary_and_capability.cpp)
 
+# A NUMBER A `.dsshir` SPELLS IS READ AS THAT NUMBER, OR REFUSED NAMING ITS FIELD
+# (P68 round 8, lane `ht`, part 1c): one row per field the reader fills, the
+# symbol table's density, and every field a number could be read as another
+# meaning in. Separate from test_hir_text.cpp because those arms pin the FORMAT
+# round trip and these pin the reader's arithmetic, row by named row.
+dss_add_test(NAME hir/test_hir_text_reads_every_number_as_written
+             SOURCES test_hir_text_reads_every_number_as_written.cpp)
+
 # D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT — the CONSEQUENCE half.
 # Separate from test_hir_text.cpp because those arms pin the round trip and this
 # one pins what the NEXT tier reads back: a dropped operand-form binding is

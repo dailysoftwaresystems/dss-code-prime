@@ -86,12 +86,12 @@ constexpr std::string_view kResolvedToNothingPrefix =
 [[nodiscard]] std::string moduleWithFormBoundOperand(std::string_view letter,
                                                      std::string_view form) {
     return std::string(
-               "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+               "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                "  function %1 : fn() -> void {\n    block {\n"
                "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"")
          + std::string(letter) + "\" spells ( \"%0\" ) operand_kind "
          + std::string(form) + " -> lit int 7 : i32 ) }\n"
-           "      return\n    }\n  }\n}\n";
+           "      return void\n    }\n  }\n}\n";
 }
 
 } // namespace
@@ -151,11 +151,11 @@ TEST(HirTextOperandForm, MemoryFormReachesTheMirLoweringWithItsBindingIntact) {
 // outright would leave the whole file green.
 TEST(HirTextOperandForm, AnOperandThatResolvedToNothingIsStillRefusedByThatName) {
     std::string const text =
-        "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
         "spells ( \"%0\" ) -> lit int 7 : i32 ) }\n"
-        "      return\n    }\n  }\n}\n";
+        "      return void\n    }\n  }\n}\n";
     DiagnosticReporter pr;
     auto parsed = parseHir(text, CompilationUnitId{3}, pr);
     ASSERT_TRUE(parsed->ok) << allDiagText(pr);

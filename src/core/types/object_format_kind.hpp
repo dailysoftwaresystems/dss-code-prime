@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>    // selectableObjectFormat's refusal (stderr)
+#include <cstdlib>   // selectableObjectFormat's refusal (abort)
 #include <optional>
 #include <string>
 #include <string_view>
@@ -128,6 +130,76 @@ objectFormatKindFromName(std::string_view s) noexcept {
 [[nodiscard]] constexpr bool
 isSelectableObjectFormatKind(ObjectFormatKind k) noexcept {
     return k != ObjectFormatKind::Unknown;
+}
+
+// ★★ "NO FORMAT" HAS ONE SPELLING — D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY.
+//
+// A parameter typed `std::optional<ObjectFormatKind>` can say "I have no format"
+// TWO ways: `nullopt`, and an ENGAGED `Unknown` — an ordinary enumerator the
+// optional cannot tell from a real format. ✔MEASURED (P68 round 8): one
+// `dss::analyze` handed the engaged sentinel read it BOTH ways at once — the
+// literal-prefix resolver as "no format" (`L"a"` fell to the base `i32`), the
+// shipped-header availability gate as a real format on which nothing restricted
+// exists (`#include <windows.h>` refused as unavailable "for this target").
+// Checking for the sentinel inside every such function is the REJECTED posture;
+// this type is the UNREPRESENTABLE one.
+//
+// `SelectableObjectFormatKind` is a kind that CANNOT be `Unknown`. Its one
+// constructor is private and `of()` is the only door: it answers `nullopt` for
+// the sentinel, so the caller decides what that means where it holds the value.
+// There is NO conversion from `ObjectFormatKind`, implicit or explicit, so a
+// function taking `std::optional<SelectableObjectFormatKind>` has exactly one
+// spelling of "no format" (`nullopt`) — and handing it `ObjectFormatKind::Unknown`,
+// or a `std::optional<ObjectFormatKind>`, does not compile.
+class SelectableObjectFormatKind {
+public:
+    [[nodiscard]] static constexpr std::optional<SelectableObjectFormatKind>
+    of(ObjectFormatKind k) noexcept {
+        if (!isSelectableObjectFormatKind(k)) return std::nullopt;
+        return SelectableObjectFormatKind{k};
+    }
+    [[nodiscard]] constexpr ObjectFormatKind kind() const noexcept { return kind_; }
+    friend constexpr bool operator==(SelectableObjectFormatKind,
+                                     SelectableObjectFormatKind) noexcept = default;
+
+private:
+    constexpr explicit SelectableObjectFormatKind(ObjectFormatKind k) noexcept
+        : kind_{k} {}
+    ObjectFormatKind kind_;
+};
+
+// The ONE bridge from a value that still admits the sentinel — a value typed
+// `std::optional<ObjectFormatKind>`, like the preprocessor's or a shipped
+// descriptor reader's `activeFormat` — into the one-spelling contract: `nullopt`
+// stays `nullopt` and a real kind is carried.
+// An ENGAGED `Unknown` is a CALLER's bug, refused rather than folded into "no
+// format" (folding it is exactly the second spelling this type removes), the way
+// this codebase refuses a caller-contract violation: a message on stderr and an
+// abort on the caller's own thread (`dss::analyze`'s role-resolver mismatch,
+// `UnitBuilder::setActiveFormat`'s sentinel).
+[[nodiscard]] inline std::optional<SelectableObjectFormatKind>
+selectableObjectFormat(std::optional<ObjectFormatKind> k) noexcept {
+    if (!k.has_value()) return std::nullopt;
+    auto selectable = SelectableObjectFormatKind::of(*k);
+    if (!selectable.has_value()) {
+        std::fputs("dss fatal: an engaged ObjectFormatKind::Unknown reached a "
+                   "format-keyed lookup -- the invalid sentinel names no object "
+                   "format, and \"no format\" is spelled nullopt\n",
+                   stderr);
+        std::abort();
+    }
+    return selectable;
+}
+
+// The bridge the OTHER way, for a consumer still typed
+// `std::optional<ObjectFormatKind>` (the shipped-descriptor readers `dss::analyze`
+// hands its active format to). Total and silent, because nothing here can go
+// wrong: a selectable kind is carried as its kind, "no format" stays `nullopt`,
+// and the result can never hold the sentinel because the input cannot.
+[[nodiscard]] constexpr std::optional<ObjectFormatKind>
+objectFormatKindOf(std::optional<SelectableObjectFormatKind> k) noexcept {
+    if (!k.has_value()) return std::nullopt;
+    return k->kind();
 }
 
 // The reserved SPELLING of the invalid sentinel, as it appears in a config

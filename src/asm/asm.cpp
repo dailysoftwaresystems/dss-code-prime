@@ -70,6 +70,44 @@ using dss::report;
         return false;
     }
 
+    // ★★ AN EARLY-CLOBBER RESULT THAT IS ALSO AN OPERAND HAS NO ENCODING THAT
+    // IS A PROGRAM (P68 round 8, `TargetOpcodeInfo::resultEarlyClobber`), and
+    // this is the one place every encoder passes, so no format can emit one.
+    // The allocator never produces the overlap (the builder marks the result
+    // early); what reaches here is a register the programmer WROTE, or an
+    // inline-asm output the allocator was free to share because it carried no
+    // `&`. Identity is the physical register's — `wzr` and `sp` encode the same
+    // field and are two registers — so only a TRUE overlap is refused.
+    if (info->resultEarlyClobber) {
+        LirReg const result = lir.instResult(inst);
+        if (result.valid() && result.isPhysical) {
+            for (LirOperand const& op : lir.instOperands(inst)) {
+                if (op.kind != LirOperandKind::Reg || !op.reg.valid()
+                    || !op.reg.isPhysical || op.reg.id != result.id) {
+                    continue;
+                }
+                auto const* reg = schema.registerInfo(
+                    static_cast<std::uint16_t>(result.id));
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "opcode '{}': its result register '{}' is also one of "
+                           "the registers it reads, and target '{}' declares that "
+                           "this instruction's result must differ from every "
+                           "register operand (the architecture makes the "
+                           "overlapping encoding UNPREDICTABLE, and clang refuses "
+                           "it) — write a different register, or give an "
+                           "inline-asm output written here the early-clobber "
+                           "constraint (`=&r`) so it is never shared with an input",
+                           info->mnemonic,
+                           reg != nullptr ? std::string_view{reg->name}
+                                          : std::string_view{"?"},
+                           schema.name()));
+                return false;
+            }
+        }
+    }
+
     // SourceMapEntry stamping (plan 13 AS6). Capture the byte
     // offset BEFORE any encoding write so the entry points at the
     // instruction's first byte. We capture the pre-encode byte
@@ -1186,8 +1224,9 @@ namespace {
 // a core INTEGER kind (the semantic tier rejects anything else), and every arm
 // below already handles those correctly INCLUDING their walls. ✔MEASURED on the
 // widest case: `enum E : __int128 g = B;` reaches the dedicated 16-byte arm and
-// EMITS, while the same enum as a struct MEMBER hits the pre-existing aggregate
-// refusal LOUD — byte-for-byte the behaviour a plain `__int128` already gets.
+// EMITS; since P68 round 8 the same enum as a struct MEMBER emits too, through
+// the same 16-byte producer — byte-for-byte what a plain `__int128` member gets
+// (pinned by `AsmDataSection.Int128AggregateMemberEmitsItsSixteenBytesAtItsOffset`).
 //
 // ★ THE FILE-WIDE INVARIANT THIS ESTABLISHES, and it is the greppable form of
 // the multi-site contract: in this file, EVERY `scalarByteSize(...)` and
@@ -1224,9 +1263,9 @@ primitiveByteSize(TypeKind k) noexcept {
         case TypeKind::I64: case TypeKind::U64: case TypeKind::F64:
             return 8u;
         // F80 (D-CSUBSET-LONG-DOUBLE): 16-byte storage like binary128 — the
-        // x87 format pads to 16/16. Sized here so LAYOUT-only uses work; a
-        // VALUE encode still fails loud (decodeScalarLiteralBits has no
-        // F80 arm — no lossless `double` backing).
+        // x87 format pads to 16/16. Sized here for LAYOUT; a VALUE of any of
+        // these four kinds is encoded by `appendSixteenByteScalarImage`, never
+        // by the u64 `decodeScalarLiteralBits` (which refuses all four).
         case TypeKind::I128: case TypeKind::U128: case TypeKind::F80:
         case TypeKind::F128:
             return 16u;
@@ -1247,9 +1286,9 @@ primitiveByteSize(TypeKind k) noexcept {
 // shipped host arches the masked shift count REPEATS the low 8 bytes into the
 // high 8, so an over-wide call writes plausible-looking WRONG bytes rather
 // than crashing. Corrected in TF-C94 — D-CSUBSET-INT128-DATA-GLOBAL.)
-// Every 16-byte scalar kind is walled BEFORE reaching here: F80/F128 have
-// dedicated widen+append paths (appendF80Extended / the binary128 arm) and
-// I128/U128 fail loud at the kind-keyed 128-bit gate, so the only widths that
+// Every 16-byte scalar kind is routed BEFORE reaching here — by the scalar-global
+// arm and the aggregate-member leaf alike — to `appendSixteenByteScalarImage`,
+// which calls this only at width 8, once per limb; so the only widths that
 // arrive are the 1/2/4/8-byte ones this loop can encode.
 //
 // ★ THE LOOP ITSELF MOVED TO `asm.hpp::appendLittleEndianBytes` when the
@@ -1268,13 +1307,11 @@ void appendLE(std::vector<std::uint8_t>& bytes,
 // binary64) LOSSLESSLY into the x87 80-bit extended format and append its 16
 // on-disk bytes (10 significant + 6 zero pad — the SysV/darwin 16-byte,
 // 16-aligned slot `scalarByteSize(F80)` reserves). This is 80-bit, WIDER than
-// the u64 `decodeScalarLiteralBits` yields, so F80 has this dedicated
-// widen+append path rather than routing through that chokepoint (which stays
-// nullopt for F80, keeping the aggregate-member leaf recursion walled — a struct/
-// array long-double MEMBER in a rodata global is a DISTINCT deferral,
-// D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, NOT the scalar arithmetic const-fold
-// this cycle's LD-3 closed: a 16-byte leaf cannot flow through the u64
-// decodeScalarLiteralBits chokepoint the aggregate recursion uses).
+// the u64 `decodeScalarLiteralBits` yields, so it is reached only through
+// `appendSixteenByteScalarImage` — the one producer the scalar-global arm AND
+// the aggregate-member leaf both call (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL,
+// closed P68 round 8: a `long double` MEMBER was refused while the same value
+// as a whole global was emitted, because only the scalar arm had a path).
 // The x87 extended memory layout is little-endian:
 //   bytes 0-7  = the 64-bit significand with an EXPLICIT integer bit (bit 63),
 //   bytes 8-9  = sign (bit 15) | 15-bit exponent,
@@ -1422,6 +1459,78 @@ void appendWideFloatBits(std::vector<std::uint8_t>& bytes, WideFloatValue const&
         bytes.push_back(static_cast<std::uint8_t>((p.hi >> (i * 8)) & 0xFFu));
 }
 
+// ── THE 16-BYTE SCALAR IMAGE: ONE PRODUCER, TWO CALL SITES ──────────────────────
+// (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, and its 128-bit integer twin
+// D-CSUBSET-INT128-AGGREGATE-MEMBER-STATIC-INITIALIZER-REFUSED — both closed P68
+// round 8.) An F80 / F128 `long double` and an I128 / U128 integer each occupy
+// 16 bytes, WIDER than the `std::uint64_t` `decodeScalarLiteralBits` returns, so
+// none of them can pass through that chokepoint. The SCALAR-global arm of
+// `lowerMirGlobalsToDataItems` used to carry three private copies of this
+// encoding (F80, F128, 128-bit) and the aggregate-member LEAF had none — so
+// `struct S { char c; long double x; } g = {'a', 40.5L};`, `static long double
+// t[3] = {…};` and `struct { __int128 v; } w = {-3};` were REFUSED at the leaf
+// while the same values as whole globals were emitted. ✔MEASURED at the P68
+// round-8 base: refused on ELF x86_64 and ELF aarch64 (the 128-bit members on
+// all four shipped formats), debug and release; gcc 13.3.0 and clang 18.1.3,
+// each separately, run the same source to 42 at -O0 and -O2 on both processors.
+// ★ Both sites now ask HERE — the `encodeBitIntImage` shape — so a value and
+// the same value as a member cannot be encoded two ways.
+// Appends exactly 16 bytes and returns true, or appends NOTHING and returns
+// false when `v` is in no arm kind `k` can be read from:
+//   * F80 / F128 — a const-folded `WideFloatValue` OF THE SAME KIND (its `pack()`
+//     IS the on-disk layout: x87 10 significant bytes + 6 zero pad, or
+//     binary128), or a host `double` widened losslessly (`appendF80Extended` /
+//     `appendF128`). A `WideFloatValue` of the OTHER wide kind is refused: an
+//     F128 pattern in an F80 slot is a different number, not a rounding.
+//   * I128 / U128 — the two little-endian 64-bit limbs of a `BitIntValue` (at
+//     most two; a third would be bits the slot cannot hold), a plain
+//     `std::uint64_t` (zero-extended), a `std::int64_t` (SIGN-extended — a
+//     negative value's high limb is all ones) or a `bool`. Keyed on the
+//     declared KIND, never on the variant: a fits-in-64 `__int128` folds into a
+//     plain integer arm (D-CSUBSET-INT128-DATA-GLOBAL's recorded lesson).
+[[nodiscard]] bool
+appendSixteenByteScalarImage(std::vector<std::uint8_t>& bytes,
+                             MirLiteralValue const& v, TypeKind k) {
+    if (k == TypeKind::F80 || k == TypeKind::F128) {
+        if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
+            if (wf->kind() != k) return false;
+            appendWideFloatBits(bytes, *wf);
+            return true;
+        }
+        if (auto const* dv = std::get_if<double>(&v.value)) {
+            if (k == TypeKind::F80) appendF80Extended(bytes, *dv);
+            else                    appendF128(bytes, *dv);
+            return true;
+        }
+        return false;
+    }
+    if (k != TypeKind::I128 && k != TypeKind::U128) return false;
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+    if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
+        auto const& limbs = bv->limbs();
+        if (limbs.size() > 2) return false;
+        lo = limbs.size() > 0 ? limbs[0] : 0ull;
+        hi = limbs.size() > 1 ? limbs[1] : 0ull;
+        // A 1-limb payload declared 128 bits wide still needs its high limb
+        // materialized; `BitIntValue` keeps its limbs sign-clean, so the
+        // extension is the sign of the declared value.
+        if (limbs.size() < 2 && bv->isSigned() && (lo >> 63) != 0) hi = ~0ull;
+    } else if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
+        lo = *uv;                       // zero-extends
+    } else if (auto const* iv = std::get_if<std::int64_t>(&v.value)) {
+        lo = static_cast<std::uint64_t>(*iv);
+        if (*iv < 0) hi = ~0ull;        // sign-extends
+    } else if (auto const* bo = std::get_if<bool>(&v.value)) {
+        lo = *bo ? 1ull : 0ull;
+    } else {
+        return false;
+    }
+    appendLE(bytes, lo, 8);
+    appendLE(bytes, hi, 8);
+    return true;
+}
+
 // Decode a SCALAR literal to the little-endian bit pattern to emit (zero-
 // extended into a u64; the writer takes the low `width` bytes). Handles
 // bool / signed / unsigned integers and F32/F64 — a `double`-arm value is
@@ -1431,13 +1540,12 @@ void appendWideFloatBits(std::vector<std::uint8_t>& bytes, WideFloatValue const&
 // wider than F64 or otherwise without a lossless host-`double` arm (F80 joined
 // with FC17.9(e)) — or a non-scalar / monostate variant (string /
 // MirAggregateValue / a LD-3 `WideFloatValue` folded leaf / unknown). The SOLE
-// scalar-encode chokepoint — the scalar-global arm and the aggregate-leaf
-// recursion both route through it, so the int/float value semantics can never
-// drift between the two encoders. A folded F80/F128 SCALAR global is handled
-// BEFORE this chokepoint (the dedicated appendWideFloatBits arm, LD-3); a folded
-// F80/F128 leaf reaching HERE inside an AGGREGATE correctly stays nullopt → the
-// aggregate recursion fails loud (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, a
-// 16-byte leaf cannot pass through this u64 chokepoint).
+// scalar-encode chokepoint for the widths a u64 can carry — the scalar-global
+// arm and the aggregate-leaf recursion both route through it, so the int/float
+// value semantics can never drift between the two encoders. The four 16-byte
+// kinds (F80/F128/I128/U128) are sent by BOTH callers to
+// `appendSixteenByteScalarImage` before this chokepoint; the nullopt it returns
+// for them is the backstop that keeps a u64 from standing in for 16 bytes.
 [[nodiscard]] std::optional<std::uint64_t>
 decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     // D-CSUBSET-INT128-DATA-GLOBAL (TF-C94): a 128-bit integer is 16 bytes —
@@ -1445,11 +1553,9 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
     // exactly like F80/F128. Checked FIRST, before the integer arms, because a
     // 128-bit value's folded literal IS a plain u64/i64 arm (it is the CONTAINER
     // that is too narrow, not the variant that is wrong): without this the u64
-    // arm below would happily return the low 8 bytes and the aggregate-leaf
-    // recursion would write them as if they were the whole value. Returning
-    // nullopt makes a `struct { __uint128_t x; }` global fail loud at that
-    // recursion; the scalar top-level global is walled by the dedicated
-    // kind-keyed arm in `lowerMirGlobalsToDataItems`.
+    // arm below would happily return the low 8 bytes and a caller would write
+    // them as if they were the whole value. Both callers send these kinds to
+    // `appendSixteenByteScalarImage` first; this is the backstop.
     if (k == TypeKind::I128 || k == TypeKind::U128) return std::nullopt;
     // Same argument for the >64-bit FLOAT kinds, and it closes a real mismatch
     // between this function's contract and its code: the header above has always
@@ -1783,7 +1889,7 @@ encodeBitIntImage(MirLiteralValue const& v, TypeInterner const& in, TypeId ty,
 // closing over a `DiagnosticReporter` local to `lowerMirGlobalsToDataItems`).
 // Every `return false` therefore surfaced through ONE generic caller message
 // that enumerates the causes it knew about ("a type↔value shape mismatch or an
-// unencodable leaf — e.g. f16/f80/f128, or an address-relocated leaf…"). The
+// unencodable leaf — e.g. an f16 leaf, or an address-relocated leaf…"). The
 // overlapping-struct refusal below is NONE of those, so a user hitting it —
 // MEASURED reachable today as `static ULARGE_INTEGER g = {1,0,0};` on pe64,
 // `windows.json`'s explicit-offset OVERLAY — was pointed at the wrong thing. An
@@ -2000,20 +2106,22 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     // TWO element-float components, real first — so this arm is the Array arm with
     // the count FIXED at 2 and the component type taken from the interner.
     //
-    // ★ THE OFFSETS ARE `elemLay->size`, NOT THE ALIGNED STRIDE, and the difference
-    // is deliberate: `computeLayout`'s own Complex arm returns `StructLayout{es * 2,
+    // ★ THE OFFSETS ARE `elemLay->size`, NOT THE ALIGNED STRIDE, and the choice is
+    // deliberate: `computeLayout`'s own Complex arm returns `StructLayout{es * 2,
     // elem->align, …}` — it lays the imaginary component at exactly `es`, where the
-    // Array arm rounds `es` UP to the element's alignment first. They coincide for
-    // F32 and F64 (size == align), and they DIVERGE for an x87 F80 element (10 bytes,
-    // align 16), so copying the Array arm's stride would silently place `im` six
-    // bytes past where every reader — `complexParts`/`loadComplex` in hir_to_mir,
-    // `collectLeaves` in aggregate_abi — expects it. This arm matches the LAYOUT
-    // AUTHORITY's formula, exactly as the Array arm matches its own.
-    // ⓘ F80/F128 elements still cannot REACH here with a value: the MIR classifier
-    // that mints this literal folds only F32/F64 components and refuses the rest
-    // loud, matching the wall complex ARITHMETIC already hits at those widths. The
-    // formula is written correctly anyway, because a layout rule copied wrong is
-    // the kind of defect that surfaces one cycle after the gate it would have passed.
+    // Array arm rounds `es` UP to the element's alignment first. For every element
+    // the layout authority sizes today the two coincide — F32 and F64 have size ==
+    // align, and an x87 F80 is STORED 16/16 (10 significant bytes + 6 pad; this note
+    // used to call it a 10-byte element, a size the authority never answers) — but
+    // this arm keeps the LAYOUT AUTHORITY's formula, exactly as the Array arm keeps
+    // its own, so no element can land `im` off the offset every reader —
+    // `complexParts`/`loadComplex` in hir_to_mir, `collectLeaves` in aggregate_abi —
+    // expects.
+    // ⓘ F80/F128 elements DO reach here since P68 round 8: the MIR classifier folds
+    // their components as `WideFloatValue`s
+    // (D-CSUBSET-COMPLEX-LONG-DOUBLE-STATIC-INITIALIZER-REFUSED), and each lands in
+    // the 16-byte leaf arm below — the imaginary one at 16, the element's second
+    // 16-byte slot.
     //
     // ⚠ A SHORT VALUE IS NOT A ZERO IMAGINARY PART BY ACCIDENT — it is one BY
     // CONSTRUCTION: `buf` is pre-zeroed to the layout size by the caller, so a
@@ -2164,13 +2272,49 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         return true;
     }
 
+    // ── D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL + its 128-bit integer twin ──
+    // A 16-byte leaf — the `long double` member of `struct S { char c; long
+    // double x; }`, an element of `static long double t[3]`, the first member of
+    // `union U { long double x; int i; }`, an `__int128` member, the component
+    // of a `_Complex long double` — takes the SAME producer as the scalar-global
+    // arm. ★ MUST PRECEDE the `scalarByteSize` / `decodeScalarLiteralBits` pair
+    // below: that chokepoint returns a u64 and refuses all four kinds, which is
+    // exactly how these members came to be refused while the same values as
+    // whole globals were emitted. The image fills the whole 16-byte slot
+    // `computeLayout` reserves (an x87 F80 leaf: 10 significant bytes + 6 zero
+    // pad — the Complex arm above places an F80 imaginary part at
+    // `elemLay->size`, i.e. at 16, the same slot).
+    if (k == TypeKind::F80 || k == TypeKind::F128
+        || k == TypeKind::I128 || k == TypeKind::U128) {
+        std::vector<std::uint8_t> img;
+        if (!appendSixteenByteScalarImage(img, v, k)) {
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    std::format("a 16-byte member (TypeKind={}) has an initializer "
+                                "in no literal arm that kind can be read from — "
+                                "refusing rather than writing a fabricated image "
+                                "(D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL)",
+                                static_cast<int>(k)));
+            return false;
+        }
+        auto const w = scalarByteSize(k, dm);
+        if (!w.has_value() || img.size() != *w || base + img.size() > buf.size()) {
+            why.set(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
+                    "a 16-byte member's image does not fill exactly the slot the "
+                    "layout reserves for it — the encoder and the layout disagree "
+                    "(D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL)");
+            return false;
+        }
+        for (std::size_t j = 0; j < img.size(); ++j) buf[base + j] = img[j];
+        return true;
+    }
+
     // Scalar / pointer leaf: write the literal's LE bytes at `base`. Width
     // comes from `scalarByteSize` (the SAME sizing `computeLayout` used for
     // the offsets, so leaf width and field offset can never disagree).
     auto const wOpt = scalarByteSize(k, dm);
     if (!wOpt.has_value()) return false;             // FnSig/Slice/Void/... → fail loud
     auto const bits = decodeScalarLiteralBits(v, k);
-    if (!bits.has_value()) return false;             // F16/F80/F128/non-scalar → fail loud
+    if (!bits.has_value()) return false;             // F16/non-scalar → fail loud
     if (base + *wOpt > buf.size()) return false;     // layout↔encoder disagreement → fail loud
     for (std::uint64_t j = 0; j < *wOpt; ++j)
         buf[base + j] = static_cast<std::uint8_t>((*bits >> (j * 8)) & 0xFFu);
@@ -2617,8 +2761,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                          ? std::format("lowerMirGlobalsToDataItems: global "
                                        "SymbolId={{ {} }} aggregate initializer "
                                        "could not be encoded (a type↔value shape "
-                                       "mismatch or an unencodable leaf — e.g. "
-                                       "f16/f80/f128, or an address-relocated leaf when "
+                                       "mismatch or an unencodable leaf — e.g. an "
+                                       "f16 leaf, or an address-relocated leaf when "
                                        "the target declares no abs64 reloc) "
                                        "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                        sym.v)
@@ -2657,105 +2801,61 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
-        // D-CSUBSET-INT128-DATA-GLOBAL (TF-C94): a 128-bit integer DATA-global is
-        // a DEFERRAL boundary — its on-disk byte layout is not yet emitted. This
-        // gate keys on the TYPE KIND, deliberately NOT on the value's variant arm,
-        // and that distinction is the whole point: the neighbouring `_BitInt` wall
-        // above keys on `holds_alternative<BitIntValue>`, and MIRRORING it here
-        // would MISS the common case. For `__uint128_t g = 5;` the folded value is
-        // a plain `std::uint64_t`, so a variant-keyed gate never fires and control
-        // reaches `appendLE(d.bytes, *bits, *widthOpt)` below with width 16 — and
-        // `appendLE` computes `(value >> (j*8))` on a `std::uint64_t` for
-        // j ∈ [0,16), so every j ≥ 8 is a shift of 64..120 bits: UNDEFINED
-        // BEHAVIOUR, which on both shipped host arches masks the shift count and
-        // REPEATS the low 8 bytes into the high 8. Wrong bytes, silently.
-        // Placed BEFORE the `widthOpt` unwrap so the wall stands whatever
-        // `scalarByteSize` reports, and BEFORE the `_BitInt` VARIANT arm below so
-        // the message matches the declared TYPE: once a >64-bit 128-bit fold
-        // lands in the `BitIntValue` pool arm (it is the only arm wide enough to
-        // carry one), a variant-keyed dispatch would claim a `__uint128_t` global
-        // is a `_BitInt` one. Keying on `k` — the global's declared kind — and
-        // going first keeps the two deferrals honestly labelled.
-        // `decodeScalarLiteralBits` returns nullopt for
-        // these kinds too, so a `struct { __uint128_t x; }` global walls at the
-        // aggregate-leaf recursion rather than slipping through this scalar path.
-        // ★ THE 16 BYTES ARE NOW EMITTED. This arm used to be a fail-loud
-        // DEFERRAL wall; it is a producer. What made the wall necessary was that
-        // `appendLE` takes a `std::uint64_t`, so a width-16 append computed
-        // `(value >> (j*8))` for j in [0,16) -- a shift of 64..120 bits, UB,
-        // which on both shipped host arches masks the count to 6 bits and
-        // REPEATS the low 8 bytes into the high 8. The fix is not a wider shift
-        // but a wider SOURCE: read the value as two little-endian 64-bit limbs
-        // and append each at its own width, so no shift ever exceeds 56.
-        //
-        // ⓘ THE TWO PAYLOAD ARMS ARE BOTH REAL AND NEITHER IMPLIES THE OTHER --
-        // this is the distinction the row recorded as the one a naive gate
-        // misses. `__uint128_t g = 5;` folds into a PLAIN `std::uint64_t` (the
-        // narrowest arm that holds it), while a value needing more than 64 bits
-        // folds into the `BitIntValue` pool arm carrying an I128/U128 core. A
-        // dispatch keyed on the VARIANT would silently miss the first; keying on
-        // the declared KIND `k`, as this arm does, catches both.
-        //
-        // ⓘ SIGN MATTERS FOR THE HIGH LIMB. A negative `__int128` folded into
-        // the int64 arm must fill its high limb with 1s, not zeros -- so the
-        // extension is taken from the VALUE's signedness, not assumed.
-        //
-        // ⚠ THE AGGREGATE LEAF STAYS WALLED, DELIBERATELY. `decodeScalarLiteralBits`
-        // still returns nullopt for these kinds, so `struct { __uint128_t x; }`
-        // fails LOUD at the aggregate-leaf recursion rather than slipping
-        // through: that chokepoint returns a `std::uint64_t` and structurally
-        // cannot carry 16 bytes. This mirrors the shipped F80 arm exactly (the
-        // sole F80 scalar-global producer, with F80 struct members walled the
-        // same way). A remaining site that is LOUD is a deferral; a remaining
-        // site that is SILENT would be the half-shipped multi-site contract this
-        // cycle exists to stop.
-        if (k == TypeKind::I128 || k == TypeKind::U128) {
-            std::uint64_t lo = 0;
-            std::uint64_t hi = 0;
-            if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
-                auto const& limbs = bv->limbs();
-                lo = limbs.size() > 0 ? limbs[0] : 0ull;
-                hi = limbs.size() > 1 ? limbs[1] : 0ull;
-                // A 1-limb payload declared 128 bits wide still needs its high
-                // limb materialized; `BitIntValue` keeps its limbs sign-clean, so
-                // the extension is the sign of the declared value.
-                if (limbs.size() < 2 && bv->isSigned()
-                    && (lo >> 63) != 0) hi = ~0ull;
-            } else if (auto const* uv = std::get_if<std::uint64_t>(&v.value)) {
-                lo = *uv;                       // zero-extends
-            } else if (auto const* iv = std::get_if<std::int64_t>(&v.value)) {
-                lo = static_cast<std::uint64_t>(*iv);
-                if (*iv < 0) hi = ~0ull;        // sign-extends
-            } else if (auto const* bo = std::get_if<bool>(&v.value)) {
-                lo = *bo ? 1ull : 0ull;
-            } else {
+        // ── THE FOUR 16-BYTE SCALAR KINDS: F80 / F128 `long double`, I128 / U128 ──
+        // (D-CSUBSET-LONG-DOUBLE-X87-ARITH LD-1, -IEEE128-ARITH LD-2, LD-3's folded
+        // `WideFloatValue`, D-CSUBSET-INT128-DATA-GLOBAL.) Each is 16 bytes, WIDER
+        // than the u64 `decodeScalarLiteralBits` returns, so each is encoded by
+        // `appendSixteenByteScalarImage` — the ONE producer the aggregate-member
+        // leaf calls too (D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL, P68 round 8), so a
+        // global and the same value as a member cannot be encoded two ways. This
+        // arm used to be three: a 128-bit one here and an F80 and an F128 one
+        // after the width unwrap, each with its own copy of the encoding.
+        // ⚠ KEYED ON THE DECLARED KIND `k`, NEVER ON THE VALUE'S VARIANT, and
+        // placed FIRST: `__uint128_t g = 5;` folds into a PLAIN `std::uint64_t`,
+        // so a variant-keyed gate would miss it and `appendLE` would be asked for
+        // width 16 — a shift of 64..120 bits, UB that on both shipped host arches
+        // REPEATS the low 8 bytes into the high 8 (TF-C94's recorded lesson).
+        // BEFORE the `_BitInt` arm, so a 128-bit value folded into the
+        // `BitIntValue` pool arm keeps its declared kind's treatment.
+        // ⓘ A negative `__int128` folded into the int64 arm gets a SIGN-extended
+        // high limb; a folded `WideFloatValue` of the OTHER wide kind is refused.
+        if (k == TypeKind::F80 || k == TypeKind::F128
+            || k == TypeKind::I128 || k == TypeKind::U128) {
+            bool const isInt = (k == TypeKind::I128 || k == TypeKind::U128);
+            std::size_t const before = d.bytes.size();
+            if (!appendSixteenByteScalarImage(d.bytes, v, k)) {
                 emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                     std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
-                                 "has a 128-bit integer type (TypeKind={}) but its "
-                                 "initializer is in no integer literal arm — refusing "
-                                 "rather than emitting a fabricated 16-byte image "
-                                 "(D-CSUBSET-INT128-DATA-GLOBAL).",
-                                 sym.v, static_cast<int>(k)));
+                     isInt
+                         ? std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                       "has a 128-bit integer type (TypeKind={}) but its "
+                                       "initializer is in no integer literal arm — refusing "
+                                       "rather than emitting a fabricated 16-byte image "
+                                       "(D-CSUBSET-INT128-DATA-GLOBAL).",
+                                       sym.v, static_cast<int>(k))
+                         : std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} "
+                                       "has a wide-float type (TypeKind={}) but its "
+                                       "initializer is neither a `double` nor a folded "
+                                       "value of that kind — refusing rather than emitting "
+                                       "a fabricated 16-byte image "
+                                       "(D-CSUBSET-LONG-DOUBLE-AGGREGATE-GLOBAL).",
+                                       sym.v, static_cast<int>(k)));
                 continue;
             }
-            std::size_t const before = d.bytes.size();
-            appendLE(d.bytes, lo, 8);
-            appendLE(d.bytes, hi, 8);
             // The layout and the encoder must agree; a disagreement is a wrong
             // image, so it fails loud rather than shipping a short/long record.
-            auto const w128 = scalarByteSize(k, dataModel);
-            if (!w128.has_value() || d.bytes.size() - before != *w128) {
+            auto const w16 = scalarByteSize(k, dataModel);
+            if (!w16.has_value() || d.bytes.size() - before != *w16) {
                 emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                     std::format("lowerMirGlobalsToDataItems: 128-bit global "
+                     std::format("lowerMirGlobalsToDataItems: 16-byte global "
                                  "SymbolId={{ {} }} encoded to {} bytes but "
-                                 "scalarByteSize reserves {} — the 128-bit encoder "
+                                 "scalarByteSize reserves {} — the 16-byte encoder "
                                  "and the layout disagree.",
                                  sym.v, d.bytes.size() - before,
-                                 w128.has_value() ? *w128 : 0));
+                                 w16.has_value() ? *w16 : 0));
                 continue;
             }
             d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                static_cast<std::uint32_t>(*w128)));
+                static_cast<std::uint32_t>(*w16)));
             out.push_back(std::move(d));
             continue;
         }
@@ -2852,121 +2952,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                              sym.v, static_cast<int>(k)));
             continue;
         }
-        // D-CSUBSET-LONG-DOUBLE-X87-ARITH (LD-1): an x87 80-bit `long double`
-        // global — the widened extended value is 10 significant + 6 pad = 16
-        // bytes, WIDER than the u64 `decodeScalarLiteralBits` returns, so it
-        // has this dedicated widen+append path (the SOLE F80 scalar-global
-        // producer — F80 struct members stay walled at the aggregate-leaf
-        // recursion, LD-3). The double→extended widen is lossless (the pool
-        // carries the value as a host `double`, exactly representable for the
-        // l-suffixed literals this slice exercises). `*widthOpt` is 16 by
-        // construction (scalarByteSize(F80)); assert-guard the invariant.
-        if (k == TypeKind::F80) {
-            // LD-3 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): a CONST-FOLDED F80
-            // global — the value lives in the `WideFloatValue` pool arm at true
-            // 80-bit precision. Checked FIRST; `pack()` yields the identical 16-byte
-            // x87 layout, so it shares the size-check + alignment path.
-            if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendWideFloatBits(d.bytes, *wf);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F80 folded global "
-                                     "SymbolId={{ {} }} packed to {} bytes but "
-                                     "scalarByteSize reserves {} — the wide-float "
-                                     "encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            if (auto const* dv = std::get_if<double>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendF80Extended(d.bytes, *dv);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F80 global "
-                                     "SymbolId={{ {} }} widened to {} bytes but "
-                                     "scalarByteSize reserves {} — the x87 "
-                                     "extended encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            // A non-`double`, non-`WideFloatValue` F80 initializer is a malformed
-            // pool entry — fall through to the decode chokepoint's fail-loud
-            // below. (TF-C94: that fail-loud is now REAL. This comment used to
-            // describe a wall the chokepoint did not provide — its u64/i64/bool
-            // arms returned a value regardless of `k`, so a malformed F80 entry
-            // reached `appendLE` with width 16 on a u64 and hit the >>64 UB.
-            // `decodeScalarLiteralBits` now returns nullopt for F16/F80/F128 by
-            // KIND, honouring the contract its own header always stated.)
-        }
-        // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): an IEEE binary128 `long
-        // double` global — the widened quad value is 16 bytes, WIDER than the
-        // u64 `decodeScalarLiteralBits` returns, so (like F80) it has this
-        // dedicated widen+append path (the SOLE F128 scalar-global producer;
-        // F128 struct members stay walled at the aggregate-leaf recursion). The
-        // double->binary128 widen is lossless for the l-suffixed literals this
-        // slice exercises. `*widthOpt` is 16 by construction (scalarByteSize
-        // (F128)); assert-guard the invariant, exactly as the F80 arm does.
-        if (k == TypeKind::F128) {
-            // LD-3: a CONST-FOLDED F128 global — the value lives in the
-            // `WideFloatValue` pool arm at true 113-bit precision. Checked FIRST;
-            // `pack()` yields the identical 16-byte binary128 layout.
-            if (auto const* wf = std::get_if<WideFloatValue>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendWideFloatBits(d.bytes, *wf);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F128 folded global "
-                                     "SymbolId={{ {} }} packed to {} bytes but "
-                                     "scalarByteSize reserves {} — the wide-float "
-                                     "encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            if (auto const* dv = std::get_if<double>(&v.value)) {
-                std::size_t const before = d.bytes.size();
-                appendF128(d.bytes, *dv);
-                if (d.bytes.size() - before != *widthOpt) {
-                    emit(DiagnosticCode::K_StaticDataEncoderInvariantBreach,
-                         std::format("lowerMirGlobalsToDataItems: F128 global "
-                                     "SymbolId={{ {} }} widened to {} bytes but "
-                                     "scalarByteSize reserves {} — the binary128 "
-                                     "encoder and the layout disagree.",
-                                     sym.v, d.bytes.size() - before, *widthOpt));
-                    continue;
-                }
-                d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*widthOpt)));
-                out.push_back(std::move(d));
-                continue;
-            }
-            // A non-`double`, non-`WideFloatValue` F128 initializer is a malformed
-            // pool entry — fall through to the decode chokepoint's fail-loud
-            // below. (TF-C94: real as of this cycle — see the F80 arm's note;
-            // `decodeScalarLiteralBits` walls F16/F80/F128 by KIND now, not only
-            // on its `double` arm.)
-        }
         // Decode the scalar value through the shared chokepoint (the SAME
         // int/float semantics the aggregate-leaf recursion uses, incl. the
         // mandatory `double → float` narrow for an F32 global — writing the
         // low 4 bytes of the binary64 pattern would be garbage). A nullopt
-        // means either an f16/f80/f128 `double` (the pool can't represent it) or
-        // a non-scalar / monostate variant — distinguished HERE for a precise
+        // means either an f16 `double` (the pool can't represent it; the four
+        // 16-byte kinds were taken by their own arm above) or a non-scalar /
+        // monostate variant — distinguished HERE for a precise
         // diagnostic (the `MirAggregateValue` arm already fired above, so a
         // non-scalar here is monostate). (Code-reviewer F1 audit fold — the
         // silent-miscompile guard for `float g = 1.0f;` at file scope.)
@@ -2978,7 +2970,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "global SymbolId={{ {} }} has "
                                  "TypeKind={} with a `double` "
                                  "literal — the pool cannot "
-                                 "represent f16/f80/f128 losslessly "
+                                 "represent f16 losslessly "
                                  "(D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT).",
                                  sym.v, static_cast<int>(k)));
             } else {

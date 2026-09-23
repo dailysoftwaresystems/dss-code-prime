@@ -1,7 +1,9 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"              // DataModel / LongDoubleFormat (the `type-size` kind's pair facts)
 #include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header)
+#include "core/types/type_lattice/core_type.hpp"  // TypeKind (the `type-size` kind's resolved core)
 
 #include <cstdint>
 #include <expected>
@@ -9,6 +11,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace dss {
@@ -35,7 +39,18 @@ namespace dss {
 //               one's value depends on how many times it has already been read.
 //               That is exactly why it cannot be a `constant` row in the config
 //               (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED).
-enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter };
+//   TypeSize -- the SIZE IN BYTES of a TYPE on the build's (target, format)
+//               pair, a decimal integer (gcc/clang `__SIZEOF_LONG__` and its
+//               family). The row names the TYPE (`PredefinedSizedType`), never
+//               a number: the value is `sizeof` of that type as the type system
+//               lays it out on the pair, so the macro and `sizeof` read ONE
+//               fact and cannot drift (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING).
+//               LANGUAGE family only -- a type name belongs to a language's
+//               vocabulary, which no target or format document has. Realized
+//               per pair by `mergePredefinedMacros`; a pair that does not
+//               realize the type leaves the macro UNDEFINED, as gcc leaves
+//               `__SIZEOF_INT128__` undefined where there is no `__int128`.
+enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter, TypeSize };
 
 // The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
 // (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
@@ -52,13 +67,14 @@ enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter };
 //
 // No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
 // so every value the engine can hold is enumerated below.
-inline constexpr EnumNameTable<PredefinedMacroKind, 6> kPredefinedMacroKindTable{{{
-    { PredefinedMacroKind::Line,     "line"     },
-    { PredefinedMacroKind::File,     "file"     },
-    { PredefinedMacroKind::Constant, "constant" },
-    { PredefinedMacroKind::Date,     "date"     },
-    { PredefinedMacroKind::Time,     "time"     },
-    { PredefinedMacroKind::Counter,  "counter"  },
+inline constexpr EnumNameTable<PredefinedMacroKind, 7> kPredefinedMacroKindTable{{{
+    { PredefinedMacroKind::Line,     "line"      },
+    { PredefinedMacroKind::File,     "file"      },
+    { PredefinedMacroKind::Constant, "constant"  },
+    { PredefinedMacroKind::Date,     "date"      },
+    { PredefinedMacroKind::Time,     "time"      },
+    { PredefinedMacroKind::Counter,  "counter"   },
+    { PredefinedMacroKind::TypeSize, "type-size" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -500,6 +516,63 @@ predefinedNameChangeIsRefused(PredefinedMacroRedefinition r) noexcept {
     return r == PredefinedMacroRedefinition::Refuse;
 }
 
+// ══ THE `type-size` KIND: WHICH TYPE A ROW SIZES, AND THE PAIR THAT SIZES IT ══
+// (P68 round 8, D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING)
+//
+// ★★★ THE ROW NAMES A TYPE, NEVER A NUMBER. The first cut of this family was 18
+// per-format `constant` rows each spelling `__SIZEOF_LONG_DOUBLE__`'s value
+// beside the `longDoubleFormat` it follows — one fact written twice per file,
+// held together only by a test. A `type-size` row states which TYPE the macro
+// measures and the merge computes the number from the same layout `sizeof`
+// uses, so there is one fact and nothing to hold together.
+//
+// WHERE THE TYPE COMES FROM — the `"type"` key's four forms:
+//   Vocabulary  -- a type NAME in the language's own vocabulary (`"short"`,
+//                  `"long double"`, `"__int128"`), resolved at LANGUAGE LOAD by
+//                  the grammar loader's `resolveTypeName` — the path the integer
+//                  literal ladder and `synthesizedTypes` already take — into the
+//                  same (core, per-data-model, per-long-double-format) triple.
+//   Synthesized -- `{"synthesized": <role>}`: an ENGINE-SYNTHESIZED standard
+//                  type (`semantics.synthesizedTypes`). C defines `size_t` as
+//                  the type `sizeof` yields and `ptrdiff_t` as the type of a
+//                  pointer difference, so those ARE the types to measure.
+//   PointerTo   -- `{"pointerTo": <type name>}`: a pointer, sized by the data
+//                  model's pointer width (the pointee is resolved, so a typo
+//                  fails the load, but does not change the size).
+//   AbiTypedef  -- `{"abiTypedef": <name>}`: a platform ABI typedef the TARGET
+//                  declares per object format (`abiTypedefs` in the
+//                  `.target.json` — `wchar_t`, `wint_t`). Resolved per PAIR, in
+//                  the merge; nothing about it is known at language load.
+enum class PredefinedTypeSource : std::uint8_t {
+    None, Vocabulary, Synthesized, PointerTo, AbiTypedef
+};
+
+struct DSS_EXPORT PredefinedSizedType {
+    PredefinedTypeSource source = PredefinedTypeSource::None;
+    // The `type` value as written — the type name, the role, the pointee, or
+    // the ABI typedef name. For the diagnostics and the dump.
+    std::string spelled;
+    // Vocabulary / Synthesized / PointerTo: set by the LANGUAGE loader once the
+    // name resolved. A row that never resolved never reaches a merge (the load
+    // fails), so an unresolved row there is a caller bug, and it realizes to
+    // nothing rather than to a guess.
+    bool resolved = false;
+    TypeKind core = TypeKind::Void;
+    std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
+};
+
+// The facts ONE (target, format) pair contributes to sizing a type: the
+// format's data model and `long double` format, and the target's ABI typedefs
+// resolved for this format. Built by `applyTargetFormatPair` from the two
+// documents' own accessors; the preprocessor and the dump receive it whole.
+struct DSS_EXPORT PredefinedTypeFacts {
+    DataModel        dataModel        = DataModel::Lp64;
+    LongDoubleFormat longDoubleFormat = LongDoubleFormat::None;
+    // (typedef name, integer core on this pair). Order is the target's.
+    std::vector<std::pair<std::string, TypeKind>> abiTypedefs;
+};
+
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the
 // materialization behavior; `value` is the literal replacement spelling and is
@@ -557,6 +630,12 @@ struct DSS_EXPORT PredefinedMacroDef {
     PredefinedMacroRedefinition programRedefinition =
         PredefinedMacroRedefinition::WarnIsoMacro;
 
+    // `type-size` rows only: the TYPE whose size this macro states (see
+    // `PredefinedSizedType`). `source == None` on every other kind. The merge
+    // writes the realized size into `value` and keeps the kind, so the dump can
+    // still say the number was derived.
+    PredefinedSizedType sizedType;
+
     // PROVENANCE — the JSON POINTER of this entry inside its declaring document
     // (e.g. "/preprocess/predefinedMacros/7"), set by the shared entry parser.
     // The declaring FILE FAMILY is supplied by the merge, which is the only
@@ -566,6 +645,15 @@ struct DSS_EXPORT PredefinedMacroDef {
     // families for it.
     std::string declaredAt;
 };
+
+// The size in bytes a `type-size` row's type has on the pair `facts` describes,
+// or nullopt when the pair does not realize it — `long double` on a format that
+// declares no `longDoubleFormat`, an ABI typedef the target does not declare, a
+// row that is not `type-size` or never resolved. The ONE place the kind's value
+// is computed; `mergePredefinedMacros` calls it and nothing else does.
+[[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
+predefinedTypeSize(PredefinedMacroDef const& row,
+                   PredefinedTypeFacts const& facts) noexcept;
 
 // FC15c (`__has_c_attribute` -- C23 6.10.1p4): one config-declared standard
 // attribute the language KNOWS, with the C23 `__STDC_VERSION__`-style version

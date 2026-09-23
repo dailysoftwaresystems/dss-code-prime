@@ -990,7 +990,7 @@ flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
 // different bounds — the separate row is
 // D-PARSE-DEEP-NEST-RECURSION-MEMORY.
 // ⚠ FOR ITS STATUS ASK THE INSTRUMENT — `python
-// scripts/check-anchor-balance/check-anchor-balance.py` — never a comment: a
+// .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` — never a comment: a
 // status word in prose is a measurement with no instrument attached, which is
 // how this sentence rotted in the first place.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {

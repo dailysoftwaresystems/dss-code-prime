@@ -130,7 +130,10 @@ std::uint16_t op(std::string_view mnemonic) {
                // third module-level side structure. Empty here — this fixture
                // exercises the pool shrink checks, and the schedule's own shrink
                // check is exercised by its own record.
-               std::vector<LirStaticInitEntry>{}};
+               std::vector<LirStaticInitEntry>{},
+               // P68 round 8 part 4: the fourth, the inline-asm bundle bodies.
+               // Empty here for the schedule's reason.
+               LirAsmRegionPool{}};
 }
 
 [[nodiscard]] detail::LirInst movInst(std::uint32_t operandStart,
@@ -528,4 +531,53 @@ TEST(LirVerifierMemAddressing, MalformedAddressesAreSTILLREJECTED) {
         EXPECT_EQ(countDiags(rep, DiagnosticCode::L_MemOperandMalformed), 1u)
             << what;
     }
+}
+
+// ── THE LIR VERIFIER'S VERDICT IS ITS OWN COUNT (P68 round 8, lane `ht`) ─────
+//
+// The `HirVerifier` / `MirVerifier` template, for the LIR verifier's five free
+// functions: every rule reports through a per-call `LirVerdict`, which counts each
+// finding the reporter's POLICY makes an Error before the reporter decides whether
+// to store it, and each function answers own count == 0 AND the delta. Every code
+// this verifier emits is a `kUnsuppressableCodes` member today, and members bypass
+// dedup and the caps, so the repeated-verify arm below holds with or without the
+// count — it is the arm that reds when BOTH guards are gone (the count, and the
+// code's membership), which is the next code added without joining the table.
+namespace {
+
+[[nodiscard]] Lir danglingConstraintModule() {
+    return handBuildModule(
+        {movInst(/*operandStart=*/0, /*operandCount=*/0,
+                 /*regConstraints=*/lirRegConstraintHandleForIndex(0))},
+        {}, LirLiteralPool{}, LirRegConstraintPool{});
+}
+
+} // namespace
+
+TEST(LirVerifierVerdict, ARefusalFailsEveryVerifyIntoOneReporter) {
+    Lir const lir = danglingConstraintModule();
+    DiagnosticReporter shared;
+    EXPECT_FALSE(verifyLirText(lir, *x86Schema(), shared))
+        << "the control: the first verify must refuse the dangling handle";
+    EXPECT_FALSE(verifyLirText(lir, *x86Schema(), shared))
+        << "a module the LIR verifier refused passed the second verify into the same reporter";
+}
+
+TEST(LirVerifierVerdict, ASuppressListCannotSilenceTheRefusal) {
+    Lir const lir = danglingConstraintModule();
+    DiagnosticReporter::Config cfg;
+    cfg.policy.suppress.insert(DiagnosticCode::L_SideStructureIndexDangling);
+    DiagnosticReporter rep{cfg};
+    EXPECT_FALSE(verifyLirText(lir, *x86Schema(), rep))
+        << "a suppress list let the module verify clean";
+    EXPECT_EQ(countDiags(rep, DiagnosticCode::L_SideStructureIndexDangling), 1u)
+        << "the refusal was silenced by the suppress list";
+}
+
+TEST(LirVerifierVerdict, ACleanModuleVerifiedTwiceIntoOneReporterPassesBothTimes) {
+    Lir const lir = buildCleanModule();
+    DiagnosticReporter shared;
+    EXPECT_TRUE(verifyLirText(lir, *x86Schema(), shared));
+    EXPECT_TRUE(verifyLirText(lir, *x86Schema(), shared));
+    EXPECT_EQ(shared.errorCount(), 0u);
 }

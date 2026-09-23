@@ -20,6 +20,7 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "diagnostic_count.hpp"
+#include "ffi/abi/abi_catalog.hpp"
 #include "ffi/ingest.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/hir.hpp"
@@ -37,6 +38,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,6 +53,56 @@ using dss::test_support::appU16;
 using dss::test_support::appU32;
 using dss::test_support::appU64;
 namespace fs = std::filesystem;
+
+namespace {
+
+// ── THE PAIRS HEADERS HERE ARE READ UNDER ────────────────────────────────────
+// D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: a header is read under a
+// `<target>:<format>` pair now (`HeaderReadPair`), and a reader cannot be called
+// without one. The fixtures written against the pair-less reader keep x86_64 ELF,
+// whose LP64 data model and POSIX case rule are what that reader's defaults
+// amounted to. Each pair is loaded ONCE per process and kept alive for it,
+// because a `HeaderReadPair` holds references; a document that does not load
+// throws out of the test that asked, NAMING the document, rather than letting a
+// header be read under nothing.
+[[nodiscard]] dss::ffi::HeaderReadPair pairOf(std::string const& targetName,
+                                              std::string const& formatName) {
+    struct Loaded {
+        std::shared_ptr<dss::TargetSchema const>       target;
+        std::shared_ptr<dss::ObjectFormatSchema const> format;
+        dss::TargetCallingConvention const*            cc = nullptr;
+    };
+    static std::map<std::string, Loaded> loaded;
+    auto const key = targetName + ":" + formatName;
+    auto it = loaded.find(key);
+    if (it == loaded.end()) {
+        auto target = dss::TargetSchema::loadShipped(targetName);
+        if (!target.has_value()) {
+            throw std::runtime_error("target document `" + targetName
+                                     + "` did not load");
+        }
+        auto format = dss::ObjectFormatSchema::loadShipped(formatName);
+        if (!format.has_value()) {
+            throw std::runtime_error("format document `" + formatName
+                                     + "` did not load");
+        }
+        Loaded l;
+        l.target = std::move(*target);
+        l.format = std::move(*format);
+        dss::DiagnosticReporter scratch;
+        auto abi = dss::ffi::resolveAbi(*l.target, *l.format, scratch);
+        l.cc = abi.has_value() ? abi->cc : nullptr;
+        it = loaded.emplace(key, std::move(l)).first;
+    }
+    return dss::ffi::HeaderReadPair{*it->second.target, *it->second.format,
+                                    it->second.cc};
+}
+
+[[nodiscard]] dss::ffi::HeaderReadPair elfPair() {
+    return pairOf("x86_64", "elf64-x86_64-linux-exec");
+}
+
+} // namespace
 
 namespace {
 
@@ -326,7 +380,7 @@ TEST(FfiIngest, ReadCHeaderDirectoryEnumeratesAlphabetical) {
             << "ignored\n";
     }
     DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", rep);
+    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rows.has_value()) << headerReadErrorKindName(rows.error().kind);
     ASSERT_EQ(rows->size(), 2u);
     // Alphabetical: stdio.h before stdlib.h.
@@ -336,7 +390,7 @@ TEST(FfiIngest, ReadCHeaderDirectoryEnumeratesAlphabetical) {
 
 TEST(FfiIngest, ReadCHeaderDirectoryRejectsNonDirectory) {
     DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory("/no/such/dir/here", "libc.so.6", rep);
+    auto rows = readCHeaderDirectory("/no/such/dir/here", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rows.has_value());
     EXPECT_EQ(rows.error().kind, HeaderReadErrorKind::FileOpenFailed);
 }
@@ -345,7 +399,7 @@ TEST(FfiIngest, ReadCHeaderDirectoryRejectsEmptyImportLibrary) {
     ScratchDir scratch{Location::Temp, "ff5-emptyLib"};
     auto const tmpDir = scratch.path();
     DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory(tmpDir, "", rep);
+    auto rows = readCHeaderDirectory(tmpDir, "", elfPair(), rep);
     ASSERT_FALSE(rows.has_value());
     EXPECT_EQ(rows.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
 }
@@ -509,7 +563,7 @@ TEST(FfiIngest, ReadCHeaderDirectoryPartialFailureReturnsSurface) {
             << "this is not valid C at all @@@\n";
     }
     DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", rep);
+    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", elfPair(), rep);
     // Partial success: good.h's row reaches the surface; bad.h's
     // failure is in the reporter; readCHeaderDirectory returns
     // expected (not unexpected) because at least one file parsed.
@@ -534,7 +588,7 @@ TEST(FfiIngest, ReadCHeaderDirectoryAllFailuresPropagatesError) {
         std::ofstream{tmpDir / "bad2.h"} << "garbage 2 @@@\n";
     }
     DiagnosticReporter rep;
-    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", rep);
+    auto rows = readCHeaderDirectory(tmpDir, "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rows.has_value());
     EXPECT_EQ(rows.error().kind, HeaderReadErrorKind::HeaderParseFailed);
 }

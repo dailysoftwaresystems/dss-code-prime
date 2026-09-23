@@ -1,0 +1,36 @@
+{
+  "$comment": "★★ A `.s` THAT ENDS INSIDE AN UNTERMINATED `/*` ASSEMBLES AND RUNS, WITH gas's WARNING (P68 round 8, D-ASM-UNTERMINATED-BLOCK-COMMENT-AT-END-OF-FILE-REFUSED). ✔MEASURED 2026-09-23: GNU as 2.42 assembles such a file (the comment opened on the SAME line as the final `ret`, no newline at the end), warning 'end of file in comment', and the program returns 42; clang 18.1.3 refuses it ('unterminated comment'). The references split on ACCEPTANCE, so the union accepts; the WARNING is gas's, and it is kept because a missing `*/` silently swallowing the rest of a file must not be silent. DSS refused it with `P_UnterminatedComment`. The dialect's `block-comment` mode now declares `atEndOfInput: closesWithWarning`: the comment closes at the end of the input with `P_ClosedByEndOfInput` at its OPENER, and only then does the implied end-of-input newline (`endOfInputImplies`) terminate the `ret` line, which is the order gas uses. The swallowed lines are load-bearing: a comment closed anywhere earlier would expose a second `main:`. ★ RED-ON-DISABLE: set `atEndOfInput` back to its default and the example is refused again; drop `endOfInputImplies` and the `ret` line has no terminator. The `release` arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "expectWarnings": [
+    {
+      "code": "P_ClosedByEndOfInput",
+      "line": 17,
+      "col": 6,
+      "$comment": "the `/*` opener on the `ret` line; the comment runs to the end of the input"
+    }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

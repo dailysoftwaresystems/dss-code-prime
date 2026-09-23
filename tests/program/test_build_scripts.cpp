@@ -79,10 +79,10 @@
 //      `add_executable` fixture would need a `$<TARGET_FILE:…>` compile
 //      definition, an `add_dependencies` edge (nothing links it, so a fresh
 //      `ctest` could otherwise run against a fixture that was never built), and
-//      a row in BOTH `scripts/check-orphan-tests/check-orphan-tests.sh` and its `.ps1` twin — whose
-//      allowlist is machine-checked and must stay byte-identical between them.
-//      That is three cross-cutting files to keep in sync for a program whose
-//      entire job is to write down its argv.
+//      a row in `.harness-config/runner/actions/check-orphan-tests/allowlist.json`, whose
+//      rows are machine-checked (a stale row reds the guard). That is three
+//      cross-cutting edits to keep in step for a program whose entire job is to
+//      write down its argv.
 //   3. THE PATH IS EXACT. `argv[0]`, made absolute, is the real executable for
 //      this build tree — no search heuristic and no chance of picking up a
 //      stale binary from another one.

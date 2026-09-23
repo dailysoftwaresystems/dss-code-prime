@@ -1,0 +1,14 @@
+# PURPOSE: refuse a new `path:line` citation in the plans -- a citation names a stable reference, never a line number.
+name: check-plan-citations
+description: >-
+  The action holds positional citations to their ratchet, then proves every refusal can fire.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `plan_citations_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-plan-citations.py
+    successPattern: 'plan-citations: self-test OK'
+    requireInputsUnmoved: true

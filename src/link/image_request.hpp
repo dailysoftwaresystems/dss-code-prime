@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Per-PROGRAM image requests — knobs the PROGRAM BEING BUILT asks of the
 // emitted image, as opposed to the defaults its object format DECLARES in
@@ -30,7 +31,9 @@
 // never tests a format identity.
 //
 // Sources + precedence (resolved in `Program`, before this struct is built):
-// the CLI flag WINS over the project manifest key when both are present.
+// for a SCALAR (the stack reserve) the CLI flag WINS over the project manifest
+// key when both are present; a LIST (the runpaths) ACCUMULATES, the manifest's
+// entries first and then the CLI's, as repeated `-rpath` does.
 
 namespace dss {
 
@@ -70,13 +73,31 @@ struct DSS_EXPORT ImageRequest {
     // walker refuses loud by name.
     std::string artifactFileName;
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH ──
+    //
+    // The directories this image asks its loader to search for the libraries it
+    // needs, in the order given — CLI `--rpath` entries (gcc's literal
+    // semantics) and project-manifest `runpaths` (the portable rule), merged by
+    // `Program` (the manifest's first, then the CLI's: a list accumulates, as
+    // repeated `-rpath` does). A leading `${ORIGIN}` is still the portable token
+    // here; the WRITER spells it for its format (`recordedRunpaths`,
+    // link/runpath.hpp) and drops exact duplicates.
+    //
+    // ★ A REQUEST, AND ACCEPTED WHERE NOTHING CAN CARRY IT. Unlike the stack
+    // reserve, a format that declares no `runpath` does not refuse: both PE
+    // references accept an rpath request and emit nothing (measured), so the
+    // image is written without it and `reportUnrecordedRunpaths` says so in a
+    // WARNING. What the gate DOES refuse is an entry no carrier can hold
+    // (`runpathEntryRefusal`: empty, or holding a NUL byte).
+    std::vector<std::string> runpaths;
+
     // True iff this request asks for anything at all. Lets a caller skip the
     // whole gate cheaply, and keeps the "did the user request something?"
     // question in ONE place as fields are added.
     // ⚠ `artifactFileName` is NOT consulted — see its docblock: it is a fact
     // the driver supplies unconditionally, not a request a format could refuse.
     [[nodiscard]] bool empty() const noexcept {
-        return !stackReserveBytes.has_value();
+        return !stackReserveBytes.has_value() && runpaths.empty();
     }
 };
 
@@ -108,5 +129,48 @@ enforceImageRequest(ImageRequest const&       request,
                     ObjectFormatSchema const& format,
                     std::string_view          contextLabel,
                     DiagnosticReporter&       reporter);
+
+// ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the request that is ACCEPTED and
+//    recorded nowhere, said out loud ──────────────────────────────────────
+//
+// Emits ONE `K_FormatLacksRunpath` WARNING when `request` asks for runpaths and
+// `format` declares no runpath carrier — a PE image (whose loader searches the
+// application directory instead), a relocatable object, an archive. Returns
+// whether it warned. Nothing is refused: the measured references accept such
+// a request and emit nothing, and so does DSS; the warning is what keeps a
+// request that had no effect VISIBLE (it stays suppressible).
+//
+// ★ A SEPARATE FUNCTION FROM `enforceImageRequest`, AND THAT IS LOAD-BEARING.
+// `enforceImageRequest` is called by the linker gate AND again by walkers that
+// are public entry points (`pe::encode`), and it may be called twice on one
+// path only because on success it is a pure predicate. A warning inside it
+// would be reported twice for every PE image. This one is called exactly once
+// per emitted ARTIFACT: by `linker::link` after its gate passes, and by the
+// static-archive route once for the whole archive (whose member links are then
+// handed a request without runpaths, so N members do not warn N times).
+DSS_EXPORT bool
+reportUnrecordedRunpaths(ImageRequest const&       request,
+                         ObjectFormatSchema const& format,
+                         std::string_view          contextLabel,
+                         DiagnosticReporter&       reporter);
+
+// ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: what a WRITER records ─────────────
+//
+// The runpath entries THIS emission records, in the format's own spelling and
+// with exact duplicates dropped (`recordedRunpaths`), for a walker whose
+// carrier is `walkerCarrier`. EMPTY when the request asks for none or the
+// format declares no carrier (the gate has already warned for that). NULLOPT
+// after exactly ONE fail-loud `K_NoMatchingObjectFormat` when the format's
+// declaration cannot be written by this walker — its values fail the one rule
+// set (`runpathDeclarationProblems`), or it names another walker's carrier.
+// That second arm is a BELT: the loader refuses both at load, but a schema
+// built in memory never passes the loader, and a writer must not accept a
+// declaration and then record something else.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+runpathsToRecord(ImageRequest const&       request,
+                 ObjectFormatSchema const& format,
+                 RunpathCarrier            walkerCarrier,
+                 std::string_view          contextLabel,
+                 DiagnosticReporter&       reporter);
 
 } // namespace dss

@@ -1,0 +1,13 @@
+# PURPOSE: re-derive the prioritized burndown queue from the registry, production errors first.
+name: burndown-queue
+description: >-
+  The action re-derives the prioritized queue's band census from the registry (its self-test runs first).
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+steps:
+  - name: counts
+    workingDirectoryRoot: action
+    run: |
+      python3 ./burndown-queue.py --counts
+    successPattern: 'burndown-queue: \d+ OPEN row\(s\)'
+    requireInputsUnmoved: true

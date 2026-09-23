@@ -4,7 +4,7 @@
 
 This skill is **client-parameterised**. The client is the real-world corpus under test.
 
-- **Today the only implemented client is `sqlite`** (`real-examples/c/sqlite/`).
+- **Today the only implemented client is `sqlite`** (`.harness-config/runner/actions/real-examples/c/sqlite/`).
 - **If the invocation does not name a client, STOP AND ASK.** Do not default to sqlite —
   the whole point of the parameter is that more clients are coming, and silently picking
   one produces a verdict labelled with the wrong subject.
@@ -15,9 +15,9 @@ A client must supply, at minimum:
 
 | the client provides | sqlite's answer |
 |---|---|
-| a driver pair (one per host family) | `build-and-test.sh` + `build-and-test.ps1` |
+| a driver that runs on every host | `build_and_test.py` |
 | a leg catalogue | `legs.json` |
-| a shared resolver both drivers hard-require | `harness_legs.py` |
+| a resolver the driver hard-requires | `harness_legs.py` |
 | a **CLI** artifact + a smoke gate | `sqlite3` + a 14-assertion smoke |
 | a **UNITS** corpus + a tier | `testfixture` + `veryquick` |
 | a **reference/oracle** build for attribution | gcc-built `reference-testfixture` / `reference-sqlite3` |
@@ -62,8 +62,8 @@ delegated build agent reliably yields mid-build and leaves an orphaned job. Driv
 foreground-blocking or via a harness-tracked background command that re-invokes you on exit.
 
 ```bash
-# Linux/WSL, macOS, VPS
-DSS_TIER=veryquick DSS_CONFIG=release bash ./build-and-test.sh
+# every host (Windows, Linux/WSL, macOS, VPS), from the action's own directory
+DSS_TIER=veryquick DSS_CONFIG=release python3 ./build_and_test.py
 ```
 
 ## 4. Adjudicating the result

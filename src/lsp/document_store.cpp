@@ -39,7 +39,7 @@ void DocumentStore::open(std::string uri,
     entry.schema          = std::move(schema);
     entry.schemaError     = std::move(schemaError);
     enforceSchemaReasonLocked_(entry);
-    entry.diagnostics.clear();
+    entry.analyses.clear();
 }
 
 bool DocumentStore::setSchema(std::string const& uri,
@@ -108,44 +108,23 @@ DocumentStore::snapshot(std::string const& uri) const {
     };
 }
 
-bool DocumentStore::setDiagnostics(std::string const& uri,
-                                    std::uint32_t expectedGen,
-                                    std::vector<dss::ParseDiagnostic> diags) {
+bool DocumentStore::setAnalyses(std::string const& uri,
+                                std::uint32_t expectedGen,
+                                std::vector<DocumentAnalysis> analyses) {
     std::lock_guard lk{mutex_};
     auto it = docs_.find(uri);
     if (it == docs_.end()) return false;
     if (it->second.parseGeneration != expectedGen) return false;
-    it->second.diagnostics = std::move(diags);
+    it->second.analyses = std::move(analyses);
     return true;
 }
 
-std::vector<dss::ParseDiagnostic>
-DocumentStore::diagnosticsFor(std::string const& uri) const {
+std::vector<DocumentAnalysis>
+DocumentStore::analysesFor(std::string const& uri) const {
     std::lock_guard lk{mutex_};
     auto it = docs_.find(uri);
     if (it == docs_.end()) return {};
-    return it->second.diagnostics;
-}
-
-bool DocumentStore::setSemanticModel(
-    std::string const& uri,
-    std::uint32_t expectedGen,
-    std::shared_ptr<dss::SemanticModel const> model) {
-    std::lock_guard lk{mutex_};
-    auto it = docs_.find(uri);
-    if (it == docs_.end()) return false;
-    if (it->second.parseGeneration != expectedGen) return false;
-    it->second.semanticModel      = std::move(model);
-    it->second.semanticGeneration = expectedGen;
-    return true;
-}
-
-std::shared_ptr<dss::SemanticModel const>
-DocumentStore::semanticModelFor(std::string const& uri) const {
-    std::lock_guard lk{mutex_};
-    auto it = docs_.find(uri);
-    if (it == docs_.end()) return nullptr;
-    return it->second.semanticModel;
+    return it->second.analyses;
 }
 
 } // namespace dss::lsp

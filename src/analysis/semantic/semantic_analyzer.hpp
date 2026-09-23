@@ -6,7 +6,7 @@
 #include "core/export.hpp"
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
-#include "core/types/object_format_kind.hpp"   // ObjectFormatKind (per-target availability gate)
+#include "core/types/object_format_kind.hpp"   // SelectableObjectFormatKind (per-target availability gate)
 
 #include <cstddef>
 #include <memory>
@@ -82,7 +82,13 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // availability (a POSIX `<sys/time.h>` is unavailable for windows-pe).
         // `nullopt` (direct-API / LSP / test callers) ⇒ NO availability gate (every
         // recorded descriptor is read, as before). (D-SHIPPED-HEADER-PER-TARGET-AVAILABILITY)
-        std::optional<ObjectFormatKind> activeFormat = std::nullopt,
+        // ★ TYPED SO "NO FORMAT" HAS ONE SPELLING: a `SelectableObjectFormatKind`
+        // cannot be the `Unknown` sentinel, so an engaged sentinel — which one
+        // analysis used to read as "no format" at the literal-prefix resolver and
+        // as a REAL format at this availability gate — does not compile here
+        // ([[D-SEMANTIC-ANALYZE-ACTIVE-FORMAT-ADMITS-THE-UNKNOWN-SENTINEL]]). A caller
+        // holding a bare kind spells `SelectableObjectFormatKind::of(kind)`.
+        std::optional<SelectableObjectFormatKind> activeFormat = std::nullopt,
         // Plan 25: the active target's ARCH NAME (`target.name()`) — the per-target
         // shipped-struct `variants` selector ((arch, format) selects a struct's
         // field list so its byte layout is correct per target). `nullopt`

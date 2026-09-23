@@ -103,6 +103,48 @@ dss_add_test(NAME asm/test_asm_cfi_producer
 target_link_libraries(dss_asm_test_asm_cfi_producer
     PRIVATE nlohmann_json::nlohmann_json)
 
+# The ONE numeric-local-label resolver (`asm/asm_local_labels.hpp`) that a `.s`
+# and an inline-asm template both ask — pinned once, on its own
+# (D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED).
+dss_add_test(NAME asm/test_asm_local_labels
+             SOURCES test_asm_local_labels.cpp)
+
+# Numeric labels, template labels and the template text forms through the
+# SHIPPED dialects and targets — the refusals, the shipped declarations and the
+# loader's refusal of every half-declaration. ⚠ CONFIG-LEVEL (it reads and
+# mutates the shipped `.lang.json` / `.target.json`), so it MUST run through
+# ctest, which points DSS_CONFIG_ROOT at the run's config snapshot.
+dss_add_test(NAME asm/test_asm_numeric_labels_and_forms
+             SOURCES test_asm_numeric_labels_and_forms.cpp)
+target_link_libraries(dss_asm_test_asm_numeric_labels_and_forms
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_numeric_labels_and_forms
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# arm64's exclusive pair (`ldaxr` / `stlxr`) written in assembly text, and the
+# target's `resultEarlyClobber` that refuses the UNPREDICTABLE overlap at every
+# tier — the builder's early mark, the text lowering and the encoder backstop.
+# ⚠ CONFIG-LEVEL, as above.
+dss_add_test(NAME asm/test_asm_arm64_exclusive_pair
+             SOURCES test_asm_arm64_exclusive_pair.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_exclusive_pair
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_exclusive_pair
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# The `.s` walker's BLOCK PLAN: every block of a function created in TEXT order,
+# the conditional branch's false edge laid out next, and a line after a
+# terminator given a block where the text put it
+# (D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END,
+# D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED). ⚠ CONFIG-LEVEL, as above; it
+# also reads the numeric-local-labels corpus sources.
+dss_add_test(NAME asm/test_asm_block_plan
+             SOURCES test_asm_block_plan.cpp)
+target_link_libraries(dss_asm_test_asm_block_plan
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_block_plan
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
 # Tests under tests/asm/ share `asm_test_support.hpp` via this
 # include path. test_asm_substrate additionally reuses the LIR
 # lowering fixture (lowered_lir_fixture.hpp lives in tests/lir/).
@@ -391,3 +433,19 @@ dss_add_test(NAME asm/test_static_data_diagnostic_codes
 # branch edge means emitting ~1 MiB of code, three times.
 dss_add_test(NAME asm/test_asm_long_branch
              SOURCES test_asm_long_branch.cpp)
+
+# P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS,
+# D-ASM-DOTTED-LABEL-AS-A-BRANCH-TARGET-REFUSED): every spelling GNU as and
+# clang accept that the shipped dialects refused at the part-3 base — literal
+# xmm names, the cross-bank movq/movd, movapd, the test family, setcc, the
+# unsuffixed AT&T spellings and gas's unstated-width default with its warning,
+# dotted labels as branch targets, the aarch64 W-form add/sub immediates,
+# cbz/cbnz, and an operand placeholder as a memory base or index — each through
+# the SHIPPED dialect and target to bytes, each widening beside its refusal
+# control. Reads the shipped documents, so it must run through ctest.
+dss_add_test(NAME asm/test_asm_reference_accepted_spellings
+             SOURCES test_asm_reference_accepted_spellings.cpp)
+target_link_libraries(dss_asm_test_asm_reference_accepted_spellings
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_reference_accepted_spellings
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

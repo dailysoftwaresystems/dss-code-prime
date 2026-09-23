@@ -30,10 +30,17 @@
 
 namespace dss {
 
-// C23 6.2.5: __BITINT_MAXWIDTH__ — the maximum admissible `_BitInt` width (the
-// same 8388608 the predefined macro + the `_BitInt(N)` specifier resolver carry;
-// the three encode ONE ABI constant). A wb/uwb literal whose magnitude-derived N
-// exceeds this is a constraint violation the typing call sites raise fail-loud.
+// C23 6.2.5: __BITINT_MAXWIDTH__ — the maximum admissible `_BitInt` width, and
+// the ONE owner of that number. The `_BitInt(N)` specifier resolver, the wb/uwb
+// literal typing, both text tiers and the static-data encoder's `_BitInt`
+// normalizer read it here; the predefined macro `__BITINT_MAXWIDTH__` is DERIVED
+// from it
+// (`c.lang.json` names the limit through the `model-limit` kind and the loader
+// writes this value — P68 round 8,
+// D-C-BITINT-MAXWIDTH-MACRO-RESTATES-THE-MODEL-BOUND), so the macro a program
+// reads and the width the compiler enforces cannot disagree. A wb/uwb literal
+// whose magnitude-derived N exceeds this is a constraint violation the typing
+// call sites raise fail-loud.
 inline constexpr std::uint32_t kBitIntMaxWidth = 8388608u;
 
 // ══ D-CSUBSET-BITINT-PADDING-POLICY-HAS-THREE-OWNERS ═════════════════════════

@@ -1907,6 +1907,14 @@ LinkedImage link(std::span<AssembledModule const> modules,
         image.resolvedFuncCount = 0;
         return image;
     }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a runpath request against a format
+    // that records none is ACCEPTED (both PE references accept it and emit
+    // nothing) — and said, once, here: this is the one call every
+    // compile-driven emission of one artifact makes. The archive route calls
+    // this link once per MEMBER, so it reports for the whole archive itself
+    // and hands the members a request without runpaths.
+    (void)reportUnrecordedRunpaths(request, objectFormatSchema, "linker",
+                                   reporter);
 
     // D-LK4-3 — N==0 is a caller error; N>1 (cross-CU) builds the collision-proof
     // compound-key index + validates each CU, then fail-louds: the multi-CU image
@@ -2355,7 +2363,8 @@ LinkedImage link(std::span<AssembledModule const> modules,
             moduleCopy = inputModule;
             moduleP    = &moduleCopy;
         }
-        if (!injectBranchVeneers(moduleCopy, targetSchema, stubLayout, reporter)) {
+        if (!injectBranchVeneers(moduleCopy, targetSchema, objectFormatSchema,
+                                 stubLayout, reporter)) {
             image.resolvedFuncCount = 0;
             return image;
         }

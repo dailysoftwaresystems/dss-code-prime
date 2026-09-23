@@ -14,7 +14,9 @@
 //
 // Target-blind: the analysis depends only on the LIR module's CFG +
 // per-instruction operand shape (Reg-kind operand → use; result vreg
-// → def). It never inspects opcode semantics, mnemonics, or
+// → def — and on an inline-asm bundle, each operand's ROLE, read through
+// `lirForEachInstUse` / `lirForEachInstDef`). It never inspects opcode
+// semantics, mnemonics, or
 // `TargetSchema`. Source-language-blind: input is LIR; the analysis
 // never touches MIR/HIR types.
 //
@@ -185,8 +187,9 @@ struct DSS_EXPORT LirLiveness {
 // Run liveness analysis over every function in `lir`. The caller owns
 // `lir`; the analysis returns a freshly-allocated result. No
 // `TargetSchema` parameter: def/use derivation is target-blind (def =
-// `instResult(id).valid() && !isPhysical`; use = Reg-kind operand
-// with a valid non-physical reg).
+// every non-physical register `lirForEachInstDef` names — the result, plus a
+// bundle's writing operands; use = every non-physical register
+// `lirForEachInstUse` names).
 [[nodiscard]] DSS_EXPORT LirLiveness
 analyzeLiveness(Lir const& lir);
 

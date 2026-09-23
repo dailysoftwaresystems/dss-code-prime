@@ -2640,6 +2640,14 @@ TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
 // RED-ON-DISABLE: delete the `predefinedMacros` key from any single LP64
 // `.format.json` (its leg reds), or add it to any pe64/wasm/spirv file (that leg
 // reds). MEASURED both ways during TF-C97.
+//
+// ⓘ P68 round 8: for part of that round each format that realizes `long
+// double` also carried a `__SIZEOF_LONG_DOUBLE__` constant, and this test
+// peeled it off before the data-model checks. That row is GONE — the size is
+// now the C language's `type-size` row, derived per pair from the type
+// (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) — so the format documents are
+// back to carrying the data model alone, and "a pe64 file has no rows" is
+// again the LLP64 negative, checked below unchanged from TF-C97.
 TEST(FormatPredefinedMacros, ShippedPopulationFollowsDataModelNotFormatName) {
     constexpr std::string_view kAll[] = {
         "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",

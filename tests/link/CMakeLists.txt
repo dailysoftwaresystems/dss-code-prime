@@ -712,3 +712,12 @@ target_link_libraries(dss_link_test_elf_static_va_chain_document_boundaries
 # exactly that instead of skipping.
 dss_add_test(NAME link/test_link_writer_commit_holder
              SOURCES test_link_writer_commit_holder.cpp)
+
+# D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpath vocabulary (the gate, portable
+# and translation rules), the format declarations and the loader's refusals over
+# them — each refusal spliced into the SHIPPED document, hence the json link —
+# and the request gate's refuse/warn split. The bytes each writer records are
+# pinned through the real driver in tests/program/test_image_runpath_build.cpp.
+dss_add_test(NAME link/test_image_runpath SOURCES test_image_runpath.cpp)
+target_link_libraries(dss_link_test_image_runpath
+                      PRIVATE nlohmann_json::nlohmann_json)

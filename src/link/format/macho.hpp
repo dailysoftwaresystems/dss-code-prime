@@ -88,7 +88,10 @@ requestsCodeSignature(MachOImage const& im) noexcept {
 // placeholder. It DEFAULTS to `{}` so every existing direct caller compiles
 // unchanged; a caller that omits it while the schema's identity names the
 // artifact is REFUSED loud (`K_WalkerInputContractViolation`) rather than
-// given a fabricated identity — see `resolveArtifactIdentity`.
+// given a fabricated identity — see `resolveArtifactIdentity`. It also carries
+// the RUNPATHS the dynamic writer records as one LC_RPATH per path under the
+// format's declared `runpath` (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH), and this
+// entry point runs `enforceImageRequest` itself, the `pe::encode` precedent.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,

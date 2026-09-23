@@ -146,6 +146,24 @@ struct ElectedDestination {
     // destination, or a non-producer), which is exactly the state `regClass ==
     // None` above already describes.
     std::optional<std::uint16_t> regOrdinal;
+    // ★ THE DESTINATION WAS WRITTEN AS **ONE ELEMENT** (`ins v0.d[1], x1`,
+    // P68 round 8). No result field reads an element — writing one lane keeps
+    // the others, which is a two-address form whose operand-0 WIRE states the
+    // element — so a variant with a `resultSlot` refuses such a destination.
+    bool element = false;
+};
+
+// ★★ HOW AN OPERAND WAS WRITTEN BEYOND ITS LANES — P68 round 8,
+// D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS. An ELEMENT (`v1.d[1]`)
+// reaches LIR as two operands, the register and then its index, and each is
+// marked so that neither can be taken for what it is not: the register only by
+// a field declaring `elementBits` at its width, the index only by an
+// `imm5.element` field. `Plain` is every other operand, and the strict reading
+// — a field declaring either refuses it.
+enum class ElectedOperandForm : std::uint8_t {
+    Plain        = 0,
+    Element      = 1,
+    ElementIndex = 2,
 };
 
 // ★★★ THE OPERANDS AN ELECTION IS ASKED ABOUT, AND THE LANE ARRANGEMENT EACH
@@ -169,9 +187,16 @@ struct ElectedDestination {
 struct ElectedOperands {
     std::span<LirOperand const>   ops;
     std::span<std::uint8_t const> laneBits;
+    // P68 round 8: each operand's `ElectedOperandForm`; empty or short reads
+    // `Plain`, which a field declaring an element or an element index refuses.
+    std::span<std::uint8_t const> forms = {};
 
     [[nodiscard]] std::uint8_t laneOf(std::size_t i) const noexcept {
         return i < laneBits.size() ? laneBits[i] : std::uint8_t{0};
+    }
+    [[nodiscard]] ElectedOperandForm formOf(std::size_t i) const noexcept {
+        return i < forms.size() ? static_cast<ElectedOperandForm>(forms[i])
+                                : ElectedOperandForm::Plain;
     }
 };
 
@@ -270,13 +295,43 @@ variantAcceptsRegisterProfile(TargetSchema const&          target,
                               ElectedOperands const&       instOps,
                               ElectedDestination const&    dest) noexcept {
     bool sawRequiredRole = v.requiresRegRole.empty();
+    // ★★ THE ELEMENT AXIS (P68 round 8): TOTAL, like the lane axis below. An
+    // operand written as an element or as an element's index must land on a
+    // field declared for exactly that — checked per OPERAND as well as per
+    // wire, because an operand no wire names would otherwise escape the check.
+    for (std::size_t i = 0; i < instOps.ops.size(); ++i) {
+        auto const form = instOps.formOf(i);
+        if (form == ElectedOperandForm::Plain) continue;
+        bool taken = false;
+        for (auto const& w : v.wires) {
+            if (w.index != i) continue;
+            taken = taken
+                || (form == ElectedOperandForm::Element && w.elementBits != 0)
+                || (form == ElectedOperandForm::ElementIndex
+                    && w.slotKind == EncodingSlotKind::ElementIndex);
+        }
+        if (!taken) return false;
+    }
     for (auto const& w : v.wires) {
         if (w.index >= instOps.ops.size()) continue;
+        auto const form = instOps.formOf(w.index);
+        if ((w.slotKind == EncodingSlotKind::ElementIndex)
+            != (form == ElectedOperandForm::ElementIndex)) {
+            return false;
+        }
         auto const& op = instOps.ops[w.index];
         if (op.kind != LirOperandKind::Reg) continue;
         auto const written = instOps.laneOf(w.index);
-        if (w.lanes != (written != 0)) return false;
-        if (w.lanes && w.laneBits != 0 && w.laneBits != written) return false;
+        bool const isElement = form == ElectedOperandForm::Element;
+        if ((w.elementBits != 0) != isElement) return false;
+        if (isElement) {
+            if (w.elementBits != written) return false;
+        } else {
+            if (w.lanes != (written != 0)) return false;
+            if (w.lanes && w.laneBits != 0 && w.laneBits != written) {
+                return false;
+            }
+        }
         // ⚠ ONLY A **PHYSICAL** REGISTER HAS A ROLE, and the guard is not
         // defensive: a pre-regalloc `LirReg` numbers a VIRTUAL register in its
         // own space, so `id` would index the target's register table by
@@ -313,6 +368,9 @@ variantAcceptsRegisterProfile(TargetSchema const&          target,
     // early-out is the same one `destWidth` and `destLanes` below sit behind,
     // and for the same reason.
     if (!v.resultSlot.has_value()) return sawRequiredRole;
+    // A result field writes a whole register; an ELEMENT destination is written
+    // by a two-address form, never through here (P68 round 8).
+    if (dest.element) return false;
     if (dest.regOrdinal.has_value()) {
         if (!target.registerFitsFieldRole(*dest.regOrdinal, v.resultRegRole)) {
             return false;

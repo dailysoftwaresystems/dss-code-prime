@@ -672,7 +672,7 @@ void MirBuilder::beginBlock(MirBlockId block) {
                      block.v);
         std::abort();
     }
-    if (blockArena_.at(block).func != openFunc_.v) {
+    if (!isBlockOfOpenFunction(block)) {
         std::fprintf(stderr,
                      "dss::MirBuilder fatal: beginBlock: MirBlockId=%u belongs to function %u, "
                      "not the open function %u\n",
@@ -765,7 +765,7 @@ void MirBuilder::recordSuccessors_(MirOpcode terminator, std::span<MirBlockId co
         // may be a forward-created block not yet filled — it still exists in the
         // arena with the right `func`). Catches cross-function / dangling targets
         // at the terminator, not hundreds of lines later in a backend pass.
-        if (blockArena_.at(s).func != openFunc_.v) {
+        if (!isBlockOfOpenFunction(s)) {
             std::fprintf(stderr,
                          "dss::MirBuilder fatal: branch target MirBlockId=%u belongs to function "
                          "%u, not the open function %u\n",
@@ -1216,10 +1216,23 @@ MirInstId MirBuilder::addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags f
 MirInstId MirBuilder::addBlockAddress(MirBlockId target, TypeId type, MirInstFlags flags) {
     // D-CSUBSET-COMPUTED-GOTO: `&&label` materialized as a value. Leaf value-origin
     // (mirror addGlobalAddr); payload = the target block id (the block whose address
-    // is taken). `target` may be a FORWARD reference (a later block id created in
-    // phase 1), so we do NOT require it to exist yet — only same-module.
+    // is taken). `target` may be a FORWARD reference — a block already CREATED
+    // (phase 1) but not yet filled — so it need not be filled yet; it must exist,
+    // in the open function (below).
     if (!type.valid()) requireValueType_("addBlockAddress");
     checkSameModule_(target.arenaTag, "block-address target");
+    // ✔MEASURED P68 (lane `ht`), x86_64 and arm64: a block address naming ANOTHER
+    // function's block passed this builder and the verifier, then `mir_to_lir`
+    // refused it ("has no LIR block mapping") — it maps blocks per function. No
+    // producer makes one: every call site re-maps into the function being built.
+    if (!isBlockOfOpenFunction(target)) {
+        std::fprintf(stderr,
+                     "dss::MirBuilder fatal: addBlockAddress: target MirBlockId=%u is not a "
+                     "block of the open function %u — a block address is lowered inside "
+                     "its own function\n",
+                     target.v, openFunc_.v);
+        std::abort();
+    }
     detail::MirInst pod;
     pod.opcode  = MirOpcode::BlockAddress;
     pod.flags   = flags;
@@ -1493,6 +1506,15 @@ bool MirBuilder::isBlockUnopened(MirBlockId block) const noexcept {
     // OOB-read; the next `beginBlock`/`at` call surfaces it loudly.
     if (!block.valid() || block.v >= blockState_.size()) return false;
     return blockState_[block.v] == BlockState::Created;
+}
+
+bool MirBuilder::isBlockOfOpenFunction(MirBlockId block) const noexcept {
+    // The same bounds and provenance `blockArena_.at` enforces, answered instead
+    // of aborted on: an untagged id (arenaTag 0) passes, as `checkSameModule_`
+    // lets it.
+    if (!openFunc_.valid() || !block.valid() || block.v >= blockArena_.size()) return false;
+    if (block.arenaTag != 0 && block.arenaTag != moduleId_.v) return false;
+    return blockArena_.at(block).func == openFunc_.v;
 }
 
 Mir MirBuilder::finish() && {

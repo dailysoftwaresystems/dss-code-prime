@@ -1,0 +1,14 @@
+# PURPOSE: refuse an action that no index documents, an index entry that no action backs, and an action no runner can start.
+name: check-scripts-index
+description: >-
+  The action verifies both action indexes and every runner against the tree, then proves each refusal can fire.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `scripts_index_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-scripts-index.py
+    successPattern: 'scripts-index: self-test OK'
+    requireInputsUnmoved: true

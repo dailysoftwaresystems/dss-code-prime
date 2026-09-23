@@ -26,7 +26,7 @@
 // ★★★ WHY THIS PIN COUNTS OPERATIONS AND DOES NOT TIME THE CLOCK.
 // A wall-clock performance assertion is sized on the machine that wrote it and reds
 // on the slowest leg that runs it, NAMING THE WRONG EVENT —
-// `scripts/check-wall-clock-in-tests/` refuses new ones for exactly that reason.
+// `.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones for exactly that reason.
 // What is asserted here is `SemanticModel::exprType{Queries,NodeVisits}`: THE
 // ALGORITHM'S OWN WORK. Those numbers are deterministic, host-independent,
 // load-independent and identical in Debug and Release, so a statement about them is a

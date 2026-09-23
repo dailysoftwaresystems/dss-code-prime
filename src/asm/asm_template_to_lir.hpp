@@ -219,6 +219,20 @@ struct DSS_EXPORT AsmDecodedOperand {
     // that produces a register operand sets it, and the election treats it as a
     // value rather than skipping the comparison.
     std::uint32_t  regLaneBits  = 0;
+    // ★ Does this register's NAME state the operation width? — relayed from
+    // `AsmResolvedRegister::nameStatesWidth`. False only for a physical
+    // register whose target row declares `nameStatesNoWidth`; such an operand
+    // abstains in every width reconciliation below and in the destination
+    // profile the election routes on, and keeps `regWidthBits` for everything
+    // else.
+    bool           regStatesWidth = true;
+    // ★ ONE ELEMENT OF THE REGISTER WAS WRITTEN (`v1.d[1]`, `%1.s[3]` — P68
+    // round 8): `regLaneBits` is then the element's width and `elementIndex`
+    // its index, and the operand reaches LIR as the register followed by the
+    // index. An element states no operation width (`regStatesWidth` false):
+    // its size is carried by the opcode the election picks.
+    bool           regIsElement = false;
+    std::uint32_t  elementIndex = 0;
     std::string    regSpelling;   // as written, for the width diagnostic
     // Immediate / displaced-scalar role: the literal value, when the scalar
     // was a NUMBER. `symbol` is set instead when it was a name.
@@ -288,6 +302,14 @@ struct DSS_EXPORT AsmResolvedRegister {
     // to declare precisely so this is never empty. Points into the schema,
     // which outlives every lowering.
     std::string_view bareSpellingAlternative;
+    // ★★ DOES `widthBits` ABOVE STATE THE OPERATION WIDTH? False for a register
+    // whose target row declares `nameStatesNoWidth` (x86 `%xmm5` — the name
+    // picks the container, the mnemonic states the width; P68 round 8,
+    // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). `widthBits` stays the
+    // register's own width; only the VOTE on the instruction's width is
+    // withheld. A caller-bound template operand always states its width: it is
+    // the C value's.
+    bool nameStatesWidth = true;
 };
 
 // The three answers a register lookup can give, and they are three rather than
@@ -504,9 +526,40 @@ public:
     openDataSectionName() const = 0;
     [[nodiscard]] virtual bool hasOpenFunction() const = 0;
     // Did the last emitted instruction terminate its block? An instruction
-    // after a terminator with no intervening label is unreachable.
+    // after a terminator with no intervening label begins a block of its own —
+    // see `openBlockAfterTerminator`.
     [[nodiscard]] virtual bool blockIsTerminated() const = 0;
     [[nodiscard]] virtual std::string_view enclosingFunctionName() const = 0;
+
+    // ── the blocks that begin WITHOUT a label (P68 round 8,
+    //    D-ASM-INSTRUCTION-AFTER-A-TERMINATOR-REFUSED and
+    //    D-ASM-CONDITIONAL-BRANCH-FALLTHROUGH-LAID-OUT-AT-THE-FUNCTION-END) ──
+    //
+    // ★ WHERE A BLOCK SITS IS THE HOST's QUESTION, because LIR's block order is
+    // its CREATION order and only the host knows the text around the
+    // instruction. The engine used to MINT a conditional branch's fall-through
+    // block itself, and a `.s` — which creates every label's block up front —
+    // then laid that code out after the function's LAST label: ✔MEASURED
+    // 2026-09-23, a 52-byte gas `main` became 139 bytes of detours.
+    //
+    // The block control reaches when the conditional branch `statement` falls
+    // through — the block the NEXT element of the text begins — and whether it
+    // is laid out immediately after the branch (then the target's shorter
+    // fall-through form applies). nullopt ⇒ the host reported why. The engine
+    // does NOT begin the block: the next element does.
+    struct Fallthrough {
+        LirBlockId block{};
+        bool       nextInLayout = false;
+    };
+    [[nodiscard]] virtual std::optional<Fallthrough>
+    fallthroughAfter(NodeId statement) = 0;
+
+    // An instruction follows a terminator with no label between them. Every
+    // reference assembler emits it where it stands (✔MEASURED, gas 2.42 and
+    // clang 18.1.3): it begins a block no fall-through reaches. The host opens
+    // that block — the conditional branch's promised fall-through when there is
+    // one. false ⇒ the host reported why.
+    [[nodiscard]] virtual bool openBlockAfterTerminator(NodeId statement) = 0;
 
     // `leaq foo,%rax` / `adr x0, Lcase1` — append the LIR operands that name
     // `symbol`'s ADDRESS. false ⇒ the host reported why.
@@ -545,9 +598,17 @@ public:
     // ── emit bookkeeping ──────────────────────────────────────────────────
     virtual void onInstructionEmitted() = 0;
     virtual void onTerminatorEmitted() = 0;
-    // The conditional branch's minted false edge: the host opens it and resets
-    // its own per-block counters.
+    // A block the host opened for the engine: reset the per-block counters.
     virtual void onBlockOpened(LirBlockId block) = 0;
+};
+
+// What one statement does to the BLOCK structure, read from its dialect row and
+// the target's control-flow class alone — the question a host asks BEFORE any
+// instruction is lowered, so it can create every block in text order.
+enum class AsmBlockEffect : std::uint8_t {
+    None,           // control continues to the next instruction
+    EndsBlock,      // an unconditional terminator (`jmp`, `ret`, `br x0`)
+    FallsThrough,   // a conditional branch: the next element is its false edge
 };
 
 // ── the engine ────────────────────────────────────────────────────────────
@@ -573,6 +634,14 @@ public:
     void lowerStatement(NodeId statement, NodeId mnemonicNode,
                         NodeId operandSeq);
 
+    // What the statement does to the block structure (see `AsmBlockEffect`),
+    // from the row it selects — no operand is decoded and nothing is emitted.
+    // A spelling no row selects is `None`: `lowerStatement` refuses it by name.
+    // ⚠ A row whose direct and indirect arms disagree about the effect cannot
+    // be planned before its operands are read, and is reported by name.
+    [[nodiscard]] AsmBlockEffect blockEffectOf(NodeId mnemonicNode,
+                                               NodeId operandSeq);
+
     [[nodiscard]] bool decodeOperandInto(NodeId node, AsmDecodedOperand& out);
 
 private:
@@ -597,11 +666,13 @@ private:
 // every placeholder would die at the parser, which is exactly the state this
 // function was added to end.
 //
-// ★ IT ALSO OWNS THE TRAILING NEWLINE. The dialect is line-oriented — the
+// ★ THE TRAILING NEWLINE IS THE DIALECT'S. The dialect is line-oriented — the
 // newline IS its statement terminator — so a template whose last line has no
-// `\n` would lose that line entirely. That is a property of the DIALECT
-// SURFACE, not of any particular caller, so it is applied here once rather
-// than remembered at every call site.
+// `\n` must still have that line terminated. That is a property of the DIALECT
+// SURFACE, not of any caller, and since P68 round 8 the dialect DECLARES it
+// (`endOfInputImplies`): the tokenizer reads the template as if it ended in the
+// declared lexeme, exactly as it reads a whole `.s`. This function used to
+// append its own `\n`; one rule now serves both.
 //
 // ★★★ WHICH OF THE TWO SURFACES A TEMPLATE IS READ ON, AND IT IS THE CALLER'S
 // FACT TO STATE — there is no default, because a wrong default is silent.
@@ -671,9 +742,11 @@ parseAsmTemplateText(std::string                          templateText,
 // placed beside the first would have forced every existing call site to be
 // rewritten in the same commit that introduced it.
 //
-// ⚠ THE BUILDER MUST ALREADY HAVE AN OPEN BLOCK. A template is emitted MID
-// FUNCTION, into the block the embedding language is filling; every instruction
-// lands there in source order.
+// ⚠ THE BUILDER MUST ALREADY HAVE AN OPEN BLOCK. A template is emitted into the
+// block its caller opened — since P68 round 8 the statement's own scratch body
+// (`mir_to_lir.cpp`, `packageAsmRegion`) — and its instructions land there in
+// source order, continuing into the blocks its own labels and conditional
+// branches open.
 //
 // Returns false with at least one diagnostic reported on any refusal.
 [[nodiscard]] DSS_EXPORT bool
@@ -683,6 +756,14 @@ lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                          std::span<AsmOperandBinding const> bindings,
                          LirBuilder&                        builder,
                          DiagnosticReporter&                reporter,
-                         std::span<AsmLabelBinding const>   labelBindings = {});
+                         std::span<AsmLabelBinding const>   labelBindings = {},
+                         // ★ THE TEMPLATE'S OWN LABELS (P68 round 8): every label
+                         // it defines is a block created in `builder` (in text
+                         // order, before the first instruction), and a line that
+                         // FALLS into one is written down as an explicit branch
+                         // the template did not write — its block is appended
+                         // here, for the caller to mark as synthetic. Null ⇒ the
+                         // caller keeps no such record.
+                         std::vector<LirBlockId>*           syntheticFallthroughs = nullptr);
 
 } // namespace dss

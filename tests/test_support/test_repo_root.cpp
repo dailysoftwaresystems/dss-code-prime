@@ -99,7 +99,7 @@ TEST(RepoRoot, ValidConfigOverrideIsHonoured) {
 // The per-run snapshot that ends the shipped-config exposure points
 // `$DSS_CONFIG_ROOT` at `<build>/dss-config-snapshot`, a root that holds
 // `src/dss-config` and `VERSION` and NOTHING ELSE. `repoRoot()` reaches
-// tests/corpus, tests/hir/lowering_goldens, examples/, scripts/, real-examples/
+// tests/corpus, tests/hir/lowering_goldens, examples/, .harness-config/runner/actions/
 // and src/ — so if the override relocated the checkout as well, every golden
 // file in the repository would resolve into a directory that does not have one.
 TEST(RepoRoot, ConfigOverrideDoesNotRelocateTheCheckout) {

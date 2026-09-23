@@ -15,6 +15,8 @@
 #include "core/types/config_path_walk.hpp"   // resolveSystemDirs — THE owner of the shippedLibDirs walk
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "core/types/target_schema.hpp"      // applyTargetFormatPair — the pair's TARGET half
+#include "link/object_format_schema.hpp"     // applyTargetFormatPair — the pair's FORMAT half
 #include "tokenizer/tokenizer.hpp"
 
 #include <algorithm>
@@ -391,7 +393,18 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
                                          // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]:
                                          // the target's plain-`char` sign, for
                                          // the `#if` ICE fold.
-                                         charIsUnsigned_);
+                                         charIsUnsigned_,
+                                         // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]:
+                                         // THIS build's include-tree view, so every
+                                         // file it preprocesses, and the resolvers
+                                         // after them, list each directory once.
+                                         &headerSearch_,
+                                         // P68 round 8: the pair's facts, so the
+                                         // language's `type-size` predefines
+                                         // (`__SIZEOF_LONG__` …) realize.
+                                         predefinedTypeFacts_.has_value()
+                                             ? &*predefinedTypeFacts_
+                                             : nullptr);
         phase.reset();
         auto remap = pp.makeRemap();
         // [[D-PP-REMAP-ORIGIN-OFFSET-UNVALIDATED]]: the DIAGNOSTIC-shaped
@@ -657,7 +670,47 @@ void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
     if (finished_) {
         cuFatal("UnitBuilder::setActiveFormat called after finish()");
     }
+    // See the header: the sentinel is not a format, and "no format" is spelled by
+    // not calling this at all.
+    if (!isSelectableObjectFormatKind(fmt)) {
+        cuFatal("UnitBuilder::setActiveFormat was handed ObjectFormatKind::Unknown, "
+                "the invalid sentinel — it names no object format; a build with no "
+                "format leaves the setting unset");
+    }
     activeFormat_ = fmt;
+}
+
+// See the header. Every value is read from the pair's own documents through the
+// accessor its owner publishes — no kind, target or format NAME is compared
+// here, so the function is as agnostic as the five setters it replaces.
+void applyTargetFormatPair(UnitBuilder&              builder,
+                           TargetSchema const&       target,
+                           ObjectFormatSchema const& format) {
+    ObjectFormatKind const kind = format.kind();
+    builder.setActiveFormat(kind);
+    builder.setHeaderNameMatching(format.headerNameMatching());
+    builder.setCharIsUnsigned(target.charIsUnsigned(kind));
+    auto const targetMacros = target.predefinedMacros();
+    builder.setTargetPredefinedMacros({targetMacros.begin(), targetMacros.end()});
+    auto const formatMacros = format.predefinedMacros();
+    builder.setFormatPredefinedMacros({formatMacros.begin(), formatMacros.end()});
+    builder.setPredefinedTypeFacts(predefinedTypeFactsFor(target, format));
+}
+
+// See the header. Each value is read from the document that owns it, and the
+// target's ABI typedefs are resolved for THIS format kind through the one
+// accessor — no typedef, target or format name is compared here.
+PredefinedTypeFacts predefinedTypeFactsFor(TargetSchema const&       target,
+                                           ObjectFormatSchema const& format) {
+    PredefinedTypeFacts facts;
+    facts.dataModel        = format.dataModel();
+    facts.longDoubleFormat = format.longDoubleFormat();
+    for (std::string_view const name : target.abiTypedefNames()) {
+        if (auto const core = target.abiTypedefCore(name, format.kind())) {
+            facts.abiTypedefs.emplace_back(std::string{name}, *core);
+        }
+    }
+    return facts;
 }
 
 // ═══ THE UNCONDITIONAL PREDEFINED-MACRO IDENTITY VALIDATION ═══════════════════
@@ -704,7 +757,8 @@ void UnitBuilder::validatePredefinedMacroIdentity_() {
     auto const validateFamily = [&](std::span<PredefinedMacroDef const> rows,
                                     std::string_view document) {
         (void)ffi::validateShippedSurfaceRequirements(
-            rows, document, systemDirs_, activeFormat_, driverDiagnostics_);
+            rows, document, systemDirs_, activeFormat_, driverDiagnostics_,
+            headerSearch_);
     };
 
     std::unordered_set<std::uint32_t> seenSchemaIds;
@@ -719,7 +773,10 @@ void UnitBuilder::validatePredefinedMacroIdentity_() {
         MergedPredefinedMacros const merged = mergePredefinedMacros(
             pp.predefinedMacros, targetPredefinedMacros_,
             formatPredefinedMacros_, activeFormat_,
-            pp.mutuallyExclusivePredefinedMacros);
+            pp.mutuallyExclusivePredefinedMacros,
+            // P68 round 8: the same pair facts the preprocess pass realizes
+            // the `type-size` rows with, so the two evaluations agree.
+            predefinedTypeFacts_.has_value() ? &*predefinedTypeFacts_ : nullptr);
         for (std::string const& msg : merged.conflicts) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::C_ConflictingPredefinedMacro;
@@ -771,6 +828,13 @@ void UnitBuilder::setFormatPredefinedMacros(
         cuFatal("UnitBuilder::setFormatPredefinedMacros called after finish()");
     }
     formatPredefinedMacros_ = std::move(macros);
+}
+
+void UnitBuilder::setPredefinedTypeFacts(PredefinedTypeFacts facts) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setPredefinedTypeFacts called after finish()");
+    }
+    predefinedTypeFacts_ = std::move(facts);
 }
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
@@ -941,6 +1005,8 @@ CompilationUnit UnitBuilder::finish() && {
         includeDirs_,
         systemDirs_,
         headerNameMatching_,
+        // The listings this build's preprocess passes already read.
+        headerSearch_,
         // D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: the same value the preprocessor
         // tier already receives. Both tiers walk the shipped-descriptor closure;
         // handing only one of them the format is how the two sets drift.
@@ -1138,6 +1204,7 @@ CompilationUnit UnitBuilder::finish() && {
                     includeDirs_,
                     systemDirs_,
                     headerNameMatching_,
+                    headerSearch_,   // identical inputs, the same view of the tree
                     activeFormat_,   // identical inputs to the first pass
                     [this](std::filesystem::path const& path, bool& ok,
                            std::shared_ptr<GrammarSchema const> schema) {

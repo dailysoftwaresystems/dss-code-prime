@@ -148,9 +148,20 @@ struct DSS_EXPORT LiteralPrefixEntry {
     // per-format override if declared, else the base `elementCore`. A pure config-
     // map lookup — NO hardcoded format identity. `nullopt` (direct-API / format-
     // agnostic caller) falls back to the base `elementCore`.
-    [[nodiscard]] TypeKind resolveElementCore(std::optional<ObjectFormatKind> fmt) const {
+    //
+    // ★ D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY: the parameter is a
+    // `SelectableObjectFormatKind`, so "no format" has ONE spelling here. Typed
+    // `std::optional<ObjectFormatKind>` it had two — `nullopt`, and an engaged
+    // `Unknown` that the lookup took for a real key — and only the first was the
+    // one the comment above describes. Handing this the sentinel, or an
+    // `std::optional<ObjectFormatKind>`, is now a compile error; a caller holding
+    // the wider type converts through `selectableObjectFormat`, which refuses the
+    // engaged sentinel loudly.
+    [[nodiscard]] TypeKind
+    resolveElementCore(std::optional<SelectableObjectFormatKind> fmt) const {
         if (fmt) {
-            if (auto it = elementCoreByFormat.find(*fmt); it != elementCoreByFormat.end()) {
+            if (auto it = elementCoreByFormat.find(fmt->kind());
+                it != elementCoreByFormat.end()) {
                 return it->second;
             }
         }

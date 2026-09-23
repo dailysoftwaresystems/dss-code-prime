@@ -1003,8 +1003,15 @@ layoutOneMaterial(TypeId id, TypeInterner const& interner,
             // like an array {re, im} of two element-float components — real@0,
             // imag@elemSize, size 2×elemSize, align = element align. This IS the ABI
             // leaf layout (collectLeaves emits 2 float leaves at 0/elemSize). A
-            // long-double-complex (F80/F128 element) sizes fine here (decl/sizeof/
-            // ABI-reject work); only its VALUE arithmetic walls loud downstream.
+            // long-double-complex (F80/F128 element) sizes here like any other
+            // (an x87 element is STORED 16/16, so its imaginary part sits at 16).
+            // ⓘ CORRECTED P68 round 8 part 4: this note used to say such a
+            // complex's "VALUE arithmetic walls loud downstream" and that its ABI
+            // "rejects". ✔MEASURED 2026-09-21 on ELF x86_64 and ELF aarch64, debug
+            // and release: run-time `_Complex long double` arithmetic, a value
+            // passed to and returned from a call through a volatile function
+            // pointer, and a static image all run to the same answer gcc 13.3.0
+            // and clang 18.1.3 give.
             auto const ops = interner.operands(id);
             if (ops.empty()) return std::nullopt;
             auto const* elem = childLayout(memo, interner, ops[0]);

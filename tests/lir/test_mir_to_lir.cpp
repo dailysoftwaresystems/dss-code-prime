@@ -9120,8 +9120,10 @@ namespace {
 
 // `_Bool f(long double* pa, long double* pb) { return *pa OP *pb; }` for a
 // memory-resident wide float. Pointer params (so the two `arg` opcodes give
-// each operand's address an IDENTIFIABLE register) + F80/F128 Loads, which
-// address-propagate — so the compare's operand registers ARE the arg registers.
+// each operand's address an IDENTIFIABLE register) + F80/F128 Loads, which are
+// read IN PLACE (nothing writes memory between them and the compare — see
+// `computeInPlaceWideFloatLoads`) — so the compare's operand registers ARE the
+// arg registers.
 [[nodiscard]] ::dss::Mir
 buildWideFloatCompare(::dss::TypeInterner& interner, ::dss::TypeKind kind,
                       ::dss::MirOpcode pred) {

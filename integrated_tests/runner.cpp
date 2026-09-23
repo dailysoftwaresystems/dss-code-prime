@@ -318,6 +318,29 @@ void check(std::string const& description, bool condition,
     return "\"" + s + "\"";
 }
 
+// D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a VALUE the shell must pass through
+// byte for byte. `quote` above uses double quotes, inside which a POSIX shell
+// still EXPANDS `$` — so `"${ORIGIN}"` would reach the compiler as an EMPTY
+// argument (refused by the CLI as a missing value) and `"$ORIGIN"`, gcc's own
+// spelling, likewise. A runpath entry is the first argument this runner passes
+// whose text is MEANT to carry a `$`, so it gets single quotes on POSIX (an
+// embedded `'` is closed, escaped and reopened). Under `cmd` — which does not
+// expand `$` at all — double quotes already keep it; ⚠ a `%NAME%` there would
+// still expand, and no corpus runpath carries a `%`.
+[[nodiscard]] std::string shellLiteral(std::string const& s) {
+#if defined(_WIN32)
+    return "\"" + s + "\"";
+#else
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += '\'';
+    return out;
+#endif
+}
+
 // Wrap a full command in the platform's `std::system()` shell
 // conventions. On Windows, `std::system()` invokes `cmd /S /C`
 // which strips a SINGLE leading + trailing pair of double quotes
@@ -579,6 +602,13 @@ struct ExampleTarget {
     // ⇒ the child's environment is this runner's, exactly as before the key
     // existed. Mirrors the in-process examples_runner, refusal for refusal.
     std::string                  loaderSearchPathVariable;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the directories this target's image
+    // records for its loader — one `--rpath <entry>` per entry on the main
+    // build's command line, in order. A property of the IMAGE, not of the
+    // spawn: an example that declares it runs with NO loader variable. Empty
+    // (the default) ⇒ no `--rpath` is passed, byte-identical to before. Mirrors
+    // the in-process examples_runner, refusal for refusal.
+    std::vector<std::string>     runpaths;
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -1128,16 +1158,17 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             if (k == "spec" || k == "artifact" || k == "runOn"
                 || k == "emulator" || k == "expectedStdout" || k == "exitCode"
                 || k == "dependsOn" || k == "prebuiltLibraries"
-                || k == "loaderSearchPathVariable"
+                || k == "loaderSearchPathVariable" || k == "runpaths"
                 || k.starts_with("$")) {
                 continue;
             }
             std::cerr << "  target '" << et.spec << "' declares unknown key '"
                       << k << "' — the runner reads spec / artifact / runOn /"
                          " emulator / expectedStdout / exitCode / dependsOn /"
-                         " prebuiltLibraries / loaderSearchPathVariable (plus"
-                         " $comment keys). An expectation the runner does not"
-                         " read is an assertion that never fires: "
+                         " prebuiltLibraries / loaderSearchPathVariable /"
+                         " runpaths (plus $comment keys). An expectation the"
+                         " runner does not read is an assertion that never"
+                         " fires: "
                       << path.generic_string() << "\n";
             return false;
         }
@@ -1215,6 +1246,32 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             }
             et.loaderSearchPathVariable = v.get<std::string>();
         }
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the image's own runpaths — the
+        // same rule, the same words as the in-process sibling. An empty entry
+        // is refused HERE because this runner could not pass it at all: the
+        // CLI refuses `--rpath ""` by its generic non-empty rule.
+        if (t.contains("runpaths")) {
+            auto const& v = t.at("runpaths");
+            bool ok = v.is_array() && !v.empty();
+            if (ok) {
+                for (auto const& e : v) {
+                    if (!e.is_string() || e.get<std::string>().empty()) {
+                        ok = false;
+                        break;
+                    }
+                    et.runpaths.push_back(e.get<std::string>());
+                }
+            }
+            if (!ok) {
+                std::cerr << "  target '" << et.spec
+                          << "' 'runpaths' must be a NON-EMPTY array of"
+                             " non-empty strings — an empty array declares a"
+                             " request the build never makes, and an empty"
+                             " entry is one this runner cannot pass: "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+        }
         out.targets.push_back(std::move(et));
     }
     // ── A LOADER SEARCH PATH THAT COULD NEVER REACH A LOADER, REFUSED BY NAME ──
@@ -1272,6 +1329,16 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             return false;
         }
         for (auto const& t : out.targets) {
+            // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH — the in-process sibling's
+            // refusal, mirrored: a refusal arm links no image.
+            if (!t.runpaths.empty()) {
+                std::cerr << "  manifest target '" << t.spec
+                          << "' declares 'runpaths' beside 'expectDiagnostics'."
+                             " A refusal arm links no image, so the runpaths"
+                             " would be parsed and then silently dropped: "
+                          << path.generic_string() << "\n";
+                return false;
+            }
             if (t.dependsOn.empty()) continue;
             std::cerr << "  manifest target '" << t.spec
                       << "' declares 'dependsOn' beside 'expectDiagnostics'."
@@ -2067,18 +2134,22 @@ std::size_t dependencyImagesDiffered  = 0;
     // ── PROJECT MODE: validate the manifest, then compile WITH `outDir` AS THE
     //    WORKING DIRECTORY ────────────────────────────────────────────────────
     //
-    // ★ THE CWD IS LOAD-BEARING HERE, and this runner did not have it. MEASURED:
-    // its ctest entry (integrated_tests/CMakeLists.txt) sets no
-    // WORKING_DIRECTORY, so the process cwd is `${CMAKE_BINARY_DIR}/
-    // integrated_tests`, and the `CwdGuard` wrapped only the RUN. A project
-    // manifest's relative `sources[]` globs expand against the PROCESS working
-    // directory (D-AP2-SOURCES-GLOB), and a `preBuildScripts` generator is
-    // spawned in that same directory — so without the guard the generator would
-    // write its source into the BUILD TREE while the glob searched it there too,
-    // scattering generated files outside the per-example scratch and defeating
-    // the neighbor staging entirely. The in-process sibling has always compiled
-    // with its scratch dir as the cwd (`ScratchDir::useAsCwd()`); this is what
-    // makes the two agree.
+    // ★ THE CWD WAS LOAD-BEARING HERE, AND IS NOT ANY MORE. This runner's ctest
+    // entry (integrated_tests/CMakeLists.txt) sets no WORKING_DIRECTORY, so the
+    // process cwd is `${CMAKE_BINARY_DIR}/integrated_tests`, and the `CwdGuard`
+    // once wrapped only the RUN. When a project manifest's relative `sources[]`
+    // globs expanded against the PROCESS working directory and its
+    // `preBuildScripts` generator was spawned there, a generator would have
+    // written its source into the BUILD TREE while the glob searched it there
+    // too — which is why this guard was grown around the compile. Since
+    // [[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]
+    // every relative path a manifest holds resolves against the MANIFEST's own
+    // directory and its hooks run there, so the staged manifest finds its own
+    // files from any cwd (`ManifestPathBase.*` builds every such field from three
+    // working directories). The guard stays for PARITY, not resolution: the
+    // in-process sibling compiles with its scratch dir as the cwd
+    // (`ScratchDir::useAsCwd()`), and the two runners compile in the same
+    // environment.
     //
     // Scoped to PROJECT MODE deliberately. A `--compile` invocation is handed
     // ABSOLUTE source paths, so its behaviour does not depend on the cwd, and
@@ -2207,6 +2278,13 @@ std::size_t dependencyImagesDiffered  = 0;
     // free instead of silently ignoring it.
     std::string const configArg =
         configName.empty() ? std::string{} : (" --config=" + configName);
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the image's own runpaths, one
+    // `--rpath` per entry in manifest order — the in-process sibling's
+    // `setRunpaths`. Shell-LITERAL, never `quote`d: see `shellLiteral`.
+    std::string runpathArgs;
+    for (auto const& entry : target->runpaths) {
+        runpathArgs += " --rpath " + shellLiteral(entry);
+    }
     std::string cmd = quote(compiler)
         + (projectMode
                ? (" --project " + projectArg)
@@ -2214,6 +2292,7 @@ std::size_t dependencyImagesDiffered  = 0;
                   + " --language " + m.language
                   + " --target "   + target->spec))
         + resolveArgs
+        + runpathArgs
         + configArg
         + " --output "   + quote(outDir.string())
         + " > " + quote(cliLog.string()) + " 2>&1";
@@ -3162,13 +3241,35 @@ void runErrorExampleViaCli(std::string const& compiler,
                   "cli.log lacks '" + posn + "':\n" + body);
         } else {
             // #4: a span-less-tier diagnostic renders code-only as
-            // `error[<code>]` (drainDiagnosticsToStderr routes a buffer-less
+            // `<severity>[<code>]` (drainDiagnosticsToStderr routes a buffer-less
             // diagnostic to the code-only one-liner). Assert THAT honest form
             // rather than a fabricated `:line:col`.
-            std::string const band = "error[" + e.code + "]";
-            check(exampleName + ": CLI emits code-only diagnostic " + band,
-                  body.find(band) != std::string::npos,
-                  "cli.log lacks '" + band + "':\n" + body);
+            //
+            // ★ UNDER WHICHEVER BAND THE RENDERER PRINTED. This arm used to
+            // build `"error[" + code + "]"`, a silent assumption that a declared
+            // code-only diagnostic is an ERROR — true of every refusal the corpus
+            // held until the first one refused in the PREPROCESSOR
+            // (`c/pp_lone_quote_does_not_swallow_directives`), whose translation
+            // unit also carries `info[D_LaterPhasesNotRun]`. A declaration names a
+            // CODE; the in-process runner, which asserts the exact set severity
+            // and all, owns the severity question. This runner links no library
+            // to ask the renderer for its severity words, so it spells none: the
+            // band is any lowercase word that opens a line and is followed
+            // directly by `[<code>]:` — the renderer's `{}[{}]: ` shape.
+            auto const renderedUnderAnyBand = [&body](std::string const& code) {
+                std::string const tail = "[" + code + "]:";
+                for (std::size_t at = body.find(tail); at != std::string::npos;
+                     at = body.find(tail, at + 1)) {
+                    std::size_t b = at;
+                    while (b > 0 && body[b - 1] >= 'a' && body[b - 1] <= 'z') --b;
+                    if (b < at && (b == 0 || body[b - 1] == '\n')) return true;
+                }
+                return false;
+            };
+            check(exampleName + ": CLI emits code-only diagnostic [" + e.code + "]",
+                  renderedUnderAnyBand(e.code),
+                  "cli.log lacks '<severity>[" + e.code + "]:' at a line start:\n"
+                      + body);
         }
     }
 }

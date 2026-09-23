@@ -111,6 +111,32 @@ dss_add_test(NAME mir/test_mir_text_global_attrs
 dss_add_test(NAME mir/test_mir_text_unsealed_block
              SOURCES test_mir_text_unsealed_block.cpp)
 
+# P68 round 8 (lane `ht`, part 1b): EVERY `MirInst` field survives a `.dssir`
+# round trip — the writer printed no instruction flag and no secondary payload
+# (an alloca's alignment, an atomic access's provable alignment), and read them
+# back as the defaults with `ok == true`. A field-by-field comparison per reader
+# arm, and a `sizeof(MirInst)` assertion that refuses to compile until a NEW
+# field is covered too.
+dss_add_test(NAME mir/test_mir_text_instruction_fields
+             SOURCES test_mir_text_instruction_fields.cpp)
+
+# P68 round 8 (lane `ht`, part 1b): the `.dssir` reader RETURNS on every input.
+# The measured table of shapes that used to abort, hang or read clean; a sweep
+# of every truncation and every single-token deletion of a golden module, each
+# announced on stderr before it is parsed so an abort or a timeout names it; and
+# the cascade pin — one bad block costs its own diagnostic, later blocks are read.
+dss_add_test(NAME mir/test_mir_text_reader_never_aborts
+             SOURCES test_mir_text_reader_never_aborts.cpp)
+
+# P68 round 8 lane `ht` part 1d: the `.dssir` v2 `types` table — a composite is
+# `type <H>`, defined ONCE with every layout channel through the ONE owner both text
+# tiers share. The cycle (a linked-list node and a mutual pair round-trip), the
+# layout (every channel and the computed layout read back equal), the size (a graph
+# mentioned N times is defined once), each refusal by name, the spelling the HIR v5
+# table shares, and the `.dss.mir` body a module holding a linked list now encodes.
+dss_add_test(NAME mir/test_mir_text_types_table
+             SOURCES test_mir_text_types_table.cpp)
+
 # D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE + D-CSUBSET-C11-THREADS-MTX-PLAIN-RECURSIVE
 # (P51 lane mx): `mtx_init`'s C11 `type` argument. The macho recipe passed a NULL
 # mutexattr, so `mtx_init(&m, mtx_recursive)` yielded a NON-recursive Darwin mutex

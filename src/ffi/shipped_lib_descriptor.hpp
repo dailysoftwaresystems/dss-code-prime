@@ -101,6 +101,7 @@ namespace dss {
 class DiagnosticReporter;
 class TypeInterner;
 class TypeRegistry;
+struct ParseDiagnostic;   // `refuseShippedSymbolWithoutABody`'s answer; see the note below
 // ⚠ DECLARED, NOT INCLUDED — see `diagnosticCodeForShippedSourceLookup` below.
 // `parse_diagnostic.hpp` is large and this header is widely included; a scoped enum
 // with a declared underlying type is exactly the forward-declarable case, so the
@@ -956,6 +957,21 @@ validateShippedIncludeClosure(std::filesystem::path const&      descriptorDir,
 // instead of naming a macro and leaving the author to grep three families.
 //
 // Returns false (diagnostics already reported) on any unsatisfied requirement.
+//
+// [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: a COMPILE
+// calls the form taking its `HeaderSearchCache`, so the claimed headers and their
+// closures are looked up in the listings the rest of the compile already read.
+// The form without one is for a check with no compile around it (the
+// `--dump-predefined-macros` report, unit tests): it lists for itself, once per
+// directory for that one call.
+[[nodiscard]] DSS_EXPORT bool
+validateShippedSurfaceRequirements(
+    std::span<PredefinedMacroDef const>    macros,
+    std::string_view                       declaringDocument,
+    std::span<std::filesystem::path const> systemDirs,
+    std::optional<ObjectFormatKind>        activeFormat,
+    DiagnosticReporter&                    reporter,
+    HeaderSearchCache&                     cache);
 [[nodiscard]] DSS_EXPORT bool
 validateShippedSurfaceRequirements(
     std::span<PredefinedMacroDef const>    macros,
@@ -1261,10 +1277,15 @@ readShippedLibIncludes(std::filesystem::path const&    path,
 //     reports, which is the exact drift this parameter exists to end. A tier that
 //     genuinely must stay silent (the preprocessor macro-splice, whose loud twin
 //     is the import resolver) passes an empty lambda AND says why.
+//   * `cache` is the COMPILE's `HeaderSearchCache`
+//     ([[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]): every
+//     edge resolves against the listings the compile already read, so a closure
+//     walked by three tiers lists `systemDirs` once, not once per edge per tier.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
     HeaderNameMatching                                      matching,
+    HeaderSearchCache&                                      cache,
     std::optional<ObjectFormatKind>                         activeFormat,
     std::unordered_set<core::PathIdentity>&                 visited,
     std::function<void(std::filesystem::path const&)> const& visit,
@@ -1284,7 +1305,8 @@ DSS_EXPORT void forEachDescriptorInClosure(
 // hold a format must use the full form and say what it does with the answer —
 // which is the property that keeps two tiers from disagreeing, and it is why
 // this is an overload with a stated precondition rather than a default argument
-// on the real one.
+// on the real one. With no compile around it, it lists for itself: one
+// `HeaderSearchCache` for the one walk.
 DSS_EXPORT void forEachDescriptorInClosure(
     std::filesystem::path const&                            startPath,
     std::span<std::filesystem::path const>                  systemDirs,
@@ -1526,6 +1548,43 @@ struct DSS_EXPORT ShippedSymbolRealization {
     TypeId      signature;
     bool        isFunction = true;   // ExternFunction vs ExternGlobal
 };
+
+// ★★★ D-DIAG-NOLIBRARYFORFORMAT-REPORTS-AN-HIR-NODE-FOR-A-CONFIG-CONDITION — THE
+// `#include` PATH'S REFUSAL, DECIDED BY THE REALIZATION ITSELF.
+//
+// A row the platform declares AVAILABLE on the active format while naming NO BODY
+// for it there — no `library` image, no `realization` source, no `synthesize`
+// recipe (`ShippedRealizationStatus::NoLibraryForFormat`) — has nothing an import
+// could bind to. That is a fact about three named things the reader can act on:
+// the DESCRIPTOR, the SYMBOL and the FORMAT.
+//
+// ✔MEASURED before this function (a scratch config tree whose `dirent.json` lost
+// its `pe` realization, `x86_64:pe64-x86_64-windows-exec`): `#include <dirent.h>`
+// stopped the build — correctly — with one `H_UnsupportedLoweringForKind` per row,
+// "HIR ExternFunction (id N) — `importLibrary` is missing from the
+// HirAttribute<FfiMetadata> side-table": an internal attribute name and a node
+// number from a tier below the one where the condition is known, naming none of
+// the three.
+//
+// The semantic tier's shipped-surface injection asks this per row it injects and
+// reports the answer on the `#include` (the diagnostic comes back UNPOSITIONED; the
+// caller places it). Built on the same `realizeRow` kernel the corpus oracle
+// uses, so the two cannot disagree about which rows have a body. `nullopt` for
+// every other realization — and ALSO for a row whose body is a runtime-library
+// ROLE the caller's read did not resolve (no resolver in hand: the descriptor does
+// declare a body there, the caller simply binds no imports).
+//
+// ⚠ THE VERDICT DID NOT MOVE; THE TIER AND THE WORDS DID. The row stopped the
+// build before this function existed and it stops the build now, for every
+// body-less row the included header declares, referenced or not. The
+// HAND-WRITTEN declaration's road is a different one and is unchanged: the oracle
+// answers a bare `extern` of such a name `NoLibraryForFormat` and routes it
+// UNBOUND to the link tier.
+[[nodiscard]] DSS_EXPORT std::optional<ParseDiagnostic>
+refuseShippedSymbolWithoutABody(ShippedLibDescriptor const&  desc,
+                                ShippedSymbol const&         sym,
+                                ObjectFormatKind             activeFormat,
+                                std::filesystem::path const& descriptorPath);
 
 // Resolve the platform realization of each requested NAME for the active target.
 //

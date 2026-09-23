@@ -174,7 +174,7 @@ public:
     // measurement with no instrument attached, so it decays silently in the
     // direction of looking authoritative.
     // The `census:` marker binds it to the `opt.mirRebuildPolicies` key of
-    // `scripts/check-doc-census/source-census.json`, which OWNS the counting
+    // `.harness-config/runner/actions/check-doc-census/source-census.json`, which OWNS the counting
     // pattern. ★ The pattern is deliberately NOT restated here: a pattern quoted in
     // prose rots exactly like the number it derives. `doc_census_guard` reds on
     // drift, and `check-doc-census.py --write` repairs the figure in place.

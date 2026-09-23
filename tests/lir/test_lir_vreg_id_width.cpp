@@ -46,7 +46,7 @@
 // identity — equally deterministic, equally host- and load-independent, equally
 // identical in Debug and Release, and sharper, because it holds or it does not.
 // No wall clock appears here, for the reason
-// `scripts/check-wall-clock-in-tests/` exists.
+// `.harness-config/runner/actions/check-wall-clock-in-tests/` exists.
 //
 // The widths are now DERIVED rather than chosen: the class field is the
 // narrowest that can name every `LirRegClass` (3 bits), `isPhysical` is one, and

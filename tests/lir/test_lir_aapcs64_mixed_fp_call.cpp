@@ -27,8 +27,16 @@
 //       legalize and callconv: the F128's register last written by its 128-bit
 //       load and the double's register by a move of the double — both orders,
 //       and an interleaved mix with a float and integer arguments;
-//   (D) a binary128 argument past the last FP argument register is REFUSED BY
-//       NAME (its AAPCS64 stack placement is not realized) — never '<deferred>'.
+//   (D) a binary128 argument past the last FP argument register is STORED ON
+//       THE STACK, 16-aligned and 16 wide, by the one outgoing cursor — it was
+//       refused by name until P68 round 8
+//       (D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED); plus the cursor's own
+//       arithmetic for a scalar wider than the slot;
+//   (E) the callee of one reads it by an `arg` stating 128 bits;
+//   (F) a `_Complex long double` result is captured whole from q0 AND q1
+//       (D-LIR-AAPCS64-COMPLEX-LONG-DOUBLE-RETURN-PIECE-REFUSED);
+//   (G) a result piece that still cannot be read is refused naming the
+//       register it needs — never the reasonless "is not yet lowered".
 //
 // ⚠ CONFIG-LEVEL: `dss_add_test` sets `DSS_CONFIG_ROOT`, so this file must run
 // through ctest and never as a bare `.exe`.
@@ -320,18 +328,261 @@ TEST(Aapcs64MixedFpCall, EveryArgumentReachesItsOwnRegisterAtTheCall) {
     }
 }
 
-// ── (D) past the last FP argument register: refused by name ──────────────────
-TEST(Aapcs64MixedFpCall, ABinary128PastTheLastFpArgumentRegisterIsRefusedByName) {
+// ── (D) past the last FP argument register: ON THE STACK, 16-aligned, 16 wide ─
+//
+// ★★ P68 round 8 (D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED). This arm
+// used to pin the REFUSAL ("belongs on the STACK — a placement this lowering
+// does not realize"); aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 run all
+// three probes of that shape to 42, so the refusal is now the placement. Each
+// case reads the `store_outgoing_arg`s `lowerWideCallArgs` emits — the byte
+// offset and the width the ONE outgoing cursor chose.
+TEST(Aapcs64MixedFpCall, ABinary128PastTheLastFpArgumentRegisterIsStoredOnTheStack) {
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
-    // eight doubles fill v0..v7; the binary128 after them belongs on the stack
-    Lowered L;
-    Mir const m = buildCall(L.interner, {A::F64, A::F64, A::F64, A::F64, A::F64,
-                                         A::F64, A::F64, A::F64, A::F128});
-    L.result = lowerArm64(m, **target, L.interner, L.reporter);
-    EXPECT_FALSE(L.result.ok);
-    EXPECT_TRUE(anyTextContains(L.reporter, "belongs on the STACK"))
-        << inventory(L.reporter);
-    EXPECT_FALSE(anyTextContains(L.reporter, "<deferred>"))
-        << "a refusal must name its reason: " << inventory(L.reporter);
+    TargetSchema const& t = **target;
+    auto const storeOut = t.opcodeByMnemonic("store_outgoing_arg");
+    ASSERT_TRUE(storeOut.has_value());
+    std::vector<A> const eight(8, A::F64);
+    struct Placed { std::uint32_t offset; std::uint32_t widthBits; };
+    struct Case { std::vector<A> args; std::vector<Placed> stores; char const* what; };
+    auto with = [&eight](std::vector<A> tail) {
+        std::vector<A> v = eight;
+        v.insert(v.end(), tail.begin(), tail.end());
+        return v;
+    };
+    std::vector<Case> const cases{
+        {with({A::F128}), {{0, 128}}, "eight doubles, then a long double"},
+        {with({A::F128, A::F64}), {{0, 128}, {16, 64}},
+         "a stacked double AFTER a stacked long double skips its 16 bytes"},
+        {with({A::F64, A::F128}), {{0, 64}, {16, 128}},
+         "a stacked long double after one 8-byte slot is aligned up to 16"},
+        {std::vector<A>(9, A::F128), {{0, 128}}, "nine long doubles"},
+    };
+    for (auto const& c : cases) {
+        TypeInterner in{CompilationUnitId{1}};
+        DiagnosticReporter rep;
+        Mir const m = buildCall(in, c.args);
+        auto lowered = lowerArm64(m, t, in, rep);
+        ASSERT_TRUE(lowered.ok) << c.what << ": " << inventory(rep);
+        EXPECT_FALSE(anyTextContains(rep, "<deferred>")) << c.what;
+        auto wide = lowerWideCallArgs(lowered.lir, t, 0, rep);
+        ASSERT_TRUE(wide.ok) << c.what << ": " << inventory(rep);
+        std::vector<Placed> got;
+        LirBlockId const bb = wide.lir.funcBlockAt(wide.lir.funcAt(0), 0);
+        for (std::uint32_t i = 0; i < wide.lir.blockInstCount(bb); ++i) {
+            LirInstId const li = wide.lir.blockInstAt(bb, i);
+            if (wide.lir.instOpcode(li) != *storeOut) continue;
+            got.push_back({wide.lir.instPayload(li),
+                           lirInstWidthBits(wide.lir.instFlags(li))});
+        }
+        ASSERT_EQ(got.size(), c.stores.size()) << c.what << ": " << inventory(rep);
+        for (std::size_t k = 0; k < got.size(); ++k) {
+            EXPECT_EQ(got[k].offset, c.stores[k].offset)
+                << c.what << ": stacked argument " << k << " at the wrong byte";
+            EXPECT_EQ(got[k].widthBits, c.stores[k].widthBits)
+                << c.what << ": stacked argument " << k << " stored at the wrong "
+                   "width (a binary128 stored at 64 bits leaves half of it behind)";
+        }
+        // The whole chain materializes it (the stores placed, the frame sized).
+        DiagnosticReporter rep2;
+        auto const lir = emitted(m, t, in, rep2);
+        EXPECT_TRUE(lir.has_value()) << c.what << ": " << inventory(rep2);
+    }
+}
+
+// The cursor itself: a 16-byte scalar is aligned by the convention's SCALAR
+// cap, occupies 16 bytes, and is read and written at 128 bits.
+TEST(Aapcs64MixedFpCall, TheStackCursorPlacesASixteenByteScalarAlignedAndWhole) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto const* cc = (**target).callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    StackArgCursor c{*cc, 8};
+    auto const a = c.placeNamedScalar(8);
+    auto const b = c.placeNamedScalar(16);
+    auto const d = c.placeNamedScalar(8);
+    EXPECT_EQ(a.byteOffset, 0u);
+    EXPECT_EQ(b.byteOffset, 16u) << "aligned up to 16 after one 8-byte slot";
+    EXPECT_EQ(lirInstWidthBits(b.widthFlags), 128u) << "moved whole";
+    EXPECT_EQ(d.byteOffset, 32u) << "the next argument follows ALL 16 bytes";
+    // THE CONTROL: an 8-byte scalar keeps the classic slot and the default width.
+    EXPECT_EQ(lirInstWidthBits(a.widthFlags), 64u);
+}
+
+// ── (E) the CALLEE of a stacked binary128 ───────────────────────────────────
+//
+// `void f(double ×8, long double l, long double *out) { *out = l; }` — `l` is
+// the ninth FP argument, so it arrives on the stack. Its MIR `Arg` carries FP
+// ordinal 8 (past the pool), and the LIR `arg` that reads it must state the
+// datum's own width — 128 bits — because that width is what the incoming
+// cursor places it by (aligned 16, 16 bytes) and what the read moves.
+// ✔MEASURED before the fix: the callee refused with "MIR opcode 'Arg' is not
+// yet lowered to target 'arm64'".
+namespace {
+[[nodiscard]] Mir buildStackedF128Callee(TypeInterner& in) {
+    TypeId const voidT = in.primitive(TypeKind::Void);
+    TypeId const f64 = in.primitive(TypeKind::F64);
+    TypeId const f128 = in.primitive(TypeKind::F128);
+    TypeId const p128 = in.pointer(f128);
+    std::vector<TypeId> params(8, f64);
+    params.push_back(f128);
+    params.push_back(p128);
+    TypeId const sig = in.fnSig(params, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{1});
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    for (std::uint32_t i = 0; i < 8; ++i) (void)mb.addArg(i, f64);
+    MirInstId const l = mb.addArg(8, f128);      // FP ordinal 8: past v7
+    MirInstId const out = mb.addArg(0, p128);    // GPR ordinal 0: x0
+    std::array<MirInstId, 2> const st{l, out};
+    (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    mb.addReturn(std::nullopt);
+    return std::move(mb).finish();
+}
+} // namespace
+
+TEST(Aapcs64MixedFpCall, AStackedBinary128ParameterIsReadWholeFromItsSlot) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& t = **target;
+    auto const argOp = t.opcodeByMnemonic("arg");
+    ASSERT_TRUE(argOp.has_value());
+    TypeInterner in{CompilationUnitId{1}};
+    DiagnosticReporter rep;
+    Mir const m = buildStackedF128Callee(in);
+    auto lowered = lowerArm64(m, t, in, rep);
+    ASSERT_TRUE(lowered.ok)
+        << "a callee taking a binary128 past v7 must LOWER — both references "
+           "run it: " << inventory(rep);
+    EXPECT_FALSE(anyTextContains(rep, "not yet lowered")) << inventory(rep);
+    std::optional<LirInstId> stacked;
+    LirBlockId const bb = lowered.lir.funcBlockAt(lowered.lir.funcAt(0), 0);
+    for (std::uint32_t i = 0; i < lowered.lir.blockInstCount(bb); ++i) {
+        LirInstId const li = lowered.lir.blockInstAt(bb, i);
+        if (lowered.lir.instOpcode(li) == *argOp && lowered.lir.instPayload(li) == 8u
+            && lowered.lir.instResult(li).regClass() == LirRegClass::FPR) {
+            stacked = li;
+        }
+    }
+    ASSERT_TRUE(stacked.has_value())
+        << "the ninth FP argument must be read by an `arg` of the FP class";
+    EXPECT_EQ(lirInstWidthBits(lowered.lir.instFlags(*stacked)), 128u)
+        << "the stacked binary128 must be read at its own width — at the "
+           "width-default the cursor would place it as an 8-byte slot and the "
+           "read would move half of it";
+    // The whole chain materializes it (the incoming read placed by the cursor).
+    DiagnosticReporter rep2;
+    auto const lir = emitted(m, t, in, rep2);
+    ASSERT_TRUE(lir.has_value()) << inventory(rep2);
+}
+
+// ── (F) a `_Complex long double` RESULT captured from q0 AND q1 ──────────────
+//
+// A two-member binary128 HFA returns in v0:v1. MIR states it as the call's own
+// F128 result (piece 0) plus `ReturnPiece(call, 1)`; the caller must store v1
+// into a home at 128 bits right after the call. ✔MEASURED before the fix: the
+// piece was refused as "MIR opcode 'returnpiece' is not yet lowered".
+namespace {
+[[nodiscard]] Mir buildComplexF128Caller(TypeInterner& in) {
+    TypeId const voidT = in.primitive(TypeKind::Void);
+    TypeId const f128 = in.primitive(TypeKind::F128);
+    TypeId const p128 = in.pointer(f128);
+    TypeId const calleeSig = in.fnSig(std::vector<TypeId>{}, f128, CallConv::CcSysV);
+    TypeId const sig = in.fnSig(std::vector<TypeId>{p128, p128}, voidT,
+                                CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{1});
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    MirInstId const re = mb.addArg(0, p128);
+    MirInstId const im = mb.addArg(1, p128);
+    std::array<MirInstId, 1> const callOps{
+        mb.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig))};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, f128);
+    MirInstId const piece = mb.addReturnPiece(call, 1, TargetRegClass::FPR, f128);
+    std::array<MirInstId, 2> const st0{call, re};
+    (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+    std::array<MirInstId, 2> const st1{piece, im};
+    (void)mb.addInst(MirOpcode::Store, st1, InvalidType);
+    mb.addReturn(std::nullopt);
+    return std::move(mb).finish();
+}
+} // namespace
+
+TEST(Aapcs64MixedFpCall, AComplexBinary128ResultIsCapturedFromBothQRegisters) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& t = **target;
+    Arm64Regs const r = regsOf(t);
+    auto const fstur = t.opcodeByMnemonic("fstur");
+    ASSERT_TRUE(fstur.has_value());
+    TypeInterner in{CompilationUnitId{1}};
+    DiagnosticReporter rep;
+    Mir const m = buildComplexF128Caller(in);
+    auto lowered = lowerArm64(m, t, in, rep);
+    ASSERT_TRUE(lowered.ok)
+        << "a caller of a function returning `_Complex long double` must "
+           "LOWER — both references run it: " << inventory(rep);
+    bool v0Captured = false, v1Captured = false;
+    LirBlockId const bb = lowered.lir.funcBlockAt(lowered.lir.funcAt(0), 0);
+    for (std::uint32_t i = 0; i < lowered.lir.blockInstCount(bb); ++i) {
+        LirInstId const li = lowered.lir.blockInstAt(bb, i);
+        if (lowered.lir.instOpcode(li) != *fstur) continue;
+        if (lirInstWidthBits(lowered.lir.instFlags(li)) != 128u) continue;
+        auto const ops = lowered.lir.instOperands(li);
+        if (ops.empty() || ops[0].kind != LirOperandKind::Reg
+            || ops[0].reg.isPhysical == 0u) continue;
+        if (ops[0].reg.id == r.v[0]) v0Captured = true;
+        if (ops[0].reg.id == r.v[1]) v1Captured = true;
+    }
+    EXPECT_TRUE(v0Captured) << "the real half (q0) must be stored whole";
+    EXPECT_TRUE(v1Captured)
+        << "the imaginary half (q1, return piece 1) must be stored whole at "
+           "128 bits — a scalar piece capture reads 64";
+    DiagnosticReporter rep2;
+    auto const lir = emitted(m, t, in, rep2);
+    ASSERT_TRUE(lir.has_value()) << inventory(rep2);
+}
+
+// ── (G) a refusal names what failed — never "is not yet lowered" ────────────
+//
+// The class of message the '<deferred>' name belonged to (P68 round 8,
+// D-LIR-REFUSAL-SAYS-AN-OPCODE-IS-NOT-LOWERED-AND-NAMES-NOTHING, which closed
+// by making every such refusal name what failed). A piece that names a return
+// register the convention does not declare is refused, and rightly: there is
+// no register to read it from. What that row's closure changed is the message,
+// which now says WHICH register of WHICH convention (✔MEASURED 2026-09-22 by
+// this test).
+TEST(Aapcs64MixedFpCall, ARefusedResultPieceNamesTheRegisterItNeeds) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& t = **target;
+    auto const* cc = t.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const voidT = in.primitive(TypeKind::Void);
+    TypeId const f128 = in.primitive(TypeKind::F128);
+    TypeId const p128 = in.pointer(f128);
+    TypeId const calleeSig = in.fnSig(std::vector<TypeId>{}, f128, CallConv::CcSysV);
+    TypeId const sig = in.fnSig(std::vector<TypeId>{p128}, voidT, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{1});
+    mb.beginBlock(mb.createBlock(StructCfMarker::EntryBlock));
+    MirInstId const out = mb.addArg(0, p128);
+    std::array<MirInstId, 1> const callOps{
+        mb.addGlobalAddr(SymbolId{2}, in.pointer(calleeSig))};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, f128);
+    // a piece ordinal past every FP return register the convention declares
+    auto const past = static_cast<std::uint32_t>(cc->returnFprs.size());
+    MirInstId const piece = mb.addReturnPiece(call, past, TargetRegClass::FPR, f128);
+    std::array<MirInstId, 2> const st{piece, out};
+    (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+    mb.addReturn(std::nullopt);
+    Mir const m = std::move(mb).finish();
+    DiagnosticReporter rep;
+    auto lowered = lowerArm64(m, t, in, rep);
+    EXPECT_FALSE(lowered.ok);
+    EXPECT_TRUE(anyTextContains(rep, "FP return register"))
+        << "the refusal must name the register it needed: " << inventory(rep);
+    EXPECT_FALSE(anyTextContains(rep, "not yet lowered"))
+        << "never the reasonless form: " << inventory(rep);
 }

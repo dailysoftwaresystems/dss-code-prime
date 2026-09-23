@@ -270,7 +270,7 @@ TEST(ConfigSnapshot, TheSnapshotIsCurrentWithTheLiveTree) {
 
 // The other half of the split this change made: `$DSS_CONFIG_ROOT` names the
 // CONFIG tree and nothing else. `repoRoot()` — which reaches tests/corpus,
-// tests/hir/lowering_goldens, examples/, scripts/ and src/ — must keep naming the
+// tests/hir/lowering_goldens, examples/, .harness-config/runner/actions/ and src/ — must keep naming the
 // checkout these binaries were built from, or pointing the suite at a
 // config-only snapshot would take every golden file in the repository with it.
 TEST(ConfigSnapshot, RepoRootStillNamesTheCheckoutTheseTestsWereBuiltFrom) {

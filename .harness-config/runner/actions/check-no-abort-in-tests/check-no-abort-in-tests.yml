@@ -1,0 +1,14 @@
+# PURPOSE: refuse a new live `abort()` call site in test or test-support code.
+name: check-no-abort-in-tests
+description: >-
+  The action refuses a new live abort() in test code, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `no_abort_in_tests_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-no-abort-in-tests.py
+    successPattern: 'selftest: OK \(0 failure\(s\)\)'
+    requireInputsUnmoved: true

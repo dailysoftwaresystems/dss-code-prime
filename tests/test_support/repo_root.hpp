@@ -29,7 +29,7 @@
 // CONFLATING THE TWO WAS A LATENT DEFECT THIS HEADER USED TO CARRY. Its
 // documented meaning (`src/core/types/config_path_walk.hpp`) is "a directory
 // that CONTAINS src/dss-config/" — it says nothing about `tests/corpus`,
-// `tests/hir/lowering_goldens`, `examples/`, `scripts/`, `real-examples/` or
+// `tests/hir/lowering_goldens`, `examples/`, `.harness-config/runner/actions/` or
 // `src/`, all of which this header's consumers reach through `repoRoot()`. While
 // the only value anyone ever put in the variable was the repo root itself, the
 // conflation cost nothing and was invisible. It stopped being invisible the

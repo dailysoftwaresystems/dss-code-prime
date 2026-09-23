@@ -352,6 +352,23 @@ TEST(AsmX86SseDialectRows, MovsdAndMovapsDoNotEncodeTheSame) {
            "silently gone: " << hex(sd->bytes);
 }
 
+// ★★ THE SAME COMPARISON FOR THE PACKED PAIR: `movapd` (66 0F 28 /r) and
+// `movaps` (0F 28 /r) move the same 128 bits and differ ONLY in the 0x66
+// prefix, which is exactly the byte a neighbour binding would drop. Measured
+// against GNU as 2.42: `movapd %xmm0, %xmm1` is 66 0F 28 C8.
+TEST(AsmX86SseDialectRows, MovapdAndMovapsDoNotEncodeTheSame) {
+    auto const pd = runXmm("movapd %0, %1\n", 64);
+    auto const ps = runXmm("movaps %0, %1\n", 64);
+    ASSERT_TRUE(pd->ok) << messages(*pd);
+    ASSERT_TRUE(ps->ok) << messages(*ps);
+    EXPECT_NE(pd->bytes, ps->bytes)
+        << "`movapd` and `movaps` encoded identically — the 0x66 prefix that "
+           "makes the move packed-DOUBLE is gone: " << hex(pd->bytes);
+    ASSERT_FALSE(pd->bytes.empty());
+    EXPECT_EQ(pd->bytes.front(), 0x66)
+        << "`movapd` must carry its 0x66 prefix: " << hex(pd->bytes);
+}
+
 // ⚠ THE MEMORY FORMS MUST SURVIVE THE NEW REGISTER FORM. `movsd` now names
 // THREE opcodes and the target's guards choose between them by operand-list
 // length; if the [reg] guard ever shadowed the memory shapes, a load would
@@ -376,17 +393,23 @@ TEST(AsmX86SseDialectRows, TheRegisterFormDoesNotShadowTheMemoryForms) {
 
 // ══ THE NEAR-MISS RULE ════════════════════════════════════════════════════
 //
-// ★★★ GNU as ACCEPTS ALL SEVEN OF THESE AND THE TARGET DECLARES NO TEMPLATE
+// ★★★ GNU as ACCEPTS ALL SIX OF THESE AND THE TARGET DECLARES NO TEMPLATE
 // THAT EMITS THEIR BYTES, so they are deliberately UNDECLARED. Binding any of
 // them to the nearest existing opcode would emit different bytes under the same
-// source text — `movapd` on `movaps` drops the 0x66 and silently becomes a
-// packed-SINGLE move. That is the silent wrong instruction this table exists to
-// prevent, so the refusal is the correct behaviour and is pinned as such.
+// source text — `xorpd` on `xorps` would drop the 0x66 and silently become a
+// packed-SINGLE operation. That is the silent wrong instruction this table
+// exists to prevent, so the refusal is the correct behaviour and is pinned as
+// such.
 //
-// ⚠ THE LIST IS THE FULL SEVEN, not a sample. A partial list would let a future
+// ⚠ THE LIST IS THE FULL SIX, not a sample. A partial list would let a future
 // edit quietly bind one of the unlisted ones to a neighbour.
+// ⓘ IT WAS SEVEN: `movapd` left the list when the target gained its OWN
+// encoding (66 0F 28 /r, P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS)
+// — the way this rule says a near miss is meant to leave it, never by binding
+// to `movaps`. `MovapdAndMovapsDoNotEncodeTheSame` below pins that the two
+// spellings stay two instructions.
 TEST(AsmX86SseDialectRows, NearMissSpellingsRefuseRatherThanBindToTheNeighbour) {
-    for (auto const* spelling : {"movapd", "movups", "comisd", "comiss",
+    for (auto const* spelling : {"movups", "comisd", "comiss",
                                  "cvtsi2ss", "xorpd", "xorps"}) {
         auto const r = runXmm(std::string{spelling} + " %0, %1\n", 64);
         EXPECT_FALSE(r->ok)

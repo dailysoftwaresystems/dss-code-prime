@@ -1,0 +1,14 @@
+# PURPOSE: create and remove lane worktrees inside the ignored .worktrees/, refusing any root that would exceed Windows MAX_PATH.
+name: lane-worktree
+description: >-
+  The action proves the work gate, the evidence gate and the verified preserve can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `lane_worktree_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./lane-worktree.py --self-test
+    successPattern: 'lane-worktree self-test: OK'
+    requireInputsUnmoved: true

@@ -106,8 +106,10 @@ constexpr std::string_view kKeyDocumentHeader = "dss-runtime-object-cache-key/2"
 // dependency-artifact key without parsing the rest. `/1` because this is the
 // first shape of it; the same bump rule applies — add or reorder a term and
 // every previously-written entry must become UNREACHABLE, not merely stale.
+// `/2` (P68 round 8, D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): the `runpath-count=`
+// and `runpath=` terms joined, after `stack-reserve=`.
 constexpr std::string_view kDependencyKeyDocumentHeader =
-    "dss-dependency-artifact-cache-key/1";
+    "dss-dependency-artifact-cache-key/2";
 
 // The anchor for the dependency artifact cache's own refusals. A message
 // naming the shipped-runtime ruling to somebody whose dependency failed to
@@ -1432,6 +1434,16 @@ computeDependencyArtifactKey(DependencyArtifactRequest const& request) {
         field("stack-reserve=", std::to_string(*request.stackReserveBytes));
     } else {
         line("stack-reserve=<format-default>");
+    }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpaths, in request ORDER (the
+    // loader searches in it, so order is meaning). The COUNT leads and every
+    // entry is LENGTH-PREFIXED: an entry may legally hold a newline, and
+    // without the length ["a\nrunpath=b", "c"] and ["a", "b\nrunpath=c"] —
+    // two different images — would render the same lines and share a key,
+    // which is the failure-toward-HIT this document exists to prevent.
+    field("runpath-count=", std::to_string(request.runpaths.size()));
+    for (std::string const& entry : request.runpaths) {
+        field("runpath=", std::format("{}:{}", entry.size(), entry));
     }
     field("inputs-sha256=", request.inputClosureDigest);
 

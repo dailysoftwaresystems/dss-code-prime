@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/semantic/semantic_analyzer.hpp"
 #include "analysis/semantic/semantic_model.hpp"
+#include "analysis/semantic/target_format_analysis.hpp"   // analyzeForTargetFormat — the pair's analysis
 #include "core/substrate/checked_file_read.hpp"   // the ONE checked whole-file read
 #include "core/substrate/path_identity.hpp"       // genericSpelling
 #include "core/types/config_path_walk.hpp"
@@ -247,10 +248,11 @@ headerReadErrorKindName(HeaderReadErrorKind k) noexcept {
 }
 
 std::expected<std::vector<ImportSurface>, HeaderReadError>
-readCHeaderFromText(std::string_view    text,
-                    std::string_view    headerPathLabel,
-                    std::string_view    importLibrary,
-                    DiagnosticReporter& reporter) {
+readCHeaderFromText(std::string_view      text,
+                    std::string_view      headerPathLabel,
+                    std::string_view      importLibrary,
+                    HeaderReadPair const& pair,
+                    DiagnosticReporter&   reporter) {
     // Post-fold #8: snapshot reporter size at entry so the F2
     // first-Error-span scan is bounded to diagnostics emitted by THIS
     // call, not by prior callers' leftover diagnostics on the same
@@ -287,34 +289,33 @@ readCHeaderFromText(std::string_view    text,
     // must not turn a good header read into a failure by itself.
     forwardConfigDiagnostics((*loaded)->loadDiagnostics(), reporter);
 
-    // TF-C74: DELIBERATELY no `setTargetPredefinedMacros` — this reader parses a
-    // shipped FFI header for its DECLARATIONS, not for a specific machine, and
-    // it takes no target parameter to supply. The effective predefined-macro
-    // list stays the LANGUAGE's alone, exactly as before this cycle. Trigger to
-    // revisit: the first shipped header whose declarations are gated on an
-    // architecture macro.
+    // ★★★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE — THE HEADER IS READ UNDER
+    // THE PAIR IT IS READ FOR. This reader used to take no target and no format
+    // and so stated none: TF-C74 and TF-C97 left the target's and the format's
+    // predefined macros out on purpose, and D-PP-HEADER-CASE-INSENSITIVE-PE
+    // stated the POSIX case rule explicitly, each "until this reader gains a
+    // target/format parameter". It has one now (`HeaderReadPair`), so the three
+    // channels light up together — through `applyTargetFormatPair`, the same
+    // call the driver's builder sites make, which also declares the two the old
+    // comments never named (the format kind and the target's plain-`char` sign)
+    // — and the analysis runs through `analyzeForTargetFormat`, the driver's own
+    // derivation of the data model, layout, `va_list`, availability gate and
+    // `long double`. A header now reads here the way it reads in the build.
     //
-    // TF-C97: and DELIBERATELY no `setFormatPredefinedMacros` either, for the
-    // SAME reason and with a DIFFERENT trigger. This reader takes no object
-    // FORMAT parameter, so there is no `dataModel` to speak for; a shipped
-    // descriptor whose declarations differ by data model already expresses that
-    // through `signatureByDataModel`, which is resolved downstream against the
-    // real format rather than through the preprocessor. Trigger to revisit: the
-    // first shipped header that gates a DECLARATION (not a signature) on
-    // `__LP64__`.
-    //
-    // D-PP-HEADER-CASE-INSENSITIVE-PE: this reader takes no object FORMAT
-    // parameter either, so it states the conservative POSIX rule EXPLICITLY.
-    // Benign here in a way it is not for the LSP: this parser reads DSS's own
-    // shipped headers, whose names are byte-exact by construction and are kept
-    // so by the repo-wide case-collision guard, so no spelling it will ever see
-    // depends on folding. Trigger to revisit: this reader gaining a target/
-    // format parameter, or being pointed at a third-party SDK header tree.
+    // The language's SYSTEM include directories come with it, as they do for
+    // every channel that builds a unit (`applySystemDirs`): without them
+    // `__has_include(<h>)` answers "no" for every shipped header whatever the
+    // pair's case rule says, and every predefined macro's surface claim is
+    // unbacked.
     UnitBuilder builder{*loaded, DiagnosticBudget::libraryDefault()};
-    builder.setHeaderNameMatching(kDefaultHeaderNameMatching);
+    applySystemDirs(builder, **loaded);
+    applyTargetFormatPair(builder, pair.target, pair.format);
     builder.addInMemory(std::string{text}, std::string{headerPathLabel});
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
-    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault());
+    SemanticModel model =
+        analyzeForTargetFormat(cu, DiagnosticBudget::libraryDefault(), pair.target,
+                               pair.format, pair.callingConvention)
+            .model;
 
     // ★★★ THE HEADER'S BUFFERS MUST TRAVEL WITH ITS DIAGNOSTICS, OR THE
     // DIAGNOSTICS CANNOT BE RENDERED. `cu` is a CompilationUnit the driver never
@@ -474,6 +475,7 @@ readCHeaderFromText(std::string_view    text,
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeader(std::filesystem::path const& headerPath,
             std::string_view             importLibrary,
+            HeaderReadPair const&        pair,
             DiagnosticReporter&          reporter) {
     auto contents = slurpFile(headerPath, reporter);
     if (!contents) return std::unexpected(contents.error());
@@ -482,7 +484,7 @@ readCHeader(std::filesystem::path const& headerPath,
     // against. A collapsed authority is therefore not a cosmetic loss here: it
     // renames the compilation unit.
     return readCHeaderFromText(*contents, core::genericSpelling(headerPath),
-                                importLibrary, reporter);
+                                importLibrary, pair, reporter);
 }
 
 } // namespace dss::ffi

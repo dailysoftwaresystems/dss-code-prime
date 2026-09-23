@@ -23,7 +23,8 @@
 //     from the layout rather than read back from the planner's own counter.
 //   * WORK, ABSOLUTE — the boundary pointer moves at most once per function,
 //     every site is visited exactly once, the exact check visits each site and
-//     veneer once.
+//     veneer once, and a new veneer's body is elected by at most one probe per
+//     declared candidate ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]).
 //   * WORK, GROWTH — doubling the input doubles the work (≤ 2.75×; quadratic
 //     scores 4.0).
 //   * CONTROL — the DECISIONS scale exactly with the input (twice the veneers,
@@ -38,6 +39,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 
 using namespace dss;
 
@@ -68,8 +70,18 @@ Subject subject(std::uint32_t tiles) {
     EXPECT_TRUE(tgt.has_value());
     auto const call26 = *link::relocFieldReach(*(*tgt)->relocationByName("call26"));
     L.reaches.push_back(call26);
-    L.veneerSize  = 12;
-    L.veneerReach = *link::relocFieldReach(*(*tgt)->relocationByName("adr_prel_pg_hi21"));
+    // The two shipped bodies, as the planner would see them past ±4 GiB: the
+    // cheap ADRP body first, the long literal body second. In this subject every
+    // veneer's target is 64 KiB away, so the long body is never ELECTED — but it
+    // is a candidate, so the margin is priced at it and every election probes at
+    // most two bodies. That is the work the pin below doubles.
+    L.bodies = {
+        linker::VeneerBodyModel{
+            12, *link::relocFieldReach(*(*tgt)->relocationByName("adr_prel_pg_hi21"))},
+        linker::VeneerBodyModel{
+            32, link::RelocReach{std::numeric_limits<std::int64_t>::min(),
+                                 std::numeric_limits<std::int64_t>::max()}},
+    };
 
     constexpr std::uint64_t kFn = 64 * 1024;
     std::uint32_t const n = tiles * kTile;
@@ -101,7 +113,7 @@ constexpr double kMaxGrowthForDoubledInput = 2.75;
 struct Measured {
     linker::VeneerPlan  plan;
     linker::BranchVeneerWork verify;
-    std::uint64_t sites = 0, functions = 0, farSites = 0;
+    std::uint64_t sites = 0, functions = 0, farSites = 0, bodies = 0;
 };
 
 Measured measure(std::uint32_t n) {
@@ -113,6 +125,7 @@ Measured measure(std::uint32_t n) {
     EXPECT_FALSE(misfit.has_value()) << "the plan must survive its own insertions";
     m.sites     = s.layout.sites.size();
     m.functions = s.layout.functionSizes.size();
+    m.bodies    = s.layout.bodies.size();
     m.farSites  = s.farSites;
     return m;
 }
@@ -151,6 +164,17 @@ TEST(BranchVeneerComplexity, PlacementWorkIsLinearInSitesAndFunctions) {
         EXPECT_EQ(m.verify.sitesVerified, m.sites + m.plan.veneers.size())
             << "n=" << n << ": the exact check visits each site and each veneer "
                "exactly once";
+        // [[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]: electing a new
+        // veneer's body scans the declared CANDIDATES, never the image. Here
+        // every target is 64 KiB from its veneer, so the cheap body wins at the
+        // first probe — exactly one probe per placed veneer.
+        EXPECT_EQ(m.plan.work.bodyProbes, m.plan.work.veneersPlaced)
+            << "n=" << n << ": the body election probed "
+            << m.plan.work.bodyProbes << " times for " << m.plan.work.veneersPlaced
+            << " veneers";
+        EXPECT_LE(m.plan.work.bodyProbes,
+                  m.plan.work.veneersPlaced * m.bodies)
+            << "n=" << n << ": at most one probe per candidate per veneer";
         EXPECT_EQ(m.plan.work.veneersPlaced + m.plan.work.veneersReused
                       + (m.sites - m.plan.work.veneersPlaced
                          - m.plan.work.veneersReused),
@@ -165,6 +189,7 @@ TEST(BranchVeneerComplexity, DoublingTheInputDoublesTheWork) {
     auto const total = [](Measured const& m) {
         return static_cast<double>(m.plan.work.sitesExamined
                                    + m.plan.work.pointerAdvances
+                                   + m.plan.work.bodyProbes
                                    + m.verify.sitesVerified + 1);
     };
     double const growth = total(large) / total(small);

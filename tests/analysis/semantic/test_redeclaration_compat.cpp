@@ -93,7 +93,7 @@ compat(TypeInterner const& in, TypeId a, TypeId b,
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
-                   std::nullopt, std::nullopt, format, "x86_64");
+                   std::nullopt, std::nullopt, SelectableObjectFormatKind::of(format), "x86_64");
 }
 
 // The elf x86_64 leg (LP64) — the leg both Linux references model.

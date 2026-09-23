@@ -516,6 +516,26 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // both directions, because a half-declared pair reads as an accident.
     // Empty ⇒ this specifier is compatible with no other member of its group.
     std::vector<std::string>        compatibleWith;
+    // ★★ P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the ASM-LABEL
+    // axis — the 6th ORTHOGONAL one. On a BLOCK-scope declaration carrying a
+    // specifier with this facet, an asm label names a MACHINE REGISTER rather
+    // than a symbol: GNU's local register variable (📄 GCC manual, "Local
+    // Register Variables": *The `register` keyword is required* … *The only
+    // supported use for this feature is to specify registers for input and
+    // output operands when calling Extended `asm`*). The semantic Pass-1 scan
+    // folds it onto `SymbolRecord::asmRegister`, after resolving the name
+    // against the TARGET's register table; without it a label on an automatic
+    // keeps the warn-and-ignore meaning both references give a non-`register`
+    // automatic. OR-only across a prefix, like the storage axes.
+    bool                            asmLabelNamesRegister = false;
+    // ★★ P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the ADDRESS axis
+    // — C 6.5.3.2p1, "The operand of the unary & operator shall be … an lvalue
+    // that designates an object that is not a bit-field and is not declared
+    // with the register storage-class specifier." Folded onto
+    // `SymbolRecord::addressNotTakeable`; consumed by the `&` operand check and
+    // by the memory-form asm operand check (GNU: *address of register variable
+    // requested*). OR-only across a prefix.
+    bool                            addressNotTakeable = false;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
@@ -2688,11 +2708,16 @@ struct DSS_EXPORT LiteralTypeMapping {
 // C 6.7.6.3p10: a parameter list of exactly `(void)` declares a function
 // taking NO parameters. When `soleVoidMeansEmpty` is true, the engine's
 // param-harvest chokepoint drops a SOLE, UNNAMED parameter whose resolved
-// type is lattice `Void`; a NAMED void parameter, or void mixed with other
-// parameters, is ill-formed and emits S_InvalidVoidParam (an ERROR,
-// positioned at the param). Default false ⇒ raw param lists (toy / tsql —
-// pinned; a void-typed param would then surface through the normal
-// invalid-type checks downstream).
+// type is lattice `Void` and that no `...` follows; an unnamed void beside
+// another parameter or a `...` emits S_InvalidVoidParam (an ERROR, positioned
+// at the param). A NAMED void parameter is KEPT in a declaration that is not a
+// definition — gcc's meaning, a parameter of an incomplete type at which a
+// call's arguments END (`TypeInterner::fnArgumentParams`) — and refused in a
+// definition, as is a qualified sole void; a `const`/`restrict` named one and
+// an `_Atomic` sole one are refused everywhere (P68 round 8, measured against
+// gcc, clang, mingw and MSVC — see `normalizeSoleVoidParams`). Default false ⇒
+// raw param lists (toy / tsql — pinned; a void-typed param would then surface
+// through the normal invalid-type checks downstream).
 struct DSS_EXPORT ParametersConfig {
     bool soleVoidMeansEmpty = false;
 };

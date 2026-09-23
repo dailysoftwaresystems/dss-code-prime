@@ -32,6 +32,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 using namespace dss;
@@ -504,7 +505,7 @@ roundTripOrFail(Lir const& lir, TargetSchema const& sch,
     // Build a NEW ctx for the re-emit using the parsed symbol-name
     // table — same shape the parser surfaces to its consumer.
     LirTextContext ctxRe{};
-    ctxRe.symbolNames = std::span<std::string const>{result->symbolNames};
+    ctxRe.symbolNameMap = &result->symbolNames;
     std::string const text2 = emitLir(result->lir, sch, ctxRe, rep3);
     EXPECT_EQ(text1, text2)
         << "round-trip text drift for " << what
@@ -1056,7 +1057,7 @@ TEST(LirTextRoundTrip, VRegIdGapMintingFillsMissingSlots) {
     // vreg AND not surface the filler (they have no defs/uses).
     DiagnosticReporter rep2;
     LirTextContext ctx2{};
-    ctx2.symbolNames = std::span<std::string const>{result->symbolNames};
+    ctx2.symbolNameMap = &result->symbolNames;
     std::string const text2 = emitLir(result->lir, *sch, ctx2, rep2);
     EXPECT_NE(text2.find("%v.5:gpr"), std::string::npos);
 }
@@ -2026,4 +2027,128 @@ TEST(LirText, AnElidedFallthroughSurvivesTheTextRoundTrip) {
         << "byte-identical re-emit is this format's round-trip contract";
     DiagnosticReporter vrep;
     EXPECT_TRUE(verifyLirText(parsed->lir, *sch, vrep));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P68 round 8, lane `ht`, part 1c — THE SYMBOL TABLE IS SIZED BY THE TEXT, AND A
+// NUMBER IN IT IS READ AS WRITTEN.
+//
+// The reader sized its table by the largest slot the text named (`resize(v + 1)`,
+// twice: the `symbols { }` entry and a function header's inline name). A
+// LEGITIMATE text carries slot 0xFFFFFF01, the writer-reserved PE `_tls_index`
+// singleton (✔MEASURED: 20 of 804 example modules) — a 128 GB table; a hostile
+// `%4294967295` wrapped `v + 1` to 0 and wrote out of bounds. The table holds one
+// entry per declared name now. And `^b<digits>` WRAPPED in a hand-rolled 32-bit
+// loop: a branch to `^b4294967297` landed on `^b1`.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+std::string oneFunctionLir(TargetSchema const& sch, std::string const& symbols,
+                           std::string const& fnHead, std::string const& blocks) {
+    return std::format(
+        "dsslir 1\n"
+        "target {} version \"{}\"\n"
+        "symbols {{\n{}}}\n"
+        "literal_pool {{}}\n"
+        "module {{\n"
+        "  function {} {{\n{}"
+        "  }}\n"
+        "}}\n",
+        sch.name(), sch.version(), symbols, fnHead, blocks);
+}
+
+std::string const kRetBlock =
+    "    block ^b0 [entry] -> [] {\n"
+    "      %v.1:gpr = mov #1 ; payload=0 flags=0\n"
+    "      ret %v.1:gpr ; payload=0 flags=0\n"
+    "    }\n";
+
+std::vector<std::string> actuals(DiagnosticReporter const& r) {
+    std::vector<std::string> out;
+    for (auto const& d : r.all()) out.push_back(d.actual);
+    return out;
+}
+
+bool anyHas(std::vector<std::string> const& v, std::string_view needle) {
+    for (auto const& x : v) if (x.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+std::string listed(std::vector<std::string> const& v) {
+    std::string out;
+    for (auto const& x : v) { out += "\n    "; out += x; }
+    return out;
+}
+
+} // namespace
+
+// The measured shapes and the legitimate reserved slot each read as the ONE
+// entry declared, beside the function's own; the reserved one round-trips.
+TEST(LirTextSymbolTable, AFarSlotIsOneEntryAndTheReservedTlsSlotRoundTrips) {
+    auto const sch = shippedX86();
+    for (std::uint32_t const slot : {100000000u, 4000000000u, 4294967295u, 4294967041u}) {
+        std::string const text = oneFunctionLir(
+            *sch, std::format("  %1 \"main\"\n  %{} \"_tls_index\"\n", slot), "%1 \"main\"",
+            kRetBlock);
+        DiagnosticReporter rep;
+        auto const parsed = parseLir(text, *sch, rep);
+        ASSERT_NE(parsed, nullptr);
+        EXPECT_TRUE(parsed->ok) << "%" << slot << listed(actuals(rep));
+        ASSERT_EQ(parsed->symbolNames.size(), 2u) << "%" << slot << " sized the table by its number";
+        ASSERT_TRUE(parsed->symbolNames.contains(slot));
+        EXPECT_EQ(parsed->symbolNames.at(slot), "_tls_index");
+        if (slot == 4294967041u) {
+            LirTextContext ctx{};
+            ctx.symbolNameMap = &parsed->symbolNames;
+            DiagnosticReporter w;
+            std::string const again = emitLir(parsed->lir, *sch, ctx, w);
+            EXPECT_NE(again.find("%1 \"main\""), std::string::npos) << again;
+        }
+    }
+}
+
+TEST(LirTextSymbolTable, ASlotNamedTwiceIsRefused) {
+    auto const sch = shippedX86();
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(
+        oneFunctionLir(*sch, "  %1 \"main\"\n  %7 \"a\"\n  %7 \"b\"\n", "%1 \"main\"", kRetBlock),
+        *sch, rep);
+    EXPECT_FALSE(parsed->ok);
+    EXPECT_TRUE(anyHas(actuals(rep), "symbol slot %7 is named twice in symbols { }"))
+        << listed(actuals(rep));
+    EXPECT_TRUE(parsed->symbolNames.empty()) << "a refused text handed back a partial table";
+}
+
+// 2^32 + 1 is not slot 1, and it is refused ONCE — not also as "slot 0".
+TEST(LirTextSymbolTable, A33BitSlotIsRefusedOnceNotCut) {
+    auto const sch = shippedX86();
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(
+        oneFunctionLir(*sch, "  %1 \"main\"\n  %4294967297 \"x\"\n", "%1 \"main\"", kRetBlock),
+        *sch, rep);
+    EXPECT_FALSE(parsed->ok);
+    auto const diags = actuals(rep);
+    EXPECT_TRUE(anyHas(diags, "symbol id value '4294967297' does not fit its 32-bit field"))
+        << listed(diags);
+    EXPECT_FALSE(anyHas(diags, "invalid-symbol sentinel"))
+        << "the refused number was ALSO reported as slot 0:" << listed(diags);
+    EXPECT_TRUE(parsed->symbolNames.empty()) << "a refused text handed back a partial table";
+}
+
+TEST(LirTextBlockSlot, ABlockSlotPast32BitsIsRefusedNotWrapped) {
+    auto const sch = shippedX86();
+    std::string const blocks =
+        "    block ^b0 [entry] -> [^b4294967297] {\n"
+        "      br ^b4294967297 ; payload=0 flags=0\n"
+        "    }\n"
+        "    block ^b1 -> [] {\n"
+        "      %v.1:gpr = mov #1 ; payload=0 flags=0\n"
+        "      ret %v.1:gpr ; payload=0 flags=0\n"
+        "    }\n";
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(oneFunctionLir(*sch, "  %1 \"main\"\n", "%1 \"main\"", blocks),
+                                 *sch, rep);
+    EXPECT_FALSE(parsed->ok) << "a branch to ^b4294967297 read as a branch to ^b1";
+    EXPECT_TRUE(anyHas(actuals(rep), "block slot value '4294967297' does not fit its 32-bit field"))
+        << listed(actuals(rep));
 }

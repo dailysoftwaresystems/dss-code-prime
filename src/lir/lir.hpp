@@ -10,7 +10,9 @@
 #include "lir/lir_node.hpp"
 #include "lir/lir_reg.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -94,7 +96,12 @@ public:
         // parameter for the reason this ctor's own comment already gives
         // about the first two — a side structure with a default is one
         // `finish()` can silently omit.
-        std::vector<LirStaticInitEntry> staticInit) noexcept;
+        std::vector<LirStaticInitEntry> staticInit,
+        // P68 round 8 part 4: the FOURTH, and trailing and non-defaulted for
+        // the same reason — the bodies of the module's inline-asm statements
+        // (`lir_asm_region.hpp`). A default here would let `finish()` hand
+        // back bundles whose bodies it had silently dropped.
+        LirAsmRegionPool asmRegionPool) noexcept;
 
     Lir(Lir const&)            = delete;
     Lir& operator=(Lir const&) = delete;
@@ -141,6 +148,26 @@ public:
         return &regConstraintPool_.at(lirRegConstraintIndexForHandle(h));
     }
 
+    // ── per-instruction asm region (the inline-asm BUNDLE) ──
+    //
+    // The RAW handle, exposed unresolved for the verifier and the `.dsslir`
+    // codec for the reason `instRegConstraintHandle` gives: a dangling handle
+    // must be SEEN, not aborted on.
+    [[nodiscard]] std::uint32_t instAsmRegionHandle(LirInstId id) const {
+        return instArena_.at(id).asmRegion;
+    }
+    // Resolved: `nullptr` when the instruction is not an asm-region bundle.
+    // Aborts on a DANGLING handle (`LirAsmRegionPool::at`'s contract), which
+    // `verifyLirSideStructures` reports as a diagnostic first.
+    // ⚠ READ A BUNDLE'S DEFS AND USES THROUGH `lirForEachInstDef` /
+    // `lirForEachInstUse` (`lir_asm_region.hpp`), NEVER through the roles
+    // directly: those two are the ONE reader of what an instruction writes.
+    [[nodiscard]] LirAsmRegion const* instAsmRegion(LirInstId id) const {
+        std::uint32_t const h = instAsmRegionHandle(id);
+        if (h == kLirNoAsmRegion) return nullptr;
+        return &asmRegionPool_.at(lirAsmRegionIndexForHandle(h));
+    }
+
     // ── block accessors ──
     [[nodiscard]] std::uint32_t                blockInstCount(LirBlockId id) const { return blockArena_.at(id).instCount; }
     [[nodiscard]] LirFuncId                    blockFunc(LirBlockId id) const;
@@ -176,6 +203,11 @@ public:
         return regConstraintPool_;
     }
 
+    // ── asm-region pool (the inline-asm bundle bodies) ──
+    [[nodiscard]] LirAsmRegionPool const& asmRegionPool() const noexcept {
+        return asmRegionPool_;
+    }
+
 private:
     TargetSchemaId            target_{};
     InstArena                 instArena_;
@@ -186,6 +218,7 @@ private:
     LirLiteralPool            literalPool_;
     LirRegConstraintPool      regConstraintPool_;
     std::vector<LirStaticInitEntry> staticInit_;
+    LirAsmRegionPool          asmRegionPool_;
 };
 
 static_assert(substrate::Arena<Lir>,
@@ -319,6 +352,16 @@ public:
                             std::span<LirBlockId const> targets,
                             std::uint32_t payload = 0,
                             std::uint8_t  flags   = 0);
+    // P68 round 8 part 4: an inline-asm `asm goto` BUNDLE (terminator kind
+    // `asm-goto`). `operands` = the statement's slots (registers); `targets` =
+    // its labels in order, then its fall-through. Seals the open block. The
+    // same shape `addIndirectBr` builds, under its own name because it is not
+    // an indirect branch: nothing reads an address, and it is never encoded.
+    LirInstId addAsmGoto(std::uint16_t opcode,
+                         std::span<LirOperand const> operands,
+                         std::span<LirBlockId const> targets,
+                         std::uint32_t payload = 0,
+                         std::uint8_t  flags   = 0);
     // Zero-successor terminator that is NOT a return — separated from
     // `addReturn` so the call-site spelling matches the semantics. AS1
     // maps to x86_64 ud2 / ARM64 brk / WASM unreachable.
@@ -388,6 +431,36 @@ public:
     // builder and `poolIndex` must be in range — both abort otherwise
     // (builder-contract discipline, same as `beginBlock`'s guards).
     void setInstRegConstraints(LirInstId inst, std::uint32_t poolIndex);
+
+    // ── per-instruction asm region (the inline-asm BUNDLE) ─────────
+    //
+    // Append a region to the module's pool; returns its INDEX (feed it to
+    // `setInstAsmRegion`). The region is IMMUTABLE from here on and shared by
+    // every rebuild's copy of the pool. Aborts on null.
+    // ★ THE REGION'S SHAPE IS VALIDATED HERE, for the reason
+    // `regConstraintPoolAdd` resolves names: a producer that could attach a
+    // body whose operand bookkeeping disagrees with itself (a role per slot,
+    // a body register per slot, an exit block in the body) would hand every
+    // consumer a question with two answers. `lirAsmRegionShapeDefect`
+    // (`lir_asm_region.hpp`) is the ONE statement of that shape; this aborts
+    // on it (a producer contract), and the verifier REPORTS it on any module
+    // that reaches it some other way (the `.dsslir` reader).
+    [[nodiscard]] std::uint32_t
+    asmRegionPoolAdd(std::shared_ptr<LirAsmRegion const> region);
+
+    // How many regions the pool holds so far — the `.dsslir` reader's
+    // range check, for `regConstraintPoolSize`'s reason.
+    [[nodiscard]] std::size_t asmRegionPoolSize() const noexcept {
+        return asmRegionPool_.size();
+    }
+
+    // Attach a pool entry to an already-appended instruction — separate from
+    // `addInst` for `setInstRegConstraints`'s reason (a defaulted "none" on
+    // every `add*` entry point is exactly the silent drop). Aborts on a
+    // cross-module id, an out-of-range index, or an instruction whose OPERAND
+    // COUNT differs from the region's slot count: the roles are read by
+    // position, so a mismatch would give some operand no role at all.
+    void setInstAsmRegion(LirInstId inst, std::uint32_t poolIndex);
 
     // OR bits into an already-appended instruction's flag byte
     // (D-LIR-EARLYCLOBBER-FLAG-UNSETTABLE-AFTER-EMISSION). The sibling
@@ -516,6 +589,7 @@ private:
     LirLiteralPool          literalPool_;
     LirRegConstraintPool    regConstraintPool_;
     std::vector<LirStaticInitEntry> staticInit_;
+    LirAsmRegionPool        asmRegionPool_;
 
     // MODULE-wide, and deliberately NOT in the per-function block below: a
     // refusal abandons the whole rebuild, not one function, so `addFunction`

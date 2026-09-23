@@ -7,6 +7,7 @@
 // by-value aggregate carrier EXACTLY as lir_callconv / lir_wide_call_args do, so a
 // spilled scalar arg's register-vs-overflow decision matches theirs.
 #include "mir/mir_opcode.hpp"
+#include "lir/lir_asm_region.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -483,7 +484,10 @@ rewriteOneFunc(Lir const&               src,
             for (std::uint32_t i = 0; i < n; ++i) {
                 LirInstId const inst = src.blockInstAt(blk, i);
                 if (src.instOpcode(inst) != *argOp) continue;
-                LirReg const res = src.instResult(inst);
+                // The register this `arg` DEFINES — the one helper's answer,
+                // which for an `arg` is exactly its result.
+                LirReg res = InvalidLirReg;
+                lirForEachInstDef(src, inst, [&](LirReg r, bool) { res = r; });
                 if (!res.valid() || res.isPhysical != 0) continue;
                 auto const inc = lir_pass_util::incomingArgRegister(
                     schema, *ccForArgs, res.regClass(), src.instPayload(inst));
@@ -512,10 +516,29 @@ rewriteOneFunc(Lir const&               src,
         }
     }
 
+    // ★ P68 round 8 part 4 — THE STORES AN `asm goto` STATEMENT OWES ITS EDGES.
+    // The statement ends its block, so a spilled output cannot be stored after
+    // it in that block; it is stored at the HEAD of every edge instead, each a
+    // block only the statement enters (`mir_to_lir` gives every edge of a
+    // statement with an output its own block). Keyed by the DESTINATION block.
+    struct EdgeStore { LirReg scratch; LirSpillSlot slot; };
+    std::unordered_map<std::uint32_t, std::vector<EdgeStore>> edgeStores;
+    std::optional<std::unordered_map<std::uint32_t, std::uint32_t>> predCount;
+    std::unordered_map<std::uint32_t, std::uint32_t> blockIndexOf;
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        blockIndexOf[src.funcBlockAt(fn, bi).v] = bi;
+    }
+
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
         LirBlockId const srcBlock = src.funcBlockAt(fn, bi);
         LirBlockId const dstBlock = srcToDst.at(srcBlock.v);
         b.beginBlock(dstBlock);
+        if (auto const it = edgeStores.find(dstBlock.v); it != edgeStores.end()) {
+            for (auto const& st : it->second) {
+                std::array<LirOperand, 1> storeOps{LirOperand::makeReg(st.scratch)};
+                b.addInst(*frameStoreOp, InvalidLirReg, storeOps, st.slot.v);
+            }
+        }
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
         for (std::uint32_t i = 0; i < instN; ++i) {
@@ -595,6 +618,170 @@ rewriteOneFunc(Lir const&               src,
             }
             std::span<std::uint16_t const> const implicitForbiddenSpan{
                 implicitForbidden.data(), implicitForbidden.size()};
+
+            // ── P68 round 8 part 4: THE INLINE-ASM BUNDLE ─────────────────
+            //
+            // ★★★ A SPILLED OPERAND IS RELOADED BEFORE THE WHOLE STATEMENT AND
+            // STORED AFTER IT — NEVER INSIDE THE TEMPLATE, which is the entire
+            // reason the statement is one instruction here. Each operand gets a
+            // register for the WHOLE statement: its allocation, or (spilled) a
+            // scratch from the registers nothing in this function was given,
+            // distinct per operand (the per-instruction cursor), and outside
+            // the statement's pinned inputs, clobbers and outputs
+            // (`implicitForbidden` — the constraint the bundle carries). A read
+            // role reloads before; a write role stores after; `"+r"` both. A
+            // write-only operand is NOT reloaded — its old value is dead.
+            // ⚠ When no scratch is left the statement needs more registers of
+            // one class at once than the function has; that is refused BY
+            // NAME. Reloading it anywhere else would put a memory access inside
+            // the template — the livelock this bundle removed.
+            if (LirAsmRegion const* region = src.instAsmRegion(inst);
+                region != nullptr) {
+                struct SlotMove { LirReg scratch; LirSpillSlot slot; };
+                std::vector<SlotMove> reloads;
+                std::vector<SlotMove> stores;
+                std::vector<LirOperand> bundleOps;
+                bundleOps.reserve(ops.size());
+                // ★ THE LINK REGISTER, AS THE LAST RESORT. It is in no
+                // allocatable list (it holds the return address), so nothing in
+                // this function lives in it — and a function whose body names it
+                // has it saved by callconv's link-register fold. So when every
+                // other register is taken, one operand of ONE statement may sit
+                // in it for the statement's length. ✔MEASURED 2026-09-22 that
+                // this is what the references do: clang 18.1.3 compiles and runs
+                // a 31-register arm64 statement for Linux (x0–x30, x30
+                // included) and a 29-register one for Apple (x18 and x29
+                // reserved there), where refusing it would refuse a program a
+                // reference compiles. ⚠ It is also arm64's frame-address
+                // scratch: a function that names it may not borrow it for a far
+                // frame access, and callconv REFUSES such an access by name
+                // rather than clobber the operand.
+                std::optional<std::uint16_t> linkFree;
+                if (ccForArgs != nullptr && ccForArgs->linkRegister.has_value()) {
+                    std::uint16_t const lr = ccForArgs->linkRegister->ordinal;
+                    bool const forbidden =
+                        std::find(implicitForbidden.begin(),
+                                  implicitForbidden.end(), lr)
+                        != implicitForbidden.end();
+                    if (!forbidden) linkFree = lr;
+                }
+                for (std::size_t k = 0; k < ops.size(); ++k) {
+                    LirOperand const& o = ops[k];
+                    if (o.kind != LirOperandKind::Reg || !o.reg.valid()
+                        || o.reg.isPhysical != 0) {
+                        bundleOps.push_back(o);
+                        continue;
+                    }
+                    auto rr = resolveReg(o.reg, alloc, scratch, cursor,
+                                         implicitForbiddenSpan);
+                    if (!rr.phys.valid() && linkFree.has_value()
+                        && o.reg.regClass() == LirRegClass::GPR) {
+                        rr.phys = makePhysicalReg(*linkFree, LirRegClass::GPR);
+                        linkFree.reset();   // one operand per statement
+                    }
+                    if (!rr.phys.valid()) {
+                        auto const cls = o.reg.regClass();
+                        auto const ci  = static_cast<std::size_t>(cls);
+                        report(reporter,
+                               DiagnosticCode::L_AsmRegionOperandUnallocatable,
+                               DiagnosticSeverity::Error,
+                               std::format(
+                                   "an inline-asm statement (function {}, "
+                                   "bundle inst {}) needs its operand {} ({} "
+                                   "slot, class '{}') in a register for the "
+                                   "WHOLE statement, and none is left: the "
+                                   "allocator could not keep it in one, and "
+                                   "every register this function leaves unused "
+                                   "({} of that class) is already holding "
+                                   "another operand of the same statement or is "
+                                   "pinned, clobbered or an output of it. The "
+                                   "statement needs more registers of one class "
+                                   "at once than this function has; reloading "
+                                   "the operand INSIDE the template instead "
+                                   "would put a memory access between its "
+                                   "instructions",
+                                   fn.v, inst.v, k,
+                                   lirAsmRoleName(region->roles[k]),
+                                   lirRegClassName(cls),
+                                   ci < scratch.pool.size()
+                                       ? scratch.pool[ci].size() : 0u));
+                        return false;
+                    }
+                    if (rr.spillSlot.has_value()) {
+                        LirAsmOperandRole const role = region->roles[k];
+                        if (lirAsmRoleReads(role)) {
+                            reloads.push_back({rr.phys, *rr.spillSlot});
+                        }
+                        if (lirAsmRoleWrites(role)) {
+                            stores.push_back({rr.phys, *rr.spillSlot});
+                        }
+                    }
+                    bundleOps.push_back(LirOperand::makeReg(rr.phys));
+                }
+                if (info != nullptr && info->isTerminator() && !stores.empty()) {
+                    // An `asm goto` statement ends its block, so its spilled
+                    // outputs are stored at the head of EVERY edge — sound only
+                    // on an edge block no other path enters and that is laid
+                    // out after this one (not yet emitted).
+                    if (!predCount.has_value()) {
+                        predCount.emplace();
+                        for (std::uint32_t pi = 0; pi < blockCount; ++pi) {
+                            for (LirBlockId const t :
+                                 src.blockSuccessors(src.funcBlockAt(fn, pi))) {
+                                ++(*predCount)[t.v];
+                            }
+                        }
+                    }
+                    for (LirBlockId const t : src.blockSuccessors(srcBlock)) {
+                        bool const ownEdge = (*predCount)[t.v] == 1
+                                          && blockIndexOf.at(t.v) > bi;
+                        if (!ownEdge) {
+                            report(reporter,
+                                   DiagnosticCode::L_AsmRegionMalformed,
+                                   DiagnosticSeverity::Error,
+                                   std::format(
+                                       "an `asm goto` statement (function {}, "
+                                       "bundle inst {}) spilled {} output(s), "
+                                       "whose store belongs at the head of each "
+                                       "edge, and its edge to block {} is not a "
+                                       "block only this statement enters and "
+                                       "that follows it — every edge of a "
+                                       "statement with an output gets a block of "
+                                       "its own when it is lowered",
+                                       fn.v, inst.v, stores.size(), t.v));
+                            return false;
+                        }
+                        auto& pending = edgeStores[srcToDst.at(t.v).v];
+                        for (auto const& st : stores) {
+                            pending.push_back({st.scratch, st.slot});
+                        }
+                    }
+                    stores.clear();   // placed on the edges, not after
+                }
+                for (auto const& l : reloads) {
+                    b.addInst(*frameLoadOp, l.scratch,
+                              std::span<LirOperand const>{}, l.slot.v);
+                }
+                if (info != nullptr && info->isTerminator()) {
+                    auto const succs = src.blockSuccessors(srcBlock);
+                    if (!lir_pass_util::emitTerminator(
+                            b, op, info, succs, bundleOps, payload, flags,
+                            srcToDst, "rewrite", reporter)) {
+                        return false;
+                    }
+                    lir_pass_util::carryInstSideData(src, inst, b);
+                } else {
+                    LirInstId const dstInst =
+                        b.addInst(op, InvalidLirReg, bundleOps, payload, flags);
+                    lir_pass_util::carryInstSideData(src, inst, b, dstInst);
+                }
+                for (auto const& st : stores) {
+                    std::array<LirOperand, 1> storeOps{
+                        LirOperand::makeReg(st.scratch)};
+                    b.addInst(*frameStoreOp, InvalidLirReg, storeOps, st.slot.v);
+                }
+                continue;
+            }
 
             struct PendingLoad { LirReg scratch; LirSpillSlot slot; };
             std::vector<PendingLoad> loads;
@@ -1055,8 +1242,9 @@ void checkLoopCarriedSpills(Lir const&          lir,
                     std::uint32_t const n2 = lir.blockInstCount(blocks[k]);
                     for (std::uint32_t j = 0; j < n2; ++j) {
                         LirInstId const ii = lir.blockInstAt(blocks[k], j);
-                        LirReg const    r  = lir.instResult(ii);
-                        if (r.valid() && !has(loopDefs, r.id)) loopDefs.push_back(r.id);
+                        lirForEachInstDef(lir, ii, [&](LirReg r, bool) {
+                            if (!has(loopDefs, r.id)) loopDefs.push_back(r.id);
+                        });
                         for (auto const& o : lir.instOperands(ii))
                             if (o.kind == LirOperandKind::Reg && o.reg.valid()
                                 && !has(loopUses, o.reg.id))

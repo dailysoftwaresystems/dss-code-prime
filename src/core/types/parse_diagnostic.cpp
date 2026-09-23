@@ -64,6 +64,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "P_PreprocessorIncludeReentryRefused";
         case DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned:
             return "P_PreprocessorIfLiteralImplicitlyUnsigned";
+        case DiagnosticCode::P_ClosedByEndOfInput:
+            return "P_ClosedByEndOfInput";
         case DiagnosticCode::S_PragmaPackAmbiguous:
             return "S_PragmaPackAmbiguous";
         case DiagnosticCode::S_AsmLabelInvalid:
@@ -133,6 +135,18 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_VariadicMarkerMustEndParameterList";
         case DiagnosticCode::S_AutoDeclaratorsInferDifferentTypes:
             return "S_AutoDeclaratorsInferDifferentTypes";
+        case DiagnosticCode::S_AsmRegisterNameUnknown:
+            return "S_AsmRegisterNameUnknown";
+        case DiagnosticCode::S_AddressOfRegisterObject:
+            return "S_AddressOfRegisterObject";
+        case DiagnosticCode::S_InlineAsmBoundRegisterConflict:
+            return "S_InlineAsmBoundRegisterConflict";
+        case DiagnosticCode::S_IncompleteReturnType:
+            return "S_IncompleteReturnType";
+        case DiagnosticCode::S_IncompleteArgumentType:
+            return "S_IncompleteArgumentType";
+        case DiagnosticCode::S_TagDeclaredInParameterList:
+            return "S_TagDeclaredInParameterList";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -405,6 +419,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_SideStructureReferenceLost:   return "L_SideStructureReferenceLost";
         case DiagnosticCode::L_ArgClassHasNoRegisterPool:    return "L_ArgClassHasNoRegisterPool";
         case DiagnosticCode::L_ArgClassPoolUndeclared:       return "L_ArgClassPoolUndeclared";
+        case DiagnosticCode::L_SymbolIdSpaceExhausted:       return "L_SymbolIdSpaceExhausted";
+        case DiagnosticCode::L_AsmRegionMalformed:           return "L_AsmRegionMalformed";
+        case DiagnosticCode::L_AsmRegionOperandUnallocatable: return "L_AsmRegionOperandUnallocatable";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";
@@ -538,6 +555,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ObjectReaderSymbolBodyDropped";
         case DiagnosticCode::F_DeclaredImportNameNotRecordable:
             return "F_DeclaredImportNameNotRecordable";
+        case DiagnosticCode::F_ShippedSymbolDeclaresNoBodyForFormat:
+            return "F_ShippedSymbolDeclaresNoBodyForFormat";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch
@@ -561,6 +580,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksStackReserveControl";
         case DiagnosticCode::K_InvalidStackReserveRequest:
             return "K_InvalidStackReserveRequest";
+        case DiagnosticCode::K_FormatLacksRunpath:
+            return "K_FormatLacksRunpath";
+        case DiagnosticCode::K_InvalidRunpathRequest:
+            return "K_InvalidRunpathRequest";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:
@@ -659,7 +682,7 @@ struct NibbleFamily {
 //
 // CROSS-PLAN AUTHORITY: plan 00 §0.3 carries the same allocation. Claiming a
 // family means updating plan 00 §0.3 and THIS table. ⓘ The third mirror —
-// `NIBBLE_LETTER` in scripts/corpus-census/corpus-census.py, which had drifted
+// `NIBBLE_LETTER` in .harness-config/runner/actions/corpus-census/corpus-census.py, which had drifted
 // identically and was mis-attributing every X_* diagnostic to the parser in the
 // very instrument whose job is to attribute failures to a tier — no longer
 // hand-copies these rows; it parses them out of this table.
@@ -741,12 +764,18 @@ bool isTokenConversionDiagnostic(DiagnosticCode c) noexcept {
             // when the literal becomes a token, not when its extent is found.
             return true;
         case DiagnosticCode::P_UnterminatedString:
-            // ⓘ CLASSIFIED, and today INERT: the diagnostic's span sits at
-            // end-of-buffer (the unterminated frame is swept there), so the
-            // byte-liveness gate only ever sees it as live unless the file ENDS
-            // inside a dead group — in which case the missing-`#endif` refusal
-            // is already the loud one. Placed by measurement all the same: gcc
-            // and clang accept an unterminated `'` inside `#if 0`.
+            // A character constant or string literal with no closer is ONE
+            // preprocessing token from its opener to the end of its line — gcc's
+            // own spelling of it is `token "'a" is not valid` — and only its
+            // CONVERSION fails. ✔MEASURED 2026-09-22 (gcc 13.3.0, clang 18.1.3,
+            // MinGW gcc, MSVC VS 18): all four accept a lone `'` or `"` in a
+            // skipped group, all but MSVC accept one in `#warning` text or an
+            // uninvoked `#define`, and all four refuse one in live code or an
+            // evaluated `#if`. ⓘ This arm was INERT until then — the report sat
+            // at end-of-buffer, because the tokenizer let the literal run across
+            // lines ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]); it is now
+            // reported at the opener, on the literal's own line, which is where
+            // the conversion gate can judge it.
             return true;
         case DiagnosticCode::P_UnterminatedComment:
             // ★ THE ONE DECOMPOSITION FAILURE. C 5.1.1.2 phase 3 replaces each
@@ -754,6 +783,14 @@ bool isTokenConversionDiagnostic(DiagnosticCode c) noexcept {
             // that never closes breaks the decomposition itself and stays loud
             // everywhere. ✔MEASURED: gcc 13.3.0 and clang 18.1.3 BOTH refuse
             // `#if 0` / `/*` / `#endif`, and both accept every other shape.
+            return false;
+        case DiagnosticCode::P_ClosedByEndOfInput:
+            // A body the END OF INPUT closed (P68 round 8) is a fact about the
+            // DECOMPOSITION, like the arm above — where the input stops — not
+            // about converting a token, so it is forwarded, never gated. ⓘ No
+            // shipped C mode declares `closesWithWarning` (C's `//` closes
+            // silently, its `/*` stays refused), so today this arm is reached
+            // only by the gas dialects, which have no preprocessor at all.
             return false;
         default:
             // See the header: an unclassified code is FORWARDED. Nothing outside

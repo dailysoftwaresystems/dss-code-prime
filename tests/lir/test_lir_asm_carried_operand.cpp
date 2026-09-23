@@ -48,6 +48,7 @@
 #include "core/types/type_lattice/core_type.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_node.hpp"
+#include "asm_region_test_support.hpp"
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_asm_descriptor.hpp"
@@ -382,11 +383,27 @@ TEST(LirAsmCarriedOperand, AnInt128InputIsLoadedAsAPairAndNamedInOrder) {
            "fix the template read the value's ADDRESS" << summarize(r);
     MemAccess const lo = pair->first, hi = pair->second;
     EXPECT_FALSE(lo.reg == hi.reg) << "a pair is two registers";
-    auto const readLo = firstReaderAfter(lir, lo.reg, lo.id);
-    auto const readHi = firstReaderAfter(lir, hi.reg, hi.id);
-    ASSERT_TRUE(readLo.has_value() && readHi.has_value())
+    // P68 round 8 part 4: the template's lines are the statement bundle's
+    // BODY, and both loaded halves are slots it READS.
+    auto const bundle = onlyAsmRegion(lir);
+    ASSERT_TRUE(bundle.has_value());
+    EXPECT_EQ(asmSlotRoleOf(*bundle->region, lo.reg), LirAsmOperandRole::Use);
+    EXPECT_EQ(asmSlotRoleOf(*bundle->region, hi.reg), LirAsmOperandRole::Use);
+    Lir const& body = bundle->region->body;
+    auto const lines = asmRegionBodyInsts(*bundle->region);
+    auto const firstReader = [&](LirReg reg) -> std::size_t {
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            for (auto const& o : body.instOperands(lines[i])) {
+                if (o.kind == LirOperandKind::Reg && o.reg == reg) return i;
+            }
+        }
+        return lines.size();
+    };
+    std::size_t const readLo = firstReader(lo.reg);
+    std::size_t const readHi = firstReader(hi.reg);
+    ASSERT_TRUE(readLo < lines.size() && readHi < lines.size())
         << "the template must read both loaded halves";
-    EXPECT_LT(positionOf(lir, *readLo), positionOf(lir, *readHi))
+    EXPECT_LT(readLo, readHi)
         << "`%2` (the first template line) must read the half at +0 and `%H2` "
            "(the second) the half at +8";
 }
@@ -676,10 +693,51 @@ TEST(LirAsmCarriedOperand, MovapsEncodesA128BitXmmOperand) {
         "  *p = v; }\n",
         *target);
     ASSERT_FALSE(r.lirReporter.hasErrors()) << summarize(r);
+    // P68 round 8 part 4: each statement's template is its bundle's BODY.
     std::size_t wide = 0;
-    for (auto const& p : allInsts(r.lir.lir)) {
-        if (r.lir.lir.instOpcode(p.id) != opOf(t, "movaps")) continue;
-        if (lirInstWidthBits(r.lir.lir.instFlags(p.id)) == 128) ++wide;
+    for (LirInstId const b : asmRegionBundles(r.lir.lir)) {
+        LirAsmRegion const& region = *r.lir.lir.instAsmRegion(b);
+        for (LirInstId const i : asmRegionBodyInsts(region)) {
+            if (region.body.instOpcode(i) != opOf(t, "movaps")) continue;
+            if (lirInstWidthBits(region.body.instFlags(i)) == 128) ++wide;
+        }
     }
     EXPECT_GE(wide, 2u) << "both template `movaps` run at 128 bits";
+}
+
+// ── (H) AN ARRAY INPUT IS THE ADDRESS OF ITS FIRST ELEMENT ───────────────────
+// P68 round 8, D-ASM-ARRAY-INPUT-OPERAND-NOT-DECAYED. C 6.3.2.1p3: an array
+// expression's VALUE is a pointer to its first element, and a register-bound
+// input takes its operand's value. ✔MEASURED 2026-09-21: gcc 13.3.0 and clang
+// 18.1.3 hand `"r"(cells)` the address on both processors; the round-7 base
+// carried the ARRAY and refused it ("binds a 16-byte 'Array' value"). The `"m"`
+// input is the CONTROL — a memory form names the OBJECT and keeps it.
+TEST(LirAsmCarriedOperand, AnArrayInputIsTheAddressOfItsFirstElement) {
+    for (auto const& [target, tmpl] :
+         {std::pair{"x86_64", "movq %1, %0"}, std::pair{"arm64", "mov %0, %1"}}) {
+        SCOPED_TRACE(target);
+        auto r = lowerCToLir(
+            std::string{"long f(void) { long cells[2]; long r;\n"
+                        "  cells[0] = 1; cells[1] = 2;\n"
+                        "  __asm__(\""} + tmpl + "\" : \"=r\"(r) : \"r\"(cells));\n"
+            "  return r; }\n",
+            target);
+        ASSERT_FALSE(r.lirReporter.hasErrors()) << summarize(r);
+        Mir const& mir = r.mir.mir;
+        MirInstId const a = theAsm(mir);
+        ASSERT_TRUE(a.valid());
+        auto const ops = mir.instOperands(a);
+        ASSERT_EQ(ops.size(), 1u) << "one source input";
+        EXPECT_EQ(r.model.lattice().interner().kind(mir.instType(ops[0])),
+                  TypeKind::Ptr)
+            << "the input's value is a POINTER — the array decayed";
+        EXPECT_EQ(mir.asmDescriptor(a).inputs[0].carriedBytes, 0u)
+            << "a pointer is register-resident: nothing is carried by address";
+    }
+    // The control: `"m"` keeps the object.
+    auto m = lowerCToLir(
+        "long g(void) { long cells[2]; long r; cells[0] = 1; cells[1] = 2;\n"
+        "  __asm__(\"movq %1, %0\" : \"=r\"(r) : \"m\"(cells)); return r; }\n",
+        "x86_64");
+    ASSERT_FALSE(m.lirReporter.hasErrors()) << summarize(m);
 }

@@ -2,8 +2,8 @@
 
 #include "core/substrate/path_identity.hpp"     // genericSpelling /
                                                 // normalizeKeepingRoot
-#include "core/types/include_path_resolve.hpp"  // isRootedPath — the ONE
-                                                // rooted-path predicate
+#include "core/types/project_sources.hpp"       // resolveManifestPath — THE one
+                                                // base rule for a manifest's paths
 
 #include <algorithm>
 #include <cstddef>
@@ -177,21 +177,21 @@ bool expandGlob(std::string_view pattern,
     // pre-AP6 call byte-identical: `fs::path{"src"}` is walked verbatim, i.e.
     // against the process cwd, exactly as before.
     //
-    // ⚠ `isRootedPath`, NOT `is_absolute()`
-    // ([[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]). ✔MEASURED: a pattern
-    // whose root is a MULTI-SEPARATOR authority answers `is_absolute()` FALSE on
-    // the toolchain that builds DSS. ⇒ the bare test classifies
-    // `\\server\share\src\*.c` as RELATIVE and re-bases it -- exactly the silent
-    // relocation the note above says must not happen. Reported as a
-    // classification defect, which is what was measured; no glob over such a
-    // pattern was run. The ONE exported predicate answers it correctly on every
-    // path model.
-    auto rebase = [&baseDir](fs::path p) {
-        if (baseDir.empty() || isRootedPath(p)) return p;
-        // `baseDir / "."` would leave a "." component that `lexically_relative`
-        // below then has to reason about; the bare `baseDir` is the same
-        // directory with no such component, so say it directly.
-        return p == fs::path{"."} ? baseDir : (baseDir / p);
+    // ★ THROUGH THE ONE BASE RULE, NOT A COPY OF IT
+    // ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]).
+    // `baseDir` is a manifest's directory, so re-basing the pattern's literal
+    // prefix IS resolving a manifest path. A private lambda stood here with the
+    // same semantics — rooted (`isRootedPath`, which keeps a `\\server\share`
+    // authority rooted where `is_absolute()` does not,
+    // [[D-CPP-QUOTE-INCLUDE-UNC-DIRECTORY-UNRESOLVED]]) or empty base ⇒
+    // untouched, `.` ⇒ the base itself — and ✔MEASURED it was the one site a
+    // disabled base rule did not reach: every path field of the manifest-path
+    // matrix went red except the glob arm. The pattern's literal prefix is
+    // re-based here and never pre-joined by the caller, because a project whose
+    // own directory is named `a[1]` must not have that `[` read as a
+    // metacharacter.
+    auto rebase = [&baseDir](fs::path const& p) {
+        return resolveManifestPath(baseDir, p);
     };
 
     // Split the pattern at the LAST '/' at or before its first metacharacter: the

@@ -34,6 +34,7 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
+#include "asm_region_test_support.hpp"
 #include "lowered_lir_fixture.hpp"
 
 #include <gtest/gtest.h>
@@ -72,19 +73,17 @@ namespace {
 }
 
 // Every LIR instruction whose `lirToMir` provenance is `producer`, in module
-// order. ★ PROVENANCE, NOT POSITION: the template's instructions are appended
-// by the shared engine into whichever block is open, so "the asm's own block"
-// is not a place a positional scan can name.
+// order. ★ PROVENANCE, NOT POSITION: "the asm's own block" is not a place a
+// positional scan can name.
 //
-// ⚠ THE ENGINE'S OWN INSTRUCTIONS ARE **NOT** IN THIS SET, and the tests below
-// depend on knowing that. `lowerAsmTemplateToLirRun` appends straight into the
-// `LirBuilder`, so `mir_to_lir`'s `recordSource` never sees them and
-// `lirToMir` carries no entry — a fact `expandInlineAsm`'s own comment states
-// (it is why `lirInstEverEmitted_` has to be set by counting template LINES).
-// What IS in this set is everything the LOWERING emitted for the statement: the
-// per-input materialisation `mov`s, the pinned-output captures, and the
-// trailing fall-through `jmp`. That is enough to name the asm's own BLOCK,
-// which is how the block-level assertions below find their subject.
+// ⚠ THE TEMPLATE'S OWN INSTRUCTIONS ARE **NOT** IN THIS SET: since P68 round 8
+// part 4 they are the BODY of the statement's `asm_region_goto` bundle, a
+// module side structure, and become instructions of the function only when
+// `expandAsmRegions` runs (`asm_region_test_support.hpp` reads both). What IS
+// in this set is everything the LOWERING emitted for the statement into the
+// function: the per-input materialisation `mov`s and the bundle itself. That is
+// enough to name the asm's own BLOCK, which is how the block-level assertions
+// below find their subject.
 [[nodiscard]] std::vector<LirInstId>
 instsFrom(MirToLirResult const& r, MirInstId producer) {
     std::vector<LirInstId> out;
@@ -154,9 +153,11 @@ terminatorsIn(Lir const& lir, TargetSchema const& t, LirBlockId b) {
 //
 // `jne %l[hit]` is a CONDITIONAL branch: the engine's `buildCondBr` names the
 // bound label as the taken target and MINTS an anonymous block for the false
-// edge, leaving it open. The fall-through edge of the `asm goto` is then a
-// branch `mir_to_lir` must emit into that open block — and if it does not, the
-// code after the statement is reached by nothing at all.
+// edge, leaving it open. That open block is the END of the template, so it
+// falls into the statement's fall-through — and if that edge were lost, the
+// code after the statement would be reached by nothing at all. (P68 round 8
+// part 4: the edge is the bundle body's branch to `exit`, and the expansion
+// makes it a real branch to the fall-through successor.)
 TEST(LirAsmGotoLabels, ABranchingTemplateGetsBothTheLabelEdgeAndTheFallThrough) {
     auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
@@ -189,50 +190,71 @@ TEST(LirAsmGotoLabels, ABranchingTemplateGetsBothTheLabelEdgeAndTheFallThrough) 
     LirBlockId const asmBlock = blockOf(lir, mine.front());
     ASSERT_TRUE(asmBlock.valid());
 
-    // ── (a) THE TEMPLATE'S CONDITIONAL BRANCH SEALS THE ASM'S OWN BLOCK WITH
-    // TWO SUCCESSORS. A label placeholder that had resolved to a REGISTER
-    // instead (the pre-P20 shape, where `AsmOperandBinding` was the only
-    // binding kind) would leave this block with no terminator at all.
+    // ── (a) ★ P68 round 8 part 4: THE STATEMENT ENDS ITS BLOCK AS ONE BUNDLE.
+    // The block's terminator is the `asm_region_goto` instruction, and its
+    // successors ARE the statement's edges, in MIR's layout — the label, then
+    // the fall-through — two DIFFERENT blocks. (The template's own `jne` is in
+    // the bundle's body, below; it becomes this block's terminator only when
+    // the expansion runs.)
     LirInstId const term = lir.blockTerminator(asmBlock);
     ASSERT_TRUE(term.valid()) << "the `asm goto` block must be sealed";
-    EXPECT_NE(lir.instOpcode(term), jmp)
-        << "`jne %l[hit]` is CONDITIONAL — sealing with an unconditional jump "
-           "would choose an edge the programmer did not write";
+    EXPECT_EQ(lir.instOpcode(term), opOf(*L.target, "asm_region_goto"))
+        << "the statement's block ends with its bundle";
+    EXPECT_EQ(terminatorsIn(lir, *L.target, asmBlock), 1u);
     auto const asmSuccs = lir.blockSuccessors(asmBlock);
     ASSERT_EQ(asmSuccs.size(), 2u)
-        << "the template's conditional branch records BOTH the taken label and "
-           "the block minted for its false edge";
-    EXPECT_EQ(terminatorsIn(lir, *L.target, asmBlock), 1u);
-
-    // ── (b) ★★★ THE FALL-THROUGH BRANCH EXISTS, AND IT IS THIS STATEMENT'S.
-    // `buildCondBr` minted the false-edge block and OPENED it, leaving it
-    // EMPTY: without a branch emitted there, the statements after the asm are
-    // reachable from nothing. Provenance is what makes this an assertion rather
-    // than an observation — an unconditional `jmp` somewhere in the function
-    // proves nothing, but one whose `lirToMir` is the `asm goto` terminator can
-    // only have come from `sealAsmGotoEdges`.
-    LirBlockId const fallBlock = asmSuccs[1];
-    LirInstId const  fallTerm  = lir.blockTerminator(fallBlock);
-    ASSERT_TRUE(fallTerm.valid())
-        << "the block the template's conditional branch minted for its false "
-           "edge is the `asm goto` FALL-THROUGH, and it must be sealed";
-    EXPECT_EQ(lir.instOpcode(fallTerm), jmp)
-        << "the fall-through edge is an unconditional branch onward";
-    ASSERT_LT(fallTerm.v, L.lir.lirToMir.size());
-    EXPECT_EQ(L.lir.lirToMir[fallTerm.v].v, g->v)
-        << "the fall-through branch must be attributed to the `asm goto` "
-           "statement — anything else means it came from elsewhere and this "
-           "assertion is measuring the wrong instruction";
-    EXPECT_EQ(terminatorsIn(lir, *L.target, fallBlock), 1u);
-
-    // ── (c) THE TWO EDGES GO TO DIFFERENT BLOCKS. Binding both to one block
-    // would satisfy (a) and (b) and still be a miscompile.
-    auto const fallSuccs = lir.blockSuccessors(fallBlock);
-    ASSERT_EQ(fallSuccs.size(), 1u);
-    EXPECT_NE(asmSuccs[0].v, fallSuccs[0].v)
+        << "the label edge and the fall-through edge";
+    EXPECT_NE(asmSuccs[0].v, asmSuccs[1].v)
         << "the label edge and the fall-through edge must reach DIFFERENT "
            "blocks — one target for both is the branch the programmer did not "
            "write";
+    LirAsmRegion const* region = lir.instAsmRegion(term);
+    ASSERT_NE(region, nullptr);
+    ASSERT_EQ(region->gotoTargets.size(), 1u) << "one label, one stub";
+
+    // ── (b) THE TEMPLATE'S CONDITIONAL BRANCH, IN THE BODY: taken → the
+    // label's stub, false edge → the block `buildCondBr` minted, which runs off
+    // the end of the template into `exit` (the fall-through) by a branch the
+    // template did not write.
+    Lir const& body = region->body;
+    std::optional<LirBlockId> condBlock;
+    for (LirBlockId const b : asmRegionBodyBlocks(*region)) {
+        if (body.blockSuccessors(b).size() == 2) condBlock = b;
+    }
+    ASSERT_TRUE(condBlock.has_value())
+        << "`jne %l[hit]` is a conditional branch in the template's body";
+    auto const bodySuccs = body.blockSuccessors(*condBlock);
+    EXPECT_EQ(bodySuccs[0].v, region->gotoTargets[0].v)
+        << "the taken edge goes to the label's stub";
+    LirBlockId const falseEdge = bodySuccs[1];
+    ASSERT_EQ(body.blockSuccessors(falseEdge).size(), 1u);
+    EXPECT_EQ(body.blockSuccessors(falseEdge)[0].v, region->exit.v)
+        << "the template's false edge is its end, which falls into the rest of "
+           "the program";
+    std::uint32_t const falseIdx = falseEdge.v - body.funcBlockAt(body.funcAt(0), 0).v;
+    EXPECT_EQ(region->syntheticFallthrough[falseIdx], 1u)
+        << "falling off the end is a branch the template did not write";
+
+    // ── (c) ★ THE EMITTED SHAPE: after the expansion the template's `jne` is
+    // a real conditional branch of the function with two DIFFERENT successors,
+    // and no bundle survives.
+    auto const expanded = lirThroughAsmExpansion(lir, *L.target);
+    ASSERT_TRUE(expanded.has_value());
+    EXPECT_TRUE(asmRegionBundles(*expanded).empty());
+    auto const jcc = opOf(*L.target, "jcc");
+    std::uint32_t jccCount = 0;
+    for (std::uint32_t fi = 0; fi < expanded->moduleFuncCount(); ++fi) {
+        LirFuncId const f = expanded->funcAt(fi);
+        for (std::uint32_t bi = 0; bi < expanded->funcBlockCount(f); ++bi) {
+            LirBlockId const b = expanded->funcBlockAt(f, bi);
+            if (expanded->instOpcode(expanded->blockTerminator(b)) != jcc) continue;
+            ++jccCount;
+            auto const es = expanded->blockSuccessors(b);
+            ASSERT_EQ(es.size(), 2u);
+            EXPECT_NE(es[0].v, es[1].v);
+        }
+    }
+    EXPECT_EQ(jccCount, 1u) << "the template's one conditional branch";
 }
 
 // ── ARM 2: AN UNCONDITIONAL TEMPLATE SEALS THE BLOCK ITSELF ──────────────────
@@ -241,8 +263,8 @@ TEST(LirAsmGotoLabels, ABranchingTemplateGetsBothTheLabelEdgeAndTheFallThrough) 
 // trailing branch here would hit `LirBuilder::appendInst_`'s *"block already
 // terminated"* fatal — a process kill on a legal program — so the stated answer
 // is to emit nothing. This arm is the one that pins that answer; ARM 1 pins the
-// opposite one, and the two together are why `openBlockIsTerminated` is asked
-// rather than assumed.
+// opposite one, and the two together are why the statement's packaging asks
+// `openBlockIsTerminated` of its body builder rather than assuming.
 TEST(LirAsmGotoLabels, AnUnconditionalTemplateSealsItsOwnBlockAndGetsNoSecondBranch) {
     auto L = lowerCToLir(
         "int f(int x){ int r; r = 0;\n"
@@ -265,29 +287,51 @@ TEST(LirAsmGotoLabels, AnUnconditionalTemplateSealsItsOwnBlockAndGetsNoSecondBra
     LirBlockId const asmBlock = blockOf(lir, mine.front());
     ASSERT_TRUE(asmBlock.valid());
 
-    // ★ THE WHOLE ARM IN ONE NUMBER: exactly ONE terminator. The template's own
-    // `jmp` sealed the block, and a second branch emitted for the (unreachable)
-    // fall-through would hit `LirBuilder::appendInst_`'s *"block already
-    // terminated"* fatal — i.e. this assertion can only fail by the process
-    // dying first, which is precisely why the lowering has to ASK rather than
-    // assume.
+    // ★ P68 round 8 part 4: the statement ends its block as ONE bundle, whose
+    // successors are MIR's [label, fall-through] — a CONSERVATIVE edge set for
+    // allocation (a path the template never takes only keeps a value alive
+    // longer). What the program's own text says is in the BODY: the template's
+    // `jmp` is its entry block's terminator, it goes to the label's stub, and
+    // NOTHING in the body reaches `exit` — no fall-through branch exists, so the
+    // expansion emits none.
     EXPECT_EQ(terminatorsIn(lir, *L.target, asmBlock), 1u);
     LirInstId const term = lir.blockTerminator(asmBlock);
     ASSERT_TRUE(term.valid());
-    EXPECT_EQ(lir.instOpcode(term), jmp)
+    EXPECT_EQ(lir.instOpcode(term), opOf(*L.target, "asm_region_goto"));
+    LirAsmRegion const* region = lir.instAsmRegion(term);
+    ASSERT_NE(region, nullptr);
+    ASSERT_EQ(region->gotoTargets.size(), 1u);
+    Lir const& body = region->body;
+    auto const blocks = asmRegionBodyBlocks(*region);
+    ASSERT_EQ(blocks.size(), 1u) << "a one-line unconditional template is one block";
+    LirInstId const tj = body.blockTerminator(blocks[0]);
+    EXPECT_EQ(body.instOpcode(tj), jmp)
         << "`jmp %l[done]` is the template's own unconditional branch";
-    EXPECT_EQ(lir.blockSuccessors(asmBlock).size(), 1u)
-        << "an unconditional branch has ONE successor — the fall-through edge "
-           "of this `asm goto` is unreachable by the program's own text, and "
-           "recording it as a LIR successor would claim a path that does not "
-           "exist";
+    ASSERT_EQ(body.blockSuccessors(blocks[0]).size(), 1u);
+    EXPECT_EQ(body.blockSuccessors(blocks[0])[0].v, region->gotoTargets[0].v);
+    for (auto const f : region->syntheticFallthrough) {
+        EXPECT_EQ(f, 0u) << "the template never falls off its end";
+    }
 
-    // ⚠ AND NO INSTRUCTION OF THIS STATEMENT MAY FOLLOW THE TERMINATOR. The
-    // trailing branch is the one this lowering would have emitted; asserting
-    // the terminator is the block's LAST instruction is how "it emitted
-    // nothing" is stated as a property rather than as a count.
-    EXPECT_EQ(lir.blockInstAt(asmBlock, lir.blockInstCount(asmBlock) - 1).v,
-              term.v);
+    // ⚠ AND AFTER THE EXPANSION NO BRANCH FOLLOWS IT: the template's `jmp` is
+    // the terminator of the block it ends, with ONE successor.
+    auto const expanded = lirThroughAsmExpansion(lir, *L.target);
+    ASSERT_TRUE(expanded.has_value());
+    EXPECT_TRUE(asmRegionBundles(*expanded).empty());
+    std::uint32_t oneWayJmps = 0;
+    for (std::uint32_t fi = 0; fi < expanded->moduleFuncCount(); ++fi) {
+        LirFuncId const f = expanded->funcAt(fi);
+        for (std::uint32_t bi = 0; bi < expanded->funcBlockCount(f); ++bi) {
+            LirBlockId const b = expanded->funcBlockAt(f, bi);
+            LirInstId const t = expanded->blockTerminator(b);
+            EXPECT_EQ(terminatorsIn(*expanded, *L.target, b), 1u);
+            if (expanded->instOpcode(t) == jmp
+                && expanded->blockSuccessors(b).size() == 1u) {
+                ++oneWayJmps;
+            }
+        }
+    }
+    EXPECT_GE(oneWayJmps, 1u) << "the template's `jmp` survives as a real branch";
 }
 
 // ── ARM 3: ★ RESULT PIECE 0 — THE SILENT ONE ─────────────────────────────────
@@ -325,23 +369,20 @@ TEST(LirAsmGotoLabels, ResultPieceZeroIsPublishedByTheExpansionNotByTheCallConve
         << firstError(L.lirReporter);
 
     Lir const& lir = L.lir.lir;
-    // Anti-vacuity: the template really lowered — its `movl $7, %0` is here.
+    // Anti-vacuity: the template really lowered — its `movl $7, %0` is in the
+    // statement's bundle BODY (P68 round 8 part 4).
     auto const mov = opOf(*L.target, "mov");
+    auto const bundle = onlyAsmRegion(lir);
+    ASSERT_TRUE(bundle.has_value());
+    Lir const& body = bundle->region->body;
     bool sawTemplateMov = false;
     LirReg templateResult = InvalidLirReg;
-    for (std::uint32_t fi = 0; fi < lir.moduleFuncCount(); ++fi) {
-        LirFuncId const f = lir.funcAt(fi);
-        for (std::uint32_t bi = 0; bi < lir.funcBlockCount(f); ++bi) {
-            LirBlockId const b = lir.funcBlockAt(f, bi);
-            for (std::uint32_t ii = 0; ii < lir.blockInstCount(b); ++ii) {
-                LirInstId const id = lir.blockInstAt(b, ii);
-                if (lir.instOpcode(id) != mov) continue;
-                for (auto const& o : lir.instOperands(id)) {
-                    if (o.kind == LirOperandKind::ImmInt && o.immInt32 == 7) {
-                        sawTemplateMov = true;
-                        templateResult = lir.instResult(id);
-                    }
-                }
+    for (LirInstId const id : asmRegionBodyInsts(*bundle->region)) {
+        if (body.instOpcode(id) != mov) continue;
+        for (auto const& o : body.instOperands(id)) {
+            if (o.kind == LirOperandKind::ImmInt && o.immInt32 == 7) {
+                sawTemplateMov = true;
+                templateResult = body.instResult(id);
             }
         }
     }
@@ -351,6 +392,9 @@ TEST(LirAsmGotoLabels, ResultPieceZeroIsPublishedByTheExpansionNotByTheCallConve
     EXPECT_TRUE(templateResult.valid())
         << "the template's `movl $7, %0` must DEFINE the operand's register — "
            "that register IS result piece 0";
+    EXPECT_EQ(asmSlotRoleOf(*bundle->region, templateResult),
+              LirAsmOperandRole::EarlyDef)
+        << "the `\"=&r\"` output is the statement's slot written EARLY";
 
     EXPECT_EQ(countOp(lir, opOf(*L.target, "ret_piece")), 0u)
         << "an `asm goto` output must be read out of the register its "

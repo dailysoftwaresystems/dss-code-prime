@@ -1312,6 +1312,23 @@ bool TypeInterner::fnIsVariadic(TypeId id) const {
     return sc.size() >= 2 && sc[1] != 0;
 }
 
+// See the header: the declared parameters up to the first one of UNQUALIFIED void.
+// `kind()` sees through a qualifier skin, so the raw `qualifierBits` is what tells
+// a `volatile void` (not the end) from a plain `void` (the end).
+GuardedSpan<TypeId> TypeInterner::fnArgumentParams(TypeId id) const {
+    auto const ps = fnParams(id);   // fatal on a non-FnSig, like its siblings
+    for (std::size_t i = 0; i < ps.size(); ++i) {
+        TypeId const p = ps[i];
+        if (p.valid() && kind(p) == TypeKind::Void && qualifierBits(p) == 0)
+            return ps.first(i);
+    }
+    return ps;
+}
+
+bool TypeInterner::fnArgumentsVariadic(TypeId id) const {
+    return fnIsVariadic(id) && fnArgumentParams(id).size() == fnParams(id).size();
+}
+
 // ── THE OBJECT-REPRESENTATION PROJECTION (D-CSUBSET-NULLPTR-T-DECLARABLE) ──
 //
 // See the header for the contract. Three things about the SHAPE of this function

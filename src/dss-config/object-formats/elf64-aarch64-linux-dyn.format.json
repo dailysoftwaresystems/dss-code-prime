@@ -39,6 +39,9 @@
   "$unnamedBitFieldAlignmentComment": "D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: an UNNAMED bit-field DOES contribute its declared type's alignment. MEASURED P45, gcc 13.3.0 and clang 18.1.3 agreeing per target: `struct { char c; unsigned :0; char d; }` is 8/4 here, against 5/1 on the x86_64 ELF and every Mach-O format -- SAME `gnu_packed` strategy, opposite answer, which is why this is its own key and not a strategy row.  ~ The contribution is the NATURAL alignment and is UNCAPPED by `#pragma pack`: MEASURED, `#pragma pack(1) struct { char c; unsigned long long :0; char d; }` is 16/8, the same uncapped quantity that decides the cursor break. ~ dss computed this ABI's answer for ALL formats before the key existed, so THIS document is the one that was already right; the key is what stops the fix for the others from breaking it.",
   "unnamedBitFieldAlignment": "contributes",
 
+  "$longDoubleFormatComment": "P68 round 8 part 4 (D-CONFIG-LONG-DOUBLE-REFUSED-ON-PIE-SHARED-AND-DLL-FORMATS): AAPCS64 Linux `long double` is IEEE binary128, 16/16, exactly as on the exec, relocatable and static-library siblings - a property of the platform's ABI, not of the image kind (gcc and clang build the same source `-shared -fPIC` and `-pie`). This document declared no axis until this change, so every `long double` was refused here (S_LongDoubleFormatUndeclared) while its siblings compiled it. ✔MEASURED 2026-09-21 in scratch with only this key added, and again on the tree 2026-09-22: DSS `.so`s exporting `long double` functions and a `long double` global, called by gcc 13.3.0 and clang 18.1.3 mains at -O0/-O2 and by a DSS main, exit 42 on x86_64 and aarch64 (24 of 24 reference cells); PIEs with `long double` statics, a relocated pointer table and a function pointer exit 42, debug and release (`examples/c/long_double_across_a_dynamic_library`, `examples/c/long_double_in_a_pie`). The cross-tier pin `ObjectFormatFamilySymmetry.EveryImageKindOfOnePlatformDeclaresOneLongDoubleFormat` keeps the image kinds of one platform from drifting apart again.",
+  "longDoubleFormat": "ieee128",
+
   "$externCallDispatchComment": "Same call-site shape as the exec image: the walker synthesizes a 16-byte ARM64 PLT stub (ADRP+LDR+BR through the GOT slot, GLOB_DAT eager-bound) per extern FUNCTION, and the call site is a plain direct `BL` to the stub -- pc-relative, so the code needs no fixup under the ET_DYN load slide. D-FFI-EXTERN-CALL-DISPATCH / D-LK6-8.",
   "$runtimeLibrariesComment": "D-CSUBSET-PACKED-ATOMIC-MEMBER: this format's ROLE -> IMAGE table. It did not exist here before P53 because no spine block on this flavor named a role; `atomicsRuntime` below is the first, and the loader REFUSES a row no block names (inert config), so the two land together or not at all.",
   "runtimeLibraries": [
@@ -79,6 +82,9 @@
   },
   "$staticInitializersComment": "D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN: THIS FORMAT DECLARES NO STATIC-INITIALIZER CHANNEL, AND THE ABSENCE IS THE ANSWER RATHER THAN AN OMISSION -- recorded here so nobody 'completes' the table by adding one.\\nThis is an IMAGE flavor that is NOT an EXEC flavor: `isExecFlavor()` is false, so DSS injects no entry trampoline and there is no DSS-synthesized entry to call anything. Nor will the platform: ld.so runs `DT_INIT_ARRAY`, a DYNAMIC TAG the ELF writer does not emit (MEASURED on a DSS image -- `readelf -d` lists eleven tags and none is an init tag), and a PE DLL's initializers run from `DllMain`/`_DllMainCRTStartup`, which DSS does not synthesize either.\\nSo both runners would be FALSE here, and declaring the SECTIONS with no runner would emit a table nothing walks -- the silent shape this anchor exists to remove. With nothing declared, a program that schedules an initializer for this format is REFUSED by the linker, naming the format and the remedy. Making it work needs a real capability first (emit DT_INIT_ARRAY/DT_INIT_ARRAYSZ, or synthesize a DllMain), not a config row. Contrast macho64-*-dylib, which DOES declare `imageLoader`: dyld really does run `__mod_init_func` in a dylib, so that arm is a capability DSS has.",
 
+
+  "$runpathComment": "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: WHERE an image of this format records the directories its loader searches for the libraries it needs (CLI --rpath, project `runpaths`). MEASURED against gcc 13.3 + GNU ld 2.42 and clang 18 + ld.lld 18: ONE .dynamic entry, DT_RUNPATH (29) by default, whose value is the .dynstr offset of every requested directory joined by ':' in command-line order, $ORIGIN stored verbatim for ld.so to expand -- on an executable, a PIE and a shared object alike. An exact duplicate is dropped, as GNU ld drops it. `origin` is how THIS format spells the directory of the image that carries the path: a leading portable ${ORIGIN} is written as it (ld.so(8): $ORIGIN 'expands to the directory containing the program or shared object').",
+  "runpath": { "carrier": "elf-dynamic-entry", "dynamicTag": 29, "separator": ":", "origin": "$ORIGIN" },
 
   "sections": [
     {
@@ -188,6 +194,12 @@
       "name": "R_AARCH64_ABS64",
       "kind": 4,
       "nativeId": 257
+    },
+    {
+      "$comment": "D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB: the 64-bit PC-relative data word (S + A - P, P = the word itself) that the linker's long-range veneer body carries past the ADRP body's +-4 GiB. kind 10 = arm64's `prel64`. The walker APPLIES it inside `.text` and never emits it: a veneer exists only in an image. PC-relative, so the load slide leaves it correct and no dynamic relocation is needed — which is why this row is legal in `.text` where abs64 is not. R_AARCH64_PREL64 = 260 is AAELF64's own type for this word, and the one GNU ld 2.42 relocates its long-branch stub's literal through.",
+      "name": "R_AARCH64_PREL64",
+      "kind": 10,
+      "nativeId": 260
     }
   ]
 }

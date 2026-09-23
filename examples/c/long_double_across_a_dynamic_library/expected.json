@@ -1,0 +1,65 @@
+{
+  "$comment": "`long double` across a DYNAMIC-LIBRARY boundary: `dsslib.c` — `long double` functions and a `long double` global it hands out the address of — is built as the target's shared library, and `main.c` calls into it (exit 11-12 names the round trip that failed). The PE arm is the one this example exists for: `pe64-x86_64-windows-dll` declared no `longDoubleFormat`, so `long double` was REFUSED in a DLL (`S_LongDoubleFormatUndeclared`) while the same source built as an exe or a static library compiled — the ABI (`long double` IS `double` on MSVC x64) does not depend on the image kind (D-CONFIG-LONG-DOUBLE-REFUSED-ON-PIE-SHARED-AND-DLL-FORMATS). ✔MEASURED 2026-09-21: the P68 round-8 base refused `dsslib.c` for the DLL at debug and release; with the axis declared, the DSS-built DLL and exe run to 42 at both configurations. The two ELF arms (`-exec` main + `-dyn` library, x86_64 natively and aarch64 under qemu, the library found through `LD_LIBRARY_PATH`) landed with the ELF shared-object and PIE documents' axis in P68 round 8 part 4: ✔MEASURED 2026-09-22, the DSS-built `.so` and main run to 42 on both processors at debug and release, and in scratch DSS `.so`s called by gcc 13.3.0 and clang 18.1.3 mains at -O0/-O2 ran to 42 as well (the PIE half is `examples/c/long_double_in_a_pie`). The macho64 arm64 arm is BUILD-ONLY (`runOn: []`), as in `dynlib_resolve_roundtrip`: its `.dylib` has declared the axis since the family-symmetry test found it missing. ★ The `release` arm: the library's arithmetic reads the global through the library's own code after `main` rewrites it through the returned address, so nothing can be folded across the boundary.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:pe64-x86_64-windows-dll",
+          "artifact": "dsslib.dll"
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "loaderSearchPathVariable": "LD_LIBRARY_PATH",
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-dyn",
+          "artifact": "dsslib.so"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "loaderSearchPathVariable": "LD_LIBRARY_PATH",
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:elf64-aarch64-linux-dyn",
+          "artifact": "dsslib.so"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "arm64:macho64-arm64-darwin-dylib",
+          "artifact": "dsslib.dylib"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

@@ -179,8 +179,10 @@ struct DSS_EXPORT SymbolRecord {
     // 'main'`, and leaving this nullopt on protos is what reproduces that.
     std::optional<EntryMaterialization> entryVerb;
     // SE4 const-correctness: set when the decl's `constMarker` token was
-    // found in the type subtree. A reassignment of a const symbol emits
-    // S_ConstViolation.
+    // found in the type subtree — or, since P68 round 8, when the TYPEDEF its
+    // head names is itself const-qualified (`typedef const int CI; CI x;`),
+    // which the semantic tier applies once that head is resolved (Pass 1.5).
+    // A reassignment of a const symbol emits S_ConstViolation.
     bool            isConst = false;
     // ★★ P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): `isConst` above answers ONE
     // question — is the declared OBJECT const — and that is why const enforcement
@@ -206,6 +208,11 @@ struct DSS_EXPORT SymbolRecord {
     // const-lvalue check then makes NO claim about the deeper levels rather than
     // inventing "unqualified". A missed diagnostic is the safe direction; a
     // fabricated one refuses correct code.
+    //
+    // ⓘ A head that NAMES A TYPEDEF contributes the typedef's own spine beneath
+    // this declarator's levels (P68 round 8), so `CI *p` carries the pointee
+    // const `const int *p` carries; a typedef making no claim makes this spine
+    // none either.
     //
     // ⓘ Level 0 is deliberately NOT read by the const-lvalue check — `isConst`
     // above stays the sole answer there, so every verdict that existed before P48
@@ -322,7 +329,7 @@ struct DSS_EXPORT SymbolRecord {
     // ExternGlobal node suppressed). Two non-defining declarations are idempotent;
     // two definitions still collide (S_RedeclaredSymbol). Default false.
     bool            isExternDeclaration = false;
-    // c33 (D-CSUBSET-TENTATIVE-DEFINITION): TRUE iff this symbol was minted from a
+    // c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): TRUE iff this symbol was minted from a
     // file-scope OBJECT declaration with NO initializer — a TENTATIVE DEFINITION
     // (C 6.9.2). Like `extern`/proto it is NON-DEFINING for redeclaration-merge
     // purposes: it merges with a later real (initialized) definition (the def wins
@@ -430,7 +437,7 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
-    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff this FUNCTION symbol is declared
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): TRUE iff this FUNCTION symbol is declared
     // `__attribute__((noinline))` (GNU; no C11/C23 standard spelling). Set at
     // Pass-1.5 declarator resolution from the `attributeSemantics` table's
     // `noInline` effect verb — NOT from a hardcoded name test — gated on the
@@ -633,6 +640,39 @@ struct DSS_EXPORT SymbolRecord {
     // B/C). Orthogonal to binding/visibility (a file-scope thread_local
     // keeps external linkage). Default false.
     bool            isThreadLocal = false;
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the machine register
+    // a GNU LOCAL REGISTER VARIABLE names — the asm label of a block-scope
+    // object whose declaration carries a `{asmLabelNamesRegister: true}`
+    // specifier (C's `register`), exactly as the source spelled it (`"x8"`,
+    // `"w9"`, `"eax"`), already RESOLVED against the target's register table
+    // (an unknown name is refused at the declaration and leaves this empty).
+    // EMPTY for every other symbol. Its ONE consumer is the inline-asm operand
+    // binding: a register-form operand whose value expression IS this object is
+    // pinned to this register (CST→HIR writes it into the operand's
+    // `fixedRegister`) — 📄 GCC: *"The only supported use for this feature is to
+    // specify registers for input and output operands when calling Extended
+    // asm."* Everywhere else the object is an ordinary automatic.
+    std::string     asmRegister;
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED, C 6.5.3.2p1): TRUE iff
+    // this object's declaration carries a `{addressNotTakeable: true}`
+    // specifier (C's `register`), so it may not be the operand of unary `&` —
+    // nor bound to a MEMORY-form asm operand, which is the same request made
+    // through a constraint letter (GNU: *address of register variable
+    // requested*). Default false.
+    bool            addressNotTakeable = false;
+    // ★★ P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): TRUE iff
+    // this GNU local register variable (`asmRegister` non-empty) is NEVER
+    // WRITTEN — it has no initializer, and every use of it is the bare value of
+    // an asm INPUT operand — so the only value it ever has is its register's
+    // content. CST→HIR then binds such an input AS IT STANDS
+    // (`HirInlineAsmOperand::registerAsItStands`): nothing is copied into the
+    // register. C 6.3.2.1p2 makes any read of the object undefined, so no
+    // defined program can tell; gcc gives it exactly this meaning (✔MEASURED
+    // 2026-09-19: `register unsigned long sp asm("sp")` read on `"r"` returns the
+    // stack pointer at -O0/-O2 on both targets, where clang copies the
+    // indeterminate slot IN and x86-64 -O0 dies). Computed after Pass 2, from
+    // the reverse use-index, so a use anywhere in the function disqualifies it.
+    bool            denotesItsRegister = false;
     // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2p3): TRUE iff
     // this identifier has INTERNAL linkage — its declaration carries a
     // `{staticStorage: true}` specifier (the SAME `linkageSpecifiers` facet the
@@ -1063,7 +1103,7 @@ public:
     // is a fact about the ALGORITHM rather than about the box a test ran on. A
     // wall-clock assertion would be sized on the machine that wrote it and would red
     // on the slowest leg that runs it, naming the wrong event
-    // (`scripts/check-wall-clock-in-tests/` refuses new ones for that reason).
+    // (`.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones for that reason).
     //
     // ⚠ BOTH ARE LOAD-BEARING AND NEITHER SUBSTITUTES FOR THE OTHER. With only
     // `nodeVisits`, "the derived-type record made this free" and "the type is no

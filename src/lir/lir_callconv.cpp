@@ -3075,6 +3075,30 @@ functionNamesPhysicalReg(Lir const& src, LirFuncId fn,
     return false;
 }
 
+// `functionNamesPhysicalReg`, plus every register an instruction's own
+// constraint set DECLARES it clobbers (an inline-asm statement's clobber list,
+// resolved to ordinals by `mir_to_lir`). The link-register fold asks this: a
+// clobber list is the source's statement that the template writes a register,
+// and it is the one written fact that names no operand.
+[[nodiscard]] bool
+functionNamesOrClobbersPhysicalReg(Lir const& src, LirFuncId fn,
+                                   std::uint32_t ordinal) {
+    if (functionNamesPhysicalReg(src, fn, ordinal)) return true;
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const n = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            auto const* c = src.instRegConstraints(src.blockInstAt(blk, i));
+            if (c == nullptr) continue;
+            for (std::uint16_t const o : c->clobberedOrdinals) {
+                if (o == ordinal) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // A general register DEAD at both function boundaries by construction: the
 // first caller-saved one (so clobbering it owes the caller nothing) outside
 // every ABI role that can be live there — the argument registers (holding
@@ -3381,7 +3405,29 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // functions keep their minimal frame. Fully config-driven: an
     // architecture with no `cc.linkRegister` (x86_64 — return address is
     // on the stack) takes the no-op path; there is no arch/format branch.
-    if (hasCalls && cc.linkRegister.has_value()) {
+    //
+    // ★★★ AND A LEAF WHOSE BODY PUTS A VALUE IN THE LINK REGISTER ITSELF,
+    // which "has a call" never saw (P68 round 8,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). The register is out of
+    // every allocatable pool, so only a register the SOURCE named reaches it —
+    // an inline-asm operand bound to it (`register long v asm("x30") = 40;`),
+    // a template that writes it by name, or a clobber list that says it does.
+    // ✔MEASURED 2026-09-19, arm64 ELF under qemu: that binding in a leaf
+    // `main` compiled rc=0 and died with SIGSEGV (exit 139) at debug AND
+    // release — the pin's `mov x30, x15` replaced the return address and the
+    // epilogue's `ret` jumped to 40. gcc 13.3.0 and clang 18.1.3 both save
+    // x30 in that leaf and return 42 at -O0 and -O2.
+    // ⚠ "NAMES", NOT "WRITES": the predicate also counts a READ (`mov x0,
+    // x30`), which needs no save. Deliberately so — a multi-destination
+    // template line (`ldp x29, x30, [sp]`) carries its second destination as
+    // an OPERAND, and the one-store over-approximation is the direction a
+    // wrong guess must fail in. A body that names no link register keeps its
+    // frame byte for byte.
+    bool const bodyNamesLinkRegister =
+        cc.linkRegister.has_value()
+        && functionNamesOrClobbersPhysicalReg(src, fn,
+                                              cc.linkRegister->ordinal);
+    if ((hasCalls || bodyNamesLinkRegister) && cc.linkRegister.has_value()) {
         LirReg const lr =
             makePhysicalReg(cc.linkRegister->ordinal, LirRegClass::GPR);
         bool alreadySaved = false;
@@ -3685,9 +3731,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // that places the CALLER's write. A callee's `arg` ops are all NAMED (varargs
     // are reached through `va_arg`, never an `arg`), so this walk uses the
     // named-scalar axis only; a stacked by-value aggregate arrives through
-    // `RecvByValueStackParam` instead and HIR→MIR refuses the interleaving of the
-    // two (a stacked scalar after a stacked aggregate, or an aggregate straddle
-    // after a stacked scalar), so the two sitings cannot collide.
+    // `RecvByValueStackParam` instead, sited by HIR→MIR's byte cursor. The two
+    // sitings cannot collide because this walk only ever sees the stacked scalars
+    // that PRECEDE every stacked aggregate — on that prefix HIR→MIR's cursor makes
+    // the same `StackArgPackingRules` calls this one does, so an aggregate after
+    // them lands where the caller put it — and a stacked scalar that FOLLOWS a
+    // stacked aggregate is read by HIR→MIR at its own byte offset
+    // (`RecvByValueStackParam` + a load), never through an `arg` this cursor would
+    // place without seeing the aggregate (P68 round 8,
+    // D-MIR-STACKED-SCALAR-AFTER-A-STACKED-AGGREGATE-REFUSED; it used to refuse
+    // both interleavings).
     StackArgCursor incomingStackArgs{cc, widthForClass(schema, LirRegClass::GPR)};
 
     // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the per-alloca FRAME OFFSET

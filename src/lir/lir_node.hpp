@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -676,6 +677,59 @@ lirRegConstraintIndexForHandle(std::uint32_t handle) noexcept {
     return handle - 1;
 }
 
+// ── per-instruction ASM-REGION pool (P68 round 8 part 4) ─────────────────
+//
+// ★★★ ONE INLINE-ASM STATEMENT IS ONE INSTRUCTION WHILE REGISTERS ARE
+// ALLOCATED. A template used to be lowered into the enclosing function as one
+// LIR instruction per template line, each its own allocation point — so the
+// allocator's spill and reload code landed BETWEEN the template's own
+// instructions (✔MEASURED 2026-09-21: x86_64 release, six inputs, 29 lines and
+// 15 memory accesses between two `nop` delimiters of a 7-line template). An
+// `ldaxr`/`stlxr` pair with a store between them never succeeds, so such a
+// template under register pressure LOOPS FOREVER. The statement is now an
+// `asm_region` bundle: its operands are the template's operand registers, its
+// BODY — the template lowered by the shared engine into a scratch one-function
+// module — lives HERE, and `expandAsmRegions` (`lir_asm_region.hpp`) replaces
+// the bundle with the body once allocation is final.
+//
+// Same by-index, identity-preserving, 1-based-handle discipline as
+// `LirRegConstraintPool`: carried across every rebuild by
+// `lir_pass_util::copyModuleSideStructures` + `carryInstSideData`, and a
+// dropped handle is a pool entry no instruction references, which
+// `checkSideStructureIntegrity` reports. The entry is held by `shared_ptr`
+// because a region is IMMUTABLE once packaged and every rebuild copies the
+// pool: sharing is the copy.
+struct LirAsmRegion;   // lir/lir_asm_region.hpp
+
+class DSS_EXPORT LirAsmRegionPool {
+public:
+    // Append a region; returns its INDEX (0-origin). Aborts on null.
+    [[nodiscard]] std::uint32_t add(std::shared_ptr<LirAsmRegion const> region);
+    // Aborts on an out-of-range index — a handle that outlived its pool.
+    [[nodiscard]] LirAsmRegion const& at(std::uint32_t index) const;
+    [[nodiscard]] std::shared_ptr<LirAsmRegion const> const&
+    shared(std::uint32_t index) const;
+    [[nodiscard]] std::size_t size()  const noexcept { return pool_.size(); }
+    [[nodiscard]] bool        empty() const noexcept { return pool_.empty(); }
+
+private:
+    std::vector<std::shared_ptr<LirAsmRegion const>> pool_;
+};
+
+// "This instruction is not an asm region" — 0, so every instruction ever
+// built means "none" by construction (the `kLirNoRegConstraints` argument).
+inline constexpr std::uint32_t kLirNoAsmRegion = 0;
+
+[[nodiscard]] constexpr std::uint32_t
+lirAsmRegionHandleForIndex(std::uint32_t poolIndex) noexcept {
+    return poolIndex + 1;
+}
+// Precondition: `handle != kLirNoAsmRegion`.
+[[nodiscard]] constexpr std::uint32_t
+lirAsmRegionIndexForHandle(std::uint32_t handle) noexcept {
+    return handle - 1;
+}
+
 namespace detail {
 
 // ── instruction POD ──────────────────────────────────────────────
@@ -719,6 +773,11 @@ struct LirInst {
     // leaves a pool entry that NO instruction references, and that is
     // detectable from the rebuilt module alone.
     std::uint32_t regConstraints = kLirNoRegConstraints;
+    // 4 — 1-based handle into the module's `LirAsmRegionPool`;
+    // `kLirNoAsmRegion` (0) = this instruction is not an asm-region bundle.
+    // Carried EXACTLY like `regConstraints` (`carryInstSideData`), and for the
+    // same reason it cannot ride `addInst`.
+    std::uint32_t asmRegion = kLirNoAsmRegion;
 };
 static_assert(sizeof(LirInst) <= 32, "detail::LirInst grew unexpectedly");
 static_assert(std::is_trivially_copyable_v<LirInst>);
