@@ -978,7 +978,8 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
         // aliases have no pe arm because Windows has no such thing, the
         // `_stati64`/`_fstat`/`_wstat` family is MSVC-only, `strtoll` is a pe-only
         // link-name realization because `libc.so.6` exports `strtoll` directly,
-        // and `environ` is elf-only because neither other reference declares it.
+        // and `environ`/`_environ` are pe-only because only the Windows CRTs reach the
+        // environment through a macro onto an accessor.
         // A descriptor is available on a format when ANY of its surface is; a
         // MACRO's reach is its own and narrower.
         //

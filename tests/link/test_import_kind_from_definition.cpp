@@ -166,13 +166,17 @@ TEST(ImportKindFromDefinition, ALibraryFunctionNamedByAddressIsNotRefused) {
     EXPECT_TRUE(withCode(rep, DiagnosticCode::K_ImportReferenceUnbindable).empty());
 }
 
-// A C unit's `extern FILE *stdout;` is `Stated`: its own references go through
-// the loader-filled slot, so the gate has nothing to judge.
-TEST(ImportKindFromDefinition, AStatedRowIsNeverJudged) {
+// A C unit's `extern FILE *stdout;` is `Stated`, and its own references go
+// through the loader-filled slot — MIR→LIR says so on the row
+// (`readThroughSlot`) — so the gate has nothing to judge. (A `Stated` row whose
+// unit names the datum DIRECTLY — every row an object reader mints — IS judged
+// since P68 round 11: test_got_slot_lowering.cpp, section C.)
+TEST(ImportKindFromDefinition, ACUnitsStatedRowReadThroughItsSlotIsNotJudged) {
     auto const s = shipped("elf64-x86_64-linux-exec");
     ASSERT_TRUE(s.target && s.format);
-    auto const m = referencingUnit(
-        s, 1, importRow("stdout", "libc.so.6", ExternKindOrigin::Stated, true));
+    auto row = importRow("stdout", "libc.so.6", ExternKindOrigin::Stated, true);
+    row.readThroughSlot = true;
+    auto const m = referencingUnit(s, 1, std::move(row));
     DiagnosticReporter rep;
     (void)linker::link(m, *s.target, *s.format, rep);
     EXPECT_TRUE(withCode(rep, DiagnosticCode::K_ImportReferenceUnbindable).empty());

@@ -936,6 +936,15 @@ struct DSS_EXPORT DeclaratorConfig {
     // array-parameter decorations (the helpers degrade to the plain
     // first-non-bracket-child view — the prior behavior, unchanged).
     std::vector<SchemaTokenId> arraySuffixModifierTokens;
+    // P68 round 10 (lane `cs`): the decorations the language allows ONLY on a
+    // parameter's OUTERMOST array derivation — C 6.7.6.2p1: "The optional type
+    // qualifiers and the keyword static shall appear only in a declaration of a
+    // function parameter with an array type, and then only in the outermost array
+    // type derivation." A parameter's other brackets (a second dimension, an array a
+    // pointer points at) carrying one is refused S_ArrayParamQualifierNonParameter.
+    // A SUBSET of `arraySuffixModifierTokens` (the `*` of `[*]` is not one: C allows
+    // it in any derivation of a prototype's parameter). EMPTY ⇒ no such restriction.
+    std::vector<SchemaTokenId> arraySuffixOutermostOnlyTokens;
     // Source spellings, retained for diagnostics (mirrors the
     // rule+ruleName pairing convention of the other facets).
     std::string   declaratorRuleName;
@@ -959,6 +968,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
     std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA
+    std::vector<std::string> arraySuffixOutermostOnlyTokenNames;   // P68 round 10
     std::string   arrayStarSuffixRuleName;                    // VLA C4c D-CSUBSET-VLA-PARAM-STAR
 };
 
@@ -2801,8 +2811,21 @@ struct DSS_EXPORT LiteralTypeMapping {
 // gcc, clang, mingw and MSVC — see `normalizeSoleVoidParams`). Default false ⇒
 // raw param lists (toy / tsql — pinned; a void-typed param would then surface
 // through the normal invalid-type checks downstream).
+//
+// `unqualifiedParameterTypes` (P68 round 10, lane `cs`) — C 6.7.6.3p15: "In the
+// determination of type compatibility and of a composite type, ... each parameter
+// declared with qualified type is taken as having the unqualified version of its
+// declared type." When true, a FUNCTION type is built from each parameter's type
+// WITHOUT its top-level `volatile`, so every identity comparison of function types
+// (a function-pointer initialization, a `_Generic` association, `==` / `?:`, a call's
+// conversion — C 6.5.2.2p7 — and a redeclaration) is the language's compatibility by
+// construction; the parameter OBJECT inside the body keeps its qualifier. `_Atomic`
+// is not a qualification the rule removes (C 6.2.5p27), and a `void` parameter keeps
+// its skin (see `normalizeSoleVoidParams`). Default false ⇒ a function type carries
+// its parameters' declared types exactly.
 struct DSS_EXPORT ParametersConfig {
     bool soleVoidMeansEmpty = false;
+    bool unqualifiedParameterTypes = false;
 };
 
 // ── inline-asm P1 (`semantics.inlineAsm`, D-CSUBSET-INLINE-ASM +

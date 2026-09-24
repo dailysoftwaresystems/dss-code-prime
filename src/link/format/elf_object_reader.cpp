@@ -105,11 +105,12 @@ constexpr std::uint8_t kSttFile    = 4;
 // ★ A REFERENCE TO IT IS ALREADY REFUSED, BY NAME, ONE STEP EARLIER — which is
 // why this arm drops the row instead of adding a second refusal. A real
 // reference travels on R_X86_64_GOTPC32 / GOTPC64 / GOTOFF64 (✔MEASURED:
-// `gcc -c "leaq _GLOBAL_OFFSET_TABLE_(%rip),%rax"` emits wire type 26), and the
-// elf64-x86_64 documents declare wire ids {1, 2, 9, 10} only, so the
+// `gcc -c "leaq _GLOBAL_OFFSET_TABLE_(%rip),%rax"` emits wire type 26), and no
+// elf64-x86_64 document declares a GOTPC or GOTOFF wire type, so the
 // undeclared-wire-type arm in the relocation pass rejects such an object before
 // any symbol is classified. A second refusal here would be a second place for
-// that wording to drift.
+// that wording to drift. (The GOTPCREL family the documents DO declare names a
+// symbol's own slot, never the GOT base.)
 //
 // ⓘ AND THE SHAPE NO ASSEMBLER EMITS IS COVERED TOO, IN THE SAME DIRECTION: a
 // reference through a DECLARED wire type (a bare `.quad _GLOBAL_OFFSET_TABLE_`,
@@ -118,11 +119,10 @@ constexpr std::uint8_t kSttFile    = 4;
 // this skip existed that case was WORSE, not better — the phantom import bound
 // it silently to an import slot.
 //
-// ★ THE SPELLING IS READER-OWNED, on the same stated convention `elf.cpp` uses
-// for `kGotSectionName`: it is not a place a PRODUCER can put anything, because
-// the assembler that produced the object already wrote this exact spelling into
-// its `.symtab`. It is gABI-generic — every ELF architecture uses it — so it
-// carries no arch branch.
+// ★ THE SPELLING IS READER-OWNED: it is not a place a PRODUCER can put
+// anything, because the assembler that produced the object already wrote this
+// exact spelling into its `.symtab`. It is gABI-generic — every ELF
+// architecture uses it — so it carries no arch branch.
 constexpr std::string_view kGotBaseSymbolName = "_GLOBAL_OFFSET_TABLE_";
 
 // st_info / st_other decode (gABI 4.31).

@@ -151,6 +151,12 @@ dss_add_test(NAME mir/test_mir_text_types_table
 dss_add_test(NAME mir/test_synth_threads_mtx_type
              SOURCES test_synth_threads_mtx_type.cpp)
 
+# P68 round 11 (D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the synthesis-once
+# rule: every body `synthesizeStdioShim` / `synthesizeThreadsShim` defines is Weak + Hidden, so
+# the copies separately compiled units carry collapse to one per image.
+dss_add_test(NAME mir/test_synth_shim_collapse_linkage
+             SOURCES test_synth_shim_collapse_linkage.cpp)
+
 # P55 lane `rc` — "depth costs heap, not host call frames". Its OWN binary
 # because a red here is a STACK OVERFLOW, which kills the process and would take
 # every sibling test in a shared executable down unattributably with it.

@@ -177,20 +177,18 @@ bool realizeEntryShape(Mir&                              mir,
         return true;   // a no-arg entry needs no setup at all.
     }
     if (!processArgs.has_value()) {
-        // Mach-O: dyld CALLS an LC_MAIN entry with argc/argv already in the
-        // argument registers, so "no mechanism" is a real ANSWER and the
-        // trampoline's pass-through is correct. DOCUMENTED, and pinned in-tree
+        // Mach-O: dyld CALLS an LC_MAIN entry with (argc, argv, envp, apple)
+        // already in the argument registers, so "no mechanism" is a real ANSWER
+        // and the trampoline's pass-through is correct for EVERY verb the format
+        // lists — the environment verbs included. DOCUMENTED, and pinned in-tree
         // by `ProcessArgsSubstrate.ShippedMachoExecsDeclareNoneAndPe…`.
         return true;
     }
+    bool const passesEnvironment = entryVerbPassesEnvironment(verb);
     switch (processArgs->mechanism) {
-    case ArgsMechanism::StackVector:
-        // The entry trampoline materializes argc/argv from the untouched
-        // process-entry stack (SysV AMD64 psABI §3.4.1 / AAPCS64 Linux). Nothing
-        // to synthesize at the MIR tier.
-        return true;
-    case ArgsMechanism::CrtArgvAccessors:
-        break;   // the one arm this pass emits — falls through below.
+    case ArgsMechanism::StackVector:        // the entry-stack arm below
+    case ArgsMechanism::CrtArgvAccessors:   // the CRT init below
+        break;
     case ArgsMechanism::None:
         // The loader rejects `mechanism: "none"`, and `optional` empty is how
         // "no mechanism" is spelled, so a `None` reaching here is a hand-built
@@ -210,54 +208,97 @@ bool realizeEntryShape(Mir&                              mir,
     }
 
     ProcessArgs const& pa = *processArgs;
+    bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
 
-    // WIDE vs NARROW comes from the VERB — i.e. from the resolved entry's own
-    // signature, exactly as c111 required, but now via the language's declared
-    // signature→verb mapping instead of an inline TypeKind inspection here. argc
-    // is SHARED between the two worlds (MEASURED, PROBE-0), so one accessor name
+    // WHAT the verb materializes comes from the ONE verb → parameter-shapes table
+    // (`entryVerbParams`): WIDE vs NARROW off its second shape, the environment off
+    // its count. That is still the RESOLVED ENTRY'S SIGNATURE deciding, exactly as
+    // c111 required — the language row that matched the entry carries the verb —
+    // and never a format flag or a second classification here. argc is SHARED
+    // between the narrow and wide worlds (MEASURED, PROBE-0), so one accessor name
     // serves both.
-    bool const wide = (verb == EntryMaterialization::ArgcWargv);
-    std::string const configureName =
-        wide ? pa.configureWideArgvFn : pa.configureNarrowArgvFn;
-    std::string const argvAccessorName =
-        wide ? pa.wideArgvAccessorFn : pa.narrowArgvAccessorFn;
+    auto const verbParams = entryVerbParams(verb);
+    bool const wide = entryVerbIsWide(verb);
+
+    // ── THE MECHANISM BACKSTOP ─────────────────────────────────────────────
+    //
+    // `ObjectFormatData::validate()` refuses every one of these pairings AT LOAD
+    // for a format document, so a loaded format cannot reach them. A hand-built
+    // `ProcessArgs` can, and the alternative to refusing here is materializing
+    // values the mechanism never produced — the entry would read them from the
+    // argument registers.
+    constexpr std::size_t kMechanismValuesMax = 3;   // (argc, argv, envp)
+    std::string unrealizable;
+    if (verbParams.size() > kMechanismValuesMax) {
+        unrealizable = std::format(
+            "it materializes {} values and a `processArgs` mechanism produces at "
+            "most {}; only a loader that delivers the arguments itself (no "
+            "`processArgs` block) realizes more", verbParams.size(),
+            kMechanismValuesMax);
+    } else if (stackVector && wide) {
+        unrealizable = "the entry-stack vector holds narrow strings only";
+    } else if (stackVector && passesEnvironment
+               && !(pa.envpFollowsArgvTerminator && pa.vectorSlotBytes != 0)) {
+        unrealizable = "the block does not declare where the environment vector "
+                       "sits (`envpFollowsArgvTerminator` + `vectorSlotBytes`)";
+    } else if (!stackVector && passesEnvironment
+               && (wide ? (pa.initializeWideEnvironmentFn.empty()
+                           || pa.wideEnvironmentAccessorFn.empty())
+                        : (pa.initializeNarrowEnvironmentFn.empty()
+                           || pa.narrowEnvironmentAccessorFn.empty()))) {
+        unrealizable = "the block does not declare that width's environment "
+                       "initialize/accessor pair";
+    }
+    if (!unrealizable.empty()) {
+        emitErr(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                std::format(
+                    "realizeEntryShape: format '{}' declares the `{}` "
+                    "`processArgs` mechanism, which cannot realize the resolved "
+                    "program entry's '{}' verb: {}. Refusing rather than handing "
+                    "the entry values nothing produced.",
+                    formatName, argsMechanismName(pa.mechanism),
+                    entryMaterializationName(verb), unrealizable));
+        return false;
+    }
+
+    // The entry trampoline materializes (argc, argv) from the untouched
+    // process-entry stack (SysV AMD64 psABI §3.4.1 / AAPCS64 Linux). An environment
+    // verb needs the vector AFTER argv, whose place depends on the RUNTIME argc —
+    // that is the one value synthesized below; every other verb needs nothing at the
+    // MIR tier. (Checked AFTER the backstop above, so a hand-built entry-stack
+    // mechanism handed a wide verb is refused rather than passed through.)
+    if (stackVector && !passesEnvironment) return true;
 
     // ── THE ARITY BACKSTOP, AND IT IS NOT THE RETIRED GATE ────────────────
     //
-    // Every argc/argv verb materializes into the entry's FIRST TWO parameters, so
-    // an entry reaching here with fewer than two is an internal inconsistency
-    // between the verb entry resolution decided and the signature actually in the
-    // merged MIR. On the normal path that CANNOT happen: the semantic tier already
-    // matched this definition against the language row the verb came from. So this
-    // fires only for a signature that never passed through the semantic tier —
-    // a hand-built `Mir`, or an entry arriving from an object DSS did not compile.
+    // Every verb materializes into the entry's FIRST N parameters, N being its
+    // row in the verb table, so an entry reaching here with fewer is an internal
+    // inconsistency between the verb entry resolution decided and the signature
+    // actually in the merged MIR. On the normal path that CANNOT happen: the
+    // semantic tier already matched this definition against the language row the
+    // verb came from. So this fires only for a signature that never passed through
+    // the semantic tier — a hand-built `Mir`, or an entry arriving from an object
+    // DSS did not compile.
     //
     // ★ WHY IT IS NOT A SECOND SIGNATURE OWNER, which is the thing to check
     // before touching it: it does not ask "is this a legal entry signature" (the
     // language owns that, with a span). It asks "can the arguments I am about to
     // materialize physically land in this function", which is a fact about the
-    // MIR in hand and about nothing declared anywhere. Without it, `params[0]` /
-    // `params[1]` below are an out-of-bounds read — a silent one, on the program
-    // entry.
+    // MIR in hand and about nothing declared anywhere. Without it, `params[k]`
+    // below is an out-of-bounds read — a silent one, on the program entry.
     //
     // ⚠ AND IT CANNOT COVER THE FOREIGN-OBJECT CASE, so do not read it as
     // closing that gap. `AssembledFunction` carries no TypeId and no signature;
     // a pre-built `.obj`/`.lib` member's entry has no C signature IN THE INPUT at
-    // all, so there is nothing here to check its arity against. The recorded
-    // long-term closure is a SUPERSET MATERIALIZATION — declaring a 3-parameter
-    // row with an `argc-argv-envp` verb on the formats whose loader ALREADY
-    // supplies envp in the argument register (glibc's `__libc_start_main` passes
-    // three; Darwin's LC_MAIN is called with four), which makes the undetectable
-    // case harmless at every tier instead of faulting. It is gated on a RUN
-    // WITNESS and is NOT implemented (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE).
+    // all, so there is nothing here to check its arity against.
     auto const params = interner.fnParams(entrySig);
-    if (params.size() < 2) {
+    if (params.size() < verbParams.size()) {
         // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
         emitErr(reporter, DiagnosticCode::K_EntryVerbUnmaterializable,
                 std::format(
                     "realizeEntryShape: the resolved program entry needs the "
-                    "'{}' materialization verb, which materializes two arguments "
-                    "into the entry's first two parameters, but the entry's "
+                    "'{}' materialization verb, which materializes {} arguments "
+                    "into the entry's first {} parameters, but the entry's "
                     "signature in the merged module declares {} parameter(s). "
                     "The verb and the signature disagree, so the arguments have "
                     "nowhere to land. On any source DSS compiled this is "
@@ -266,12 +307,14 @@ bool realizeEntryShape(Mir&                              mir,
                     "signature did not pass through it (a hand-built module, or "
                     "an entry from a pre-built object): give the entry the "
                     "signature its language row declares.",
-                    entryMaterializationName(verb), params.size()));
+                    entryMaterializationName(verb), verbParams.size(),
+                    verbParams.size(), params.size()));
         return false;
     }
 
     TypeId const argcTy = params[0];   // int      (language-row-matched: I32)
     TypeId const argvTy = params[1];   // char**   (language-row-matched: ptr→ptr→…)
+    TypeId const envpTy = passesEnvironment ? params[2] : InvalidType;
 
     auto const ccOpt = entryCallConv(interner, entrySig);
     if (!ccOpt.has_value()) {
@@ -287,77 +330,21 @@ bool realizeEntryShape(Mir&                              mir,
     }
     CallConv const cc = *ccOpt;
 
-    // Types for the synth body.
     TypeId const i32Ty     = interner.primitive(TypeKind::I32);
     TypeId const i64Ty     = interner.primitive(TypeKind::I64);
-    TypeId const boolTy    = interner.primitive(TypeKind::Bool);
-    TypeId const pArgcTy   = interner.pointer(argcTy);   // int*    (__p___argc)
-    TypeId const pArgvTy   = interner.pointer(argvTy);   // char*** (__p___argv)
-    // errno_t _configure_{narrow,wide}_argv(int mode)
-    std::array<TypeId, 1> const cfgParams{i32Ty};
-    TypeId const cfgSig    = interner.fnSig(cfgParams, i32Ty, cc);
-    // int* __p___argc(void) / char*** __p___argv(void)
-    TypeId const argcAccSig = interner.fnSig({}, pArgcTy, cc);
-    TypeId const argvAccSig = interner.fnSig({}, pArgvTy, cc);
-    TypeId const synthSig   = interner.fnSig({}, i32Ty, cc);
-    TypeId const pCfgSig    = interner.pointer(cfgSig);
-    TypeId const pArgcAccSig = interner.pointer(argcAccSig);
-    TypeId const pArgvAccSig = interner.pointer(argvAccSig);
-    TypeId const pEntrySig   = interner.pointer(entrySig);
-
-    // Mint fresh symbols: the synth function + the three CRT imports.
-    std::uint32_t const maxV = maxSymbolIdV(mir, externImports);
-    SymbolId const synthSym{maxV + 1};
-    SymbolId const cfgSym{maxV + 2};
-    SymbolId const argcAccSym{maxV + 3};
-    SymbolId const argvAccSym{maxV + 4};
-
-    // Register the CRT imports (all FUNCTION imports, not data). Their library is
-    // the ROLE-resolved image — see `RuntimeLibraryRole`; nothing here spells a
-    // DLL name.
-    //
-    // ★★ THE NAMES ARE C-MANGLED FOR THE ACTIVE FORMAT, and this is a REAL
-    // DIFFERENCE from c111, not tidying. c111 wrote `crtName` into the import
-    // VERBATIM, which was harmless only because the one format using the pass
-    // declares `cSymbolDecoration: {"scheme": "none"}` — an assumption invisible
-    // in the code and untrue the moment a decorating format declares the
-    // mechanism. Routing through the SAME `applyCMangling` the FFI ingest uses
-    // means a `leading-underscore` format would request `__p___argc` correctly
-    // instead of silently asking for an undecorated name that does not exist.
-    // Getting this wrong is the `_exit`-vs-`exit` class of mis-bind, which is not
-    // hypothetical: MEASURED 2026-08-06, ucrtbase exports `exit`, `_exit` AND
-    // `_Exit` as three DISTINCT functions, so an off-by-one-underscore request
-    // binds to a DIFFERENT function rather than failing to resolve.
-    auto addImport = [&](SymbolId sym, std::string const& name) {
-        ExternImport imp;
-        imp.symbol      = sym;
-        imp.mangledName = dss::ffi::applyCMangling(name, scheme);
-        imp.libraryPath = pa.crtLibraryPath;
-        imp.isData      = false;
-        externImports.push_back(std::move(imp));
-    };
-    addImport(cfgSym,     configureName);
-    addImport(argcAccSym, pa.argcAccessorFn);
-    addImport(argvAccSym, argvAccessorName);
+    TypeId const pEntrySig = interner.pointer(entrySig);
 
     // Rebuild the module (Mir is frozen): clone every existing function verbatim,
     // then APPEND the synth function, then clone globals — the prune_unreachable
-    // rebuild idiom.
+    // rebuild idiom. The mint floor is read BEFORE any import is appended.
+    std::uint32_t const maxV = maxSymbolIdV(mir, externImports);
+    SymbolId const synthSym{maxV + 1};
     MirBuilder builder;
     IdentityClonePolicy policy;
     for (std::uint32_t i = 0; i < nf; ++i) {
         opt::passes::MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(mir.funcAt(i));
     }
-
-    // _dss_pe_start(): the pre-main init. Global-bound so DCE (which runs AFTER
-    // this synthesis on the single-CU seam) keeps it — it is also the retargeted
-    // program entry.
-    (void)builder.addFunction(synthSig, synthSym, SymbolBinding::Global,
-                              SymbolVisibility::Default);
-    MirBlockId const entryBlk = builder.createBlock(StructCfMarker::EntryBlock);
-    MirBlockId const failBlk  = builder.createBlock();
-    MirBlockId const callBlk  = builder.createBlock();
 
     auto konst = [&](std::int64_t v, TypeKind core, TypeId ty) {
         MirLiteralValue lit;
@@ -366,83 +353,241 @@ bool realizeEntryShape(Mir&                              mir,
         return builder.addConst(std::move(lit), ty);
     };
 
-    builder.beginBlock(entryBlk);
-    // _configure_{narrow,wide}_argv(<argvMode>). The RESULT IS DELIBERATELY
-    // IGNORED: MEASURED 2026-08-10, every valid `_crt_argv_mode` returns
-    // `errno_t` 0 — including mode 0, which returns 0 while yielding
-    // `argv == NULL`. Branching on it would be a guard that asserts nothing. The
-    // real check is the argv test below.
-    {
-        MirInstId const cfgAddr = builder.addGlobalAddr(cfgSym, pCfgSig);
-        MirInstId const mode    = konst(static_cast<std::int64_t>(pa.argvMode),
-                                        TypeKind::I32, i32Ty);
-        std::array<MirInstId, 2> call{cfgAddr, mode};
-        (void)builder.addInst(MirOpcode::Call, call, i32Ty, /*payload=*/0);
-    }
-    // argc = *__p___argc();  argv = *__p___argv();
-    // EXACTLY ONE dereference each — the accessors return the ADDRESS of the
-    // CRT's state (`ucrt/stdlib.h`'s `__p___argc` / `__p___argv`: `int*` and
-    // `char***`), which is why a second load would read the first element
-    // instead of the vector.
-    MirInstId argc{};
-    MirInstId argv{};
-    {
-        MirInstId const accAddr = builder.addGlobalAddr(argcAccSym, pArgcAccSig);
-        std::array<MirInstId, 1> call{accAddr};
-        MirInstId const slot =
-            builder.addInst(MirOpcode::Call, call, pArgcTy, /*payload=*/0);
-        argc = builder.addInst(MirOpcode::Load,
-                               std::array<MirInstId, 1>{slot}, argcTy);
-    }
-    {
-        MirInstId const accAddr = builder.addGlobalAddr(argvAccSym, pArgvAccSig);
-        std::array<MirInstId, 1> call{accAddr};
-        MirInstId const slot =
-            builder.addInst(MirOpcode::Call, call, pArgvTy, /*payload=*/0);
-        argv = builder.addInst(MirOpcode::Load,
-                               std::array<MirInstId, 1>{slot}, argvTy);
-    }
-    // if (argv == NULL) → the failure arm. Compared through PtrToInt against a
-    // machine-word zero (the shape `synth_threads_shim` already uses for a
-    // handle-is-null test), so no null-pointer literal encoding is needed.
-    {
-        MirInstId const argvInt = builder.addInst(
-            MirOpcode::PtrToInt, std::array<MirInstId, 1>{argv}, i64Ty);
-        std::array<MirInstId, 2> cmp{argvInt,
-                                     konst(0, TypeKind::I64, i64Ty)};
-        MirInstId const isNull =
-            builder.addInst(MirOpcode::ICmpEq, cmp, boolTy);
-        builder.addCondBr(isNull, failBlk, callBlk);
-    }
-
-    // The failure arm RETURNS the format's declared status rather than calling
-    // anything: the value leaves through the format's already-wired `processExit`
-    // path (the trampoline moves this return value into the exit mechanism's
-    // status register), so this needs no second exit import — and it is not an
-    // `Unreachable`, which in a REACHABLE position would invite an optimizer to
-    // treat the guarded branch as dead and delete the check.
-    builder.beginBlock(failBlk);
-    builder.addReturn(konst(
-        static_cast<std::int64_t>(pa.argvUnavailableExitStatus),
-        TypeKind::I32, i32Ty));
-
-    // return entry(argc, argv);
-    builder.beginBlock(callBlk);
-    {
+    if (stackVector) {
+        // ── THE ENTRY-STACK ENVIRONMENT (mechanism `stack-vector`) ─────────────
+        //
+        //   int _dss_stack_start(int argc, char **argv) {   // argc/argv from the
+        //       char **envp = argv + (argc + 1);            // trampoline, as before
+        //       return main(argc, argv, envp);
+        //   }
+        //
+        // The environment vector starts one slot past argv's NULL terminator in the
+        // SAME entry-stack layout (SysV AMD64 psABI §3.4.1; AAPCS64 Linux), so its
+        // address depends on the RUNTIME argc — which is why no static offset in
+        // `processArgs` can name it, and why it is ordinary pointer arithmetic here
+        // rather than per-architecture trampoline code. ✔MEASURED 2026-09-24, gcc
+        // 13.3.0 and clang 18.1.3 on x86_64 Linux: `envp - argv == argc + 1` under
+        // glibc's own startup. The slot width is DECLARED (`vectorSlotBytes`), never
+        // derived here. The synth takes exactly the two values the trampoline
+        // materializes, so the trampoline and its before-entry park are unchanged.
+        TypeId const synthSig = interner.fnSig(
+            std::array<TypeId, 2>{argcTy, argvTy}, i32Ty, cc);
+        (void)builder.addFunction(synthSig, synthSym, SymbolBinding::Global,
+                                  SymbolVisibility::Default);
+        MirBlockId const entryBlk = builder.createBlock(StructCfMarker::EntryBlock);
+        builder.beginBlock(entryBlk);
+        MirInstId const argc = builder.addArg(0, argcTy);
+        MirInstId const argv = builder.addArg(1, argvTy);
+        MirInstId const argc64 = builder.addInst(
+            MirOpcode::SExt, std::array<MirInstId, 1>{argc}, i64Ty);
+        MirInstId const slots = builder.addInst(
+            MirOpcode::Add,
+            std::array<MirInstId, 2>{argc64, konst(1, TypeKind::I64, i64Ty)},
+            i64Ty);
+        MirInstId const bytes = builder.addInst(
+            MirOpcode::Mul,
+            std::array<MirInstId, 2>{
+                slots,
+                konst(static_cast<std::int64_t>(pa.vectorSlotBytes),
+                      TypeKind::I64, i64Ty)},
+            i64Ty);
+        // A BYTE-offset Gep — the MIR Gep index contract (the lowering emits
+        // `lea [base + index*1]`), which is why the slot width is multiplied in.
+        MirInstId const envp = builder.addInst(
+            MirOpcode::Gep, std::array<MirInstId, 2>{argv, bytes}, envpTy);
         MirInstId const entryAddr =
             builder.addGlobalAddr(*userEntrySymbol, pEntrySig);
         MirInstId const ret = builder.addInst(
             MirOpcode::Call,
-            std::array<MirInstId, 3>{entryAddr, argc, argv},
+            std::array<MirInstId, 4>{entryAddr, argc, argv, envp},
             i32Ty, /*payload=*/0);
         builder.addReturn(ret);
+    } else {
+        // ── THE CRT INIT (mechanism `crt-argv-accessors`) ──────────────────────
+        TypeId const boolTy  = interner.primitive(TypeKind::Bool);
+        TypeId const pArgcTy = interner.pointer(argcTy);   // int*    (__p___argc)
+        TypeId const pArgvTy = interner.pointer(argvTy);   // char*** (__p___argv)
+        // errno_t _configure_{narrow,wide}_argv(int mode)
+        std::array<TypeId, 1> const cfgParams{i32Ty};
+        TypeId const cfgSig      = interner.fnSig(cfgParams, i32Ty, cc);
+        // int* __p___argc(void) / char*** __p___argv(void)
+        TypeId const argcAccSig  = interner.fnSig({}, pArgcTy, cc);
+        TypeId const argvAccSig  = interner.fnSig({}, pArgvTy, cc);
+        TypeId const synthSig    = interner.fnSig({}, i32Ty, cc);
+        TypeId const pCfgSig     = interner.pointer(cfgSig);
+        TypeId const pArgcAccSig = interner.pointer(argcAccSig);
+        TypeId const pArgvAccSig = interner.pointer(argvAccSig);
+
+        std::string const configureName =
+            wide ? pa.configureWideArgvFn : pa.configureNarrowArgvFn;
+        std::string const argvAccessorName =
+            wide ? pa.wideArgvAccessorFn : pa.narrowArgvAccessorFn;
+
+        // Mint the CRT import symbols above the synth function.
+        SymbolId const cfgSym{maxV + 2};
+        SymbolId const argcAccSym{maxV + 3};
+        SymbolId const argvAccSym{maxV + 4};
+        SymbolId const envInitSym{maxV + 5};   // used iff passesEnvironment
+        SymbolId const envAccSym{maxV + 6};    // used iff passesEnvironment
+
+        // Register the CRT imports (all FUNCTION imports, not data). Their library
+        // is the ROLE-resolved image — see `RuntimeLibraryRole`; nothing here spells
+        // a DLL name.
+        //
+        // ★★ THE NAMES ARE C-MANGLED FOR THE ACTIVE FORMAT, and this is a REAL
+        // DIFFERENCE from c111, not tidying. c111 wrote `crtName` into the import
+        // VERBATIM, which was harmless only because the one format using the pass
+        // declares `cSymbolDecoration: {"scheme": "none"}` — an assumption invisible
+        // in the code and untrue the moment a decorating format declares the
+        // mechanism. Routing through the SAME `applyCMangling` the FFI ingest uses
+        // means a `leading-underscore` format would request `__p___argc` correctly
+        // instead of silently asking for an undecorated name that does not exist.
+        // Getting this wrong is the `_exit`-vs-`exit` class of mis-bind, which is not
+        // hypothetical: MEASURED 2026-08-06, ucrtbase exports `exit`, `_exit` AND
+        // `_Exit` as three DISTINCT functions, so an off-by-one-underscore request
+        // binds to a DIFFERENT function rather than failing to resolve.
+        auto addImport = [&](SymbolId sym, std::string const& name) {
+            ExternImport imp;
+            imp.symbol      = sym;
+            imp.mangledName = dss::ffi::applyCMangling(name, scheme);
+            imp.libraryPath = pa.crtLibraryPath;
+            imp.isData      = false;
+            externImports.push_back(std::move(imp));
+        };
+        addImport(cfgSym,     configureName);
+        addImport(argcAccSym, pa.argcAccessorFn);
+        addImport(argvAccSym, argvAccessorName);
+        if (passesEnvironment) {
+            addImport(envInitSym, wide ? pa.initializeWideEnvironmentFn
+                                       : pa.initializeNarrowEnvironmentFn);
+            addImport(envAccSym,  wide ? pa.wideEnvironmentAccessorFn
+                                       : pa.narrowEnvironmentAccessorFn);
+        }
+
+        // _dss_pe_start(): the pre-main init. Global-bound so DCE (which runs AFTER
+        // this synthesis on the single-CU seam) keeps it — it is also the retargeted
+        // program entry.
+        (void)builder.addFunction(synthSig, synthSym, SymbolBinding::Global,
+                                  SymbolVisibility::Default);
+        MirBlockId const entryBlk = builder.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const failBlk  = builder.createBlock();
+        MirBlockId const callBlk  = builder.createBlock();
+
+        builder.beginBlock(entryBlk);
+        // _configure_{narrow,wide}_argv(<argvMode>). The RESULT IS DELIBERATELY
+        // IGNORED: MEASURED 2026-08-10, every valid `_crt_argv_mode` returns
+        // `errno_t` 0 — including mode 0, which returns 0 while yielding
+        // `argv == NULL`. Branching on it would be a guard that asserts nothing. The
+        // real check is the argv test below.
+        {
+            MirInstId const cfgAddr = builder.addGlobalAddr(cfgSym, pCfgSig);
+            MirInstId const mode    = konst(static_cast<std::int64_t>(pa.argvMode),
+                                            TypeKind::I32, i32Ty);
+            std::array<MirInstId, 2> call{cfgAddr, mode};
+            (void)builder.addInst(MirOpcode::Call, call, i32Ty, /*payload=*/0);
+        }
+        // _initialize_{narrow,wide}_environment() — MSVC's OWN startup order and its
+        // own treatment of the result (DOCUMENTED, the MSVC toolset's
+        // `crt/src/vcruntime/exe_common.inl`: `pre_c_initialization` calls
+        // `environment_policy::initialize_environment()` AFTER `configure_argv` and
+        // IGNORES what it returns, where it fast-fails on the argv call's). ✔MEASURED
+        // 2026-09-24 against ucrtbase 10.0.26100.9444 with no CRT startup — DSS's
+        // situation: the DLL has already built both vectors at load, and the call
+        // returns 0 leaving the same pointer. So it is not what makes envp valid on
+        // the dynamic UCRT; it is what the reference does, and matching it keeps the
+        // environment's state the reference's rather than a DLL-attach side effect's.
+        if (passesEnvironment) {
+            TypeId const initSig  = interner.fnSig({}, i32Ty, cc);
+            MirInstId const initAddr =
+                builder.addGlobalAddr(envInitSym, interner.pointer(initSig));
+            (void)builder.addInst(MirOpcode::Call,
+                                  std::array<MirInstId, 1>{initAddr}, i32Ty,
+                                  /*payload=*/0);
+        }
+        // argc = *__p___argc();  argv = *__p___argv();
+        // EXACTLY ONE dereference each — the accessors return the ADDRESS of the
+        // CRT's state (`ucrt/stdlib.h`'s `__p___argc` / `__p___argv`: `int*` and
+        // `char***`), which is why a second load would read the first element
+        // instead of the vector.
+        MirInstId argc{};
+        MirInstId argv{};
+        {
+            MirInstId const accAddr = builder.addGlobalAddr(argcAccSym, pArgcAccSig);
+            std::array<MirInstId, 1> call{accAddr};
+            MirInstId const slot =
+                builder.addInst(MirOpcode::Call, call, pArgcTy, /*payload=*/0);
+            argc = builder.addInst(MirOpcode::Load,
+                                   std::array<MirInstId, 1>{slot}, argcTy);
+        }
+        {
+            MirInstId const accAddr = builder.addGlobalAddr(argvAccSym, pArgvAccSig);
+            std::array<MirInstId, 1> call{accAddr};
+            MirInstId const slot =
+                builder.addInst(MirOpcode::Call, call, pArgvTy, /*payload=*/0);
+            argv = builder.addInst(MirOpcode::Load,
+                                   std::array<MirInstId, 1>{slot}, argvTy);
+        }
+        // if (argv == NULL) → the failure arm. Compared through PtrToInt against a
+        // machine-word zero (the shape `synth_threads_shim` already uses for a
+        // handle-is-null test), so no null-pointer literal encoding is needed.
+        {
+            MirInstId const argvInt = builder.addInst(
+                MirOpcode::PtrToInt, std::array<MirInstId, 1>{argv}, i64Ty);
+            std::array<MirInstId, 2> cmp{argvInt,
+                                         konst(0, TypeKind::I64, i64Ty)};
+            MirInstId const isNull =
+                builder.addInst(MirOpcode::ICmpEq, cmp, boolTy);
+            builder.addCondBr(isNull, failBlk, callBlk);
+        }
+
+        // The failure arm RETURNS the format's declared status rather than calling
+        // anything: the value leaves through the format's already-wired
+        // `processExit` path (the trampoline moves this return value into the exit
+        // mechanism's status register), so this needs no second exit import — and
+        // it is not an `Unreachable`, which in a REACHABLE position would invite an
+        // optimizer to treat the guarded branch as dead and delete the check.
+        builder.beginBlock(failBlk);
+        builder.addReturn(konst(
+            static_cast<std::int64_t>(pa.argvUnavailableExitStatus),
+            TypeKind::I32, i32Ty));
+
+        // return entry(argc, argv[, envp]);
+        //
+        // envp is `_get_initial_{narrow,wide}_environment()` — the accessor's result
+        // IS the vector (no dereference), passed exactly as MSVC's own `invoke_main`
+        // passes it (`main(__argc, __argv, _get_initial_narrow_environment())`,
+        // DOCUMENTED in the same file), unchecked there too.
+        builder.beginBlock(callBlk);
+        {
+            MirInstId const entryAddr =
+                builder.addGlobalAddr(*userEntrySymbol, pEntrySig);
+            MirInstId ret{};
+            if (passesEnvironment) {
+                TypeId const envAccSig = interner.fnSig({}, envpTy, cc);
+                MirInstId const envAddr =
+                    builder.addGlobalAddr(envAccSym, interner.pointer(envAccSig));
+                MirInstId const envp = builder.addInst(
+                    MirOpcode::Call, std::array<MirInstId, 1>{envAddr}, envpTy,
+                    /*payload=*/0);
+                ret = builder.addInst(
+                    MirOpcode::Call,
+                    std::array<MirInstId, 4>{entryAddr, argc, argv, envp},
+                    i32Ty, /*payload=*/0);
+            } else {
+                ret = builder.addInst(
+                    MirOpcode::Call,
+                    std::array<MirInstId, 3>{entryAddr, argc, argv},
+                    i32Ty, /*payload=*/0);
+            }
+            builder.addReturn(ret);
+        }
     }
 
     opt::passes::cloneGlobalsVerbatim(mir, builder);
     mir = std::move(builder).finish();
 
     // Canonicalize StructCfMarkers module-wide from the CFG. REQUIRED because the
-    // synth body is MULTI-BLOCK now (the argv gate) and the single-CU seam runs
+    // CRT synth body is MULTI-BLOCK (the argv gate) and the single-CU seam runs
     // POST-optimize, so no later pass re-derives them — and `MirVerifier`'s
     // marker-equality check rejects a module whose raw markers are not already
     // canonical. Same call, same reason, as `synthesizeThreadsShim`'s

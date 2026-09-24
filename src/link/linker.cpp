@@ -10,6 +10,7 @@
 #include "link/branch_veneers.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/fresh_symbol_ids.hpp"   // maxExistingSymbolIdV — the ONE taken-id scan
+#include "link/got_slots.hpp"          // lowerGotSlotReferences — the image's GOT slots
 #include "link/static_init_tables.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/macho.hpp"
@@ -63,6 +64,28 @@ using dss::report;
 // `kSelectableExitMechanismNames`, with the literal count AND a `static_assert`
 // on the rejected-row count — the write-up and the nine-arm measurement are
 // there. "Declarable" and "selectable" were two names for the same set.
+
+// The target's ABSOLUTE pointer relocation of `widthBytes` bytes — the one a
+// slot holding an address is filled through — found by FORMULA, never by name:
+// a Linear, non-pc-relative row of that width that is neither a thread-pointer
+// offset nor an image-relative value (both answer the width-and-pc question
+// structurally while writing a number in another coordinate space — the reason
+// `absoluteRelocKind` in the assembler names both properties). ONE scan for the
+// three passes of this file that mint a slot: the cross-CU merge, the
+// object-carried import slots and the GOT-slot lowering (P68 round 11: the first
+// two had each spelled `widthBytes == 8 && !pcRelative` for themselves, without
+// the two exclusions).
+[[nodiscard]] std::optional<RelocationKind>
+absolutePointerRelocKind(TargetSchema const& targetSchema,
+                         std::uint8_t        widthBytes) {
+    for (auto const& r : targetSchema.relocations()) {
+        if (r.formulaKind == RelocFormulaKind::Linear && r.widthBytes == widthBytes
+            && !r.pcRelative && !r.tls && !r.imageRelative) {
+            return r.kind;
+        }
+    }
+    return std::nullopt;
+}
 
 // D-LK4-3 — build the collision-proof compound-key symbol index for one module.
 // Every function / data item / extern import is keyed by `(module.cuId, SymbolId)`
@@ -236,7 +259,12 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     // combination the preemption arm below has to distinguish.
     bool                   realizesCoalescingScopeReferences,
     std::uint64_t          pointerBytes,
-    DiagnosticReporter&    reporter) {
+    DiagnosticReporter&    reporter,
+    // The WEAK data imports this gate bound to NOTHING (their symbols become the
+    // null import slots below) — handed on to the GOT-slot lowering, which
+    // gives a GOT reference to one a slot holding 0 rather than a slot holding
+    // the null slot's own address.
+    std::vector<SymbolId>& resolvedToNothing) {
     // Candidate test: does ANY named import need the gate — i.e. is there a
     // NON-EAGER row? An eager row is always kept, so a module whose every named
     // import is eager has nothing to gate.
@@ -519,6 +547,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
             static_cast<std::uint32_t>(pointerBytes));
         filtered.dataItems.push_back(std::move(slot));
     }
+    resolvedToNothing = std::move(nullBound);
     return false;
 }
 
@@ -760,13 +789,12 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
     }
     if (needSlot.empty()) return true;
 
-    // The slot's own fixup, found by FORMULA (`widthBytes == 8 &&
-    // !pcRelative`) exactly as `mergeModules` finds the thunk slot's — never
-    // by an "abs64" name or a kind constant.
-    std::optional<RelocationKind> absPtrKind;
-    for (auto const& r : targetSchema.relocations()) {
-        if (r.widthBytes == 8 && !r.pcRelative) { absPtrKind = r.kind; break; }
-    }
+    // The slot's own fixup, found by FORMULA (`absolutePointerRelocKind`, the
+    // one scan `mergeModules` and the GOT-slot lowering ask too) at the width
+    // of the slot it fills — never by an "abs64" name or a kind constant.
+    std::optional<RelocationKind> const absPtrKind =
+        absolutePointerRelocKind(targetSchema,
+                                 static_cast<std::uint8_t>(pointerBytes));
     if (!absPtrKind.has_value()) {
         report(reporter, DiagnosticCode::K_AbsolutePointerRelocMissing,
                DiagnosticSeverity::Error,
@@ -1200,10 +1228,9 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // name/constant — agnosticism). This is the relocation the thunk slot carries so the
     // format walker writes the sibling def's runtime address into the slot bytes.
     // Resolved ONCE; consumed only if there is at least one cross-CU reference to thunk.
-    std::optional<RelocationKind> absPtrKind;
-    for (auto const& r : targetSchema.relocations()) {
-        if (r.widthBytes == 8 && !r.pcRelative) { absPtrKind = r.kind; break; }
-    }
+    // (`absolutePointerRelocKind` — the one scan every slot-minting pass here asks.)
+    std::optional<RelocationKind> const absPtrKind =
+        absolutePointerRelocKind(targetSchema, 8);
 
     // Per-module SymbolId.v -> EVERY `ModuleSymbol` row carrying it, in table order.
     //
@@ -2004,17 +2031,82 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 // Judged per MODULE, before the merge folds this row into a C unit's `Stated` one
 // (which carries a kind but says nothing about how THIS unit's references read
 // it). An unbound row is left to the reference gate's `K_SymbolUndefined`.
+//
+// ★★★ AND THE SAME (b) FOR A STATED ROW WHOSE CODE NAMES THE DATUM DIRECTLY —
+// P68 round 11, ✔MEASURED 2026-09-24 as a SILENT miscompile before this arm
+// existed. A relocatable object's code says how it reaches each import, and
+// `ExternImport::readThroughSlot` is false on every row an object reader mints
+// (that field's docblock: a reader never sets it). A NON-GOT code relocation
+// against a library DATUM from such a unit — gcc's default x86_64 PIE code for
+// `stdout` is `R_X86_64_PC32 stdout` (it assumes a copy relocation), and so is
+// DSS's own x86_64 staticlib for the same C (D-LK-OBJECT-DATA-EXTERN-RELOCATABLE
+// shipped it for a foreign linker's copy relocation) — was bound by every image
+// writer to the datum's loader-filled SLOT, because a writer resolves a code
+// reference to a data import to that slot (the MIR→LIR shape, which reads
+// through it). The object's `leaq stdout(%rip)` returned the slot's address and
+// its `movq stdout(%rip)` the slot's content: exit 2 on ELF x86_64 exec and PIE,
+// debug and release, with gcc -no-pie / -pie → 42 on the same archive. The GOT
+// lowering is what made this reachable from far more members: a default-built
+// member that ALSO takes any function's address (REX_GOTPCRELX) used to be
+// refused at read, loudly, and now links. A GOT-slot-relative reference is not
+// direct (the link mints its slot, `lowerGotSlotReferences`), a DATA-item
+// relocation is not code (the writers give it a row against the symbol, which
+// the loader fills), and a thread-local row has its own gate — none is judged.
+// Nor is any row of a format that declares no `dataImportBinding: got-indirect`:
+// the slot the reference would be bound to is that declaration, and a format
+// without it refuses every surviving data import at its own gate
+// (K_FormatLacksImportSupport), which says the truer thing.
+// The ids above belong to the source; the message states the condition and the
+// action.
 // Returns false after reporting.
 [[nodiscard]] bool refuseUnbindableImportReferences(
         std::span<AssembledModule const>                        modules,
         std::unordered_map<std::string, LinkedSymbolKey> const& siblingWinners,
+        TargetSchema const&                                     targetSchema,
+        ObjectFormatSchema const&                               objectFormatSchema,
         DiagnosticReporter&                                     reporter) {
     bool ok = true;
+    bool const dataBindsThroughASlot =
+        objectFormatSchema.dataImportBinding() == DataImportBinding::GotIndirect;
     for (auto const& m : modules) {
+        // The first NON-GOT code relocation naming each import of this unit — the
+        // references that want the symbol's own address rather than a slot's.
+        std::unordered_map<std::uint32_t, TargetRelocationInfo const*> directCodeRef;
+        for (auto const& fn : m.functions) {
+            for (auto const& rel : fn.relocations) {
+                auto const* tri = targetSchema.relocationInfo(rel.kind);
+                if (tri == nullptr || tri->tls) continue;   // the kind unifier's / the TLS gate's
+                if (relocFormulaFacts(tri->formulaKind).isGotSlotRelative) continue;
+                directCodeRef.try_emplace(rel.target.v, tri);
+            }
+        }
         for (auto const& ext : m.externImports) {
-            if (ext.kindOrigin == ExternKindOrigin::Stated) continue;
             if (ext.libraryPath.empty()) continue;              // K_SymbolUndefined's
             if (siblingWinners.contains(ext.mangledName)) continue;  // a sibling decides
+            if (ext.kindOrigin == ExternKindOrigin::Stated) {
+                if (!dataBindsThroughASlot) continue;
+                if (!ext.isData || ext.isThreadLocal || ext.readThroughSlot) continue;
+                auto const it = directCodeRef.find(ext.symbol.v);
+                if (it == directCodeRef.end()) continue;
+                report(reporter, DiagnosticCode::K_ImportReferenceUnbindable,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "'{}' binds as a DATA import of library '{}', and the "
+                           "code of a unit this link reads (CU #{}) names it "
+                           "directly through '{}', not through a slot. That "
+                           "reference expects the datum at a link-time address — "
+                           "a copy relocation — which this link does not make: "
+                           "library data binds through a loader-filled slot, so "
+                           "the code would read the slot instead of the datum. "
+                           "gcc links it with a copy relocation, PIE or not. "
+                           "Build that unit to reach the datum through the GOT "
+                           "(gcc -fPIC does), or define the datum in a linked "
+                           "unit.",
+                           ext.mangledName, ext.libraryPath, m.cuId.v,
+                           it->second->name));
+                ok = false;
+                continue;
+            }
             if (ext.kindOrigin == ExternKindOrigin::Pending) {
                 report(reporter, DiagnosticCode::K_ImportReferenceUnbindable,
                        DiagnosticSeverity::Error,
@@ -2051,6 +2143,175 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
 }
 
 } // namespace
+
+// ── GOT-SLOT-RELATIVE REFERENCES, LOWERED TO SLOTS THE LINK MINTS ─────────
+// (see `link/got_slots.hpp` for the mechanism and why it lives here, once,
+// rather than in each image writer).
+TargetRelocationInfo const*
+gotSlotDirectTwin(TargetSchema const& target, TargetRelocationInfo const& gotRow,
+                  std::string& why) {
+    if (!relocFormulaFacts(gotRow.formulaKind).isGotSlotRelative) {
+        why = "relocation '" + gotRow.name + "' does not address a GOT slot";
+        return nullptr;
+    }
+    if (gotRow.gotSlotTwin.empty()) {
+        why = std::format(
+            "the GOT-slot-relative relocation '{}' of target schema '{}' names no "
+            "'gotSlotTwin' — the direct relocation the link rewrites it into, "
+            "against the slot it mints — so no image can apply it",
+            gotRow.name, target.name());
+        return nullptr;
+    }
+    auto const* twin = target.relocationByName(gotRow.gotSlotTwin);
+    if (twin == nullptr) {
+        why = std::format(
+            "the GOT-slot-relative relocation '{}' names 'gotSlotTwin' '{}', which "
+            "target schema '{}' does not declare",
+            gotRow.name, gotRow.gotSlotTwin, target.name());
+        return nullptr;
+    }
+    if (auto const mismatch = gotSlotTwinMismatch(gotRow, *twin)) {
+        why = *mismatch;
+        return nullptr;
+    }
+    return twin;
+}
+
+bool lowerGotSlotReferences(AssembledModule const&    in,
+                            AssembledModule&          out,
+                            TargetSchema const&       target,
+                            ObjectFormatSchema const& format,
+                            DiagnosticReporter&       reporter,
+                            std::span<SymbolId const> resolvedToNothing) {
+    // A relocatable artifact keeps its GOT relocations for the final linker —
+    // DSS's own aarch64 staticlib WRITES them (`externAddrBinding: got`).
+    if (!format.isImageFlavor()) return true;
+    auto const isGotSlotRelative = [&](Relocation const& rel) {
+        auto const* tri = target.relocationInfo(rel.kind);
+        return tri != nullptr && relocFormulaFacts(tri->formulaKind).isGotSlotRelative;
+    };
+    bool any = false;
+    for (auto const& fn : in.functions) {
+        for (auto const& rel : fn.relocations) any = any || isGotSlotRelative(rel);
+    }
+    // A GOT-slot-relative relocation names an INSTRUCTION field; one in a data
+    // item has no meaning this lowering could preserve, so it is refused by
+    // name rather than left for a writer to misapply.
+    for (auto const& di : in.dataItems) {
+        for (auto const& rel : di.relocations) {
+            if (!isGotSlotRelative(rel)) continue;
+            report(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                   DiagnosticSeverity::Error,
+                   std::format("linker: data item #{} carries the GOT-slot-relative "
+                               "relocation '{}', which addresses an instruction "
+                               "field that loads a pointer from a slot — in a data "
+                               "item it has no meaning this link can apply.",
+                               di.symbol.v, target.relocationInfo(rel.kind)->name));
+            return false;
+        }
+    }
+    if (!any) return true;
+
+    // The slot is one POINTER, of the format's declared width, filled through
+    // the target's absolute pointer relocation of that width.
+    std::uint64_t const ptrBytes =
+        scalarByteSize(TypeKind::Ptr, format.dataModel()).value_or(8);
+    auto const absPtrKind =
+        absolutePointerRelocKind(target, static_cast<std::uint8_t>(ptrBytes));
+    if (!absPtrKind.has_value()) {
+        report(reporter, DiagnosticCode::K_AbsolutePointerRelocMissing,
+               DiagnosticSeverity::Error,
+               std::format("linker: the module reads through GOT slots, and target "
+                           "schema '{}' declares no absolute {}-byte pointer "
+                           "relocation (Linear, not pc-relative, neither TLS nor "
+                           "image-relative) to fill one — a slot with no fixup would "
+                           "be a permanent null pointer.",
+                           target.name(), ptrBytes));
+        return false;
+    }
+    std::unordered_set<std::uint32_t> const nothing = [&] {
+        std::unordered_set<std::uint32_t> s;
+        for (SymbolId const id : resolvedToNothing) s.insert(id.v);
+        return s;
+    }();
+
+    out = in;
+    std::uint32_t maxV = maxExistingSymbolIdV(out);
+    std::unordered_map<GotSlotKey, SymbolId, GotSlotKeyHash> slotByKey;
+    std::unordered_map<std::uint32_t, TargetRelocationInfo const*> twinByKind;
+    for (auto& fn : out.functions) {
+        for (auto& rel : fn.relocations) {
+            auto const* tri = target.relocationInfo(rel.kind);
+            if (tri == nullptr) continue;   // the link's kind unifier names it
+            RelocFormulaFacts const f = relocFormulaFacts(tri->formulaKind);
+            if (!f.isGotSlotRelative) continue;
+            auto [twinIt, freshTwin] = twinByKind.try_emplace(rel.kind.v, nullptr);
+            if (freshTwin) {
+                std::string why;
+                twinIt->second = gotSlotDirectTwin(target, *tri, why);
+                if (twinIt->second == nullptr) {
+                    report(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                           DiagnosticSeverity::Error, "linker: " + why + ".");
+                    return false;
+                }
+            }
+            GotSlotKey const key = gotSlotKeyFor(rel, f);
+            auto [slotIt, freshSlot] = slotByKey.try_emplace(key, SymbolId{});
+            if (freshSlot) {
+                bool const holdsNothing = nothing.contains(key.symbol.v);
+                if (holdsNothing && key.addend != 0) {
+                    report(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                           DiagnosticSeverity::Error,
+                           std::format(
+                               "linker: '{}' names the GOT slot of a WEAK symbol this "
+                               "link resolved to nothing, plus {} — a slot that "
+                               "would hold the bare number {} (AAELF64's GDAT(S+A) "
+                               "with S = 0). No compiler writes this form and the "
+                               "references disagree on it (GNU ld drops the addend, "
+                               "lld refuses the misaligned load), so it is refused "
+                               "rather than guessed.",
+                               tri->name, key.addend, key.addend));
+                    return false;
+                }
+                if (maxV == std::numeric_limits<std::uint32_t>::max()) {
+                    report(reporter, DiagnosticCode::K_SymbolUndefined,
+                           DiagnosticSeverity::Error,
+                           "linker: SymbolId space exhausted minting a GOT slot.");
+                    return false;
+                }
+                SymbolId const slotSym{++maxV};
+                slotIt->second = slotSym;
+                AssembledData slot;
+                slot.symbol    = slotSym;
+                slot.bytes.assign(static_cast<std::size_t>(ptrBytes), 0u);
+                slot.alignment = Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(ptrBytes));
+                if (holdsNothing) {
+                    // S resolved to nothing: the slot HOLDS 0 — a constant,
+                    // relocation-free, so read-only.
+                    slot.section = DataSectionKind::Rodata;
+                } else {
+                    // A CONST pointer the link (or the loader) fills — the
+                    // shared c145 chokepoint routes it to RelRoConst, whose
+                    // fill each image writer already decides per image kind.
+                    slot.section = relocBearingGlobalSection(/*isThreadLocal=*/false,
+                                                             /*isConst=*/true);
+                    Relocation fill;
+                    fill.offset = 0;
+                    fill.target = key.symbol;
+                    fill.kind   = *absPtrKind;
+                    fill.addend = key.addend;
+                    slot.relocations.push_back(fill);
+                }
+                out.dataItems.push_back(std::move(slot));
+            }
+            rel.target = slotIt->second;
+            rel.kind   = twinIt->second->kind;
+            if (f.slotHoldsAddend) rel.addend = 0;   // it lives in the slot now
+        }
+    }
+    return false;   // caller switches to `out`
+}
 
 LinkedImage link(std::span<AssembledModule const> modules,
                  TargetSchema const&       targetSchema,
@@ -2150,6 +2411,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // that consumes it, exactly as gas does, and that linker judges it.
     if (objectFormatSchema.isImageFlavor()
         && !refuseUnbindableImportReferences(modules, image.resolvedGlobalDefs,
+                                             targetSchema, objectFormatSchema,
                                              reporter)) {
         image.resolvedFuncCount = 0;
         return image;
@@ -2166,6 +2428,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // Placed BEFORE externImportNames / the data-import gate / the trampoline so
     // every downstream consumer sees the filtered module.
     AssembledModule unboundFilteredStorage;   // populated only when rows drop
+    std::vector<SymbolId> weakResolvedToNothing;   // the gate's null-bound imports
     {
         std::size_t const errsBeforeUnbound = reporter.errorCount();
         // D-CSUBSET-WEAK-EXTERN-IMPORT-NOT-IN-SYMBOL-TABLE: the null import slot
@@ -2182,7 +2445,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
                                         objectFormatSchema.allowsUndefinedImports(),
                                         fmtBackend != nullptr
                                             && fmtBackend->realizesCoalescingScopeReferences(),
-                                        ptrBytes, reporter)) {
+                                        ptrBytes, reporter, weakResolvedToNothing)) {
             selectedInput = &unboundFilteredStorage;
         }
         if (reporter.errorCount() != errsBeforeUnbound) {
@@ -2215,6 +2478,30 @@ LinkedImage link(std::span<AssembledModule const> modules,
                 return image;
             }
             selectedInput = &slotStorage;
+        }
+    }
+    // P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS,
+    // D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS): an IMAGE's GOT-slot-relative
+    // references — every default-built gcc/clang archive member reaching an
+    // extern, and DSS's own aarch64 staticlib — are lowered to direct references
+    // to slots minted here as relocation-bearing data items, which every image
+    // writer already fills per image kind (`link/got_slots.hpp`). The objects
+    // are the relocatable twin's business above; this is the image's. AFTER the
+    // reference gate, for the same reason the object slots are (a slot for an
+    // import the gate drops would point at nothing), and it takes the gate's
+    // null-bound weak data symbols so their slot HOLDS 0; BEFORE the kind
+    // unifier and the walkers, which then never see a GOT-slot-relative kind.
+    AssembledModule gotSlotStorage;   // populated only when slots are minted
+    {
+        std::size_t const errsBeforeGot = reporter.errorCount();
+        if (!lowerGotSlotReferences(*selectedInput, gotSlotStorage, targetSchema,
+                                    objectFormatSchema, reporter,
+                                    weakResolvedToNothing)) {
+            if (reporter.errorCount() != errsBeforeGot) {
+                image.resolvedFuncCount = 0;
+                return image;
+            }
+            selectedInput = &gotSlotStorage;
         }
     }
     AssembledModule const& inputModule = *selectedInput;

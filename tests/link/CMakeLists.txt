@@ -209,6 +209,16 @@ dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c
 # selects, which nothing else exercises), and the shipped-document sweep.
 dss_add_test(NAME link/test_static_init_schedule SOURCES test_static_init_schedule.cpp)
 
+# D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the format half of the environment entry forms —
+# the shipped verb sets and environment declarations per exec format, and the load
+# rules holding a format's verbs and its `processArgs` mechanism together. Its
+# fixtures are the shipped documents changed in ONE place, hence the json link (the
+# `test_c_symbol_decoration` precedent).
+dss_add_test(NAME link/test_entry_environment_verbs
+             SOURCES test_entry_environment_verbs.cpp)
+target_link_libraries(dss_link_test_entry_environment_verbs
+                      PRIVATE nlohmann_json::nlohmann_json)
+
 # c163 (D-LK-STATIC-ARCHIVE-WRITER, writer half of D-FF1-AR-WRITER-STATIC-LINK)
 # — the GNU/System V `ar` static-archive WRITER: byte-exact framing + armap
 # pins, round-trip through the shipped c161 reader (the inverse-pair oracle),
@@ -657,6 +667,22 @@ target_link_libraries(dss_link_test_glibc_relocation_vocabulary
 # vacuous without anyone noticing.
 dss_add_test(NAME link/test_glibc_gotpcrel_resolution
              SOURCES test_glibc_gotpcrel_resolution.cpp)
+# P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS,
+# D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS): the link's GOT-slot lowering —
+# where each formula's addend goes, the direct twin it becomes, a relocatable
+# format left alone, a weak symbol resolved to nothing — and the REAL gcc members
+# (every x86 GOT type, the aarch64 pair) linked through `linker::link` into an
+# exec, a PIE and a shared object, each slot filled as its image kind requires.
+dss_add_test(NAME link/test_got_slot_lowering
+             SOURCES test_got_slot_lowering.cpp)
+
+# P68 round 11 (D-LK-MACHO-GOT-RELOCATIONS-REFUSED-AT-READ): clang's Mach-O
+# GOT_LOAD / GOT relocations — x86_64's in-place remainder read as the addend,
+# and the REAL members (`macho_got_member_objects.inc`) linked through
+# `linker::link` into a Mach-O exec on both ISAs, each slot rebased or bound as
+# its target requires.
+dss_add_test(NAME link/test_macho_got_relocations
+             SOURCES test_macho_got_relocations.cpp)
 
 # D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the ELF image's `.note.gnu.build-id` -- its
 # wire record, the fixed-point content derivation, reproducibility, distinctness,

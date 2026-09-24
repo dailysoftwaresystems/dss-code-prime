@@ -288,6 +288,15 @@ TEST(IncompatiblePointerConversion, CompatiblePointerConversionsStaySilent) {
              "static int f(void) { return 42; }\nint main(void) { int (*fp)(void) = f; return fp(); }\n",
              "static int f(void) { return 42; }\nint main(void) { void *v = f; return v ? 42 : 0; }\n",
              "int main(void) { int x = 42; volatile int *v = &x; return *v; }\n",
+             // P68 round 10 (lane `cs`): an ARRAY decaying into a pointer to a more-
+             // qualified element adds the qualifier as a pointer does (C 6.5.16.1p1) —
+             // at an initialization, an assignment and an argument. Each used to draw
+             // S_IncompatiblePointerIntegerPointee (the array arm compared the element
+             // by identity); all four references are silent (`.temp/probe/bv` bv24).
+             "int main(void) { int a[2] = { 40, 2 }; volatile int *v = a; return v[0] + v[1]; }\n",
+             "int main(void) { int a[2] = { 40, 2 }; volatile int *v; v = a; return v[0] + v[1]; }\n",
+             "static int f(volatile int *p) { return p[0] + p[1]; }\n"
+             "int main(void) { int a[2] = { 40, 2 }; return f(a); }\n",
          }) {
         auto model = analyzeC(src);
         EXPECT_FALSE(model.hasErrors()) << src;

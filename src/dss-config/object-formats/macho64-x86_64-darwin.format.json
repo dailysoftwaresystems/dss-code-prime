@@ -206,6 +206,18 @@
         { "bytesAfterField": 2, "nativeId": 1962934272 },
         { "bytesAfterField": 4, "nativeId": 2231369728 }
       ]
+    },
+    {
+      "$comment": "P68 round 11 (the Mach-O GOT_LOAD / GOT item): X86_64_RELOC_GOT_LOAD (3), r_pcrel = 1, r_length = 2 → nativeId = (3<<28)|(2<<25)|(1<<24) = 0x35000000 — what clang writes for `movq sym@GOTPCREL(%rip), %reg`, the load of a GOT slot a linker may relax: ✔MEASURED 2026-09-24, clang 18 `-O2 --target=x86_64-apple-macos11` reads an extern datum, an extern array element's address and an extern function's address this way, and DSS refused every such member at READ ('relocation nativeId 889192448 … is not declared'). The field keeps the displacement's remainder in place, so `kind` = 12 is x86_64.target.json's `gotriprel32_load` (bias -4, its `gotSlotTwin` `riprel32`). No relaxation.",
+      "name": "X86_64_RELOC_GOT_LOAD",
+      "kind": 12,
+      "nativeId": 889192448
+    },
+    {
+      "$comment": "P68 round 11: X86_64_RELOC_GOT (4), r_pcrel = 1, r_length = 2 → nativeId = (4<<28)|(2<<25)|(1<<24) = 0x45000000 — every OTHER GOT-slot operand (✔MEASURED 2026-09-24, clang 18: `cmpq $0, sym@GOTPCREL(%rip)` — clang's weak-function null check — `addq`, `pushq`, `callq *`, a store with an immediate, `movq sym@GOTPCREL+8(%rip)`), and in `__eh_frame` / `__gcc_except_tab` the personality and typeinfo pointers — which this document's readers refuse today by name (the unwind carrier has no personality or LSDA: D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE). `kind` = 11 is `gotriprel32`.",
+      "name": "X86_64_RELOC_GOT",
+      "kind": 11,
+      "nativeId": 1157627904
     }
   ]
 }

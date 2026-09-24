@@ -1,9 +1,15 @@
 // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS — the RESOLUTION
 // half. `test_glibc_relocation_vocabulary.cpp` proves a real glibc member READS
 // once its GOT-slot-relative wire type is declared; this file proves the read
-// module then LINKS — that the static ET_EXEC walker mints a real `.got`, that
-// every GOT-slot-relative site is patched to name a slot inside it, and that
+// module then LINKS — THROUGH `linker::link`, the driver's link, which lowers
+// every GOT-slot-relative site to a direct reference to a slot it mints, and
 // each slot holds the target's resolved address.
+// ⚠ P68 round 11: these pins used to call `elf::encode` on the read module
+// directly, and so exercised the STATIC ET_EXEC writer's own `.got` — a writer
+// ✔MEASURED 2026-09-24 that no program the driver builds reaches (every ELF
+// image imports libc `exit`), while the dynamic writer the driver does reach
+// refused the reference. The row was reopened for exactly that; the pins now
+// stand where the driver stands.
 //
 // ⚠ REAL ARCHIVE BYTES, NEVER A SYNTHESISED OBJECT. The fixtures in
 // `glibc_relocation_vocabulary_members.inc` are verbatim members of
@@ -15,18 +21,19 @@
 //
 // ── WHAT EACH TEST HERE IS FOR ────────────────────────────────────────────
 //
-//  1. `RealExitMemberGotPcRelSitesResolveThroughASynthesizedGot`
-//     THE CLOSURE. The real member's two `cmpq $0x0,sym@GOTPCREL(%rip)` sites
-//     are patched with a displacement that lands inside a `.got` the image
-//     actually carries, and the slot each names holds that symbol's link-time
-//     address. Every number is recomputed from the EMITTED bytes.
+//  1. `RealExitMemberGotPcRelSitesResolveThroughSlotsTheLinkMints`
+//     THE CLOSURE. Linked through `linker::link` (and so through the DYNAMIC
+//     writer, every ELF image's), the real member's two
+//     `cmpq $0x0,sym@GOTPCREL(%rip)` sites are patched with displacements that
+//     land on two DISTINCT slots inside the image's writable data, and the slot
+//     each names holds that symbol's link-time address. Every number is
+//     recomputed from the EMITTED bytes.
 //
-//  2. `AModuleWithNoGotSlotRelocationCarriesNoGot`
-//     THE CONTROL for (1), and it is not optional: without it, "the image has
-//     a `.got`" is equally consistent with "this walker always emits one",
-//     which would say nothing about the relocation. A foreign gcc `.o` whose
-//     every relocation is an ordinary PC32/PLT32 links to an image with NO
-//     `.got` section at all.
+//  2. `AModuleWithNoGotSlotRelocationGetsNoSlot`
+//     THE CONTROL for (1), and it is not optional: without it, "a slot exists"
+//     is equally consistent with "the link always mints one". A foreign gcc
+//     `.o` whose every relocation is an ordinary PC32/PLT32 leaves the lowering
+//     with nothing to do, and still links.
 //
 //  3. `AStillUndeclaredWireTypeIsStillRefused`
 //     THE GUARD, re-pinned in the SAME commit that removes the apply refusal.
@@ -40,6 +47,8 @@
 #include "core/types/target_schema.hpp"
 #include "link/format/elf.hpp"
 #include "link/format/elf_object_reader.hpp"
+#include "link/got_slots.hpp"
+#include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
 #include "repo_root.hpp"
@@ -300,22 +309,11 @@ struct GotSite {
     return out;
 }
 
-// The writer concatenates `.text` in module order, so a site's runtime VA is
-// the text VA plus every preceding function's byte count plus its own offset.
-[[nodiscard]] std::uint64_t funcTextStartOf(AssembledModule const& mod,
-                                            std::size_t            funcIndex) {
-    std::uint64_t start = 0;
-    for (std::size_t i = 0; i < funcIndex; ++i) {
-        start += mod.functions[i].bytes.size();
-    }
-    return start;
-}
-
 }  // namespace
 
 // ── 1. THE CLOSURE ────────────────────────────────────────────────────────
 TEST(GlibcGotPcRelResolution,
-     RealExitMemberGotPcRelSitesResolveThroughASynthesizedGot) {
+     RealExitMemberGotPcRelSitesResolveThroughSlotsTheLinkMints) {
     auto const S = loadShippedSchemas();
     ASSERT_TRUE(S.target && S.reader && S.writer);
 
@@ -332,84 +330,104 @@ TEST(GlibcGotPcRelResolution,
         << "the fixture member carries exactly two plain-GOTPCREL sites "
            "(`.rela.text` 0x1b against `__call_tls_dtors` and 0x123 against "
            "`_IO_cleanup`)";
+    // Each site by the NAMES the image will carry — its function and its
+    // target — recorded before the module is linked: the link inserts its
+    // entry trampoline ahead of every function, so a `.text` offset measured
+    // on the module would no longer point at the site.
+    struct NamedSite {
+        std::string   function;
+        std::uint64_t offset = 0;
+        std::int64_t  addend = 0;
+        std::string   target;
+    };
+    auto const nameOf = [&](SymbolId id) {
+        for (auto const& s : module->symbols) {
+            if (s.symbol == id) return s.name;
+        }
+        for (auto const& e : module->externImports) {
+            if (e.symbol == id) return e.mangledName;
+        }
+        return std::string{};
+    };
+    std::vector<NamedSite> named;
     for (auto const& s : sites) {
         EXPECT_EQ(s.addend, -5)
             << "a real `cmpq $0x0,sym@GOTPCREL(%rip)` site is 5 bytes from the "
                "next instruction (4-byte displacement + 1-byte immediate)";
+        named.push_back({nameOf(module->functions[s.funcIndex].symbol), s.offset,
+                         s.addend, nameOf(s.target)});
+        ASSERT_FALSE(named.back().function.empty());
+        ASSERT_FALSE(named.back().target.empty());
     }
-    // Remember the site VAs BEFORE the module is mutated — `defineRemainingExterns`
-    // appends data items but never touches `.text`, so the offsets stay valid.
-    std::vector<std::uint64_t> siteTextOffsets;
-    for (auto const& s : sites) {
-        siteTextOffsets.push_back(funcTextStartOf(*module, s.funcIndex)
-                                  + s.offset);
-    }
+    EXPECT_NE(named[0].target, named[1].target) << "two distinct targets";
 
     std::size_t const definedCount = defineRemainingExterns(*module);
     EXPECT_GT(definedCount, 0u)
         << "the member names undefined symbols other archive members define; "
            "if this is zero the fixture stopped being a real archive member";
 
-    module->imageEntryOverride = 0u;
-    DiagnosticReporter writeReporter;
-    auto const image = elf::encode(*module, *S.target, *S.writer,
-                                   writeReporter);
-    ASSERT_FALSE(image.empty())
-        << "the read member must LINK into a static ET_EXEC image once its "
-           "externs are defined — a GOT-slot-relative relocation is no longer a "
-           "refusal. Got:\n"
-        << errorText(writeReporter);
+    // THROUGH THE DRIVER'S LINK: the entry trampoline imports libc `exit`, so
+    // the image is the DYNAMIC writer's — exactly as for every program.
+    module->userEntrySymbol = module->functions.front().symbol;
+    DiagnosticReporter linkReporter;
+    auto const image = linker::link(*module, *S.target, *S.writer, linkReporter);
+    ASSERT_FALSE(linkReporter.hasErrors())
+        << "the read member must LINK through `linker::link` once its externs "
+           "are defined — a GOT-slot-relative relocation is lowered, not refused. "
+           "Got:\n"
+        << errorText(linkReporter);
+    ASSERT_FALSE(image.bytes.empty());
 
-    auto const sections = readSections(image);
-    auto const* got  = findSection(sections, ".got");
+    auto const sections = readSections(image.bytes);
     auto const* text = findSection(sections, ".text");
-    ASSERT_NE(got, nullptr)
-        << "the image must carry a `.got` the walker minted for these sites";
     ASSERT_NE(text, nullptr);
-    EXPECT_EQ(got->entSize, 8u) << "an ELF64 GOT slot is 8 bytes";
-    EXPECT_EQ(got->size, 16u)
-        << "two distinct GOT-slot-relative targets ⇒ exactly two slots; a "
-           "larger table means a slot was minted per SITE rather than per SYMBOL";
-    EXPECT_EQ(got->type, 1u) << ".got is SHT_PROGBITS — its slots are file bytes";
-    EXPECT_EQ(got->flags & 0x3u, 0x3u)
-        << ".got is SHF_ALLOC|SHF_WRITE, the shape a real static image's GOT has";
-
-    // Each site: recover the slot the emitted displacement names, and assert
-    // the slot holds the target symbol's own address.
-    //   disp = slotVa + A - P   ⇒   slotVa = disp - A + P
-    for (std::size_t i = 0; i < sites.size(); ++i) {
-        std::uint64_t const siteVa = text->addr + siteTextOffsets[i];
-        std::uint64_t const siteAt = text->offset + siteTextOffsets[i];
-        std::int64_t const  disp   = readI32(image, siteAt);
+    std::vector<std::uint64_t> slotVas;
+    for (auto const& s : named) {
+        auto const fnVa = symbolValue(image.bytes, s.function);
+        ASSERT_TRUE(fnVa.has_value())
+            << "`.symtab` must name " << s.function << ". It carries: "
+            << symbolNames(image.bytes);
+        // disp = slotVa + A - P  ⇒  slotVa = disp - A + P
+        std::uint64_t const siteVa = *fnVa + s.offset;
+        std::uint64_t const siteAt = text->offset + (siteVa - text->addr);
+        std::int64_t const  disp   = readI32(image.bytes, siteAt);
         std::uint64_t const slotVa = static_cast<std::uint64_t>(
-            disp - sites[i].addend + static_cast<std::int64_t>(siteVa));
-        EXPECT_GE(slotVa, got->addr)
-            << "site " << i << " patched a displacement that does not reach `.got`";
-        EXPECT_LT(slotVa, got->addr + got->size)
-            << "site " << i << " patched a displacement past the end of `.got`";
-        ASSERT_EQ((slotVa - got->addr) % 8u, 0u)
-            << "site " << i << " names a misaligned slot";
+            disp - s.addend + static_cast<std::int64_t>(siteVa));
+        // The slot is a pointer inside the image's writable, file-backed data.
+        Section const* home = nullptr;
+        for (auto const& sec : sections) {
+            if (sec.type == 1u && (sec.flags & 0x3u) == 0x3u
+                && slotVa >= sec.addr && slotVa + 8 <= sec.addr + sec.size) {
+                home = &sec;
+            }
+        }
+        ASSERT_NE(home, nullptr)
+            << s.function << "+" << s.offset << " names " << slotVa
+            << ", which lies in no writable PROGBITS section of the image";
+        ASSERT_EQ(slotVa % 8u, 0u) << "a misaligned slot";
         std::uint64_t const slotContent =
-            readU64(image, got->offset + (slotVa - got->addr));
-        // In a static, non-PIE image the slot is a LINK-TIME CONSTANT: no
-        // loader writes it, so it must already hold the target's address.
-        auto const symVa = symbolValue(image, i == 0 ? "__call_tls_dtors"
-                                                      : "_IO_cleanup");
+            readU64(image.bytes, home->offset + (slotVa - home->addr));
+        // A non-PIE exec: the slot is a LINK-TIME CONSTANT — it must already
+        // hold the target's address.
+        auto const symVa = symbolValue(image.bytes, s.target);
         ASSERT_TRUE(symVa.has_value())
             << "the emitted `.symtab` must name the GOT target. It carries: "
-            << symbolNames(image);
+            << symbolNames(image.bytes);
         EXPECT_EQ(slotContent, *symVa)
-            << "the GOT slot for site " << i << " must hold the target's "
-               "resolved address — a slot holding anything else makes every "
-               "load through it read the wrong object";
+            << "the slot " << s.function << " reads must hold " << s.target
+            << "'s resolved address — anything else makes every load through it "
+               "read the wrong object";
         EXPECT_NE(slotContent, 0u)
-            << "these two targets ARE defined in this link, so a zero slot "
-               "would mean the walker never filled it";
+            << "these targets ARE defined in this link, so a zero slot would "
+               "mean nothing filled it";
+        slotVas.push_back(slotVa);
     }
+    EXPECT_NE(slotVas[0], slotVas[1])
+        << "two distinct targets ⇒ two slots — one per SYMBOL, not one shared";
 }
 
-// ── 2. THE CONTROL — no GOT-slot relocation, no `.got` ───────────────────
-TEST(GlibcGotPcRelResolution, AModuleWithNoGotSlotRelocationCarriesNoGot) {
+// ── 2. THE CONTROL — no GOT-slot relocation, no slot ─────────────────────
+TEST(GlibcGotPcRelResolution, AModuleWithNoGotSlotRelocationGetsNoSlot) {
     auto const S = loadShippedSchemas();
     ASSERT_TRUE(S.target && S.reader && S.writer);
 
@@ -422,15 +440,22 @@ TEST(GlibcGotPcRelResolution, AModuleWithNoGotSlotRelocationCarriesNoGot) {
         << "premise: this control object carries no GOT-slot-relative site";
 
     (void)defineRemainingExterns(*module);
-    module->imageEntryOverride = 0u;
-    DiagnosticReporter writeReporter;
-    auto const image = elf::encode(*module, *S.target, *S.writer,
-                                   writeReporter);
-    ASSERT_FALSE(image.empty()) << errorText(writeReporter);
+    DiagnosticReporter lowerReporter;
+    AssembledModule lowered;
+    EXPECT_TRUE(linker::lowerGotSlotReferences(*module, lowered, *S.target,
+                                               *S.writer, lowerReporter))
+        << "a module naming no GOT slot must leave the lowering nothing to do — "
+           "otherwise test 1's slots say nothing about the relocation, only "
+           "about the link";
+    EXPECT_FALSE(lowerReporter.hasErrors()) << errorText(lowerReporter);
+    EXPECT_TRUE(lowered.dataItems.empty() && lowered.functions.empty())
+        << "and `out` untouched";
 
-    EXPECT_EQ(findSection(readSections(image), ".got"), nullptr)
-        << "a module naming no GOT slot must get NO `.got` — otherwise test 1's "
-           "`.got` says nothing about the relocation, only about the walker";
+    module->userEntrySymbol = module->functions.front().symbol;
+    DiagnosticReporter linkReporter;
+    auto const image = linker::link(*module, *S.target, *S.writer, linkReporter);
+    EXPECT_FALSE(linkReporter.hasErrors()) << errorText(linkReporter);
+    EXPECT_FALSE(image.bytes.empty());
 }
 
 // ── 3. THE GUARD — widening by one relocation did not weaken it ──────────

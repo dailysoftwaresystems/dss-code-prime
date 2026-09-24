@@ -253,3 +253,14 @@ dss_add_test(NAME analysis/preprocess/test_stdint_limit_macros
              SOURCES test_stdint_limit_macros.cpp)
 target_include_directories(dss_analysis_preprocess_test_stdint_limit_macros
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 (lane lm, #2 — D-C-LINUX-IDENTITY-PREDEFINES-MISSING): the operating-system and
+# object-format identity predefines on every real pair — exactly the names the platform's
+# references predefine in their ISO modes (the Linux six on ELF, `__APPLE__`/`__MACH__` on
+# Mach-O, `_WIN32`/`_WIN64` on pe), never the GNU-mode `linux`/`unix`, and on the ELF pairs
+# the surface the Linux claims imply. Reads the shipped config, so it runs through ctest
+# (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_os_identity_predefines
+             SOURCES test_os_identity_predefines.cpp)
+target_include_directories(dss_analysis_preprocess_test_os_identity_predefines
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

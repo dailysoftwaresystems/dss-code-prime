@@ -650,6 +650,69 @@ TEST(HirLoweringC, GnuAttributeAfterDeclaratorLowersClean) {
            "Global — the attribute must not be mistaken for the initializer";
 }
 
+// P68 round 10 (lane `cs`) — a PARAMETER's specifier prefix is scanned for linkage
+// specifiers too (the `param` row declares `register`, round 8), so every token the
+// scan does not know used to be reported: `volatile`, `_Atomic` and each piece of an
+// attribute (`__attribute__((unused))` drew THREE H_UnknownLinkageSpecifier warnings).
+// gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 are silent on every shape
+// below (✔MEASURED 2026-09-24, the lane's `.temp/probe/lk`); `register volatile` puts
+// the one specifier the row declares beside a qualifier it must skip.
+TEST(HirLoweringC, AParametersQualifierOrAttributeIsNotAnUnknownLinkageSpecifier) {
+    for (char const* src : {
+             "static int f(volatile int x) { return x; }\nint g(void) { return f(1); }\n",
+             "static int f(_Atomic int x) { return x; }\nint g(void) { return f(1); }\n",
+             "static int f(const volatile int x) { return x; }\nint g(void) { return f(1); }\n",
+             "static int f(__attribute__((unused)) int x) { return 0; }\nint g(void) { return f(1); }\n",
+             "static int f([[maybe_unused]] int x) { return 0; }\nint g(void) { return f(1); }\n",
+             "static int f(register volatile int x) { return x; }\nint g(void) { return f(1); }\n",
+             "typedef int A[2];\nstatic int f(volatile A p) { return p[0]; }\n"
+             "int g(void) { int a[2] = { 1, 2 }; return f(a); }\n",
+         }) {
+        SemanticModel model = analyzeC(src);
+        ASSERT_FALSE(model.hasErrors()) << src;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << src << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << src << (r.all().empty() ? "" : r.all()[0].actual);
+    }
+}
+
+// P68 round 11 (lane `cs`) — the REALIZE half of an array decaying to a pointer to a MORE
+// qualified element (C 6.3.2.1p3, C 6.5.16.1p1: `int a[2]` initializing, assigned to and passed
+// as a `volatile int *`). The semantic tier admits the pair on `decayedElementReachesPointee`;
+// `coerce` must realize it as the decay Cast, typed as the TARGET pointer, at all three sites.
+// Without that arm the operand kept its ARRAY type where a pointer is declared, and nothing at
+// run time showed it (an array value lowers to its address downstream), so only the HIR can:
+// ✔MEASURED 2026-09-24 — the item-2 red-on-disable mutant that realized the decay by element
+// IDENTITY (BV13) left every executing pin green.
+TEST(HirLoweringC, AnArrayDecayingToAMoreQualifiedPointeeIsRealizedAsTheDecay) {
+    SemanticModel model = analyzeC(
+        "static int f(volatile int *q) { return q[0] + q[1]; }\n"
+        "int g(void) { int a[2] = { 40, 2 }; volatile int *p = a; p = a; return f(a) + p[0]; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    auto const& in = model.lattice().interner();
+    unsigned decays = 0;
+    // Arena slot 0 is the reserved sentinel; real ids run [1, nodeCount()).
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i) {
+        HirNodeId const n{i};
+        if (res->hir.kind(n) != HirKind::Cast) continue;
+        auto const kids = res->hir.children(n);
+        if (kids.size() != 1u || in.kind(res->hir.typeId(kids[0])) != TypeKind::Array) continue;
+        TypeId const to = res->hir.typeId(n);
+        if (in.kind(to) != TypeKind::Ptr) continue;
+        auto const pointee = in.operands(to);
+        if (pointee.size() == 1u && in.isVolatileQualified(pointee[0])) ++decays;
+    }
+    EXPECT_EQ(decays, 3u)
+        << "the initialization, the assignment and the argument must each be the Array->Ptr "
+           "decay Cast typed `volatile int *`";
+}
+
 // (The positional-symmetry pin that explains WHY `aligned` left this test —
 // `AfterDeclaratorAlignedAppliesLikeTheLeadingPosition` — lives with the rest of
 // the TF-C73 battery further down, where the shared `globalAlignment` helper it

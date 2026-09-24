@@ -148,29 +148,15 @@ constexpr std::uint64_t SHF_WRITE     = 1;
 constexpr std::uint64_t SHF_ALLOC     = 2;
 constexpr std::uint64_t SHF_EXECINSTR = 4;
 
-// ── The static image's OWN GOT ─────────────────────────────────────────────
-//    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
-//
-// `.got` is WRITER-OWNED — no `.format.json` row, like `.plt` / `.rela.dyn` in
-// the dynamic walker. A producer cannot place anything in it: every slot is
-// minted by the linker for a relocation that names one, so there is nothing
-// for a schema author to decide. ✔MEASURED: no shipped document under
-// `src/dss-config/` DECLARES a `.got` section row — the name appears there only
-// inside `$comment` prose describing the dynamic walker's GOT, never as a row a
-// loader reads.
-//
-// ⚠ THIS SENTENCE USED TO READ *"zero `.got` hits under `src/dss-config/`"* AND
-// THAT GREP RETURNS FOUR. The intended claim was always the structural one
-// above and it is TRUE; the sentence stating it was a self-documenting COUNT
-// that was already false when it was typed — one tier worse than the ordinary
-// rot, where a claim is true when typed and goes false only once the commit
-// lands. The claim is stated
-// structurally rather than as a figure because it is not a line count over a
-// named file set — the four prose hits are exactly what such a count would
-// report — so there is nothing here for the source census to bind.
-constexpr std::string_view kGotSectionName = ".got";
-// Slot width. ELF64 throughout this walker (`Elf64_Ehdr`, `Elf64_Shdr`), and
-// the dynamic walker's `.got` uses the same 8.
+// The dynamic walker's `.got` slot width. ELF64 throughout this walker
+// (`Elf64_Ehdr`, `Elf64_Shdr`).
+// ⚠ THE STATIC IMAGE'S OWN `.got` IS GONE (P68 round 11). It was minted here
+// for R_X86_64_GOTPCREL
+// (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS), and ✔MEASURED
+// 2026-09-24 no program the driver builds ever reached
+// it — every ELF image imports libc `exit` and takes the DYNAMIC writer. The
+// link now lowers every GOT-slot-relative reference, for every image writer, to
+// a direct reference to a slot it mints as a data item (`link/got_slots.hpp`).
 constexpr std::uint64_t kGotSlotBytes = 8;
 
 // ── `.note.gnu.build-id` ───────────────────────────────────────────────────
@@ -4230,34 +4216,13 @@ encode(AssembledModule const&    module,
     std::uint64_t const buildIdSectionVa =
         hasBuildId ? alignUp(roDataEndVa, buildIdAlign) : 0;
 
-    // ── `.got` — the GOT-slot table this image mints for itself ───────────
-    //    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
-    //
-    // One pointer-sized slot per symbol a GOT-SLOT-RELATIVE relocation names
-    // (`planGotSlotSymbols`), in first-reference order. A foreign
-    // static-archive member reaches this: glibc's `exit.o` carries
-    // `cmpq $0x0,sym@GOTPCREL(%rip)` against two weak-undefined symbols, and
-    // the whole meaning of that idiom is the CONTENT of the slot.
-    //
-    // ★ IN A STATIC, NON-PIE IMAGE A SLOT IS A LINK-TIME CONSTANT. There is no
-    // loader to write it and no `.rela.dyn` to describe it: the writer stores
-    // the target's resolved VA and the image is final. That is what separates
-    // this from the ET_DYN `.got`, whose slots are filled by ld.so through
-    // GLOB_DAT.
-    //
-    // ★ THE NAME IS WRITER-OWNED, like `.plt` / `.rela.dyn` in the dynamic
-    // walker — because the section is not a place a PRODUCER can put anything.
-    // ✔MEASURED: no shipped document declares a `.got` section row; the write-up
-    // and the correction of this sentence's earlier COUNT form live at
-    // `kGotSectionName`.
-    std::vector<SymbolId> const gotSlotSymbols =
-        isExec ? link::format::planGotSlotSymbols(module, targetSchema)
-               : std::vector<SymbolId>{};
-    bool const hasGot = !gotSlotSymbols.empty();
-    std::uint64_t const gotSize =
-        static_cast<std::uint64_t>(gotSlotSymbols.size()) * kGotSlotBytes;
-
-    bool const hasWritableSeg = hasData || hasBss || hasGot;
+    // ⓘ NO `.got` HERE (P68 round 11): a GOT-slot-relative reference reaches
+    // this writer already lowered by the link to a direct reference to a slot
+    // minted as a relocation-bearing data item (`link/got_slots.hpp`), which
+    // lands in `.data` and is filled below like any other pointer-holding item
+    // — a link-time constant in this static image. The `.got` this writer used
+    // to mint for R_X86_64_GOTPCREL is gone with the planner that fed it.
+    bool const hasWritableSeg = hasData || hasBss;
     // End of the read-only VA span (text + optional rodata + optional note).
     std::uint64_t const roSpanEndVa =
         hasBuildId ? buildIdSectionVa + buildIdNote.size() : roDataEndVa;
@@ -4297,29 +4262,11 @@ encode(AssembledModule const&    module,
         (isExec && hasWritableSeg) ? alignUp(roSpanEndVa, pageAlignStatic) : 0;
     std::uint64_t const dataSectionVa =
         (isExec && hasData) ? alignUp(writableSegVa, dataAlign) : 0;
-    // `.got` sits between `.data` and `.bss`: file-backed like `.data` (its
-    // slots carry resolved VAs, not zeroes), and BEFORE `.bss` because `.bss`
-    // must stay last so PT_LOAD #2's p_memsz tail is the only thing past
-    // p_filesz.
-    std::uint64_t const gotSectionVa =
-        (isExec && hasGot)
-            ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
-                      kGotSlotBytes)
-            : 0;
     std::uint64_t const bssSectionVa =
         (isExec && hasBss)
-            ? alignUp((hasGot    ? gotSectionVa + gotSize
-                       : hasData ? dataSectionVa + dataSize
-                                 : writableSegVa),
+            ? alignUp((hasData ? dataSectionVa + dataSize : writableSegVa),
                       bssAlign)
             : 0;
-
-    // `.got` body + the slot-address map, declared OUT here because the
-    // section layout below needs the bytes and the `isExec` block below needs
-    // to fill them (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
-    std::vector<std::uint8_t> gotBytes;
-    gotBytes.reserve(static_cast<std::size_t>(gotSize));
-    std::unordered_map<SymbolId, std::uint64_t> gotSlotVa;
 
     // ── ET_EXEC: apply intra-module relocations in-place ───────
     //
@@ -4384,34 +4331,10 @@ encode(AssembledModule const&    module,
                 "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
-        // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: fill the
-        // `.got` slots planned above, now that `symbolVa` is complete, and hand
-        // the applier the slot ADDRESSES in their own map. The two maps are
-        // deliberately separate: ✔MEASURED on the real glibc `exit.o`, both
-        // `__call_tls_dtors` and `_IO_cleanup` are the target of a GOTPCREL AND
-        // of a PLT32 in the SAME member, so one symbol needs its slot's address
-        // at one site and its own address at another.
-        for (SymbolId const slotSym : gotSlotSymbols) {
-            auto const symIt = symbolVa.find(slotSym);
-            if (symIt == symbolVa.end()) {
-                emit(reporter, DiagnosticCode::K_SymbolUndefined,
-                     std::string{"elf::encode (ET_EXEC): a GOT-slot-relative "
-                                 "relocation names symbol #"}
-                         + std::to_string(slotSym.v)
-                         + ", which no function, data item or import gives an "
-                           "address — the slot would hold a fabricated value "
-                           "and every load through it would read the wrong "
-                           "object "
-                           "(D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).");
-                return {};
-            }
-            gotSlotVa.emplace(slotSym, gotSectionVa + gotBytes.size());
-            appendU64LE(gotBytes, symIt->second);
-        }
         if (!link::format::applyExecRelocations(
                 text, module, funcTextStart, symbolVa,
                 targetSchema, secText->virtualAddress,
-                "elf::encode (ET_EXEC)", reporter, &gotSlotVa)) {
+                "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
         // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): `.data` now carries reloc-
@@ -4463,7 +4386,7 @@ encode(AssembledModule const&    module,
     std::uint16_t const IDX_BSS    =
         hasBss ? static_cast<std::uint16_t>(
                      2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u)
-                     + (hasRelRo ? 1u : 0u) + (hasGot ? 1u : 0u))
+                     + (hasRelRo ? 1u : 0u))
                : 0u;
 
     StringTable strtab;
@@ -5153,7 +5076,6 @@ encode(AssembledModule const&    module,
     SectionHeader hRodata{};
     SectionHeader hData{};
     SectionHeader hBss{};
-    SectionHeader hGot{};          // .got (ET_EXEC) — GOT-slot table
     SectionHeader hRelRo{};        // c145: .data.rel.ro (ET_REL)
     SectionHeader hRela{};
     SectionHeader hRelaData{};     // c145: .rela.data (ET_REL)
@@ -5207,9 +5129,6 @@ encode(AssembledModule const&    module,
     }
     if (hasBss) {
         hBss.name_offset   = shstrtab.add(secBss->name);
-    }
-    if (hasGot) {
-        hGot.name_offset   = shstrtab.add(std::string{kGotSectionName});
     }
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
@@ -5271,9 +5190,6 @@ encode(AssembledModule const&    module,
     if (hasRodata) { (void)nextIdxS(); }
     if (hasData)   { (void)nextIdxS(); }
     if (hasRelRo)  { (void)nextIdxS(); }           // .data.rel.ro (ET_REL) c145
-    if (hasGot)    { (void)nextIdxS(); }           // .got (ET_EXEC) — before
-                                                   // `.bss`, matching the VA
-                                                   // order and the push order
     if (hasBss)    { (void)nextIdxS(); }
     if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
     // c145: `.rela.data` / `.rela.data.rel.ro` follow `.rela.text` (ET_REL only,
@@ -5334,20 +5250,6 @@ encode(AssembledModule const&    module,
         hBss.entry_size  = secBss->entrySize;
         hBss.size        = bssSize;
         hBss.addr        = isExec ? bssSectionVa : 0;  // ET_REL: unbound
-    }
-    // `.got` (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS) —
-    // SHT_PROGBITS + SHF_ALLOC|SHF_WRITE with an 8-byte entry size, the shape
-    // `readelf -S` shows for a real static image's GOT. The values here are
-    // WRITER-OWNED rather than schema rows for the same reason the name is: a
-    // producer cannot put anything in this section, so there is nothing for a
-    // `.format.json` author to decide.
-    if (hasGot) {
-        hGot.type        = SHT_PROGBITS;
-        hGot.flags       = SHF_ALLOC | SHF_WRITE;
-        hGot.addr_align  = kGotSlotBytes;
-        hGot.entry_size  = kGotSlotBytes;
-        hGot.size        = gotSize;
-        hGot.addr        = gotSectionVa;
     }
     // `.data.rel.ro` section header (D-LK-RELRO-CONST-DATA-RELOCATABLE, c145).
     // sh_type / sh_flags from the SCHEMA ROW (SHT_PROGBITS + SHF_ALLOC|SHF_WRITE,
@@ -5658,26 +5560,6 @@ encode(AssembledModule const&    module,
     if (hasRelRo) {
         layoutSection(hRelRo, relroLayout.bytes);
     }
-    // `.got` — file-backed, right after `.data`, before the zero-fill `.bss`
-    // tail. ET_EXEC only, and its file/VA congruence is asserted like `.data`'s
-    // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).
-    if (hasGot) {
-        layoutSection(hGot, gotBytes, gotSectionVa);
-        std::uint64_t const gotFileDelta = hGot.offset - hText.offset;
-        if (secText->virtualAddress + gotFileDelta != gotSectionVa) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("elf::encode (ET_EXEC): .got file/VA congruence "
-                             "broken — textVa({}) + fileDelta({}) != "
-                             "gotSectionVa({}). Every GOT-slot-relative "
-                             "displacement was computed against the VA, so a "
-                             "desync makes each one load from the wrong file "
-                             "bytes. "
-                             "D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS.",
-                             secText->virtualAddress, gotFileDelta,
-                             gotSectionVa));
-            return {};
-        }
-    }
     if (hasBss) {
         // NOBITS: record sh_offset at the current cursor (conventional — points
         // just past .data) WITHOUT appending bytes; sh_size is the zero-fill
@@ -5734,8 +5616,6 @@ encode(AssembledModule const&    module,
     if (hasData) headers.push_back(&hData);
     // `.data.rel.ro` (c145) between `.data` and `.bss` (ET_REL only).
     if (hasRelRo) headers.push_back(&hRelRo);
-    // `.got` before `.bss` — MUST match the cursor above and the VA order.
-    if (hasGot) headers.push_back(&hGot);
     if (hasBss) headers.push_back(&hBss);
     if (!isExec) headers.push_back(&hRela);
     // `.rela.data` / `.rela.data.rel.ro` (c145) after `.rela.text` (ET_REL only).
@@ -5905,11 +5785,7 @@ encode(AssembledModule const&    module,
             std::uint32_t pFlags2 = 0;
             if (hasData) pFlags2 |= shFlagsToPFlags(secData->flags);
             if (hasBss)  pFlags2 |= shFlagsToPFlags(secBss->flags);
-            // `.got` is SHF_ALLOC|SHF_WRITE by construction (it is not a schema
-            // row), so it contributes R+W exactly as `.data` does.
-            if (hasGot)  pFlags2 |= shFlagsToPFlags(SHF_ALLOC | SHF_WRITE);
-            std::uint64_t const seg2Off =
-                hasData ? hData.offset : (hasGot ? hGot.offset : hBss.offset);
+            std::uint64_t const seg2Off = hasData ? hData.offset : hBss.offset;
             // ⚠ THE SEGMENT'S ADDRESS IS DERIVED FROM ITS FILE OFFSET, not
             // taken as `writableSegVa`. The loader maps `file[p_offset …]` at
             // `p_vaddr`, so the two must differ by the image's one delta — and
@@ -5921,21 +5797,15 @@ encode(AssembledModule const&    module,
             // more than a page, which is why no ordinary image moves.
             // D-LINK-ELF-IMAGE-OVERALIGNED-DATA-PLACED-AT-ALIGNED-FILE-OFFSET.
             std::uint64_t const seg2Va = imageBaseVa + seg2Off;
-            // p_filesz spans every FILE-BACKED member (`.data` then `.got`);
-            // `.bss` adds none.
+            // p_filesz spans the FILE-BACKED `.data`; `.bss` adds none.
             std::uint64_t const seg2FileEnd =
-                hasGot    ? (hGot.offset + gotSize)
-                : hasData ? (hData.offset + dataSize)
-                          : seg2Off;
+                hasData ? (hData.offset + dataSize) : seg2Off;
             std::uint64_t const seg2FileSz = seg2FileEnd - seg2Off;
             std::uint64_t const seg2MemEnd =
-                hasBss    ? (bssSectionVa + bssSize)
-                : hasGot  ? (gotSectionVa + gotSize)
-                          : (dataSectionVa + dataSize);
+                hasBss ? (bssSectionVa + bssSize) : (dataSectionVa + dataSize);
             std::uint64_t const seg2MemSz = seg2MemEnd - seg2Va;
             appendPhdr(pFlags2, seg2Off, seg2Va, seg2FileSz, seg2MemSz,
-                       segmentAlign(std::max({dataAlign, bssAlign,
-                                              kGotSlotBytes})));
+                       segmentAlign(std::max(dataAlign, bssAlign)));
         }
         std::memcpy(bytes.data() + kEhdrSize, phdr.data(), phdr.size());
     }

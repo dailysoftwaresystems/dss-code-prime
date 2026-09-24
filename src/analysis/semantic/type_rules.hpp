@@ -181,6 +181,27 @@ namespace detail::type_rules {
     return false;
 }
 
+// ── THE ARRAY-TO-POINTER DECAY'S ELEMENT TEST, ONE ANSWER FOR BOTH TIERS ──────
+// (P68 round 10, lane `cs`)
+//
+// Does an array whose element is `element` decay into a pointer whose pointee is
+// `pointee` as C's own conversion? When the two are the same type up to their
+// `volatile` skins: the decay yields a pointer to the element (C 6.3.2.1p3), and a
+// pointer conversion may ADD the qualifier (C 6.5.16.1p1) — the relation
+// `isAssignable`'s Ptr←Ptr arm already applies to a pointer that has decayed. The
+// ADMIT side (`isAssignable`'s Ptr←Array arm) and the REALIZE side (the HIR
+// `coerce` decay arm) both ask HERE, so admit ⟺ realize holds by construction.
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/bv` bv21 / bv24): an `int a[2]`
+// passed to a `volatile int *` parameter is silent on gcc 13.3.0, clang 18.1.3,
+// mingw-w64 13.2.0 and MSVC 19.51; DSS warned S_IncompatiblePointerIntegerPointee
+// ("a pointer of a different integer type") because the arm compared the element
+// by identity while the pointer arm stripped the skin.
+[[nodiscard]] inline bool decayedElementReachesPointee(TypeInterner const& interner,
+                                                       TypeId pointee, TypeId element) {
+    return pointee.valid() && element.valid()
+        && interner.stripVolatile(pointee) == interner.stripVolatile(element);
+}
+
 // rhs assignable into lhs?
 //   InvalidType on either side → true (cascade suppression).
 //   Identical → true.
@@ -704,7 +725,9 @@ namespace detail::type_rules {
         auto const lhsElem = interner.operands(lhs);
         auto const rhsElem = interner.operands(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()) {
-            if (lhsElem[0] == rhsElem[0]) {
+            // P68 round 10: the element up to its `volatile` skin — the one test the
+            // HIR `coerce` decay arm realizes (`decayedElementReachesPointee`).
+            if (decayedElementReachesPointee(interner, lhsElem[0], rhsElem[0])) {
                 return true;
             }
             // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed

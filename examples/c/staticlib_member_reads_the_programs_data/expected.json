@@ -1,0 +1,52 @@
+{
+  "$comment": "★★★ THE PROGRAM DEFINES WHAT ITS ARCHIVE READS (P68 round 11, D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS — the reverse direction of `staticlib_data_imports_read_by_main`). Each target's `dependsOn` builds `dsslib.c` into a DSS static library whose member reads `dss_app_value`, takes the address of an element of `dss_app_table` and of the function `dss_app_twice` — all three DEFINED by `main.c`. A relocatable object reaches an extern the way its format declares: directly (ELF x86_64, Mach-O), through its own `.refptr` slot (PE), or through the GOT (ELF aarch64, `externAddrBinding: got` — `adrp :got:` + `ldr :got_lo12:`, the same pair every default-built aarch64 gcc object carries). ✔MEASURED 2026-09-24 on main's build before this change: the ELF aarch64 exec link REFUSED the member ('relocation kind 7 ... is not declared by object format elf64-aarch64-linux-exec', debug and release), while pe64 and ELF x86_64 returned 42. The references on the same two files, library as an `ar` archive: gcc 13 -no-pie and -pie 42, clang 18 42, aarch64-linux-gnu-gcc 13.3 42 under qemu, mingw-w64 gcc 13.2 42. What each value proves by the exit code: 1 — the member read the program's datum wrongly; 2 — the member's address of the program's array element differs from the program's own; 3 — the member's address of the program's function differs from the program's own; 42 = 17 + 25 + 0 only if every reference reached its definition. The Mach-O x86_64 arm is compiled only; Mach-O arm64 runs on the darwin leg. The `release` arm builds the archive and main through the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "x86_64:pe64-x86_64-windows-staticlib", "artifact": "dsslib.lib" }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "x86_64:elf64-x86_64-linux-staticlib", "artifact": "dsslib.a" }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "arm64:elf64-aarch64-linux-staticlib", "artifact": "dsslib.a" }
+      ]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "arm64:macho64-arm64-darwin-staticlib", "artifact": "dsslib.a" }
+      ]
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": [],
+      "dependsOn": [
+        { "sources": ["dsslib.c"], "spec": "x86_64:macho64-x86_64-darwin-staticlib", "artifact": "dsslib.a" }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -122,11 +122,12 @@
 //       - X86_64_RELOC_GOT_LOAD → `__got` slot absolute VA.
 //
 // ⚠ THIS LIST USED TO CARRY A SECOND ELF ROW — *"R_X86_64_GOTPCREL /
-// load-from-GOT → GOT slot absolute VA"* — AND IT WAS REFUTED BY MEASUREMENT.
-// A GOT-slot VA now travels in its OWN map (`gotSlotVa`, the trailing
-// parameter) because one symbol can need BOTH meanings in one module; the
-// argument and the glibc member that showed it are written up at
-// `relocFormulaReferencesGotSlot` below.
+// load-from-GOT → GOT slot absolute VA"* — AND IT WAS REFUTED BY MEASUREMENT:
+// one symbol can need BOTH meanings in one module (the glibc member written up
+// below). A GOT-slot-relative reference is now lowered by the LINK to a direct
+// reference to a slot of its own (`lowerGotSlotReferences`), so the slot is a
+// separate symbol with its own `symbolVa` entry and the kernel never sees the
+// GOT form (its arms refuse it — see "GOT-SLOT-RELATIVE RELOCATION KINDS").
 
 namespace dss::link::format {
 
@@ -162,62 +163,27 @@ namespace dss::link::format {
 // literal AND a `static_assert` on the rejected-row count; the write-up lives
 // there.
 
-// ── GOT-SLOT-RELATIVE RELOCATION KINDS ────────────────────────────────────
-//    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS
+// ── GOT-SLOT-RELATIVE RELOCATION KINDS ARE NOT APPLIED HERE ──────────────
+//    D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS,
+//    D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS (P68 round 11)
 //
-// TRUE for a formula whose `S` is NOT the symbol's own address but the address
-// of the SLOT THAT HOLDS it. A walker must mint a slot per such target before
-// it can apply the relocation, and `applyExecRelocations` reads those slots
-// out of a SECOND map rather than out of `symbolVa`.
-//
-// ★★ THE SECOND MAP IS A MEASUREMENT, NOT A PREFERENCE, AND IT REFUTES A
-// CONVENTION THIS HEADER USED TO STATE. The docblock above still described the
-// ELF arrangement as *"R_X86_64_GOTPCREL / load-from-GOT → GOT slot absolute
-// VA"* in `symbolVa` — one map, one meaning per symbol. ✔MEASURED on the REAL
-// glibc `exit.o` (`/usr/lib/x86_64-linux-gnu/libc.a`, md5
-// 56a6e057fd9df0ebce6e3bd15d33b0d9): `__call_tls_dtors` is the target of a
-// GOTPCREL at `.rela.text` 0x1b **AND** of a PLT32 at 0x294, and `_IO_cleanup`
-// of a GOTPCREL at 0x123 AND a PLT32 at 0x28a. One symbol, two references,
-// two DIFFERENT required values — the slot's address for one and the callee's
-// own address for the other. A single map cannot hold both, so binding
-// `symbolVa` to the slot would silently mis-patch every call to the same name.
-//
-// ⚠ THE arm64 GOT-ADDRESS KINDS ARE DELIBERATELY NOT HERE. `Aarch64AdrGotPage`
-// / `Aarch64Ld64GotLo12` are emitted ONLY into a relocatable object a FOREIGN
-// linker finishes (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT); DSS applies neither,
-// and their arm below refuses on purpose. Listing them here would turn that
-// deliberate refusal into a request for a slot no DSS image mints.
-[[nodiscard]] constexpr bool
-relocFormulaReferencesGotSlot(RelocFormulaKind k) noexcept {
-    return k == RelocFormulaKind::X86_64GotPcRel;
-}
-
-// The symbols a module's `.text` relocations need a GOT slot for, in FIRST-
-// REFERENCE order so the emitted slot table is a deterministic function of the
-// module (a `--config=release` corpus artifact is compared byte-for-byte).
-// Returns an empty vector when the module names none — the overwhelmingly
-// common case, in which a walker emits no `.got` at all and stays byte-
-// identical to its pre-GOT layout.
-//
-// A relocation whose kind has no row on the target schema is SKIPPED here
-// rather than reported: `applyExecRelocations` owns that diagnostic, and a
-// second copy of the check would be a second place for its wording to drift.
-[[nodiscard]] inline std::vector<SymbolId>
-planGotSlotSymbols(AssembledModule const& module,
-                   TargetSchema const&    targetSchema) {
-    std::vector<SymbolId>              order;
-    std::unordered_set<std::uint32_t>  seen;
-    for (auto const& fn : module.functions) {
-        for (auto const& rel : fn.relocations) {
-            auto const* tri = targetSchema.relocationInfo(rel.kind);
-            if (tri == nullptr) continue;
-            if (!relocFormulaReferencesGotSlot(tri->formulaKind)) continue;
-            if (!seen.insert(rel.target.v).second) continue;
-            order.push_back(rel.target);
-        }
-    }
-    return order;
-}
+// A GOT-slot-relative formula's `S` is not the symbol's address but the address
+// of a SLOT that holds it. `linker::link` lowers every one before any writer
+// runs (`lowerGotSlotReferences`, `link/got_slots.hpp`): it mints the slot as a
+// relocation-bearing data item and rewrites the reference into its DIRECT twin
+// against that item, so this kernel only ever sees ordinary formulas. The GOT
+// arms below therefore REFUSE: reaching one means a writer was handed a module
+// the link never lowered, and patching the symbol's own address where the code
+// dereferences a slot would load the object's first bytes as the pointer.
+// ⚠ THIS HEADER USED TO MINT THE SLOTS ITSELF — a `planGotSlotSymbols` planner
+// and a `gotSlotVa` map the STATIC ET_EXEC writer filled for R_X86_64_GOTPCREL.
+// ✔MEASURED 2026-09-24 that no program the driver builds ever reached it: every
+// ELF image imports libc `exit` and goes through the DYNAMIC writer, which
+// passed no map and refused the reference. The map's reason — ✔MEASURED on the
+// real glibc `exit.o`, one symbol can be the target of a GOTPCREL AND a PLT32,
+// needing its slot's address at one site and its own at the other — is kept by
+// the lowering: the slot is a separate symbol, so the two references name two
+// symbols.
 
 [[nodiscard]] inline bool applyExecRelocations(
     std::vector<std::uint8_t>&  text,
@@ -227,13 +193,7 @@ planGotSlotSymbols(AssembledModule const& module,
     TargetSchema const&         targetSchema,
     std::uint64_t               patchSectionVa,
     std::string_view            diagPrefix,
-    DiagnosticReporter&         reporter,
-    // GOT-slot VA per symbol — see `relocFormulaReferencesGotSlot`. `nullptr`
-    // (the default, and what every walker that mints no GOT passes) makes a
-    // GOT-slot-relative relocation fail LOUD rather than fall back to
-    // `symbolVa`, which would patch a DIRECT reference where an INDIRECT one
-    // was meant. D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS.
-    std::unordered_map<SymbolId, std::uint64_t> const* gotSlotVa = nullptr) {
+    DiagnosticReporter&         reporter) {
     using ::dss::link::format::detail::emit;
     auto const prefixStr = std::string{diagPrefix};
 
@@ -612,100 +572,39 @@ planGotSlotSymbols(AssembledModule const& module,
                     break;
                 }
                 case RelocFormulaKind::Aarch64AdrGotPage:
-                case RelocFormulaKind::Aarch64Ld64GotLo12: {
-                    // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the
-                    // arm64 GOT-address macro's ADR_GOT_PAGE / LD64_GOT_-
-                    // LO12_NC relocs. These are emitted ONLY into an ELF
-                    // relocatable `.o` / static-archive member — an
-                    // artifact linked by a FOREIGN toolchain (gcc/clang),
-                    // which synthesizes the GOT slot and applies them.
-                    // DSS itself has NO apply consumer: every DSS-linked
-                    // image — exec, pie and dyn alike — materializes an
-                    // extern DATA object's address through the c117
-                    // DSS-local got-indirect slot and a FUNCTION's through
-                    // its stub (the Linear/AddAbsLo12 kernels). So reaching THIS kernel
-                    // with a GOT-address reloc means a DSS exec/dyn image
-                    // is somehow carrying a foreign-link-only reloc — a
-                    // bug. Fail LOUD; a silent S/A/P fabrication here would
-                    // patch a GOT-slot offset the DSS image has no slot
-                    // for (a wrong-address miscompile).
+                case RelocFormulaKind::Aarch64Ld64GotLo12:
+                case RelocFormulaKind::X86_64GotPcRel: {
+                    // A GOT-slot-relative reference names the SLOT that holds
+                    // its symbol's address, never the symbol — and every one
+                    // an image carries is lowered by `linker::link` BEFORE any
+                    // writer runs (`lowerGotSlotReferences`, which mints the
+                    // slot and rewrites the reference into its direct twin
+                    // against it). Reaching this arm means a writer was handed
+                    // a module the link never lowered. ⚠ THE ANSWER IS A
+                    // REFUSAL, AND THAT IS THE WHOLE GUARD: patching the
+                    // symbol's own address where the code dereferences a slot
+                    // makes it load the object's first bytes as the pointer —
+                    // ✔MEASURED against the real glibc `exit.o`, whose plain-
+                    // GOTPCREL sites are `cmpq $0x0,sym@GOTPCREL(%rip)`
+                    // weak-symbol NULL checks, a fabricated value would take
+                    // the wrong arm forever.
+                    // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS and
+                    // D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS (the id lives
+                    // here, not in the message: the message states the condition
+                    // and the action).
                     emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                          prefixStr + ": relocation '" + tri->name
-                             + "' is an arm64 GOT-address reloc "
-                               "(ADR_GOT_PAGE / LD64_GOT_LO12_NC) — DSS "
-                               "does not APPLY these; they are emitted only "
-                               "into a foreign-linked relocatable object "
-                               "and resolved by the final (gcc/clang) "
-                               "linker. Reaching the DSS reloc kernel with "
-                               "one is a bug "
-                               "(D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT).");
+                             + "' against symbol #" + std::to_string(rel.target.v)
+                             + " is a GOT-slot-relative reference — it names the "
+                               "slot HOLDING the symbol's address — and it reached "
+                               "the relocation applier un-lowered: `linker::link` "
+                               "lowers every one to a direct reference to a slot it "
+                               "mints (`lowerGotSlotReferences`), and a writer "
+                               "called on a module that bypassed it has no slot to "
+                               "read. Patching the symbol's own address instead "
+                               "would be a wrong-address miscompile. Link the "
+                               "module through `linker::link`.");
                     return false;
-                }
-                case RelocFormulaKind::X86_64GotPcRel: {
-                    // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS:
-                    // R_X86_64_GOTPCREL names the SLOT that holds the symbol's
-                    // address, never the symbol. So `S` here is the SLOT's VA —
-                    // read out of `gotSlotVa`, which the walker built while it
-                    // laid the `.got` out — and NOT `symbolVa[target]`, which
-                    // holds the symbol's own address and is what the SAME symbol
-                    // needs for its ordinary PC32/PLT32 references.
-                    //
-                    // ⚠ THE FALLBACK IS A REFUSAL, AND THAT IS THE WHOLE GUARD.
-                    // Patching `symbolVa + A − P` when no slot exists would emit
-                    // a DIRECT pc-relative reference where an INDIRECT one was
-                    // meant — ✔MEASURED against the real glibc `exit.o`, both of
-                    // its plain-GOTPCREL sites are `cmpq $0x0,sym@GOTPCREL(%rip)`
-                    // weak-undefined NULL checks, so the fabricated value would
-                    // be a non-zero address and the branch would take the wrong
-                    // arm forever. GNU ld 2.42, LLVM lld 18.1.3 and GNU gold all
-                    // three decline to relax a plain GOTPCREL for exactly this
-                    // reason; only the `*_GOTPCRELX` forms are relaxable, and
-                    // they say so on the wire.
-                    std::uint64_t slotVa   = 0;
-                    bool          haveSlot = false;
-                    if (gotSlotVa != nullptr) {
-                        auto const slotIt = gotSlotVa->find(rel.target);
-                        if (slotIt != gotSlotVa->end()) {
-                            slotVa   = slotIt->second;
-                            haveSlot = true;
-                        }
-                    }
-                    if (!haveSlot) {
-                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                             prefixStr + ": relocation '" + tri->name
-                                 + "' is a GOT-slot-relative reference — it "
-                                   "names the slot HOLDING the symbol's "
-                                   "address, and this image minted no slot for "
-                                   "symbol #"
-                                 + std::to_string(rel.target.v)
-                                 + ". Patching the symbol's own pc-relative "
-                                   "displacement instead would be a "
-                                   "wrong-address miscompile "
-                                   "(D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS).");
-                        return false;
-                    }
-                    std::int64_t const value =
-                        static_cast<std::int64_t>(slotVa) + A
-                        - static_cast<std::int64_t>(P) + tri->addendBias;
-                    if (!fitsSignedNBits(value, 8 * tri->widthBytes)) {
-                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                             prefixStr + ": relocation '" + tri->name
-                                 + "' value " + std::to_string(value)
-                                 + " does not fit signed in widthBytes="
-                                 + std::to_string(
-                                       static_cast<int>(tri->widthBytes))
-                                 + " — the GOT slot is out of pc-relative "
-                                   "reach of the patch site, and truncating "
-                                   "would load from the wrong address.");
-                        return false;
-                    }
-                    auto const uVal = static_cast<std::uint64_t>(value);
-                    for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
-                        text[patchOff + b] =
-                            static_cast<std::uint8_t>((uVal >> (8u * b))
-                                                      & 0xFFu);
-                    }
-                    break;
                 }
             }
         }

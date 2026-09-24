@@ -234,6 +234,18 @@
       "decodeWhenInstruction": [
         { "mask": 4286578688, "value": 1031798784 }
       ]
+    },
+    {
+      "$comment": "P68 round 11 (the Mach-O GOT_LOAD / GOT item): ARM64_RELOC_GOT_LOAD_PAGE21 (5), r_pcrel = 1, r_length = 2 → nativeId = (5<<28)|(2<<25)|(1<<24) = 0x55000000 — the ADRP of a GOT slot: ✔MEASURED 2026-09-24, clang 18 `-O2 --target=arm64-apple-macos11` reads an extern datum, an extern array element's address and an extern function's address through this pair, and DSS refused every such member at READ ('relocation nativeId 1677721600 … is not declared', the pair's second half). `kind` = 7 is arm64.target.json's `adr_got_page`: an image link lowers it to its declared twin `adr_prel_pg_hi21` against a slot it mints. The instruction field holds no addend.",
+      "name": "ARM64_RELOC_GOT_LOAD_PAGE21",
+      "kind": 7,
+      "nativeId": 1426063360
+    },
+    {
+      "$comment": "P68 round 11: ARM64_RELOC_GOT_LOAD_PAGEOFF12 (6), r_pcrel = 0, r_length = 2 → nativeId = (6<<28)|(2<<25)|(0<<24) = 0x64000000 — the 64-bit LDR of the slot the PAGE21 half pages to. `kind` = 8 is `ld64_got_lo12` (its twin `ldst64_abs_lo12_nc`, scale 3). The eh_frame shape, ARM64_RELOC_POINTER_TO_GOT, is not declared: the readers refuse a personality pointer by name until the unwind carrier has one (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).",
+      "name": "ARM64_RELOC_GOT_LOAD_PAGEOFF12",
+      "kind": 8,
+      "nativeId": 1677721600
     }
   ]
 }

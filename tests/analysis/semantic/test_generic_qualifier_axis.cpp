@@ -307,3 +307,41 @@ TEST(GenericQualifierAxis, AnAbstractDeclaratorCarriesItsQualifiersAndItsParamet
          "int main(void) { return _Generic(&h, void (*)(int): 42, default: 1); }\n"},
     });
 }
+
+// ── P68 round 10 (lane `cs`): a qualifier INSIDE an abstract declarator's group is its
+//    layer's, never the base's ────────────────────────────────────────────────────
+// With no star at the type name's own level, the base-qualifier scan walked into the
+// abstract declarator, so `int (*volatile *)[2]` named an array of `volatile int` — the
+// association missed the very object DECLARED with it, and a cast through it built a
+// pointer the declared one converted from with S_IncompatiblePointerConversion. The
+// same held for `_Atomic` and for a function pointer's group (the base there is the
+// RESULT type). `const` rides the spine and was right. ✔MEASURED 2026-09-24 (lane
+// `cs`'s `.temp/probe/hxv`, every program RUN): gcc 13.3.0, clang 18.1.3 (both modes),
+// mingw-w64 13.2.0 and MSVC 19.51 (both modes; no `_Atomic`: abstains on m04) select
+// every `42` below; DSS fell to `default` on m01-m04.
+TEST(GenericQualifierAxis, AQualifierInsideAnAbstractGroupStaysInItsLayer) {
+    expectSelects42({
+        {"m01 &p of `int (*volatile p)[2]`",
+         "int main(void) { int a[2] = { 1, 2 }; int (*volatile p)[2] = &a;\n"
+         "  return _Generic(&p, int (**)[2]: 1, int (*volatile *)[2]: 42, default: 3); }\n"},
+        {"m02 an object declared with the association's own type",
+         "int main(void) { int (*volatile *q)[2] = 0;\n"
+         "  return _Generic(q, int (**)[2]: 1, int (*volatile *)[2]: 42, default: 3); }\n"},
+        {"m03 a volatile function pointer's address — the base is the result type",
+         "static int g(void) { return 1; }\n"
+         "int main(void) { int (*volatile fp)(void) = g;\n"
+         "  return _Generic(&fp, int (**)(void): 1, int (*volatile *)(void): 42, default: 3); }\n"},
+        {"m04 an `_Atomic` pointer to an array",
+         "int main(void) { static int a[2] = { 1, 2 }; int (*_Atomic p)[2] = &a;\n"
+         "  return _Generic(&p, int (**)[2]: 1, int (*_Atomic *)[2]: 42, default: 3); }\n"},
+        {"m05 the control: `const` inside the group",
+         "int main(void) { int a[2] = { 1, 2 }; int (*const p)[2] = &a;\n"
+         "  return _Generic(&p, int (**)[2]: 1, int (*const *)[2]: 42, default: 3); }\n"},
+    });
+    // The cast through the group converts to the declared object with no diagnostic.
+    auto m = analyzeC("int main(void) { int a[2] = { 1, 2 }; int (*p)[2] = &a;\n"
+                      "  int (*volatile *pp)[2] = (int (*volatile *)[2])&p; return (**pp)[0]; }\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(m.diagnostics()))
+        << "the cast's type IS the declared type — nothing converts";
+}

@@ -157,6 +157,14 @@ dss_add_test(NAME program/test_dump_predefined_macros
 dss_add_test(NAME program/test_entry_argv_run
              SOURCES test_entry_argv_run.cpp)
 
+# D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the environment entry forms' REAL-INPUT-PATH
+# witnesses, live on EVERY host (the host's own exec format): a variable the test
+# sets must reach `main(int, char**, char**)` byte-exact with real arguments, and
+# Darwin's four-parameter form and MSVC's 3-parameter `wmain` RUN where the host's
+# format realizes them and are REFUSED by code where it does not.
+dss_add_test(NAME program/test_entry_envp_run
+             SOURCES test_entry_envp_run.cpp)
+
 # D-C-ATOMICS-RUNTIME-PE64-BUS-LOCKS-EVERY-ACCESS-TO-A-CACHE-LINE-STRADDLING-OBJECT:
 # the NON-TIMING pin that DSS's pe64 atomics runtime executes no split-locked
 # instruction on an object crossing a cache line, that every image in a process

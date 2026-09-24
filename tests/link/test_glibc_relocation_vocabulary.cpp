@@ -147,10 +147,15 @@ injectGotPcRelKind(nlohmann::json& targetDoc, std::string const& formula) {
             r.erase("pcRelative");
             r.erase("addendBias");
             r.erase("widthBytes");
+            // A GOT-slot-relative row names its twin and no other row may
+            // (P68 round 11) — the key follows the formula.
+            r.erase("gotSlotTwin");
             if (formula == "linear") {
                 r["pcRelative"] = true;
                 r["addendBias"] = 0;
                 r["widthBytes"] = 4;
+            } else {
+                r["gotSlotTwin"] = "pcrel32";
             }
             return r.at("kind").get<std::uint32_t>();
         }
@@ -168,6 +173,8 @@ injectGotPcRelKind(nlohmann::json& targetDoc, std::string const& formula) {
         row["pcRelative"] = true;
         row["addendBias"] = 0;
         row["widthBytes"] = 4;
+    } else {
+        row["gotSlotTwin"] = "pcrel32";
     }
     rows.push_back(std::move(row));
     return kind;

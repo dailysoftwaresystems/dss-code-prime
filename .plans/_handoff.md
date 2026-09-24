@@ -77,6 +77,129 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ P68 ROUND 11 — READ THIS FIRST: `getopt`, `environ` and `main`'s third parameter ship on every format, GOT relocations link through the driver on ELF and Mach-O, and the round-close recompile caught a printf family that a second unit duplicated
+
+**THE LANES THIS COMMIT CARRIES**, in nine folds (F1–F9, plus F8b, a two-file correction to F8), each from a snapshot the lane cut at its fold point and
+md5-verified (a three-way merge wherever main had moved), its rows applied through `dssharness {write,set}-anchor`
+and read back identical, and main's own build + `repo-guard` label + full ctest run after every fold pair (2431 →
+2473 tests on MinGW Debug across the round):
+
+| lane | subject | what landed |
+|---|---|---|
+| `xa` | assembler surface, relocations, linker (F1 GOT, F6 Mach-O GOT, F8 suffixes) | **GOT relocations are lowered ONCE, at link time** (`lowerGotSlotReferences`): a slot per symbol and addend, an ordinary pointer item, the reference rewritten to its direct twin; the static `.got` writer is deleted. It RE-CLOSES `D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS` (round 10 reopened it: its fix lived in a writer no real program reaches), now proved through the driver on both ISAs, and closes the aarch64 exec's GOT refusal (P1, born closed). The slot fill (`R_X86_64_64` / `R_AARCH64_ABS64`) is DOCUMENTED equivalent to `GLOB_DAT` from glibc's own `dl-machine.h`. A direct reference to LIBRARY data (gcc's `stdout` via PC32, expecting a copy relocation) is now refused by name — round 10's HEAD ran it and exited 2 where gcc gives 42 (disclosed P1). **Mach-O's `GOT_LOAD_PAGE21`/`GOT_LOAD_PAGEOFF12` and x86_64's `GOT_LOAD`/`GOT` were refused at READ**; they link now (P1, born closed; the Mac 6/6). sqlite's ELF link is unaffected: testfixture (189 TUs) and CLI (103 TUs) build and link on x86_64 and aarch64, smoke 14/14, `select1.test` 0 errors in 199. **MSVC's ten mixed-case `long long` suffixes** (`lL`, `Ll`, `ulL` … `LlU`) are accepted with ISO's 22 — MSVC 19.51 accepts all 32 undiagnosed, and one working reference makes a spelling required (the brief said `lL`/`Ll` stay refused; MEASURED otherwise) |
+| `lm` | limits, shipped headers and runtime (F2, F4, F7, F9) | **`getopt` ships on every format** (`D-CONFIG-NO-SHIPPED-GETOPT-ON-ANY-FORMAT`, P1) — a shipped realization where the C library lacks one. **The Linux identity predefines** (`__linux__`, `__unix__`, `__ELF__`, … with an honest `impliedSurface`; P1, born closed): sqlite 3.54.0 with its Linux arms on is transcript-identical to gcc -O2 (exit 42, debug/release, x86_64/aarch64), and its syscalls now match the reference's (`pread64` 10/8, `pwrite64` 502, `mremap` 1, `lseek` 0). **`environ` ships** (`D-FFI-ENVIRON-NOT-SHIPPED`; on Darwin it lives in `libdyld`, MEASURED). **A synthesized library body now exists once per linked image** (F9, the merge blocker below; P1, born closed): every body DSS synthesizes — the pe printf family, which the UCRT does not export, and the `<threads.h>` family with its once-adapter — is emitted `Weak` + `Hidden`, which every writer already expresses (ELF `STB_WEAK`, Mach-O `N_WEAK_DEF`, COFF COMDAT `SELECT_ANY`) and the linker's all-weak arm collapses: no new vocabulary, no reader, writer or linker change. Hidden was DECIDED BY MEASUREMENT: a DSS pe DLL calling `printf` exported all six bodies beside its one function, and now exports only its function — what mingw-w64 `gcc -shared` and MSVC `cl /LD` export for the same source. Disclosed: a shipped runtime member's bodies still cross COFF, which has no visibility field, so a DLL that calls `getopt` exports them (P2; the `dirent` family did the same before round 11) |
+| `cs` | C semantics (F3, fold 6) | **A `volatile` inside an array parameter's bracket was dropped** (`void f(int p[volatile])`: the adjusted pointer lost it — a visible wrong result, P1); the one type adjustment (`adjustParamDeclaredType`) now carries the bracket, and the `int p[_Atomic]` meaning decision is recorded. Seven more born closed, three of them P1: **a function's TYPE kept a parameter's top-level `volatile`** (C 6.7.6.3p15 — now the language's rule `semantics.parameters.unqualifiedParameterTypes`); **a qualifier inside a type name's abstract-declarator group leaked onto its base** (`int (*volatile *)[2]`); **a qualifier on a typedef'd ARRAY qualified the array, not its element** (C 6.7.3p10). Disclosed: a qualifier among the type specifiers is a parse error (P2) |
+| `mig` | the harness and the diagnostics surface (F5, row 6) | **`main`'s third parameter** (`D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE`): `int main(int, char**, char**)` on all seven exec formats, MSVC's three-parameter `wmain` on pe, and Darwin's four-parameter `main` on Mach-O only (clang refuses it on Linux; gcc and MSVC pass garbage — MEASURED). pe follows MSVC's own order (`_initialize_narrow_environment()`, then `_get_initial_narrow_environment()` as `envp`); ELF computes `envp = argv + argc + 1` in generated startup code; the constructor trampoline's park is now derived from the format's entry forms (Mach-O 4 / ELF 2 / pe 0 slots). The entry-resolution diagnostic split closes with a new pe example; the example that pinned the old refusal is deleted, because the form is supported now |
+
+**Also (orchestrator).**
+- **THE ROUND-CLOSE RECOMPILE FOUND A MERGE BLOCKER THAT NO CTEST ENTRY COULD SEE.** At F7 it printed `tus=189
+  reference_ok=189 dss_ok=189 blockers=0` and still exited 1: six `K_SymbolRedefinedAcrossUnits` errors located in no
+  TU — `printf`, `fprintf`, `sprintf`, `snprintf`, `sscanf`, `vfprintf` had "multiple strong (Global) definitions
+  across CompilationUnits". pe SYNTHESIZES the printf family (UCRT exports none of those names) as a STRONG body in
+  every unit that calls it, and F2's shipped `getopt.c` realization is a second unit that calls `fprintf`. A seven-line
+  program calling `getopt` and `printf` reproduced it. Lane `lm` measured the class OLDER than F2: a DSS pe static
+  library whose member calls `printf`, linked into a program that calls `printf`, failed the same way — F2 only made
+  it reachable through a shipped function. F9 makes every synthesized body `Weak` + `Hidden` (lane `lm` above); the
+  repro now runs `c=-1`, exit 42, on pe64, ELF x86_64 and ELF aarch64 (qemu), debug and release, and two new examples
+  pin the program and static-library shapes. The per-TU verdict is not the run's verdict: read `RECOMPILE_RC`.
+- **A row's history was lost and restored.** Applying lane `lm`'s environ rows in one chained command skipped the
+  precheck's `LOST` flags: the closing trigger had REPLACED the row's record at creation, and the cross-refs dropped
+  `D-LK-EXTERN-DATA-IMPORT`. Both were restored through the door (the 2026-08-10 record verbatim beneath the lead).
+  A precheck `LOST` is now reviewed before every apply, never chained past.
+- **My own verify scripts still waited for 70% memory** after round 10 moved the threshold to 76% — the rule held
+  only for the lanes. One verify sat waiting at 70.4–70.9% until it was restarted with the scripts fixed.
+- **A snapshot deletion keyed its reference check by file STEM**, and `main`/`expected` name every example, so mig's
+  one deleted example was refused as "still named" by the whole corpus. The key is now the stem only when it is
+  unique, else the example's directory.
+- **The API session limit** stopped three lanes mid-turn (HTTP 429, reset 13:10); all resumed from their own state.
+- **F8's refusal example cited the row F8 closed.** `check-stale-refusal-citations` failed on main after the fold: in
+  lane `xa`'s tree the row was still open, so the lane's own run could not see it. The example now cites C 6.4.4.1 and
+  the four references that refuse those spellings (F8b).
+- **Six MSVC gate reds that a lane called "known" were root-caused, not re-run away.** Lane `xa`'s MSVC ctest showed
+  `NATIVE-PROBE-ENVIRONMENT-FAILED` 25 times ("vcvars64.bat (exit 255) but `set` left nothing"), and a one-at-a-time
+  re-run passed. No row or note recorded them. REPRODUCED: each `vcvars64` import grows PATH by 1,673 characters on
+  this host (2,655 → 4,328 → 6,001 → 7,674); an entry starting from 7,674 dies in VsDevCmd with "The input line is too
+  long." and cmd abandons the batch before `set` runs. The lane's gate script had imported the environment twice
+  in one process; the re-run imported it once. The probe's `>nul 2>&1` discarded the only words that said why. The
+  fix (restore `__VSCMD_PREINIT_*` before entering, keep vcvars' output) is lane `xa`'s, in round 12.
+
+**DssHarness.** **0.5.10** (repo-harness PR #12, installed 2026-09-24 11:12) answers reports #8, its addendum and #9:
+a fresh worktree's FIRST sync to the Mac is batched — ✔MEASURED 7,252 files in **24.4 s** with ≥ 26 ssh sessions
+(0.5.9: ~2,446 sessions, ~1,136 s), so the lanes run their own Mac and VPS work again, one Mac job per lane at a
+time; the host's shell-startup output no longer reaches a log (✔MEASURED 42 profile lines under 0.5.9, 0 under
+0.5.10), and exit codes still report both ways. Their four asks were answered (1, 2 and 4 measured; 3 from this
+gate: the six INCREMENTAL legs still warn a 174/176-character path — the object of the test round 10 renamed away,
+which no target owns — while the two WSL legs, rebuilt from clean, do not; 0.5.10's wording is now right, "This build
+did not write it", so #9 is fixed; we asked for a definitive no-owner verdict and a `ninja -t cleandead` remedy, and
+did not raise the reserve for a dead path). Sent this round: **#10** (a Mac leg
+rebuilt from clean after a successful 0.5.10 build on the same host copy — "previous build recorded no input
+fingerprint") and its addendum (three clean rebuilds in a row); and the operator's **manual steps** proposal
+(`manual: true` steps a run executes only when named with `--manual-step <name>`), so `benchmark_speedtest1.py` can
+run on a remote leg as a declared step instead of by hand. Also reported: WSL's host copy answered `sync --dry-run`
+"OK" with zero runnable legs (a vacuous OK), and **#11** — at this gate the Mac answered two `legs` probes and a
+dry-run sync, then `test` five seconds later found it asleep ("resolved to no address in 3 lookups") and did no work,
+twice; the INFERRED cause is a dark wake (the dry-run's keep-awake ends with the dry-run). Asked: a per-host
+resolution retry window at `test` start, or a keep-awake hold across invocations. Our gate script now treats a run that
+did no work as "not ready" and waits again; the third attempt ran.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **591 open at HEAD → 598**, "closed 6, opened 13
+(created 0, disclosed-pre-existing 13)"; banding **P0 0 · P1 59 · P2 195 · P3 329 · P4 11 · P5 4**; `read-anchors
+--lint` 0 findings. ✔MEASURED against HEAD (`registry_delta`): **25 new rows** — 12 born closed, 13 born open (all
+disclosed: 5 P1, 8 P2) — 6 rows open at HEAD closed, none reopened; the done registry 1597 → 1615 rows. Every opened
+row is HEAD's debt, found by the round's own work; the round again surfaced more old debt than it retired, and three
+of the five new P1s are whole ISO header surfaces (`<stdio.h>`'s 13 functions, `<stdlib.h>`'s 35 names) or a
+refused suffix family MSVC's own headers use.
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.10) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2.0 (C, CXX) · **2473 / 2473** | **MSVC 19.51.36260.0** (C, CXX; VS 18.10.12217.157, toolset 14.51.36231) · **2473 / 2473** |
+| WSL x86_64, gcc 13.3.0 (C, CXX) | **2441 / 2441** | **2441 / 2441** |
+| arm64 VPS, gcc 13.3.0 (C, CXX) | **2441 / 2441** | **2441 / 2441** |
+| macOS arm64, AppleClang 21.0.0 (C, CXX) | **2441 / 2441** | **2441 / 2441** |
+
+- **The round-close sqlite recompile** (`build_and_test.py --recompile pe64-x86_64`, this tree's dsscp against the
+  mingw reference oracle): **`tus=189 reference_ok=189 dss_ok=189 blockers=0`, RECOMPILE_RC=0** — after F7 the same
+  run printed the same verdict line and exited 1 (the merge blocker above).
+- **2441 = 2473 minus the 32-entry `repo-guard` label**, which the indirect legs leave out through `remoteExcludes`.
+  The six non-Mac legs ran as ONE invocation (exit 0). The Mac pair ran as a second: the Mac was asleep at the start,
+  and twice it answered the probes and slept again before `test` resolved it (report #11); the third attempt ran.
+  Both WSL legs rebuilt from clean (a WSL2 clock step).
+- **The host's memory during the gate:** commit reached 84% with the operator's own applications holding about 30 GB
+  of it; the lanes' heavy jobs were stopped for the Windows and WSL legs (a GATE WINDOW), and one lane's redundant
+  MSVC build was stopped earlier, when five heavy jobs had taken commit to 79.6% during main's verify.
+- **Owed since row 6, now paid:** the Mac legs' `LastTest.log` (read through `read-leg-path`) shows
+  `entry_main_envp_apple` and `entry_main_envp` with 3 arms verified each, debug and release (the latter's x86_64
+  Mach-O arms are the never-run ones, `D-TEST-EXAMPLES-X8664-MACHO-ARMS-NEVER-RUN-ON-THE-DARWIN-LEG`), and F8's and
+  F9's four new examples with 2 arms verified each. The per-example ledgers of both Mac legs are lane `mig`'s BEFORE for
+  that row: 61 never-run arms across 29 examples in the in-process runner, 4 across 2 in `integrated_tests`.
+
+**NEXT — P68 ROUND 12.** The lanes hold:
+- `mig` — row 3 (`D-CONFIG-COMMENT-CLAIM-ROT`: the 29 refused comment claims rewritten — four of them were FALSE from
+  the start — and the outright ban in one fold, with the SEH early-exit and label-address texts re-verdicted from
+  MSVC 19.51 and clang 18.1.3 measurements) FIRST; then one fold of three: the sqlite driver judging a single-file
+  `DSS_TEST_FILE` run as "zero files"; `probe-reference-cc` accepting an empty source and dumping a linked image, and
+  `read-leg-path` redacting a name only as a whole token (both self-tests into ctest); and the never-run x86_64
+  Mach-O example arms (the BEFORE above: 61 + 4) run under Rosetta on the Mac through one config table and one shared
+  decision in both runners — an arm that goes red there is a finding, never an exclusion.
+- `cs` — fold 7: node spans that ended on whitespace pushed before an optional tail (the `trimmedNodeText` workaround
+  deleted, 9 corpus spans move), the HIR/MIR text formats carrying an enum's fixed underlying type (HIR 5 → 6, MIR
+  2 → 3: a test spelling `dsshir 5`/`dssir 2` fails after it), the type-name VLA cases; then an enumeration constant
+  typed as its enum (SILENT, P1), the non-lvalue `&` acceptances and the refused `&(int){42}`, invalid static
+  initializers accepted, the sparse aggregate, and the examples runners (the declared-warning rule; the 144 vacuous
+  passes become classified skips) after mig's runner fold.
+- `xa` — the fc3 suite's `abort()` and the MSVC environment entry above (one fold), then **int → f32** (P1: `float f =
+  n;` is refused on x86_64, 8 of the 34 conversion cells on every target; the drafted fix adds CVTSI2SS and an exact
+  unsigned-64 sequence), MSVC's sized suffixes `i8`…`ui64` (P1: MSVC's own `limits.h` writes `LLONG_MAX` with `i64`),
+  and the unwind row (personality and LSDA carriage, P1).
+- `lm` — `<stdlib.h>`'s 35 missing ISO names (P1: `EXIT_SUCCESS`, `RAND_MAX`, `MB_CUR_MAX` are refused on every pair),
+  `<stdio.h>`'s 13 missing ISO functions (P1) with ELF's `scanf`/`strtol` binding glibc's GNU entry points
+  (`sscanf("%as")` writes a pointer into a `float`: SILENT, P1), the pe identity predefines, and the disclosed header
+  version and Apple platform identity rows.
+
+---
+
 ### ★ P68 ROUND 10 — READ THIS FIRST: four silent wrong results are gone, `extern` data read from a DSS static library no longer crashes, and a closed GOT row was reopened because its fix lived in a writer no real program reaches
 
 **THE LANES THIS COMMIT CARRIES**, in seven folds (F1–F7), each from a snapshot the lane cut at its fold point and

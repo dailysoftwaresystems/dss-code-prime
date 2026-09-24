@@ -3665,20 +3665,25 @@ enum class RelocFormulaKind : std::uint8_t {
     // [x,:got_lo12:sym]` GOT-address macro — materializes an undefined-
     // extern's address as a live code-form VALUE so a foreign default-PIE
     // link accepts it (an absolute ADR_PREL_PG_HI21 against a preemptible
-    // symbol is rejected "when making a shared object"). Emitted ONLY into
-    // an ELF relocatable `.o` / static-archive member, which is linked by
-    // a FOREIGN toolchain (gcc/clang) — DSS itself NEVER applies this
-    // reloc (no DSS-apply consumer: every DSS-linked image reaches an
-    // imported object through the c117 DSS-local got-indirect slot). So the `applyExecRelocations`
-    // kernel arm is an EXPLICIT FAIL-LOUD REFUSAL, not an S/A/P formula.
+    // symbol is rejected "when making a shared object"). DSS's codegen emits
+    // it ONLY into an ELF relocatable `.o` / static-archive member
+    // (`externAddrBinding: got`), and every default-built (PIE) gcc or clang
+    // aarch64 member carries it. A DSS IMAGE link never applies it as
+    // written: `lowerGotSlotReferences` (link/got_slots.hpp) mints the slot
+    // as a pointer data item holding S+A — AAELF64 writes this relocation
+    // over GDAT(S+A) — and rewrites the reference into ADR_PREL_PG_HI21
+    // against that slot. So the `applyExecRelocations` kernel arm is an
+    // EXPLICIT FAIL-LOUD REFUSAL of an un-lowered one, not an S/A/P formula.
     // Declaring it a real (non-Linear) kind is what keeps the ET_DYN
     // slide-safe classifier from mis-treating it as a Linear-absolute-in-
     // `.text` fixup (D-LK-DYN-TEXT-ABS-RELOC keys `formulaKind == Linear`).
     Aarch64AdrGotPage     = 5,
     // ARM64 R_AARCH64_LD64_GOT_LO12_NC (D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT,
     // TF-C52): the LDR word of the same GOT-address macro (the
-    // scaled 12-bit GOT-slot offset). Same foreign-linked-only /
-    // fail-loud-in-kernel discipline as Aarch64AdrGotPage above.
+    // scaled 12-bit GOT-slot offset). Same discipline as Aarch64AdrGotPage
+    // above: the link rewrites it into the 64-bit LDR's scaled page offset
+    // (LDST64_ABS_LO12_NC) of the slot, and the kernel refuses an un-lowered
+    // one.
     Aarch64Ld64GotLo12    = 6,
     // x86_64 R_X86_64_GOTPCREL = 9
     // (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS): the
@@ -3706,24 +3711,32 @@ enum class RelocFormulaKind : std::uint8_t {
     // reference site's own address, never zero, and silently take the
     // wrong branch forever. Only the `*_GOTPCRELX` (41) / `REX_GOTPCRELX`
     // (42) forms are relaxable, and they say so on the wire BECAUSE the
-    // assembler checked the instruction shape.
+    // assembler checked the instruction shape. All three share this formula,
+    // and DSS relaxes none of them: relaxation is an optimisation the
+    // assembler PERMITS, never a meaning — a load through a slot holding the
+    // same address is always correct.
     //
-    // ⚠ THIS PARAGRAPH USED TO SAY *"DSS synthesizes no GOT in its static
-    // ET_EXEC path, so the `applyExecRelocations` kernel arm is an EXPLICIT
-    // FAIL-LOUD REFUSAL"*, AND IT WENT FALSE WHEN THE WALKER LEARNED TO MINT
-    // ONE. The ELF static ET_EXEC walker now lays a `.got` — one pointer slot
-    // per symbol a GOT-slot-relative relocation names — and the kernel arm
-    // RESOLVES the relocation against that slot's address, which travels in
-    // its OWN map (`gotSlotVa`) rather than in `symbolVa`, because one symbol
-    // can need the slot's address at a GOTPCREL site and its own address at a
-    // PLT32 site in the SAME member.
+    // ⚠ WHERE THE SLOT COMES FROM MOVED TWICE. This paragraph used to say
+    // *"DSS synthesizes no GOT in its static ET_EXEC path, so the kernel arm
+    // is an EXPLICIT FAIL-LOUD REFUSAL"*; P64 then taught the STATIC ET_EXEC
+    // walker to lay its own `.got`, which ✔MEASURED 2026-09-24 no program
+    // reached — every ELF image the driver builds imports libc `exit` and
+    // takes the DYNAMIC writer, which had no slot. Since P68 round 11 the
+    // slot is minted ONCE, at the link, for every image writer:
+    // `lowerGotSlotReferences` (link/got_slots.hpp) makes it an ordinary
+    // pointer data item holding S and rewrites the reference into its direct
+    // twin — the target's Linear pc-relative row of the same width and bias —
+    // against it, the addend staying on the reference (G + GOT + A − P). The
+    // slot is a symbol of its own, so one symbol that needs the slot's
+    // address at a GOTPCREL site and its own address at a PLT32 site in the
+    // SAME member (measured on `exit.o`) gets both, and `symbolVa` keeps one
+    // meaning per symbol.
     //
-    // ★ THE REFUSAL SURVIVES WHERE NO SLOT EXISTS, and that is the whole
-    // guard: a walker that mints no GOT passes no map, so the arm fails LOUD
-    // instead of falling back to `symbolVa` — fabricating `S + A − P` there
-    // would patch a DIRECT reference where an INDIRECT one was meant. That is
-    // still the same discipline as the two arm64 GOT rows above; what changed
-    // is that ONE walker now has an answer, not that the refusal was relaxed.
+    // ★ THE REFUSAL SURVIVES FOR AN UN-LOWERED REFERENCE, and that is the
+    // whole guard: the kernel arm fails LOUD instead of falling back to
+    // `symbolVa` — fabricating `S + A − P` there would patch a DIRECT
+    // reference where an INDIRECT one was meant. The same discipline as the
+    // two arm64 GOT rows above.
     X86_64GotPcRel        = 7,
     // ARM64 R_AARCH64_ADR_PREL_LO21 (P68 round 9, the aarch64 twin of
     // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the ONE-word `adr`.
@@ -3773,6 +3786,69 @@ DSS_CHECK_ENUM_NAME_TABLE(kRelocFormulaTable);
 
 [[nodiscard]] DSS_EXPORT std::string_view
     relocFormulaName(RelocFormulaKind k) noexcept;
+
+// ── WHAT EACH FORMULA IS, IN ONE EXHAUSTIVE TABLE ─────────────────────────
+// (P68 round 11: the Mach-O GOT_LOAD / GOT item; the GOT half of it moved here
+// from `link/got_slots.hpp`, because the target LOADER now checks a GOT row's
+// declared twin against it and core cannot reach into link/.)
+//
+// Every formula is enumerated (no `default`), so a new one is a decision taken
+// here, in one place, for every reader.
+struct RelocFormulaFacts {
+    // The patch site is a plain LITTLE-ENDIAN BYTE FIELD (not an instruction
+    // word the formula scatters bits into). Such a field can hold an addend in
+    // place (COFF, Mach-O) and its arithmetic may carry a declared bias:
+    // `Linear`, and x86-64's GOT displacement — `GOTSLOT(S) + A − P` into four
+    // plain bytes, which Mach-O writes relative to the END of the field
+    // (✔MEASURED 2026-09-24, clang 18 `--target=x86_64-apple-macos11`:
+    // X86_64_RELOC_GOT_LOAD / X86_64_RELOC_GOT leave the displacement's
+    // remainder in place — 0, −1 before an imm8, −4 before an imm32, +8 for
+    // `sym@GOTPCREL+8` — exactly as X86_64_RELOC_SIGNED does for a direct
+    // reference). Every AArch64 formula patches an instruction word.
+    bool patchesPlainField = false;
+    // Addresses a SLOT that holds the symbol's address, never the symbol: an
+    // image link lowers it (`linker::lowerGotSlotReferences`) into the row the
+    // GOT row declares as its `gotSlotTwin`, against a slot it mints.
+    bool isGotSlotRelative = false;
+    // Where a GOT reference's addend goes. TRUE: into the slot — the slot HOLDS
+    // S + A, so `sym` and `sym+4` are two slots (AAELF64 writes ADR_GOT_PAGE /
+    // LD64_GOT_LO12_NC over GDAT(S+A), "a 64-bit entry in the GOT for address
+    // S+A"). FALSE: it stays on the reference — x86-64's GOTPCREL is
+    // `G + GOT + A − P`, A being the displacement's own bias, and the slot
+    // holds S.
+    bool slotHoldsAddend = false;
+    // The formula of the DIRECT row a GOT row's declared twin must have — the
+    // same arithmetic applied to the slot's own address.
+    RelocFormulaKind directTwin = RelocFormulaKind::Linear;
+    // For a scaled load/store twin, the access size its field counts in (a
+    // GOT entry is one 64-bit pointer).
+    std::uint8_t twinScaleLog2 = 0;
+};
+
+[[nodiscard]] constexpr RelocFormulaFacts relocFormulaFacts(RelocFormulaKind k) noexcept {
+    switch (k) {
+        case RelocFormulaKind::Linear:
+            return {true, false, false, RelocFormulaKind::Linear, 0};
+        case RelocFormulaKind::X86_64GotPcRel:
+            // The twin is a Linear pc-relative field of the SAME width and
+            // bias (`gotSlotTwinMismatch` checks all three).
+            return {true, true, false, RelocFormulaKind::Linear, 0};
+        case RelocFormulaKind::Aarch64AdrGotPage:
+            // Page(G) - Page(P): ADR_PREL_PG_HI21's arithmetic on the slot.
+            return {false, true, true, RelocFormulaKind::Aarch64AdrPrelPgHi21, 0};
+        case RelocFormulaKind::Aarch64Ld64GotLo12:
+            // (G & 0xFFF) >> 3: the 64-bit LDR's scaled page offset of the slot.
+            return {false, true, true, RelocFormulaKind::Aarch64LdstAbsLo12, 3};
+        case RelocFormulaKind::Aarch64Call26:
+        case RelocFormulaKind::Aarch64AdrPrelPgHi21:
+        case RelocFormulaKind::Aarch64AddAbsLo12:
+        case RelocFormulaKind::Aarch64TprelAddHi12:
+        case RelocFormulaKind::Aarch64AdrPrelLo21:
+        case RelocFormulaKind::Aarch64LdstAbsLo12:
+            return {};
+    }
+    return {};
+}
 
 // `SymbolAddressPart` — which part of a symbol's address an operand denotes —
 // lives in `core/types/symbol_address_part.hpp` (the LIR operand carries it too).
@@ -4043,24 +4119,25 @@ struct DSS_EXPORT ProcessExit {
 //                     [SP + argvStackOffset] — `argv` the VALUE is
 //                     that stack address itself (no copy exists
 //                     anywhere else). envp follows argv's NULL
-//                     terminator; it is NOT materialized (the
-//                     c entry signature is
-//                     `(int, char**)` — envp is reachable via
-//                     libc `environ` for programs that need it).
+//                     terminator in the same layout; the
+//                     trampoline does not load it — for the
+//                     `argc-argv-envp` verb a synthesized init
+//                     computes it from (argc, argv), where the
+//                     format declares the layout
+//                     (`envpFollowsArgvTerminator` +
+//                     `vectorSlotBytes`, below).
 //   * `None`        — default-constructed sentinel. "No mechanism"
 //                     is encoded by `optional<ProcessArgs>` empty
 //                     (exactly the ProcessExit discipline); the
 //                     JSON loader rejects `mechanism="none"`.
 //
-// A Windows PE arm is DELIBERATELY absent (not a half-declared enum
-// slot): the OS entry point there receives NO C argument vector —
-// the CRT route is an out-parameter call
-// (`msvcrt!__getmainargs(&argc,&argv,&env,0,&startinfo)`) that needs
-// trampoline STACK LOCALS + a 5-argument import call, a genuinely
-// different mechanism anchored at D-RUNTIME-PE-MAIN-ARGS. Mach-O
-// needs NO mechanism at all: LC_MAIN entry is CALLED by dyld with
-// argc/argv/envp/apple already in the argument registers, which the
-// trampoline passes through untouched.
+// The Windows PE arm is `CrtArgvAccessors`, below: the OS entry point
+// there receives NO C argument vector, so a synthesized pre-main init
+// asks the CRT for it (UCRT-P4; c111's msvcrt out-parameter route is
+// retired — see the note on slot 2). Mach-O needs NO mechanism at all:
+// LC_MAIN entry is CALLED by dyld with argc/argv/envp/apple already in
+// the argument registers, which the trampoline passes through
+// untouched.
 enum class ArgsMechanism : std::uint8_t {
     None        = 0,  // default-constructed zero; loader rejects "none"
     StackVector = 1,  // argc + in-place argv vector on the entry stack
@@ -4158,6 +4235,19 @@ static_assert(kArgsMechanismTable.rows.size()
 //                         argc). The trampoline LEAs this address
 //                         into the second argument register; it
 //                         never dereferences it.
+//   * `envpFollowsArgvTerminator` + `vectorSlotBytes`
+//                         (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE) — the
+//                         environment vector's place in the SAME
+//                         entry-stack layout: it starts one slot past
+//                         argv's NULL terminator, each slot
+//                         `vectorSlotBytes` wide (8 on both LP64
+//                         Linux ABIs — SysV AMD64 psABI §3.4.1,
+//                         AAPCS64 Linux). DECLARED, never derived from
+//                         the offsets above; declared only by a format
+//                         that realizes an environment verb. The
+//                         trampoline still materializes (argc, argv);
+//                         a synthesized init computes
+//                         `envp = argv + (argc + 1) slots` from them.
 //
 // The destination registers are intentionally NOT fields — they are
 // read from the format's `entryCallingConvention.argGprs[0..1]`
@@ -4169,6 +4259,8 @@ struct DSS_EXPORT ProcessArgs {
     // StackVector arm
     std::uint32_t argcStackOffset = 0;
     std::uint32_t argvStackOffset = 0;
+    bool          envpFollowsArgvTerminator = false;
+    std::uint32_t vectorSlotBytes = 0;
 
     // ── CrtArgvAccessors arm (UCRT-P4) ────────────────────────────────────
     //
@@ -4218,6 +4310,21 @@ struct DSS_EXPORT ProcessArgs {
     std::string   wideArgvAccessorFn;      // "__p___wargv"
     std::uint32_t argvMode = 0;            // `_crt_argv_mode`, 0..2
     std::int32_t  argvUnavailableExitStatus = 0;
+    //   * the ENVIRONMENT pair per width (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE),
+    //     declared only by a format realizing that width's environment verb:
+    //     the one-shot initialize call, then the accessor whose result IS the
+    //     vector (NOT an address-of — no dereference). The order is MSVC's own
+    //     startup's (DOCUMENTED, exe_common.inl: `initialize_environment()` in
+    //     `pre_c_initialization`, then `main(__argc, __argv,
+    //     _get_initial_narrow_environment())`). ✔MEASURED 2026-09-24 against
+    //     ucrtbase 10.0.26100.9444 with no CRT startup (DSS's situation): the
+    //     DLL has already initialized both vectors at load, and the initialize
+    //     call returns 0 and leaves the same pointer — so the call matches the
+    //     reference rather than relying on a DLL-attach side effect.
+    std::string   initializeNarrowEnvironmentFn;   // "_initialize_narrow_environment"
+    std::string   narrowEnvironmentAccessorFn;     // "_get_initial_narrow_environment"
+    std::string   initializeWideEnvironmentFn;     // "_initialize_wide_environment"
+    std::string   wideEnvironmentAccessorFn;       // "_get_initial_wide_environment"
 
     // The import library the CRT entry-point names resolve from. The JSON
     // declares `role`; `crtLibraryPath` is the DERIVED copy the loader resolved
@@ -4365,7 +4472,31 @@ struct DSS_EXPORT TargetRelocationInfo {
     // every other formula, which reads no scale: one formula serves the five
     // LDSTn_ABS_LO12_NC rows, and this is the fact that makes them five.
     std::uint8_t scaleLog2   = 0;
+    // P68 round 11 (the Mach-O GOT_LOAD / GOT item): the NAME of the DIRECT row
+    // this GOT-slot-relative row becomes when an image link mints its slot — the
+    // JSON key `gotSlotTwin`. REQUIRED on every row whose formula
+    // `isGotSlotRelative` and refused on every other row; `gotSlotTwinMismatch`
+    // checks, at load, that the named row applies the same arithmetic to the
+    // slot (formula, and pc-relativity, width and bias, or scale).
+    // ★ WHY IT IS DECLARED AND NOT SEARCHED FOR. Two direct rows can carry the
+    // same arithmetic and differ only in how a FORMAT spells them — x86_64's
+    // `rel32` (a branch displacement) and `riprel32` (a RIP-relative memory
+    // operand) are both Linear, pc-relative, 4 bytes, bias −4. A search for "the"
+    // twin of a bias −4 GOT row (Mach-O's) would find both and would have to
+    // pick; a declaration is the config author saying which, and the loader
+    // proving it has the arithmetic.
+    std::string  gotSlotTwin;
 };
+
+// Why `twin` cannot be the direct row `gotRow` lowers into, or nullopt when it
+// can: a GOT-slot-relative `gotRow` and a direct `twin` whose formula is
+// `relocFormulaFacts(gotRow.formulaKind).directTwin`, neither thread-local nor
+// image-relative, and — for a Linear twin — pc-relative with `gotRow`'s width
+// and bias, or — for a scaled twin — the formula's scale. The ONE owner of that
+// rule: the loader asks it of every shipped row, and the link asks it again of a
+// schema built past the loader.
+[[nodiscard]] DSS_EXPORT std::optional<std::string>
+gotSlotTwinMismatch(TargetRelocationInfo const& gotRow, TargetRelocationInfo const& twin);
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
 // table can declare. Required because the `.dsslir` parser

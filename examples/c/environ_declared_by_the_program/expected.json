@@ -1,0 +1,16 @@
+{
+  "$comment": "POSIX `environ` in the one spelling POSIX gives it — the PROGRAM declares `extern char **environ;` (XBD 8.1: the array is pointed to by the external variable environ; no POSIX header declares it) — on EVERY pair, debug and release (P68 round 11, D-FFI-ENVIRON-NOT-SHIPPED). ✔MEASURED 2026-09-24, exit 42 under every reference: gcc 13.3.0 x86_64 (-std=c2x and gnu17), clang 18.1.3 x86_64 (-std=c23), aarch64-linux-gnu-gcc 13.3.0 (-std=c2x and gnu17, qemu), mingw-w64 13.2.0 (-std=c2x and gnu17), MSVC 14.51 (/std:clatest and /std:c11). BEFORE the round-11 rows DSS refused it on all five pairs (K_SymbolUndefined `environ` on pe and both ELF, `_environ` on both Mach-O): no descriptor realized the NAME. THREE REALIZATIONS, ONE MEANING: glibc exports `environ` (with `_environ` and `__environ`, one object at one address) and libSystem `_environ`, each bound GOT-INDIRECT through unistd.json's data-object row (the image defines nothing, so no spelling can split the object; DSS's Mach-O images carry a `__got` bind of `_environ` from libSystem); neither Windows CRT exports a bare `environ`, and both Windows references' <stdlib.h> `#define environ _environ` onto `(*__p__environ())`, which stdlib.json now does too — the declaration becomes a compatible redeclaration of the UCRT accessor and every use reads the CRT's own table. WHAT EACH GROUP PROVES (a bit set per failure; 42 only when all pass): 1 the vector is live and well formed (non-NULL, non-empty, every entry NAME=VALUE with a non-empty NAME — a binding one indirection off fails the '=' scan instead of passing); 2 a variable the program sets through libc (setenv / `_putenv`) appears in the vector read through the declaration — glibc and Apple reallocate the vector when a NEW name is added, so a binding that read a copy (the deleted copy-relocation shape) or cached the pointer would miss it; 4 getenv's answer points INTO that entry (pointer identity, not string equality); 8 the WRITE direction — the program installs its own vector through the declaration and getenv must see it, then restores the original (the UCRT frees its table's entries at exit); 16 removal is visible (unsetenv / `_putenv(\"NAME=\")`). RED-ON-DISABLE: un-ship unistd.json's `environ` row -> K_SymbolUndefined `environ` on both ELF, `_environ` on both Mach-O (the Mach-O arms are compiled on every host by this runner); un-ship stdlib.json's pe `environ` macro -> K_SymbolUndefined `environ` on pe64. The environment's CONTENT is never asserted (host-dependent), only the program's own variables.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

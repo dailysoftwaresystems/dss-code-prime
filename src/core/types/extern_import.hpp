@@ -358,7 +358,10 @@ struct DSS_EXPORT ExternImport {
     // ★ ONE OWNER: MIR→LIR sets it (`lowerToLir`); an object READER never does —
     // a relocatable object's code states its own shape (a direct reference, a GOT
     // relocation, or a slot of its own, like PE's object-carried one) — and the
-    // merge and the object-slot pass only read it. Deriving it there from
+    // merge, the object-slot pass and the image link's import-reference judgment
+    // (`refuseUnbindableImportReferences`: a unit that does NOT read a library
+    // datum through a slot and names it in code needs a copy relocation, P68
+    // round 11) only read it. Deriving it there from
     // "data + a got-indirect format" would send a DIRECT load (a pulled
     // member's, a `.s`'s) to a slot and load the ADDRESS instead of the value.
     bool readThroughSlot = false;

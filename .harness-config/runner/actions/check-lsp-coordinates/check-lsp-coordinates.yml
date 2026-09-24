@@ -6,9 +6,9 @@ description: >-
   runner starts it and what witnesses that it ran.
   Gated by ctest as `lsp_coordinate_ownership_guard`.
 steps:
-  - name: verify
+  - name: verify-then-self-test
     workingDirectoryRoot: action
     run: |
       python3 ./check-lsp-coordinates.py
-    successPattern: 'check-lsp-coordinates: OK'
+    successPattern: 'check-lsp-coordinates selftest: OK'
     requireInputsUnmoved: true

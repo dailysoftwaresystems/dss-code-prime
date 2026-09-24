@@ -1425,7 +1425,9 @@ constexpr std::array<UnsuppressableEntry, 198> kUnsuppressableCodes{{
     // ★ WHY ALL FOUR AND NOT JUST THE SHAPE CHECK. Each is a distinct way to end
     // up running the wrong code, or none, with a successful-looking build:
     //   * S_EntryShapeNotDeclared — the definition has the wrong signature for its
-    //     name (the measured 3-param-main fault above).
+    //     name. (The measured 3-param-main fault above is closed by SUPPORT
+    //     now — the language declares that row — so what this code refuses
+    //     is every signature the language does NOT declare for an entry name.)
     //   * K_ProgramEntryUndefined — an exec build with NO candidate. Suppressed,
     //     the build proceeds to a link-tier "symbol not found" at best, and the
     //     explanation of WHY (the verb this format cannot realize) is lost.

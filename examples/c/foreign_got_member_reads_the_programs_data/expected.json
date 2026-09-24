@@ -1,0 +1,62 @@
+{
+  "$comment": "★★★ A FOREIGN ARCHIVE MEMBER READS THE PROGRAM'S DATA THROUGH THE GOT (P68 round 11: D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS — the x86_64 GOTPCREL / GOTPCRELX / REX_GOTPCRELX half, and D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS — the aarch64 ADR_GOT_PAGE + LD64_GOT_LO12_NC half). The prebuilt archives hold three gcc 13.3 -O2 members each (the sources and flags are quoted in main.c): between them the x86_64 archive carries every GOT-slot-relative type gcc writes, and the aarch64 one the GOT pair for a datum, an element address, a function address and a call. ✔MEASURED 2026-09-24 on main's build before this change: the x86_64 archive was refused at READ ('relocation type 42 ... is not declared') and the aarch64 one at the link's kind unifier ('relocation kind 7 ... is not declared by object format elf64-aarch64-linux-exec'); gcc -no-pie and -pie, clang 18 and aarch64 gcc under qemu link each archive with this main.c to 42. The link now lowers each GOT reference to a direct reference to a slot it mints, filled like any pointer-holding datum; no instruction is relaxed. What each value proves by the exit code: 1-3 — the default member's datum, element address, function address; 4 — the -fno-plt member's call through the GOT; 5-7 — the plain-GOTPCREL member's three; 42 = 17 + 25 + 0 only if every reference reached its definition. The `release` arm links the same archive under the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13.3.0 `-O2 -c` (lib_default.c, default PIE), `-O2 -fPIC -fno-plt -c` (lib_calls.c) and `-O2 -fPIC -Wa,-mrelax-relocations=no -c` (lib_plain.c) + ar `rcs`: R_X86_64_REX_GOTPCRELX, R_X86_64_GOTPCRELX and plain R_X86_64_GOTPCREL. The witness is a definition's own name.",
+          "path": "tests/link/data/libforeign_got_members_x86_64_elf.a",
+          "containerWitness": "dss_lib_reads_app"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "prebuiltLibraries": [
+        {
+          "$comment": "aarch64-linux-gnu-gcc 13.3.0 `-O2 -c`, `-O2 -fPIC -fno-plt -c` and `-O2 -fPIC -c` of the same three files + aarch64-linux-gnu-ar `rcs`: eight R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC pairs. The witness is a definition's own name.",
+          "path": "tests/link/data/libforeign_got_members_aarch64_elf.a",
+          "containerWitness": "dss_lib_reads_app"
+        }
+      ]
+    },
+    {
+      "$comment": "P68 round 11 (D-LK-MACHO-GOT-RELOCATIONS-REFUSED-AT-READ): the Mach-O twin. clang reaches every extern of the same three sources through ARM64_RELOC_GOT_LOAD_PAGE21 + GOT_LOAD_PAGEOFF12 (the -fno-plt call stays a BRANCH26 on arm64); before this change DSS refused the members at READ.",
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "clang 18.1.3 (Ubuntu) `--target=arm64-apple-macos11 -O2 -c` of the three files (`-fno-plt` on lib_calls.c) + llvm-ar 18 `--format=darwin rcs`: seven GOT_LOAD pairs. The witness is a definition's own (Mach-O) name.",
+          "path": "tests/link/data/libforeign_got_members_arm64_macho.a",
+          "containerWitness": "_dss_lib_reads_app"
+        }
+      ]
+    },
+    {
+      "$comment": "P68 round 11: the x86_64 Mach-O twin — X86_64_RELOC_GOT_LOAD for each load of a slot and X86_64_RELOC_GOT for the element address and the -fno-plt call (`callq *_dss_app_twice@GOTPCREL(%rip)`), each field holding its remainder in place.",
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "clang 18.1.3 (Ubuntu) `--target=x86_64-apple-macos11 -O2 -c` of the three files (`-fno-plt` on lib_calls.c) + llvm-ar 18 `--format=darwin rcs`: five X86_64_RELOC_GOT_LOAD and three X86_64_RELOC_GOT. The witness is a definition's own (Mach-O) name.",
+          "path": "tests/link/data/libforeign_got_members_x86_64_macho.a",
+          "containerWitness": "_dss_lib_reads_app"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

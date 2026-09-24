@@ -50,11 +50,17 @@ struct PlacedRelocationAddend {
     std::optional<std::int64_t> column;
 };
 
-// ★ A LINEAR KIND's FIELD IS `widthBytes` LITTLE-ENDIAN BYTES — the plain byte
-// field an in-place addend can occupy.
+// ★ A PLAIN-FIELD FORMULA's FIELD IS `widthBytes` LITTLE-ENDIAN BYTES — the byte
+// field an in-place addend can occupy (`relocFormulaFacts(k).patchesPlainField`:
+// a Linear kind, and x86-64's GOT displacement, whose four bytes Mach-O fills
+// with the displacement's remainder exactly as it does a direct reference's —
+// ✔MEASURED 2026-09-24, clang 18: 0, −1 before an imm8, −4 before an imm32, +8
+// for `sym@GOTPCREL+8`). Asking for Linear alone — what this did until the
+// Mach-O documents declared their GOT rows (P68 round 11) — would read every
+// Mach-O GOT addend as 0: one to eight bytes off at every such site.
 [[nodiscard]] inline bool relocationFieldHoldsAnAddend(
         TargetRelocationInfo const& tri) noexcept {
-    return tri.formulaKind == RelocFormulaKind::Linear
+    return relocFormulaFacts(tri.formulaKind).patchesPlainField
         && (tri.widthBytes == 4u || tri.widthBytes == 8u);
 }
 

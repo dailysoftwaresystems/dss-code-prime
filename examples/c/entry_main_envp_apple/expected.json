@@ -1,0 +1,14 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the RUN witness for Darwin's four-parameter `int main(int, char**, char**, char**)` -- dyld calls LC_MAIN with (argc, argv, envp, apple) in the first four argument registers. The Mach-O formats realize the `argc-argv-envp-apple` verb by pass-through (nothing emitted), so the entry trampoline's one obligation is to keep all four registers intact across the before-entry static initializers; the `__attribute__((constructor))` here CALLS a four-argument function between dyld's call and `main`, which makes a short park observable. The program checks structure and independent agreement, never content: envp against getenv, apple distinct from envp and carrying an `executable_path=` entry (see main.c for the exit-code ladder, 90..97). DARWIN-ONLY: no ELF or pe loader hands an entry a fourth vector, so the same source is refused there (entry_main_apple_refused_off_darwin). RED-ON-DISABLE: park two argument registers instead of the format-derived four -> 92..97 on both Mach-O legs; drop \"argc-argv-envp-apple\" from a Mach-O format's `entryVerbs` -> K_ProgramEntryUndefined.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

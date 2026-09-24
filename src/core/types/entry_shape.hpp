@@ -68,20 +68,23 @@
 // artifact. Neither half documents the accepted set alone; the accepted set is
 // their intersection, and both comments say so and name the other file.
 //
-// ★ DIVERGENCE, RECORDED HONESTLY RATHER THAN MINIMISED: gcc, clang AND MSVC
-// all ACCEPT `int main(int, char**, char**)`. Refusing it IS a real divergence
-// from all three for as long as `D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE` stays open.
-// The cost is accepted because a loud refusal beats a binary that faults on the
-// first envp dereference — and it denies no program any C23 facility, since
-// `getenv` (C23 7.24.4.6) is ALREADY shipped on every format (`stdlib.json`,
-// with no `availableObjectFormats` gate). POSIX.1 does not specify main's third
-// parameter either; it blesses `extern char **environ`.
+// ★ THE ENVIRONMENT FORMS ARE SUPPORTED, NOT REFUSED (the divergence this header
+// used to record is closed). gcc, clang AND MSVC all accept
+// `int main(int, char**, char**)`, MSVC also the 3-parameter `wmain`, and
+// Darwin's loader calls `main(argc, argv, envp, apple)`; the refusal that
+// replaced the fault was the SAFETY half, and these verbs are the SUPPORT half.
+// Each format realizes them its own declared way — a CRT's environment
+// accessors (pe), the entry-stack vector after argv's terminator (elf), or the
+// loader's argument registers (Mach-O) — and a format that realizes none of
+// them still refuses the shape, by the same intersection as before.
 
 #include "core/export.hpp"
 #include "core/types/enum_name_table.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -158,8 +161,8 @@ static_assert(kEntryParamShapeTable.rows.size()
 // The entry's RETURN shape. Only `i32` is declared, and the omission of `void`
 // is the point: C23 5.1.2.2.1 says main's return type "shall be int", so
 // `void main()` — accepted by MSVC, refused by `gcc -pedantic-errors` — falls
-// out of the SAME declared-set check as a 3-param main, with NO second
-// mechanism. Adding a `void` row to a LANGUAGE file is how a source language
+// out of the SAME declared-set check as any undeclared parameter list, with NO
+// second mechanism. Adding a `void` row to a LANGUAGE file is how a source language
 // would opt in, and it would need a materialization verb to go with it.
 enum class EntryReturnShape : std::uint8_t {
     None = 0,  // default-constructed sentinel; loader rejects "none"
@@ -207,11 +210,18 @@ entryReturnShapeFromName(std::string_view s) noexcept {
 // already put them in the argument registers). `argc-argv` under
 // `stack-vector` is materialized by the entry trampoline; under
 // `crt-argv-accessors` by the synthesized init; under no mechanism at all by
-// dyld, before DSS code runs.
+// dyld, before DSS code runs. The ENVIRONMENT verbs follow the same split: the
+// CRT's environment accessors in the synthesized init, a synthesized init that
+// computes envp from the trampoline's (argc, argv) on the entry stack, and dyld's
+// own registers — and which verbs a mechanism can realize at all is refused at
+// format load when it cannot (`ObjectFormatData::validate`).
 enum class EntryMaterialization : std::uint8_t {
-    None      = 0,  // NOT a sentinel here — see below. Loader ACCEPTS "none".
-    ArgcArgv  = 1,  // materialize (argc, narrow argv)
-    ArgcWargv = 2,  // materialize (argc, wide argv)
+    None              = 0,  // NOT a sentinel here — see below. Loader ACCEPTS "none".
+    ArgcArgv          = 1,  // materialize (argc, narrow argv)
+    ArgcWargv         = 2,  // materialize (argc, wide argv)
+    ArgcArgvEnvp      = 3,  // materialize (argc, narrow argv, narrow envp)
+    ArgcWargvWenvp    = 4,  // materialize (argc, wide argv, wide envp) — MSVC's 3-param wmain
+    ArgcArgvEnvpApple = 5,  // materialize (argc, argv, envp, apple) — Darwin's LC_MAIN delivery
 };
 
 // ⚠ `None` IS A REAL, DECLARABLE VERB ON THIS ENUM, unlike the sibling
@@ -222,11 +232,14 @@ enum class EntryMaterialization : std::uint8_t {
 // `EntryFunctionShape` looks like a legal no-arg row, which is why
 // `EntryFunctionShape::returns` carries the sentinel duty for the struct as a
 // whole.
-inline constexpr EnumNameTable<EntryMaterialization, 3>
+inline constexpr EnumNameTable<EntryMaterialization, 6>
 kEntryMaterializationTable{{{
-    { EntryMaterialization::None,      "none"       },
-    { EntryMaterialization::ArgcArgv,  "argc-argv"  },
-    { EntryMaterialization::ArgcWargv, "argc-wargv" },
+    { EntryMaterialization::None,              "none"                 },
+    { EntryMaterialization::ArgcArgv,          "argc-argv"            },
+    { EntryMaterialization::ArgcWargv,         "argc-wargv"           },
+    { EntryMaterialization::ArgcArgvEnvp,      "argc-argv-envp"       },
+    { EntryMaterialization::ArgcWargvWenvp,    "argc-wargv-wenvp"     },
+    { EntryMaterialization::ArgcArgvEnvpApple, "argc-argv-envp-apple" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -242,6 +255,62 @@ entryMaterializationName(EntryMaterialization m) noexcept {
 entryMaterializationFromName(std::string_view s) noexcept {
     return kEntryMaterializationTable.fromName(s);
 }
+
+// ── WHAT EACH VERB MATERIALIZES — THE ONE OWNER ──────────────────────────────
+//
+// The parameter shapes a verb's emitter hands the entry, in order. Three readers,
+// ONE table:
+//   * the language loader's VERB ⟺ SIGNATURE coherence check (an `entryFunctions`
+//     row whose signature is not exactly its verb's list is refused at load);
+//   * the synthesized pre-main inits (`realizeEntryShape`), which read WIDE vs
+//     NARROW off the second shape and whether an environment is passed off the
+//     count, instead of re-classifying the verb;
+//   * the entry trampoline, which saves across the static initializers exactly
+//     the argument registers a loader-delivered entry form fills (the LARGEST
+//     count among the format's own `entryVerbs`, on a format whose loader puts
+//     the arguments in registers).
+// A new verb that forgets its row here is a compile error (the switch has no
+// `default:`), never a permissive empty list.
+inline constexpr std::array<EntryParamShape, 2> kEntryVerbArgcArgvParams{
+    EntryParamShape::I32, EntryParamShape::PtrPtrChar};
+inline constexpr std::array<EntryParamShape, 2> kEntryVerbArgcWargvParams{
+    EntryParamShape::I32, EntryParamShape::PtrPtrU16};
+inline constexpr std::array<EntryParamShape, 3> kEntryVerbArgcArgvEnvpParams{
+    EntryParamShape::I32, EntryParamShape::PtrPtrChar, EntryParamShape::PtrPtrChar};
+inline constexpr std::array<EntryParamShape, 3> kEntryVerbArgcWargvWenvpParams{
+    EntryParamShape::I32, EntryParamShape::PtrPtrU16, EntryParamShape::PtrPtrU16};
+// Darwin's fourth value, `apple`, is a NULL-terminated vector of C strings
+// (`executable_path=…` first) — the same shape as argv and envp.
+inline constexpr std::array<EntryParamShape, 4> kEntryVerbArgcArgvEnvpAppleParams{
+    EntryParamShape::I32, EntryParamShape::PtrPtrChar, EntryParamShape::PtrPtrChar,
+    EntryParamShape::PtrPtrChar};
+
+[[nodiscard]] constexpr std::span<EntryParamShape const>
+entryVerbParams(EntryMaterialization m) noexcept {
+    switch (m) {
+    case EntryMaterialization::None:              return {};
+    case EntryMaterialization::ArgcArgv:          return kEntryVerbArgcArgvParams;
+    case EntryMaterialization::ArgcWargv:         return kEntryVerbArgcWargvParams;
+    case EntryMaterialization::ArgcArgvEnvp:      return kEntryVerbArgcArgvEnvpParams;
+    case EntryMaterialization::ArgcWargvWenvp:    return kEntryVerbArgcWargvWenvpParams;
+    case EntryMaterialization::ArgcArgvEnvpApple: return kEntryVerbArgcArgvEnvpAppleParams;
+    }
+    return {};
+}
+
+// Derived views of the table, never a second classification of the verb.
+[[nodiscard]] constexpr bool entryVerbIsWide(EntryMaterialization m) noexcept {
+    auto const p = entryVerbParams(m);
+    return p.size() >= 2 && p[1] == EntryParamShape::PtrPtrU16;
+}
+[[nodiscard]] constexpr bool entryVerbPassesEnvironment(EntryMaterialization m) noexcept {
+    return entryVerbParams(m).size() >= 3;
+}
+
+static_assert(entryVerbParams(EntryMaterialization::None).empty());
+static_assert(entryVerbParams(EntryMaterialization::ArgcArgvEnvpApple).size() == 4);
+static_assert(entryVerbIsWide(EntryMaterialization::ArgcWargvWenvp)
+              && !entryVerbIsWide(EntryMaterialization::ArgcArgvEnvp));
 
 // One declared entry row: the NAME the source language spells this entry with,
 // the signature that spelling must have, and the verb that realizes it.

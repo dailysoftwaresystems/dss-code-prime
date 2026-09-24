@@ -1715,6 +1715,118 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: every declared verb must be REALIZABLE
+    //    by the declared mechanism, and every environment key must be CONSUMED ──
+    //
+    // The rule above stops at "the CRT names are not dead". A verb the mechanism
+    // CANNOT produce is the worse half: it survives candidate selection (the verb
+    // is in this set), so the entry is called — and the values the mechanism never
+    // produced are read from whatever the argument registers hold, which is the
+    // MEASURED fault the entry-verb set exists to refuse (an envp observed as
+    // `0x4`). What a mechanism can hand an entry is a property of the MECHANISM,
+    // stated here once and asked of every declared verb:
+    //   * `stack-vector` — the entry-stack vector: argc and NARROW strings, and the
+    //     environment vector only where this format DECLARES its position
+    //     (`envpFollowsArgvTerminator` + `vectorSlotBytes`). That layout holds no
+    //     wide vector.
+    //   * `crt-argv-accessors` — argc and argv in both widths (the loader requires
+    //     all five accessor names), and each width's environment only where this
+    //     format declares that width's initialize/accessor PAIR.
+    //   * both end at the environment: neither layout has a fourth value, so a
+    //     four-value verb (Darwin's `apple`) is realizable only where the LOADER
+    //     delivers the arguments itself — no `processArgs` block at all, where the
+    //     listed verbs ARE the declaration of what the loader hands over and there
+    //     is no model here to second-guess it with.
+    // And the converse: an environment position or pair that no listed verb
+    // consumes is dead config — nothing would ever read it — refused like the
+    // dead accessor names above.
+    if (processArgs.has_value()) {
+        ProcessArgs const& pa = *processArgs;
+        constexpr std::size_t kMechanismValuesMax = 3;   // (argc, argv, envp)
+        bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
+        bool const crt         = pa.mechanism == ArgsMechanism::CrtArgvAccessors;
+        bool const stackEnvDeclared =
+            pa.envpFollowsArgvTerminator && pa.vectorSlotBytes != 0;
+        bool const narrowPairDeclared = !pa.initializeNarrowEnvironmentFn.empty()
+                                     && !pa.narrowEnvironmentAccessorFn.empty();
+        bool const widePairDeclared = !pa.initializeWideEnvironmentFn.empty()
+                                   && !pa.wideEnvironmentAccessorFn.empty();
+        bool narrowEnvConsumed = false;
+        bool wideEnvConsumed   = false;
+        for (auto const v : entryVerbs) {
+            auto const params = entryVerbParams(v);
+            if (params.empty()) continue;   // `none` — nothing to materialize
+            bool const wide = entryVerbIsWide(v);
+            bool const env  = entryVerbPassesEnvironment(v);
+            if (env && wide) wideEnvConsumed = true;
+            if (env && !wide) narrowEnvConsumed = true;
+            std::string why;
+            if (params.size() > kMechanismValuesMax) {
+                why = std::format(
+                    "it hands the entry {} values and this mechanism produces at "
+                    "most {} (argc, argv, envp); only a format whose LOADER "
+                    "delivers the arguments itself — no `processArgs` block — "
+                    "can realize more",
+                    params.size(), kMechanismValuesMax);
+            } else if (stackVector && wide) {
+                why = "the entry-stack vector holds NARROW strings only — no wide "
+                      "argument vector exists in that layout";
+            } else if (stackVector && env && !stackEnvDeclared) {
+                why = "`processArgs` does not declare where the environment "
+                      "vector sits (`envpFollowsArgvTerminator` + "
+                      "`vectorSlotBytes`)";
+            } else if (crt && env && !(wide ? widePairDeclared : narrowPairDeclared)) {
+                why = wide
+                    ? "`processArgs` does not declare the wide environment's "
+                      "`initializeWideEnvironmentFn` + `wideEnvironmentAccessorFn` "
+                      "pair"
+                    : "`processArgs` does not declare the narrow environment's "
+                      "`initializeNarrowEnvironmentFn` + "
+                      "`narrowEnvironmentAccessorFn` pair";
+            }
+            if (!why.empty()) {
+                // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+                fail("/entryVerbs",
+                     std::format(
+                         "declares the `{}` verb, which the `{}` mechanism cannot "
+                         "realize: {}. The verb would survive candidate selection "
+                         "and the entry would read the values nothing produced "
+                         "from uninitialized argument registers — the MEASURED "
+                         "fault this set exists to refuse (an envp observed as "
+                         "0x4). Declare what the mechanism needs, or drop the "
+                         "verb.",
+                         entryMaterializationName(v),
+                         argsMechanismName(pa.mechanism), why));
+            }
+        }
+        if (stackVector && pa.envpFollowsArgvTerminator && !narrowEnvConsumed) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            fail("/processArgs/envpFollowsArgvTerminator",
+                 "declares the environment vector's position but `entryVerbs` "
+                 "names no environment verb that reads it — dead config the "
+                 "synthesized init would never consult. Declare `argc-argv-envp`, "
+                 "or drop the position.");
+        }
+        if (crt && (!pa.initializeNarrowEnvironmentFn.empty()
+                    || !pa.narrowEnvironmentAccessorFn.empty())
+            && !narrowEnvConsumed) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            fail("/processArgs/initializeNarrowEnvironmentFn",
+                 "declares the narrow environment's CRT exports but `entryVerbs` "
+                 "names no narrow environment verb — the names would never be "
+                 "imported. Declare `argc-argv-envp`, or drop the pair.");
+        }
+        if (crt && (!pa.initializeWideEnvironmentFn.empty()
+                    || !pa.wideEnvironmentAccessorFn.empty())
+            && !wideEnvConsumed) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            fail("/processArgs/initializeWideEnvironmentFn",
+                 "declares the wide environment's CRT exports but `entryVerbs` "
+                 "names no wide environment verb — the names would never be "
+                 "imported. Declare `argc-wargv-wenvp`, or drop the pair.");
+        }
+    }
+
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: `supportedDataSections` is NO
     // longer restricted to exec-flavored formats. A RELOCATABLE object DOES
     // carry data — a global lands in `.data`/`.rodata`/`.bss` with `sh_addr=0`

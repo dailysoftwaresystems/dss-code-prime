@@ -2996,6 +2996,12 @@ TEST(LinkerEndToEnd, PeExecAcceptsAndBindsDataExternImport) {
     mod.functions.push_back(std::move(fn));
     ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
     dataExt.isData = true;
+    // What MIR→LIR states for a data import its code reads through the IAT
+    // slot (`readThroughSlot`, the one owner of that statement). Without it the
+    // row is an OBJECT's direct reference to library data, which needs a copy
+    // relocation and is refused by name since P68 round 11
+    // (test_got_slot_lowering.cpp, section C).
+    dataExt.readThroughSlot = true;
     mod.externImports.push_back(std::move(dataExt));
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);

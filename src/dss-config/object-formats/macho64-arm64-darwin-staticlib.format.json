@@ -237,6 +237,18 @@
       "decodeWhenInstruction": [
         { "mask": 4286578688, "value": 1031798784 }
       ]
+    },
+    {
+      "$comment": "P68 round 11: ARM64_RELOC_GOT_LOAD_PAGE21 — see the relocatable sibling (hand-sync). A static-archive member is read with this document.",
+      "name": "ARM64_RELOC_GOT_LOAD_PAGE21",
+      "kind": 7,
+      "nativeId": 1426063360
+    },
+    {
+      "$comment": "P68 round 11: ARM64_RELOC_GOT_LOAD_PAGEOFF12 — see the relocatable sibling (hand-sync).",
+      "name": "ARM64_RELOC_GOT_LOAD_PAGEOFF12",
+      "kind": 8,
+      "nativeId": 1677721600
     }
   ]
 }

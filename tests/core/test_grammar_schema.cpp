@@ -5317,6 +5317,65 @@ TEST(GrammarSchema, SemanticsEntryFunctionsDuplicateSignatureReportsInvalid) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
+// D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE — the environment verbs load with EXACTLY the
+// parameter lists their materialization produces, read off the one verb → shapes
+// table (`entryVerbParams`), and a row whose list disagrees with its verb is
+// refused: an `argc-argv-envp` row with two parameters would materialize an envp the
+// entry never receives, a two-parameter verb on a three-parameter row would call the
+// entry with an uninitialized third argument.
+TEST(GrammarSchema, SemanticsEntryFunctionsEnvironmentVerbsMatchTheirParameterLists) {
+    auto const load = [](std::string const& rows) {
+        std::string const cfg = R"JSON({
+          "dssSchemaVersion": 4,
+          "language": { "name": "X", "version": "0.1.0" },
+          "tokens": { ";": [{ "kind": "Semi" }] },
+          "shapes": { "root": { "sequence": [ "Semi" ] } },
+          "semantics": {
+            "declarations": [ { "rule": "root", "name": 0, "kind": "function",
+                                "entryFunctions": )JSON" + rows + R"JSON( } ]
+          }
+        })JSON";
+        return GrammarSchema::loadFromText(cfg);
+    };
+    // Every verb with the list its row in the table names — loads.
+    auto ok = load(R"({
+        "main": [
+          { "returns": "i32", "params": ["i32", "ptr-ptr-char", "ptr-ptr-char"],
+            "verb": "argc-argv-envp" },
+          { "returns": "i32",
+            "params": ["i32", "ptr-ptr-char", "ptr-ptr-char", "ptr-ptr-char"],
+            "verb": "argc-argv-envp-apple" } ],
+        "wmain": [
+          { "returns": "i32", "params": ["i32", "ptr-ptr-u16", "ptr-ptr-u16"],
+            "verb": "argc-wargv-wenvp" } ] })");
+    ASSERT_TRUE(ok.has_value()) << "each environment verb with its own list must load";
+    auto const& rows = (*ok)->semantics().declarations.at(0).entryFunctions;
+    ASSERT_EQ(rows.size(), 3u);
+    for (auto const& row : rows) {
+        auto const want = entryVerbParams(row.verb);
+        EXPECT_EQ(row.params, (std::vector<EntryParamShape>(want.begin(), want.end())))
+            << row.name << " / " << entryMaterializationName(row.verb);
+    }
+    // Each verb against a list one parameter short, or with the other width — refused.
+    for (char const* bad : {
+             R"({ "main": [ { "returns": "i32", "params": ["i32", "ptr-ptr-char"],
+                              "verb": "argc-argv-envp" } ] })",
+             R"({ "main": [ { "returns": "i32",
+                              "params": ["i32", "ptr-ptr-char", "ptr-ptr-char"],
+                              "verb": "argc-argv" } ] })",
+             R"({ "main": [ { "returns": "i32",
+                              "params": ["i32", "ptr-ptr-char", "ptr-ptr-char"],
+                              "verb": "argc-argv-envp-apple" } ] })",
+             R"({ "wmain": [ { "returns": "i32",
+                               "params": ["i32", "ptr-ptr-u16", "ptr-ptr-char"],
+                               "verb": "argc-wargv-wenvp" } ] })"}) {
+        SCOPED_TRACE(bad);
+        auto r = load(bad);
+        ASSERT_FALSE(r.has_value()) << "a verb disagreeing with its list must be refused";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+    }
+}
+
 // ── `externLibraryByFormat` IS RETIRED — THE KEY ITSELF IS NOW THE ERROR ─────
 //
 // This replaces the six tests that pinned the per-language `externLibraryByFormat`
@@ -8120,4 +8179,100 @@ TEST(GrammarSchemaProbeIndex, AByteNoDeclaredKeyStartsWithHasAnEmptyRow) {
     // front of the table.
     EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0x80).empty());
     EXPECT_TRUE(schema->lexemeLengthsForLeadByte(0xFF).empty());
+}
+
+// ── P68 round 10: the two array-parameter qualification keys fail loud ──────────
+//
+// `semantics.parameters.unqualifiedParameterTypes` (C 6.7.6.3p15: a function type
+// takes each parameter's UNQUALIFIED type) and
+// `declarators.arraySuffixOutermostOnlyTokens` (C 6.7.6.2p1: the decorations only a
+// parameter's OUTERMOST array derivation may carry). Each refusal is driven from the
+// SHIPPED `c` text with the key's shipped spelling replaced, so a pin whose needle
+// went stale fails instead of asserting nothing, and the unmutated text is the
+// baseline arm (a loader refusing everything would turn every negative arm green).
+// The SUBSET arm is the refusal that would otherwise read as configured: an
+// outermost-only token the bound locator does not skip (it is not an
+// `arraySuffixModifierTokens` entry) would be read AS the array's bound.
+// RED-ON-DISABLE: drop the subset check from the loader and that arm loads clean.
+namespace {
+// The shipped c text with its ONE occurrence of `needle` replaced; empty (with an
+// ADD_FAILURE) when the needle is gone or no longer unique.
+[[nodiscard]] std::string shippedCWithReplaced(std::string_view needle,
+                                               std::string_view replacement) {
+    std::string text = shippedCTextForPrefixTest();
+    auto const pos = text.find(needle);
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "the shipped c text no longer spells " << needle;
+        return {};
+    }
+    if (text.find(needle, pos + 1) != std::string::npos) {
+        ADD_FAILURE() << "the shipped c text spells " << needle << " more than once";
+        return {};
+    }
+    text.replace(pos, needle.size(), replacement);
+    return text;
+}
+
+constexpr std::string_view kUnqualifiedParameterTypesKey =
+    "\"unqualifiedParameterTypes\": true";
+constexpr std::string_view kOutermostOnlyTokensKey =
+    "\"arraySuffixOutermostOnlyTokens\": [ \"StaticKeyword\", \"ConstKeyword\", "
+    "\"VolatileKeyword\", \"RestrictKeyword\", \"AtomicKeyword\" ]";
+} // namespace
+
+TEST(GrammarSchema, TheArrayParameterQualificationKeysFailLoud) {
+    // Baseline: the shipped text loads, and both keys were READ.
+    auto const base = GrammarSchema::loadFromText(shippedCTextForPrefixTest());
+    ASSERT_TRUE(base.has_value()) << "shipped c must load clean before mutation";
+    auto const& sem = (*base)->semantics();
+    EXPECT_TRUE(sem.parameters.unqualifiedParameterTypes);
+    ASSERT_TRUE(sem.declarators.has_value());
+    EXPECT_EQ(sem.declarators->arraySuffixOutermostOnlyTokenNames.size(), 5u);
+
+    // A switch that is not a boolean.
+    {
+        auto const text = shippedCWithReplaced(kUnqualifiedParameterTypesKey,
+                                               "\"unqualifiedParameterTypes\": 1");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value())
+            << "a non-boolean `unqualifiedParameterTypes` must fail the load";
+        EXPECT_TRUE(hasDiagMessage(r.error(),
+                                   "'unqualifiedParameterTypes' must be a boolean"));
+    }
+    // The SUBSET arm: an outermost-only token the modifier list does not name.
+    {
+        auto const text = shippedCWithReplaced(
+            kOutermostOnlyTokensKey,
+            "\"arraySuffixOutermostOnlyTokens\": [ \"StaticKeyword\", \"IntKeyword\" ]");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value())
+            << "an outermost-only token that is not an array-suffix modifier must fail "
+               "the load: the bound locator would read it as the bound";
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+        EXPECT_TRUE(hasDiagMessage(r.error(), "names 'IntKeyword', which "
+                                              "'arraySuffixModifierTokens' does not"));
+    }
+    // A token kind the language does not declare.
+    {
+        auto const text = shippedCWithReplaced(
+            kOutermostOnlyTokensKey,
+            "\"arraySuffixOutermostOnlyTokens\": [ \"NoSuchDecorationKind\" ]");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value());
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+        EXPECT_TRUE(hasDiagMessage(r.error(),
+                                   "references unknown token kind 'NoSuchDecorationKind'"));
+    }
+    // A value that is not an array.
+    {
+        auto const text = shippedCWithReplaced(
+            kOutermostOnlyTokensKey, "\"arraySuffixOutermostOnlyTokens\": \"StaticKeyword\"");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value());
+        EXPECT_TRUE(hasDiagMessage(r.error(), "must be an array of token-kind name strings"));
+    }
 }

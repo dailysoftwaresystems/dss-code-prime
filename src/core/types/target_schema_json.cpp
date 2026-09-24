@@ -1680,9 +1680,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 9> kRelocationKeys{
+            static constexpr std::array<std::string_view, 10> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
-                "addendBias", "tls", "imageRelative", "scaleLog2"};
+                "addendBias", "tls", "imageRelative", "scaleLog2",
+                "gotSlotTwin"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1831,6 +1832,22 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                    relocFormulaName(info.formulaKind)));
                 return false;
             }
+            // P68 round 11: `gotSlotTwin` — the direct row a GOT-slot-relative
+            // row lowers into (`TargetRelocationInfo::gotSlotTwin`). Parsed
+            // here; WHETHER a row must or may carry one, and whether the named
+            // row has the arithmetic, is `TargetSchema::validate()`'s rule (g),
+            // so a schema built past this loader meets the same rule.
+            if (r.contains("gotSlotTwin")) {
+                auto const path = std::format("/relocations/{}/gotSlotTwin", i);
+                if (!r.at("gotSlotTwin").is_string()
+                    || r.at("gotSlotTwin").get<std::string>().empty()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'gotSlotTwin' must be the non-empty name of a "
+                           "relocation row of this target");
+                    return false;
+                }
+                info.gotSlotTwin = r.at("gotSlotTwin").get<std::string>();
+            }
             // Non-Linear coherence + default widthBytes=4 (ARM64
             // instruction word).
             if (info.formulaKind != RelocFormulaKind::Linear) {
@@ -1855,7 +1872,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                                        relocFormulaName(info.formulaKind)));
                     return false;
                 }
-                if (info.addendBias != 0) {
+                // A plain-field formula (x86-64's GOT displacement) may carry
+                // a bias — see `TargetSchema::validate()` rule (e).
+                if (info.addendBias != 0
+                    && !relocFormulaFacts(info.formulaKind).patchesPlainField) {
                     c.emit(DiagnosticCode::C_MalformedJson,
                            std::format("/relocations/{}/addendBias", i),
                            std::format("non-Linear formula '{}' encodes "

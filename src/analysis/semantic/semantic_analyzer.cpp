@@ -1891,6 +1891,9 @@ struct DeclaratorChainLevel {
     // contributes (the fold applies a direct's suffixes outermost first). P68 round 9:
     // an array PARAMETER's own qualifiers are the ones written in THIS bracket.
     NodeId              firstArraySuffix{};
+    // Its direct declarator node — where every one of its suffixes sits (P68 round 10:
+    // the bracket rule reads each array suffix, not only the first).
+    NodeId              direct{};
     std::vector<NodeId> layers;        // its pointer layers, SOURCE order
 };
 
@@ -1948,6 +1951,7 @@ readDeclaratorChain(Tree const& tree, NodeId start, DeclaratorConfig const& dc,
                 direct = c;
             }
         }
+        lvl.direct = direct;
         if (direct.valid()) {
             for (NodeId c : visibleChildren(tree, direct)) {
                 if (tree.kind(c) != NodeKind::Internal) continue;
@@ -2443,6 +2447,85 @@ void applyArrayParameterQualification(Tree const& tree, DeclaratorConfig const& 
         rec.qualSpine->restrictBits &= ~std::uint64_t{1};
         if (ownConst)    rec.qualSpine->constBits    |= 1u;
         if (ownRestrict) rec.qualSpine->restrictBits |= 1u;
+    }
+}
+
+// The bracket's INTERNED qualifiers — the other half of C 6.7.6.3p7 (P68 round 10, lane `cs`). `volatile` and
+// `_Atomic` live on the TYPE, so they belong to the one type adjustment (`adjustParamDeclaredType`) rather than to
+// the symbol like `const` / `restrict` above; read from the SAME outermost bracket. `void f(int p[volatile])`
+// declares exactly `int *volatile p`. A declarator whose outermost derivation is not an array — and a parameter with
+// no declarator — contributes none: a typedef'd array has no bracket, and its head qualifiers are its ELEMENT's
+// (`applyBaseQualifiers`, C 6.7.3p10), which the adjustment carries into the pointee.
+struct ArrayParameterPointerQualifiers {
+    bool isVolatile = false;
+    bool isAtomic   = false;
+};
+[[nodiscard]] ArrayParameterPointerQualifiers
+arrayParameterPointerQualifiers(SemanticConfig const& cfg, Tree const& tree, NodeId dNode) {
+    ArrayParameterPointerQualifiers q;
+    if (!dNode.valid() || !cfg.declarators.has_value()) return q;
+    ParameterOutermostLevel const outer = parameterOutermostLevel(tree, dNode, *cfg.declarators);
+    if (outer.kind != ParameterOutermost::Array) return q;
+    q.isVolatile = cfg.volatileMarker.has_value()
+                && bracketQualifierIs(tree, outer.suffix, *cfg.volatileMarker);
+    q.isAtomic   = cfg.atomicMarker.has_value()
+                && bracketQualifierIs(tree, outer.suffix, *cfg.atomicMarker);
+    return q;
+}
+
+// C 6.7.6.2p1's OTHER half (P68 round 10, lane `cs`): the bracket's decorations may appear
+// "only in the outermost array type derivation". Every array suffix of a PARAMETER's
+// declarator other than that derivation's own bracket — a second dimension (`int p[2]
+// [volatile 3]`), an array a pointer points at (`int (*p)[volatile 3]`) — must carry none
+// of the language's outermost-only decorations (`arraySuffixOutermostOnlyTokens`). A nested
+// function declarator's parameters are declarations of their own, asked at their own
+// visit: the chain walk reads each level's DIRECT suffixes and never enters a function
+// suffix's parameter list. Refused S_ArrayParamQualifierNonParameter, once per bracket,
+// from the definitive visit.
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/bv` bv38 / bv39): gcc 13.3.0, clang 18.1.3
+// and mingw-w64 13.2.0 refuse both shapes in every mode; DSS built them and dropped the
+// qualifier.
+void refuseDecorationsOffTheOutermostBracket(EngineState& s, SemanticConfig const& cfg,
+                                             Tree const& tree, NodeId dNode) {
+    if (!dNode.valid() || !cfg.declarators.has_value()) return;
+    DeclaratorConfig const& dc = *cfg.declarators;
+    if (dc.arraySuffixOutermostOnlyTokens.empty() || tree.kind(dNode) != NodeKind::Internal)
+        return;
+    NodeId inner = dNode;
+    if (isDeclaratorSlotWrapper(tree.rule(dNode), dc)) {
+        inner = declarator_walk_detail::firstChildOfRule(TreeDeclaratorView{tree}, dNode,
+                                                         dc.declaratorRule);
+        if (!inner.valid()) return;
+    }
+    std::vector<DeclaratorChainLevel> chain;
+    if (!readDeclaratorChain(tree, inner, dc, chain)) return;
+    ParameterOutermostLevel const outer = parameterOutermostLevel(tree, dNode, dc);
+    NodeId const allowed =
+        outer.kind == ParameterOutermost::Array ? outer.suffix : NodeId{};
+    for (DeclaratorChainLevel const& lvl : chain) {
+        if (!lvl.direct.valid()) continue;
+        for (NodeId c : visibleChildren(tree, lvl.direct)) {
+            if (tree.kind(c) != NodeKind::Internal || c == allowed) continue;
+            RuleId const cr = tree.rule(c);
+            bool const isArraySuffix =
+                cr == dc.arraySuffixRule
+                || (dc.arrayStarSuffixRule.has_value() && cr == *dc.arrayStarSuffixRule);
+            if (!isArraySuffix) continue;
+            for (SchemaTokenId const tok : dc.arraySuffixOutermostOnlyTokens) {
+                if (!bracketQualifierIs(tree, c, tok)) continue;
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_ArrayParamQualifierNonParameter;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(c);
+                d.actual   = "an array declarator's `static` / type-qualifier decoration is "
+                             "permitted only on a function parameter's OUTERMOST array "
+                             "derivation (C 6.7.6.2p1): `"
+                             + std::string{tree.text(c)} + "`";
+                s.reporter.report(std::move(d));
+                break;
+            }
+        }
     }
 }
 
@@ -3013,12 +3096,58 @@ genericSelectedArm(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 // own scan. Two call sites, one body: the fail-loud arm and the merge order
 // cannot drift apart, which is exactly the [[a partial fix reads as a complete
 // one]] failure this would otherwise be.
+//
+// ★ P68 round 10 (lane `cs`): C 6.7.3p10 — "If the specification of an array
+// type includes any type qualifiers, the element type is so-qualified" (C23:
+// both the array and the element). A qualifier reaches an ARRAY base only
+// through a name for the array type — `typedef int A[2]; volatile A x;`, a
+// `typeof` — and `volatileQualifiedObjectType` gives it to the ELEMENT, the one
+// place every spelling of the type puts it (`volatile int x[2]` qualifies the
+// element before the bracket is ever folded). A skin on the ARRAY is invisible
+// to every consumer that reads the element — an index, a decay, `&x[0]`, and a
+// parameter's adjustment.
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/bv` bv11 / bv26-bv28, every
+// build RUN): gcc 13.3.0, clang 18.1.3 (-std=c17 -pedantic-errors, -std=c2x),
+// mingw-w64 13.2.0 and MSVC 19.51 type `&x[0]` and the decay of `volatile A x`
+// `volatile int *`, `&x` `volatile int (*)[2]`, and a `volatile A p` parameter
+// `volatile int *`; DSS typed them `int *`, neither pointer-to-array, and
+// `int *` — silently.
+[[nodiscard]] TypeId
+volatileQualifiedObjectType(TypeInterner& in, TypeId t) {
+    if (in.kind(t) != TypeKind::Array) return in.volatileQualified(t);
+    // The array spine, OUTERMOST first — a loop over the spine, never a
+    // recursion over the input's depth.
+    std::vector<TypeId> levels;
+    TypeId element = t;
+    while (in.kind(element) == TypeKind::Array) {
+        auto const ops = in.operands(element);
+        if (ops.empty() || !ops[0].valid()) return in.volatileQualified(t);  // shapeless:
+                                                                             // the fail-loud sites own it
+        levels.push_back(element);
+        element = ops[0];
+    }
+    TypeId rebuilt = in.volatileQualified(element);
+    std::int64_t const volatileBit = static_cast<std::int64_t>(QualBit::Volatile);
+    for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
+        TypeId const level = *it;
+        if (in.isVlaArray(level))             rebuilt = in.vlaArray(rebuilt);
+        else if (in.isIncompleteArray(level)) rebuilt = in.incompleteArray(rebuilt);
+        else                                  rebuilt = in.array(rebuilt, in.scalars(level)[0]);
+        // Whatever ELSE decorates this level (a type-level alignment) stays on it;
+        // a `volatile` on it is the element's now.
+        std::int64_t const keepBits = in.qualifierBits(level) & ~volatileBit;
+        std::uint32_t const keepAlign = in.typeAlignOverride(level);
+        if (keepBits != 0 || keepAlign != 0) rebuilt = in.qualified(rebuilt, keepBits, keepAlign);
+    }
+    return rebuilt;
+}
+
 [[nodiscard]] TypeId
 applyBaseQualifiers(EngineState& s, Tree const& tree, TypeId base,
                     bool isVolatile, bool isAtomic, NodeId diagNode,
                     bool emitOnMiss) {
     if (!base.valid()) return base;
-    if (isVolatile) base = s.lattice.interner().volatileQualified(base);
+    if (isVolatile) base = volatileQualifiedObjectType(s.lattice.interner(), base);
     if (isAtomic) {
         if (isByValueClass(s.lattice.interner(), base)) {
             if (emitOnMiss) {
@@ -3725,6 +3854,23 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             for (auto child : kids) {
                 if (isPointerStar(child)) {
                     break;   // reached the star run — a later qualifier is the pointer object's
+                }
+                // P68 round 10 (lane `cs`): and the ABSTRACT DECLARATOR ends the
+                // specifiers just as a star does — its own qualifiers belong to its
+                // own layers, which `directDeclaredType` folds through the
+                // declarator's east arms. With no star at this level the scan used to
+                // walk INTO it, so `int (*volatile *)[2]` built an array of `volatile
+                // int`. ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/hxv`, `hx` hx07):
+                // the cast `(int (*volatile *)[2])0` was typed
+                // `ptr<volatile<ptr<arr<volatile<i32>, 2>>>>`, so `_Generic` over that
+                // association missed `&p` for `int (*volatile p)[2]` (and missed an
+                // object DECLARED `int (*volatile *q)[2]`), where gcc 13.3.0, clang
+                // 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 all select it.
+                if (cfg.declarators.has_value()
+                    && cfg.declarators->directAbstractRule.has_value()
+                    && tree.kind(child) == NodeKind::Internal
+                    && tree.rule(child) == *cfg.declarators->directAbstractRule) {
+                    break;
                 }
                 if (cfg.volatileMarker.has_value()
                     && subtreeContainsToken(tree, child, *cfg.volatileMarker,
@@ -8187,10 +8333,24 @@ declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
 //
 // c82: the CC's `va_list` is EXCLUDED — see the guard's own comment.
 // Non-array, non-function types (and rows without the flag) pass through
-// untouched. The transparent kind()/operands() accessors make a qualified
-// array element ride into the pointee unchanged.
+// untouched. A qualified ELEMENT rides into the pointee unchanged — and a
+// qualifier written on a typedef'd array IS its element's
+// (`applyBaseQualifiers`, C 6.7.3p10), so `typedef int A[4]; void f(volatile
+// A p)` points at `volatile int`.
+//
+// ★ P68 round 10 (lane `cs`): p7's "QUALIFIED pointer" — the adjusted pointer
+// carries the qualifiers written inside the OUTERMOST bracket. `const` /
+// `restrict` ride the symbol (`applyArrayParameterQualification`); `volatile`
+// and `_Atomic` are interned on the type, so they are applied HERE, read
+// through `dNode` (the parameter's declarator; invalid when it has none), and
+// `void f(int p[volatile])` types `p` exactly as `int *volatile p`. The
+// qualifier stays OUT of the function's type all the same: C 6.7.6.3p15 takes
+// a parameter's unqualified type there, which `functionTypeParameter` applies
+// as the FnSig is harvested.
 [[nodiscard]] TypeId
-adjustParamDeclaredType(EngineState& s, DeclarationRule const& decl, TypeId t) {
+adjustParamDeclaredType(EngineState& s, SemanticConfig const& cfg,
+                        Tree const& tree, DeclarationRule const& decl,
+                        NodeId dNode, TypeId t) {
     if (!decl.paramAdjustments || !t.valid()) return t;
     // c82: the CC's `va_list` is EXCLUDED — the per-CC va_* machinery (c63)
     // owns va_list parameter passing end-to-end (param slot, decay-at-call,
@@ -8210,7 +8370,71 @@ adjustParamDeclaredType(EngineState& s, DeclarationRule const& decl, TypeId t) {
     auto const elems = in.operands(t);
     if (elems.empty() || !elems[0].valid()) return t;  // interner invariant —
                                                        // downstream fails loud
-    return in.pointer(elems[0]);
+    TypeId adjusted = in.pointer(elems[0]);
+    ArrayParameterPointerQualifiers const bracket =
+        arrayParameterPointerQualifiers(cfg, tree, dNode);
+    if (bracket.isVolatile) adjusted = in.volatileQualified(adjusted);
+    if (bracket.isAtomic)   adjusted = in.atomicQualified(adjusted);
+    return adjusted;
+}
+
+// ── C 6.7.6.3p15: A FUNCTION TYPE TAKES EACH PARAMETER'S UNQUALIFIED TYPE ──────
+// (P68 round 10, lane `cs`)
+//
+// "In the determination of type compatibility and of a composite type, ... each
+// parameter declared with qualified type is taken as having the unqualified
+// version of its declared type." Compatibility is what every consumer of a
+// function's TYPE asks — a function-pointer initialization or assignment, a
+// `_Generic` association, `==` / `?:` over function pointers, a redeclaration —
+// and C 6.5.2.2p7 converts a call's arguments to the unqualified parameter type
+// too. So the FnSig is interned WITHOUT a parameter's top-level `volatile`, and
+// every one of those identity comparisons is C's relation by construction. The
+// OBJECT inside the body keeps it: the parameter symbol is bound from its own
+// adjusted declared type (the Pass-1.5 visit), never from the FnSig.
+// `_Atomic` STAYS in the FnSig: C 6.2.5p27 keeps an atomic type out of the
+// "qualified or unqualified" wording, and gcc and clang both refuse `int
+// f(_Atomic int); int f(int);` (the redeclaration oracle's measurement). A
+// type-level alignment stays too — it is not a qualifier. And a `volatile
+// void` parameter keeps its qualifier: in DSS's signature an UNQUALIFIED void
+// is where argument matching ends (`fnArgumentParams`), so a named `volatile
+// void v` stripped here would let `f()` call `void f(volatile void v)` — a
+// call gcc, the one reference that accepts that declaration, refuses
+// (`normalizeSoleVoidParams` states the measurement).
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/bv` bv16 / bv18 / bv29, every
+// build RUN): for `int f(int *volatile p)`, gcc 13.3.0, clang 18.1.3, mingw-w64
+// 13.2.0 and MSVC 19.51 initialize an `int (*)(int *)` from `f` with no
+// diagnostic and select `int (*)(int *)` in `_Generic(f, …)`, and `_Generic` on
+// a plain `int f(int *p)` selects `int (*)(int *volatile)`; DSS warned
+// S_IncompatiblePointerConversion on the first and selected `default` on both.
+// The redeclaration comparison already dropped the qualifier (its oracle strips
+// it); nothing else did.
+[[nodiscard]] TypeId functionTypeParameter(TypeInterner& in, TypeId t) {
+    if (!t.valid() || !in.isVolatileQualified(t)) return t;
+    if (in.kind(t) == TypeKind::Void) return t;
+    std::int64_t const volatileBit = static_cast<std::int64_t>(QualBit::Volatile);
+    return in.qualified(in.stripVolatile(t), in.qualifierBits(t) & ~volatileBit,
+                        in.typeAlignOverride(t));
+}
+
+// The ONE construction of a function type from a harvested parameter list — the
+// declarator suffix (a definition, a prototype, a function pointer, a type name)
+// and the legacy function-declaration row both end here, AFTER the `(void)`
+// normalization has read each parameter's qualifiers (a qualified `void` is
+// refused there, so the unqualification below must not run first). The rule is
+// the language's (`parameters.unqualifiedParameterTypes`); a language that does
+// not declare it keeps its parameters' declared types in the function type. CcSysV
+// is the canonical MIR-tier placeholder: ML7's calling-convention pass applies the
+// target's real convention at materialize time — do not inspect it before then.
+[[nodiscard]] TypeId
+functionTypeOfParams(TypeInterner& in, SemanticConfig const& cfg,
+                     std::vector<std::pair<NodeId, TypeId>> const& params,
+                     TypeId result, bool isVariadic) {
+    bool const unqualify = cfg.parameters.unqualifiedParameterTypes;
+    std::vector<TypeId> types;
+    types.reserve(params.size());
+    for (auto const& [node, ty] : params)
+        types.push_back(unqualify ? functionTypeParameter(in, ty) : ty);
+    return in.fnSig(types, result, CallConv::CcSysV, isVariadic);
 }
 
 // The declared type of ONE declaration-row node — the fn-suffix param
@@ -8257,7 +8481,8 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     /*allowInitInferredArray=*/false,
                     /*paramDecay=*/decl.paramAdjustments,
                     /*typeAliasRow=*/decl.kind == DeclarationKind::Type);
-                return adjustParamDeclaredType(s, decl, t);
+                return adjustParamDeclaredType(s, cfg, tree, decl,
+                                               kids[*decl.declaratorChild], t);
             }
             // Declarator structurally absent — a TYPE-ONLY (abstract) param.
             // C 6.7.6.3p7/p8 adjust the declared type REGARDLESS of a name:
@@ -8270,7 +8495,7 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // (`sqlite3_vmprintf(const char*, va_list)` abstract vs the
             // named caller param; va_list itself is EXCLUDED inside the
             // helper, see its comment).
-            return adjustParamDeclaredType(s, decl, head);
+            return adjustParamDeclaredType(s, cfg, tree, decl, NodeId{}, head);
         }
         return InvalidType;   // a LIST row has no single param type
     }
@@ -8280,7 +8505,7 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         pty = applyArraySuffix(s, tree, decl, declNode, pty, scope, &cfg);
         // c82: the legacy-row twin of the declarator-mode adjustment above —
         // the two param-resolution shapes must not drift.
-        return adjustParamDeclaredType(s, decl, pty);
+        return adjustParamDeclaredType(s, cfg, tree, decl, NodeId{}, pty);
     }
     return InvalidType;
 }
@@ -8366,25 +8591,16 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                                         &s.idx().declByRule)) {
                 normalizeSoleVoidParams(s, cfg, tree, params, /*variadic=*/true,
                                         emitOnMiss);
-                std::vector<TypeId> vt;
-                vt.reserve(params.size());
-                for (auto const& [pNode, pTy] : params) vt.push_back(pTy);
-                return s.lattice.interner().fnSig(vt, inner, CallConv::CcSysV,
-                                                  /*isVariadic=*/true);
+                return functionTypeOfParams(s.lattice.interner(), cfg, params, inner,
+                                            /*isVariadic=*/true);
             }
         }
         // C 6.7.6.3p10 `(void)` normalization — the same call the legacy
         // function-decl FnSig build applies (ONE convention, two paths).
         normalizeSoleVoidParams(s, cfg, tree, params, /*variadic=*/false,
                                 emitOnMiss);
-        std::vector<TypeId> paramTypes;
-        paramTypes.reserve(params.size());
-        for (auto const& [pNode, pTy] : params) paramTypes.push_back(pTy);
-        // CcSysV is the canonical MIR-tier placeholder — the SAME cc source
-        // every interner `fnSig()` call site uses pre-ML7 (the function-decl
-        // path above, builtins, moduleInit); ML7's calling-convention pass
-        // applies the target's real convention at materialize time.
-        return s.lattice.interner().fnSig(paramTypes, inner, CallConv::CcSysV);
+        return functionTypeOfParams(s.lattice.interner(), cfg, params, inner,
+                                    /*isVariadic=*/false);
     }
     if (dc.arrayStarSuffixRule.has_value() && r == *dc.arrayStarSuffixRule) {
         // VLA C4c (D-CSUBSET-VLA-PARAM-STAR, C99 §6.7.6.2p4): the bare
@@ -8404,7 +8620,12 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 d.severity = DiagnosticSeverity::Error;
                 d.buffer   = tree.source().id();
                 d.span     = tree.span(suffix);
-                d.actual   = std::string{tree.text(suffix)};
+                // P68 round 10 (lane `cs`): prose, then the lexeme — the render
+                // contract D-DIAG-ARRAY-SUFFIX-REPORTS-ONLY-THE-LEXEME gave the two
+                // bound-suffix arms, which this star arm had kept as the bare `[*]`.
+                d.actual   = "an array declarator's unspecified-size `*` is permitted only "
+                             "in a function parameter's declaration with prototype scope "
+                             "(C 6.7.6.2p4): `" + std::string{tree.text(suffix)} + "`";
                 s.reporter.report(std::move(d));
             }
             return InvalidType;
@@ -12393,7 +12614,12 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // the FnSig-typed-Variable reject below unreachable
                         // for parameters: the param's type is Ptr<FnSig>
                         // (isFnSig false) by the time that arm is tested.
-                        declTy = adjustParamDeclaredType(s, decl, declTy);
+                        // P68 round 10 (lane `cs`): the bracket rule's other half — a
+                        // parameter's decorations sit on its OUTERMOST bracket only.
+                        if (decl.paramAdjustments)
+                            refuseDecorationsOffTheOutermostBracket(s, cfg, tree, dNode);
+                        declTy = adjustParamDeclaredType(s, cfg, tree, decl, dNode,
+                                                         declTy);
                         // SINGLE-declarator rows (param-like): also stamp
                         // the row node — an ABSTRACT param has no name
                         // node to carry the type, but its slot still
@@ -14259,10 +14485,11 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             //   * The question it asks — "does the definition in
                             //     front of me have one of the signatures this
                             //     LANGUAGE declares for this name" — needs no
-                            //     target at all. A 3-parameter `main` is refused
-                            //     on a relocatable `.o` too, because no format
-                            //     realizes it and no later translation unit can
-                            //     make it legal.
+                            //     target at all. A signature the language does
+                            //     not declare — `int main(int, char**, int)` — is
+                            //     refused on a relocatable `.o` too, because no
+                            //     format realizes an undeclared shape and no later
+                            //     translation unit can make it legal.
                             //   * The format-dependent question ("does the active
                             //     format realize this row's verb") MUST NOT be
                             //     answered here even though `s.activeFormat`
@@ -15451,24 +15678,8 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                 &s.idx().declByRule);
                         normalizeSoleVoidParams(s, cfg, tree, params, isVariadic,
                                                 /*emitOnMiss=*/true);
-                        std::vector<TypeId> paramTypes;
-                        paramTypes.reserve(params.size());
-                        for (auto const& [pNode, pTy] : params) {
-                            paramTypes.push_back(pTy);
-                        }
-                        // CcSysV is the canonical MIR-tier placeholder
-                        // (mirrors `hir_to_mir.cpp:lowerModuleInit`'s
-                        // moduleInit FnSig): the target's real
-                        // convention is applied by ML7 (`lir_callconv`)
-                        // via `cc.name` lookup at materialize time.
-                        // Do NOT inspect this CallConv field at MIR
-                        // tier — it's a semantic placeholder, not the
-                        // load-bearing CC. Anchored as the same
-                        // placeholder convention every interner
-                        // `fnSig()` callsite uses pre-ML7.
-                        TypeId const fnTy = s.lattice.interner().fnSig(
-                            paramTypes, returnTy, CallConv::CcSysV,
-                            isVariadic);
+                        TypeId const fnTy = functionTypeOfParams(
+                            s.lattice.interner(), cfg, params, returnTy, isVariadic);
                         s.symbols.at(sym).type = fnTy;
                         s.nodeToType.set(resolved.node, fnTy);
                         // GAP A: record the function's RESULT type keyed on

@@ -11667,6 +11667,34 @@ TEST(MirLoweringCVolatile, VolatileStoreThroughPointerParamSurvivesDce) {
            "MirInstFlags::Volatile like dce.cpp)";
 }
 
+// P68 round 10 (lane `cs`) — C 6.7.6.3p7: `int p[volatile]` IS `int *volatile p`, so
+// `p` is a volatile OBJECT. With its address taken it lives in memory, and the
+// incoming argument's store into its slot and the read of `p` for `*p` carry the flag,
+// exactly as the explicit spelling's do; the plain `int p[]` is the control. Before the
+// fix the bracket's `volatile` was dropped and both accesses were plain.
+TEST(MirLoweringCVolatile, ABracketVolatileArrayParameterIsAVolatileObject) {
+    for (char const* src : {"int f(int p[volatile]) { (void)&p; return *p; }\n",
+                            "int f(int *volatile p) { (void)&p; return *p; }\n"}) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors())
+            << src << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok)
+            << src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+            << "the incoming argument's store into p's slot must be volatile: " << src;
+        EXPECT_GE(countOpWithVolatile(m, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "the read of p must be volatile: " << src;
+    }
+    auto L = lowerC("int f(int p[]) { (void)&p; return *p; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 0u);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u);
+}
+
 // ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION — opaque / incomplete struct ──
 // These pin the FAIL-LOUD axis end-to-end: an opaque (forward-declared, never
 // defined) struct is INCOMPLETE; a `Ptr<incomplete>` is sizeable and usable, but

@@ -42,10 +42,11 @@ dss_add_test(NAME ffi/test_pe_abort_behavior_binding
              SOURCES test_pe_abort_behavior_binding.cpp)
 target_link_libraries(dss_ffi_test_pe_abort_behavior_binding
                       PRIVATE nlohmann_json::nlohmann_json)
-# POSIX `environ` — the extern DATA-OBJECT row's two load-bearing properties:
-# its availability set (eager-import law — widening it to a format whose CRT
-# has no such export breaks every including binary's LOAD, silently at build
-# time) and the absence of any macro that would shadow an LVALUE data object.
+# POSIX `environ` — exactly ONE realization per format (a DATA-OBJECT row on elf
+# and macho, a macro onto the UCRT accessor on pe), each row's availability set
+# (widening one to a format whose CRT has no such export breaks the LOAD of every
+# binary that references it, silently at build time) and the absence of any
+# macro that would shadow an LVALUE data object.
 # Reads the shipped descriptors' JSON directly, hence the same json link as its
 # three siblings above.
 dss_add_test(NAME ffi/test_environ_data_object_binding

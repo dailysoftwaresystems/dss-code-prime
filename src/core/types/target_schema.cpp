@@ -61,6 +61,52 @@ std::string acceptedRelocFormulaList() {
     return out;
 }
 
+std::optional<std::string> gotSlotTwinMismatch(TargetRelocationInfo const& gotRow,
+                                               TargetRelocationInfo const& twin) {
+    RelocFormulaFacts const f = relocFormulaFacts(gotRow.formulaKind);
+    if (!f.isGotSlotRelative) {
+        return std::format("relocation '{}' does not address a GOT slot, so it has "
+                           "no twin", gotRow.name);
+    }
+    if (relocFormulaFacts(twin.formulaKind).isGotSlotRelative) {
+        return std::format("relocation '{}': its 'gotSlotTwin' '{}' addresses a GOT "
+                           "slot itself — the twin is the DIRECT reference to the "
+                           "slot the link mints", gotRow.name, twin.name);
+    }
+    if (twin.formulaKind != f.directTwin) {
+        return std::format("relocation '{}': its 'gotSlotTwin' '{}' has formula "
+                           "'{}', and formula '{}' lowers into '{}'",
+                           gotRow.name, twin.name, relocFormulaName(twin.formulaKind),
+                           relocFormulaName(gotRow.formulaKind),
+                           relocFormulaName(f.directTwin));
+    }
+    if (twin.tls || twin.imageRelative) {
+        return std::format("relocation '{}': its 'gotSlotTwin' '{}' writes a {} "
+                           "value, and a slot is addressed by its own address",
+                           gotRow.name, twin.name,
+                           twin.tls ? "thread-pointer-relative" : "image-relative");
+    }
+    if (f.directTwin == RelocFormulaKind::Linear
+        && (!twin.pcRelative || twin.widthBytes != gotRow.widthBytes
+            || twin.addendBias != gotRow.addendBias)) {
+        return std::format("relocation '{}': its 'gotSlotTwin' '{}' must be "
+                           "pc-relative, {} bytes, bias {} — the arithmetic '{}' "
+                           "applies to the slot — and it is {}, {} bytes, bias {}",
+                           gotRow.name, twin.name, gotRow.widthBytes,
+                           gotRow.addendBias, gotRow.name,
+                           twin.pcRelative ? "pc-relative" : "absolute",
+                           twin.widthBytes, twin.addendBias);
+    }
+    if (f.directTwin == RelocFormulaKind::Aarch64LdstAbsLo12
+        && twin.scaleLog2 != f.twinScaleLog2) {
+        return std::format("relocation '{}': its 'gotSlotTwin' '{}' counts its "
+                           "field in units of 2^{} bytes, and a GOT entry is one "
+                           "2^{}-byte pointer", gotRow.name, twin.name,
+                           twin.scaleLog2, f.twinScaleLog2);
+    }
+    return std::nullopt;
+}
+
 // UCRT-P4: the ONE entry-signature renderer moved to `core/types/entry_shape.hpp`
 // as `entrySignatureSpelling` (inline) when the vocabulary was extracted there —
 // the semantic tier now renders the same string, and that tier must not link
@@ -2503,7 +2549,11 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                              "LK6 in-place applier will reject them).",
                              r.name));
         }
-        if (r.addendBias != 0 && !r.pcRelative) {
+        // A plain-field GOT formula is pc-relative BY ITS FORMULA
+        // (`GOTSLOT(S) + A − P`), so its bias is not an absolute one: rule (c)
+        // reads the row's declared `pcRelative` for a Linear row only.
+        if (r.addendBias != 0 && !r.pcRelative
+            && r.formulaKind == RelocFormulaKind::Linear) {
             fail(std::format("/relocations/{}/addendBias", i),
                  std::format("relocation '{}': 'addendBias' is "
                              "non-zero ({}) but 'pcRelative' is "
@@ -2604,7 +2654,15 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  r.name,
                                  relocFormulaName(r.formulaKind)));
             }
-            if (r.addendBias != 0) {
+            // P68 round 11: a formula that patches a PLAIN BYTE FIELD may carry
+            // a bias — the one non-Linear such formula is x86-64's GOT
+            // displacement, which ELF's RELA spells with bias 0 (the −4 rides
+            // the record's addend) and Mach-O relative to the field's END
+            // (bias −4, the addend in place). An instruction-word formula
+            // encodes its bias itself, and one declared here would be applied
+            // twice.
+            if (r.addendBias != 0
+                && !relocFormulaFacts(r.formulaKind).patchesPlainField) {
                 fail(std::format("/relocations/{}/addendBias", i),
                      std::format("relocation '{}': non-Linear formula "
                                  "'{}' encodes any addend bias "
@@ -2612,6 +2670,40 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  r.name,
                                  relocFormulaName(r.formulaKind)));
             }
+        }
+        // Rule (g) — P68 round 11: a GOT-slot-relative row NAMES the direct
+        // row it lowers into, and that row applies the same arithmetic to the
+        // slot (`gotSlotTwinMismatch`, the one owner of the rule). A row that
+        // does not address a slot names none: a twin nothing reads is a fact
+        // that silently does nothing.
+        if (relocFormulaFacts(r.formulaKind).isGotSlotRelative) {
+            if (r.gotSlotTwin.empty()) {
+                fail(std::format("/relocations/{}", i),
+                     std::format("relocation '{}': formula '{}' addresses a GOT "
+                                 "slot, so the row must name the direct row an "
+                                 "image link rewrites it into ('gotSlotTwin'). "
+                                 "Without one, no image can apply it.",
+                                 r.name, relocFormulaName(r.formulaKind)));
+            } else {
+                TargetRelocationInfo const* twin = nullptr;
+                for (auto const& c : relocations) {
+                    if (c.name == r.gotSlotTwin) { twin = &c; break; }
+                }
+                if (twin == nullptr) {
+                    fail(std::format("/relocations/{}/gotSlotTwin", i),
+                         std::format("relocation '{}': 'gotSlotTwin' names '{}', "
+                                     "which this target does not declare.",
+                                     r.name, r.gotSlotTwin));
+                } else if (auto const why = gotSlotTwinMismatch(r, *twin)) {
+                    fail(std::format("/relocations/{}/gotSlotTwin", i), *why);
+                }
+            }
+        } else if (!r.gotSlotTwin.empty()) {
+            fail(std::format("/relocations/{}/gotSlotTwin", i),
+                 std::format("relocation '{}': 'gotSlotTwin' is read only for a "
+                             "formula that addresses a GOT slot, and this row "
+                             "declares '{}'.",
+                             r.name, relocFormulaName(r.formulaKind)));
         }
         // Rule (f) — P68 round 9: `scaleLog2` is read by the scaled
         // page-offset formula alone, and it is at most a 16-byte access.

@@ -1,10 +1,10 @@
 /* POSIX `environ` — the SMOKE TEST: does reading the environment through the
-   shipped `environ` -> `__environ` macro/symbol split actually WORK in a
-   DSS-built ELF exec, on both arches, debug and release.
+   `environ` DSS's <unistd.h> declares on elf (the shipped data-object row)
+   actually WORK in a DSS-built ELF exec, on both arches, debug and release.
 
    ★★ READ THIS BEFORE TRUSTING WHAT THIS EXAMPLE PROVES, BECAUSE IT ONCE
    PROVED LESS THAN IT CLAIMED. This program is a SELF-LOOP and cannot witness
-   an OBJECT-IDENTITY property: it reads `environ` through the DSS macro and
+   an OBJECT-IDENTITY property: it read `environ` through the DSS macro and
    cross-checks the value against libc's own `getenv`, but under the ELF COPY
    RELOCATION binding that shipped at the time, BOTH of those reads went through
    the very name the exec CLAIMED, so it compared the exec's copy WITH ITSELF.
@@ -26,15 +26,15 @@
    third parameter to main AT ALL. `environ` is the blessed, portable spelling,
    so it is what real code reaches for.
 
-   WHY THE SYMBOL IS `__environ`: glibc declares `__environ`
-   UNCONDITIONALLY (/usr/include/unistd.h) and exports it STRONG, while
-   `environ` sits behind `#ifdef __USE_GNU` and is exported WEAK. DSS
-   EAGER-IMPORTS every name a descriptor declares, so the strong,
-   always-present spelling is the safe one — and the POSIX spelling reaches it
-   through an elf-gated macro. ⓘ It is no longer a CORRECTNESS requirement:
-   under the got-indirect binding this example now uses, ld.so resolves either
-   spelling to glibc's ONE object. It WAS one under copy relocation, and that is
-   history worth keeping rather than a live claim.
+   WHICH SYMBOL (P68 round 11, D-FFI-ENVIRON-NOT-SHIPPED): `environ` itself —
+   a data-object row on elf and macho, which glibc exports (WEAK) at the one
+   address it also exports as `_environ` and `__environ`. It used to be an
+   elf macro onto the STRONG `__environ`, a copy-relocation-era choice (the
+   claimed name decided which object the exec read); under got-indirect every
+   spelling resolves to glibc's ONE object, and the macro could not serve a
+   program's own `extern char **environ;` in a TU without <unistd.h> — the
+   POSIX spelling, witnessed on every pair by
+   examples/c/environ_declared_by_the_program.
 
    Binding model: every ELF format declares `dataImportBinding: "got-indirect"`
    — the exec reserves a GOT slot, emits one R_*_GLOB_DAT against it, ld.so
@@ -63,21 +63,25 @@
      program reads, so it cannot detect a SPLIT — only a garbage or stale
      pointer.
 
-   RED-ON-DISABLE: un-ship the row -> honest S0001; un-ship the macro -> honest
-   S0001 `got environ`; drop `dataImportBinding` from the elf exec format -> the
+   RED-ON-DISABLE: un-ship the `environ` row -> S_UndeclaredIdentifier `environ`
+   at compile time (MEASURED 2026-09-24, both arches, debug and release); drop
+   `dataImportBinding` from the elf exec format -> the
    linker's loud data-import reject (K_FormatLacksImportSupport); neuter the
    got-indirect deref (a bare lea) -> the vector walk reads the slot's own
    address as `environ[0]` and fails the '=' scan at exit 2.
-   ⓘ NOT red-on-disable here any more, and that is the whole point of the sibling
-   example: repointing the row at the WEAK `environ` spelling now WORKS (ld.so
-   resolves it to the same object), where under copy relocation it returned 1.
-   elf-ONLY on purpose: no Windows CRT exports a spelling ucrtbase can bind
-   (measured — ucrtbase has none at all, msvcrt only the underscored
-   `_environ`), and the macho export could not be measured this cycle, so both
-   stay fail-loud S0001 per this directory's need-driven staging rule.
-   Cross-checked in WSL against `gcc -std=gnu17 -no-pie` (exit 42, identical
-   stdout) — `-std=gnu17`, not `-std=c17`, because glibc gates the `environ`
-   spelling behind __USE_GNU. */
+   ⓘ The row's SPELLING is not red-on-disable here, and that is the whole point
+   of the sibling example: `environ` and `__environ` resolve to one object under
+   got-indirect, where under copy relocation the weak spelling returned 1.
+   elf-ONLY on purpose: this program reads `environ` as <unistd.h> declares it,
+   and only glibc's <unistd.h> does that (under _GNU_SOURCE) — Apple's never
+   declares it, and pe's `environ` is <stdlib.h>'s macro onto the UCRT accessor
+   — so a Mach-O or pe arm of THIS program would have no reference behind it.
+   The spelling every platform shares, the program's own declaration, is
+   witnessed on all five pairs by examples/c/environ_declared_by_the_program.
+   Cross-checked in WSL against `gcc -std=gnu17 -D_GNU_SOURCE -no-pie` (exit 42,
+   identical stdout; MEASURED 2026-09-24) — `-D_GNU_SOURCE` because glibc
+   declares `environ` only under __USE_GNU, which no `-std` mode defines for C:
+   plain `-std=gnu17 -no-pie` refuses it ('environ' undeclared). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

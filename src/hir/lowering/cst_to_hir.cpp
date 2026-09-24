@@ -602,8 +602,13 @@ struct Lowerer {
             // Both emit the synthetic Array→Ptr Cast that MIR re-types by the
             // target (element-agnostic), so a string-literal / array arg lands as
             // a width-correct `void*`.
+            // P68 round 10 (lane `cs`): the element up to its `volatile` skin — the
+            // SAME test `isAssignable`'s Ptr←Array arm admits with
+            // (`decayedElementReachesPointee`), so `int a[2]` reaching a
+            // `volatile int *` is realized as the decay it is admitted as.
             bool const sameElem = !arrElem.empty() && !ptrElem.empty()
-                               && arrElem[0] == ptrElem[0];
+                               && decayedElementReachesPointee(interner, ptrElem[0],
+                                                               arrElem[0]);
             // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed element
             // is an ARRAY on both sides and the two are COMPATIBLE though not identical
             // — a fixed `int b[2][2]` (rows `int[2]`) reaching an `int (*)[n]`

@@ -203,6 +203,18 @@
         { "bytesAfterField": 2, "nativeId": 1962934272 },
         { "bytesAfterField": 4, "nativeId": 2231369728 }
       ]
+    },
+    {
+      "$comment": "P68 round 11: X86_64_RELOC_GOT_LOAD — see the relocatable sibling (hand-sync). A static-archive member is read with this document, so a clang-built macOS archive whose members read an extern datum reaches the link.",
+      "name": "X86_64_RELOC_GOT_LOAD",
+      "kind": 12,
+      "nativeId": 889192448
+    },
+    {
+      "$comment": "P68 round 11: X86_64_RELOC_GOT — see the relocatable sibling (hand-sync).",
+      "name": "X86_64_RELOC_GOT",
+      "kind": 11,
+      "nativeId": 1157627904
     }
   ]
 }

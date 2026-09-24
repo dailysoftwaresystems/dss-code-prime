@@ -4080,11 +4080,17 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // × pair) — un-gated for the `type-size` rows' reason: whether one is defined
     // is the pair's question (test_type_derived_predefines pins the family).
     // 164 un-gated, 13 pe-gated, 3 macho-gated = 180.
-    EXPECT_EQ(pms.size(), 180u)
-        << "c declares 164 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // P68 (lane lm, #2): +6 ELF-GATED rows, the Linux identity every Linux reference
+    // predefines in its ISO modes — `__linux__`, `__linux`, `__gnu_linux__`, `__unix__`,
+    // `__unix`, `__ELF__` (✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 and aarch64);
+    // each carries the `impliedSurface` it backs (test_os_identity_predefines pins them
+    // on every real pair). 164 un-gated, 13 pe-gated, 3 macho-gated, 6 elf-gated = 186.
+    EXPECT_EQ(pms.size(), 186u)
+        << "c declares 164 un-gated + 13 pe-gated + 3 macho-gated + 6 elf-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
+    std::vector<std::string> elfGatedNames;
     for (auto const& pm : pms) {
         if (pm.availableObjectFormats.empty()) {
             ++ungated;
@@ -4096,11 +4102,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
             auto const& fmt = pm.availableObjectFormats.front();
             if (fmt == "macho") {
                 machoGatedNames.push_back(pm.name);
+            } else if (fmt == "elf") {
+                elfGatedNames.push_back(pm.name);
             } else {
                 ++peGated;
                 EXPECT_EQ(fmt, "pe")
-                    << pm.name << " should be pe-gated (Windows selection) or macho-gated "
-                                  "(Darwin selection) — no other format gate is declared";
+                    << pm.name << " should be pe-gated (Windows selection), macho-gated "
+                                  "(Darwin selection) or elf-gated (Linux selection) — no "
+                                  "other format gate is declared";
             }
         }
     }
@@ -4118,6 +4127,17 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
+    // The Linux identity (P68, lane lm, #2). EXACT SET, as for Darwin: every portable C
+    // program branches on `__linux__`, and without it DSS silently compiled the non-Linux
+    // arms of sqlite's os_unix.c on the ELF pairs (no pread/pwrite, no mmap I/O, no
+    // mremap) — a different program than every reference builds.
+    std::sort(elfGatedNames.begin(), elfGatedNames.end());
+    EXPECT_EQ(elfGatedNames,
+              (std::vector<std::string>{"__ELF__", "__gnu_linux__", "__linux", "__linux__",
+                                        "__unix", "__unix__"}))
+        << "elf targets must predefine exactly the six names gcc and clang define for a "
+           "linux triple in their ISO modes (`linux`/`unix` are GNU-mode only and belong "
+           "to the program)";
     EXPECT_EQ(ungated, 164u)
         << "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
            "round 9, realized per pair) + "

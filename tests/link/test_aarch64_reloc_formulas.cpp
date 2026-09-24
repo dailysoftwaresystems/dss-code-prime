@@ -37,12 +37,38 @@ namespace {
 // named formula kind. Returns shared_ptr<TargetSchema> on success.
 std::shared_ptr<TargetSchema const>
 loadOneRelocTarget(std::string_view formula, std::uint32_t kind = 1) {
+    // A GOT-slot-relative formula must NAME the direct row an image link
+    // lowers it into (`gotSlotTwin`, P68 round 11) and the target must declare
+    // that row with the formula's arithmetic, so such a fixture carries both:
+    // the row under test at `kind`, its twin at another kind.
+    std::string twinRow;
+    std::string twinKey;
+    if (auto const k = parseRelocFormulaKind(formula);
+        k.has_value() && relocFormulaFacts(*k).isGotSlotRelative) {
+        std::uint32_t const twinKind = kind == 99 ? 98 : 99;
+        switch (relocFormulaFacts(*k).directTwin) {
+            case RelocFormulaKind::Aarch64AdrPrelPgHi21:
+                twinRow = R"(, { "name": "twin", "kind": )" + std::to_string(twinKind)
+                        + R"(, "formula": "aarch64_adr_prel_pg_hi21" })";
+                break;
+            case RelocFormulaKind::Aarch64LdstAbsLo12:
+                twinRow = R"(, { "name": "twin", "kind": )" + std::to_string(twinKind)
+                        + R"(, "formula": "aarch64_ldst_abs_lo12", "scaleLog2": 3 })";
+                break;
+            default:
+                twinRow = R"(, { "name": "twin", "kind": )" + std::to_string(twinKind)
+                        + R"(, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 4 })";
+                break;
+        }
+        twinKey = R"(, "gotSlotTwin": "twin")";
+    }
     std::string const json = std::string{R"({
       "dssTargetVersion": 1,
       "target": {"name":"aarch64_test"},
       "relocations":[
         { "name": "test_kind", "kind": )"} + std::to_string(kind)
-        + R"(, "formula": ")" + std::string{formula} + R"(" }
+        + R"(, "formula": ")" + std::string{formula} + R"(")" + twinKey + " }"
+        + twinRow + R"(
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })";
@@ -81,13 +107,7 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
                       std::uint64_t symbolVa,
                       std::int64_t  addend,
                       std::uint64_t patchSectionVa,
-                      std::uint64_t funcOffset,
-                      // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS:
-                      // the GOT slot the image minted for the target, or 0 for
-                      // "this image minted none" — which is what every caller
-                      // but the GOTPCREL pair means, and what the walkers that
-                      // synthesize no GOT pass.
-                      std::uint64_t gotSlotVa = 0) {
+                      std::uint64_t funcOffset) {
     Patched out;
     out.text.resize(funcOffset + 4);
     // assembler emitted base inst at funcOffset (LE)
@@ -112,12 +132,9 @@ Patched applyOneReloc(std::shared_ptr<TargetSchema const> tgt,
     std::unordered_map<SymbolId, std::uint64_t> symbolVaMap{{SymbolId{2}, symbolVa}};
 
     DiagnosticReporter rep;
-    std::unordered_map<SymbolId, std::uint64_t> gotMap;
-    if (gotSlotVa != 0) gotMap.emplace(SymbolId{2}, gotSlotVa);
     out.ok = applyExecRelocations(
         out.text, mod, funcTextStart, symbolVaMap,
-        *tgt, patchSectionVa, "test", rep,
-        gotSlotVa != 0 ? &gotMap : nullptr);
+        *tgt, patchSectionVa, "test", rep);
     for (auto const& d : rep.all()) out.messages.push_back(d.actual);
     return out;
 }
@@ -163,23 +180,28 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     EXPECT_EQ(parseRelocFormulaKind(""),                         std::nullopt);
 }
 
-// D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the two GOT-address reloc
-// formulas are declared REAL (non-Linear) kinds — so the loader coherence
-// gate + the ET_DYN slide-safe classifier treat them right — but DSS never
-// APPLIES them (they are emitted only into a foreign-linked relocatable
-// object). The `applyExecRelocations` kernel arm is an EXPLICIT FAIL-LOUD
-// REFUSAL: reaching it means a DSS exec/dyn image carried a foreign-link-only
-// reloc — a bug, never a silent S/A/P fabrication (which would patch a
-// GOT-slot offset the DSS image has no slot for). RED-ON-DISABLE: delete
-// either kernel arm and this build fails `-Werror=switch` (the exhaustive
-// switch over RelocFormulaKind).
+// P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS,
+// D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS): the three GOT-slot-relative
+// formulas never reach this kernel through a link — `linker::link` lowers each
+// to its direct twin against a slot it mints (`lowerGotSlotReferences`, pinned
+// in `test_got_slot_lowering.cpp`) — so the kernel's arm is a REFUSAL of an
+// un-lowered one, never a silent S/A/P fabrication: patching the symbol's own
+// address where the code dereferences a slot would load the object's first
+// bytes as the pointer. ⚠ These pins used to say the arm64 pair is refused
+// because "it is foreign-linked"; that was true of DSS's output and false of its
+// input, and the x86 arm used to apply GOTPCREL from a slot map the static ET_EXEC
+// writer filled — a writer no program the driver builds reaches (✔MEASURED
+// 2026-09-24). RED-ON-DISABLE: delete the arm and the build fails
+// `-Werror=switch` (the exhaustive switch over RelocFormulaKind).
 TEST(Aarch64GotAddr, ApplyFailsLoudAdrGotPage) {
     auto tgt = loadOneRelocTarget("aarch64_adr_got_page");
     ASSERT_NE(tgt, nullptr);
     // A base ADRP word (0x90000000); any symbol VA. The kernel must REFUSE.
     auto p = applyOneReloc(tgt, 0x90000000u, 0x400000, 0, 0x400000, 0);
     EXPECT_FALSE(p.ok)
-        << "DSS must NOT apply an arm64 GOT-page reloc — it is foreign-linked.";
+        << "an un-lowered arm64 GOT-page reloc must be refused, never applied "
+           "to the symbol's own page";
+    EXPECT_TRUE(p.anySays("un-lowered")) << "and the refusal must say why";
 }
 
 TEST(Aarch64GotAddr, ApplyFailsLoudLd64GotLo12) {
@@ -188,48 +210,8 @@ TEST(Aarch64GotAddr, ApplyFailsLoudLd64GotLo12) {
     // A base LDR word (0xF9400000); any symbol VA. The kernel must REFUSE.
     auto p = applyOneReloc(tgt, 0xF9400000u, 0x400000, 0, 0x400000, 0);
     EXPECT_FALSE(p.ok)
-        << "DSS must NOT apply an arm64 GOT-lo12 reloc — it is foreign-linked.";
-}
-
-// D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
-// GOT-slot-relative reference. `symbolVa` holds the SYMBOL's address; the
-// relocation names the SLOT that holds it, so the kernel reads a SECOND map —
-// `gotSlotVa`, which the walker fills while it lays the `.got` out.
-//
-// ⚠ THE TWO MAPS ARE A MEASUREMENT. ✔MEASURED on the real glibc `exit.o`
-// (`/usr/lib/x86_64-linux-gnu/libc.a`), `__call_tls_dtors` is the target of a
-// GOTPCREL at `.rela.text` 0x1b AND of a PLT32 at 0x294 — one symbol needing
-// its slot's address at one site and its own address at another, which a single
-// map cannot express.
-//
-// The pair below is the whole contract: WITH a slot the reference resolves
-// through it; WITHOUT one it REFUSES rather than falling back to `symbolVa`,
-// because writing `S + A − P` would emit a DIRECT reference where an INDIRECT
-// one was meant. Every plain-GOTPCREL site in that member is
-// `cmpq $0x0,sym@GOTPCREL(%rip)` — a weak-undefined NULL check — so the
-// fabricated value would be the reference site's own address, never zero, and
-// the branch would take the wrong arm forever.
-TEST(X86_64GotPcRel, ResolvesThroughTheSlotTheImageMinted) {
-    auto tgt = loadOneRelocTarget("x86_64_gotpcrel");
-    ASSERT_NE(tgt, nullptr);
-    auto const* tri = tgt->relocationInfo(RelocationKind{1});
-    ASSERT_NE(tri, nullptr);
-    EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
-    // Patch site at VA 0x400000; the slot at 0x404020; the addend a real
-    // `cmpq $0x0,sym@GOTPCREL(%rip)` site carries. value = slot + A - P.
-    constexpr std::uint64_t kSlot = 0x404020;
-    constexpr std::uint64_t kSite = 0x400000;
-    auto p = applyOneReloc(tgt, 0u, /*symbolVa=*/0x401234, -5, kSite, 0, kSlot);
-    ASSERT_TRUE(p.ok)
-        << "a GOT-slot-relative reference must RESOLVE once the image mints the "
-           "slot it names";
-    auto const written = static_cast<std::int32_t>(readInst(p.text, 0));
-    EXPECT_EQ(written, static_cast<std::int32_t>(
-                           static_cast<std::int64_t>(kSlot) - 5
-                           - static_cast<std::int64_t>(kSite)))
-        << "the displacement must reach the SLOT, not the symbol — a value "
-           "computed from symbolVa (0x401234) would load from the object "
-           "itself and the `cmpq $0x0` idiom would compare the wrong bytes";
+        << "an un-lowered arm64 GOT-lo12 reloc must be refused";
+    EXPECT_TRUE(p.anySays("un-lowered")) << "and the refusal must say why";
 }
 
 TEST(X86_64GotPcRel, ApplyFailsLoudRatherThanFabricatingADirectReference) {
@@ -238,11 +220,13 @@ TEST(X86_64GotPcRel, ApplyFailsLoudRatherThanFabricatingADirectReference) {
     auto const* tri = tgt->relocationInfo(RelocationKind{1});
     ASSERT_NE(tri, nullptr);
     EXPECT_EQ(tri->formulaKind, RelocFormulaKind::X86_64GotPcRel);
-    // No slot map — the state every walker that mints no GOT is in.
+    // An un-lowered GOTPCREL: the state of a module a writer is handed
+    // without `linker::link`.
     auto p = applyOneReloc(tgt, 0u, 0x400000, -5, 0x400000, 0);
     EXPECT_FALSE(p.ok)
         << "DSS must NOT fabricate a direct pc-relative displacement for a "
-           "GOT-slot-relative reference it has no slot for.";
+           "GOT-slot-relative reference.";
+    EXPECT_TRUE(p.anySays("un-lowered")) << "and the refusal must say why";
     // Non-vacuous CONTROL: the SAME module + the SAME addend under a Linear
     // 32-bit pc-relative row is applied happily. So the refusal is a property
     // of the FORMULA KIND, not of the fixture (an empty text buffer, a missing
@@ -275,15 +259,24 @@ TEST(Aarch64GotAddr, NonLinearDefaultsAndRejectsPcRelative) {
     EXPECT_EQ(tri->widthBytes, 4);
     EXPECT_FALSE(tri->pcRelative);
 
+    // The twin is declared so that `pcRelative` is the ONLY thing wrong with
+    // this row (a GOT row naming no twin is refused on its own, since P68
+    // round 11 — that must not be what turns this pin red).
     auto bad = TargetSchema::loadFromText(R"({
       "dssTargetVersion": 1,
       "target": {"name":"bad"},
       "relocations":[
-        { "name": "x", "kind": 1, "formula": "aarch64_adr_got_page", "pcRelative": true }
+        { "name": "x", "kind": 1, "formula": "aarch64_adr_got_page", "pcRelative": true, "gotSlotTwin": "t" },
+        { "name": "t", "kind": 2, "formula": "aarch64_adr_prel_pg_hi21" }
       ],
       "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
     })");
-    EXPECT_FALSE(bad.has_value());
+    ASSERT_FALSE(bad.has_value());
+    bool namesPcRelative = false;
+    for (auto const& d : bad.error()) {
+        if (d.message.find("pcRelative") != std::string::npos) namesPcRelative = true;
+    }
+    EXPECT_TRUE(namesPcRelative) << "refused for its pcRelative, not for anything else";
 }
 
 // ── JSON loader rejects bad formula discriminator ─────────────

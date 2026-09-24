@@ -1556,20 +1556,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   `SourceSpan` for a function, so it could only name the entry by symbol
     //   name — the weakest possible report of what is a plain declaration
     //   mistake with an obvious location.
-    //   ★ WHAT IT REFUSES, MEASURED 2026-08-10 on HEAD `3e86a187` (`build-dbg`):
-    //   `int main(int argc, char **argv, char **envp)` compiled **rc=0 with ZERO
-    //   diagnostics** on BOTH `pe64-x86_64-windows-exec` and
-    //   `elf64-x86_64-linux-exec`, and both images FAULT — observed `argc=3
-    //   argv=0x…7D10 envp=0x0000000000000004`, dereferencing envp gives
-    //   `0xC0000005` on pe and SIGSEGV (rc=139) on elf. gcc compiles the identical
-    //   source and it works. (The ORIGIN of the `0x4` is UNDETERMINED. An earlier
-    //   probe explained it as "the integer argc left in a leftover register"; that
-    //   is REFUTED — the measured run had argc=3 with envp still 0x4. Do NOT put a
-    //   mechanism claim into this diagnostic's text.)
-    //   ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY. A 3-parameter `main` is refused
-    //   on a relocatable `.o` too, because no format realizes it and no
-    //   translation unit can make it legal later — the check needs no target and
-    //   so runs wherever the declaration is seen. What IS format-dependent is
+    //   ★ THE MEASURED FAULT THAT CREATED IT (2026-08-10, HEAD `3e86a187`,
+    //   `build-dbg`): `int main(int argc, char **argv, char **envp)` compiled
+    //   **rc=0 with ZERO diagnostics** on BOTH `pe64-x86_64-windows-exec` and
+    //   `elf64-x86_64-linux-exec`, and both images FAULTED — observed `argc=3
+    //   argv=0x…7D10 envp=0x0000000000000004`, dereferencing envp gave
+    //   `0xC0000005` on pe and SIGSEGV (rc=139) on elf, while gcc compiled the
+    //   identical source and it worked. (The ORIGIN of the `0x4` is
+    //   UNDETERMINED; the "argc left in a leftover register" explanation is
+    //   REFUTED — that run had argc=3 with envp still 0x4. Do NOT put a mechanism
+    //   claim into this diagnostic's text.) That form is SUPPORTED now: the
+    //   language declares its row and every exec format realizes its verb
+    //   (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE), so what this code refuses is every
+    //   signature the language does NOT declare for an entry name —
+    //   `int main(int, char**, int)`, `void main()`.
+    //   ★ IT IS FORMAT-INDEPENDENT, DELIBERATELY. An undeclared signature is
+    //   refused on a relocatable `.o` too, because no format realizes a shape the
+    //   language does not declare and no translation unit can make it legal
+    //   later — the check needs no target and so runs wherever the declaration
+    //   is seen. What IS format-dependent is
     //   CANDIDACY ("does this format realize the verb this row needs"), and that
     //   deliberately lives at entry resolution instead: on ELF, `wmain` is not a
     //   candidate but it is NOT an error either — a program defining `main` and
@@ -5239,6 +5244,13 @@ enum class DiagnosticCode : std::uint16_t {
     //       one, -no-pie and -pie alike), which DSS does not make, and DSS binds
     //       library data through a GOT slot, so the reference would silently
     //       yield the SLOT's address.
+    //   Since P68 round 11 also (c), for a row whose kind WAS stated: the CODE
+    //   of a unit that does not read the import through a slot (every unit an
+    //   object reader produces — a pulled archive member, gcc's or DSS's own)
+    //   names a library DATUM through a non-GOT relocation (`R_X86_64_PC32
+    //   stdout`, gcc's default x86_64 PIE code). Same copy relocation, same
+    //   silent slot read before the arm existed (✔MEASURED 2026-09-24: exit 2
+    //   where gcc's link of the same archive exits 42).
     //   Always an Error, so it needs no row in the unsuppressable table.
     K_ImportReferenceUnbindable    = 0x802A,
     // K-NEXT-SLOT: 0x802B — grep this marker before adding a K_* code.

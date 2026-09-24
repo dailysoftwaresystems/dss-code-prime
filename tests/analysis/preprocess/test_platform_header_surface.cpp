@@ -2,6 +2,8 @@
 // header graph are the PLATFORM REFERENCES' — no more, no less. P68 round 9:
 // D-CONFIG-SYS-STAT-OVER-DECLARES-S-ISLNK-ON-PE (the coordinator's ruling (a)) and
 // the `<sys/stat.h>` family found incomplete while measuring it.
+// Also, at the end: <getopt.h> and <unistd.h>'s POSIX getopt subset on every real pair
+// (D-CONFIG-NO-SHIPPED-GETOPT-ON-ANY-FORMAT).
 //
 // ✔MEASURED 2026-09-23 with `#ifdef` + value probes per name, each reference
 // separately:
@@ -221,4 +223,86 @@ TEST(PlatformHeaderSurface, ThePeDirectAndDirentHeadersPullOnlyWhatTheReferences
         << "<direct.h> must not reach DIR (no Windows reference does)";
     EXPECT_NE(errorsOf(**targetR, **formatR, "#include <dirent.h>\nstatic DWORD w;\n"), "")
         << "<dirent.h> must not reach <windows.h> (mingw's does not; MSVC has none)";
+}
+
+// ── <getopt.h> AND <unistd.h>'s POSIX SUBSET, ON EVERY REAL PAIR ─────────────
+// P68 round 9, D-CONFIG-NO-SHIPPED-GETOPT-ON-ANY-FORMAT. ✔MEASURED 2026-09-23, one
+// TU per (header, name), by ADDRESS-OF, a `struct option` object or `#ifdef`:
+//   * <getopt.h> declares getopt, getopt_long, getopt_long_only, optarg, optind,
+//     opterr, optopt and `struct option` on glibc (gcc 13.3.0, clang 18.1.3, both
+//     arches), mingw-w64 13.2.0 and Darwin (Apple clang 21.0.0);
+//   * the three has_arg names are MACROS on glibc and Darwin, ENUM constants on
+//     mingw — so `#ifdef no_argument` is true on elf/macho and false on pe, while
+//     the VALUE (0/1/2) is the same everywhere;
+//   * `optreset` is Darwin's alone (mingw hides it behind `_BSD_SOURCE`, glibc has
+//     none);
+//   * <unistd.h> declares getopt and the four globals and NOT the long API (glibc
+//     in its default dialect, mingw, Darwin).
+// Each pair compiles every positive probe and refuses every negative one.
+namespace {
+
+[[nodiscard]] std::string getoptProbe(ObjectFormatKind f) {
+    bool const hasArgIsMacro = f != ObjectFormatKind::Pe;
+    bool const hasOptreset = f == ObjectFormatKind::MachO;
+    std::string s = "#include <getopt.h>\n";
+    for (std::string_view const fn : {"getopt", "getopt_long", "getopt_long_only"}) {
+        s += std::format("void *dss_fn_{0} = (void *)&{0};\n", fn);
+    }
+    for (std::string_view const obj : {"optarg", "optind", "opterr", "optopt"}) {
+        s += std::format("void *dss_obj_{0} = (void *)&{0};\n", obj);
+    }
+    s += "struct option dss_opt = {\"name\", required_argument, 0, 'n'};\n"
+         "_Static_assert(no_argument == 0 && required_argument == 1 && optional_argument == 2,"
+         " \"has_arg values\");\n";
+    s += hasArgIsMacro
+             ? "#if !defined(no_argument) || !defined(required_argument) || !defined(optional_argument)\n"
+               "#error \"the has_arg names are macros on this platform\"\n#endif\n"
+             : "#if defined(no_argument) || defined(required_argument) || defined(optional_argument)\n"
+               "#error \"the has_arg names are enum constants on this platform, not macros\"\n#endif\n";
+    if (hasOptreset) s += "void *dss_obj_optreset = (void *)&optreset;\n";
+    s += "int dss_getopt_probe;\n";
+    return s;
+}
+
+} // namespace
+
+TEST(PlatformHeaderSurface, GetoptIsThePlatformsSurface) {
+    ASSERT_NE(cLanguage(), nullptr);
+    std::size_t pairs = 0;
+    for (std::string const& targetName : shippedNames("targets", ".target.json")) {
+        auto targetR = TargetSchema::loadShipped(targetName);
+        ASSERT_TRUE(targetR.has_value()) << targetName;
+        for (std::string const& formatName : shippedNames("object-formats", ".format.json")) {
+            auto formatR = ObjectFormatSchema::loadShipped(formatName);
+            ASSERT_TRUE(formatR.has_value()) << formatName;
+            if ((*formatR)->targetArch() != (*targetR)->name()) continue;
+            ObjectFormatKind const k = (*formatR)->kind();
+            if (k != ObjectFormatKind::Elf && k != ObjectFormatKind::MachO
+                && k != ObjectFormatKind::Pe) {
+                continue;
+            }
+            SCOPED_TRACE(targetName + ":" + formatName);
+            ++pairs;
+            // The whole surface, positively.
+            EXPECT_EQ(errorsOf(**targetR, **formatR, getoptProbe(k)), "");
+            // `optreset` where no platform reference declares it: refused.
+            if (k != ObjectFormatKind::MachO) {
+                EXPECT_NE(errorsOf(**targetR, **formatR,
+                                   "#include <getopt.h>\nvoid *p = (void *)&optreset;\n"),
+                          "")
+                    << "optreset is Darwin's alone";
+            }
+            // <unistd.h>: the POSIX subset, and NOT the long API.
+            EXPECT_EQ(errorsOf(**targetR, **formatR,
+                               "#include <unistd.h>\nvoid *a = (void *)&getopt;\n"
+                               "void *b = (void *)&optarg;\nvoid *c = (void *)&optind;\n"
+                               "void *d = (void *)&opterr;\nvoid *e = (void *)&optopt;\n"),
+                      "");
+            EXPECT_NE(errorsOf(**targetR, **formatR,
+                               "#include <unistd.h>\nvoid *a = (void *)&getopt_long;\n"),
+                      "")
+                << "<unistd.h> declares the POSIX getopt only, not the GNU long API";
+        }
+    }
+    EXPECT_GE(pairs, 22u) << "the real-pair enumeration collapsed";
 }

@@ -197,6 +197,13 @@
       "kind": 8,
       "nativeId": 2,
       "emitOnly": true
+    },
+    {
+      "$comment": "P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS): `pcrel32`, what a lowered GOT-slot-relative reference becomes — see the exec sibling's row (hand-sync).",
+      "name": "R_X86_64_PC32_UNBIASED",
+      "kind": 5,
+      "nativeId": 2,
+      "emitOnly": true
     }
   ]
 }

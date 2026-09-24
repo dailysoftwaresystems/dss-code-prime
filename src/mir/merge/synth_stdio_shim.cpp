@@ -339,9 +339,25 @@ bool synthesizeStdioShim(
     // Open a shim function + its ENTRY block. Every printf-family recipe is single-block
     // except `snprintf`, whose return clamp adds a two-block tail (created in-arm, exactly
     // as `synthesizeThreadsShim`'s `thrd_join` does).
+    //
+    // ★★ THE LINKAGE IS THE SYNTHESIS-ONCE RULE — a synthesized library body exists ONCE
+    // per linked image, however many separately compiled units carry it (P68 round 11,
+    // D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT). Every CU that references
+    // the family gets its own copy of the body — a program CU, a DSS static library's
+    // member, a shipped runtime unit (a nested single-member archive: getopt.c prints
+    // through fprintf) — and each used to be a STRONG definition, so linking two of them
+    // was K_SymbolRedefinedAcrossUnits for all six names (✔MEASURED: a program with
+    // <getopt.h> + <stdio.h>, and a DSS static library calling printf linked into a program
+    // calling printf). `Weak` is DSS's "several translation units may define this; the
+    // linker keeps one" (symbol_attrs.hpp): ELF STB_WEAK, Mach-O N_WEAK_DEF, COFF COMDAT
+    // IMAGE_COMDAT_SELECT_ANY with associative .pdata/.xdata, collapsed by the linker's
+    // all-weak arm. `Hidden` keeps the body INTERNAL to its image, as the UCRT's own header
+    // inline is: never in a DLL's export table (✔MEASURED before: a DSS DLL calling the
+    // family exported all six), never preemptible, and not a DCE root — the body lives
+    // exactly as long as something in its module references it.
     auto begin = [&](SymbolId sym, TypeId fnSig) {
-        (void)builder.addFunction(fnSig, sym, SymbolBinding::Global,
-                                  SymbolVisibility::Default);
+        (void)builder.addFunction(fnSig, sym, SymbolBinding::Weak,
+                                  SymbolVisibility::Hidden);
         MirBlockId const entry = builder.createBlock(StructCfMarker::EntryBlock);
         builder.beginBlock(entry);
     };

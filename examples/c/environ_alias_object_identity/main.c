@@ -97,12 +97,15 @@
      * Repoint the shipped `.so` at the PREFIXED spelling and (a) reds at
        exit 13 — the witness refuses to certify itself.
      * Delete the shipped `.so` and (a) reds at exit 10 rather than skipping.
-     * Un-ship the `__environ` row or the `environ` macro in unistd.json →
-       honest S0001 at compile time.
-   elf-ONLY on purpose: no Windows CRT exports a spelling ucrtbase can bind
-   (✔MEASURED: ucrtbase has none of the three; msvcrt only `_environ`), and
-   the macho export is unmeasured, so both stay fail-loud S0001 per this
-   directory's need-driven staging rule.
+     * Un-ship the `environ` row in unistd.json → S_UndeclaredIdentifier
+       `environ` at compile time (MEASURED 2026-09-24, both arches, debug and
+       release).
+   elf-ONLY on purpose: the witness is a gcc-built ELF `.so` loaded into the
+   exec, so its subject is ELF's alias set. pe realizes `environ` as
+   <stdlib.h>'s macro onto the UCRT accessor (✔MEASURED: no Windows CRT
+   exports a data spelling ucrtbase can bind — ucrtbase has none of the three,
+   msvcrt only `_environ`), and Mach-O binds libSystem's one `_environ`; both
+   are witnessed by examples/c/environ_declared_by_the_program.
    ════════════════════════════════════════════════════════════════════════ */
 #include <dlfcn.h>
 #include <stdio.h>

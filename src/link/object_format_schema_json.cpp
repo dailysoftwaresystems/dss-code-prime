@@ -3100,23 +3100,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     // ── PER-ARM typo discriminator ──────────────────────
                     //
                     // Same rule as `processExit`: `mechanism` is the only key
-                    // both arms read, and the stack-vector arm's two offsets
-                    // are meaningless to the CRT arm (and its eight fields
-                    // meaningless to stack-vector). `ArgsMechanism` has
+                    // both arms read, and the stack-vector arm's layout fields
+                    // are meaningless to the CRT arm (and the CRT arm's export
+                    // names meaningless to stack-vector). `ArgsMechanism` has
                     // exactly three enumerators and `none` is refused above,
                     // so these two arms are exhaustive.
                     static constexpr std::array<std::string_view, 1>
                         kProcessArgsCommonKeys{"mechanism"};
-                    static constexpr std::array<std::string_view, 2>
+                    static constexpr std::array<std::string_view, 4>
                         kProcessArgsStackVectorKeys{"argcStackOffset",
-                                                    "argvStackOffset"};
-                    static constexpr std::array<std::string_view, 8>
+                                                    "argvStackOffset",
+                                                    "envpFollowsArgvTerminator",
+                                                    "vectorSlotBytes"};
+                    static constexpr std::array<std::string_view, 12>
                         kProcessArgsCrtKeys{"role", "configureNarrowArgvFn",
                                             "configureWideArgvFn",
                                             "argcAccessorFn",
                                             "narrowArgvAccessorFn",
                                             "wideArgvAccessorFn", "argvMode",
-                                            "argvUnavailableExitStatus"};
+                                            "argvUnavailableExitStatus",
+                                            "initializeNarrowEnvironmentFn",
+                                            "narrowEnvironmentAccessorFn",
+                                            "initializeWideEnvironmentFn",
+                                            "wideEnvironmentAccessorFn"};
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCommonKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsStackVectorKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCrtKeys);
@@ -3189,6 +3195,58 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         }
                         if (!requireOffset("argvStackOffset",
                                            out.argvStackOffset)) {
+                            armOk = false;
+                        }
+                        // D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: where the
+                        // environment vector sits in the same layout. OPTIONAL
+                        // here (only a format realizing an environment verb
+                        // declares it — `validate()` holds the two together),
+                        // but WHOLE when present: a vector position with no
+                        // slot width, or a width for no vector, is refused.
+                        bool const hasEnvpKey =
+                            pa.contains("envpFollowsArgvTerminator");
+                        bool const hasSlotKey = pa.contains("vectorSlotBytes");
+                        if (hasEnvpKey
+                         && !pa.at("envpFollowsArgvTerminator").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processArgs/envpFollowsArgvTerminator",
+                                      "'envpFollowsArgvTerminator' must be a "
+                                      "boolean (the environment vector starts one "
+                                      "slot past argv's NULL terminator)");
+                            armOk = false;
+                        } else if (hasEnvpKey) {
+                            out.envpFollowsArgvTerminator =
+                                pa.at("envpFollowsArgvTerminator").get<bool>();
+                        }
+                        if (hasSlotKey) {
+                            auto const& slot = pa.at("vectorSlotBytes");
+                            if (!slot.is_number_unsigned()
+                             || slot.get<std::uint64_t>() == 0
+                             || slot.get<std::uint64_t>() > 64) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/processArgs/vectorSlotBytes",
+                                          "'vectorSlotBytes' must be an unsigned "
+                                          "slot width in bytes, 1..64 (the width "
+                                          "of one entry-stack vector slot)");
+                                armOk = false;
+                            } else {
+                                out.vectorSlotBytes = static_cast<std::uint32_t>(
+                                    slot.get<std::uint64_t>());
+                            }
+                        }
+                        if (armOk
+                         && out.envpFollowsArgvTerminator != hasSlotKey) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processArgs",
+                                      out.envpFollowsArgvTerminator
+                                          ? "'envpFollowsArgvTerminator' is true "
+                                            "but 'vectorSlotBytes' is absent — "
+                                            "the environment vector's position "
+                                            "needs the slot width to be computed"
+                                          : "'vectorSlotBytes' is declared but "
+                                            "'envpFollowsArgvTerminator' is not "
+                                            "true — a slot width for no "
+                                            "environment vector is dead config");
                             armOk = false;
                         }
                     } else {
@@ -3322,6 +3380,45 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                         static_cast<std::int32_t>(v);
                                 }
                             }
+                            // D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the ENVIRONMENT
+                            // pair per width — OPTIONAL here (only a format
+                            // realizing that width's environment verb declares
+                            // it; `validate()` holds verbs and pairs together),
+                            // but a PAIR: an initialize call with no accessor, or
+                            // an accessor with no initialize call, is refused.
+                            auto optionalPair =
+                                [&](char const* initField, std::string& initDst,
+                                    char const* accField, std::string& accDst) {
+                                    bool const hasInit = pa.contains(initField);
+                                    bool const hasAcc  = pa.contains(accField);
+                                    if (hasInit && !requireStr(initField, initDst)) {
+                                        armOk = false;
+                                    }
+                                    if (hasAcc && !requireStr(accField, accDst)) {
+                                        armOk = false;
+                                    }
+                                    if (hasInit != hasAcc) {
+                                        coll.emit(
+                                            DiagnosticCode::C_MalformedJson,
+                                            std::string{"/processArgs/"}
+                                                + (hasInit ? accField : initField),
+                                            std::format(
+                                                "'{}' and '{}' are a PAIR (the "
+                                                "initialize call, then the "
+                                                "accessor whose result is the "
+                                                "vector) — declare both or "
+                                                "neither", initField, accField));
+                                        armOk = false;
+                                    }
+                                };
+                            optionalPair("initializeNarrowEnvironmentFn",
+                                         out.initializeNarrowEnvironmentFn,
+                                         "narrowEnvironmentAccessorFn",
+                                         out.narrowEnvironmentAccessorFn);
+                            optionalPair("initializeWideEnvironmentFn",
+                                         out.initializeWideEnvironmentFn,
+                                         "wideEnvironmentAccessorFn",
+                                         out.wideEnvironmentAccessorFn);
                         } else {
                             // Closed-enum discipline: a new ArgsMechanism member
                             // must add its own field-set arm HERE. Falling through

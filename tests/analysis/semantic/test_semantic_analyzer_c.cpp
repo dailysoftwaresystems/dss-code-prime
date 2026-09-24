@@ -14591,13 +14591,19 @@ TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
 }
 
 // VLA C4c (D-CSUBSET-VLA, audit IMPORTANT 3): a multi-dim VLA parameter whose INNER dim
-// carries a lenient `static` (`int a[n][static m]`) must locate the REAL inner bound `m` (the
-// shared bound-locator skips the `static`), never mis-size or spuriously reject. The inner
-// `static` is leniently accepted on a parameter (both dims carry paramDecay=true, so the gate
-// does not fire), and `m` still types the inner dimension. RED-ON-DISABLE: a mis-located bound
-// (reading `static` instead of `m`) would query the wrong node's type -> a spurious
-// S_VlaSizeNotInteger.
-TEST(SemanticAnalyzerC, MultiDimParamInnerStaticSizesCorrectly) {
+// carries a `static` (`int a[n][static m]`) must still locate the REAL inner bound `m` (the
+// shared bound-locator skips the `static`) — never a spurious S_VlaSizeNotInteger from reading
+// the keyword as the bound. RED-ON-DISABLE: a mis-located bound (reading `static` instead of
+// `m`) would query the wrong node's type -> a spurious S_VlaSizeNotInteger.
+// ★ P68 round 10 (lane `cs`): the inner `static` is REFUSED now, and this pin used to assert
+// the opposite. C 6.7.6.2p1 allows the keyword "only in the outermost array type derivation";
+// gcc 13.3.0 ("static or type qualifiers in non-parameter array declarator"), clang 18.1.3
+// ("'static' used in non-outermost array type derivation") and mingw-w64 13.2.0 refuse this
+// spelling, its definition twin and a fixed-dimension `int a[2][static 3]` in every mode, and
+// all three accept `int a[static n][m]` (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/bvs`).
+// The refusal is exactly ONE S_ArrayParamQualifierNonParameter, with the bound locator's point
+// kept beside it; the legal outermost spelling analyzes clean.
+TEST(SemanticAnalyzerC, MultiDimParamInnerStaticIsRefusedWithItsBoundLocated) {
     auto model = analyzeShipped("c", {
         "int f(int n, int m, int a[n][static m]);\n"
         "int main(void) { return 0; }\n",
@@ -14607,12 +14613,15 @@ TEST(SemanticAnalyzerC, MultiDimParamInnerStaticSizesCorrectly) {
         << "the inner `[static m]` bound must resolve to `m` (integer), never the `static` "
            "token -> no spurious S_VlaSizeNotInteger";
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
-        << "a lenient inner `[static m]` on a PARAMETER (paramDecay=true both dims) must NOT "
-           "trip the non-parameter gate";
-    EXPECT_FALSE(model.hasErrors())
-        << "`int a[n][static m]` (a multi-dim VLA param with a lenient inner `static`) "
-           "analyzes clean — the decoration is skipped, `m` sizes the inner dim";
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 1u)
+        << "a `static` in a parameter's INNER bracket is refused once (C 6.7.6.2p1: the "
+           "outermost array type derivation only)";
+    auto outer = analyzeShipped("c", {
+        "int f(int n, int m, int a[static n][m]);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_FALSE(outer.hasErrors())
+        << "`int a[static n][m]` — the `static` on the OUTERMOST bracket — analyzes clean";
 }
 
 // D-CSUBSET-VLA-PTR-INIT-FORM-TYPING — ✅ CLOSED IN P34, AND THE DEFERRAL'S OWN

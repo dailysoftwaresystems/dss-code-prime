@@ -9183,7 +9183,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 23>
+                    static constexpr std::array<std::string_view, 24>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -9200,6 +9200,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // VLA C4c (D-CSUBSET-VLA): the OPTIONAL array-parameter
                             // decoration token-kind set (static / cv-qualifiers / `*`).
                             "arraySuffixModifierTokens",
+                            // P68 round 10: the OPTIONAL subset C 6.7.6.2p1 allows only on a
+                            // parameter's OUTERMOST array derivation.
+                            "arraySuffixOutermostOnlyTokens",
                             // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL
                             // struct/union member-declarator + member-list roles.
                             "memberDeclaratorRule", "memberListRule",
@@ -9531,6 +9534,55 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 dc.arraySuffixModifierTokens.push_back(
                                     data.schemaTokens->find(nm));
                                 dc.arraySuffixModifierTokenNames.push_back(nm);
+                            }
+                        }
+                    }
+                    // P68 round 10 (lane `cs`): the OPTIONAL decorations C 6.7.6.2p1 allows
+                    // only on a parameter's OUTERMOST array derivation. Known token-kind
+                    // names, and each ALSO an `arraySuffixModifierTokens` entry — a
+                    // decoration the bound locator did not skip would be read as the bound.
+                    if (dj.contains("arraySuffixOutermostOnlyTokens")) {
+                        json const& ot = dj.at("arraySuffixOutermostOnlyTokens");
+                        std::string const oPath = dPath + "/arraySuffixOutermostOnlyTokens";
+                        if (!ot.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, oPath,
+                                      "'declarators.arraySuffixOutermostOnlyTokens' must be "
+                                      "an array of token-kind name strings");
+                            dOk = false;
+                        } else {
+                            for (auto const& el : ot) {
+                                if (!el.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, oPath,
+                                              "each 'arraySuffixOutermostOnlyTokens' entry "
+                                              "must be a token-kind name string");
+                                    dOk = false;
+                                    continue;
+                                }
+                                auto const nm = el.get<std::string>();
+                                if (!data.schemaTokens->contains(nm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken, oPath,
+                                              std::format("'declarators."
+                                                          "arraySuffixOutermostOnlyTokens' "
+                                                          "references unknown token kind "
+                                                          "'{}'", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                if (std::find(dc.arraySuffixModifierTokenNames.begin(),
+                                              dc.arraySuffixModifierTokenNames.end(), nm)
+                                    == dc.arraySuffixModifierTokenNames.end()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, oPath,
+                                              std::format("'declarators."
+                                                          "arraySuffixOutermostOnlyTokens' names "
+                                                          "'{}', which 'arraySuffixModifierTokens' "
+                                                          "does not — the bound locator would read "
+                                                          "that decoration as the bound", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                dc.arraySuffixOutermostOnlyTokens.push_back(
+                                    data.schemaTokens->find(nm));
+                                dc.arraySuffixOutermostOnlyTokenNames.push_back(nm);
                             }
                         }
                     }
@@ -11084,11 +11136,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             continue;
                                         }
                                         row.verb = *vb;
-                                        // ★★ VERB ⟺ SIGNATURE COHERENCE. Stated as a
-                                        // table of the (verb → the param shapes that
-                                        // verb's emitter actually materializes) pairs,
-                                        // so a NEW verb has to add a row here instead
-                                        // of inheriting a permissive default.
+                                        // ★★ VERB ⟺ SIGNATURE COHERENCE, read off the
+                                        // ONE (verb → the param shapes that verb's
+                                        // emitter actually materializes) table,
+                                        // `entryVerbParams` in entry_shape.hpp — the
+                                        // table the synthesized inits and the entry
+                                        // trampoline read too, so a NEW verb adds its
+                                        // row there (its switch has no `default:`)
+                                        // instead of inheriting a permissive default.
                                         //
                                         // ⓘ THIS RULE MIGRATED HERE FROM THE FORMAT
                                         // LOADER, where it could not survive: the
@@ -11107,18 +11162,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         // UNINITIALIZED registers — the measured
                                         // `argc=846361312` class. Neither is the
                                         // "harmless" one.
-                                        std::vector<EntryParamShape> want;
-                                        switch (row.verb) {
-                                        case EntryMaterialization::None:      break;
-                                        case EntryMaterialization::ArgcArgv:
-                                            want = {EntryParamShape::I32,
-                                                    EntryParamShape::PtrPtrChar};
-                                            break;
-                                        case EntryMaterialization::ArgcWargv:
-                                            want = {EntryParamShape::I32,
-                                                    EntryParamShape::PtrPtrU16};
-                                            break;
-                                        }
+                                        auto const wantShapes = entryVerbParams(row.verb);
+                                        std::vector<EntryParamShape> const want(
+                                            wantShapes.begin(), wantShapes.end());
                                         if (row.params != want) {
                                             std::string wantText;
                                             for (auto const w : want) {
@@ -12746,8 +12792,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // ── FC4 c1: parameters (parameter-list conventions) ────────
             // `soleVoidMeansEmpty` (C 6.7.6.3p10): a `(void)` list means
-            // zero params at the engine's param-harvest chokepoint. Closed
-            // keys; non-bool value fails loud.
+            // zero params at the engine's param-harvest chokepoint.
+            // `unqualifiedParameterTypes` (C 6.7.6.3p15, P68 round 10): a
+            // function type takes each parameter's unqualified type. Closed
+            // keys; a non-bool value fails loud.
             if (sem.contains("parameters")) {
                 json const& pj = sem.at("parameters");
                 if (!pj.is_object()) {
@@ -12755,25 +12803,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "/semantics/parameters",
                               "'parameters' must be an object");
                 } else {
-                    // DERIVED FROM THE PARSE ARM below: the block reads exactly
-                    // one key today.
-                    static constexpr std::array<std::string_view, 1>
-                        kParametersKeys{"soleVoidMeansEmpty"};
+                    // DERIVED FROM THE PARSE ARMS below: the block reads exactly
+                    // these two keys.
+                    static constexpr std::array<std::string_view, 2>
+                        kParametersKeys{"soleVoidMeansEmpty", "unqualifiedParameterTypes"};
                     DSS_CHECK_KEY_VOCABULARY(kParametersKeys);
                     (void)checkKeysAgainst(
                         pj, kParametersKeys, "/semantics/parameters",
                         "the 'parameters' block",
                         DiagnosticCode::C_InvalidSemantics, coll);
-                    if (pj.contains("soleVoidMeansEmpty")) {
-                        if (!pj.at("soleVoidMeansEmpty").is_boolean()) {
+                    auto const readBool = [&](std::string_view key, bool& out) {
+                        std::string const k{key};
+                        if (!pj.contains(k)) return;
+                        if (!pj.at(k).is_boolean()) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      "/semantics/parameters/soleVoidMeansEmpty",
-                                      "'soleVoidMeansEmpty' must be a boolean");
-                        } else {
-                            cfg.parameters.soleVoidMeansEmpty =
-                                pj.at("soleVoidMeansEmpty").get<bool>();
+                                      "/semantics/parameters/" + k,
+                                      "'" + k + "' must be a boolean");
+                            return;
                         }
-                    }
+                        out = pj.at(k).get<bool>();
+                    };
+                    readBool("soleVoidMeansEmpty", cfg.parameters.soleVoidMeansEmpty);
+                    readBool("unqualifiedParameterTypes",
+                             cfg.parameters.unqualifiedParameterTypes);
                 }
             }
 
