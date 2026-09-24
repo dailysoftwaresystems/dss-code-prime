@@ -50,7 +50,21 @@ namespace dss {
 //               per pair by `mergePredefinedMacros`; a pair that does not
 //               realize the type leaves the macro UNDEFINED, as gcc leaves
 //               `__SIZEOF_INT128__` undefined where there is no `__int128`.
-enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter, TypeSize };
+//   TypeUnsigned -- DEFINED (as `1`) exactly where a TYPE is an UNSIGNED integer
+//               type on the build's (target, format) pair, and undefined
+//               everywhere else (clang's `__CHAR_UNSIGNED__`,
+//               `__WCHAR_UNSIGNED__`, `__WINT_UNSIGNED__`). The row names the
+//               TYPE, never a format list: the answer is the type's own
+//               signedness on the pair — plain `char` by the target's
+//               `charIsUnsigned`, an ABI typedef by the core the target
+//               declares for it — so the macro and the type cannot disagree
+//               (P68 round 9, D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX; the
+//               `__CHAR_UNSIGNED__` row this replaced was a hand-gated second
+//               notation of `charIsUnsigned` that only a test held together).
+//               LANGUAGE family only, for `TypeSize`'s reason; realized per
+//               pair by `mergePredefinedMacros`, which DROPS it where the type
+//               is signed or not realized.
+enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter, TypeSize, TypeUnsigned };
 
 // The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
 // (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
@@ -67,15 +81,24 @@ enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter, Type
 //
 // No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
 // so every value the engine can hold is enumerated below.
-inline constexpr EnumNameTable<PredefinedMacroKind, 7> kPredefinedMacroKindTable{{{
-    { PredefinedMacroKind::Line,     "line"      },
-    { PredefinedMacroKind::File,     "file"      },
-    { PredefinedMacroKind::Constant, "constant"  },
-    { PredefinedMacroKind::Date,     "date"      },
-    { PredefinedMacroKind::Time,     "time"      },
-    { PredefinedMacroKind::Counter,  "counter"   },
-    { PredefinedMacroKind::TypeSize, "type-size" },
+inline constexpr EnumNameTable<PredefinedMacroKind, 8> kPredefinedMacroKindTable{{{
+    { PredefinedMacroKind::Line,         "line"          },
+    { PredefinedMacroKind::File,         "file"          },
+    { PredefinedMacroKind::Constant,     "constant"      },
+    { PredefinedMacroKind::Date,         "date"          },
+    { PredefinedMacroKind::Time,         "time"          },
+    { PredefinedMacroKind::Counter,      "counter"       },
+    { PredefinedMacroKind::TypeSize,     "type-size"     },
+    { PredefinedMacroKind::TypeUnsigned, "type-unsigned" },
 }}};
+
+// The two kinds whose row names a TYPE (the `type` key) and whose value the
+// merge derives from that type on the build pair. One predicate, so the loader,
+// the language-load resolution and the merge cannot disagree on the set.
+[[nodiscard]] constexpr bool
+predefinedMacroKindNamesAType(PredefinedMacroKind k) noexcept {
+    return k == PredefinedMacroKind::TypeSize || k == PredefinedMacroKind::TypeUnsigned;
+}
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
 // spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
@@ -571,6 +594,11 @@ struct DSS_EXPORT PredefinedTypeFacts {
     LongDoubleFormat longDoubleFormat = LongDoubleFormat::None;
     // (typedef name, integer core on this pair). Order is the target's.
     std::vector<std::pair<std::string, TypeKind>> abiTypedefs;
+    // Plain `char`'s signedness on this pair — `TargetSchema::charIsUnsigned`
+    // for the format, the one owner of the fact (P68 round 9). Read by the
+    // `type-unsigned` kind alone: a plain-`char` core has no signedness of its
+    // own, so without the pair's answer it could only be guessed.
+    bool             charIsUnsigned   = false;
 };
 
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
@@ -630,10 +658,11 @@ struct DSS_EXPORT PredefinedMacroDef {
     PredefinedMacroRedefinition programRedefinition =
         PredefinedMacroRedefinition::WarnIsoMacro;
 
-    // `type-size` rows only: the TYPE whose size this macro states (see
+    // `type-size` and `type-unsigned` rows only (`predefinedMacroKindNamesAType`):
+    // the TYPE whose size — or whose signedness — this macro states (see
     // `PredefinedSizedType`). `source == None` on every other kind. The merge
-    // writes the realized size into `value` and keeps the kind, so the dump can
-    // still say the number was derived.
+    // writes the realized value into `value` (the size, or `1` for an unsigned
+    // type) and keeps the kind, so the dump can still say it was derived.
     PredefinedSizedType sizedType;
 
     // PROVENANCE — the JSON POINTER of this entry inside its declaring document
@@ -654,6 +683,17 @@ struct DSS_EXPORT PredefinedMacroDef {
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 predefinedTypeSize(PredefinedMacroDef const& row,
                    PredefinedTypeFacts const& facts) noexcept;
+
+// Whether a `type-unsigned` row's type is an UNSIGNED integer type on the pair
+// `facts` describes: `true`/`false`, or nullopt when the pair does not realize
+// the type (an ABI typedef the target does not declare) or the row is not
+// `type-unsigned`. Plain `char` answers `facts.charIsUnsigned`; `bool` is
+// unsigned (C 6.2.5p8). The core is chosen by the rule `predefinedTypeSize`
+// uses, from the one shared selection. `mergePredefinedMacros` calls it and
+// nothing else does.
+[[nodiscard]] DSS_EXPORT std::optional<bool>
+predefinedTypeIsUnsigned(PredefinedMacroDef const& row,
+                         PredefinedTypeFacts const& facts) noexcept;
 
 // FC15c (`__has_c_attribute` -- C23 6.10.1p4): one config-declared standard
 // attribute the language KNOWS, with the C23 `__STDC_VERSION__`-style version

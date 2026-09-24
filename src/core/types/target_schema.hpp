@@ -2564,6 +2564,19 @@ slotShapeFor(EncodingSlotKind s) noexcept {
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
 }
 
+// ★★ CAN A MEMORY-BASE FIELD OF THIS KIND ADDRESS RELATIVE TO THE PROGRAM
+// COUNTER? A fact about the slot kind — the format's own addressing forms —
+// never about a register or a target
+// (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The x86-64 ModR/M
+// memory field has such a form (mod 00, rm 101: `[rip + disp32]`, relative to
+// the NEXT instruction), and it is the only field any walker encodes that way;
+// `validate()` refuses a `pcRelativeMemoryBase` naming any other, so a target
+// cannot claim a form its walker would silently encode as an ordinary base.
+[[nodiscard]] constexpr bool
+slotKindAddressesPcRelative(EncodingSlotKind s) noexcept {
+    return s == EncodingSlotKind::ModRmRmMem;
+}
+
 [[nodiscard]] constexpr std::string_view
 encodingSlotKindName(EncodingSlotKind s) noexcept {
     return kEncodingSlotKindTable.name(s);
@@ -5071,6 +5084,34 @@ struct DSS_EXPORT TargetSchemaData {
     };
     std::vector<AsmValueCarriageRow> asmValueCarriage;
 
+    // ★★★ THE PROGRAM-COUNTER-RELATIVE MEMORY BASE — the `pcRelativeMemoryBase`
+    // root key (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    //
+    // gcc writes every global access as `movq sym(%rip), %rax`: a memory
+    // operand whose BASE is the instruction pointer. That register is not an
+    // operand anywhere else — gas refuses `movq %rip, %rax` — and it is not
+    // allocatable: allocation draws only from a calling convention's
+    // `kAllocatablePoolLists`, which name no program counter, so a `registers`
+    // row for it hands nothing to the allocator. What the row alone cannot say
+    // is where the register IS legal and what a symbolic displacement against it
+    // becomes, so this key says both, once:
+    //   * `register` — the row that is the program counter (it must carry a
+    //     non-default `encodingRole`, so every field naming no role refuses it);
+    //   * `memoryBaseSlots` — the memory-base FIELDS that accept it (each one a
+    //     kind whose walker encodes the PC-relative form —
+    //     `slotKindAddressesPcRelative`);
+    //   * `symbolicDisplacementRelocation` — the FORMAT-NEUTRAL relocation kind
+    //     a symbolic displacement against it takes (`msg(%rip)`); each object
+    //     format maps that kind to its own wire type.
+    // ⓘ Absent ⇒ this processor has no PC-relative memory base, and a program
+    // counter spelled as one is refused like any other register would be.
+    struct PcRelativeMemoryBase {
+        std::uint16_t                 registerOrdinal = 0;
+        std::vector<EncodingSlotKind> memoryBaseSlots;
+        RelocationKind                symbolicDisplacementRelocation{};
+    };
+    std::optional<PcRelativeMemoryBase> pcRelativeMemoryBase;
+
     // The CIE's `return_address_register` — the DWARF column an unwinder
     // reads to find where this frame's return address went.
     //
@@ -5671,6 +5712,30 @@ public:
             if (row.regClass == cls) return row.stagesThrough;
         }
         return std::nullopt;
+    }
+
+    // The program-counter-relative memory base this target declares
+    // (`pcRelativeMemoryBase`), or nullptr when it declares none.
+    [[nodiscard]] detail::TargetSchemaData::PcRelativeMemoryBase const*
+    pcRelativeMemoryBase() const noexcept {
+        return d_.pcRelativeMemoryBase.has_value() ? &*d_.pcRelativeMemoryBase
+                                                   : nullptr;
+    }
+
+    // ★ IS `ordinal` THE PROGRAM COUNTER, WRITTEN AS THE BASE OF A MEMORY FIELD
+    // OF KIND `slot` THAT ACCEPTS IT? The ONE predicate the election (which lets
+    // it past the field-role axis) and the encoder (which switches to the
+    // PC-relative form) both ask, so the two cannot disagree about where the
+    // register is legal.
+    [[nodiscard]] bool isPcRelativeMemoryBase(std::uint16_t    ordinal,
+                                              EncodingSlotKind slot) const noexcept {
+        if (!d_.pcRelativeMemoryBase.has_value()) return false;
+        auto const& pc = *d_.pcRelativeMemoryBase;
+        if (pc.registerOrdinal != ordinal) return false;
+        for (EncodingSlotKind const s : pc.memoryBaseSlots) {
+            if (s == slot) return true;
+        }
+        return false;
     }
 
     // The CIE's `return_address_register` (see the field's docblock in

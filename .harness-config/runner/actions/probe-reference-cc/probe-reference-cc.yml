@@ -1,0 +1,46 @@
+# PURPOSE: compile, and optionally run or dump, one probe with the reference compiler of the host a leg runs on, and keep the verdict, the diagnostics and the result redacted, so a reference is MEASURED on a host no session reaches directly.
+name: probe-reference-cc
+description: >-
+  Compiles ONE probe with the reference compiler of the host the leg runs on (a bare program name
+  found on that host's PATH, `cc` by default) and keeps what happened: the compiler's identity, the
+  compile's exit code and diagnostics, and, by mode, the program's output and exit code, the
+  assembly it wrote, a dump tool's reading of the object, or what the compiler printed. The probe's
+  source travels as base64 in `src_b64`, never as a file in the tree, because a synced file would
+  overwrite the ONE copy of the repository that host keeps, under whatever lane is using it. Built
+  2026-09-23 because a Mach-O row's reference, Apple's clang with the SDK's headers, exists only on
+  the Mac, and no runner could measure it there. A refused compile is a measurement: the step
+  succeeds whenever the probe ran, and the report carries the verdict. The program documents itself
+  in its own header; this file declares only how a runner starts it and what witnesses that it ran.
+  Bring the kept report back with `dssharness sync --legs <leg> --pull <its path>`.
+inputs:
+  src_b64:
+    description: "ONE probe's source text, base64 (standard or URL-safe alphabet, padding optional); this or batch_b64"
+    default: ''
+  batch_b64:
+    description: 'a BATCH: base64 of a UTF-8 JSON array of {name, src, ext?, cc?, flags?, mode?, dump?}, run in turn in ONE run; this or src_b64'
+    default: ''
+  ext:
+    description: 'the source file extension: c, s, S or cpp'
+    default: 'c'
+  cc:
+    description: "the compiler, a bare program name on the host's PATH (cc, gcc, clang, aarch64-linux-gnu-gcc ...)"
+    default: 'cc'
+  flags:
+    description: 'comma-separated compiler flags, each percent-decoded (a comma inside one flag is %2C); -o is refused'
+    default: ''
+  mode:
+    description: 'run (compile, link, run), link, object (-c, then dump), asm (-S) or stdout (-E, -dM,-E)'
+    default: 'run'
+  dump:
+    description: 'object mode only: a comma-separated argv of objdump, llvm-objdump, otool, nm, llvm-nm, readelf, llvm-readelf, size or llvm-size'
+    default: ''
+steps:
+  - name: probe
+    workingDirectoryRoot: action
+    # ★ EVERY OPTION IS SPELLED `--name=value`: a flag list, a URL-safe base64 source and a dump argv can each BEGIN
+    # with `-`, and argparse reads `--flags -std=c2x` as a second option (exit 2). ✔MEASURED 2026-09-23, first run.
+    run: |
+      python3 ./probe-reference-cc.py --tree="{treeDir}" --src-b64="{src_b64}" --batch-b64="{batch_b64}" --ext="{ext}" --cc="{cc}" --flags="{flags}" --mode="{mode}" --dump="{dump}" --out="{stepBuild}/probe-reference-cc.txt"
+    outputs: [probe-reference-cc.txt]
+    persist: true
+    successPattern: 'probe-reference-cc: OK '

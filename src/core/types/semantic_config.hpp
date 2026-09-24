@@ -1032,6 +1032,17 @@ struct DSS_EXPORT DeclarationRule {
     // engine never names a keyword). `nullopt` ⇒ no presence gate (a language
     // whose inference form is structurally unambiguous).
     std::optional<SchemaTokenId> requiredSpecifierToken;
+    // ⚠ P68 round 9 (lane `cs`): `constMarker` AND `restrictMarker` BELOW ARE
+    // DERIVED, NEVER READ FROM THE ROW. The loader copies
+    // `SemanticConfig::{const,restrict}Marker` into every TYPED row (declarator
+    // mode, or a `type` child) and leaves every other row without them; a row
+    // that still spells `constMarker` / `restrictMarker` / `volatileMarker` is
+    // refused at load. They stay per-row fields because "does THIS row declare
+    // something a qualifier qualifies" is a per-row fact — the TOKEN is the
+    // language's, declared once. The per-row `volatileMarker` this struct used to
+    // carry is GONE: no code read it (a declaration's volatility is read off its
+    // TYPE, the resolver's `VolatileQual`, driven by `semantics.volatileMarker`).
+    //
     // SE4 const-correctness: a token kind that, when found anywhere in the
     // `typeChild` subtree (or the whole declaration subtree when no
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the
@@ -1058,19 +1069,6 @@ struct DSS_EXPORT DeclarationRule {
     // "unrestricted", which would refuse the legal `int f(char *restrict *);`
     // against a descriptor that simply cannot spell it.
     std::optional<SchemaTokenId> restrictMarker;
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a token kind that, when found in the
-    // `typeChild` subtree (or the whole declaration subtree when no `typeChild`),
-    // marks the minted symbol VOLATILE — mirrors `constMarker` exactly (an
-    // independent scan, so `const volatile` sets BOTH bits). Read at HIR-access
-    // lowering to thread `MirInstFlags::Volatile` onto the symbol's Load/Store so
-    // the optimizer (DCE/CSE/Mem2Reg/LICM, all already Volatile-aware) cannot
-    // elide or reorder a volatile access. `nullopt` ⇒ the language has no volatile
-    // marker for this declaration form. c27 (D-CSUBSET-VOLATILE-POINTEE): this
-    // token ALSO drives the resolver's VolatileQual construction — a head volatile
-    // wraps the base (`volatile int *` => Ptr<VolatileQual(int)>) and an east
-    // ptrQualifier volatile wraps the pointer; the former pointee-volatile reject is
-    // retired (volatile is now a type qualifier). Config-driven, no hardcoded keyword.
-    std::optional<SchemaTokenId> volatileMarker;
     // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): a token kind that, when
     // found anywhere in this declaration's params subtree (the subtree
     // rooted at the `paramsChild` visible child), marks the declared
@@ -3245,6 +3243,11 @@ struct DSS_EXPORT SemanticConfig {
     // the language has no predefined function-name surface (the bind never
     // runs — toy/tsql). Source-AGNOSTIC: WHICH spellings are per-language
     // config; the engine never hardcodes "__func__".
+    // P68 round 9 (lane `cs`): the same spellings also bind ONE file-scope twin
+    // each in the language's builtin scope — text "" (gcc's and clang's meaning
+    // outside a function body), each use warning
+    // S_PredefinedIdentifierOutsideFunction — and seed the parser's binder sketch
+    // as VALUES, so `sizeof ( __func__ )` takes the expression reading.
     std::vector<std::string>     predefinedFunctionNameIdentifiers;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // semantics table (see AttributeSemanticsRow). `attrSpecRule`/`stdAttrRule`
@@ -3524,6 +3527,17 @@ struct DSS_EXPORT SemanticConfig {
     // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
     // engine reads THIS, never a hardcoded token name.
     std::optional<SchemaTokenId>    atomicMarker;
+    // P68 round 9 (lane `cs`): the language's `const`- and `restrict`-class qualifier
+    // tokens (c: `ConstKeyword`, `RestrictKeyword`). NEITHER IS INTERNED, so both ride
+    // the qualifier spine beside a TypeId — a declaration's (the declarator walk, which
+    // reads them through each declarator-mode row's DERIVED `constMarker` /
+    // `restrictMarker`), a type NAME's and an expression's (`_Generic` matching). With
+    // `volatileMarker` / `atomicMarker` above these are the language's WHOLE qualifier
+    // vocabulary, declared ONCE here: a declaration row may no longer spell any of the
+    // three it used to (the loader refuses the key by name). nullopt ⇒ the language
+    // has no such qualifier, and no spine makes a claim about it.
+    std::optional<SchemaTokenId>    constMarker;
+    std::optional<SchemaTokenId>    restrictMarker;
     // ── RETIRED: `externLibraryByFormat` (UCRT-P4, Decision 1) ──────────────
     // A per-LANGUAGE map "object-format kind -> runtime library identity" that
     // supplied the import library for any source-declared extern carrying none of
@@ -3634,20 +3648,21 @@ struct DSS_EXPORT SemanticConfig {
     // ── TWO 2026-06-02 type-design notes, BOTH REFUTED BY MEASUREMENT ──
     // Each was recorded as a forward-looking anchor whose premise was the
     // SHAPE of this struct on the day it was written. ✔MEASURED 2026-09-16:
-    // this struct now carries SIX bools, not two, so neither premise holds
-    // and neither id ever became a registry row — spelling them here was a
-    // citation resolving to nothing. What survives is the design fact:
+    // this struct carried SIX bools then (SEVEN since P68 round 9), not two, so
+    // neither premise holds and neither id ever became a registry row — spelling
+    // them here was a citation resolving to nothing. What survives is the design
+    // fact:
     //   * PER-ELEMENT-TYPE PREDICATES ARE NOT FORECLOSED. The note claimed
     //     "today's two-bool shape forecloses" a rule like "only T* → void*
-    //     when T ∈ {char, byte}". The four flags added since (the two
-    //     null-pointer-constant arms, `allowVoidPtrFnConvert`,
-    //     `directCallIntPointeeCompat`) are the evidence that this block
+    //     when T ∈ {char, byte}". The flags added since (the two
+    //     null-pointer-constant arms, `allowVoidPtrFnConvert`, and the two
+    //     diagnosed-conversion classes) are the evidence that this block
     //     extends ADDITIVELY; a `PointerConversionPredicate` variant slot
     //     would land beside the bools exactly the same way, breaking
     //     nothing. Nothing is deferred and nothing is at risk.
     //   * `isAssignable` TAKING THIS BY CONST-REF IS NOW THE ONLY SENSIBLE
     //     FORM. The note weighed by-value against const-ref "for a 2-byte
-    //     POD"; at six bools, and with `isAssignable` carrying a dozen
+    //     POD"; at seven bools, and with `isAssignable` carrying a dozen
     //     further scalar parameters, by-value is not the simpler spelling
     //     it was argued to be. The question is settled, not deferred.
     struct PointerConversionRules {
@@ -3715,63 +3730,43 @@ struct DSS_EXPORT SemanticConfig {
         // pointer (`char*`, `int*`, `struct S*`) STAYS a loud reject regardless of
         // this flag.
         bool allowVoidPtrFnConvert = false;
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (was
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT, TF-C41): at a DIRECT
-        // bare-name call's ARGUMENT boundary ONLY, admit an integer pointer whose
-        // pointee has the SAME representation (size ∧ signedness ∧
-        // integer-base-kind, via TypeInterner::sameRepresentation) but a DISTINCT
-        // identity (the `_Generic`-splitting vocabulary NAME differs) — e.g.
-        // `long long*`/`sqlite3_int64*` into a `long*` parameter on LP64 — and
-        // report S_IncompatiblePointerIntegerPointee as a WARNING rather than
-        // silently accepting it.
+        // ★★★ P68 round 9 (lane `cs`),
+        // D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS:
+        // the two CLASSES of pointer conversion C lists as constraint violations and
+        // every pinned reference nevertheless builds WITH A DIAGNOSTIC. Each flag
+        // admits its class at every site of the constraint — initialization (a brace
+        // element included), assignment, argument, return, and the pairings of
+        // `==`/`!=`/relational and `?:` — as a WARNING, never silently, and keeps the
+        // value exactly as the explicit cast would (`--warnings-as-errors` restores
+        // the refusal, which is also GCC 14's default). Default FALSE = the pair stays
+        // refused; only c opts in. `diagnosedConversion` in
+        // `src/analysis/semantic/type_rules.hpp` is the ONE classifier both tiers ask,
+        // and `cst_to_hir.cpp::coerce` realizes exactly the classes it names.
         //
-        // ★ SCOPE WIDENED 2026-08-07 (TF-C135) FROM "shipped FFI descriptor callee"
-        // TO "any direct callee", BY MEASUREMENT, and the widening is the whole
-        // point of this note. TF-C41 gated the relaxation on
-        // `isShippedDescriptorFn` because the only known consumer was the tcl.json
-        // `ptr<i64>` parameter. That gate made the admission a property of WHERE THE
-        // DECLARATION CAME FROM rather than of WHAT THE TYPES ARE — and a real
-        // header hits the identical shape: on Darwin/LP64 `tcl.h` takes its
-        // `#ifdef __APPLE__ / #ifdef __LP64__` override, defines
-        // TCL_WIDE_INT_IS_LONG, and so declares `Tcl_WideInt` = `long`, while
-        // `sqlite3_int64` is `long long`. sqlite's own
-        // `ext/session/test_session.c`'s
-        // `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` therefore passes
-        // `long long*` to a `long*` parameter on macOS and NOWHERE ELSE. ✔MEASURED
-        // on Apple clang 21.0.0 against every macOS SDK on the operator's machine
-        // (8.5.9 headers, MacOSX13.3/14.4/15.4/26.5): rc=0, 0 errors, 1
-        // `-Wincompatible-pointer-types` WARNING. DSS's hard S0003 there was
-        // stricter than the platform toolchain and cost the ENTIRE mach-o unit
-        // corpus on every host — a compiler that cannot build what the platform's
-        // own compiler builds is not portable, whatever the standard permits.
-        //
-        // C 6.5.2.2p7 makes this a CONSTRAINT VIOLATION requiring *a* diagnostic;
-        // both an error and a warning conform, so this is a policy choice and it is
-        // recorded as one. DSS now takes gcc's and clang's: diagnose, do not refuse.
-        // `--warnings-as-errors` restores the strict posture for anyone who wants
-        // it, so the strict reading remains available without being the default.
-        // ★ NOT a silent admission — the warning is the diagnostic the standard
-        // requires, and silence here would be exactly the fail-loud violation this
-        // flag's own default guards against.
-        //
-        // Read by `isAssignable` (admit — the trailing
-        // `intPointeeSameRepresentationCompat` arg, passed true ONLY by
-        // `checkCallAgainstSig` at a DIRECT callee) and by `cst_to_hir.cpp::coerce`
-        // (realize — the node-mark-gated Ptr→Ptr bitcast), in lockstep. Default
-        // FALSE = strict; only c opts in. The boundary stays SCOPED:
-        // init/assign/return and the fn-pointer/indirect call paths ALL remain
-        // strict, and identity is NEVER merged (a compat admission, not a
-        // canonicalization — `_Generic(long:,long long:)` still distinguishes).
-        // Per-target by construction, with NO format branch: on LLP64/pe64 `long`
-        // is I32, so `long*` still REFUSES a `long long*`/`ptr<i64>` parameter on
-        // sameRepresentation's kind axis. ⚠ THE WIDENING HAS A MEASURED
-        // CONSEQUENCE ON LLP64 THAT THE OLD GATE HID: `int*` into
-        // `_InterlockedCompareExchange`'s `long*` was previously rejected because a
-        // BUILTIN is not a shipped descriptor; on pe64 both are I32, so it is now
-        // admitted-with-a-warning — which is what MSVC (C4133) and clang do.
-        // Sibling of `allowVoidPtrFnConvert` (the fn<->void* Option-B gate) — the
-        // same admit/realize-in-lockstep discipline.
-        bool directCallIntPointeeCompat = false;
+        // `incompatiblePointerConvertsDiagnosed`: a pointer from a pointer (an array or
+        // a function designator contributing its decayed pointer) whose pointed-to
+        // type is not compatible — object pointers of different types, an object
+        // pointer beside a function pointer, a function pointer of another signature.
+        // Two distinct integer pointees of ONE representation (`long *` from `long
+        // long *` on LP64, `long *` from `int *` on LLP64) report under their own
+        // narrower code, S_IncompatiblePointerIntegerPointee.
+        // ⓘ This RETIRES `directCallIntPointeeCompat` (TF-C41 / TF-C135), which
+        // admitted only that same-representation integer pair and only at a DIRECT
+        // call's argument, with a node mark the HIR realize had to consult. The
+        // measurement that widened it once already — the sqlite-on-Darwin
+        // `Tcl_GetWideIntFromObj(…, &iVal)` shape, a `-Wincompatible-pointer-types`
+        // WARNING under Apple clang 21.0.0 and a hard refusal here — was one instance
+        // of this whole class; the class is now decided by the types alone, at every
+        // site, and the old key is REFUSED by the loader rather than read.
+        bool incompatiblePointerConvertsDiagnosed = false;
+        // `integerPointerConvertsDiagnosed`: a pointer from an integer that is not a
+        // null pointer constant (`int *p = 5;`, `struct B *pv = anIntptr;`), and an
+        // integer from a pointer (`intptr_t v = p;`, `int n = p;`). C 6.3.2.3p5-p6
+        // makes both results implementation-defined — the value an explicit cast
+        // gives; gcc 13.3.0, mingw-w64 13.2.0 and MSVC 19.51 build them with a warning
+        // (clang 18.1.3 refuses by default), and the union owes what one reference
+        // builds. `bool` from a pointer is C's own conversion and is not this class.
+        bool integerPointerConvertsDiagnosed = false;
     };
     PointerConversionRules pointerConversions;
 

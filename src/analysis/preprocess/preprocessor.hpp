@@ -369,6 +369,12 @@ struct DSS_EXPORT MergedPredefinedMacros {
 //      conflict on every pair) and within the format filter, so the effective
 //      list stays in (c)'s order. The dump passes the same facts to its
 //      per-family calls, or its origin check would see the rows vanish.
+//  (g) P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): every
+//      `type-unsigned` entry is KEPT, with `value` `1`, exactly where its type
+//      is an unsigned integer type on the pair (`predefinedTypeIsUnsigned` —
+//      plain `char` by `typeFacts->charIsUnsigned`), and DROPPED where the type
+//      is signed, is not realized, or `typeFacts` is null — (f)'s rule, with
+//      the type's signedness in place of its size.
 [[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,

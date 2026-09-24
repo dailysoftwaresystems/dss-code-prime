@@ -10,14 +10,14 @@
         { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long\"" },
         { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" }
     ] },
-    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "type": "u16" }] }
+    { "name": "wchar_t", "abiTypedef": "wchar_t" }
   ],
   "constants": [
-    { "name": "NULL", "value": 0, "type": "i64" },
     { "name": "_WRITE_ABORT_MSG",  "variants": [{ "when": { "format": "pe" }, "value": 1, "type": "i32" }] },
     { "name": "_CALL_REPORTFAULT", "variants": [{ "when": { "format": "pe" }, "value": 2, "type": "i32" }] }
   ],
   "macros": [
+    { "name": "NULL", "replacement": "((void*)0)" },
     { "name": "atexit", "availableObjectFormats": ["elf", "pe"], "variants": [
       { "when": { "format": "elf" }, "params": ["f"], "replacement": "__cxa_atexit((void (*)(void *))(f), 0, 0)" },
       { "when": { "format": "pe" }, "replacement": "_crt_atexit" }

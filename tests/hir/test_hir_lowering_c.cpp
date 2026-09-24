@@ -128,10 +128,14 @@ namespace {
                    std::nullopt, LongDoubleFormat::None, fixtureTarget());
 }
 
-// As `analyzeC`, but under the PE object format — so `L'…'`/`L"…"` (wchar_t)
+// As `analyzeC`, but for the x86_64 × PE PAIR — so `L'…'`/`L"…"` (wchar_t)
 // resolves to the 2-byte Windows UTF-16 unit (U16), not the POSIX I32. Used to
-// witness the FORMAT-keyed wide-char constraint (an astral `L'😀'` is representable
-// under the default I32 but NOT under the pe U16).
+// witness the PAIR-keyed wide-char constraint (an astral `L'😀'` is representable
+// under the I32 of x86_64 × ELF but NOT under the U16 of x86_64 × PE).
+// ★ P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): `wchar_t` is a (processor ×
+// platform) fact read from the TARGET's `abiTypedefs` for the format, so the
+// fixture must name the target as well as the format — a format alone is no
+// pair, and a pair-less analysis takes the row's base core (I32).
 [[nodiscard]] SemanticModel analyzeCPe(std::string src) {
     // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
@@ -143,7 +147,8 @@ namespace {
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     return analyze(cu, DiagnosticBudget::libraryDefault(),
                    DataModel::Llp64, std::nullopt, std::nullopt,
-                   SelectableObjectFormatKind::of(ObjectFormatKind::Pe));
+                   SelectableObjectFormatKind::of(ObjectFormatKind::Pe),
+                   std::nullopt, LongDoubleFormat::None, fixtureTarget());
 }
 
 // Drive c → SemanticModel with the parser's expression-depth cap RAISED to
@@ -5377,12 +5382,12 @@ TEST(HirLoweringC, WideCharMultiCharAndEmptyFailLoud) {
     }
 }
 
-// SHOULD-FIX #6 — the DEFINITIVE per-format / agnostic witness. `L'😀'` (U+1F600)
-// is a wchar_t constant, and wchar_t is FORMAT-keyed: on pe it is the 16-bit UTF-16
-// unit (U16) → the astral cp is UNREPRESENTABLE → fail loud; on the POSIX default it
-// is I32 → the astral cp fits → lowers to value 0x1F600. ONE source, opposite
-// outcomes, decided purely by the config `elementCoreByFormat` map — no format
-// branch in shared substrate. Red-on-disable of the format-keying flips one arm.
+// SHOULD-FIX #6 — the DEFINITIVE per-pair / agnostic witness. `L'😀'` (U+1F600)
+// is a wchar_t constant, and wchar_t is PAIR-keyed (P68 round 9): for x86_64 × pe it
+// is the 16-bit UTF-16 unit (U16) → the astral cp is UNREPRESENTABLE → fail loud; for
+// x86_64 × elf it is I32 → the astral cp fits → lowers to value 0x1F600. ONE source,
+// opposite outcomes, decided purely by the target's `abiTypedefs` table — no format
+// branch in shared substrate. Red-on-disable of the pair-keying flips one arm.
 TEST(HirLoweringC, WideCharAstralIsFormatKeyed) {
     char const* src = "void f() { L'\xf0\x9f\x98\x80'; }";
     // PE (u16 wchar_t) → fail loud.
@@ -7199,21 +7204,30 @@ TEST(HirLoweringC, D5_4_UnionEmptyBrace) {
 }
 
 // Multi-element union brace-init MUST emit a diagnostic.
+// ★ P68 round 9 (lane `cs`): the diagnostic is now C's — the second element is
+// EXCESS once the first member is initialized (C 6.7.9p2), reported with the warning
+// gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 (-std=c2x) give and DROPPED, as every
+// other excess element is (✔MEASURED `.temp/probe/r9c` c29: they build and run 42;
+// MSVC 19.51 and c17-pedantic refuse). It was a refusal ("at most one variant") that
+// also refused the multi-element lists C DOES accept — `{40, 2}` over a union whose
+// first member is a two-int structure (brace elision) — see
+// D5_4_UnionListsArePlacedLikeAnyOtherList below.
 TEST(HirLoweringC, D5_4_UnionMultiElementEmitsDiag) {
     SemanticModel model = analyzeC(
         "union U { int i; char c; };\n"
         "void f() { union U u = { 1, 2 }; }\n");
-    if (model.hasErrors()) return;
+    ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    bool found = false;
+    std::size_t excess = 0;
     for (auto const& d : r.all()) {
-        if (d.actual.find("at most one variant") != std::string::npos) {
-            found = true; break;
+        if (d.code == DiagnosticCode::S_ExcessInitializerElements) {
+            ++excess;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
         }
     }
-    EXPECT_TRUE(found) << "multi-element union init must be diagnosed";
-    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(excess, 1u) << "the element after the union's member must be diagnosed";
+    EXPECT_TRUE(res->ok) << "an excess element is dropped, not refused";
 }
 
 // Unknown union variant name → diagnostic.
@@ -7252,31 +7266,85 @@ TEST(HirLoweringC, D5_4_UnionIndexDesignatorEmitsDiag) {
     EXPECT_FALSE(res->ok);
 }
 
-// Chained designator `{.a.b = 1}` on a union must be diagnosed (variant
-// access has no sub-position semantics in C99). Lock-in for the
-// silent-failure-hunter HIGH finding.
+// A chained designator `{.a.v = 1}` on a union designates member `a`'s member `v`
+// (C 6.7.9p7's designator LIST — it has sub-position semantics, and always had).
+// ★ P68 round 9 (lane `cs`): this pinned a REFUSAL ("chained designator on a union is
+// not supported") that no reference has — gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0
+// and MSVC 19.51 all build `union U u = {.a.v = 42}` and run 42 (✔MEASURED
+// `.temp/probe/r9c` c28). What the silent-failure-hunter finding it locked in was
+// about — the leaf silently written as the whole variant — is still pinned: the
+// union's one child is the `Inner` aggregate holding `v`, not a bare literal.
 TEST(HirLoweringC, D5_4_UnionChainedDesignatorEmitsDiag) {
     SemanticModel model = analyzeC(
         "struct Inner { int v; };\n"
         "union U { struct Inner a; int i; };\n"
         "void f() { union U u = { .a.v = 1 }; }\n");
-    if (model.hasErrors()) return;
+    ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    bool found = false;
-    for (auto const& d : r.all()) {
-        if (d.actual.find("chained designator on a union") != std::string::npos) {
-            found = true; break;
-        }
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId init = firstVarInitOfFn(res->hir, fn);
+    ASSERT_TRUE(init.valid());
+    ASSERT_EQ(res->hir.kind(init), HirKind::ConstructAggregate);
+    auto const kids = res->hir.children(init);
+    ASSERT_EQ(kids.size(), 1u) << "a union holds ONE member";
+    ASSERT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate)
+        << "the member is `a`, a structure — `.a.v` wrote INTO it";
+    auto const inner = res->hir.children(kids[0]);
+    ASSERT_EQ(inner.size(), 1u);
+    EXPECT_EQ(res->hir.kind(inner[0]), HirKind::Literal);
+}
+
+// ★ P68 round 9 (lane `cs`): a union's list is placed by the same current-object
+// rules as any other (C 6.7.9p17-p20) — a positional element initializes the FIRST
+// member, eliding into it when it is an aggregate (`{40, 2}` fills a two-int
+// structure), and a later designator for another member replaces the earlier one
+// (C 6.7.9p19: `{.f = 1.0f, .i = 42}` holds `i`). ✔MEASURED on all four references
+// (`.temp/probe/r9b` c13, c25; every build RUN to 42); DSS refused both ("at most one
+// variant").
+TEST(HirLoweringC, D5_4_UnionListsArePlacedLikeAnyOtherList) {
+    {
+        SemanticModel model = analyzeC(
+            "union U { struct { int a, b; } s; int i; };\n"
+            "void f() { union U u = { 40, 2 }; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_TRUE(r.all().empty()) << "brace elision into the first member is C, not excess";
+        HirNodeId init = firstVarInitOfFn(res->hir, firstFunction(res->hir));
+        ASSERT_TRUE(init.valid());
+        auto const kids = res->hir.children(init);
+        ASSERT_EQ(kids.size(), 1u);
+        ASSERT_EQ(res->hir.kind(kids[0]), HirKind::ConstructAggregate);
+        auto const members = res->hir.children(kids[0]);
+        ASSERT_EQ(members.size(), 2u);
+        EXPECT_EQ(res->hir.kind(members[0]), HirKind::Literal);
+        EXPECT_EQ(res->hir.kind(members[1]), HirKind::Literal)
+            << "the SECOND element lands in the member's second field";
     }
-    EXPECT_TRUE(found) << "chained designator on union must be diagnosed";
-    EXPECT_FALSE(res->ok);
+    {
+        SemanticModel model = analyzeC(
+            "union V { int i; float f; };\n"
+            "void f() { union V v = { .f = 1.0f, .i = 42 }; }\n");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        HirNodeId init = firstVarInitOfFn(res->hir, firstFunction(res->hir));
+        ASSERT_TRUE(init.valid());
+        auto const kids = res->hir.children(init);
+        ASSERT_EQ(kids.size(), 1u) << "a union holds ONE member — the last designated";
+        EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Literal);
+        EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(kids[0])), TypeKind::I32)
+            << "`.i = 42` came last, so the member is the `int`, not the `float`";
+    }
 }
 
 // Union nested inside a struct: the InitSlot path lands on the union's own
-// level (`prepareUnionBraceInit` picks the variant, the brace-init work stack
-// runs it as a one-slot level) correctly + omitted struct slots
-// containing unions zero-fill via the corrected `synthZeroOrError`
+// level (its own brace list, placed by the element walk) correctly + omitted
+// struct slots containing unions zero-fill via the corrected `synthZeroOrError`
 // Union arm (1-child first-variant).
 TEST(HirLoweringC, D5_4_UnionNestedInStruct) {
     SemanticModel model = analyzeC(

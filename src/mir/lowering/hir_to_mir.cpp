@@ -17191,17 +17191,33 @@ struct Lowerer {
         }
     }
 
-    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a NULL POINTER CONSTANT
-    // member — an integer constant expression equal to 0 in a POINTER context
-    // (`(void*)0`, `int(*fn)(void) = 0`, the `0` member of an aSyscall row).
-    // const-eval refuses a cast-to-pointer ("pointer/aggregate targets remain
-    // non-foldable", const_eval.cpp), so peel the pointer-typed Cast and fold
-    // its INTEGER operand. iff that operand folds to 0, the member is a null
-    // pointer → a zero pointer leaf (`uint64_t 0`, core=Ptr); the encoder's
-    // scalar-leaf arm writes 8 zero bytes with NO relocation. A non-zero or
-    // non-integer operand (`(void*)0x1000`, a runtime expr) yields nullopt so
-    // the caller's evaluateConstant fallback / whole-aggregate bail still
-    // governs — this arm ONLY recognizes the standard null pointer constant.
+    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a NULL POINTER in a
+    // pointer object or member — an integer constant expression equal to 0
+    // reaching a POINTER type (`(void*)0`, `int(*fn)(void) = 0`, the `0` member of
+    // an aSyscall row, `char *p = NULL`). const-eval refuses a cast-to-pointer
+    // ("pointer/aggregate targets remain non-foldable", const_eval.cpp), so peel
+    // the pointer-typed Casts and fold the INTEGER operand under them. iff it
+    // folds to 0 the object is a null pointer → a zero pointer leaf (`uint64_t
+    // 0`, core=Ptr); the encoder's scalar-leaf arm writes 8 zero bytes with NO
+    // relocation. A non-zero or non-integer operand (`(void*)0x1000`, an address,
+    // a runtime expr) yields nullopt so the caller's later arms / whole-aggregate
+    // bail still govern — this arm recognizes ONLY a null pointer.
+    // ★ EVERY POINTER-TYPED CAST IS PEELED, NOT ONE
+    // (D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED). `char *p = NULL;` with
+    // the references' `NULL`, `((void*)0)`, is TWO casts: the explicit `(void*)`
+    // and the implicit `void*`→`char*` conversion. Peeling one left the `(void*)0`
+    // for const-eval, which refused it, so the object fell to a runtime
+    // initializer that the static-data producer refuses on every format.
+    // ✔MEASURED at 4d9a24c4 on x86_64 ELF: `char *g = (void*)0`,
+    // `(char*)(void*)0`, `int (*g)(void) = (void*)0`, a struct member, `char
+    // *const`, a static local and a mixed pointer array were each refused, while
+    // gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 14.51 accept them all.
+    // C 6.3.2.3p4 makes the chain a null pointer ("conversion of a null pointer
+    // to another pointer type yields a null pointer of that type"), and 6.6p9
+    // lets pointer casts build an address constant. The peel stops at the first
+    // node that is not a pointer-typed Cast: an integer-typed cast is the
+    // integer expression's own business, and the fold below still demands a
+    // plain integer, so no address can pass for a null pointer.
     [[nodiscard]] std::optional<MirLiteralValue>
     tryClassifyNullPointerConst(HirNodeId node, EvalEnvironment const& env,
                                 EvalOptions const& opts) {
@@ -17209,10 +17225,12 @@ struct Lowerer {
         if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr)
             return std::nullopt;
         HirNodeId operand = node;
-        if (hir.kind(node) == HirKind::Cast) {
-            auto kids = hir.children(node);
+        while (hir.kind(operand) == HirKind::Cast) {
+            TypeId const ct = hir.typeId(operand);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr) break;
+            auto kids = hir.children(operand);
             if (kids.size() != 1) return std::nullopt;
-            operand = kids[0];   // fold the integer behind the pointer cast
+            operand = kids[0];   // the value behind this pointer cast
         }
         ConstEvalResult const r =
             evaluateConstant(hir, interner, literals, operand, env, opts);
@@ -17302,25 +17320,39 @@ struct Lowerer {
     // STATIC-storage pointer initializer (6.6/6.3.2.3); its value IS the integer,
     // an ABSOLUTE address with NO symbol and NO relocation (gcc/clang emit the same
     // bytes). const-eval refuses a cast-to-pointer (invariant: "pointer targets
-    // remain non-foldable", const_eval.cpp) so peel the pointer Cast and fold its
-    // INTEGER operand → a plain `uint64_t` leaf (core=Ptr); the encoder's scalar-leaf
-    // arm writes 8 raw LE bytes. Sibling of the null-pointer (c67/c80) and null-base
-    // array-index (c68/c80) classifiers. CONSERVATIVE: fires ONLY on an explicit
-    // Cast whose operand folds to a PLAIN integer (int64/uint64 arm) — a symbol
-    // address (HirAddressValue), an AddressOf/Index (the SQLITE_INT_TO_PTR shape,
-    // claimed by tryClassifyNullBaseIndexConst which runs FIRST), an aggregate, a
-    // float, or a fold-failure all yield nullopt → the earlier symbol-addr path or
-    // the whole-aggregate bail / runtimeInit fail-loud still governs.
+    // remain non-foldable", const_eval.cpp) so peel the pointer Casts and fold the
+    // INTEGER operand under them → a plain `uint64_t` leaf (core=Ptr); the encoder's
+    // scalar-leaf arm writes 8 raw LE bytes. Sibling of the null-pointer (c67/c80)
+    // and null-base array-index (c68/c80) classifiers. CONSERVATIVE: fires ONLY on
+    // a Cast whose integer operand folds to a PLAIN integer (int64/uint64 arm) — a
+    // symbol address (HirAddressValue), an AddressOf/Index (the SQLITE_INT_TO_PTR
+    // shape, claimed by tryClassifyNullBaseIndexConst which runs FIRST), an
+    // aggregate, a float, or a fold-failure all yield nullopt → the earlier
+    // symbol-addr path or the whole-aggregate bail / runtimeInit fail-loud still
+    // governs.
+    // ★ EVERY POINTER-TYPED CAST IS PEELED, NOT ONE
+    // (D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED), for the reason the
+    // null-pointer arm above gives: `char *g = (char*)(void*)0x10;` is a chain of
+    // pointer casts over one integer, an address constant by C 6.6p9, and peeling
+    // one handed `(void*)0x10` to const-eval, which refused it — ✔MEASURED at
+    // 4d9a24c4 on x86_64 ELF, as a scalar and as a struct member, while the four
+    // references accept both and keep the value 0x10 through the chain.
     [[nodiscard]] std::optional<MirLiteralValue>
     tryClassifyIntToPtrConst(HirNodeId node, EvalEnvironment const& env,
                              EvalOptions const& opts) {
         TypeId const ty = hir.typeId(node);
         if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr) return std::nullopt;
         if (hir.kind(node) != HirKind::Cast) return std::nullopt;   // explicit int→ptr cast only
-        auto kids = hir.children(node);
-        if (kids.size() != 1) return std::nullopt;
+        HirNodeId operand = node;
+        while (hir.kind(operand) == HirKind::Cast) {
+            TypeId const ct = hir.typeId(operand);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr) break;
+            auto kids = hir.children(operand);
+            if (kids.size() != 1) return std::nullopt;
+            operand = kids[0];   // the value behind this pointer cast
+        }
         ConstEvalResult const r =
-            evaluateConstant(hir, interner, literals, kids[0], env, opts);
+            evaluateConstant(hir, interner, literals, operand, env, opts);
         if (!r.value.has_value()) return std::nullopt;
         std::uint64_t value = 0;
         if (std::holds_alternative<std::int64_t>(r.value->value))

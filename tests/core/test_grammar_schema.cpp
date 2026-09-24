@@ -5883,7 +5883,10 @@ TEST(GrammarSchema, SemanticsBuiltinFunctionsVariadicNotBool) {
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
 }
 
-// ── constMarker (on a declaration entry) ─────────────────────────────────
+// ── constMarker (the language's qualifier vocabulary, `semantics` level) ──
+// P68 round 9 (lane `cs`): the qualifier tokens are declared ONCE, in the
+// semantics block; a declaration row takes them by derivation and may no longer
+// spell them.
 
 TEST(GrammarSchema, SemanticsConstMarkerUnknownTokenReportsUnknownToken) {
     constexpr std::string_view kCfg = R"JSON({
@@ -5891,9 +5894,8 @@ TEST(GrammarSchema, SemanticsConstMarkerUnknownTokenReportsUnknownToken) {
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { ";": [{ "kind": "Semi" }] },
       "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": { "declarations": [
-        { "rule": "root", "name": 0, "kind": "variable",
-          "constMarker": "GhostConst" }
+      "semantics": { "constMarker": "GhostConst", "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable" }
       ] }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
@@ -5907,14 +5909,42 @@ TEST(GrammarSchema, SemanticsConstMarkerNotStringReportsInvalid) {
       "language": { "name": "X", "version": "0.1.0" },
       "tokens": { ";": [{ "kind": "Semi" }] },
       "shapes": { "root": { "sequence": [ "Semi" ] } },
-      "semantics": { "declarations": [
-        { "rule": "root", "name": 0, "kind": "variable",
-          "constMarker": 42 }
+      "semantics": { "restrictMarker": 42, "declarations": [
+        { "rule": "root", "name": 0, "kind": "variable" }
       ] }
     })JSON";
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A declaration row that still SPELLS a qualifier marker is refused by name, the
+// message saying where the vocabulary lives now — never loaded as a second owner.
+TEST(GrammarSchema, APerRowQualifierMarkerIsRefusedAsRetired) {
+    for (char const* key : {"constMarker", "restrictMarker", "volatileMarker"}) {
+        std::string const cfg = std::string{R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "keywords": [ { "word": "lock", "kind": "Lock" } ],
+      "shapes": { "root": { "sequence": [ "Semi" ] } },
+      "semantics": { "constMarker": "Lock", "declarations": [
+        { "rule": "root", "name": 0, "type": 0, "kind": "variable", ")JSON"}
+            + key + R"JSON(": "Lock" }
+      ] }
+    })JSON";
+        auto r = GrammarSchema::loadFromText(cfg);
+        ASSERT_FALSE(r.has_value()) << key;
+        bool named = false;
+        for (auto const& d : r.error()) {
+            if (d.code == DiagnosticCode::C_InvalidSemantics
+                && d.message.find(std::string{"'declarations[0]."} + key + "' is retired")
+                       != std::string::npos
+                && d.message.find(std::string{"'semantics."} + key + "'") != std::string::npos)
+                named = true;
+        }
+        EXPECT_TRUE(named) << key << ": the refusal names the retired key and its home";
+    }
 }
 
 // ── kindByChild ───────────────────────────────────────────────────────────
@@ -6064,9 +6094,9 @@ TEST(GrammarSchema, SemanticsSE4SE6FacetsHappyPathRoundTrips) {
       },
       "semantics": {
         "identifierToken": "Identifier",
+        "constMarker": "Lock",
         "declarations": [
           { "rule": "decl", "name": 0, "kind": "variable",
-            "constMarker": "Lock",
             "kindByChild": {
               "childPath": [1, 0],
               "whenRule": "fnTail",
@@ -6093,7 +6123,12 @@ TEST(GrammarSchema, SemanticsSE4SE6FacetsHappyPathRoundTrips) {
     auto const& sem = (*r)->semantics();
     ASSERT_EQ(sem.declarations.size(), 1u);
     EXPECT_EQ(sem.declarations[0].ruleName, "decl");
-    ASSERT_TRUE(sem.declarations[0].constMarker.has_value());
+    // P68 round 9 (lane `cs`): the language's `const` token is declared once, at
+    // the semantics level; a row takes it only when it declares a TYPED entity
+    // (declarator mode or a `type` child), and `decl` has neither.
+    ASSERT_TRUE(sem.constMarker.has_value());
+    EXPECT_FALSE(sem.declarations[0].constMarker.has_value())
+        << "an untyped row derives no qualifier marker";
     ASSERT_TRUE(sem.declarations[0].kindByChild.has_value());
     auto const& disc = *sem.declarations[0].kindByChild;
     ASSERT_EQ(disc.childPath.size(), 2u);
@@ -6903,7 +6938,7 @@ TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
 }
 
 // C11/C23 6.4.5: the shipped c text with `stringLiteralPrefixes`, for
-// mutation-based validation of the `elementCoreByFormat` per-format core map.
+// mutation-based validation of the literal-prefix row grammar.
 namespace {
 // Located through the ONE test-side resolver (`repo_root.hpp`:
 // $DSS_CONFIG_ROOT → the CMake-baked repo root → the cwd ancestor walk). The
@@ -6928,101 +6963,110 @@ namespace {
 }
 } // namespace
 
-TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
-    // An unknown object-format key in `elementCoreByFormat` must FAIL LOUD (a typo'd
-    // format would otherwise silently never override, baking the wrong wchar width).
+// ── P68 round 9: `elementCoreByFormat` IS DELETED, AND REFUSED BY NAME ──────────
+//
+// The per-format element-core map had ONE use, `wchar_t`, and that is a (processor
+// × platform) fact no format-keyed map can hold: `elf` is x86_64's `int` and
+// aarch64's `unsigned int` (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX). The wide rows now
+// name `abiTypedef: wchar_t`, read from the TARGET's `abiTypedefs` per pair, and the
+// map is gone. A document that still carries the key is REFUSED, in both prefix
+// tables, with a sentence naming its replacement — its author made no typo, they
+// wrote a mechanism that no longer exists. And a row's keys are a CLOSED set, so a
+// misspelled `abiTypedef` cannot load clean and leave the row on its base core.
+// These replace the four format-map refusal pins (unknown format key, the sentinel
+// key, an unknown per-format core, the char table's unknown key), whose map no
+// longer exists.
+// RED-ON-DISABLE: drop the retired-key sentence from the loader and the first pin
+// reds on its message; drop the closed-key check and BOTH mutated documents load.
+namespace {
+// The shipped c text with `insertion` spliced in right after the `"startToken"` of
+// the prefix row whose opener is `token`; empty (with an ADD_FAILURE) when the row
+// is gone.
+[[nodiscard]] std::string shippedCWithPrefixRowKey(std::string_view token,
+                                                   std::string_view insertion) {
     std::string text = shippedCTextForPrefixTest();
-    ASSERT_FALSE(text.empty());
-    // Baseline: the unmutated shipped config loads clean.
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    // Swap the WideStringStart row's valid `"pe"` key for a bogus format name.
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    std::string const needle = std::format("\"startToken\": \"{}\"", token);
     auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos) << "elementCoreByFormat pe-key not found in shipped config";
-    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "an unknown object-format key must fail the load, not silently ignore";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+    if (pos == std::string::npos) {
+        ADD_FAILURE() << "no literal-prefix row opens with " << token;
+        return {};
+    }
+    text.insert(pos + needle.size(), std::format(", {}", insertion));
+    return text;
+}
+} // namespace
+
+TEST(GrammarSchema, LiteralPrefixRetiredFormatMapIsRefusedByName) {
+    std::string const base = shippedCTextForPrefixTest();
+    ASSERT_FALSE(base.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(base).has_value())
+        << "shipped c must load clean before mutation";
+    // A string row and a char row (the two tables share one validator), and a row
+    // that names no ABI typedef at all — the refusal is about the KEY, not the row.
+    for (std::string_view const token :
+         {"WideStringStart", "WideCharStart", "Utf16StringStart"}) {
+        SCOPED_TRACE(token);
+        std::string const text =
+            shippedCWithPrefixRowKey(token, "\"elementCoreByFormat\": { \"pe\": \"U16\" }");
+        ASSERT_FALSE(text.empty());
+        auto result = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(result.has_value())
+            << "a document carrying the retired key must not load";
+        EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+        EXPECT_TRUE(std::ranges::any_of(result.error(), [](auto const& d) {
+            return d.message.find("'elementCoreByFormat' was removed") != std::string::npos
+                && d.message.find("'abiTypedef'") != std::string::npos;
+        })) << "the refusal names the retired key AND its replacement: "
+            << errorDiags(result.error());
+    }
 }
 
-// ★ THE SENTINEL VARIANT of the test above, and the WORST of the family. This
-// map is ALREADY keyed on `ObjectFormatKind`, so `"unknown"` does not merely sit
-// dead — it stores a LIVE `ObjectFormatKind::Unknown` row. `resolveElementCore`
-// used to take an `optional<ObjectFormatKind>`, so any caller holding a
-// default-constructed kind (== Unknown, NOT nullopt) MATCHED that row and took a
-// wchar_t element width nothing intended. A dead entry is a silent no-op; this
-// one was a silent WRONG ANSWER. The CODE half is closed too now: the resolver
-// takes a `SelectableObjectFormatKind`, which cannot be `Unknown` (the pins right
-// after this test) — so this refusal is the config half's own guard, not the only
-// thing standing between a sentinel row and a lookup.
-//
-// RED-ON-DISABLE: remove the `isSelectableObjectFormatKind` branch in the
-// `elementCoreByFormat` loop and the mutated config loads clean.
-TEST(GrammarSchema, StringPrefixSentinelFormatKeyReportsCode) {
-    std::string text = shippedCTextForPrefixTest();
+TEST(GrammarSchema, LiteralPrefixRowKeysAreAClosedSet) {
+    std::string const text =
+        shippedCWithPrefixRowKey("WideCharStart", "\"abiTypdef\": \"wchar_t\"");
     ASSERT_FALSE(text.empty());
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
-    auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos)
-        << "elementCoreByFormat pe-key not found in shipped config";
-    text.replace(pos, needle.size(),
-                 "\"elementCoreByFormat\": { \"unknown\": \"U16\"");
     auto result = GrammarSchema::loadFromText(text);
     ASSERT_FALSE(result.has_value())
-        << "the 'unknown' sentinel must fail the load — it resolves through the "
-           "name table, so it would be STORED as a live per-format override";
-    EXPECT_TRUE(hasDiagCode(result.error(),
-                            DiagnosticCode::C_InvalidHirLowering));
+        << "a misspelled key must not load clean: the row would keep its base core "
+           "on every pair";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
     EXPECT_TRUE(std::ranges::any_of(result.error(), [](auto const& d) {
-        return d.message.find("sentinel") != std::string::npos;
+        return d.message.find("abiTypdef") != std::string::npos;
     })) << errorDiags(result.error());
+}
+
+TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
+    // A row's element core that is not a known TypeKind must FAIL LOUD. (It pinned
+    // the deleted per-format map's values until P68 round 9; the base core is the
+    // one element-core field a row still has.)
+    std::string text = shippedCTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    std::string const needle =
+        "{ \"startToken\": \"Utf16StringStart\", \"elementCore\": \"U16\"";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos) << "the Utf16StringStart row was not found";
+    text.replace(pos, needle.size(),
+                 "{ \"startToken\": \"Utf16StringStart\", \"elementCore\": \"U17\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "an unknown element-core TypeKind must fail the load";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
 }
 
 // ── D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY — "NO FORMAT" HAS ONE SPELLING ──
 //
-// The code half of the row above. `resolveElementCore` took an
-// `optional<ObjectFormatKind>`, which says "no format" two ways — `nullopt`, and
-// an engaged `Unknown` the lookup took for a real key. ✔MEASURED before the
-// change (a temporary probe over the shipped c grammar): the engaged sentinel
-// answered the base `i32` for both wide rows, the same as `nullopt`, only because
-// no map holds that key; and one `analyze()` handed it read it two ways at once
-// (the literal-prefix resolver as "no format", the shipped-header availability
-// gate as a real format with nothing restricted on it).
-//
-// The contract is now in the TYPE. These are runtime assertions over what the CALL
-// accepts, on purpose: a `static_assert` would make a regression a BUILD failure,
-// and a build failure leaves ctest running the previous binary green — a pin that
-// cannot red through ctest is not a pin. And the question is asked of the call
-// expression, not of `&LiteralPrefixEntry::resolveElementCore`: an added
-// convenience overload (the likeliest way the wide type comes back) makes the
-// address ambiguous and would turn this pin into a compile error too.
-namespace {
-template <class Arg>
-concept ResolverAccepts = requires(LiteralPrefixEntry const& px, Arg a) {
-    px.resolveElementCore(a);
-};
-} // namespace
-
-TEST(LiteralPrefixElementCore, TheSentinelCannotBeHandedToTheResolver) {
-    EXPECT_FALSE(ResolverAccepts<ObjectFormatKind>)
-        << "a bare ObjectFormatKind — `Unknown` among its values — must not reach "
-           "the per-format lookup";
-    EXPECT_FALSE(ResolverAccepts<std::optional<ObjectFormatKind>>)
-        << "an optional<ObjectFormatKind> spells \"no format\" twice; it must not "
-           "reach the lookup unconverted";
-    EXPECT_TRUE(ResolverAccepts<std::optional<SelectableObjectFormatKind>>);
-    EXPECT_TRUE(ResolverAccepts<std::nullopt_t>)
-        << "nullopt is THE spelling of \"no format\"";
+// That row closed by giving the literal-prefix resolver a `SelectableObjectFormatKind`
+// parameter, a type that cannot hold the `Unknown` sentinel. P68 round 9 DELETED the
+// resolver with the per-format map it read (see the retired-key pins above), so the
+// pin that asked what the RESOLVER accepts went with it; `analyze()`'s own
+// `activeFormat` takes the same type and keeps its call-shape pin
+// (`SemanticAnalyzerActiveFormat.TheSentinelCannotBeHandedToAnalyze`). What stays here
+// is the TYPE's own contract — the only door is `of()`, which refuses the sentinel —
+// and the bridge that converts a wider optional, refusing an engaged sentinel loudly.
+TEST(LiteralPrefixElementCore, OfAnswersNothingForTheSentinelAndCarriesEveryRealKind) {
     EXPECT_FALSE((std::is_constructible_v<SelectableObjectFormatKind, ObjectFormatKind>))
         << "the only door into the type is `of()`, which refuses the sentinel";
     EXPECT_FALSE((std::is_convertible_v<ObjectFormatKind, SelectableObjectFormatKind>));
-}
-
-TEST(LiteralPrefixElementCore, OfAnswersNothingForTheSentinelAndCarriesEveryRealKind) {
     EXPECT_FALSE(SelectableObjectFormatKind::of(ObjectFormatKind::Unknown).has_value());
     for (auto const& [kind, name] : kObjectFormatKindTable.rows) {
         if (!isSelectableObjectFormatKind(kind)) continue;
@@ -7046,66 +7090,25 @@ TEST(LiteralPrefixElementCoreDeathTest, TheBridgeRefusesAnEngagedSentinel) {
         "engaged ObjectFormatKind::Unknown");
 }
 
-// The shipped wide rows through the new signature: `nullopt` is the base, a real
-// format its declared override — the answers the pre-fix resolver gave for them.
-TEST(LiteralPrefixElementCore, TheShippedWideRowsResolvePerFormat) {
+// The shipped wide rows name the platform typedef (P68 round 9): exactly the two `L`
+// openers — string and char — carry `abiTypedef: wchar_t`, and no other row carries
+// one. (It walked the deleted per-format map until then.) The per-PAIR answer is
+// pinned against the references in tests/analysis/preprocess/test_wchar_t_abi_typedef.
+TEST(LiteralPrefixElementCore, TheShippedWideRowsNameThePlatformTypedef) {
     auto const schema = dss::test_support::shippedSchemaOrThrow("c");
-    std::size_t rows = 0;
+    std::vector<std::string> named;
     for (auto const* list : {&schema->hirLowering().stringLiteralPrefixes,
                              &schema->hirLowering().charLiteralPrefixes}) {
         for (auto const& px : *list) {
-            if (px.elementCoreByFormat.empty()) continue;
-            ++rows;
-            EXPECT_EQ(px.resolveElementCore(std::nullopt), px.elementCore)
-                << px.startTokenName;
-            for (auto const& [fmt, core] : px.elementCoreByFormat) {
-                auto const selectable = SelectableObjectFormatKind::of(fmt);
-                ASSERT_TRUE(selectable.has_value())
-                    << px.startTokenName << ": the config half let a sentinel key in";
-                EXPECT_EQ(px.resolveElementCore(selectable), core) << px.startTokenName;
-            }
+            if (px.abiTypedef.empty()) continue;
+            EXPECT_EQ(px.abiTypedef, "wchar_t") << px.startTokenName;
+            named.push_back(px.startTokenName);
         }
     }
-    EXPECT_EQ(rows, 2u) << "the shipped c grammar keys WideStringStart and "
-                           "WideCharStart by format; a walk that found neither "
-                           "checked nothing";
-}
-
-TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
-    // A per-format value that is not a known TypeKind must FAIL LOUD.
-    std::string text = shippedCTextForPrefixTest();
-    ASSERT_FALSE(text.empty());
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
-    auto const pos = text.find(needle);
-    ASSERT_NE(pos, std::string::npos);
-    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"pe\": \"U17\"");
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "an unknown per-format TypeKind must fail the load";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
-}
-
-// C11/C23 6.4.4.4: `charLiteralPrefixes` shares the SAME validator as
-// `stringLiteralPrefixes` (one loader lambda) — this mutates the WIDE-CHAR row's
-// format key to prove the char table is parsed + closed-key-validated too (a typo'd
-// char wchar format would otherwise silently bake the wrong char width).
-TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
-    std::string text = shippedCTextForPrefixTest();
-    ASSERT_FALSE(text.empty());
-    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
-        << "shipped c must load clean before mutation";
-    // The WideCharStart row's `elementCoreByFormat` (the SECOND such snippet — the
-    // first belongs to WideStringStart).
-    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
-    auto const first = text.find(needle);
-    ASSERT_NE(first, std::string::npos);
-    auto const pos = text.find(needle, first + needle.size());
-    ASSERT_NE(pos, std::string::npos) << "the WideCharStart elementCoreByFormat row was not found";
-    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
-    auto result = GrammarSchema::loadFromText(text);
-    ASSERT_FALSE(result.has_value())
-        << "an unknown object-format key in charLiteralPrefixes must fail the load";
-    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+    std::ranges::sort(named);
+    EXPECT_EQ(named, (std::vector<std::string>{"WideCharStart", "WideStringStart"}))
+        << "exactly the `L` openers name wchar_t; a walk that found neither checked "
+           "nothing";
 }
 
 // The regression wall for the CLOSED `semantics` key vocabulary: every key

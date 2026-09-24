@@ -16,13 +16,14 @@
     // built, and every leg's line names what CMake resolved. The lesson is `msvc`'s: until
     // 2026-09-18 it named none, so CMake took the first compiler on PATH and the "MSVC Release"
     // leg silently built with MinGW gcc (✔MEASURED in a CMakeCache).
-    // `compilerId` holds only CXX, because CXX is the only language this project compiles: the
-    // top-level `project()` declares `LANGUAGES CXX`, and C is enabled only by googletest's own
-    // `project()`, which compiles no C source. CMake never identifies that compiler, so its
-    // file-API toolchain entry carries a path and no id (✔MEASURED 2026-09-22, MSVC tree:
-    // C `cl.exe` id ABSENT, CXX `cl.exe` id MSVC 19.51). A C id declared here would make the
-    // harness judge every leg unwitnessed and build nothing. `env` CC still names the C
-    // compiler, so every toolchain names both.
+    // `compilerId` holds BOTH languages the build enables: CXX, which the top-level `project()`
+    // declares, and C, which only googletest's own `project()` enables. CMake's file-API answer
+    // holds what the top-level directory holds, so its C entry carries a path and no id
+    // (✔MEASURED 2026-09-22, MSVC tree: C `cl.exe` id ABSENT, CXX `cl.exe` id MSVC 19.51), and
+    // DssHarness 0.5.8, reading only that answer, judged a leg with a C id declared unwitnessed.
+    // 0.5.9 reads the language's own record, `CMakeFiles/<version>/CMake<LANG>Compiler.cmake`,
+    // held to the answer (the two must name the same compiler, the record no newer), so C is
+    // held to its id too, and a C compiler other than the one declared fails the leg by name.
     // `msvc` starts in the Visual Studio developer environment the harness sets up itself
     // (`developerEnvironments.visualStudio`), so no wrapper script or developer prompt is
     // involved. Never INCLUDE/LIB/PATH here -- machine-specific.
@@ -37,6 +38,7 @@
         "CXX": "cl"
       },
       "compilerId": {
+        "C": "MSVC",
         "CXX": "MSVC"
       }
     },
@@ -50,6 +52,7 @@
         "CXX": "g++"
       },
       "compilerId": {
+        "C": "GNU",
         "CXX": "GNU"
       }
     },
@@ -63,13 +66,14 @@
         "CXX": "g++"
       },
       "compilerId": {
+        "C": "GNU",
         "CXX": "GNU"
       }
     },
-    // `AppleClang` is INFERRED, not yet measured: over ssh the Mac's PATH answers `clang` with
-    // /usr/bin/clang, Apple's (the directories the harness finds programs in are APPENDED, never
-    // prepended). The first macOS leg's line names what CMake resolved, and any other id fails
-    // that leg before it builds -- confirm or correct this there.
+    // `AppleClang` ✔MEASURED by the P68 round-8 gate (2026-09-23): both macOS legs' lines named
+    // AppleClang 21.0 for CXX. Over ssh the Mac's PATH answers `clang` with /usr/bin/clang, Apple's
+    // (the directories the harness finds programs in are APPENDED, never prepended). C is the same
+    // driver, so the same id.
     "clang": {
       "platforms": [
         "macos"
@@ -80,6 +84,7 @@
         "CXX": "clang++"
       },
       "compilerId": {
+        "C": "AppleClang",
         "CXX": "AppleClang"
       }
     }
@@ -136,12 +141,30 @@
             "--no-tests=error"
           ],
           "filterArg": "-R",
+          // `test --label L` (repeatable) reaches ctest as `-L L`; several `--exclude`s reach it
+          // as ONE `-LE a|b`, because ctest leaves out only what EVERY `-LE` matches (DssHarness
+          // 0.5.9 refuses several exclusions given apart without `excludeJoin`).
+          "labelArg": "-L",
           "excludeArg": "-LE",
+          "excludeJoin": "|",
+          // The operator's 2026-08-25 ruling (recorded in the root CMakeLists.txt): a leg a host
+          // runs through WSL or ssh does not run the `repo-guard` label. Those guards check the
+          // source tree, the tree is byte-identical everywhere, and a synced host's git index is
+          // its own copy's, not this checkout's. Before 0.5.9 that took a second `test`
+          // invocation with `--exclude repo-guard`; declared here, every indirect leg leaves the
+          // label out and the Windows legs run it, so the eight-run gate is ONE invocation.
+          "remoteExcludes": [
+            "repo-guard"
+          ],
           "coresEnv": [
             "CTEST_PARALLEL_LEVEL"
           ],
           "successPattern": "100% tests passed",
-          "countPattern": "tests failed out of (?<total>\\d+)"
+          // BOTH forms of ctest's summary: "100% tests passed, 0 tests failed out of N" (Windows, WSL's ctest 4.3.2)
+          // and "100% tests passed out of N", with no failed clause, which the arm64 VPS's ctest prints
+          // (✔MEASURED 2026-09-24 through read-leg-path: its two legs' ledgers carried NO count, so the cross-leg
+          // count comparison never saw the VPS; round 8 read those counts by hand for the same reason).
+          "countPattern": "tests (?:passed|failed) out of (?<total>\\d+)"
         }
         // ⓘ NO PER-PLATFORM TEST SET: every leg's count is compared with every other leg's. Until
         // 2026-09-23 Windows legs formed their own set because a Windows build registered one test
@@ -641,6 +664,30 @@
       "action": "read-leg-path/read-leg-path.yml",
       "stallSeconds": 120
     },
+    // ★ HOW A REFERENCE COMPILER IS MEASURED ON A HOST NO SESSION REACHES. The bar measures every
+    // reference separately, per target, and a Mach-O row's reference (Apple's clang with the SDK's
+    // headers) exists only on the Mac. A runner is the sanctioned way to run code on a leg's host,
+    // so compiling a probe there is one -- every leg, because each host carries its own references
+    // (the arm64 VPS's native gcc, WSL's gcc/clang and cross compilers, the Mac's clang). The probe
+    // travels as base64 in an input, never as a file: `sync` keeps ONE copy of the repository per
+    // host, and placing a file would overwrite that copy under whatever lane is using it.
+    // A BATCH (`batch_b64`) runs many probes in one run: one sync, one pull, and a Mac kept awake for
+    // all of them (MEASURED 2026-09-23: the Mac fell asleep between single-probe runs a minute apart).
+    "probe-reference-cc": {
+      "description": "Compiles one probe, or a batch of probes in ONE run (sources given as base64), with the reference compiler of the leg's own host, and prints and keeps the report redacted: the compiler's identity, the compile's exit code and diagnostics, and by mode the program's output and exit code, the assembly, a dump of the object, or what the compiler printed. A refused compile is reported as a measurement.",
+      "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "action": "probe-reference-cc/probe-reference-cc.yml",
+      "stallSeconds": 420
+    },
     // ★★★ THE MANUAL END-TO-END CORPUS. Declared here because a runner is reachable ONLY through
     // this map — `DssHarness run <runner>` takes the runner "as predefinedRunners names it", so an
     // action directory without an entry here is a program nothing can start. ✔MEASURED 2026-09-17:
@@ -706,7 +753,7 @@
     // `.harness-config/` except this file, so the action's own directory never reaches the host.
     // Fixed upstream (round four, unreleased at this writing); the Windows legs run today.
     "anchors": {
-      "description": "Read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled.",
+      "description": "Read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor.",
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
@@ -1104,6 +1151,12 @@
     "doneAnchorsPath": ".plans/_deferred-anchor-registry-done.md",
     "idPrefix": "D",
     "minimumIdSegments": 3,
+    // This repository's convention: a closed row's Trigger OPENS with the closure (`✅ CLOSED
+    // <date> …`) and no other row's does. With this set (DssHarness 0.5.9), write-anchor and
+    // set-anchor refuse a row whose Status and Trigger disagree, either way round, and
+    // `read-anchors --lint` reports one written by hand -- the rule our own launcher enforced
+    // before the door could (report #7).
+    "triggerCarriesVerdict": true,
     // `.harness-config` joined 2026-09-18, when every program this repository ships moved under
     // it (`scripts/` and `real-examples/` retired) and its dangling citations -- mostly the retired
     // harness registry's rows -- were settled first. Run output (`build/`, `artifacts/`, `runs/`)
@@ -1136,6 +1189,15 @@
     "workflows": [
       ".github/workflows/pipeline-pr.yml"
     ],
+    // What `check-ci-legs` reads (DssHarness 0.5.9 declares none of it itself). A leg is a
+    // `run-tests (…)` matrix job named by its first matrix value (`name`); the job name's
+    // second-to-last number is `ctest_budget_min` (the last is `ctest_step_timeout_min`), and
+    // GitHub may cut a long name short, so the budget part is optional and the workflow's own
+    // matrix line (`"name":"<leg>", … "ctest_budget_min":N`) answers for a cut name.
+    "legJobPattern": "run-tests \\((?<leg>[^,)]+)(?:.*,\\s*(?<budget>[0-9]+)\\s*,\\s*[0-9]+\\s*\\)\\s*$)?",
+    "buildStep": "Build",
+    "testStep": "Test",
+    "workflowBudgetPattern": "\"name\"\\s*:\\s*\"{leg}\"[^\\r\\n]*?\"ctest_budget_min\"\\s*:\\s*(?<budget>[0-9]+)",
     "legBudgetMinutes": 180
   }
 }

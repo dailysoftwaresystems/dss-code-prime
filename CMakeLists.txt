@@ -1028,23 +1028,25 @@ if(DSS_BUILD_TESTS)
     # self-test behind a flag nobody passes found by
     # the same question: which self-test does nothing unless a human types it?
     #
-    # ★★ THIS ONE IS THE HIGHEST-VALUE OMISSION OF THE THREE. `anchors.py` is the
-    # ONLY sanctioned door to all three registries — it is what makes a wrapped
-    # anchor id, an unescaped pipe and a wrong cell count inexpressible, and it
-    # performs the archive MOVE that a closed row depends on. Its 26 arms were the
-    # only thing standing behind every one of those invariants, and they ran on
-    # request.
+    # ★★ WHAT IT PROVES SINCE THE DOOR MOVED TO DSSHARNESS. A registry row is
+    # written by `dssharness write-anchor` / `set-anchor` and by nothing else;
+    # `anchors.py` keeps the registry READER, the status vocabulary, and the ONE
+    # launcher the row callers reach the door through. Its self-test drives every
+    # refusal the retired writer made into the REAL door, in git fixture trees —
+    # a pre-escaped pipe, an empty Trigger, an id no guard resolves, a duplicate,
+    # the archive MOVE a closed row depends on — plus the launcher's own
+    # refusals, and it FAILS on a host without DssHarness: a door nobody ran is
+    # not a door that refused.
     #
     # ⚠ ✔MEASURED 2026-09-02, and it is why this entry is here rather than on a
     # list: 35 pipes across 14 rows had been stored with a DOUBLED backslash, so
     # they rendered a stray `\` where their author wrote `|` — a C `||`, a shell
-    # `||`, a regex alternation, `awk -F"|"`. `make_cell`'s own docstring had
-    # considered and dismissed that input as one "that never arrives". It arrives
-    # from two directions, neither detectable downstream: an author pre-escaping a
-    # pipe, and a lane reading the RAW TABLE LINE instead of `read-anchor --json`
-    # and handing the escaped form back — which COMPOUNDS, one backslash per
-    # re-close. The writer now refuses it (arms 6b–6d), and this entry is what
-    # makes that refusal a property of the tree rather than of a habit.
+    # `||`, a regex alternation, `awk -F"|"`. It arrives from two directions,
+    # neither detectable downstream: an author pre-escaping a pipe, and a lane
+    # reading the RAW TABLE LINE instead of `read-anchor --json` and handing the
+    # escaped form back — which COMPOUNDS, one backslash per re-close. The door
+    # refuses it, and this entry is what makes that refusal a property of the
+    # tree rather than of a habit.
     add_test(
         NAME anchors_selftest_guard
         COMMAND ${Python3_EXECUTABLE}

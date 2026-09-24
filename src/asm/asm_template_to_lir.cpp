@@ -527,6 +527,8 @@ struct AsmInstructionLowering::Impl {
     [[nodiscard]] std::optional<TargetCondCode>
     condCodeOfOperand(AsmDecodedOperand const& op) const {
         if (op.isMemory || op.indirect || op.symbol.empty()) return std::nullopt;
+        // `eq+4` names an address, never a condition.
+        if (op.symbolAddend != 0) return std::nullopt;
         auto const cc = kTargetCondCodeTable.fromName(op.symbol);
         if (!cc.has_value()) return std::nullopt;
         if (!target_.condCodeEncoding(*cc).has_value()) return std::nullopt;
@@ -1882,21 +1884,36 @@ struct AsmInstructionLowering::Impl {
                 if (scalar.valid() && !decodeScalar(scalar, out)) {
                     return std::nullopt;
                 }
-                if (!out.symbol.empty()) {
-                    sink_.fail(cur,
-                         std::format("displacement '{}' is a symbol, and a "
-                                     "symbol-relative memory operand needs a "
-                                     "relocation this build does not reach from "
-                                     "assembly yet{}", out.symbol,
-                                     sink_.pairSuffix()));
-                    return std::nullopt;
-                }
-                if (!fitsDisp(out.value, cur)) return std::nullopt;
-                std::int32_t const disp =
-                    static_cast<std::int32_t>(out.value);
+                // ★★★ A SYMBOLIC DISPLACEMENT (`msg(%rip)`, `msg+4(%rip)` —
+                // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The name
+                // travels to the operand's lowering, where the HOST resolves it
+                // (only the host has a label model) and the operand becomes a
+                // `MemSymbolOffset`; the constant written after it is the
+                // displacement's constant part. Which relocation it takes is the
+                // ENCODER's question — it depends on the base — so nothing here
+                // decides whether the base can carry one.
+                std::string dispSymbol = std::move(out.symbol);
+                out.symbol.clear();
+                std::int64_t const constant =
+                    dispSymbol.empty() ? out.value : out.symbolAddend;
+                out.symbolAddend = 0;
+                if (!fitsDisp(constant, cur)) return std::nullopt;
+                std::int32_t const disp = static_cast<std::int32_t>(constant);
                 out.value    = 0;
                 out.hasValue = false;
                 if (!decodeMemory(base, out)) return std::nullopt;
+                // A symbol OUTSIDE the memory form and a displacement INSIDE it
+                // say the address twice, the same refusal as two numbers below.
+                if (!dispSymbol.empty() && out.disp != 0) {
+                    sink_.fail(cur,
+                         std::format("this operand carries a symbolic "
+                                     "displacement '{}' outside the memory form "
+                                     "and a displacement {} inside it, and LIR "
+                                     "addresses model exactly one{}",
+                                     dispSymbol, out.disp, sink_.pairSuffix()));
+                    return std::nullopt;
+                }
+                out.dispSymbol = std::move(dispSymbol);
                 // ⚠ TWO DISPLACEMENTS ARE REFUSED, NOT MERGED. A dialect that
                 // writes one OUTSIDE the memory form and nests another INSIDE
                 // it has said the address twice, and picking either (or adding
@@ -1944,6 +1961,14 @@ struct AsmInstructionLowering::Impl {
         case AsmOperandRole::NegNumber:
             if (!decodeScalar(cur, out)) return std::nullopt;
             return out;
+        case AsmOperandRole::Addend:
+            // An addend is the tail of a NAME, read by `decodeScalar`; a dialect
+            // whose operand production reaches one on its own has bound the role
+            // to a rule that can stand alone.
+            sink_.fail(cur, std::format("an addend (`+4`, `-8`) stands after a "
+                                        "symbol name, never as an operand on "
+                                        "its own{}", sink_.pairSuffix()));
+            return std::nullopt;
         }
         sink_.fail(cur, "unhandled operand role");
         return std::nullopt;
@@ -2561,6 +2586,32 @@ struct AsmInstructionLowering::Impl {
     }
 
     bool decodeScalar(NodeId node, AsmDecodedOperand& out) {
+        // ★★ A NAME WITH A CONSTANT AFTER IT (`msg+4`, `.LC0-8` — P68 round 9,
+        // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER) IS SPLIT FIRST: the
+        // dialect's `addend` rule is read as the constant, and the scalar
+        // WITHOUT it is decoded below as the name it is. ⚠ BEFORE THE NEGATION
+        // SEARCH, NOT AFTER: `sym-8`'s addend is a minus sign and a number, and
+        // a negation search over the whole scalar would take the name for a
+        // number and drop it.
+        RuleId const addendRule = cfg_.ruleForRole(AsmOperandRole::Addend);
+        if (NodeId const addendNode = findDescendantOfRule(tree_, node, addendRule);
+            addendNode.valid() && addendNode.v != node.v) {
+            std::int64_t addend = 0;
+            if (!decodeAddend(addendNode, addend)) return false;
+            std::string name;
+            forEachTokenOutside(node, addendNode,
+                                [&](std::string_view t) { name += t; });
+            if (name.empty() || (name.front() >= '0' && name.front() <= '9')) {
+                sink_.fail(node,
+                     std::format("'{}' writes a constant after something that is "
+                                 "not a symbol name — an addend adds to an "
+                                 "ADDRESS{}", name, sink_.pairSuffix()));
+                return false;
+            }
+            out.symbol       = std::move(name);
+            out.symbolAddend = addend;
+            return true;
+        }
         // A scalar is either a number (possibly negated) or a symbol name.
         //
         // ★★★ THE NEGATION IS SEARCHED FOR ON THE WHOLE DESCENT, NOT TESTED ON
@@ -2674,6 +2725,41 @@ struct AsmInstructionLowering::Impl {
             if (isEmptySpace(tree_.flags(c))) continue;
             forEachTokenInOrder(c, fn);
         }
+    }
+
+    // The same traversal with one subtree left out — the name of `msg+4`
+    // without its addend.
+    template <class Fn>
+    void forEachTokenOutside(NodeId n, NodeId excluded, Fn&& fn) const {
+        if (!n.valid() || n.v == excluded.v) return;
+        if (tree_.kind(n) == NodeKind::Token) { fn(tree_.text(n)); return; }
+        for (NodeId const c : tree_.children(n)) {
+            if (isEmptySpace(tree_.flags(c))) continue;
+            forEachTokenOutside(c, excluded, fn);
+        }
+    }
+
+    // The constant of an `addend` node: its LAST token is the magnitude — the
+    // same (sign, magnitude) reading `decodeScalar` gives a negated number —
+    // and it is negative iff the dialect's negation rule is under it (`-8`),
+    // positive otherwise (`+4`). The sign is read from the PARSE, never from
+    // re-scanning text, for the reason `decodeScalar` states.
+    bool decodeAddend(NodeId addendNode, std::int64_t& out) {
+        std::string_view last;
+        forEachTokenInOrder(addendNode, [&](std::string_view t) { last = t; });
+        std::int64_t magnitude = 0;
+        if (last.empty() || !parseInteger(last, magnitude)) {
+            sink_.fail(addendNode,
+                 std::format("'{}' is not a constant this build can read as an "
+                             "addend{}", last, sink_.pairSuffix()));
+            return false;
+        }
+        bool const negative =
+            findDescendantOfRule(tree_, addendNode,
+                                 cfg_.ruleForRole(AsmOperandRole::NegNumber))
+                .valid();
+        out = negative ? -magnitude : magnitude;
+        return true;
     }
 
     // ★★★ THE OPERAND→LIR SHAPE IS DERIVED FROM THE TARGET, NOT RE-DECLARED
@@ -3096,7 +3182,7 @@ struct AsmInstructionLowering::Impl {
         // a non-producer can take it — that is the `store` shape.
         if (dest.isMemory) {
             OperandList operands = sources;
-            appendMemory(dest, operands);
+            if (!appendMemory(dest, ins.mnemonic, operands)) return;
             // ★ THE ONE SITE THAT SETS THE MEMORY-DIRECTION AXIS
             // (D-ASM-X86-CMP-AGAINST-MEMORY-DIRECTION-IS-UNELECTABLE). This
             // arm ran because the DESTINATION-position operand is the memory
@@ -3273,7 +3359,7 @@ struct AsmInstructionLowering::Impl {
                              sink_.pairSuffix()));
             return false;
         }
-        if (src.isMemory) { appendMemory(src, sources); return true; }
+        if (src.isMemory) return appendMemory(src, ins.mnemonic, sources);
         switch (src.role) {
         case AsmOperandRole::Register:
             if (src.regIsElement) {
@@ -3321,6 +3407,7 @@ struct AsmInstructionLowering::Impl {
         }
         case AsmOperandRole::Memory:
         case AsmOperandRole::Indirect:
+        case AsmOperandRole::Addend:
             break;
         }
         sink_.fail(src.node, std::format("this operand form is not yet "
@@ -3367,6 +3454,21 @@ struct AsmInstructionLowering::Impl {
                              "a name{}", mnemonic, sink_.pairSuffix()));
             return false;
         }
+        // ⚠ AN ADDRESS WITH A CONSTANT AFTER IT (`leaq msg+4, %rax`, `$msg+4`)
+        // IS REFUSED, NOT TRUNCATED: the shapes below name a symbol's address
+        // and carry no addend, so taking one would drop the `+4` and address
+        // the wrong byte with a clean build log. Through the program counter
+        // (`msg+4(%rip)`) the same address IS expressible.
+        if (src.symbolAddend != 0) {
+            sink_.fail(src.node,
+                 std::format("'{}' takes the address '{}{:+}' as an operand of "
+                             "its own, and this build carries a constant added "
+                             "to a symbol only in a memory displacement "
+                             "(`{}{:+}(%rip)`-style){}",
+                             mnemonic, src.symbol, src.symbolAddend, src.symbol,
+                             src.symbolAddend, sink_.pairSuffix()));
+            return false;
+        }
         std::vector<LirOperand> appended;
         if (!host_.appendSymbolAddress(src.symbol, src.node, mnemonic,
                                        appended)) {
@@ -3382,13 +3484,34 @@ struct AsmInstructionLowering::Impl {
     // states it once, where the operands are made, instead of leaving the
     // elector to infer it from an array that ran out.
     // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
-    void appendMemory(AsmDecodedOperand const& m, OperandList& operands) const {
+    //
+    // ★★ A SYMBOLIC DISPLACEMENT BECOMES A `MemSymbolOffset`
+    // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the host names the
+    // symbol (its label model decides what the name IS), the module's literal
+    // pool holds the (symbol, constant) pair, and the operand stands where the
+    // numeric displacement would — so every memory form the target declares
+    // takes it with no variant of its own. false ⇒ the host reported why.
+    [[nodiscard]] bool appendMemory(AsmDecodedOperand const& m,
+                                    std::string_view mnemonic,
+                                    OperandList& operands) {
         operands.push(LirOperand::makeReg(m.baseReg));
         if (m.hasIndex) {
             operands.push(LirOperand::makeReg(m.indexReg));
         }
         operands.push(LirOperand::makeMemBase(m.scale));
-        operands.push(LirOperand::makeMemOffset(m.disp));
+        if (m.dispSymbol.empty()) {
+            operands.push(LirOperand::makeMemOffset(m.disp));
+            return true;
+        }
+        auto const symbol =
+            host_.resolveDisplacementSymbol(m.dispSymbol, m.node, mnemonic);
+        if (!symbol.has_value()) return false;
+        LirLiteralValue value;
+        value.value = LirSymbolAddress{*symbol, m.disp};
+        value.core  = TypeKind::Ptr;
+        operands.push(LirOperand::makeMemSymbolOffset(
+            builder_.literalPoolAdd(std::move(value))));
+        return true;
     }
 
     // The candidate opcodes of `row` whose control-flow class is `cls` — the
@@ -3674,6 +3797,17 @@ struct AsmInstructionLowering::Impl {
                              "not one{}", mnemonic, sink_.pairSuffix()));
             return std::nullopt;
         }
+        // A branch into the middle of a block (`jmp .L3+2`) has no LIR edge —
+        // the successor is a BLOCK — so it is refused, never taken to `.L3`.
+        if (op.symbolAddend != 0) {
+            sink_.fail(op.node,
+                 std::format("'{}' branches to '{}{:+}', an address a constant "
+                             "past a label — a branch edge names a block, and "
+                             "this build does not split one at a byte "
+                             "offset{}", mnemonic, op.symbol, op.symbolAddend,
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
         return host_.resolveBranchTarget(op.symbol, op.node, mnemonic);
     }
 
@@ -3784,6 +3918,18 @@ struct AsmInstructionLowering::Impl {
         // a GPR holding an address, and `applyArrangement` refuses an
         // arrangement on a non-vector class long before this point.
         OperandList ops;
+        // A call into the middle of a function (`call foo+4`) would enter a
+        // frame past its prologue; the call relocation carries no addend here,
+        // so it is refused rather than taken to `foo`.
+        if (!callee.indirect && !callee.symbol.empty()
+            && callee.symbolAddend != 0) {
+            sink_.fail(callee.node,
+                 std::format("'{}' calls '{}{:+}', an address a constant past a "
+                             "symbol, and this build's call relocation names "
+                             "the symbol alone{}", ins.mnemonic, callee.symbol,
+                             callee.symbolAddend, sink_.pairSuffix()));
+            return;
+        }
         if (callee.indirect && callee.role == AsmOperandRole::Register) {
             ops.push(LirOperand::makeReg(callee.reg));
         } else if (!callee.indirect && !callee.symbol.empty()
@@ -4281,6 +4427,18 @@ public:
                        "whichever block sits at that index in the caller",
             symbol, sink_.pairSuffix()));
         return false;
+    }
+
+    // A symbolic memory displacement inside a template (`movl x(%%rip), %0`)
+    // names a symbol of the EMBEDDING program or one of the template's own
+    // labels; this host resolves neither, for the reasons `appendSymbolAddress`
+    // states, so it refuses with the same distinction.
+    [[nodiscard]] std::optional<SymbolId>
+    resolveDisplacementSymbol(std::string const& symbol, NodeId at,
+                              std::string_view mnemonic) override {
+        std::vector<LirOperand> unused;
+        (void)appendSymbolAddress(symbol, at, mnemonic, unused);
+        return std::nullopt;
     }
 
     // ★★★ THE `asm goto` TARGET, ANSWERED FROM THE CALLER'S OWN BINDINGS.

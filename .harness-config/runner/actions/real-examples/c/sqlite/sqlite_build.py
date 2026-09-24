@@ -181,11 +181,41 @@ def generator_caps(run):
     r = C.capture(C.python_argv(C.MANIFEST_GEN, "--help"), env_=C.child_env(python=True),
                   merge=True)
     caps = {"recipeTransform": "--recipe-transform" in r.out,
-            "stackReserve": "--stack-reserve" in r.out}
-    run.log.info("manifest generator: %s  --recipe-transform:%s  --stack-reserve:%s"
+            "stackReserve": "--stack-reserve" in r.out,
+            "tuPreludes": "--tu-preludes" in r.out}
+    run.log.info("manifest generator: %s  --recipe-transform:%s  --stack-reserve:%s  --tu-preludes:%s"
                  % (os.path.basename(C.MANIFEST_GEN), "YES" if caps["recipeTransform"] else "no",
-                    "YES" if caps["stackReserve"] else "no"))
+                    "YES" if caps["stackReserve"] else "no", "YES" if caps["tuPreludes"] else "no"))
     return caps
+
+
+def write_tu_preludes(leg, outd):
+    """The leg's declared `build.tuPreludes`, written as `<outd>/tu-preludes.json` for the manifest
+    generator -> its path; "" for a leg that declares none (whose generator argv stays the one it
+    always had). Both compilers read the manifest the generator writes, so the declaration reaches
+    dsscp and the same-platform reference alike."""
+    entries = leg.build.get("tuPreludes")
+    if not entries:
+        return ""
+    path = os.path.join(outd, "tu-preludes.json")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(entries, fh, indent=2)
+        fh.write("\n")
+    return path
+
+
+def fixture_manifest(run, leg, outd, manifest, tokens):
+    """THE ONE COMPOSITION of a leg's testfixture manifest, written to `manifest`: the stage's
+    fixture recipe (TUs, defines), the leg's include list, its resolved-library argv `tokens`, its
+    recipe transform, stack reserve and declared TU preludes, through the ONE generator. Step 7
+    and the round-close recompile (`sqlite_recompile`) both call it, so what the recompile
+    judges is exactly what a run builds. -> the generator's Result."""
+    fx = _field(run.stage, "fixture_recipe")
+    return B.generate_manifest(C.MANIFEST_GEN, manifest, "testfixture", leg.spec,
+                               _field(fx, "tus"), leg.inc_file, _field(fx, "defines"),
+                               leg.build.get("recipeTransform") or "none",
+                               leg.build.get("stackReserveBytes") or 0, tokens,
+                               tu_preludes=write_tu_preludes(leg, outd))
 
 
 def manifest_blockers(leg, caps, include_file):
@@ -197,6 +227,12 @@ def manifest_blockers(leg, caps, include_file):
                         "leg's manifest would silently apply the WINDOWS transform to a non-Windows "
                         "target — a cross-compile category error, so it is refused"
                         % (t, leg.build.get("stackReserveBytes"), os.path.basename(C.MANIFEST_GEN)))
+    if leg.build.get("tuPreludes") and not caps.get("tuPreludes"):
+        blockers.append("this leg declares build.tuPreludes for %s, but %s does not take "
+                        "--tu-preludes; building it would compile those TUs WITHOUT the prelude "
+                        "its leg declares for them, so it is refused"
+                        % (", ".join("<%s>" % e.get("tu") for e in leg.build["tuPreludes"]
+                                     if isinstance(e, dict)), os.path.basename(C.MANIFEST_GEN)))
     if not include_file:
         blockers.append("this leg has no include list: its staged zlib header dir 'zinc/%s' (declared "
                         "zconfGuards: %s) and/or its staged sqlite config dir 'cfg/%s' (declared "
@@ -425,10 +461,7 @@ def step7(run):
             log.warn("[%s] POISONED — %s" % (leg.label, leg.verdict_detail))
             continue
         log.info("[%s] resolve-library: %s" % (leg.label, why))
-        g = B.generate_manifest(C.MANIFEST_GEN, manifest, "testfixture", leg.spec,
-                                _field(fx, "tus"), leg.inc_file, _field(fx, "defines"),
-                                leg.build.get("recipeTransform") or "none",
-                                leg.build.get("stackReserveBytes") or 0, tokens)
+        g = fixture_manifest(run, leg, outd, manifest, tokens)
         if g.rc != 0:
             run.counts["compile"] += 1
             run.ledger.set_leg(leg, "poisoned", "manifest generation FAILED (%s, rc=%d): %s"
@@ -644,7 +677,8 @@ def step7b(run):
         g = B.generate_manifest(C.MANIFEST_GEN, manifest, "sqlite3", leg.spec, _field(cli, "tus"),
                                 leg.cli_inc_file, _field(cli, "defines"),
                                 leg.build.get("recipeTransform") or "none",
-                                leg.build.get("stackReserveBytes") or 0, tokens)
+                                leg.build.get("stackReserveBytes") or 0, tokens,
+                                tu_preludes=write_tu_preludes(leg, outd))
         if g.rc != 0:
             run.counts["cli"] += 1
             ledger.set(leg.label, "sqlite3", "poisoned", "CLI manifest generation FAILED (rc=%d): %s"

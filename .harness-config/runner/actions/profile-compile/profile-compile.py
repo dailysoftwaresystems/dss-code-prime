@@ -80,6 +80,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ── OUTPUT ENCODING, AT IMPORT ───────────────────────────────────────────────────
 # ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, both streams pipes -- how the

@@ -34,6 +34,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ★ BOTH STREAMS, AT IMPORT -- the property `guard_output_encoding_guard` ratchets. This file
 # was DEBT in that guard's inventory: it reconfigured only stdout, only inside `main()`. When

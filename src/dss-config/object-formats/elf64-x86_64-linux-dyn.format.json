@@ -169,6 +169,10 @@
     }
   ],
 
+  "$relocationAddendsComment": "P68 round 9: WHERE a relocatable object of this format keeps a relocation's addend — `explicit`: the ELF RELA record's `r_addend` column, which carries the psABI's full implicit addend (DSS's addend plus the target kind's `addendBias`). Read and written only through `link/format/relocation_addend.hpp`.",
+  "relocationAddends": "explicit",
+  "$inputSectionPlacementComment": "P68 round 9: an input section of a relocatable object in this format is the UNIT OF PLACEMENT, as it is for every ELF and PE/COFF linker. The reader slices it into symbol-bounded atoms, and the link keeps every atom at its offset from the others, keeping or dropping the section whole. Code in the object can depend on that layout with nothing a reader can see: a reference gas reduced to `section symbol + offset` with an immediate folded into the addend, a `sym+off` that runs into the next object, objects walked as an array between two labels. ✔MEASURED 2026-09-23: gcc -O2 `static int y, x` stores, linked by DSS while atoms moved independently, ran to 33 where gcc's link runs to 42.",
+  "inputSectionPlacement": "unit",
   "relocations": [
     {
       "$comment": "The pc-relative kinds are the only ones legal in ET_DYN `.text` (an absolute fixup in code would need DT_TEXTREL -- D-LK-DYN-TEXT-ABS-RELOC fails loud). kind numbers match the target schema rows (the cross-reference unifier requires both sides).",
@@ -186,6 +190,13 @@
       "name": "R_X86_64_32",
       "kind": 3,
       "nativeId": 10
+    },
+    {
+      "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction, a DATA reference. ELF writes it as R_X86_64_PC32 (never PLT32: ✔MEASURED 2026-09-23, gas 2.42 writes PC32 for `leaq ext_fn(%rip)`), so this row is an EMISSION ALIAS of the `rel32` row's wire type and decodes as that row.",
+      "name": "R_X86_64_PC32_RIPREL",
+      "kind": 8,
+      "nativeId": 2,
+      "emitOnly": true
     }
   ]
 }

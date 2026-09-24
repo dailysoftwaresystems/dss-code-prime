@@ -67,6 +67,7 @@ import re
 import subprocess
 import sys
 import tempfile
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ── OUTPUT ENCODING — AND HERE THE GLYPH **IS** THE FACT ────────────────────────
 # ⚠ A GATE THAT CRASHES WHILE REPORTING IS WORSE THAN ONE THAT SAYS NOTHING.
@@ -336,9 +337,14 @@ def norm_cell(text):
     return strip_decoration(text).lower()
 
 
-# The three words a cell may LEAD with to state a verdict. `DEFERRED` is a third spelling
-# of GATED that the 2026-06-era rows use freely, and a reader treats it as one.
-_VERDICT_WORDS = {"CLOSED": "CLOSED", "OPEN": "OPEN", "GATED": "GATED", "DEFERRED": "GATED"}
+# The words a cell may LEAD with to state a verdict. `DEFERRED` is a third spelling of GATED
+# that the 2026-06-era rows use freely, and a reader treats it as one. `DISCLOSED` is the
+# door's status cell for OPEN work whose debt pre-dates the cycle (`🔵 DISCLOSED`, written by
+# `dssharness write-anchor --status disclosed`): without it here that cell stated NO verdict,
+# so ARM 7 could not see a disclosed row whose prose says GATED. ✔MEASURED 2026-09-23 on
+# main: 24 such rows, each read as None before this entry and OPEN after it.
+_VERDICT_WORDS = {"CLOSED": "CLOSED", "OPEN": "OPEN", "GATED": "GATED", "DEFERRED": "GATED",
+                  "DISCLOSED": "OPEN"}
 
 
 def lead_verdict_word(text):
@@ -2668,7 +2674,17 @@ def self_test():
         "arm 7: THE ESCAPE IS DIRECTIONAL -- a fired trigger excuses PROSE that says "
         "GATED, never a COLUMN that does; undirected, it exonerated every new row at "
         "once because every row this project mints declares its trigger fired")
-    extra_total += 8
+    pin(list(gate_probe(
+        "| `D-XX" "-G9` | P2 | \U0001f535 DISCLOSED | ⏳ **GATED (opened by [[D-XX" "-Z]])** "
+        "| w | r |")) == [REG_PREFIX + "#D-XX" "-G9"],
+        "arm 7: the door's DISCLOSED cell states OPEN -- beside GATED prose it is RECORDED; "
+        "before `DISCLOSED` was a verdict word the cell stated nothing and ARM 7 was blind "
+        "to every disclosed row")
+    pin(not gate_probe(
+        "| `D-XX" "-G10` | P2 | \U0001f535 DISCLOSED | \U0001f7e0 **OPEN** debt that pre-dates "
+        "the cycle | w | r |"),
+        "arm 7: CONTROL -- a DISCLOSED row whose prose reads OPEN agrees, and is not recorded")
+    extra_total += 10
 
     # ── THE PARTITION ARM ────────────────────────────────────────────────────
     def partition_probe(prod_rows, harn_rows, done_rows, with_archive=True):
@@ -3113,10 +3129,9 @@ def main():
             print("  ! %s\n      Status column: %s\n      Trigger prose: %s"
                   % (k, col, prose))
         print("  Decide which is TRUE, then make both say it. Set the column with")
-        print("      python .harness-config/runner/actions/anchors/anchors.py set --<registry> <anchor> "
-              "--status <word> --apply")
-        print("  (`anchors.py --help` lists the words; this message deliberately does")
-        print("   NOT re-type the vocabulary, which would be a second copy of it)")
+        print("      dssharness set-anchor <anchor> --status <word>")
+        print("  (`dssharness set-anchor --help` lists the words; this message deliberately")
+        print("   does NOT re-type the vocabulary, which would be a second copy of it)")
         print("  which rewrites the column and MOVES the row if the verdict changed;")
         print("  reword the prose only if the prose is the half that is wrong. Do NOT")
         print("  silence this by reading one cell -- the whole reason the column exists")
@@ -3150,7 +3165,7 @@ def main():
         print("  while the column says GATED invites a lane to start something blocked.")
         print("  Decide which half is TRUE. If the row is genuinely gated, correct the")
         print("  COLUMN (which also moves the row):")
-        print("      python .harness-config/runner/actions/anchors/anchors.py set <anchor> --status gated --apply")
+        print("      dssharness set-anchor <anchor> --status gated")
         print("  If the gate has fired or was never a gate, reword the PROSE's leading")
         print("  verdict -- and say WHY in the row, so the next cycle does not undo it.")
         print("  A row that is ABOUT gated rows may declare `Trigger: ALREADY FIRED`.")

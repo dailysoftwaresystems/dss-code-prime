@@ -56,7 +56,7 @@ python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py
 <!-- BEGIN GENERATED ACTION INDEX -->
 | Action | Runs | Purpose |
 | --- | --- | --- |
-| **`anchors`** | `anchors.py` | read and write deferred-anchor registry rows in the one canonical form, so a row is never hand-assembled. |
+| **`anchors`** | `anchors.py` | read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor. |
 | **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |
 | **`check-anchor-balance`** | `check-anchor-balance.py` | refuse a cycle that ends with more OPEN deferral-registry rows than it began. |
@@ -91,9 +91,10 @@ python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py
 | **`manual-end-to-end`** | `manual-end-to-end.py` | run the manual end-to-end corpus, the entries whose cost makes them wrong to put in a gate, taken deliberately instead. |
 | **`owning-tree`** | `owning-tree.py` | name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment. |
 | **`pragma-profile-census`** | `pragma-profile-census.py` | census `#pragma` usage across the corpus and hold the profile to its expected shape. |
+| **`probe-reference-cc`** | `probe-reference-cc.py` | compile, and optionally run or dump, one probe with the reference compiler of the host a leg runs on, and keep the verdict, the diagnostics and the result redacted, so a reference is MEASURED on a host no session reaches directly. |
 | **`profile-compile`** | `profile-compile-support.py`, `profile-compile.py` | compile one fixed subject with a RELEASE dsscp on this host and report where the time went, so the HOST is the only variable across legs. |
 | **`read-leg-path`** | `read-leg-path.py` | print the tail of a file, or the newest entries of a directory, inside a leg's tree on the host that leg runs on, redacted and kept, so a remote step's log can be read without a raw ssh session. |
-| **`real-examples/c/sqlite`** | `benchmark_speedtest1.py`, `build_and_test.py`, `cli-smoke.py`, `gen-pe64-manifest.py`, `harness_legs.py`, `speedtest1_bench.py`, `sqlite_base.py`, `sqlite_build.py`, `sqlite_coherence.py`, `sqlite_common.py`, `sqlite_compiler.py`, `sqlite_corpus.py`, `sqlite_launch.py`, `sqlite_libs.py`, `sqlite_procs.py`, `sqlite_report.py`, `sqlite_smoke.py`, `sqlite_stage.py`, `sqlite_units.py`, `sqlite_verdicts.py`, `stage-zinc.py`, `test_confound_scope.py`, `test_driver_contracts.py` | prove dsscp builds SQLite from its real sources into the Tcl testfixture and the sqlite3 CLI, and runs SQLite's own unit corpus green, for every declared target. |
+| **`real-examples/c/sqlite`** | `benchmark_speedtest1.py`, `build_and_test.py`, `cli-smoke.py`, `gen-pe64-manifest.py`, `harness_legs.py`, `speedtest1_bench.py`, `sqlite_base.py`, `sqlite_build.py`, `sqlite_coherence.py`, `sqlite_common.py`, `sqlite_compiler.py`, `sqlite_corpus.py`, `sqlite_launch.py`, `sqlite_libs.py`, `sqlite_procs.py`, `sqlite_recompile.py`, `sqlite_report.py`, `sqlite_smoke.py`, `sqlite_stage.py`, `sqlite_units.py`, `sqlite_verdicts.py`, `stage-zinc.py`, `test_confound_scope.py`, `test_driver_contracts.py` | prove dsscp builds SQLite from its real sources into the Tcl testfixture and the sqlite3 CLI, and runs SQLite's own unit corpus green, for every declared target. |
 | **`refresh_landing_log`** | `refresh_landing_log.py`, `test_refresh_landing_log.py` | regenerate the PR landing-log hash anchors in the plans from git log. |
 | **`sqlite-round-trip`** | `sqlite-round-trip.py` | carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip). |
 | **`sqlite-runtime-bench`** | `sqlite-runtime-bench.py` | measure the RUNTIME of an emitted sqlite3 binary, the standing runtime-differential instrument. |

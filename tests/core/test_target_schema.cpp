@@ -1689,7 +1689,8 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // grew one, all trip it now and none of them tripped the total.
     auto r = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->registerCount(), 81u);
+    // 81 + `rip` (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    EXPECT_EQ((*r)->registerCount(), 82u);
 
     // ★★ THE COMPOSITION IS KEYED ON (class, sub-ness, WIDTH), NOT JUST
     // (class, sub-ness) — extended when the 8-bit views landed
@@ -1711,13 +1712,28 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     // ZERO, so it now means "no sub-register of a width this file does not
     // enumerate", which is a claim the old form could not make about a 2-byte
     // row. A total re-cut to 81 alone would have said strictly less.
+    // ★★★ THE INSTRUCTION POINTER IS ITS OWN BUCKET, NOT A 17th GPR (P68
+    // round 9). `rip` is a full-width `gpr` row, but it is the memory base
+    // `pcRelativeMemoryBase` names and its `encodingRole` fits no field that
+    // names no role. Counting it among `fullGpr` would re-cut that total to
+    // 17 and stop saying "rax..r15". It is counted apart, and the bucket
+    // requires BOTH facts to agree, so a general register that took the role,
+    // or a base the key names without the role, trips it.
+    auto const* pcBase = (*r)->pcRelativeMemoryBase();
+    ASSERT_NE(pcBase, nullptr) << "x86_64 declares its PC-relative memory base";
     std::size_t fullGpr = 0, subGpr32 = 0, subGpr16 = 0, subGpr8 = 0;
-    std::size_t subGprOther = 0;
+    std::size_t subGprOther = 0, instructionPointer = 0;
     std::size_t fpr = 0, flags = 0, other = 0;
+    std::uint16_t ordinal = 0;
     for (auto const& info : (*r)->registers()) {
         bool const sub = !info.subOf.empty();
+        bool const isPcBase = ordinal++ == pcBase->registerOrdinal;
         switch (info.regClass) {
             case TargetRegClass::GPR:
+                if (!sub && isPcBase && info.encodingRole == "instructionPointer") {
+                    ++instructionPointer;
+                    break;
+                }
                 if (!sub) { ++fullGpr; break; }
                 if (info.widthBytes == 4)      ++subGpr32;
                 else if (info.widthBytes == 2) ++subGpr16;
@@ -1742,6 +1758,9 @@ TEST(TargetSchema, ShippedX86_64ExactRegisterCount) {
     EXPECT_EQ(subGprOther, 0u) << "every declared sub-register is 4, 2 or 1 "
                                   "bytes wide — a row at any other width is "
                                   "one this composition does not describe";
+    EXPECT_EQ(instructionPointer, 1u)
+        << "rip: the one register `pcRelativeMemoryBase` names, carrying the "
+           "`instructionPointer` role";
     EXPECT_EQ(fpr,      16u) << "xmm0..xmm15";
     EXPECT_EQ(flags,     1u) << "rflags";
     EXPECT_EQ(other,     0u);
@@ -1989,14 +2008,14 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   {"__ARM_ARCH_ISA_A64", K::Constant, "1", {}},
                   {"__arm64__",          K::Constant, "1", {"macho"}},
                   {"__arm64",            K::Constant, "1", {"macho"}},
-                  // TF-C75: NOT an identity spelling — the PREPROCESSOR face of
-                  // this file's `charIsUnsigned` key, gated to exactly the leg
-                  // where that key's `default` (true) is the effective answer.
-                  // The macho/pe `byObjectFormat` overrides make bare `char`
-                  // SIGNED there, so the macro must NOT appear on those legs.
-                  // MEASURED 2026-07-28, `/usr/bin/clang -dM -E`: defined for
-                  // aarch64-linux-gnu only.
-                  {"__CHAR_UNSIGNED__",  K::Constant, "1", {"elf"}},
+                  // P68 round 9: `__CHAR_UNSIGNED__` is NOT a row of this file
+                  // any more. It was TF-C75's hand-gated `{"elf"}` constant — the
+                  // preprocessor face of this file's `charIsUnsigned` in a
+                  // second notation. It is now the LANGUAGE's `type-unsigned`
+                  // row naming `char`, realized per pair FROM that key (so it is
+                  // still defined on arm64 × elf alone — pinned per pair in
+                  // test_type_unsigned_predefines); its absence here is what
+                  // keeps a second owner from coming back.
                   // TF-C115 (D-PP-ENDIANNESS-PREDEFINES): the per-CPU byte-order
                   // ANSWER. UNGATED — MEASURED 2026-08-04 (`clang-19 -dM -E -x c
                   // /dev/null -target <triple>`), __LITTLE_ENDIAN__ is 1 on
@@ -2016,10 +2035,10 @@ TEST(TargetSchema, TFC74Arm64PredefinedMacrosExactSet) {
                   {"__BYTE_ORDER__",     K::Constant, "__ORDER_LITTLE_ENDIAN__", {}},
               }))
         << "arm64 must predefine the two UNIVERSAL AArch64 spellings ungated, "
-           "the two APPLE-ONLY spellings gated to macho, __CHAR_UNSIGNED__ "
-           "gated to elf — the one row whose gate is an ABI property rather "
-           "than a vendor spelling — and the two UNGATED endianness rows, with "
-           "NO __BIG_ENDIAN__ anywhere";
+           "the two APPLE-ONLY spellings gated to macho and the two UNGATED "
+           "endianness rows, with NO __BIG_ENDIAN__ anywhere — and no "
+           "__CHAR_UNSIGNED__ row: that macro is the language's type-unsigned "
+           "row, derived from charIsUnsigned (P68 round 9)";
 }
 
 // The x86_64 twin: MEASURED identical on x86_64-linux-gnu, x86_64-apple-darwin

@@ -2080,6 +2080,88 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
         }
     }
 
+    // ── pcRelativeMemoryBase (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER)
+    //
+    // The loader resolved the three names; what they must BE is judged here,
+    // because each rule is what keeps the program counter from being encoded or
+    // allocated as an ordinary register — a silent wrong answer in every case.
+    if (pcRelativeMemoryBase.has_value()) {
+        auto const& pc = *pcRelativeMemoryBase;
+        std::string const root{"/pcRelativeMemoryBase"};
+        if (pc.registerOrdinal >= registers.size()) {
+            fail(root + "/register",
+                 "the program-counter register resolved to no row");
+        } else {
+            auto const& r = registers[pc.registerOrdinal];
+            if (!r.subOf.empty()) {
+                fail(root + "/register",
+                     std::format("register '{}' is a view of '{}' — the program "
+                                 "counter is a whole register", r.name, r.subOf));
+            }
+            // ★ A NON-DEFAULT ROLE IS WHAT MAKES EVERY OTHER FIELD REFUSE IT:
+            // a field naming no `regRole` fits only a role-less register or the
+            // group's default reading. Without one, `movq %rip, %rax` would
+            // encode the register's number as an ordinary register (gas refuses
+            // it: "`%rip' not allowed").
+            if (r.encodingRole.empty() || r.encodingRoleIsDefault) {
+                fail(root + "/register",
+                     std::format("register '{}' must declare an 'encodingRole' "
+                                 "that is NOT its group's default reading — that "
+                                 "is what makes every operand field naming no "
+                                 "role refuse the program counter", r.name));
+            }
+            // ★ NEVER ALLOCATABLE, NEVER A FRAME REGISTER. Allocation draws only
+            // from `kAllocatablePoolLists`; a convention naming the program
+            // counter there would hand it to the allocator.
+            for (std::size_t ci = 0; ci < callingConventions.size(); ++ci) {
+                auto const& cc = callingConventions[ci];
+                bool named =
+                    (cc.stackPointer.has_value() && cc.stackPointer->name == r.name)
+                    || (cc.framePointer.has_value()
+                        && cc.framePointer->name == r.name);
+                for (std::size_t li = 0; li < kAllocatablePoolLists.size(); ++li) {
+                    for (auto const& ref : cc.*(kAllocatablePoolLists[li])) {
+                        named = named || ref == r.name;
+                    }
+                }
+                if (named) {
+                    fail(std::format("/callingConventions/{}", ci),
+                         std::format("callingConvention '{}' names '{}', the "
+                                     "program counter, as an allocatable, stack "
+                                     "or frame register — it is a memory base "
+                                     "only", cc.name, r.name));
+                }
+            }
+        }
+        for (std::size_t si = 0; si < pc.memoryBaseSlots.size(); ++si) {
+            EncodingSlotKind const sk = pc.memoryBaseSlots[si];
+            if (!slotKindAddressesPcRelative(sk)) {
+                fail(std::format("{}/memoryBaseSlots/{}", root, si),
+                     std::format("slot kind '{}' has no program-counter-relative "
+                                 "form in its encoding walker, so a program "
+                                 "counter wired into it would be encoded as an "
+                                 "ordinary base register",
+                                 encodingSlotKindName(sk)));
+            }
+        }
+        bool relocationFound = false;
+        for (auto const& rel : relocations) {
+            if (rel.kind != pc.symbolicDisplacementRelocation) continue;
+            relocationFound = true;
+            if (!rel.pcRelative) {
+                fail(root + "/symbolicDisplacementRelocation",
+                     std::format("relocation '{}' is not PC-relative — a "
+                                 "displacement against the program counter is "
+                                 "the distance to its symbol, never the "
+                                 "symbol's address", rel.name));
+            }
+        }
+        if (!relocationFound) {
+            fail(root + "/symbolicDisplacementRelocation",
+                 "the relocation resolved to no row");
+        }
+    }
+
     // ── registerClassOps (FC2 Part B, class×class per
     //    D-TARGET-NO-CROSS-CLASS-MOVE-VERB) ───────────────────────
     // Every DECLARED mnemonic must resolve to an opcode row

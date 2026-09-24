@@ -8,9 +8,9 @@ pinned by CALLING the driver's own functions -- the very function objects produc
 driving the real resume loop, the real ledger and the real gates -- and every pin is proven
 non-vacuous by MUTATING a temporary COPY of the module that owns the guard (red-on-disable):
 
-  DC-01 .. DC-22  green pins; each carries the UNION of both twins' arms for its subject, plus
+  DC-01 .. DC-26  green pins; each carries the UNION of both twins' arms for its subject, plus
                   the negatives neither twin had (report 09, section E.4);
-  RD-01 .. RD-42  red arms; each MUTATES a copy of one driver module -- fail-closed: the witness
+  RD-01 .. RD-52  red arms; each MUTATES a copy of one driver module -- fail-closed: the witness
                   occurs EXACTLY once, the mutant bytes (or AST) differ, the witness is absent,
                   it parses, compiles and IMPORTS under a unique module name kept out of
                   sys.modules -- and re-runs the SAME pin, which must go red ON A CHECK THE ARM
@@ -61,6 +61,7 @@ import re  # noqa: E402
 import shutil  # noqa: E402
 import stat  # noqa: E402
 import subprocess  # noqa: E402
+import sysconfig  # noqa: E402
 import tempfile  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
@@ -470,6 +471,10 @@ class FakeResolver:
             return self.C.Result(64, "", "the contract suite's fake resolver was not scripted for: %s"
                                  % " ".join(args))
         return got
+
+    def json(self, args, what, catalogue=True, ok=(0,)):
+        """The driver's OWN JSON-reading rule (`sqlite_common.Resolver.json`) over the scripted answers."""
+        return self.C.Resolver.json(self, args, what, catalogue=catalogue, ok=ok)
 
 
 def deterministic_translator(calls):
@@ -2403,6 +2408,118 @@ def pin_dc21(t, x):
          "build/ is not", [os.path.normcase(os.path.abspath(vtree))],
          [os.path.normcase(c.tree) for c in cands])
 
+    # ── (A) THE REFRESH ROUTE COMES FROM THE TREE'S OWNER, AND FROM CONFIG ───────────────────────
+    # ✔MEASURED 2026-09-22: without DSS_BIN on Windows, Step 5 refreshed build/x86_64-msvc-release with a
+    # plain `cmake --build`, which needs the Visual Studio developer environment whenever anything is
+    # stale. The route is now read from the tree's DssHarness marker, the leg declared for its variant on
+    # this host, and that leg's toolchain's `developerEnvironment` -- the fixture's toolchains are named
+    # `tc-env` / `tc-plain` so nothing here can pass by a toolchain name. ⓘ `dssharness build` rebuilds a
+    # leg's whole project from CLEAN when any input changed (DssHarness report #2): the tool's route can
+    # cost a full build where `cmake --build` is incremental -- the cost is upstream's, the route correct.
+    here = CMP._host_leg_os(x.C.host_os())
+    repo4 = x.sub("repo-owner")
+
+    def harness_cfg(env_declared):
+        write_bytes(os.path.join(repo4, ".harness-config", "config.json"), json.dumps({
+            "legs": {"leg-env": {"os": here, "processor": "x86_64", "toolchain": "tc-env", "config": "release"},
+                     "leg-plain": {"os": here, "processor": "x86_64", "toolchain": "tc-plain",
+                                   "config": "release"},
+                     "leg-elsewhere": {"os": "plan9", "processor": "x86_64", "toolchain": "tc-env",
+                                       "config": "debug"}},
+            "toolchains": {"tc-env": {"developerEnvironment": "env-x"} if env_declared else {},
+                           "tc-plain": {}}}))
+    harness_cfg(True)
+    env_tree, env_bin = fake_tree(repo4, "build/x86_64-tc-env-release", "Release")
+    write_bytes(os.path.join(env_tree, ".harness-build"), b"clean\nx86_64-tc-env-release\nin 00 CMakeLists.txt\n")
+    plain_tree, _pb = fake_tree(repo4, "build/x86_64-tc-plain-release", "Release")
+    write_bytes(os.path.join(plain_tree, ".harness-build"), b"clean\nx86_64-tc-plain-release\n")
+    bare_tree, _bb = fake_tree(repo4, "build/rel", "Release")
+    odd_tree, _ob = fake_tree(repo4, "build/x86_64-tc-env-debug", "Release")
+    write_bytes(os.path.join(odd_tree, ".harness-build"), b"clean\nx86_64-tc-env-debug\n")
+    tool = "/fixture/dssharness"
+    t.eq("P15", "a tree DssHarness built for a leg whose toolchain DECLARES a developer environment is refreshed "
+         "by the tool, which enters it", [tool, "build", "--legs", "leg-env", "-C", repo4, "--no-prompt"],
+         CMP.refresh_argv(repo4, env_tree, 7, harness=tool)[0])
+
+    def plain(tree_):
+        return ["cmake", "--build", tree_, "--config", "Release", "--target", "dsscp", "-j", "7"]
+    t.eq("P16", "CONTROL: a DssHarness tree whose toolchain declares none, a tree with no marker, and a variant no "
+         "leg on this host declares each take the plain incremental build",
+         [plain(plain_tree), plain(bare_tree), plain(odd_tree)],
+         [CMP.refresh_argv(repo4, tr, 7, harness=tool)[0] for tr in (plain_tree, bare_tree, odd_tree)])
+    harness_cfg(False)
+    t.eq("P17", "THE ROUTE IS CONFIG: the same tree, its toolchain no longer declaring the environment, takes the "
+         "plain build -- nothing in code names a toolchain", plain(env_tree),
+         CMP.refresh_argv(repo4, env_tree, 7, harness=tool)[0])
+    harness_cfg(True)
+    newest = time.time() + 5
+    os.utime(env_bin, (newest, newest))
+    ran = []
+    fake_c = Proxy(x.C, capture=lambda argv, **_kw: (ran.append(list(argv)), x.C.Result(0, "", ""))[1])
+    CMPx = x.M.fresh("sqlite_compiler", C=fake_c, harness_executable=lambda environ=None: tool)
+    with patched_environ(unset=x.suite.knobs):
+        r, comp = refused(CMPx.obtain, repo4, 7, False, log=x.log())
+    t.eq("P18", "Step 5's DEFAULT refresh of that located tree runs the tool's command (the call site takes the "
+         "owner's route)", [[tool, "build", "--legs", "leg-env", "-C", repo4, "--no-prompt"]], ran)
+
+    # ── (B) THE STAMP IS THE CODE'S, NAMED, AND IT ORDERS THE CANDIDATES ─────────────────────────
+    repo5 = x.sub("repo-stamp")
+    tree_a, bin_a = fake_tree(repo5, "build/a-rel", "Release")
+    lib_a = write_bytes(os.path.join(tree_a, "bin", "dss", "libdsscp.so"), b"code a\n")
+    tree_b, bin_b = fake_tree(repo5, "build/b-rel", "Release")
+    lib_b = write_bytes(os.path.join(tree_b, "bin", "dss", "libdsscp.so"), b"code b\n")
+    base = time.time() - 10000
+    for path_, at in ((bin_a, 500), (lib_a, 100), (bin_b, 200), (lib_b, 400)):
+        os.utime(path_, (base + at, base + at))
+    cands5, _searched5 = CMP.find_candidates(repo5)
+    cand_a = CMP.build_type(bin_a)
+    t.ck("P19", "a candidate's stamp is its CODE's -- the library beside the launcher -- and the line names that file",
+         abs(cand_a.mtime - (base + 100)) < 1 and cand_a.image == os.path.abspath(lib_a)
+         and CMP.built_stamp(cand_a).endswith("(libdsscp.so)"), (cand_a, CMP.built_stamp(cand_a)))
+    seen_images = []
+    for spelling in ("dsscp.dll", "libdsscp.dll", "libdsscp.so", "libdsscp.dylib"):
+        tree_s, bin_s = fake_tree(repo5, "build/s-%s" % spelling.replace(".", "-"), "Release")
+        write_bytes(os.path.join(tree_s, "bin", "dss", spelling), b"code\n")
+        seen_images.append(os.path.basename(CMP.build_type(bin_s).image))
+    t.eq("P19b", "...in each spelling the builds this project uses write -- MSVC, MinGW, ELF and Mach-O "
+         "(read 2026-09-23 in build/x86_64-msvc-release, build/mig, the WSL tree)",
+         ["dsscp.dll", "libdsscp.dll", "libdsscp.so", "libdsscp.dylib"], seen_images)
+    t.eq("P20", "a NEWER launcher over OLDER code LOSES: the candidates are ordered by their code's stamp",
+         [os.path.normcase(os.path.abspath(tree_b)), os.path.normcase(os.path.abspath(tree_a))],
+         [os.path.normcase(c.tree) for c in cands5])
+    tree_c, bin_c = fake_tree(repo5, "build/c-rel", "Release")
+    cand_c = CMP.build_type(bin_c)
+    t.ck("P21", "CONTROL: with no library beside it the executable IS the code, and its own time is the stamp",
+         cand_c.image == os.path.abspath(bin_c) and abs(cand_c.mtime - os.path.getmtime(bin_c)) < 1, cand_c)
+
+    # ── (C) THE TOOL IS FOUND WHERE ITS INSTALLER PUTS IT, UNDER THIS HOST'S OWN FILE NAME ───────────
+    # ✔MEASURED 2026-09-23: the first form of this search spelled a Windows suffix beside the name, which
+    # `HarnessLegs.NeitherDriverNamesTheArtefactTheCompilerDoes` refuses. The fixture's file takes Python's
+    # own platform executable suffix (`sysconfig` EXE: '.exe' on Windows, '' on Linux), so the arm names
+    # none either. ⚠ NOT the interpreter's file name: under ctest on Linux that is `python3.12`, whose
+    # ".12" the first draft of this arm took for a suffix (✔MEASURED red in the WSL proof tree).
+    home = x.sub("home-with-tool")
+    tools = os.path.join(home, ".dotnet", "tools")
+    installed = write_bytes(os.path.join(tools, "DssHarness" + (sysconfig.get_config_var("EXE") or "")),
+                            b"tool\n")
+    os.chmod(installed, 0o755)
+    # ⚠ BY FILE IDENTITY, NOT BY SPELLING: on a case-INSENSITIVE filesystem (macOS's default APFS, Windows' NTFS)
+    # the FIRST spelling, `dssharness`, already names the file installed as `DssHarness`, so the search answers that
+    # spelling -- the installed tool under another name. `os.path.normcase` folds case on Windows only, so comparing
+    # the two strings was red on macOS alone (✔MEASURED 2026-09-24, P68 round-9 gate, both macOS legs: expected
+    # `.../.dotnet/tools/DssHarness`). On a case-sensitive filesystem the first spelling is absent and the second is
+    # the one found, as the label says.
+    found = CMP.harness_executable({"PATH": "", "HOME": home})
+    t.ck("P22", "with nothing on PATH, the tool is found in <home>/.dotnet/tools under its second spelling (the "
+         "installed FILE, whatever case the filesystem folds)",
+         bool(found) and os.path.samefile(installed, found)
+         and os.path.normcase(os.path.dirname(os.path.abspath(found))) == os.path.normcase(os.path.abspath(tools)),
+         "installed=%r found=%r" % (installed, found))
+    empty_home = x.sub("home-without-tool")
+    os.makedirs(os.path.join(empty_home, ".dotnet", "tools"))
+    t.eq("P22b", "CONTROL: an empty tools directory finds nothing", "",
+         CMP.harness_executable({"PATH": "", "HOME": empty_home}))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
 # DC-22 -- what a leftover-fixture sweep LEARNT reaches the leg's verdict (the REAL run_corpus)
@@ -2464,6 +2581,557 @@ def pin_dc22(t, x):
          (s2.segments, s2.stop, asked2, hyg2))
     t.ck("H08", "NEGATIVE: ...and the verdict has no [PROCESS HYGIENE suffix",
          verdict2.startswith("FAIL:PRECONDITION") and "[PROCESS HYGIENE" not in verdict2, verdict2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-23 -- a failed self-test's REPORT carries each failing arm's DETAIL, not only its name
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# ✔MEASURED 2026-09-23: four sqlite_base arms failed on macOS, and Step 0's report -- the only
+# text the gate receives from a host it reaches through a runner -- kept each arm's NAME and
+# dropped the OBSERVED/EXPECTED lines printed under it, because only a line with `FAIL` in it
+# was kept. The fixture below puts the failing arm OUTSIDE the tail, so the tail cannot carry it.
+
+def pin_dc23(t, x):
+    bt = x.M.mod("build_and_test")
+    detail = ["         EXPECTED: ['a.o']", "         OBSERVED: ['a.o/']",
+              "           argv   : ['ar', 't', 'x.a']"]
+    fillers = ["  [PASS] p%02d filler" % i for i in range(30)]
+    out = "\n".join(["== m --self-test ==", "  [PASS] a before", "  [FAIL] n28 lists the members"]
+                    + detail + ["  [PASS] b after"] + fillers + ["", "passed=32 failed=1 skipped=0"])
+    rep = bt._failure_report(out)
+    head = rep.split("the last ")[0]
+    t.ck("F00", "CONTROL: the fixture's failing arm lies OUTSIDE the tail the report also prints",
+         not any("EXPECTED" in ln for ln in out.splitlines()[-20:]), out.splitlines()[-20:])
+    t.has("F01", "the failing arm's NAME is in the report", head, "[FAIL] n28 lists the members")
+    t.has("F02", "...and, right under it, every detail line the arm printed (what it expected, what it "
+          "observed, the host tool's argv)", head, "\n".join(["  [FAIL] n28 lists the members"] + detail))
+    t.lacks("F03", "NEGATIVE: the next arm's line is not taken for detail (it is not indented deeper)", head,
+            "[PASS] b after")
+    many = ["         d%03d" % i for i in range(200)]
+    rep2 = bt._failure_report("\n".join(["  [FAIL] big"] + many + ["passed=0 failed=1 skipped=0"]))
+    head2 = rep2.split("the last ")[0]
+    t.ck("F04", "a detail longer than the cap is CUT, and the cut says how many lines it dropped",
+         "d079" in head2 and "d080" not in head2 and "120 more detail line(s) not shown" in head2, head2[-300:])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-24 -- Step 0 runs EVERY suite, then names every failure in ONE refusal
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# ✔MEASURED 2026-09-23: Step 0 stopped at the first failing suite, so on the Mac the failures of
+# `sqlite_stage.py` surfaced only after `sqlite_base.py` was fixed -- one gate, and one round trip
+# to a host reached only through a runner, per suite. The REAL step0 runs here over a private copy
+# of build_and_test whose `C.capture` answers for the suites (two of them failing) and whose
+# resolver answers the self-test and the lint.
+
+def pin_dc24(t, x):
+    real_c = x.M.mod("sqlite_common")
+
+    def drive(failing):
+        ran = []
+        fake = types.SimpleNamespace(**dict((k, getattr(real_c, k)) for k in dir(real_c) if not k.startswith("__")))
+
+        def capture(argv, env_=None, merge=False, **_kw):
+            name = next((os.path.basename(a) for a in argv if str(a).endswith(".py")), "?")
+            ran.append(name)
+            if name in failing:
+                return real_c.Result(1, "  [FAIL] x the pinned failure of %s\npassed=0 failed=1 skipped=0\n" % name, "")
+            return real_c.Result(0, "passed=3 failed=0 skipped=0\n", "")
+        fake.capture = capture
+        bt = x.M.fresh("build_and_test", C=fake)
+        res = FakeResolver(lambda a: real_c.Result(0, "passed=5 failed=0\n", "") if a == ["--self-test"]
+                           else real_c.Result(0, "", "") if a == ["--lint"] else None, real_c)
+        run = types.SimpleNamespace(log=real_c.Log(io.StringIO()), cfg=types.SimpleNamespace(skip_selftest=False),
+                                    resolver=res)
+        with contextlib.redirect_stderr(io.StringIO()):
+            r, msg = refused(bt.step0, run)
+        return list(bt.SELF_TESTS + bt.MODULE_SELF_TESTS), ran, r, str(msg), res.asked
+    every, ran, r, msg, asked = drive(("sqlite_base.py", "sqlite_stage.py"))
+    t.eq("Z01", "EVERY suite ran although an early one (sqlite_base.py) failed", every, ran)
+    t.ck("Z02", "ONE refusal names BOTH failing suites and counts them",
+         r and "sqlite_base.py (rc=1)" in msg and "sqlite_stage.py (rc=1)" in msg and "2 of Step 0's checks" in msg,
+         msg)
+    t.eq("Z03", "...and the leg plan's self-test and the lint still ran after them", [["--self-test"], ["--lint"]],
+         asked)
+    every2, ran2, r2, msg2, _a2 = drive(())
+    t.ck("Z04", "CONTROL: every suite green -> Step 0 returns, no refusal", not r2 and ran2 == every2, msg2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-25 -- a leg's declared TU preludes reach the manifest generator, or the leg is POISONED
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The driver's half of `build.tuPreludes` (legs.json): the declaration is written beside the
+# leg's manifest and handed to the generator, and a generator that cannot apply it must stop
+# the leg -- building without the prelude compiles the TU its leg said needs one.
+
+def pin_dc25(t, x):
+    bld = x.M.mod("sqlite_build")
+    entries = [{"tu": "ext/misc/fileio.c", "artifacts": ["testfixture"], "lines": ["#include <dirent.h>"]}]
+    with_p = types.SimpleNamespace(label="pe64-x86_64", build={"recipeTransform": "windows-selfconfig",
+                                                                "tuPreludes": entries})
+    without = types.SimpleNamespace(label="elf64-x86_64", build={"recipeTransform": "none"})
+    outd = x.sub("dc25")
+    path = bld.write_tu_preludes(with_p, outd)
+    got = json.loads(read_text(path)) if path and os.path.isfile(path) else None
+    t.ck("P01", "a leg that declares TU preludes has them written beside its manifest, verbatim",
+         got == entries and os.path.dirname(path) == outd, (path, got))
+    empty = x.sub("dc25-none")
+    t.ck("P02", "CONTROL: a leg that declares none gets \"\" and no file (its generator argv is unchanged)",
+         bld.write_tu_preludes(without, empty) == "" and os.listdir(empty) == [], os.listdir(empty))
+    caps_no = {"recipeTransform": True, "stackReserve": True, "tuPreludes": False}
+    caps_yes = dict(caps_no, tuPreludes=True)
+    blocked = bld.manifest_blockers(with_p, caps_no, "inc.txt")
+    t.ck("P03", "a generator WITHOUT --tu-preludes POISONS a leg that declares preludes, naming the TU",
+         any("tuPreludes" in b and "<ext/misc/fileio.c>" in b for b in blocked), blocked)
+    t.eq("P04", "CONTROL: a generator that takes --tu-preludes blocks nothing, and a leg without preludes is never "
+         "blocked for them", ([], []), (bld.manifest_blockers(with_p, caps_yes, "inc.txt"),
+                                         bld.manifest_blockers(without, caps_no, "inc.txt")))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-26 -- a declared TU prelude reaches BOTH compilers: dsscp and the same-platform reference
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# The whole data path, through the REAL Steps 7 and 7b over the SHIPPED plan's pe64 and ELF legs:
+# legs.json `build.tuPreludes` -> the plan -> `write_tu_preludes` -> the REAL generator -> ONE
+# manifest, read by (a) the REAL `build_artifact`, which spawns a stand-in dsscp that prints the
+# sources its `--project` manifest names, and (b) harness_legs' REAL `build_reference_oracle`, which
+# composes the reference compiler's argv from the manifest the driver handed `--build-reference-
+# oracle` (its compiler probe, lookup and spawn injected: no toolchain is needed). Stubbed: only the
+# steps' host-bound collaborators -- the coherence gate, the include-list writer, the run-dir plan,
+# the leftover sweep and the library argv.
+
+DC26_DSSCP = ("import json, sys\n"
+              "a = sys.argv[1:]\n"
+              "m = a[a.index('--project') + 1]\n"
+              "print('DTC-DSSCP-PROJECT ' + m)\n"
+              "with open(m, encoding='utf-8') as fh:\n"
+              "    doc = json.load(fh)\n"
+              "for s in doc.get('sources') or []:\n"
+              "    print('DTC-DSSCP-SOURCE ' + s)\n")
+DC26_TRIPLES = {"pe64-x86_64": "x86_64-w64-mingw32", "elf64-x86_64": "x86_64-linux-gnu"}
+DC26_TU = "ext/misc/fileio.c"
+
+
+def _dc26_norm(p):
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _dc26_fileio(paths):
+    return [p for p in paths if str(p).replace("\\", "/").endswith("/" + DC26_TU)]
+
+
+def _dc26_dsscp_saw(outd):
+    """(the --project paths, the sources) the stand-in dsscp printed into `<outd>/compile.log`."""
+    path = os.path.join(outd, "compile.log")
+    lines = read_text(path).splitlines() if os.path.isfile(path) else []
+    return ([ln[len("DTC-DSSCP-PROJECT "):] for ln in lines if ln.startswith("DTC-DSSCP-PROJECT ")],
+            [ln[len("DTC-DSSCP-SOURCE "):] for ln in lines if ln.startswith("DTC-DSSCP-SOURCE ")])
+
+
+def pin_dc26(t, x):
+    C, B, hl = x.C, x.M.mod("sqlite_base"), x.suite.hl
+    catalogue = os.path.join(HERE, "legs.json")
+    by = dict((d["label"], d) for d in x.suite.plan("windows", "x86_64", "wsl.exe").get("legs") or [])
+    shipped = [e for e in ((by.get("pe64-x86_64") or {}).get("build") or {}).get("tuPreludes") or []
+               if isinstance(e, dict) and e.get("tu") == DC26_TU]
+    if not t.ck("Q00", "the SHIPPED plan carries the pe64 and ELF legs, the pe leg declaring a prelude for <%s> for "
+                "the testfixture, the ELF leg none" % DC26_TU,
+                len(shipped) == 1 and "testfixture" in (shipped[0].get("artifacts") or [])
+                and "elf64-x86_64" in by and not by["elf64-x86_64"]["build"].get("tuPreludes"), sorted(by)):
+        return
+    fx = x.sub("dc26-src")
+    real = write_bytes(os.path.join(fx, "sqlite", *DC26_TU.split("/")), "int dc26_fileio;\n")
+    lists = {"tus": [write_bytes(os.path.join(fx, "sqlite", "src", "dc26_main.c"), "int dc26_main;\n"), real],
+             "cli-tus": [write_bytes(os.path.join(fx, "sqlite", "src", "dc26_shell.c"), "int dc26_shell;\n"), real],
+             "includes": [os.path.join(fx, "inc")], "defines": ["DC26=1"]}
+    files = dict((k, write_bytes(os.path.join(fx, k + ".txt"), "".join(v + "\n" for v in vals)))
+                 for k, vals in lists.items())
+    dsscp = write_bytes(os.path.join(fx, "dc26_dsscp.py"), DC26_DSSCP)
+    cat_legs = hl.load_catalogue(catalogue)
+    oracle = {}
+
+    def answer(a):
+        if a[:1] != ["--build-reference-oracle"]:
+            return None
+        label, manifest = a[1], a[a.index("--manifest") + 1]
+        decl = hl.leg_by_label(cat_legs, label, catalogue)
+        spawned = []
+
+        def spawn(argv):
+            spawned.append(list(argv))
+            write_bytes(argv[argv.index("-o") + 1], b"DC26")
+            return 0, b""
+        rep, rc, notes = hl.build_reference_oracle(
+            decl, manifest, os.path.join(a[a.index("--oracle-dir") + 1], hl.reference_oracle_name(decl)),
+            a[a.index("--oracle-log") + 1], runner=lambda _argv: (0, DC26_TRIPLES.get(label, "") + "\n"),
+            which=lambda name: "/dc26/bin/" + name, spawn=spawn)
+        oracle.setdefault(label, []).append((manifest, spawned))
+        return C.Result(rc, json.dumps(rep) + "\n", "\n".join(notes))
+
+    def library_argv(_run, lg, which, _log):
+        return ([tok for w in which for tok in ("--resolve-library", lg.tcl_lib_any if w == "tcl" else lg.z_lib_any)],
+                "the contract suite's library argv")
+
+    def drive(tag, pe_preludes=None, steps=("7", "7b")):
+        log = x.log()
+        run = make_run(x, log, x.sub("dc26-out-" + tag))
+        for label in ("pe64-x86_64", "elf64-x86_64"):
+            d = copy.deepcopy(by[label])
+            if label == "pe64-x86_64" and pe_preludes is not None:
+                d["build"]["tuPreludes"] = pe_preludes
+            lg = C.Leg(d)
+            lg.tcl_lib = lg.tcl_lib_any = os.path.join(fx, "dc26-tcl.lib")
+            lg.z_lib = lg.z_lib_any = os.path.join(fx, "dc26-z.lib")
+            lg.inc_file = lg.cli_inc_file = files["includes"]
+            run.legs.append(lg)
+        run.stage = {"fixture_recipe": {"tus": files["tus"], "defines": files["defines"]},
+                     "cli_recipe": {"tus": files["cli-tus"], "defines": files["defines"]}}
+        run.ledger = C.Ledger(x.suite.vocab, log)
+        run.artifacts = B.VerdictLedger()
+        run.compiler = types.SimpleNamespace(path=[sys.executable, dsscp])
+        run.resolver = FakeResolver(answer, C)
+        oracle.clear()
+        bld = x.M.fresh("sqlite_build", coherence_gate=lambda *_a, **_k: None,
+                        write_include_lists=lambda *_a, **_k: None, leg_run_dir_plan=lambda *_a, **_k: None,
+                        preflight_sweep=lambda *_a, **_k: [], library_argv=library_argv)
+        if "7" in steps:
+            bld.step7(run)
+        else:
+            run.gen_caps = bld.generator_caps(run)
+        if "7b" in steps:
+            bld.step7b(run)
+        return run, dict((lg.label, run.leg_out(lg)) for lg in run.legs), dict(oracle)
+
+    run, outs, orc = drive("shipped")
+    reach = {}
+    for label, outd in sorted(outs.items()):
+        proj, srcs = _dc26_dsscp_saw(outd)
+        calls = orc.get(label) or []
+        o_manifest, o_argvs = calls[0] if len(calls) == 1 else ("", [])
+        reach[label] = (proj, srcs, o_manifest, o_argvs[0] if len(o_argvs) == 1 else [])
+    want_m = dict((label, _dc26_norm(os.path.join(outd, "%s.dss-project.json" % label))) for label, outd in outs.items())
+    t.ck("Q01", "Step 7 hands EACH leg's ONE manifest to both compilers: the stand-in dsscp's --project and the "
+         "reference oracle's --manifest name the same file, and each compiler ran exactly once",
+         all([_dc26_norm(p) for p in r[0]] == [want_m[label]] and _dc26_norm(r[2]) == want_m[label] and r[3]
+             for label, r in reach.items()) and sorted(reach) == ["elf64-x86_64", "pe64-x86_64"],
+         "%r\n%s" % (reach, text(run.log)[-1500:]))
+    pe_proj, pe_srcs, _pe_m, pe_argv = reach.get("pe64-x86_64", ([], [], "", []))
+    tu_dir = _dc26_norm(os.path.join(outs.get("pe64-x86_64", ""), "tu-preludes")) + os.sep
+    fio = _dc26_fileio(pe_srcs)
+    wrapper = fio[0] if len(fio) == 1 and _dc26_norm(fio[0]).startswith(tu_dir) else ""
+    t.ck("Q02", "pe64: dsscp compiles the generated WRAPPER in place of <%s>, and never the real TU" % DC26_TU,
+         wrapper and _dc26_norm(real) not in [_dc26_norm(s) for s in pe_srcs], pe_srcs)
+    t.ck("Q03", "pe64: the reference compiler's argv, composed from the manifest the driver handed it, carries the "
+         "SAME wrapper and not the real TU",
+         wrapper and [_dc26_norm(a) for a in _dc26_fileio(pe_argv)] == [_dc26_norm(wrapper)]
+         and _dc26_norm(real) not in [_dc26_norm(a) for a in pe_argv], (wrapper, pe_argv))
+    got = ([ln for ln in read_text(wrapper).splitlines() if ln.lstrip().startswith("#")]
+           if wrapper and os.path.isfile(wrapper) else None)
+    t.eq("Q04", "pe64: the wrapper holds the SHIPPED declared lines, in order, then #include of the real TU, last",
+         list(shipped[0]["lines"]) + ['#include "%s"' % real.replace("\\", "/")], got)
+    elf_proj, elf_srcs, _elf_m, elf_argv = reach.get("elf64-x86_64", ([], [], "", []))
+    elf_out = outs.get("elf64-x86_64", "")
+    t.ck("Q05", "NEGATIVE: the ELF leg declares no prelude -- both of its compilers get the real TU, and no "
+         "tu-preludes file or directory is written for it",
+         [_dc26_norm(s) for s in _dc26_fileio(elf_srcs)] == [_dc26_norm(real)]
+         and [_dc26_norm(a) for a in _dc26_fileio(elf_argv)] == [_dc26_norm(real)]
+         and not os.path.exists(os.path.join(elf_out, "tu-preludes.json"))
+         and not os.path.exists(os.path.join(elf_out, "tu-preludes")), (elf_srcs, elf_argv))
+    _p, cli_srcs = _dc26_dsscp_saw(os.path.join(outs.get("pe64-x86_64", ""), "cli"))
+    t.ck("Q07", "CONTROL: the SHIPPED declaration names the testfixture only, so the pe64 sqlite3 CLI (Step 7b) "
+         "compiles the real TU", [_dc26_norm(s) for s in _dc26_fileio(cli_srcs)] == [_dc26_norm(real)], cli_srcs)
+    both = [dict(shipped[0], artifacts=["testfixture", "sqlite3"])]
+    run2, outs2, _orc2 = drive("cli-declared", pe_preludes=both, steps=("7b",))
+    cli_out = os.path.join(outs2.get("pe64-x86_64", ""), "cli")
+    _p2, cli_srcs2 = _dc26_dsscp_saw(cli_out)
+    fio2 = _dc26_fileio(cli_srcs2)
+    t.ck("Q06", "a declaration that ALSO names sqlite3 reaches Step 7b: the pe64 CLI's dsscp compiles a wrapper "
+         "(under the CLI's own output) in place of the real TU",
+         len(fio2) == 1 and _dc26_norm(fio2[0]).startswith(_dc26_norm(os.path.join(cli_out, "tu-preludes")) + os.sep),
+         "%r\n%s" % (cli_srcs2, text(run2.log)[-1200:]))
+
+
+# ── DC-27: the round-close RECOMPILE (`build_and_test.py --recompile <leg>`) ─────────
+# (A) the stage-currency rule, `stage_findings`, over a synthetic stage whose per-target headers are
+# written by stage-zinc's OWN writers for the SHIPPED pe64 leg's declarations: current -> no reason;
+# each single drift -> exactly the reason that names it. (B) the whole mode through the REAL
+# `recompile()`: the REAL stage loader and currency check, the REAL include-list writer, generator and
+# `fixture_manifest`, the REAL `build_artifact` spawning a stand-in dsscp, and the census asked of the
+# REAL `harness_legs.py --recompile-verdicts` (in this process, through the module set a red arm
+# mutates). Stubbed: only the host-bound collaborators -- the compiler pairing and its pre-flight
+# (DC-18/DC-21 pin those), library acquisition (DC-08), and the one-vintage gate (sqlite_coherence's
+# own self-test).
+
+DC27_LEG = "pe64-x86_64"
+DC27_TUS = ("src/alter.c", "src/test1.c", "ext/misc/fileio.c")
+# A stand-in dsscp: it reads its --project manifest and either reports an artefact, or -- when
+# DTC_DSSCP_REFUSE names a TU's tail -- refuses that TU with an error located where dsscp would put
+# it: in the REAL file, which for a prelude wrapper is the file the wrapper #includes.
+DC27_DSSCP = ("import json, os, sys\n"
+              "a = sys.argv[1:]\n"
+              "print('DTC-DSSCP-ARGV ' + json.dumps(a))\n"
+              "with open(a[a.index('--project') + 1], encoding='utf-8') as fh:\n"
+              "    doc = json.load(fh)\n"
+              "spec = doc['targets'][0]\n"
+              "want = os.environ.get('DTC_DSSCP_REFUSE', '')\n"
+              "for s in doc['sources']:\n"
+              "    p = s.replace(chr(92), '/')\n"
+              "    if want and p.endswith('/' + want):\n"
+              "        body = open(s, encoding='utf-8').read().strip().splitlines()\n"
+              "        if '/tu-preludes/' in p and body and body[-1].startswith('#include \"'):\n"
+              "            p = body[-1][len('#include \"'):-1]\n"
+              "        print('error[S_ConstViolation]: [target=%s] increment or decrement of `objv`, a '\n"
+              "              'const-qualified object' % spec)\n"
+              "        print('  --> %s:4335:9' % p)\n"
+              "        print('   |')\n"
+              "        sys.exit(1)\n"
+              "art = os.path.join(a[a.index('--output') + 1], spec.split(':', 1)[1], doc['artifactName'] + '.exe')\n"
+              "os.makedirs(os.path.dirname(art), exist_ok=True)\n"
+              "open(art, 'wb').write(b'MZ')\n"
+              "print('dsscp: artifact %s %s' % (spec, art))\n")
+DC27_ZCONF = ("#if 1    /* was set to #if 1 by ./configure */\n#  define Z_HAVE_UNISTD_H\n#endif\n"
+              "#if 1    /* was set to #if 1 by ./configure */\n#  define Z_HAVE_STDARG_H\n#endif\n")
+DC27_CFG = "#define HAVE_PREAD64 1\n#define HAVE_PWRITE64 1\n#define HAVE_MALLOC_H 1\n"
+
+
+def _dc27_stage(x, root, leg, sb, zinc_mod):
+    """A synthetic staged sqlite state under `root/stage`, CURRENT for `leg` under the catalogue's
+    stage-build `sb` -> the derive-result dict (the file is written too)."""
+    S = importlib.import_module("sqlite_stage")
+    st = os.path.join(root, "stage")
+    tus = [write_bytes(os.path.join(st, "sqlite", *tu.split("/")), "int dc27_%d;\n" % i)
+           for i, tu in enumerate(DC27_TUS)]
+    lists = {"tus": tus, "defines": ["DC27=1"], "includes": [os.path.join(st, "sqlite", "src")]}
+    files = dict((k, write_bytes(os.path.join(st, "%s.txt" % k), "".join(v + "\n" for v in vals)))
+                 for k, vals in lists.items())
+    write_bytes(os.path.join(st, "sqlite", "bld", "sqlite3.h"), "/* dc27 */\n")
+    write_bytes(os.path.join(st, "tclinc", "tcl.h"), "/* dc27 tcl.h */\n")
+    zsrc = os.path.join(st, "zinc-src")
+    write_bytes(os.path.join(zsrc, "zlib.h"), "/* dc27 zlib.h */\n")
+    write_bytes(os.path.join(zsrc, "zconf.h"), DC27_ZCONF)
+    host_cfg = write_bytes(os.path.join(root, "host-sqlite_cfg.h"), DC27_CFG)
+    zinc_mod.stage_one(leg.build["headerStageKey"], leg.build.get("zconfGuards") or {},
+                       os.path.join(zsrc, "zlib.h"), os.path.join(zsrc, "zconf.h"), os.path.join(st, "zinc"))
+    zinc_mod.stage_one_cfg(leg.build["configStageKey"], leg.build.get("configureAnswers") or {}, host_cfg,
+                           os.path.join(st, "cfg"))
+    recipe = {"tus": files["tus"], "defines": files["defines"], "includes": files["includes"],
+              "recipe": os.path.join(st, "recipe.txt"), "summary": "dc27", "n_tus": len(tus), "n_defines": 1,
+              "n_includes": 1}
+    d = {"schema": S.RESULT_SCHEMA, "fixture_recipe": recipe, "cli_recipe": dict(recipe),
+         "configure_args": ["--with-tcl=/dc27"] + list(sb["configure_flags"]) + ["LDFLAGS=-L/dc27"],
+         "make_options": sb["make_options"], "required_defines": list(sb["required_defines"]),
+         "witnesses": dict(sb["witnesses"]), "copy_to_stage": True, "clone_lock_notes": [], "ref_link_notes": [],
+         "ref_link_warnings": [], "warnings": []}
+    paths = {"out_dir": st, "sqlite_dir": os.path.join(root, "clone"), "bld": os.path.join(st, "sqlite", "bld"),
+             "src": os.path.join(st, "sqlite", "src"), "ext": os.path.join(st, "sqlite", "ext"),
+             "testdir": os.path.join(st, "sqlite", "test"), "tier_file": os.path.join(st, "veryquick.test"),
+             "tcl_inc": os.path.join(st, "tclinc"), "zinc_src": zsrc,
+             "sqlite_cfg_h": os.path.join(st, "sqlite", "bld", "sqlite_cfg.h")}
+    for k in S.StageResult.HOST_PATHS:
+        d[k] = paths.get(k, os.path.join(st, k + ".log"))
+    for k in S.StageResult.OPTIONAL_HOST_PATHS:
+        d[k] = None if k != "test_file" else ""
+    for k in S.StageResult.POSIX_PATHS:
+        d[k] = "/dc27/" + k
+    for k in S.StageResult.STRINGS:
+        d.setdefault(k, {"sqlite_head": "dc27head", "sqlite_branch": "master", "tier": "veryquick",
+                         "tcl_version": "8.6", "stage_identity": "dc27 identity"}.get(k, ""))
+    write_json(os.path.join(st, S.RESULT_FILE), d)
+    return d
+
+
+def pin_dc27(t, x):
+    C, S = x.C, importlib.import_module("sqlite_stage")
+    RC = x.M.use("sqlite_recompile")
+    hl = x.M.mod("harness_legs")
+    catalogue = os.path.join(HERE, "legs.json")
+    by = dict((d["label"], d) for d in x.suite.plan("windows", "x86_64", "wsl.exe").get("legs") or [])
+    leg_plan = by.get(DC27_LEG)
+    if not t.ck("R00", "the SHIPPED plan carries the %s leg with its header-stage keys and a TU prelude" % DC27_LEG,
+                leg_plan and leg_plan["build"].get("headerStageKey") and leg_plan["build"].get("configStageKey")
+                and leg_plan["build"].get("tuPreludes"), sorted(by)):
+        return
+    sb = S.parse_stage_build(x.suite.stage_build)
+    zinc = RC._stage_zinc()
+    root = x.sub("dc27")
+    d = _dc27_stage(x, root, C.Leg(copy.deepcopy(leg_plan)), sb, zinc)
+
+    # ── (A) the currency rule, one drift at a time ─────────────────────────────────
+    def findings(mut=None, leg_build=None, coherent=True):
+        dd = copy.deepcopy(d)
+        if mut:
+            mut(dd)
+        lg = C.Leg(copy.deepcopy(leg_plan))
+        lg.build.update(leg_build or {})
+        return RC.stage_findings(S.StageResult.from_dict(dd), sb, lg, zinc.verify_guards, zinc.verify_answers,
+                                 lambda dirs: (coherent, "      two identity ids (the contract suite)"))
+
+    t.eq("A01", "a stage CURRENT for the leg yields no reason", [], findings())
+    guards = dict(leg_plan["build"].get("zconfGuards") or {})
+    answers = dict(leg_plan["build"].get("configureAnswers") or {})
+    flip_g = sorted(guards)[0]
+    flip_a = sorted(answers)[0]
+    host_cfg = os.path.join(root, "stage", "sqlite", "bld", "sqlite_cfg.h")
+    cases = (
+        ("A02", "a declared configure flag the stage was not configured with",
+         lambda dd: dd.__setitem__("configure_args", [a for a in dd["configure_args"]
+                                                      if a != sb["configure_flags"][-1]]), None, True,
+         "the catalogue now declares the configure flags"),
+        ("A03", "other make OPTIONS", lambda dd: dd.__setitem__("make_options", "-DDC27_OTHER"), None, True,
+         "make OPTIONS"),
+        ("A04", "other required defines", lambda dd: dd.__setitem__("required_defines", ["DC27_ONLY"]), None,
+         True, "now requires"),
+        ("A05", "other capability witnesses", lambda dd: dd.__setitem__("witnesses", {}), None, True,
+         "capability witnesses"),
+        ("A06", "a fixture TU that is gone",
+         lambda dd: write_bytes(dd["fixture_recipe"]["tus"],
+                                "".join(p + "\n" for p in _read_lines(d["fixture_recipe"]["tus"]) + [
+                                    os.path.join(root, "gone.c")])), None, True, "are gone"),
+        ("A07", "a zconf.h guard the leg now declares the other way", None, {"zconfGuards": dict(
+            guards, **{flip_g: not guards[flip_g]})}, True, "does not carry its CURRENT declaration"),
+        ("A08", "a sqlite_cfg.h answer the leg now declares the other way", None, {"configureAnswers": dict(
+            answers, **{flip_a: not answers[flip_a]})}, True, "does not carry its CURRENT declaration"),
+        ("A09", "a stage whose sources are not one vintage", None, None, False, "not ONE vintage"),
+        ("A10", "the DERIVING host's sqlite_cfg.h still in the build dir",
+         lambda dd: write_bytes(host_cfg, DC27_CFG), None, True, "DERIVING host's sqlite_cfg.h"),
+    )
+    tus_text = read_text(d["fixture_recipe"]["tus"])
+    for key, label, mut, lb, coherent, needle in cases:
+        try:
+            got = findings(mut, lb, coherent)
+        finally:
+            write_bytes(d["fixture_recipe"]["tus"], tus_text)
+            if os.path.exists(host_cfg):
+                os.remove(host_cfg)
+        t.ck(key, "EXACTLY ONE reason, naming it, for %s" % label,
+             len(got) == 1 and needle in got[0], got)
+    t.ck("A11", "the declared configure flags must appear IN ORDER and CONTIGUOUS in the stage's configure argv",
+         RC.configure_flags_applied(["--p", "a", "b", "L=1"], ["a", "b"])
+         and not RC.configure_flags_applied(["b", "a"], ["a", "b"])
+         and not RC.configure_flags_applied(["a", "x", "b"], ["a", "b"])
+         and not RC.configure_flags_applied(["a"], []), "configure_flags_applied")
+
+    # ── (B) the whole mode, through the REAL recompile() ────────────────────────────
+    dsscp = write_bytes(os.path.join(root, "dc27_dsscp.py"), DC27_DSSCP)
+    cache = os.path.join(root, "acq")
+    tcl_dll = write_bytes(os.path.join(cache, "dc27tcl.dll"), b"MZ")
+    z_dll = write_bytes(os.path.join(cache, "dc27z.dll"), b"MZ")
+
+    mode = {"reference": True}
+
+    def census(args):
+        o, e = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            try:
+                rc = hl.main(["--catalogue", catalogue] + list(args))
+            except SystemExit as exc:
+                rc = exc.code if isinstance(exc.code, int) else 2
+        return C.Result(rc, o.getvalue(), e.getvalue())
+
+    def answer(a):
+        if a[:1] == ["--plan"]:
+            return C.Result(0, json.dumps({"legs": [leg_plan]}), "")
+        if a[:1] == ["--verdict-vocabulary"]:
+            return C.Result(0, "\n".join(x.suite.vocab) + "\n", "")
+        if a[:1] == ["--stage-build"]:
+            return C.Result(0, json.dumps(x.suite.stage_build), "")
+        if a[:1] == ["--resolve-library-argv"]:
+            return C.Result(0, "--resolve-library\n%s\n" % a[1], "")
+        if a[:1] == ["--build-reference-oracle"]:
+            if not mode["reference"]:
+                # rc 4, as `--build-reference-oracle` answers when no declared compiler on this host
+                # targets the leg: no log is written.
+                return C.Result(4, json.dumps({"status": "no-reference-compiler"}) + "\n",
+                                "no declared targetCc candidate for leg %s (the contract suite)" % a[1])
+            olog, odir = a[a.index("--oracle-log") + 1], a[a.index("--oracle-dir") + 1]
+            write_bytes(olog, "x86_64-w64-mingw32-gcc -o ref.exe <the manifest's sources>\n")
+            exe = write_bytes(os.path.join(odir, "reference-testfixture.exe"), b"MZ")
+            return C.Result(0, json.dumps({"status": "built", "path": exe, "cc": "x86_64-w64-mingw32-gcc",
+                                           "triple": "x86_64-w64-mingw32", "log": olog}) + "\n", "")
+        if a[:1] == ["--recompile-verdicts"]:
+            return census(a)
+        return None
+
+    def resolve_leg(run_, lg, _known):
+        lg.tcl_lib = lg.tcl_lib_any = tcl_dll
+        lg.z_lib = lg.z_lib_any = z_dll
+
+    comp = types.SimpleNamespace(path=[sys.executable, dsscp], type="Debug", tree="", built="dc27",
+                                 origin="the contract suite")
+    mod = x.M.fresh("sqlite_recompile",
+                    given_compiler=lambda _log: comp, pair_config_root=lambda _c, _log: root,
+                    coherence_gate=lambda _label: (lambda _dirs: (True, "")),
+                    CMP=Proxy(importlib.import_module("sqlite_compiler"),
+                              assert_current=lambda *_a, **_k: leg_plan["spec"], rebuild_command=lambda *_a: ""),
+                    LIBS=Proxy(importlib.import_module("sqlite_libs"), resolve_leg=resolve_leg,
+                               library_providers=lambda _run: "", tcl_coherence=lambda _run: None))
+    driver = types.SimpleNamespace(step0=lambda _run: None,
+                                   read_vocabulary=importlib.import_module("build_and_test").read_vocabulary)
+
+    def drive(tag, refuse="", reference=True):
+        mode["reference"] = reference
+        log = x.log()
+        run = make_run(x, log, os.path.join(root, "unused-" + tag))
+        run.stage_root = root
+        run.out_dir = os.path.join(root, "recompile")
+        run.resolver = FakeResolver(answer, C)
+        printed = io.StringIO()
+        rc, why = None, ""
+        try:
+            with patched_environ(DTC_DSSCP_REFUSE=refuse or None), contextlib.redirect_stdout(printed):
+                r, got = refused(mod.recompile, run, DC27_LEG, driver)
+            rc, why = (1, got) if r else (got, "")
+        finally:
+            if run.run_lock is not None:
+                run.run_lock.release()
+        lines = [ln for ln in printed.getvalue().splitlines() if ln.strip()]
+        outd = os.path.join(root, "recompile", DC27_LEG)
+        clog = os.path.join(outd, "compile.log")
+        return rc, lines, why, (read_text(clog) if os.path.isfile(clog) else ""), outd, text(log)
+
+    rc, lines, why, clog, outd, logtext = drive("clean")
+    t.ck("B01", "a pair that accepts every TU: exit 0, and the LAST line printed is exactly the summary",
+         rc == 0 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=3 dss_ok=3 blockers=0" % DC27_LEG,
+         "rc=%r why=%s\n%s\n%s" % (rc, why, "\n".join(lines[-6:]), logtext[-1500:]))
+    argv = next((json.loads(ln[len("DTC-DSSCP-ARGV "):]) for ln in clog.splitlines()
+                 if ln.startswith("DTC-DSSCP-ARGV ")), [])
+    t.ck("B02", "dsscp is asked for its WHOLE diagnostic stream: both caps raised to the recompile's own count",
+         argv and all(argv[argv.index(f) + 1] == str(RC.DIAGNOSTIC_CAP) for f in ("--max-diagnostics",
+                                                                                 "--max-per-code") if f in argv)
+         and "--max-diagnostics" in argv and "--max-per-code" in argv, argv)
+    vj = os.path.join(outd, "recompile-verdicts.json")
+    rec = json.loads(read_text(vj)) if os.path.isfile(vj) else {}
+    t.ck("B03", "the census's JSON is kept beside the logs, clean, one row per TU -- the wrapped TU under its "
+         "REAL path", rec.get("clean") is True and [r["tu"].rsplit("/sqlite/", 1)[-1] for r in rec.get("tus", [])]
+         == list(DC27_TUS), rec.get("tus"))
+    rc, lines, why, clog, outd, logtext = drive("blocker", refuse="src/test1.c")
+    t.ck("B04", "a TU the reference BUILT and dsscp refused is a BLOCKER: exit 1, and the summary COUNTS it",
+         rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=3 dss_ok=2 blockers=1" % DC27_LEG
+         and any("BLOCKER" in ln and ln.endswith("src/test1.c") for ln in lines),
+         "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-8:])))
+    rc, lines, why, clog, outd, logtext = drive("wrapped", refuse="ext/misc/fileio.c")
+    t.ck("B05", "a refusal inside a TU compiled through its prelude WRAPPER is placed in that TU (dsscp names the "
+         "real file): a BLOCKER, counted",
+         rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=3 dss_ok=2 blockers=1" % DC27_LEG
+         and any("BLOCKER" in ln and ln.endswith("ext/misc/fileio.c") for ln in lines),
+         "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-8:])))
+    write_bytes(host_cfg, DC27_CFG)
+    try:
+        rc, lines, why, clog, outd, logtext = drive("stale")
+    finally:
+        os.remove(host_cfg)
+    t.ck("B06", "a stage that is NOT current is REFUSED before either compiler runs, naming the reason",
+         rc == 1 and "NOT CURRENT" in why and "DERIVING host's sqlite_cfg.h" in why
+         and not any(ln.startswith("recompile: ") for ln in lines), "rc=%r why=%s" % (rc, why))
+    rc, lines, why, clog, outd, logtext = drive("no-reference", reference=False)
+    t.ck("B07", "with NO reference on this host (no log written): exit 1, INCOMPLETE says so, and the summary "
+         "counts NO TU as accepted by the reference",
+         rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=0 dss_ok=3 blockers=0" % DC27_LEG
+         and any("INCOMPLETE: NO REFERENCE RAN" in ln for ln in lines),
+         "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-6:])))
+
+
+def _read_lines(path):
+    return [ln.rstrip("\r\n") for ln in read_text(path).splitlines() if ln.strip()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -2648,6 +3316,12 @@ PINS = (
     PinSpec("DC-20", "the leftover-fixture sweep (decoy, ancestors, UNVERIFIED)", pin_dc20),
     PinSpec("DC-21", "a LOCATED compiler is REFRESHED, not trusted", pin_dc21),
     PinSpec("DC-22", "what a leftover sweep LEARNT reaches the leg's verdict (the REAL run_corpus)", pin_dc22),
+    PinSpec("DC-23", "a failed self-test's report carries each failing arm's DETAIL", pin_dc23),
+    PinSpec("DC-24", "Step 0 runs EVERY suite, then names every failure in ONE refusal", pin_dc24),
+    PinSpec("DC-25", "a leg's declared TU preludes reach the manifest generator, or the leg is POISONED", pin_dc25),
+    PinSpec("DC-26", "a declared TU prelude reaches BOTH compilers (dsscp and the same-platform reference)", pin_dc26),
+    PinSpec("DC-27", "the round-close RECOMPILE: a current stage only, the whole stream, every blocker COUNTED",
+            pin_dc27),
 )
 PIN_BY_ID = dict((p.id, p) for p in PINS)
 
@@ -2867,6 +3541,77 @@ REDS = (
         old="        if not sw.verified and not any(h.startswith(blind) for h in lr.hygiene):\n",
         new="        if not sw.verified:\n", expect=("H04", "H05"),
         stay_green=("H01", "H02", "H03", "H06", "H07", "H08")),
+    red("RD-43", "DC-23", "build_and_test", "new (macOS, 2026-09-23)",
+        "report a failing arm's name without the detail printed under it",
+        '        blocks.append("\\n".join([head] + detail))\n',
+        new="        blocks.append(head)\n", expect=("F02",), stay_green=("F00", "F01", "F03")),
+    red("RD-44", "DC-24", "build_and_test", "new (macOS, 2026-09-23)",
+        "stop Step 0 at the first failing suite again",
+        '                failed.append("%s (rc=%d)" % (name, r.rc))\n                continue\n',
+        new='                C.die("DRIVER SELF-TEST FAILED (%s, rc=%d)" % (name, r.rc))\n',
+        expect=("Z01", "Z02", "Z03"), stay_green=("Z04",)),
+    red("RD-45", "DC-25", "sqlite_build", "new (tuPreludes, 2026-09-23)",
+        "build a leg whose generator cannot apply its declared TU preludes",
+        '    if leg.build.get("tuPreludes") and not caps.get("tuPreludes"):\n',
+        new='    if False:\n', expect=("P03",), stay_green=("P01", "P02", "P04")),
+    red("RD-46", "DC-26", "sqlite_build", "new (tuPreludes, 2026-09-23)",
+        "generate Step 7's testfixture manifest without the leg's declared TU preludes",
+        '                               _field(fx, "tus"), leg.inc_file, _field(fx, "defines"),\n'
+        '                               leg.build.get("recipeTransform") or "none",\n'
+        '                               leg.build.get("stackReserveBytes") or 0, tokens,\n'
+        '                               tu_preludes=write_tu_preludes(leg, outd))\n',
+        new='                               _field(fx, "tus"), leg.inc_file, _field(fx, "defines"),\n'
+            '                               leg.build.get("recipeTransform") or "none",\n'
+            '                               leg.build.get("stackReserveBytes") or 0, tokens)\n',
+        expect=("Q02", "Q03", "Q04"), stay_green=("Q00", "Q01", "Q05", "Q06", "Q07")),
+    red("RD-47", "DC-26", "sqlite_build", "new (tuPreludes, 2026-09-23)",
+        "generate Step 7b's sqlite3 manifest without the leg's declared TU preludes",
+        '                                leg.cli_inc_file, _field(cli, "defines"),\n'
+        '                                leg.build.get("recipeTransform") or "none",\n'
+        '                                leg.build.get("stackReserveBytes") or 0, tokens,\n'
+        '                                tu_preludes=write_tu_preludes(leg, outd))\n',
+        new='                                leg.cli_inc_file, _field(cli, "defines"),\n'
+            '                                leg.build.get("recipeTransform") or "none",\n'
+            '                                leg.build.get("stackReserveBytes") or 0, tokens)\n',
+        expect=("Q06",), stay_green=("Q00", "Q01", "Q02", "Q03", "Q04", "Q05", "Q07")),
+    red("RD-48", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
+        "route every DssHarness tree through the tool, whatever its toolchain declares",
+        "    if not environment:\n", new="    if False:\n", expect=("P16", "P17"),
+        stay_green=("P14", "P15", "P18", "P19", "P19b", "P20", "P21")),
+    red("RD-49", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
+        "refresh a located tree with a plain cmake build whoever owns it",
+        "        invoke_build = lambda tree, j: _refresh_build(repo_root, tree, j, log)  # noqa: E731\n",
+        new='        invoke_build = lambda tree, j: C.capture(["cmake", "--build", tree, "--target", "dsscp"]).rc\n',
+        expect=("P18",), stay_green=("P14", "P15", "P16", "P17", "P19", "P19b", "P20", "P21")),
+    red("RD-50", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
+        "stamp a candidate with its launcher's time again",
+        "    return [p for p in beside if os.path.isfile(p)] or [path]\n", new="    return [path]\n",
+        expect=("P19", "P19b", "P20"), stay_green=("P14", "P15", "P16", "P17", "P18", "P21")),
+    red("RD-51", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
+        "forget MinGW's spelling of the compiler's library (the one the first draft missed)",
+        'COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")\n',
+        new='COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")\n',
+        expect=("P19b",), stay_green=("P14", "P15", "P16", "P17", "P18", "P19", "P20", "P21")),
+    red("RD-52", "DC-21", "sqlite_compiler", "new (item 3 repair, 2026-09-23)",
+        "stop looking in the tool installer's own directory",
+        '            hit = shutil.which(name, path=os.path.join(home, ".dotnet", "tools"))\n',
+        new="            hit = None\n",
+        expect=("P22",), stay_green=("P19", "P20", "P21", "P22b")),
+    red("RD-53", "DC-27", "harness_legs", "new (round-close recompile, 2026-09-23)",
+        "leave a BLOCKER out of the census's count",
+        '"blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}',
+        new='"blockers": 0}', expect=("B04", "B05"),
+        stay_green=("A01", "A10", "A11", "B01", "B02", "B03", "B06", "B07")),
+    red("RD-54", "DC-27", "sqlite_recompile", "new (round-close recompile, 2026-09-23)",
+        "read dsscp's CAPPED stream as if it were whole",
+        "                           diagnostic_cap=DIAGNOSTIC_CAP)\n",
+        new="                           )\n", expect=("B02",),
+        stay_green=("A01", "A10", "A11", "B01", "B03", "B04", "B05", "B06", "B07")),
+    red("RD-55", "DC-27", "sqlite_recompile", "new (round-close recompile, 2026-09-23)",
+        "reuse a stage whose per-target headers were never staged",
+        "    if os.path.isfile(st.sqlite_cfg_h):\n",
+        new="    if False:\n", expect=("A10", "B06"),
+        stay_green=("A01", "A09", "A11", "B01", "B02", "B03", "B04", "B05", "B07")),
 )
 
 
@@ -2975,9 +3720,9 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 22 pins + 49 red arms + 10 mutator arms. A registry that no longer
+# Every arm this file registers: 27 pins + 62 red arms + 10 mutator arms. A registry that no longer
 # adds up to this -- an arm deleted, or one added without this line -- is a FAILURE.
-DECLARED_TOTAL = 81
+DECLARED_TOTAL = 99
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

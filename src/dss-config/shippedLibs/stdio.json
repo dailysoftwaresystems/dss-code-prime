@@ -11,7 +11,7 @@
         { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long\"" },
         { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" }
     ] },
-    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "type": "u16" }] }
+    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "abiTypedef": "wchar_t" }] }
   ],
   "constants": [
     { "name": "FILENAME_MAX", "variants": [
@@ -19,7 +19,6 @@
         { "when": { "format": "macho" }, "value": 1024, "type": "i32" },
         { "when": { "format": "pe" },    "value": 260,  "type": "i32" }
     ] },
-    { "name": "NULL", "value": 0, "type": "i64" },
     { "name": "_IOFBF", "value": 0, "type": "i32" },
     { "name": "_IOLBF", "variants": [
         { "when": { "format": "elf" },   "value": 1,  "type": "i32" },
@@ -96,6 +95,7 @@
     { "name": "_wpopen", "signature": "fn(ptr<u16>, ptr<u16>) -> ptr<struct \"FILE\" opaque>", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ],
   "macros": [
+    { "name": "NULL", "replacement": "((void*)0)" },
     { "name": "stdin", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(0))" }, { "when": { "format": "macho" }, "replacement": "__stdinp" }, { "when": { "format": "elf" }, "replacement": "stdin" }] },
     { "name": "stdout", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(1))" }, { "when": { "format": "macho" }, "replacement": "__stdoutp" }, { "when": { "format": "elf" }, "replacement": "stdout" }] },
     { "name": "stderr", "variants": [{ "when": { "format": "pe" }, "replacement": "(__acrt_iob_func(2))" }, { "when": { "format": "macho" }, "replacement": "__stderrp" }, { "when": { "format": "elf" }, "replacement": "stderr" }] }

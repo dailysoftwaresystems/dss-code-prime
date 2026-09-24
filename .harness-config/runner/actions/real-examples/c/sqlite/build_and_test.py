@@ -38,6 +38,13 @@ The environment knobs are read and validated up front (`sqlite_common.Config`).
 `--self-test` runs Step 0 ALONE and exits (0 every check held, 1 not): the gate's entry
 (`harness/sqlite_driver_selftest`) runs exactly the list and the judgement a real run applies
 before it starts, so the two cannot come to disagree about what is checked.
+
+`--recompile <leg>` is the ROUND-CLOSE RECOMPILE (`sqlite_recompile.py`): the leg's testfixture
+manifest, composed exactly as Step 7 composes it from the STAGED sqlite state (reused only when
+current, refused otherwise), compiled by the dsscp DSS_BIN names and by the leg's same-platform
+reference, then a per-TU census and ONE summary line
+`recompile: <leg> tus=N reference_ok=N dss_ok=N blockers=N`. A blocker is a TU the reference
+compiles and dsscp refuses. Exit 0 only with no blocker and a census that saw every TU.
 """
 from __future__ import annotations
 
@@ -62,8 +69,10 @@ import sqlite_common as C        # noqa: E402
 
 HERE = C.HERE
 SELF_TESTS = ("test_confound_scope.py", "test_driver_contracts.py")
+# `gen-pe64-manifest.py` joined 2026-09-23 with its first self-test (the TU-prelude wrapper and its
+# refusals): a self-test behind a flag no gate passes proves nothing.
 MODULE_SELF_TESTS = ("sqlite_base.py", "sqlite_coherence.py", "sqlite_corpus.py", "sqlite_procs.py",
-                     "sqlite_stage.py")
+                     "sqlite_stage.py", "gen-pe64-manifest.py")
 
 
 # ── Step 0 ────────────────────────────────────────────────────────────────────────────
@@ -85,23 +94,46 @@ def _summary(out, strict_zero_failed):
     return None
 
 
-def _failure_report(out, tail=20):
+def _failure_report(out, tail=20, detail_cap=80):
     """What a failed self-test's output must show: EVERY line that reports a failure (`FAIL`,
-    wherever it sits), then the tail. ✔MEASURED 2026-09-22: the last 40 lines alone left the
-    failing arm of a 134-arm self-test out of the report, while the refusal below claimed the
-    output named it."""
+    wherever it sits) WITH ITS DETAIL -- the non-blank lines right after it that are indented
+    deeper than it, which is where an arm prints what it OBSERVED and EXPECTED -- then the tail.
+    ✔MEASURED 2026-09-22: the last 40 lines alone left the failing arm of a 134-arm self-test out
+    of the report, while the refusal below claimed the output named it. ✔MEASURED 2026-09-23: the
+    failing lines alone left out every arm's detail, so four macOS failures reached the gate as
+    four bare names, from a host the gate can only reach through a runner. A detail longer than
+    `detail_cap` lines is cut, and the cut says how many lines it dropped."""
     lines = (out or "").splitlines()
-    fails = [ln for ln in lines if "FAIL" in ln]
+    blocks, i = [], 0
+    while i < len(lines):
+        if "FAIL" not in lines[i]:
+            i += 1
+            continue
+        head = lines[i]
+        depth = len(head) - len(head.lstrip())
+        j = i + 1
+        while j < len(lines) and lines[j].strip() and len(lines[j]) - len(lines[j].lstrip()) > depth:
+            j += 1
+        detail = lines[i + 1:j]
+        if len(detail) > detail_cap:
+            detail = detail[:detail_cap] + ["%s... %d more detail line(s) not shown"
+                                            % (" " * (depth + 2), len(detail) - detail_cap)]
+        blocks.append("\n".join([head] + detail))
+        i = j
     parts = []
-    if fails:
-        parts.append("the failing line(s):\n" + "\n".join(fails))
+    if blocks:
+        parts.append("the failing line(s), each with its detail:\n" + "\n".join(blocks))
     parts.append("the last %d line(s):\n%s" % (tail, "\n".join(lines[-tail:])))
     return "\n".join(parts)
 
 
 def step0(run):
     """Refuse to start when the late-stage logic is broken. DSS_SKIP_SELFTEST=1 skips RUNNING the
-    suites and the resolver's self-test, never the existence checks and never the lint."""
+    suites and the resolver's self-test, never the existence checks and never the lint.
+    ★ EVERY suite runs, and the lint, before the ONE refusal that names each failure. ✔MEASURED
+    2026-09-23: stopping at the first failing suite hid the next one -- on a host reached only
+    through a runner, the Mac's `sqlite_stage.py` failures surfaced one gate AFTER the
+    `sqlite_base.py` fix, a whole round trip later."""
     log, cfg = run.log, run.cfg
     for path, what in ((C.HARNESS_LEGS, "leg resolver"), (C.LEGS_JSON, "leg catalogue"),
                        (C.MANIFEST_GEN, "manifest generator"), (C.CLI_SMOKE, "CLI smoke gate"),
@@ -110,6 +142,7 @@ def step0(run):
         if not os.path.isfile(path):
             C.die("%s missing: %s\n      It is part of this harness; there is no fallback, by design."
                   % (what, path))
+    failed = []
     if cfg.skip_selftest:
         log.warn("driver self-tests SKIPPED (DSS_SKIP_SELFTEST=1) — a late-stage defect will not surface "
                  "until the end of the run.")
@@ -125,15 +158,18 @@ def step0(run):
             r = C.capture(C.python_argv(path, *args), env_=C.child_env(python=True), merge=True)
             if r.rc != 0:
                 print(_failure_report(r.out), file=sys.stderr)
-                C.die("DRIVER SELF-TEST FAILED (%s, rc=%d) — refusing to start.\n      Late-stage driver "
-                      "logic is broken, so this run would execute the whole corpus and then misclassify "
-                      "it. The output above names the failing assertion." % (name, r.rc))
+                print(" ✗ DRIVER SELF-TEST FAILED (%s, rc=%d) — its failing assertions are above."
+                      % (name, r.rc), file=sys.stderr, flush=True)
+                failed.append("%s (rc=%d)" % (name, r.rc))
+                continue
             got = _summary(r.out, strict_zero_failed=True)
             if got is None:
                 print(C.last_lines(r.out, 20), file=sys.stderr)
-                C.die("driver self-test %s exited 0 but printed no readable 'passed=N failed=0 "
-                      "skipped=N' line. A self-test whose RESULT cannot be read proves nothing."
-                      % name)
+                print(" ✗ driver self-test %s exited 0 but printed no readable 'passed=N failed=0 "
+                      "skipped=N' line. A self-test whose RESULT cannot be read proves nothing." % name,
+                      file=sys.stderr, flush=True)
+                failed.append("%s (exit 0, no readable result line)" % name)
+                continue
             passed, skipped = got
             if skipped:
                 log.warn("driver self-test %s: OK (%d assertions) — but %d assertion(s) SKIPPED on this "
@@ -147,15 +183,23 @@ def step0(run):
         got = _summary(r.out, strict_zero_failed=True)
         if r.rc != 0 or got is None:
             print(_failure_report((r.out or "") + (r.err or "")), file=sys.stderr)
-            C.die("LEG-PLAN SELF-TEST FAILED (rc=%d) — refusing to start.\n      The leg resolver or the "
-                  "catalogue it reads is broken, so this run would build a leg set nobody declared."
-                  % r.rc)
-        log.info("leg-plan self-test: OK (%d assertions)" % got[0])
+            print(" ✗ LEG-PLAN SELF-TEST FAILED (rc=%d) — the leg resolver or the catalogue it reads is "
+                  "broken, so a run would build a leg set nobody declared." % r.rc, file=sys.stderr,
+                  flush=True)
+            failed.append("the leg plan's self-test (rc=%d)" % r.rc)
+        else:
+            log.info("leg-plan self-test: OK (%d assertions)" % got[0])
     r = run.resolver.call(["--lint"])
     if r.rc != 0:
         print(C.last_lines((r.out or "") + (r.err or ""), 40), file=sys.stderr)
-        C.die("THE LEG CATALOGUE DOES NOT LINT — refusing to start. See %s." % C.LEGS_JSON)
-    log.info("leg catalogue: lints clean (%s)" % C.LEGS_JSON)
+        print(" ✗ THE LEG CATALOGUE DOES NOT LINT — see %s." % C.LEGS_JSON, file=sys.stderr, flush=True)
+        failed.append("the leg catalogue's lint (rc=%d)" % r.rc)
+    else:
+        log.info("leg catalogue: lints clean (%s)" % C.LEGS_JSON)
+    if failed:
+        C.die("DRIVER SELF-TEST FAILED: %d of Step 0's checks — %s — refusing to start.\n      Late-stage "
+              "driver logic is broken, so this run would execute the whole corpus and then misclassify "
+              "it. The output above names every failing assertion." % (len(failed), "; ".join(failed)))
 
 
 # ── Step 1 ────────────────────────────────────────────────────────────────────────────
@@ -638,6 +682,23 @@ def self_test():
     return 0
 
 
+def place_run(run):
+    """Where a run's trees are, the ONE rule for every mode: the DSS tree (SRC_DIR, else the tree
+    this harness ships in) and the output tree (OUT_DIR, else `<tree>/build/real-examples/c/sqlite`,
+    under `windows/` on a Windows host). The recompile finds the STAGE a run left there."""
+    cfg = run.cfg
+    run.driver_tree = C.driver_tree()
+    run.repo_root = os.path.abspath(cfg.src_dir) if cfg.src_dir else (run.driver_tree or "")
+    if not run.repo_root:
+        C.die("this copy of the harness lives in no DSS tree, and SRC_DIR is not set — name the "
+              "checkout to build with SRC_DIR=<path>.")
+    run.out_dir = os.path.abspath(cfg.out_dir) if cfg.out_dir else os.path.join(
+        run.repo_root, "build", "real-examples", "c", "sqlite",
+        *(["windows"] if run.host == "windows" else []))
+    run.registry_glob = os.path.join(run.driver_tree or os.path.join(HERE, "no-dss-tree"),
+                                     ".plans", "_deferred-anchor-registry*.md")
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if args:
@@ -646,24 +707,22 @@ def main(argv=None):
             return 0
         if args == ["--self-test"]:
             return self_test()
-        print("build_and_test.py takes no arguments but `--self-test` (Step 0 alone); a run is "
-              "configured by environment variables (see sqlite_common.Config). Got: %s"
-              % " ".join(args), file=sys.stderr)
+        if args[:1] == ["--recompile"]:
+            if len(args) != 2 or not args[1] or args[1].startswith("-"):
+                print("build_and_test.py --recompile takes exactly ONE leg label (a label legs.json "
+                      "declares); got: %s" % " ".join(args), file=sys.stderr)
+                return 2
+            import sqlite_recompile as RC
+            return RC.main(args[1], sys.modules[__name__])
+        print("build_and_test.py takes no arguments but `--self-test` (Step 0 alone) or `--recompile "
+              "<leg>`; a run is configured by environment variables (see sqlite_common.Config). "
+              "Got: %s" % " ".join(args), file=sys.stderr)
         return 2
     run = None
     try:
         cfg = C.Config()
         run = C.Run(cfg)
-        run.driver_tree = C.driver_tree()
-        run.repo_root = os.path.abspath(cfg.src_dir) if cfg.src_dir else (run.driver_tree or "")
-        if not run.repo_root:
-            C.die("this copy of the harness lives in no DSS tree, and SRC_DIR is not set — name the "
-                  "checkout to build with SRC_DIR=<path>.")
-        run.out_dir = os.path.abspath(cfg.out_dir) if cfg.out_dir else os.path.join(
-            run.repo_root, "build", "real-examples", "c", "sqlite",
-            *(["windows"] if run.host == "windows" else []))
-        run.registry_glob = os.path.join(run.driver_tree or os.path.join(HERE, "no-dss-tree"),
-                                         ".plans", "_deferred-anchor-registry*.md")
+        place_run(run)
         return run_all(run)
     except C.CloneLockBlocked as exc:
         print(str(exc), file=sys.stderr, flush=True)

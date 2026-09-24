@@ -239,6 +239,13 @@ struct DSS_EXPORT AsmDecodedOperand {
     std::int64_t   value      = 0;
     bool           hasValue   = false;
     std::string    symbol;        // empty unless the scalar was a name
+    // ★★ THE CONSTANT WRITTEN AFTER THE NAME — the `+4` of `msg+4`, the `-8`
+    // of `.LC0-8` — or 0 when none was written. ⚠ IT IS NOT `value`: a
+    // symbolic scalar keeps `hasValue` false, so every reader that takes
+    // `hasValue` to mean "a number" still refuses a name; a reader that takes
+    // `symbol` must read this too, or refuse a non-zero one — dropping it would
+    // address the wrong byte with a clean build log.
+    std::int64_t   symbolAddend = 0;
     // `*%rax` — the dialect's indirect marker. Carried, never dropped: `jmp foo`
     // and `jmp *%rax` are different instructions and losing the star is a
     // miscompile with no diagnostic.
@@ -251,6 +258,13 @@ struct DSS_EXPORT AsmDecodedOperand {
     LirReg         indexReg     = InvalidLirReg;
     std::uint32_t  scale        = 1;
     std::int32_t   disp         = 0;
+    // ★★ A SYMBOLIC DISPLACEMENT (`msg(%rip)`, `msg+4(%rip)` —
+    // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the name the
+    // displacement is relative to, with `disp` holding the constant added to
+    // it. Empty for a numeric displacement. The HOST resolves the name to a
+    // symbol when the operand is lowered, because only the host has a label
+    // model; the operand reaches LIR as a `MemSymbolOffset`.
+    std::string    dispSymbol;
 };
 
 // What a register-role operand SPELLING denotes, as the host resolved it.
@@ -567,6 +581,17 @@ public:
     appendSymbolAddress(std::string const& symbol, NodeId at,
                         std::string_view mnemonic,
                         std::vector<LirOperand>& out) = 0;
+
+    // `movq msg(%rip), %rax` — the symbol a memory operand's SYMBOLIC
+    // displacement is relative to (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    // A different question from `appendSymbolAddress`'s: there the operand IS
+    // the address and a block label is named by a `[SymbolRef, BlockRef]` pair
+    // the encoder binds; here the address only reaches a displacement FIELD, so
+    // the host binds an interior label's symbol to its block itself. nullopt ⇒
+    // the host reported why.
+    [[nodiscard]] virtual std::optional<SymbolId>
+    resolveDisplacementSymbol(std::string const& symbol, NodeId at,
+                              std::string_view mnemonic) = 0;
 
     // The block `symbol` names, or nullopt with a diagnostic.
     //

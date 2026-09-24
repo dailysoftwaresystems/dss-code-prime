@@ -113,6 +113,8 @@ TEST(WasmFormatJson, WasmKindWithUniversalFieldRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"wasm-with-relocations","kind":"wasm"},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_FALSE(r.has_value());

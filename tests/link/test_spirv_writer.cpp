@@ -100,6 +100,8 @@ TEST(SpirvFormatJson, SpirvKindWithUniversalFieldRejected) {
   "dataModel": "LP64",
   "headerNameMatching": "case-sensitive",
       "format": {"name":"spirv-with-relocations","kind":"spirv"},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": [{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_FALSE(r.has_value());

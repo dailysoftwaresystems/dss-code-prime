@@ -17,6 +17,17 @@ dss_add_test(NAME hir/test_hir_verifier      SOURCES test_hir_verifier.cpp)
 dss_add_test(NAME hir/test_const_eval        SOURCES test_const_eval.cpp)
 dss_add_test(NAME hir/test_hir_text          SOURCES test_hir_text.cpp)
 dss_add_test(NAME hir/test_hir_lowering_c SOURCES test_hir_lowering_c.cpp)
+# P68 round 9 (lane `cs`): a brace-init ELEMENT's diagnosed conversion is reported
+# by the lowering (the one tier that knows the element's slot) and realized by
+# `coerce` — [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]].
+dss_add_test(NAME hir/test_brace_element_diagnosed_conversion
+             SOURCES test_brace_element_diagnosed_conversion.cpp)
+# P68 round 9 (lane `cs`): three initializer-list rules — an unknown size is the
+# largest initialized index + 1 (C 6.7.9p22, designators included), a string
+# literal in braces initializes a character array (6.7.9p14), and excess positional
+# elements warn S_ExcessInitializerElements and are dropped unevaluated (6.7.9p2).
+dss_add_test(NAME hir/test_initializer_list_shapes
+             SOURCES test_initializer_list_shapes.cpp)
 # D-CSUBSET-LONG-DOUBLE-LITERAL-DECODE-PRECISION. Separate from
 # test_hir_lowering_c.cpp because that file's fixture deliberately pins the
 # long-double axis at `None` ("moving it would silently re-point every one of

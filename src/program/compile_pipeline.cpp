@@ -3814,6 +3814,35 @@ namespace {
 // format-keyed step the C path has too. Every other input is data off a
 // descriptor row or an export table.
 //
+// ★★ THE DEFINITION DECIDES WHAT THE REFERENCE LEFT OPEN
+// (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). A `.s` address operand
+// or data slot naming a symbol the file does not define mints its import
+// `Pending`: it states no code-vs-data, and gas's relocation states none either.
+// The library this binder just matched it to is the DEFINITION, and it states
+// its own kind, so that kind is written into `isData`, as ld reads it from the
+// symbol it resolves to. A library that states none (a stripped `.so`'s
+// NOTYPE, a PE forwarder) leaves the row `Pending`, and the link refuses it by
+// name if it survives (`K_ImportReferenceUnbindable`), because a default would
+// be a guess with a wire consequence. A row the reference itself decided (a
+// CALL) is never touched: its kind is its own statement.
+void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
+    if (e.kindOrigin != ExternKindOrigin::Pending) return;
+    switch (definition) {
+        case ffi::SymbolKind::Function:
+            e.isData     = false;
+            e.kindOrigin = ExternKindOrigin::FromLibrary;
+            return;
+        case ffi::SymbolKind::Object:
+            e.isData     = true;
+            e.kindOrigin = ExternKindOrigin::FromLibrary;
+            return;
+        case ffi::SymbolKind::Tls:        // refused by the storage-duration rule above it
+        case ffi::SymbolKind::NoType:     // the definition states nothing
+        case ffi::SymbolKind::Forwarder:  // the kind is the forward target's, unread here
+            return;
+    }
+}
+
 // Returns false iff a diagnostic was reported and the build must stop.
 [[nodiscard]] bool bindAsmExternImports(std::vector<ExternImport>& externs,
                                         CompilationUnit const&     cu,
@@ -3865,6 +3894,7 @@ namespace {
             }
             e.libraryPath = it->second.library;
             e.version     = it->second.version;
+            decideKindFromTheDefinition(e, it->second.kind);
         }
     }
 
@@ -3974,6 +4004,10 @@ namespace {
         if (lib == row->row.library.end() || lib->second.empty()) continue;
         e.libraryPath = lib->second;
         e.version     = row->row.version;
+        // The corpus row IS the platform's definition, and it states its kind
+        // (an ExternFunction or an ExternGlobal).
+        decideKindFromTheDefinition(e, row->row.isFunction ? ffi::SymbolKind::Function
+                                                           : ffi::SymbolKind::Object);
         // ⚠ `mangledName` IS NOT REWRITTEN, and a `linkName` row is REFUSED
         // rather than silently re-spelled. `ShippedSymbolRealization::linkName`
         // replaces the C identifier a C declaration would have been decorated

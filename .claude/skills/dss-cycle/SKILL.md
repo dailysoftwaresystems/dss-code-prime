@@ -149,9 +149,9 @@ this repository's configuration, and which of this repository's own programs (it
 
 - **Closing a row MOVES it.** It is deleted from its working registry and appended to the archive's
   matching table. Reopening moves it BACK. Neither is an edit in place.
-- **You do not do this by hand.** `.harness-config/runner/actions/anchors/anchors.py` performs the move as part of writing
-  the row, and `apply-registry-row` delegates to it. Hand-editing the tables is how the two halves
-  drift.
+- **You do not do this by hand.** The door — `dssharness set-anchor`, and `write-anchor` for a new
+  row — performs the move as part of writing the row; `apply-registry-row` and `lane-fold` hand
+  their rows to it. Hand-editing the tables is how the two halves drift.
 - **`check-anchor-balance` refuses both directions** (ARM 6's sibling, the partition arm): a CLOSED
   row left in a working registry, or an OPEN row filed in the archive. The second is the dangerous
   one — every queue in this project reads the two working registries ONLY, so a live row filed in
@@ -201,16 +201,16 @@ controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCL
 - ★ **Plan-side §3.1 tables were NOT migrated** and still use the four-cell shape. Both are
   recognized; only the registry documents changed.
 
-### The four verbs — `.harness-config/runner/actions/anchors/`
+### The door — `dssharness write-anchor` / `set-anchor`
 
-They are verbs of ONE program, `anchors.py` (`python3 .harness-config/runner/actions/anchors/anchors.py
-write|set|read|list`); the `.sh`/`.ps1` launchers that once fronted it are retired, and the door in
-daily use is DssHarness's own `write-anchor` / `set-anchor` / `read-anchor` / `read-anchors`
-(`references/anchors-and-deferrals.md`). Every `anchors.py` verb takes **`--production` / `--done`,
-and those are the only two.**
-⚠ **`--harness` NO LONGER EXISTS and is refused** — the harness registry retired on 2026-09-16.
-✔MEASURED 2026-09-16 at `305604f1`: `write-anchor`, `set-anchor` and `read-anchors` each print
-`(--production | --done)` in their own usage line. A command still typing `--harness` fails.
+A row is WRITTEN by DssHarness's `write-anchor` (a new row) or `set-anchor` (an existing one), and by
+nothing else; `read-anchor` / `read-anchors` read it (`references/anchors-and-deferrals.md`).
+`.harness-config/runner/actions/anchors/anchors.py` has no write verb: it is the reader
+(`read` / `list [--lint]`, each taking `--production` / `--done` and only those two — the harness
+registry retired on 2026-09-16) and the one launcher that `lane-fold` and `apply-registry-row` call
+the door through. That launcher refuses, before the door, a write the gate would fail (a `Status`
+contradicting the verdict leading its `Trigger`) or the door would rewrite (in-line whitespace in a
+cell it writes), and an update names only the fields that change.
 
 ```
 DssHarness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
@@ -221,7 +221,7 @@ DssHarness read-anchors  --pending --band P0       # name + priority + status on
 DssHarness read-anchors  --lint                       # every row a reader cannot key on
 ```
 
-⚠ **Never hand-assemble a row.** The writer takes the FIELDS, so a wrapped anchor id (invisible to
+⚠ **Never hand-assemble a row.** The door takes the FIELDS, so a wrapped anchor id (invisible to
 every grep, and it MINTS a false id), an unescaped `|` (silently adds a column) and a wrong cell
 count are all inexpressible. `set-anchor` is the ordinary way to close a row: it patches only the
 fields you name, preserves the rest byte-for-byte, and performs the move.
@@ -1092,8 +1092,8 @@ hand-typing every edit or reading every subsystem.
 8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
    in place. `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` rewrites
    the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
-   handing you a verbatim row FILE goes through `apply-registry-row`, which delegates to the same
-   writer. A NEW row is `DssHarness write-anchor <ID> ...` (it WRITES unless given
+   handing you a verbatim row FILE goes through `apply-registry-row`, which hands its cells to the
+   same door. A NEW row is `DssHarness write-anchor <ID> ...` (it WRITES unless given
    `--anchor-dry-run`). ⚠ Never
    hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
    behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that

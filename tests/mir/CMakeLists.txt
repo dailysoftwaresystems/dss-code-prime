@@ -167,3 +167,11 @@ dss_add_test(NAME mir/test_deep_nesting_costs_heap
 # nullopt arm cannot be green for a reason unrelated to the abort.
 dss_add_test(NAME mir/test_mir_try_accessors
              SOURCES test_mir_try_accessors.cpp)
+
+# P68 round 9 lane `lm` — D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED: a null
+# pointer or an integer address reaching a STATIC pointer object through a CHAIN of
+# pointer casts (`char *p = NULL;` with the references' `((void *)0)` is two) is
+# static data. Pinned at the MIR literal and at the static-data producer on every
+# real (target, format) pair, through the driver's own `buildCuMir`/`assembleUnit`.
+dss_add_test(NAME mir/test_static_pointer_cast_chain
+             SOURCES test_static_pointer_cast_chain.cpp)

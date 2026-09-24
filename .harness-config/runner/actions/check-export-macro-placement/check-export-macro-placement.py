@@ -81,6 +81,7 @@ import io
 import os
 import re
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ★ AT IMPORT, NOT IN `main()`, AND BOTH STREAMS. On Windows a Python child whose
 # stdout is a PIPE — which is how ctest runs every guard — comes up

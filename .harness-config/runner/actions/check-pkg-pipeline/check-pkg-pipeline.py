@@ -82,6 +82,7 @@ import os
 import re
 import sys
 from pathlib import Path
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ⚠ AT IMPORT, COVERING BOTH STREAMS, and not inside main(): on Windows a Python
 # child whose stdout is a PIPE comes up cp1252, so printing any of the glyphs a

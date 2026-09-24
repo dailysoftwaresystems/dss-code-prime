@@ -45,6 +45,7 @@ import io
 import json
 import os
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 for _s in (sys.stdout, sys.stderr):
     try:

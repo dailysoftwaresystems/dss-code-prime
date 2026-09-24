@@ -1,12 +1,15 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 // Header-only type-relation rules over `TypeInterner const&`. SE1 ships
 // the minimum the toy/c/tsql tests need: assignability, the
@@ -284,20 +287,7 @@ namespace detail::type_rules {
     bool                                               floatSameKindNarrows = false,
     bool                                               charArrayFromStringLiteralInit = false,
     bool                                               bitIntConversions = false,
-    bool                                               scalarConvertsToBool = false,
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (default false): admit a `Ptr<A>` →
-    // `Ptr<B>` where BOTH pointees A,B are integer kinds AND
-    // `interner.sameRepresentation(A,B)` — the shipped-FFI-descriptor abstract
-    // width-based `ptr<i64>` accepting a real C `long long*`/`sqlite3_int64*`/
-    // `long*`(LP64) whose pointee is same-REPRESENTATION but distinct-IDENTITY (the
-    // `_Generic`-splitting NAME differs; the bits do not). Passed `true` ONLY by
-    // `checkCallAgainstSig` at a shipped-descriptor DIRECT call-arg (the boundary the
-    // config gate scopes it to — never native C-to-C, never init/assign/return, never
-    // the fn-pointer/indirect paths). Per-target by construction: on LLP64 `long` is
-    // I32 so `long*` vs `ptr<i64>` FAILS `sameRepresentation`'s kind axis → still
-    // rejected, NO format branch. Identity is UNTOUCHED — this is a COMPAT admission
-    // that the coerce() Ptr→Ptr bitcast realizes, never a TypeId merge.
-    bool                                               intPointeeSameRepresentationCompat = false) noexcept {
+    bool                                               scalarConvertsToBool = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -875,41 +865,11 @@ namespace detail::type_rules {
             }
             // BOTH void: caught by sameType() above (Ptr<Void> ==
             // Ptr<Void> via interning). NEITHER void: distinct typed
-            // pointers; fall through to the strict-reject default
-            // below (Ptr<int> → Ptr<float> is NOT implicit) — UNLESS the
-            // shipped-descriptor integer-pointee relaxation below admits it.
-        }
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: at a shipped-FFI-descriptor
-        // call-arg boundary ONLY (the sole caller passing this flag true — never
-        // native C-to-C, never init/assign/return), a descriptor's abstract width-
-        // based integer-pointee param (`ptr<i64>`, …) accepts a real C integer
-        // pointer whose pointee is the SAME representation (`long long*` /
-        // `sqlite3_int64*` / `long*`-on-LP64) — the ABI-identical match gcc admits.
-        // Predicate = BOTH pointees are integer kinds (size ∧ signedness ∧ integer-
-        // base-kind, via signedIntRank/unsignedIntRank) AND `sameRepresentation`
-        // (compares kind ∧ extensionKind ∧ operands ∧ scalars, NOT the identity
-        // NAME) — attribute-driven, NO `if(type==long long)`. Per-target by
-        // construction: on LLP64/pe64 `long` is I32, so `long*` vs `ptr<i64>` FAILS
-        // sameRepresentation's kind axis → still rejected, with NO format branch
-        // (Condition 6). A `_BitInt(64)*` fails the extensionKind axis; an
-        // `unsigned long long*` / `double*` / `enum E*` fail the kind/base-kind axes.
-        // Identity is UNTOUCHED — a COMPAT admission the coerce() Ptr→Ptr bitcast
-        // realizes, never a TypeId merge (Condition 1); `_Generic(long:,long long:)`
-        // still distinguishes. Cf. TF-C15/C16/C32 pointer-compat-policy notes +
-        // D-LANG-TYPE-IDENTITY-VOCABULARY / LD-5 (identity nominal).
-        if (intPointeeSameRepresentationCompat
-            && !lhsElem.empty() && !rhsElem.empty()) {
-            auto const lpk = interner.kind(lhsElem[0]);
-            auto const rpk = interner.kind(rhsElem[0]);
-            bool const bothInt =
-                (detail::type_rules::signedIntRank(lpk)
-                 || detail::type_rules::unsignedIntRank(lpk))
-                && (detail::type_rules::signedIntRank(rpk)
-                    || detail::type_rules::unsignedIntRank(rpk));
-            if (bothInt
-                && interner.sameRepresentation(lhsElem[0], rhsElem[0])) {
-                return true;
-            }
+            // pointers; fall through to the strict-reject default below
+            // (Ptr<int> → Ptr<float> is NOT one of C's conversions). A language
+            // that converts such a pair WITH A DIAGNOSTIC says so in its
+            // `pointerConversions` block, and `diagnosedConversion` below — asked
+            // by every site after this function declines — names the class.
         }
     }
     // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
@@ -938,6 +898,352 @@ namespace detail::type_rules {
         return true;
     }
     return false;
+}
+
+// `isAssignable` under EVERY conversion gate a language's `SemanticConfig` declares —
+// the one spelling of "the ordinary rules", so the semantic tier's five
+// assignment-shaped sites and the HIR tier's brace-element report and `coerce`
+// realize cannot pass different gate sets (they used to spell the dozen arguments out
+// at each site). `boolWidensToArith` is true here because every caller is a
+// PRE-coerce judgement; the post-coerce HIR verifier keeps calling `isAssignable`
+// with its strict defaults.
+[[nodiscard]] inline bool isAssignableUnder(SemanticConfig const& cfg,
+                                            TypeInterner const&   interner,
+                                            TypeId                lhs,
+                                            TypeId                rhs,
+                                            bool charArrayFromStringLiteralInit) noexcept {
+    return isAssignable(interner, lhs, rhs, cfg.pointerConversions,
+                        /*boolWidensToArith=*/true,
+                        cfg.charConvertsToArith, cfg.enumConvertsToArith,
+                        cfg.intCrossSignednessConverts, cfg.intSameSignednessNarrows,
+                        cfg.intConvertsToFloat, cfg.floatConvertsToInt,
+                        cfg.floatSameKindNarrows, charArrayFromStringLiteralInit,
+                        cfg.bitIntConversions, cfg.scalarConvertsToBool);
+}
+
+// ★★★ P68 round 9 (lane `cs`) — THE CONVERSIONS A LANGUAGE ADMITS WITH A DIAGNOSTIC,
+// D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS.
+//
+// C23 6.5.17.2p1 (C17 6.5.16.1p1) lists the pointer pairings an assignment may
+// convert between — compatible pointed-to types, an object pointer beside `void *`, a
+// null pointer constant, `bool` from a pointer — and a pairing outside the list is a
+// CONSTRAINT VIOLATION: the implementation must DIAGNOSE it, and C says nothing more.
+// An initialization, an argument and a return convert "as if by assignment", so they
+// share the list. What every pinned reference does next is convert anyway, keeping
+// the pointer's value (C 6.3.2.3p5-p8 give that value for an explicit cast; the
+// implicit conversion is the same bits). ✔MEASURED 2026-09-23, each reference separately and every build RUN
+// (gcc 13.3.0 and clang 18.1.3 at `-std=c17 -pedantic-errors` off and `-std=c2x`,
+// mingw-w64 13.2.0, MSVC 19.51 at `/std:c17` and `/std:clatest`): pointers to
+// incompatible object types, an object pointer beside a function pointer, and a
+// function pointer of another signature are built with a warning by gcc, mingw and
+// MSVC (clang too for the object pairs; it refuses the function-signature and
+// integer/pointer mixes by default); an integer that is not a null pointer constant
+// into a pointer, and a pointer into an integer, are built with a warning by gcc,
+// mingw and MSVC. Each such program RUNS to the value its explicit-cast twin gives.
+// `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` therefore owes every one WITH a diagnostic,
+// and DSS refused every one (S_TypeMismatch / S_ReturnTypeMismatch) — below the union
+// on a class legacy C is full of. 📄 GCC 14 made these errors by default; the union is
+// over the PINNED references, and `--warnings-as-errors` reproduces GCC 14's default.
+//
+// ★ THIS IS THE ONE CLASSIFIER, asked by every site of the pointer-compatibility
+// constraint in both tiers: the semantic tier's initialization, assignment,
+// argument and return checks, its `==`/`!=`/relational and `?:` checks, and the HIR
+// tier's brace-element report and `coerce` realize. A site asks only AFTER the
+// language's ordinary rules (`isAssignableUnder`, the null pointer constant) have
+// declined the pair, and reports the class it names; `coerce` realizes exactly the
+// classes this names and nothing the ordinary rules admit, so admit ⟺ realize holds
+// by construction.
+//
+// ⚠ CONFIG-DRIVEN, NOT C-SHAPED: the pointer classes are admitted only when the
+// language says so (`pointerConversions.incompatiblePointerConvertsDiagnosed`), the
+// integer classes only under `integerPointerConvertsDiagnosed`; a language that sets
+// neither keeps every such pair refused, byte for byte.
+enum class DiagnosedConversion : std::uint8_t {
+    None,                              // not admitted: the caller refuses the pair
+    IncompatiblePointer,               // pointer ← pointer / array / function designator
+    SameRepresentationIntegerPointee,  // … whose two pointees are distinct integer types of ONE representation
+    IntegerToPointer,                  // pointer ← an integer that is not a null pointer constant
+    PointerToInteger,                  // integer ← pointer / array / function designator
+};
+
+// Where a diagnosed conversion was met — it words the report and nothing else.
+enum class DiagnosedConversionSite : std::uint8_t {
+    Initialization, Assignment, CompoundAssignment, Argument, Return, Comparison, Conditional
+};
+
+// The pointee a pointer-VALUED operand contributes once it decays (C 6.3.2.1p3-p4):
+// a pointer's own, an array's element, a function designator itself. Invalid for
+// anything else, and for a shapeless (element-less) array or pointer.
+[[nodiscard]] inline TypeId contributedPointee(TypeInterner const& interner,
+                                               TypeId t) noexcept {
+    if (!t.valid()) return InvalidType;
+    t = interner.stripVolatile(t);
+    switch (interner.kind(t)) {
+        case TypeKind::Ptr:
+        case TypeKind::Array: {
+            auto const ops = interner.operands(t);
+            return ops.empty() ? InvalidType : ops[0];
+        }
+        case TypeKind::FnSig: return t;
+        default:              return InvalidType;
+    }
+}
+
+// An INTEGER kind in C's sense (6.2.5p17): the two rank ladders, `char`, `_Bool`, an
+// enumeration and a bit-precise integer.
+[[nodiscard]] inline bool isIntegerKindForConversion(TypeKind k) noexcept {
+    using namespace detail::type_rules;
+    return signedIntRank(k) != 0 || unsignedIntRank(k) != 0 || k == TypeKind::Char
+        || k == TypeKind::Bool || k == TypeKind::Enum || k == TypeKind::BitInt;
+}
+
+// Are two pointees COMPATIBLE for a pairing (`==`, `?:`) — the same type modulo the
+// qualifiers C23 6.5.10p2 / 6.5.16p3 let the two sides differ by (DSS interns
+// `volatile` on the type; `const` lives on the qualifier spine), or two array types C
+// 6.7.6.2p6 calls compatible? The same relation `isAssignable`'s pointer arms apply.
+[[nodiscard]] inline bool pointeesCompatible(TypeInterner const& interner,
+                                             TypeId a, TypeId b) {
+    if (!a.valid() || !b.valid()) return true;   // cascade suppression
+    TypeId const sa = interner.stripVolatile(a);
+    TypeId const sb = interner.stripVolatile(b);
+    return sa == sb || vlaCompatibleArrayTypes(interner, sa, sb);
+}
+
+// A POINTER PAIRING C admits without a diagnostic at `==`/`!=` and `?:`: compatible
+// pointees, or an object pointer beside a `void *` (C23 6.5.10p2, 6.5.16p3) — and a
+// function pointer beside a `void *` where the language admits that conversion
+// (`allowVoidPtrFnConvert`, the POSIX `dlsym` class; gcc diagnoses it only under
+// `-pedantic`). The relational operators admit no `void` pairing (C23 6.5.9p2), so
+// they pass `voidPairingAdmitted = false`.
+[[nodiscard]] inline bool pointerPairingAdmitted(
+    TypeInterner const& interner, TypeId lPointee, TypeId rPointee,
+    bool voidPairingAdmitted,
+    SemanticConfig::PointerConversionRules const& rules) {
+    if (pointeesCompatible(interner, lPointee, rPointee)) return true;
+    if (!voidPairingAdmitted) return false;
+    TypeKind const lk = interner.kind(interner.stripVolatile(lPointee));
+    TypeKind const rk = interner.kind(interner.stripVolatile(rPointee));
+    bool const lVoid = lk == TypeKind::Void;
+    bool const rVoid = rk == TypeKind::Void;
+    if (lVoid == rVoid) return false;
+    TypeKind const other = lVoid ? rk : lk;
+    return other == TypeKind::FnSig ? rules.allowVoidPtrFnConvert
+                                    : rules.implicitToVoidPtr;
+}
+
+// ── P68 round 9 (lane `cs`): THE POINTER HALF OF THE ARITHMETIC OPERATORS' OPERAND
+//    CONSTRAINTS — the one answer the operator check (pass2Post's SE4e) and the
+//    expression typer (`subtreeType`, which must not hand a refused operation a type
+//    its context would then judge a second time) both ask.
+//
+// C23 6.5.7p2: `+` takes two arithmetic operands or a pointer and an integer (either
+// order); `-` takes two arithmetic operands, two pointers, or a pointer then an
+// integer. 6.5.6p2, 6.5.8p2 and 6.5.11-13 give `*` `/` `%` `<<` `>>` `&` `|` `^` no
+// pointer at all. `base` is the operator's core name (a compound assignment's
+// `compoundBase`). A pairing with NO pointer operand, or a `void` / `nullptr_t`
+// operand (the void-value and nullptr arms own those), is not this rule's question.
+enum class PointerOperands : std::uint8_t { NotApplicable, Admitted, Refused };
+
+[[nodiscard]] inline bool isPointerArithmeticOperator(std::string_view base) noexcept {
+    return base == "Add" || base == "Sub" || base == "Mul" || base == "Div"
+        || base == "Rem" || base == "Shl" || base == "Shr" || base == "BitAnd"
+        || base == "BitOr" || base == "BitXor";
+}
+
+[[nodiscard]] inline PointerOperands
+pointerOperandPairing(TypeInterner const& interner, std::string_view base, TypeId lt,
+                      TypeId rt) noexcept {
+    if (!isPointerArithmeticOperator(base) || !lt.valid() || !rt.valid())
+        return PointerOperands::NotApplicable;
+    auto const ownedElsewhere = [&](TypeId t) {
+        TypeKind const k = interner.kind(interner.stripVolatile(t));
+        return k == TypeKind::Void || k == TypeKind::NullptrT;
+    };
+    if (ownedElsewhere(lt) || ownedElsewhere(rt)) return PointerOperands::NotApplicable;
+    bool const lP = contributedPointee(interner, lt).valid();
+    bool const rP = contributedPointee(interner, rt).valid();
+    if (!lP && !rP) return PointerOperands::NotApplicable;
+    bool const lI = isIntegerKindForConversion(interner.kind(interner.stripVolatile(lt)));
+    bool const rI = isIntegerKindForConversion(interner.kind(interner.stripVolatile(rt)));
+    bool ok = false;
+    if (base == "Add")      ok = (lP && rI) || (lI && rP);
+    else if (base == "Sub") ok = lP && (rI || rP);
+    return ok ? PointerOperands::Admitted : PointerOperands::Refused;
+}
+
+// The COMPOUND form `E1 op= E2` (C23 6.5.17.3p1): for `+=` / `-=` a pointer left
+// operand takes an INTEGER right operand only and an arithmetic left operand an
+// arithmetic right one; every other `op=` takes the operands `op` takes. Two shapes C
+// refuses are BUILT by gcc 13.3.0 and mingw-w64 13.2.0 at `-std=c2x`, each with its
+// `-Wint-conversion` warning, as the literal `E1 = E1 op E2`: ✔MEASURED 2026-09-23
+// (`.temp/probe/r7c`, `r7d`, each reference separately, every build RUN) —
+//   * `x += p` (an integer `x`): `x + p` is a POINTER (6.5.7p9), converted to `x`'s
+//     type — gcc stores `(int)(p + x)`, the STRIDE-SCALED address;
+//   * `p -= q` (two pointers to COMPATIBLE types): `p - q` is the element
+//     difference, an integer, converted to `p`'s type — gcc stores `(T *)(p - q)`.
+// clang and MSVC refuse both, and all four refuse `p -= q` over incompatible
+// pointees (gcc: `p - q` itself is invalid there). One working reference makes the
+// two shapes owed, each WITH the integer/pointer diagnostic its conversion draws.
+enum class CompoundPointerOperands : std::uint8_t {
+    NotApplicable,           // no pointer operand (or a void / nullptr_t one): not this rule
+    Admitted,                // `p += n`, `p -= n`: C's own
+    Refused,                 // every reference refuses
+    PointerIntoInteger,      // `x += p`: the pointer sum converts to the integer
+    DifferenceIntoPointer,   // `p -= q`: the element difference converts to the pointer
+};
+
+[[nodiscard]] inline CompoundPointerOperands
+compoundPointerOperandPairing(TypeInterner const& interner, std::string_view base,
+                              TypeId lt, TypeId rt) noexcept {
+    PointerOperands const binary = pointerOperandPairing(interner, base, lt, rt);
+    if (binary == PointerOperands::NotApplicable) return CompoundPointerOperands::NotApplicable;
+    if (binary == PointerOperands::Refused) return CompoundPointerOperands::Refused;
+    TypeId const lPointee = contributedPointee(interner, lt);
+    TypeId const rPointee = contributedPointee(interner, rt);
+    if (!lPointee.valid()) return CompoundPointerOperands::PointerIntoInteger;   // `x += p`
+    if (!rPointee.valid()) return CompoundPointerOperands::Admitted;             // `p ± n`
+    // `p -= q`: the only two-pointer pairing `pointerOperandPairing` admits.
+    return pointeesCompatible(interner, lPointee, rPointee)
+        ? CompoundPointerOperands::DifferenceIntoPointer
+        : CompoundPointerOperands::Refused;
+}
+
+// The unary half (C23 6.5.4.3): `+` and `-` take an arithmetic operand and `~` an
+// integer one — a pointer (an array or a function designator decaying to one) is
+// none of them.
+[[nodiscard]] inline bool
+pointerOperandRefusedByUnary(TypeInterner const& interner, std::string_view target,
+                             TypeId operand) noexcept {
+    return (target == "Neg" || target == "Pos" || target == "BitNot")
+        && contributedPointee(interner, operand).valid();
+}
+
+// Which class a pair the ordinary rules DECLINED belongs to. `target` is the type
+// converted TO (an lvalue's, a parameter's, a function result's), `source` the
+// operand's own, un-decayed. The pairing sites (`==`, `?:`) pass a pointer target
+// built from one operand and the other operand as the source.
+[[nodiscard]] inline DiagnosedConversion
+diagnosedConversion(TypeInterner const& interner, TypeId target, TypeId source,
+                    SemanticConfig::PointerConversionRules const& rules) noexcept {
+    if (!target.valid() || !source.valid()) return DiagnosedConversion::None;
+    target = interner.stripVolatile(target);
+    source = interner.stripVolatile(source);
+    TypeKind const tk = interner.kind(target);
+    TypeKind const sk = interner.kind(source);
+    TypeId const sourcePointee = contributedPointee(interner, source);
+    if (tk == TypeKind::Ptr && sourcePointee.valid()) {
+        if (!rules.incompatiblePointerConvertsDiagnosed) return DiagnosedConversion::None;
+        auto const tops = interner.operands(target);
+        if (!tops.empty()) {
+            using namespace detail::type_rules;
+            TypeKind const tpk = interner.kind(interner.stripVolatile(tops[0]));
+            TypeKind const spk = interner.kind(interner.stripVolatile(sourcePointee));
+            bool const bothIntegers =
+                (signedIntRank(tpk) != 0 || unsignedIntRank(tpk) != 0)
+                && (signedIntRank(spk) != 0 || unsignedIntRank(spk) != 0);
+            if (bothIntegers && interner.sameRepresentation(tops[0], sourcePointee))
+                return DiagnosedConversion::SameRepresentationIntegerPointee;
+        }
+        return DiagnosedConversion::IncompatiblePointer;
+    }
+    if (tk == TypeKind::Ptr && isIntegerKindForConversion(sk)) {
+        return rules.integerPointerConvertsDiagnosed ? DiagnosedConversion::IntegerToPointer
+                                                     : DiagnosedConversion::None;
+    }
+    // `_Bool` from a pointer is C's OWN conversion (6.3.1.2, the truth value), which
+    // `isAssignable` admits; it never reaches here as a diagnosed class.
+    if (isIntegerKindForConversion(tk) && tk != TypeKind::Bool && sourcePointee.valid()) {
+        return rules.integerPointerConvertsDiagnosed ? DiagnosedConversion::PointerToInteger
+                                                     : DiagnosedConversion::None;
+    }
+    return DiagnosedConversion::None;
+}
+
+// The code each class reports under — one per class, at every site, in both tiers.
+[[nodiscard]] inline DiagnosticCode
+diagnosedConversionCode(DiagnosedConversion c) noexcept {
+    switch (c) {
+        case DiagnosedConversion::SameRepresentationIntegerPointee:
+            return DiagnosticCode::S_IncompatiblePointerIntegerPointee;
+        case DiagnosedConversion::IntegerToPointer:
+        case DiagnosedConversion::PointerToInteger:
+            return DiagnosticCode::S_IntegerPointerConversion;
+        case DiagnosedConversion::IncompatiblePointer:
+        case DiagnosedConversion::None:
+            break;
+    }
+    return DiagnosticCode::S_IncompatiblePointerConversion;
+}
+
+// The sentence each class reports — one wording for both tiers, so a brace element
+// (reported by the HIR tier, the one that knows which slot it fills) reads exactly
+// like the initialization the semantic tier reports.
+[[nodiscard]] inline std::string
+diagnosedConversionSentence(DiagnosedConversion c, DiagnosedConversionSite site,
+                            std::string_view operandText) {
+    bool const pairing = site == DiagnosedConversionSite::Comparison
+                      || site == DiagnosedConversionSite::Conditional;
+    // Clauses are C23's (N3220) numbering: simple assignment is 6.5.17.2 there
+    // (C17 6.5.16.1), initialization 6.7.11, the call 6.5.3.3, the return 6.8.7.5,
+    // the relational / equality operators 6.5.9 / 6.5.10, the conditional 6.5.16.
+    std::string_view where = "this conversion";
+    std::string_view clause = "C23 6.5.17.2p1";
+    switch (site) {
+        case DiagnosedConversionSite::Initialization:
+            where = "this initialization"; clause = "C23 6.7.11p12 / 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::Assignment:
+            where = "this assignment"; clause = "C23 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::CompoundAssignment:
+            where = "this compound assignment"; clause = "C23 6.5.17.3p1"; break;
+        case DiagnosedConversionSite::Argument:
+            where = "this argument"; clause = "C23 6.5.3.3p2 / 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::Return:
+            where = "this return"; clause = "C23 6.8.7.5p3 / 6.5.17.2p1"; break;
+        case DiagnosedConversionSite::Comparison:
+            where = "this comparison"; clause = "C23 6.5.10p2 / 6.5.9p2"; break;
+        case DiagnosedConversionSite::Conditional:
+            where = "this conditional"; clause = "C23 6.5.16p3"; break;
+    }
+    std::string_view what = "converts between incompatible types";
+    std::string_view outcome = "the value converts exactly as an explicit cast would convert it";
+    switch (c) {
+        case DiagnosedConversion::IncompatiblePointer:
+            what = pairing ? "pairs pointers to incompatible types"
+                           : "converts a pointer to a pointer of an incompatible type";
+            break;
+        case DiagnosedConversion::SameRepresentationIntegerPointee:
+            what = pairing ? "pairs pointers to two different integer types that share one "
+                             "representation"
+                           : "converts a pointer to a pointer of a different integer type that "
+                             "shares its representation";
+            break;
+        case DiagnosedConversion::IntegerToPointer:
+            what = pairing ? "pairs a pointer with an integer that is not a null pointer "
+                             "constant"
+                           : "converts an integer that is not a null pointer constant to a "
+                             "pointer";
+            break;
+        case DiagnosedConversion::PointerToInteger:
+            what = pairing ? "pairs a pointer with an integer"
+                           : "converts a pointer to an integer";
+            break;
+        case DiagnosedConversion::None:
+            break;
+    }
+    if (site == DiagnosedConversionSite::Comparison) {
+        outcome = "the two addresses are compared";
+    } else if (site == DiagnosedConversionSite::Conditional
+               && c != DiagnosedConversion::IntegerToPointer
+               && c != DiagnosedConversion::PointerToInteger) {
+        outcome = "the conditional has type `void *` (gcc's and clang's meaning)";
+    }
+    std::string out;
+    out.reserve(operandText.size() + 256);
+    out.append("`").append(operandText).append("`: ").append(where).append(" ")
+       .append(what).append(" without a cast — a constraint violation (")
+       .append(clause).append(") that C requires a diagnostic for; ")
+       .append(outcome);
+    return out;
 }
 
 // FC2 explicit-cast legality (`(T)expr`). DELIBERATELY wider than

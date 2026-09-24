@@ -157,6 +157,11 @@ void appendLine(std::string&          out,
             // the preprocessor will see; `kind=type-size` beside it says the
             // number was derived from a type, not declared.
             return pm.value;
+        case PredefinedMacroKind::TypeUnsigned:
+            // P68 round 9: `1`, and only on a pair where the merge found the
+            // type unsigned — a signed pair has no such row to print, exactly as
+            // `-dM` lists no `__WCHAR_UNSIGNED__` where `wchar_t` is `int`.
+            return pm.value;
         case PredefinedMacroKind::Date:
             // Quoted exactly as the materializer quotes it, so the dumped
             // spelling is the token the parser would see.

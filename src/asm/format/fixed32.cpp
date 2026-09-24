@@ -1719,6 +1719,20 @@ bool encode(Lir const&                  lir,
             // orInto with the width-0 slot writes no bits but marks
             // wroteSlot[MemBaseNoScale] (collision/consumed tracking).
             if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
+        } else if (srcOp.kind == LirOperandKind::MemSymbolOffset) {
+            // A symbolic displacement names a LINK-TIME address, and a fixed32
+            // memory field holds a few bits of one: which bits (the low 12 of
+            // the page offset, scaled by the access size) is a relocation
+            // operator the program states, never one this encoder may pick.
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': operand {} is a symbolic memory "
+                               "displacement, and field '{}' has no "
+                               "relocation declared for one — a fixed-width "
+                               "memory field carries only part of an address",
+                               info->mnemonic, wire.index,
+                               encodingSlotKindName(wire.slotKind)));
+            return false;
         } else {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,

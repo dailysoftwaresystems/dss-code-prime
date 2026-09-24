@@ -185,6 +185,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 EXIT_OK, EXIT_RATCHET, EXIT_COLLAPSE = 0, 1, 2
 

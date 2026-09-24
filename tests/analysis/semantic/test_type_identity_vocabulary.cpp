@@ -214,9 +214,12 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
 })JSON";
 
 // Analyze `mainSrc` against `kFfiWideDescriptorJson` (written into `sysDir`) under
-// the axis `ax`. `flagOn` selects the SHIPPED schema (relaxation enabled) vs a
-// perturbed copy with `pointerConversions.directCallIntPointeeCompat=false` —
-// the config red-on-disable axis (the `analyzeWithOverride` perturbation idiom).
+// the axis `ax`. `flagOn` selects the SHIPPED schema (the diagnosed conversion
+// enabled) vs a perturbed copy with
+// `pointerConversions.incompatiblePointerConvertsDiagnosed=false` — the config
+// red-on-disable axis (the `analyzeWithOverride` perturbation idiom). P68 round 9
+// retired `directCallIntPointeeCompat` into that key: the same-representation
+// integer pointee is one instance of the class it admits.
 // The ScratchDir must outlive the returned model (the semantic phase reads the
 // descriptor file), so the caller owns it.
 [[nodiscard]] SemanticModel analyzeFfiWide(ScratchDir const& sysDir,
@@ -236,7 +239,7 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
     };
     if (flagOn) return build(loadShippedSchema("c"));
     nlohmann::json doc = loadShippedCJson();
-    doc["semantics"]["pointerConversions"]["directCallIntPointeeCompat"] = false;
+    doc["semantics"]["pointerConversions"]["incompatiblePointerConvertsDiagnosed"] = false;
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<ffi-wide-flag-off>");
     // ★ FAIL-CLOSED, TF-C135: this was `EXPECT_TRUE`, which is NON-FATAL — so when
     // the key was renamed and the perturbed schema stopped loading, the helper walked
@@ -247,8 +250,8 @@ constexpr char const* kFfiWideDescriptorJson = R"JSON({
     if (!schema.has_value()) {
         throw std::runtime_error(
             "perturbed c schema failed to load — the "
-            "`directCallIntPointeeCompat` key was renamed or removed, so this "
-            "red-on-disable axis is testing nothing");
+            "`incompatiblePointerConvertsDiagnosed` key was renamed or removed, so "
+            "this red-on-disable axis is testing nothing");
     }
     return build(*schema);
 }
@@ -532,21 +535,29 @@ TEST(TypeIdentityVocabulary, IncompatiblePointerTypesNowDiagnose) {
     // C requires a constraint diagnostic here. Under the collapse `int` and
     // `long` were ONE TypeId on LLP64, so this compiled SILENTLY — the collapse
     // did not merely fail loud, it ACCEPTED invalid code.
+    // ★ P68 round 9 (lane `cs`): the diagnostic is now the WARNING every pinned
+    // reference gives (the program builds and keeps its pointer), not a refusal —
+    // [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]].
+    // What this test exists for is unchanged and still asserted: the two types are
+    // DIFFERENT, so the conversion is DIAGNOSED, never silent.
     auto llp = analyzeC(
         "int f(void){ int x = 0; int *p = &x; long *q = p; return *q != 0; }\n",
         DataModel::Llp64);
-    EXPECT_TRUE(llp.hasErrors())
-        << "`long *q = p;` from an `int *` is a C constraint violation";
-    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_FALSE(llp.hasErrors())
+        << "`long *q = p;` from an `int *` is admitted with the diagnostic C requires";
+    EXPECT_EQ(countCode(llp.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
+        << "`long *q = p;` from an `int *` is a C constraint violation: DIAGNOSED";
 
-    // The same tightening on LP64's OTHER same-representation pair.
+    // The same diagnostic on LP64's OTHER same-representation pair.
     auto lp = analyzeC(
         "int f(void){ long x = 0; long *p = &x; long long *q = p;\n"
         "  return *q != 0; }\n",
         DataModel::Lp64);
-    EXPECT_TRUE(lp.hasErrors())
+    EXPECT_FALSE(lp.hasErrors());
+    EXPECT_EQ(countCode(lp.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
         << "`long long *q = (long*)…` is a C constraint violation on LP64 too";
-    EXPECT_EQ(countCode(lp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
 
     // ... and the matching-type control stays CLEAN (proves the tightening is
     // not a blanket pointer reject).
@@ -560,13 +571,16 @@ TEST(TypeIdentityVocabulary, CharFamilyStaysThreeDistinctTypes) {
     // Pre-existing behavior that must be PRESERVED: char / signed char /
     // unsigned char are three distinct CORES (Char/I8/U8), so their pointers
     // were already incompatible. Unrelated to the vocabulary split — pinned so a
-    // future identity change cannot quietly merge them.
+    // future identity change cannot quietly merge them. (P68 round 9: the
+    // incompatibility is DIAGNOSED with the warning every reference gives rather
+    // than refused; a merged identity would make it silent, which is what this
+    // pin catches.)
     auto m = analyzeC(
         "int f(void){ char c = 0; char *p = &c; signed char *q = p;\n"
         "  return *q != 0; }\n",
         DataModel::Lp64);
-    EXPECT_TRUE(m.hasErrors());
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion), 1u);
 }
 
 // ── Conversion RANK is keyed on the NAME, not the width ────────────────────
@@ -777,15 +791,18 @@ TEST(TypeIdentityVocabulary, ShippedFixedWidthAliasesAreTheNamedStandardTypes) {
 }
 
 // The pointer direction — strict TypeId identity, so a wrongly-anonymous alias
-// shows up as a bare S_TypeMismatch on code C says is correct.
+// shows up as a DIAGNOSED pointer conversion on code C says is correct. (P68
+// round 9, lane `cs`: an incompatible pointer conversion is admitted with the
+// warning every pinned reference gives, so the witness is the diagnosed-conversion
+// code, never `hasErrors()` alone — that would pass over a silent accept too.)
 TEST(TypeIdentityVocabulary, ShippedAliasPointersMatchTheirNamedStandardType) {
     for (ModelAxis const ax : {kLp64, kLlp64}) {
         SCOPED_TRACE(ax.label);
         std::string const ok =
             // The pointer flows through an INTERMEDIATE variable of the alias's
-            // own pointer type: a direct `T *p = &x;` initializer is not
-            // pointee-checked today (a pre-existing gap, unrelated to identity),
-            // so it would make this pin vacuous in BOTH directions.
+            // own pointer type. A direct `T *p = &x;` initializer runs the same
+            // pointer-conversion classifier, so either spelling witnesses the
+            // identity; the intermediate keeps the pin's source unchanged.
             std::string{"#include <stdint.h>\n#include <stddef.h>\n"}
             + "int f(void){ uint64_t x = 0; uint64_t *px = &x;\n"
             + "  " + ax.sizeName + " *p = px;\n"
@@ -798,18 +815,36 @@ TEST(TypeIdentityVocabulary, ShippedAliasPointersMatchTheirNamedStandardType) {
         EXPECT_FALSE(m.hasErrors())
             << "the shipped alias IS that named type on this data model";
         EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+            << "the alias and its named type are ONE type: nothing to diagnose";
+        EXPECT_EQ(countCode(m.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerConversion), 0u)
+            << "the alias and its named type are ONE type: nothing to diagnose";
 
         // ... and the OTHER model's name is a genuinely different type, so it
         // must still DIAGNOSE (proving the pin above is not a blanket accept).
-        std::string const wrongName =
-            ax.dm == DataModel::Lp64 ? "unsigned long long" : "unsigned long";
+        // On LP64 the wrong name (`unsigned long long`) shares `uint64_t`'s
+        // representation, so it is the narrower same-representation code; on
+        // LLP64 the wrong name (`unsigned long`) is 32-bit, the general one.
+        bool const lp = ax.dm == DataModel::Lp64;
+        std::string const wrongName = lp ? "unsigned long long" : "unsigned long";
         std::string const bad =
             std::string{"#include <stdint.h>\n"}
             + "int f(void){ uint64_t x = 0; uint64_t *px = &x;\n"
             + "  " + wrongName + " *p = px;\n"
             + "  return *p != 0; }\n";
         auto n = analyzeWithShippedHeaders(bad, ax.dm, ax.fmt, ax.arch);
-        EXPECT_EQ(countCode(n.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        EXPECT_FALSE(n.hasErrors())
+            << "an incompatible pointer conversion builds with its diagnostic";
+        EXPECT_EQ(countCode(n.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+        EXPECT_EQ(countCode(n.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerIntegerPointee),
+                  lp ? 1u : 0u)
+            << "the other model's vocabulary entry is a DIFFERENT type here";
+        EXPECT_EQ(countCode(n.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerConversion),
+                  lp ? 0u : 1u)
             << "the other model's vocabulary entry is a DIFFERENT type here";
     }
 }
@@ -911,19 +946,31 @@ TEST(TypeIdentityVocabulary, WindowsDwordPointerIsUnsignedLongPointer) {
         "int f(void){ DWORD d = 0; DWORD *pd = &d; unsigned int *q = pd;\n"
         "  return (int)(*q != 0); }\n",
         kLlp64.dm, kLlp64.fmt, kLlp64.arch);
-    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+    // P68 round 9: DIAGNOSED with the warning the references give, not refused.
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u)
         << "`unsigned int *` is NOT `DWORD *` — both are u32, and that is "
            "exactly the collapse this change undoes";
+    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // ── D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT ────────────────────────────────
 //
 // A shipped-FFI-descriptor `ptr<i64>` parameter accepts a real C integer pointer
-// of the SAME representation (size ∧ signedness ∧ integer-base-kind) AT THE
-// CALL-ARG BOUNDARY ONLY. Every pin is red-on-disable and scoped: the relaxation
-// admits ONLY a same-representation integer pointer, ONLY at a direct
-// shipped-descriptor call arg, ONLY with the config flag on, and NEVER merges the
+// of the SAME representation (size ∧ signedness ∧ integer-base-kind) with the
+// narrower S_IncompatiblePointerIntegerPointee warning, and NEVER merges the
 // distinct type identities.
+// ★ P68 round 9 (lane `cs`,
+// [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]): this
+// admission used to be SCOPED — a direct call's argument only, a same-representation
+// integer pointee only — and every other incompatible pointer pair was refused. It
+// was one instance of a class every pinned reference builds with a warning at EVERY
+// site, and the class is now admitted as such: a different width or signedness
+// reports the general S_IncompatiblePointerConversion, the same pair at init /
+// assignment / return / an indirect call reports the same narrower code, and the
+// switch is `incompatiblePointerConvertsDiagnosed`. The pins below keep what the row
+// was for — the identity witness, the per-target answer, the diagnostic never going
+// silent, the config key being the switch — and state the moved expectations.
 
 // ★★ TF-C135 — THE CASE THE OLD `isShippedDescriptorFn` GATE COULD NOT REACH, AND
 // THE REASON THE GATE WAS WRONG. The callee here is an ORDINARY C PROTOTYPE, not a
@@ -956,15 +1003,19 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeAdmitsAtAPlainCPrototypeAndWarn
 
     // PER-TARGET, BY CONSTRUCTION AND WITH NO FORMAT BRANCH: on LLP64 `long` is I32
     // while `long long` is I64, so `sameRepresentation` fails on the width axis and
-    // the SAME source stays a hard error. This is the negative control for the pin
-    // above — without it, "admitted on LP64" could equally describe a relaxation that
-    // admits everywhere.
+    // the SAME source is the GENERAL incompatible-pointer class (P68 round 9: admitted
+    // with S_IncompatiblePointerConversion, as MSVC's C4133 and gcc 13 admit it). The
+    // negative control for the pin above is therefore the CODE: without it, "the
+    // narrower code on LP64" could equally describe a predicate that answers it
+    // everywhere.
     auto llp = analyzeWithShippedHeaders(src, kLlp64.dm, kLlp64.fmt, kLlp64.arch);
-    EXPECT_TRUE(llp.hasErrors())
-        << "`long long*` into `long*` is a REAL width mismatch on LLP64";
-    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_FALSE(llp.hasErrors());
+    EXPECT_EQ(countCode(llp.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_EQ(countCode(llp.diagnostics(),
-                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u);
+                  DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+        << "`long long*` into `long*` is a REAL width mismatch on LLP64";
+    EXPECT_EQ(countCode(llp.diagnostics(),
+                  DiagnosticCode::S_IncompatiblePointerConversion), 1u);
 }
 
 // POSITIVE: `ptr<i64>` accepts `long long*`, a `typedef long long` (the
@@ -1001,18 +1052,25 @@ TEST(TypeIdentityVocabulary,
     EXPECT_EQ(vocabOf(m, "a"), "long long");
 }
 
-// PER-TARGET (Condition 6): on LLP64/pe (where `long` is I32) the SAME `long*`
-// REFUSES the `ptr<i64>` parameter — emergent from the data model's `kind`, with
-// no format branch. `long long*` (I64 on both models) is still admitted.
-TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetRefusesLongUnderLlp64) {
+// PER-TARGET (Condition 6): on LLP64/pe (where `long` is I32) the SAME `long*` is
+// NOT the `ptr<i64>` parameter's representation — emergent from the data model's
+// `kind`, with no format branch — so it takes the GENERAL incompatible-pointer code
+// (P68 round 9: admitted with S_IncompatiblePointerConversion, no longer S0003).
+// `long long*` (I64 on both models) keeps the narrower same-representation code.
+TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetUnderLlp64LongIsAnotherWidth) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-llp64"};
     auto bad = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
         "int f(void){ long c = 0; ffi_take_wide(&c); return 0; }\n",
         kLlp64);
-    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "`long` is 32-bit under LLP64, so `long*` is NOT `ptr<i64>` — still S0003, "
-           "with no format branch (sameRepresentation's kind axis decides)";
+    EXPECT_EQ(countCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+        << "`long` is 32-bit under LLP64, so `long*` is NOT `ptr<i64>`'s "
+           "representation — with no format branch (sameRepresentation's kind axis "
+           "decides)";
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u);
 
     auto ok = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
@@ -1020,15 +1078,17 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeePerTargetRefusesLongUnderLlp64)
         kLlp64);
     EXPECT_FALSE(ok.hasErrors())
         << "`long long` is 64-bit on every model — its pointer is the parameter";
-    EXPECT_EQ(countCode(ok.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(ok.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u);
 }
 
-// PREDICATE NEGATIVES at the shipped boundary (flag on, calleeIsShippedFfi true):
-// the relaxation admits ONLY same-(size ∧ signedness ∧ integer-base-kind) — every
-// other integer/non-integer pointer STILL S0003 (proving the predicate
-// discriminates exactly where it is active).
+// PREDICATE NEGATIVES at the shipped boundary: the NARROWER code answers ONLY a
+// same-(size ∧ signedness ∧ integer-base-kind) pointee — every other integer /
+// non-integer pointer takes the general S_IncompatiblePointerConversion (P68 round
+// 9: admitted with a warning, no longer S0003), proving the predicate still
+// discriminates exactly where it is asked.
 TEST(TypeIdentityVocabulary,
-     DirectCallIntPointeePredicateNegativesStillRejectAtShippedBoundary) {
+     DirectCallIntPointeePredicateNegativesTakeTheGeneralCode) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-neg"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -1041,15 +1101,25 @@ TEST(TypeIdentityVocabulary,
         "  _BitInt(64) w = 0;        ffi_take_wide(&w);\n"    // extensionKind (BitInt)
         "  return p; }\n";
     auto m = analyzeFfiWide(sysDir, src, kLp64);
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 5u)
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
         << "each arg differs on exactly one axis (size / signedness / base-kind / "
            "kind / extensionKind) — none is a same-representation integer pointer";
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 5u);
 }
 
-// CONDITION 3 (red-on-disable): the relaxation is SCOPED to the call-arg boundary.
-// With the flag ON, the SAME sameRepresentation-distinct integer-pointer mismatch
-// at INIT / ASSIGNMENT / RETURN still S0003 — it never leaks past the call arg.
-TEST(TypeIdentityVocabulary, DirectCallIntPointeeScopedToCallArgNotInitAssignReturn) {
+// ★ P68 round 9: THE CONVERSION IS ONE RULE AT EVERY SITE. This pin used to assert
+// the opposite — that the SAME same-representation pair stayed a hard S0003 at
+// INIT / ASSIGNMENT / RETURN because the relaxation was scoped to the call argument
+// (TF-C41's "Condition 3"). Every pinned reference builds all four sites with the
+// same warning, and C converts an initializer, an argument and a return "as if by
+// assignment", so a scope that differed by site was the defect
+// [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]
+// closed. What survives is the property that matters: each site DIAGNOSES it, with
+// the same narrower code, once.
+TEST(TypeIdentityVocabulary, IntPointeeSameRepresentationReportsAlikeAtInitAssignReturn) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-scope"};
     std::string const src =
         "#include <ffiwide.h>\n"
@@ -1057,20 +1127,17 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeScopedToCallArgNotInitAssignRet
         "void g_assign(void){ long long *p; p = ffi_wide_ptr(); }\n"              // ASSIGN
         "long long* g_return(void){ return ffi_wide_ptr(); }\n";                  // RETURN
     auto m = analyzeFfiWide(sysDir, src, kLp64);
-    // `ptr<i64>` (the ffi_wide_ptr result) into a `long long*` slot is a
-    // sameRep-distinct mismatch — admitted at a call ARG, but INIT / ASSIGN /
-    // RETURN keep the strict default-false isAssignable (no leak past the arg).
-    // INIT + ASSIGN report S_TypeMismatch; RETURN has its own S_ReturnTypeMismatch.
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 2u)
-        << "INIT + ASSIGN keep the strict assignment reject";
-    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "RETURN keeps the strict return-type reject — the relaxation never leaks "
-           "past the call-arg boundary";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    EXPECT_EQ(countCode(m.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 3u)
+        << "INIT + ASSIGN + RETURN each report the same narrower code once";
 }
 
-// CONFIG RED-ON-DISABLE: the whole relaxation is gated on
-// `pointerConversions.ffiDescriptorIntPointeeCompat`. Flip it FALSE (schema
-// perturbation) and the very admission above reverts to S0003.
+// CONFIG RED-ON-DISABLE: the admission is gated on
+// `pointerConversions.incompatiblePointerConvertsDiagnosed` (P68 round 9; it was
+// `directCallIntPointeeCompat`). Flip it FALSE (schema perturbation) and the very
+// admission above reverts to S0003.
 TEST(TypeIdentityVocabulary, DirectCallIntPointeeConfigFlagRedOnDisable) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-flagoff"};
     std::string const src =
@@ -1084,24 +1151,26 @@ TEST(TypeIdentityVocabulary, DirectCallIntPointeeConfigFlagRedOnDisable) {
         << "flag OFF reverts to the strict pointer-pointee reject";
 }
 
-// FN-POINTER / INDIRECT: the relaxation fires ONLY at the DIRECT bare-name call.
-// The SAME shipped fn reached through a NON-direct callee (a designator deref —
-// the vehicle here because a typed C fn-pointer cannot spell the descriptor's
-// anonymous `i64` parameter) routes the expression-callee path, which passes
-// calleeIsShippedFfi=false → STILL S0003 even for the `long long*` a direct call
-// admits.
-TEST(TypeIdentityVocabulary, DirectCallIntPointeeIndirectCallStaysStrict) {
+// FN-POINTER / INDIRECT: ★ P68 round 9 — the same shipped fn reached through a
+// NON-direct callee (a designator deref — the vehicle here because a typed C
+// fn-pointer cannot spell the descriptor's anonymous `i64` parameter) reports
+// EXACTLY what the direct call reports. This pin used to assert the indirect path
+// stayed S0003; a conversion that depends on how the callee is SPELLED is the
+// provenance-gated rule TF-C135 already called a mistake, one layer further out.
+TEST(TypeIdentityVocabulary, IntPointeeSameRepresentationReportsAlikeThroughAnIndirectCall) {
     ScratchDir sysDir{Location::Temp, "ffi-wide-indirect"};
     auto direct = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
         "int f(void){ long long a = 0; ffi_take_wide(&a); return 0; }\n", kLp64);
     EXPECT_FALSE(direct.hasErrors()) << "the direct bare-name call admits";
+    EXPECT_EQ(countCode(direct.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u);
     auto indirect = analyzeFfiWide(sysDir,
         "#include <ffiwide.h>\n"
         "int f(void){ long long a = 0; (*ffi_take_wide)(&a); return 0; }\n", kLp64);
-    EXPECT_EQ(countCode(indirect.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "a shipped fn reached through a non-direct callee stays strict — the "
-           "relaxation is scoped to the direct-symbol call site";
+    EXPECT_FALSE(indirect.hasErrors()) << "the indirect call admits it alike";
+    EXPECT_EQ(countCode(indirect.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 1u);
 }
 
 // ── The f64 float axis: a QUALIFIED named operand still yields the entry ──

@@ -77,6 +77,117 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ P68 ROUND 9 — READ THIS FIRST: round 8 put an array's element `const` on its pointer and broke every sqlite testfixture; that and eight silent miscompiles are gone, and DssHarness 0.5.9 owns the anchor door's rules
+
+**THE LANES THIS COMMIT CARRIES**, in eleven folds (F1–F11), each from a snapshot the lane cut at its fold point and
+md5-verified (a three-way merge wherever main had moved), its rows applied through `dssharness {write,set}-anchor`
+and read back identical, and main's own build + `repo-guard` label + full ctest run after every fold (2352 → 2404
+tests on MinGW Debug across the round); F12 is the orchestrator's DssHarness 0.5.9 adoption:
+
+| lane | subject | what landed |
+|---|---|---|
+| `cs` | C semantics (folds 1, P0, 2, 3) | **A MERGE BLOCKER round 8 shipped (P0, born closed):** `T *const p[]` followed by `p++` was refused, because the element's `const` had been put on the ADJUSTED pointer (C 6.7.6.3p7 puts only the bracket qualifiers there). sqlite's `src/test1.c` does exactly that, so every leg's testfixture failed to build, and no ctest entry compiles it. **Incompatible pointer conversions** are accepted with a warning at every site (initializers including brace elements, assignment, argument, return, comparisons, `?:`), as all four references do (`S_IncompatiblePointerConversion` 0xE083), with the integer↔pointer class beside it (0xE084); `x += p` / `p -= q` computed SILENT wrong values; `_Generic` selects on the qualifier axis (24 of 30 cases were wrong); all four qualifier markers have ONE owner, `semantics.*`; `char s[] = {"abc"}`, designator-sized arrays, and excess positional elements as a warning (0xE087); `__func__`'s elements are read-only (the image segfaulted) and a file-scope `__func__` is `""` with a warning (0xE085). **Fold 3, the current-object cursor** (C 6.7.9p17–20): brace elision, union lists and designators through anonymous members — `{.u.i = 40, 2}` dropped the 40 and `{.i.a = 30, 12}` wrote the wrong member, both silently |
+| `lm` | limits, types, shipped headers (folds 1b, 2) | `<limits.h>` derives all 32 names from the pair's type lattice (DSS defined nine); `wchar_t` follows each pair's ABI through `abiTypedef` (it was SIGNED on arm64 Linux, a silent wrong result; `S_AbiTypedefUndeclared` 0xE086); a derived `type-unsigned` predefine kind (`__CHAR/WCHAR/WINT_UNSIGNED__`); `#undef INT_MAX` no longer resurrects; INT64_C, `clock_t`; NULL is `((void*)0)`, and the static-initializer cast chain peels every cast (`static char *p = NULL;` was refused on every format); `elementCoreByFormat` is DELETED; `S_ISLNK`/`S_IFLNK` and two include edges leave pe, where neither reference defines them. **Fold 2:** `L'a'`, `u'a'`, `U'a'`, `u8'a'` are integer constant expressions and work in `#if`, and the narrow `#if` arm follows plain char's signedness (arm64 ELF took the wrong arm SILENTLY: 7, not 42) |
+| `xa` | assembler surface, relocations, linker (tranche 1, tranche 2 part 1) | RIP- and symbol-relative addressing (a `rip` register row, a PC-relative-base target key, the format-neutral `riprel32`); **an input section is the unit of placement**, a FORMAT rule (ELF and PE never split, Mach-O only under MH_SUBSECTIONS_VIA_SYMBOLS) — a gcc `-O2` object storing through section-symbol+offset linked to a program exiting 33, not 42, and a gcc sqlite3 archive of 1,558 functions now RUNS (`K_InputSectionSplit` 0x8029); the COFF reader dropped an in-place `.text` addend (a clang object exited 32); an address operand may name an undefined symbol, its kind taken from the DEFINITION as ld does (`K_ImportReferenceUnbindable` 0x802A) |
+| `mig` | the harness | the Python sqlite driver on macOS (an archive reader instead of the host `ar`; `make`'s cwd compared by identity); **ONE DOOR**: `anchors.py`'s write path deleted, every row write through `dssharness write-anchor`/`set-anchor`; pe's `fileio.c` takes the HARNESS's own `build.tuPreludes`, handed to both compilers, and `referenceSurface` is gone; Step 5 refreshes through `dssharness build`; Step 9 stamps the newest CODE image; `sys.dont_write_bytecode` in 34 programs, owned by check-scripts-index clause 12; **the round-close recompile is a committed driver mode**, `build_and_test.py --recompile <leg>` (`sqlite_recompile.py`, the resolver verb `--recompile-verdicts`, the manifest composition shared with Step 7, three blind spots closed: dsscp's diagnostic caps, header errors with no include chain, a reference failure with no parsed error) |
+
+**Also (orchestrator).**
+- **DssHarness 0.5.9 is adopted** (deployed 2026-09-24 00:56; repo-harness PR #11 answers our reports #2–#7). The
+  door now refuses a Status/Trigger verdict split either way round (`anchors.triggerCarriesVerdict: true`),
+  including a `set-anchor` against the Trigger it KEEPS, refuses a non-UTF-8 or BOM-led cell, and keeps in-line
+  whitespace as written — each MEASURED on throwaway repositories — so the launcher's copies of those rules are
+  DELETED (`anchors.py`; its self-test pins the config key instead; red-on-disable through ctest). `remoteExcludes:
+  ["repo-guard"]` makes the eight-run gate ONE invocation; `labelArg`/`excludeJoin`; `compilerId.C` holds C to its
+  id on every toolchain (the gate lines name `(C, CXX)`); the four `ci` settings `check-ci-legs` now needs. `init` on
+  main: everything kept, no notes. No leg rebuilt from clean.
+- **NEW runner `probe-reference-cc`**: measures a reference compiler on any leg's host (the Mac's Apple clang 21, the
+  VPS's gcc 13.3 — the VPS has NO clang —, WSL, Windows), batched so one keep-awake covers a Mac batch. It measured,
+  among others: Apple's SDK ships NO `<uchar.h>`; Darwin's `int_fast16_t`/`int_fast32_t` are `short`/`int`.
+- **The host crashed mid-round (~23:15).** Four lanes and main's verify drove it to its commit limit (81.0 of
+  113.7 GB, pagefile peak 38.7 GB); the Claude host process died with every agent. The OS did not reboot, main's
+  verify ran on orphaned and passed, and no text file was damaged (0 empty, 0 NUL-truncated among 1,338 touched).
+  Lanes now build and test at `-j 4`, one heavy job each, behind `wait_for_memory.ps1` (the English `Get-Counter`
+  path FAILS on this pt-BR host), and the orchestrator opens a GATE WINDOW (no lane build or ctest) for its gate.
+- **A composer broke three paths** in two rows it wrote to the done registry (a wrapped line joined with a space:
+  `tests/hir/ test_…`); repaired, and the orchestrator's row apply now refuses that shape before writing.
+- **Round 8's `<gate summary … TBD>` placeholder** in its DssHarness list was filled with report #4's items.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **590 open at HEAD → 588**, "closed 8, opened 6
+(created 0, disclosed-pre-existing 6)"; banding **P0 0 · P1 57 · P2 187 · P3 329 · P4 11 · P5 4**; `read-anchors
+--lint` 0 findings. ✔MEASURED against HEAD: **16 new rows** — 10 born closed, 6 born open (all disclosed) — and 8
+rows open at HEAD closed (the done registry 1569 → 1587 rows).
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.9) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2.0 (C, CXX) · **2404 / 2404** | **MSVC 19.51.36260.0** (C, CXX; VS 18.10.12217.157, toolset 14.51.36231) · **2404 / 2404** |
+| WSL x86_64, gcc 13.3.0 (C, CXX) | **2373 / 2373** | **2373 / 2373** |
+| arm64 VPS, gcc 13.3.0 (C, CXX) | **2373 / 2373** | **2373 / 2373** |
+| macOS arm64, AppleClang 21.0.0 (C, CXX) | **2372 / 2373** — the one red: `harness/sqlite_driver_selftest` | **2372 / 2373** — the same one |
+
+- **2373 = 2404 minus the 31-entry `repo-guard` label**, which the four indirect legs leave out through
+  `remoteExcludes` (the operator's 2026-08-25 ruling). The six non-Mac legs ran as ONE invocation (`GATE_RC=0`); the
+  Mac pair ran as a second only because the Mac was asleep at the start (it was waited for, not skipped).
+- **The VPS counts were READ from the host** (`read-leg-path`): "100% tests passed out of 2373" on both legs. The
+  ledger carried no count for them, because the VPS's ctest prints no "0 tests failed" clause and our
+  `countPattern` matched only that form — so the cross-leg count comparison never saw the VPS (round 8 read its counts
+  by hand for the same reason). Fixed after the gate: the pattern reads both forms, and a targeted VPS run recorded
+  its count ("1 test").
+- **The Mac's one red is a test arm, not the driver:** DC-21/P22 (read from the Mac's own log through
+  `read-leg-path`) compared the found tool's PATH with the installed one's as strings. The locator tries
+  `dssharness` before `DssHarness`; macOS's default APFS is case-INSENSITIVE, so the first spelling already names the
+  installed file and is what it returns, and `os.path.normcase` folds case on Windows only. Fixed after the gate:
+  P22 compares by FILE IDENTITY (`os.path.samefile` + the directory). On Windows the contract suite reads
+  `passed=486 failed=0`, and its own red-on-disable row RD-52 (the installer directory dropped) reddens exactly P22.
+  **On the Mac, re-run after the fix on both legs: `harness/sqlite_driver_selftest` PASSED** (AppleClang 21.0.0,
+  `GATE_RC=0`) — the gate's only red, fixed and proven where it failed.
+- **The round-close sqlite recompile** (new at every round close, `build_and_test.py --recompile pe64-x86_64` with
+  this commit's dsscp against the mingw reference oracle): **`tus=189 reference_ok=189 dss_ok=189 blockers=0`**.
+- Every leg WARNED that a test object this round added, `…test_sizeof_value_names_the_parser_never_saw_declared.cpp.o`,
+  is 174 characters below the build directory (176 with its depfile), past `worktrees.pathBudgetReserve` 168. The
+  reserve is NOT raised (config.json's own budget, `50 + name + 30 + 168 + 1 < 260`, leaves one character at the
+  maximum worktree-name length): lane cs's fold 4 renames the test (its path carries the name twice; 136 after).
+- **The 77 files this round ADDED were untracked until the commit** — no fold staged them — so every git-reading
+  guard run during the round saw an index without them. Staged after the gate (explicit paths, `.a` test archives
+  included): the `repo-guard` label **31/31** and `-R ^harness/` **6/6** on the complete index.
+
+**DssHarness.** Sent to repo-harness this round: #5 (the Mac's dark wake: `legs` answers while the transport cannot
+resolve; one copy per host serializes lanes), #6 (`sync --pull` of a missing path; an unresolved host reported as
+DssHarness not answering), #7 + addendum (the anchor door: no verdict check, whitespace collapsed, non-UTF-8 stored
+as U+FFFD, a BOM stripped). ALL answered in 0.5.9 (above), plus reports #2–#4 and the compiler-updated-in-place
+report from round 8. After upgrading: the host-exec command line they asked for, the upgrade measurements, and two
+leftover `DssHarness <command>` spellings in `--help` output. **#8** (0.5.9): a worktree's FIRST sync to a host opens
+one ssh session per write (lane xa measured 2,446 sessions and 1,136 s to the Mac, which slept mid-sync; the
+per-worktree copies make that the common case); ssh's failure text names the PINNED address and is relayed
+verbatim into the leg's reason (a host address in an output); keep-awake starts with the leg, not the sync before it.
+Until #8 is fixed, Mac and VPS work runs from MAIN's copy (incremental), routed through the orchestrator.
+
+**NEXT — P68 ROUND 10.** The lanes hold, at a fold point or one gate short of it:
+- `cs` fold 4 (at its fold point: MinGW 2380/2381 and MSVC 2380/2381, the census only; 9/9 red-on-disable): the array operand of `+`/`-` decays in the typer (`sizeof(a + 1)`
+  was 40, not 8; `_Generic(1 + a, …)` missed; P1, born closed); an index designator of 2^32 or more wrapped to a small
+  index SILENTLY (P1, born closed; a stated 2^32−1 limit); a disclosed P1, that a brace-initialized array costs its
+  LENGTH, not its initializer (a zeroed 1 GiB buffer would need ~200 GB); the test rename; 84 vacuous pins hardened. Then UAC's unsigned counterpart, the bracket `volatile` (now a visible wrong
+  result, P1), the sparse aggregate, and the examples runners' declared-warning rule.
+- `xa` tranche 2 part 2 (at its fold point: MSVC 2362/2365 on the exact snapshot, the three guards a lane tree
+  cannot pass; 15/15 red-on-disable): the aarch64 twins of row 1 (`adrp`, `:lo12:`, `@PAGE`/`@PAGEOFF`,
+  scaled page-offset loads) and **a foreign Mach-O arm64 page-offset LOAD patched as an ADD** (P1 silent, born
+  closed); then the archive-DATA crash (reading `extern int x` from a DSS-built staticlib crashes on every format;
+  P1, it unblocks lm's getopt), the relocation kind by instruction class with `&puts` ≠ dlsym, the arm64 gas surface.
+- `lm`: the `__*_TYPE__` family with the glibc `int_fast16_t`/`int_fast32_t` typedefs (they are `long`; DSS says
+  `i16`/`i32` on every pair); `__linux__`/`__unix__`/`__ELF__` with an honest `impliedSurface`; the stdint limit
+  macros; getopt once xa lands.
+- `mig` Phase B (at its fold point, 2383/2383 MinGW and MSVC): ONE owner for a kind's config documents (a stray
+  file named after a language loaded as a second document; P1, closed), `check-diagnostic-codes --cross-branch`
+  (P1, closed), a guard that ratchets anchor ids out of operator-facing C++ messages (69 burned; the row stays
+  disclosed), the uncapped diagnostic stream for Step 7's attribution; then the stage result written on every POSIX
+  host, not only WSL.
+- **Fold order at the start of round 10:** cs fold 4, xa tranche 2 part 2, lm fold 3 (when reported), mig Phase B —
+  each snapshot is frozen and accepted; main's verify after each.
+- **Owed at round 10's gate:** xa's two arm64 Mach-O examples running on the Mac (only objdump has checked them).
+
+---
+
 ### ★ P68 ROUND 8 — READ THIS FIRST: DssHarness 0.5.8 runs all eight legs, no `.sh`/`.ps1` is left in the actions tree, and five lanes landed
 
 **THE LANES THIS COMMIT CARRIES**, each folded md5-verified against its lane (a 3-way merge wherever main had
@@ -156,7 +267,17 @@ rows open at HEAD closed (the done registry 1488 → 1569 rows).
 - #2: `successPattern` is undocumented;
 - #2: `delete-worktree` and the path budget differ from our old tool's policy;
 - #3: a compiler updated in place is invisible to a leg tree (compare the recorded compiler VERSION).
-<gate summary + survey + MSVC verdict line — TBD>
+- #4: two WSL legs starting at once race on `/tmp/.dotnet/shm/global` (`EEXIST`, exit 70);
+- #4: `sync` warns that it "does not manage" a file that differs, for a file it does manage;
+- #4: no per-leg label exclusion, so the gate takes two invocations;
+- #4: a synced leg's git index is the remote clone's own, so an index-reading guard judges another index;
+- #4: a failed remote step reports only its exit code. Its log stays on the host, under the REMOTE sub-run's id,
+  not the id the verb prints first;
+- #4: the leg probe resolves the Mac's `.local` name with .NET's resolver, and the transport with whichever `ssh`
+  PATH finds first.
+- With #4: this gate's table, the contention survey's line for `linux-arm64-release` (`dsscp` shares the per-user
+  runtime object cache), and the MSVC verdict (the Release leg is MSVC 19.51.36260, read from its own tree).
+  (This list was left as a placeholder in the round-8 commit and filled in round 9.)
 
 **FIRST, BEFORE ROUND 9's LANES — the sqlite driver on macOS (harness, fixed when faced).** Four
 `harness/sqlite_driver_selftest` arms fail on the Mac and nowhere else:

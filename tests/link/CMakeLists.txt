@@ -721,3 +721,25 @@ dss_add_test(NAME link/test_link_writer_commit_holder
 dss_add_test(NAME link/test_image_runpath SOURCES test_image_runpath.cpp)
 target_link_libraries(dss_link_test_image_runpath
                       PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 9: an ELF or PE/COFF INPUT SECTION is the unit of placement
+# (`inputSectionPlacement`, `InputSectionSlice`). Reference-built objects read
+# by the readers and laid out by the writers' own `buildExecDataSection`; each
+# pin checks the address the producer's instruction reaches, because the
+# measured defect was a green link that ran to 33. The native witnesses build
+# their objects with a mingw-w64 gcc on PATH (Windows) and RUN them.
+dss_add_test(NAME link/test_input_section_units
+             SOURCES test_input_section_units.cpp)
+# Loads each shipped `.format.json` minus one key, so the fixture cannot drift from the file.
+target_link_libraries(dss_link_test_input_section_units
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 9 (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL): a `.s`
+# reference that states no code-vs-data kind takes it from the DEFINITION. The
+# link gate on hand-built modules (a library stating no kind or DATUM refused by
+# name, a library FUNCTION and a sibling definition not, a relocatable object
+# keeping the name, the merge adopting a statement), then the same cases
+# through the driver: a golden NOTYPE shared object, the shipped `stdout`, and
+# the example's own source with its reference-built archives (run on Windows).
+dss_add_test(NAME link/test_import_kind_from_definition
+             SOURCES test_import_kind_from_definition.cpp)

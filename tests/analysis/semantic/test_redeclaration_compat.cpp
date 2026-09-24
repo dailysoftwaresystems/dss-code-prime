@@ -393,7 +393,8 @@ TEST(RedeclarationCompat, LegalRedeclarationsStayAccepted) {
 // calling convention, no codegen DSS performs) nor, before this cycle, declarable
 // in any shipped language config, so the spine could make no claim about it and
 // the oracle could not judge the axis at all. It now rides `QualifierSpine`
-// beside `const`, driven by a per-declaration `restrictMarker` role.
+// beside `const`, driven by the language's `restrictMarker` (declared once in the
+// semantics block since P68 round 9; every typed declaration row derives it).
 //
 // THE THREE CASES ARE ASSERTED TOGETHER because any two of them alone would pass
 // for a mistake:
@@ -407,9 +408,10 @@ TEST(RedeclarationCompat, LegalRedeclarationsStayAccepted) {
 // last two.
 //
 // RED-ON-DISABLE (REMOVE direction): delete `"restrictMarker": "RestrictKeyword"`
-// from `param`'s declaration row in `c.lang.json` and the first case goes green
-// into silence — the refusal disappears while every other assertion here still
-// passes, which is exactly why it is asserted by NAME and not by a count.
+// from `c.lang.json`'s semantics block (until P68 round 9, from `param`'s row) and
+// the first case goes green into silence — the refusal disappears while every
+// other assertion here still passes, which is exactly why it is asserted by NAME
+// and not by a count.
 TEST(RedeclarationCompat, RestrictIsJudgedOnPointeesAndDroppedAtAParameterTopLevel) {
     auto const refused = [](char const* src) {
         auto model = analyzeC(src);

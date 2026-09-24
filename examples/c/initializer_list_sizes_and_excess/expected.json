@@ -1,0 +1,37 @@
+{
+  "$comment": "P68 round 9 (lane `cs`), found while fixing a compound literal's omitted bound (D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS' continuation): three initializer-list rules. C 6.7.9p22 — an array of unknown size is the LARGEST initialized index plus one (designators move the index; a compound literal too); C 6.7.9p14 — a character array initialized by a string literal in braces; C 6.7.9p2 — EXCESS positional elements are a constraint violation that the accepting compilers warn about and DROP UNEVALUATED. ✔MEASURED 2026-09-23, each reference separately, this file compiled and RUN: gcc 13.3.0, mingw-w64 13.2.0 and clang 18.1.3 at -std=c2x build it with two excess-element warnings and exit 42 (`calls` stays 0: neither `bump()` ran); at -std=c17 -pedantic-errors they refuse it, and MSVC 19.51 refuses it (C2078), each for the excess elements alone. DSS warns S_ExcessInitializerElements at the two excess elements below and exits 42. Before this round (✔MEASURED, the lane's WSL tree at the P0 fold) DSS refused the file S_NonConstantArrayLength (the compound literal's omitted bound), and each designated size and the excess elements were refused in their own probes (`.temp/probe/r8b`, `r8e`: H_UnsupportedLoweringForKind); the braced string was a verifier failure. exit 42 = every size, every value, and no excess element evaluated.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    { "code": "S_ExcessInitializerElements", "line": 33, "col": 24 },
+    { "code": "S_ExcessInitializerElements", "line": 34, "col": 26 }
+  ],
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

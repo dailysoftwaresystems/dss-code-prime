@@ -374,6 +374,15 @@ ObjectFormatSchema::relocationDecodeTable() const {
             }
             table.callSignalNativeIds.insert(r.pltNativeId);
         }
+        // The wire types a format spells by the bytes after the field
+        // (X86_64_RELOC_SIGNED_1/_2/_4) decode to the row's own kind: they
+        // differ from `nativeId` in the type alone, never in the addend.
+        for (auto const& e : r.nativeIdByBytesAfterField) {
+            if (auto err = mapNative(e.nativeId, r.kind)) {
+                return std::unexpected(std::move(*err));
+            }
+            if (r.isCall) table.callSignalNativeIds.insert(e.nativeId);
+        }
         if (r.isCall) table.callSignalNativeIds.insert(r.nativeId);
     }
     return table;
@@ -971,6 +980,81 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                              "R_X86_64_PC32 = 2)",
                              relocations[i].name));
         }
+    }
+
+    // ── nativeIdByBytesAfterField (P68 round 9) ──────────────────────────
+    // Each entry is a WIRE TYPE of its own and decodes to its row's kind, so it
+    // obeys the rules a `nativeId` does: non-zero, claimed by no other row or
+    // entry, and on a row that DECODES (an emission alias is excluded from the
+    // reverse map, so an entry on one could never be read back). A byte count
+    // of 0 would shadow the row's own `nativeId`, and two entries for one count
+    // would make the emitter's choice a declaration-order coin flip.
+    {
+        std::unordered_map<std::uint32_t, std::string> claimed;
+        for (auto const& r : relocations) {
+            if (!r.emitOnly) claimed.emplace(r.nativeId, r.name);
+            if (r.pltNativeId != 0u) claimed.emplace(r.pltNativeId, r.name);
+        }
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            auto const& r = relocations[i];
+            if (!r.nativeIdByBytesAfterField.empty() && r.emitOnly) {
+                fail(std::format("/relocations/{}/nativeIdByBytesAfterField", i),
+                     std::format("relocation '{}' is an emission alias "
+                                 "(emitOnly), so its bytes-after-field wire "
+                                 "types could never be decoded", r.name));
+            }
+            for (std::size_t j = 0; j < r.nativeIdByBytesAfterField.size(); ++j) {
+                auto const& e = r.nativeIdByBytesAfterField[j];
+                auto const path = std::format(
+                    "/relocations/{}/nativeIdByBytesAfterField/{}", i, j);
+                if (e.bytesAfterField == 0 || e.nativeId == 0) {
+                    fail(path,
+                         std::format("relocation '{}': a bytes-after-field "
+                                     "entry needs a non-zero byte count (0 is "
+                                     "the row's own 'nativeId') and a non-zero "
+                                     "wire type", r.name));
+                }
+                for (std::size_t k = 0; k < j; ++k) {
+                    if (r.nativeIdByBytesAfterField[k].bytesAfterField
+                        == e.bytesAfterField) {
+                        fail(path,
+                             std::format("relocation '{}' lists {} byte(s) "
+                                         "after the field twice", r.name,
+                                         e.bytesAfterField));
+                    }
+                }
+                auto const ins = claimed.emplace(e.nativeId, r.name);
+                if (!ins.second) {
+                    fail(path,
+                         std::format("relocation '{}': wire type {} is already "
+                                     "claimed by '{}' — a native wire id maps "
+                                     "back to exactly ONE RelocationKind",
+                                     r.name, e.nativeId, ins.first->second));
+                }
+            }
+        }
+    }
+
+    // ── relocationAddends (P68 round 9): where an addend lives is a FORMAT
+    // fact, and a format that writes relocations must state it — both
+    // answers produce a well-formed object, and only one is the format.
+    if (!relocations.empty() && !relocationAddendStorage.has_value()) {
+        fail("/relocationAddends",
+             "a format that declares relocations must declare where their "
+             "addend lives ('relocationAddends': 'explicit' — the record has an "
+             "addend column — or 'inPlace' — the patched field holds it)");
+    }
+
+    // ── inputSectionPlacement (P68 round 9): whether the link may split a
+    // relocatable object's input section into independently placed atoms. A
+    // format whose objects carry relocations must say it, because both answers
+    // link and only one of them keeps the producer's code correct.
+    if (!relocations.empty() && !inputSectionPlacement.has_value()) {
+        fail("/inputSectionPlacement",
+             "a format that declares relocations must declare whether its "
+             "input sections may be split into independently placed atoms "
+             "('inputSectionPlacement': 'unit' — never — or "
+             "'subsectionsWhenDeclared' — only when the object declares it)");
     }
 
     // Sections: (kind, encoding) unique cross-row + name non-empty. The format

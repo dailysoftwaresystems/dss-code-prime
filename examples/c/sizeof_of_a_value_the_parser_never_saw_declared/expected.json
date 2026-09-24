@@ -1,0 +1,15 @@
+{
+  "$comment": "P68 round 9 (lane `cs`) — `sizeof ( NAME )` where NAME is a VALUE the parser's binder sketch never saw declared. `sizeof ( X )` has no operand after its type position, so a name the sketch did not know COMMITTED AS A TYPE and the semantic tier refused it S_UnknownType. Two kinds of value never reached the sketch: the language's PREDEFINED identifiers (`semantics.predefinedFunctionNames` — `__func__`, `__FUNCTION__`), which the source never declares, and ENUMERATION CONSTANTS, which the sketch bound inside their enum's body scope where they died with it. The sketch now records the first as values from that config row and binds the second where the analyzer republishes them (`fieldChildren.liftToEnclosingScope`). MEASURED 2026-09-23, this very file, each reference separately and RUN: gcc 13.3.0 and clang 18.1.3 at -std=c2x, clang at -std=c17 -pedantic-errors, mingw-w64 13.2.0 at -std=c2x and MSVC 19.51.36260 at /std:c17 and /std:clatest all build it and exit 42 (gcc and mingw at -std=c17 -pedantic-errors refuse only the non-ISO `__FUNCTION__`). exit 42 = 5 (`sizeof(__func__)` in main) + 5 (`__FUNCTION__`) + 7 (helper's `__func__`) + 4 x 4 (enumerators of a file-scope anonymous, a named, a block-scope and a struct-nested enum) + 5 (the typedef control) + 4. RED-ON-DISABLE: drop the predefined-identifier seed from the sketch -> the build fails S_UnknownType on `__func__`; drop the enumerator lift -> it fails on `A`. Release pipeline + all four targets, because the claim is 'DSS BUILDS AND RUNS THIS'.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

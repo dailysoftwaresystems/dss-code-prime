@@ -63,6 +63,7 @@ import argparse
 import os
 import re
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # The row reader is the SIBLING program `anchors`, loaded from beside this file's own

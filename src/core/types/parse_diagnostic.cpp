@@ -147,6 +147,16 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_IncompleteArgumentType";
         case DiagnosticCode::S_TagDeclaredInParameterList:
             return "S_TagDeclaredInParameterList";
+        case DiagnosticCode::S_IncompatiblePointerConversion:
+            return "S_IncompatiblePointerConversion";
+        case DiagnosticCode::S_IntegerPointerConversion:
+            return "S_IntegerPointerConversion";
+        case DiagnosticCode::S_PredefinedIdentifierOutsideFunction:
+            return "S_PredefinedIdentifierOutsideFunction";
+        case DiagnosticCode::S_AbiTypedefUndeclared:
+            return "S_AbiTypedefUndeclared";
+        case DiagnosticCode::S_ExcessInitializerElements:
+            return "S_ExcessInitializerElements";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -584,6 +594,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksRunpath";
         case DiagnosticCode::K_InvalidRunpathRequest:
             return "K_InvalidRunpathRequest";
+        case DiagnosticCode::K_InputSectionSplit:
+            return "K_InputSectionSplit";
+        case DiagnosticCode::K_ImportReferenceUnbindable:
+            return "K_ImportReferenceUnbindable";
         case DiagnosticCode::K_ExternImportAttributeConflict:
             return "K_ExternImportAttributeConflict";
         case DiagnosticCode::K_FormatLacksProcessExit:

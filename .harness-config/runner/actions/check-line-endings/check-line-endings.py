@@ -64,6 +64,7 @@ import sys
 import tempfile
 import threading
 import time
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # A cp1252 console turns a printed glyph into a traceback; reconfigure before anything can
 # print (the property `guard_output_encoding_guard` ratchets for every program).

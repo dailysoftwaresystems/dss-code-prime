@@ -106,7 +106,21 @@
 
     "attDottedName": {
       "$comment": "★★★ A DOTTED NAME — `.L3`, `.rodata` — AND WHY IT LIVES UNDER `attScalar` (P68 round 8, D-ASM-DOTTED-LABEL-AS-A-BRANCH-TARGET-REFUSED). This rule used to hang off the OPERAND alternatives, unbound to any role, which served `.section .rodata` (its operand is read as TOKENS by the directive handler) and refused every dotted name in an INSTRUCTION — including the one every `gcc -S` output writes: `jmp .L3` to a `.L` label. ✔MEASURED 2026-09-21 at the part-3 base, both dialects: `jmp .L1` / `b .L1` refused, `operand shape is not one this dialect binds to an operand role`; GNU as 2.42 and clang 18.1.3 assemble both. The closed rows that claimed the branch-target half (the dot-prefixed-label and dotted-name rows) had pinned only a label DEFINITION and a `jmp` to an undotted label. ⇒ Under the symbol-bearing rule the dotted name decodes as the SYMBOL it spells, introducer included (`decodeScalar` joins the tokens), so a branch reaches the block `.L3:` defined, and `.section .rodata` still reads first and last token exactly as before. In an arithmetic operand position it is a symbol like any other and meets the same refusal a bare symbol does. ── The original rationale, still true of the section half: ★★★ `.rodata` IN OPERAND POSITION — the shape `.section .rodata` needs (D-ASM-SECTION-DIRECTIVE-WITH-OPERAND-UNMODELLED, closed 2026-08-13). ✔MEASURED 2026-08-13 with x86_64 `as`: `.section .rodata` assembles rc=0 into a `.rodata` PROGBITS+A section, a bare `.rodata` is `Error: unknown pseudo-op`, and — the part that makes the dot load-bearing — `.section rodata` WITHOUT the dot creates a section literally named `rodata` with NO allocation flag, i.e. a DIFFERENT section. So the introducer is part of the name and the consumer checks for it (read off the tree, never hardcoded).\n★ IT HAS NO `operandForms` ROLE OF ITS OWN: an instruction reaches it through `attDisplaced` → `attScalar`, so it decodes with the `displaced` role like any other symbol, and the directive handler still reads `.section .rodata` as TEXT against this dialect's own section-opening directive ROWS. In an arithmetic position it meets a bare symbol's refusal — ✔MEASURED 2026-09-21, `addq .rodata, %rax` is `A_AsmTextUnsupported: 'addq' takes the address of '.rodata', which this file defines no label for`.\n★ FIRST-DISJOINT WITH EVERY SIBLING ARM OF `attScalar` (`DirectiveDot` versus `IntLiteral | MinusSign | Identifier`), so no speculation is introduced.\nⓘ BOTH HALVES OF THE `jmp .L3` GAP the token banner records are closed: a dotted name is an operand, and — since P68 round 8 — a branch TARGET (`jmp .L1` to a `.L1:` label assembles to the block it names).",
-      "sequence": ["DirectiveDot", "Identifier"]
+      "sequence": ["DirectiveDot", "Identifier", {"optional": "attAddend"}]
+    },
+
+    "attSymbolRef": {
+      "$comment": "★★ A SYMBOL NAME WITH AN OPTIONAL CONSTANT AFTER IT — `msg`, `msg+4`, `table-8` (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). gcc -S writes `leaq table+8(%rip)` and `movl gp+8(%rip)` for a global's field; ✔MEASURED 2026-09-23 at the round-9 base, `leaq msg+4(%rip), %r8` was refused at the parser (`expected 'LineEnd' — got '+'`) while gas 2.42, mingw gas and clang 18.1.3 assemble it on ELF, PE and Mach-O. The grammar is LL(1), so the name cannot gain a sibling arm; it gains a TAIL, the `addend` role, which the decode takes off before it reads the name (a `-8` there is a constant added to the symbol, never the whole value's sign). `attDottedName` takes the same tail (`.LC0+16`). ⓘ Only a symbol takes one: gas's full constant expressions (`8-4`, `(1<<3)`) stay out, as `attImmediate` says.",
+      "sequence": ["Identifier", {"optional": "attAddend"}]
+    },
+
+    "attAddend": {
+      "$comment": "The constant after a symbol: `+4` or `-8`. The `-` arm IS `attNegNumber`, so its sign is read exactly as a negated number's is; the `+` arm is its mirror.",
+      "alt": ["attPlusNumber", "attNegNumber"]
+    },
+
+    "attPlusNumber": {
+      "sequence": ["PlusSign", "IntLiteral"]
     },
 
     "attTypeMarker": {
@@ -128,8 +142,8 @@
     },
 
     "attScalar": {
-      "$comment": "A displacement / immediate value: a number, a negated number, or a symbol name.",
-      "alt": ["IntLiteral", "attNegNumber", "Identifier", "attDottedName"]
+      "$comment": "A displacement / immediate value: a number, a negated number, or a symbol name (dotted or not) with an optional constant after it.",
+      "alt": ["IntLiteral", "attNegNumber", "attSymbolRef", "attDottedName"]
     },
 
     "attNegNumber": {
@@ -230,7 +244,8 @@
       "displaced": "attDisplaced",
       "indirect":  "attIndirect",
       "scalar":    "attScalar",
-      "negNumber": "attNegNumber"
+      "negNumber": "attNegNumber",
+      "addend":    "attAddend"
     },
 
     "entryLabels": ["main"],

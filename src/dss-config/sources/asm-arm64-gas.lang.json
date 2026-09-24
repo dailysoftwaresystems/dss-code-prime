@@ -244,7 +244,8 @@
       "displaced":  "armName",
       "indirect":   null,
       "scalar":     "armScalar",
-      "negNumber":  "armNegNumber"
+      "negNumber":  "armNegNumber",
+      "addend":     null
     },
 
     "entryLabels": ["main"],

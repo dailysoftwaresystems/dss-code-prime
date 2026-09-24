@@ -12,6 +12,7 @@
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
+#include "link/format/relocation_addend.hpp"
 #include "link/format/string_table.hpp"
 #include "link/format/weak_definition_gate.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -4890,6 +4891,36 @@ encode(AssembledModule const&    module,
     // ET_EXEC applies relocations in-place (above) and emits no
     // .rela.text — the build loop is skipped entirely.
 
+    // ★ THE RELA ADDEND COLUMN, from the ONE owner of where a format keeps an
+    // addend (`link/format/relocation_addend.hpp`): an ELF RELA record's column
+    // carries DSS's addend plus the target kind's `addendBias`
+    // (D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN), and the ELF object reader
+    // recovers the addend through the same helper. An ELF format declaring any
+    // storage but `explicit` has no column to write, and is refused.
+    auto const addendStorage = fmt.relocationAddendStorage();
+    auto const relaAddendColumn =
+        [&](Relocation const& rel, TargetRelocationInfo const& tri)
+        -> std::optional<std::int64_t> {
+        if (!addendStorage.has_value()
+            || *addendStorage != RelocationAddendStorage::Explicit) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format("elf::encode: object format '{}' does not declare "
+                             "'relocationAddends': 'explicit', and an ELF RELA "
+                             "record keeps its addend nowhere else", fmt.name()));
+            return std::nullopt;
+        }
+        auto const placed = link::format::placeRelocationAddend(
+            *addendStorage, tri, rel.addend, std::span<std::uint8_t>{});
+        if (!placed.has_value() || !placed->column.has_value()) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format("elf::encode: {}",
+                             placed.has_value() ? std::string{"no addend column"}
+                                                : placed.error()));
+            return std::nullopt;
+        }
+        return *placed->column;
+    };
+
     std::vector<std::uint8_t> relaText;
     if (!isExec) {
         // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined-extern FUNCTION
@@ -4971,10 +5002,12 @@ encode(AssembledModule const&    module,
                      && externCallTargets.contains(rel.target))
                         ? fmtReloc->pltNativeId
                         : fmtReloc->nativeId;
+                auto const column = relaAddendColumn(rel, *triReloc);
+                if (!column.has_value()) continue;
                 std::uint64_t const rOffset = fnStart + rel.offset;
                 appendU64LE(relaText, rOffset);
                 appendU64LE(relaText, makeRelaInfo(symIdx, emittedNativeId));
-                appendI64LE(relaText, rel.addend + triReloc->addendBias);
+                appendI64LE(relaText, *column);
             }
         }
     }
@@ -5025,9 +5058,11 @@ encode(AssembledModule const&    module,
                              + std::string{targetSchema.name()} + "'");
                     continue;
                 }
+                auto const column = relaAddendColumn(rel, *triReloc);
+                if (!column.has_value()) continue;
                 appendU64LE(rela, itemOff + rel.offset);
                 appendU64LE(rela, makeRelaInfo(it->second, fmtReloc->nativeId));
-                appendI64LE(rela, rel.addend + triReloc->addendBias);
+                appendI64LE(rela, *column);
             }
         }
         return rela;

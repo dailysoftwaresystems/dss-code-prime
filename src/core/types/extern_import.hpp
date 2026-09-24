@@ -40,6 +40,31 @@
 
 namespace dss {
 
+// ★★ WHERE AN IMPORT's CODE-vs-DATA CAME FROM
+// (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL, P68 round 9).
+// A C declaration states its kind, and so does a `.s` CALL: a call target is
+// code. A `.s` ADDRESS operand or data slot (`leaq x(%rip)`, `.quad x`) naming
+// a symbol the file does not define states NOTHING. gas records the name alone
+// (✔MEASURED 2026-09-23: the same R_X86_64_PC32 for a datum and a function),
+// and ld takes the kind from the DEFINITION it finds. So does DSS:
+//   * `Stated`: `isData` is the reference's own statement (every producer
+//     except the one below, and the default);
+//   * `Pending`: the reference stated nothing, and no binder has read a
+//     definition yet. `isData` MEANS NOTHING in this state and must not be
+//     read as a statement;
+//   * `FromLibrary`: a binder read the definition's own kind from the library
+//     that owns the name and wrote it into `isData`.
+// A sibling unit's definition decides by folding the row away (the link's
+// cross-unit resolution), whatever the state. A row that SURVIVES to the
+// writers still `Pending` is refused by name, and so is one whose library
+// definition is a DATUM, because a direct reference to library data needs a
+// copy relocation (which DSS does not make). Neither is ever defaulted.
+enum class ExternKindOrigin : std::uint8_t {
+    Stated,
+    Pending,
+    FromLibrary,
+};
+
 struct DSS_EXPORT ExternImport {
     SymbolId    symbol{};       // matches Relocation::target
     std::string mangledName;    // on-binary symbol name
@@ -308,6 +333,11 @@ struct DSS_EXPORT ExternImport {
     // walker never assigned is a resolution error at link, never a zero address
     // at run.
     SymbolId addressSlotSymbol{};
+
+    // Where `isData` came from (see `ExternKindOrigin`). `Stated` for every
+    // producer except a `.s` address operand or data slot naming a symbol the
+    // file does not define.
+    ExternKindOrigin kindOrigin = ExternKindOrigin::Stated;
 };
 
 } // namespace dss

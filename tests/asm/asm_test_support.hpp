@@ -255,6 +255,7 @@ roundTripVerify(TargetSchema const&            schema,
             case LirOperandKind::BlockRef:
             case LirOperandKind::MemBase:
             case LirOperandKind::MemOffset:
+            case LirOperandKind::MemSymbolOffset:
                 report(reporter, DiagnosticCode::A_RoundTripMismatch,
                        DiagnosticSeverity::Error,
                        std::format("round-trip: opcode '{}' wire {} "

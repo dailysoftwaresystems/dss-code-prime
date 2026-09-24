@@ -10,6 +10,7 @@
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/preprocess_config.hpp"  // PredefinedMacroDef / ShippedSurfaceClaim (the `impliedSurface` satisfaction half)
 #include "core/types/strong_ids.hpp"   // TypeId
+#include "core/types/type_lattice/core_type.hpp" // TypeKind (a constant's declared core, ShippedPpConstant)
 
 #include <cstddef>     // std::size_t (ShippedDescriptorCacheStats)
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>     // std::pair (ShippedPairFacts::abiTypedefs)
 #include <vector>
 
 // ── LANGUAGE-NEUTRAL shipped-library FFI descriptor reader ───────────────────
@@ -99,6 +101,7 @@
 namespace dss {
 
 class DiagnosticReporter;
+class GrammarSchema;   // ShippedPairFacts::language — the consuming language's vocabulary
 class TypeInterner;
 class TypeRegistry;
 struct ParseDiagnostic;   // `refuseShippedSymbolWithoutABody`'s answer; see the note below
@@ -431,16 +434,64 @@ struct DSS_EXPORT ShippedConstant {
 // One `constants` row PROJECTED into the PREPROCESSOR's vocabulary — the
 // interner-free view `readShippedLibConstants` returns. `TypeId` cannot cross
 // this boundary (it is per-CompilationUnit and the preprocessor has no
-// interner), so the two facts a phase-4 spelling actually needs travel as DATA:
-// the value's bit pattern and the declared type's signedness + width. Rendering
-// them back into a source-language literal is the LANGUAGE tier's job (the
-// preprocessor splice, driven by `semantics.integerLiteralTyping`), never this
-// one — `src/ffi` stays free of any language's literal spelling.
+// interner), so the facts a spelling needs travel as DATA: the value's bit
+// pattern, the declared type's signedness + width (phase 4), and its IDENTITY —
+// core and vocabulary tag (phase 7). Rendering them back into a source-language
+// literal is the LANGUAGE tier's job (the preprocessor splice, driven by
+// `semantics.integerLiteralTyping`), never this one — `src/ffi` stays free of
+// any language's literal spelling.
+//
+// ★ THE IDENTITY IS NEW, AND IT IS THE P68 ROUND-9 FIX
+// (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS). The splice spelled a
+// constant by its signedness alone, so its C TYPE was whatever the least-decorated
+// literal of that signedness typed to: `<stdint.h>`'s `INT64_MAX` came out `long`
+// on Mach-O where `int64_t` is `long long`, and a `LONG_MAX` on pe would have
+// been an `int`. The splice now requires the literal's PHASE-7 type to be
+// exactly (`core`, `vocabularyName`).
 struct DSS_EXPORT ShippedPpConstant {
     std::string  name;
     std::int64_t value      = 0;      // bit pattern, exactly as ShippedConstant::value
     bool         isUnsigned = false;  // the declared integer scalar's signedness
     unsigned     width      = 0;      // the declared integer scalar's width, in bits
+    TypeKind     core       = TypeKind::Void;  // the declared type's core (I8..U128)
+    std::string  vocabularyName;      // its vocabulary tag; empty = the anonymous type
+};
+
+// ══ THE ACTIVE PAIR'S FACTS A DERIVED ROW IS REALIZED FROM ═══════════════════
+// (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS)
+//
+// A `constants` row may NAME a type and a limit instead of stating a value —
+// `{ "name": "LONG_MAX", "of": "long", "limit": "max" }` — because C 5.2.5.3.2
+// gives each `<limits.h>` macro its type's promoted type AND value, and those are
+// per PAIR: `long` is 32 bits on pe and 64 on ELF/Mach-O, plain `char` is unsigned
+// on aarch64 Linux only. A fixed row would be right on some pairs and silently
+// wrong on the rest. The reader realizes such a row from these facts, supplied by
+// the caller that has them (the preprocessor splice and the semantic tier build
+// them from the same `applyTargetFormatPair` inputs):
+//
+//   * `language` — the CONSUMING language. Its vocabulary resolves `of`
+//     (`resolveLanguageTypeName`, the loader's own resolver) and its integer
+//     promotions (`arithmeticConversions`) give a max/min row its type. nullptr ⇒
+//     no derived row is realized (a descriptor read for validation only).
+//   * `dataModel` — the pair's; nullopt means NO PAIR, and a fact that depends on
+//     it (`long`'s width) is then NOT realized — never borrowed from a default.
+//     A fact the data model cannot change (`int`) is realized without one.
+//   * `charIsUnsigned` — the pair's plain-`char` signedness
+//     (`TargetSchema::charIsUnsigned`); nullopt ⇒ `char`'s range is unknown and a
+//     row of `char` is not realized.
+//   * `abiTypedefs` — the TARGET's platform ABI typedefs resolved for this format
+//     (`TargetSchema::abiTypedefCore`, the table `__SIZEOF_WCHAR_T__` reads):
+//     (name, integer core). A `typedefs` entry (or variant) that names one —
+//     `{ "name": "wchar_t", "abiTypedef": "wchar_t" }` — takes its type from here
+//     (P68 round 9, D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): `wchar_t` is a
+//     processor × platform fact, and `<stddef.h>` restating it per format said
+//     `int` for aarch64 Linux, whose `wchar_t` is `unsigned int`. Empty ⇒ such an
+//     entry is not injected (the undefined name then fails loud at its use).
+struct DSS_EXPORT ShippedPairFacts {
+    GrammarSchema const*     language = nullptr;
+    std::optional<DataModel> dataModel;
+    std::optional<bool>      charIsUnsigned;
+    std::vector<std::pair<std::string, TypeKind>> abiTypedefs;
 };
 
 // One decoded named FLOAT CONSTANT — the float-valued sibling of `ShippedConstant`
@@ -1080,6 +1131,16 @@ struct DSS_EXPORT ShippedDescriptorCacheStats {
 // string: the stated UNBOUND arm, byte-identical to an omitted key. Every
 // producer of an `ExternImport` (the driver's `analyze()` call and its
 // archive-member / assembly binders) passes one.
+//
+// ── `pairFacts` (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS)
+//
+// What a LATTICE-DERIVED `constants` row (`{name, of, limit}`) is realized from —
+// see `ShippedPairFacts`. `nullptr` (the default) realizes none: the row is still
+// VALIDATED (its keys, its `limit` verb), and injects nothing, exactly like a
+// `variants` row no target selects. The semantic tier passes the facts it built
+// for the pair; a validation-only reader passes none. Its `dataModel`, when
+// engaged, is the SAME model as `dataModel` above — the caller builds both from
+// one pair.
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -1089,7 +1150,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          std::optional<std::string_view> activeTarget = std::nullopt,
                          std::optional<ObjectFormatKind> activeFormat = std::nullopt,
                          std::span<NamedTypeBinding const> namedTypes = {},
-                         RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+                         RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+                         ShippedPairFacts const*         pairFacts    = nullptr);
 
 // Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
 // TypeInterner. Macros are pure preprocessor token text (no types), so the
@@ -1153,11 +1215,20 @@ readShippedLibMacros(std::filesystem::path const&    path,
 // diagnostics, exactly as it already does for `readShippedLibMacros`, so a
 // malformed `constants` surface is reported ONCE — by the import-resolver /
 // semantic tier that owns the positioned message.
+//
+// `pairFacts` (P68 round 9): the pair a LATTICE-DERIVED row is realized for —
+// the same facts the semantic read receives, so the two seams realize the same
+// value and type. Its `dataModel` also selects a `when:{dataModel}` typedef
+// variant a derived row's `of` names (the descriptor's typedefs are decoded
+// here for that alone, into a scratch reporter, so a typedef that needs the
+// semantic tier's cross-descriptor bindings costs nothing but its own rows).
+// nullptr ⇒ no derived row is realized, and no data model is assumed.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<ShippedPpConstant>>
 readShippedLibConstants(std::filesystem::path const&    path,
                         DiagnosticReporter&             reporter,
                         std::optional<std::string_view> activeTarget = std::nullopt,
-                        std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+                        std::optional<ObjectFormatKind> activeFormat = std::nullopt,
+                        ShippedPairFacts const*         pairFacts    = nullptr);
 
 // Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
 // WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the

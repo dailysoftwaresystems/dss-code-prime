@@ -180,9 +180,11 @@ constexpr char const* kIgnoreProbeOnly[]  = {kBadSpelling};
 
 // ✔MEASURED 2026-08-20 by walking `c.lang.json` for every enum-keyed
 // map: `coreByDataModel` occurs at 7 pointers, `coreByLongDoubleFormat` at 2,
-// `elementCoreByFormat` at 2, `signatureByDataModel` at 1, `synthesizedTypes`
-// at 1 (three roles). One representative pointer of each is probed here, and
-// `at()` re-validates it on every run.
+// `signatureByDataModel` at 1, `synthesizedTypes` at 1 (three roles). One
+// representative pointer of each is probed here, and `at()` re-validates it on
+// every run. `elementCoreByFormat` — the one map keyed on OBJECT-FORMAT names —
+// occurred at 2 until P68 round 9 deleted it (the loader refuses it now), so it
+// occurs at 0 and its probe site is gone with it.
 inline std::vector<KeyedMapSite> keyedMapSites() {
     static constexpr auto kDataModelNames  = allNames(dss::kDataModelTable);
     static constexpr auto kLongDoubleNames = allNames(dss::kLongDoubleFormatTable);
@@ -197,10 +199,6 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
         {"c", {"/semantics/synthesizedTypes/pointerDifference"},
          "\"int\"", "synthesizedTypes/pointerDifference", kDataModelNames,
          kIgnoreProbeOnly},
-        {"c",
-         {"/hirLowering/stringLiteralPrefixes/4/elementCoreByFormat"},
-         "\"I32\"", "elementCoreByFormat",
-         dss::kSelectableObjectFormatKindNames, kIgnoreProbeOnly},
     };
 }
 

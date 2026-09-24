@@ -2174,6 +2174,8 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
       "sections": [
         { "kind": "text", "name": "__text", "segment": "__TEXT", "type": 2147484672, "flags": 0, "addrAlign": 16, "entrySize": 0, "virtualAddress": 4294975488 }
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations": [
         { "name": "X86_64_RELOC_BRANCH", "kind": 1, "nativeId": 369098752 },
         { "name": "X86_64_RELOC_UNSIGNED_8", "kind": 2, "nativeId": 100663296 },
@@ -2204,7 +2206,16 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
 
 // ── Non-zero addend fails loud (Mach-O has no Rela addend) ─────
 
-TEST(MachOWriter, NonZeroAddendFailsLoud) {
+TEST(MachOWriter, NonZeroAddendIsWrittenIntoThePatchedField) {
+    // Mach-O's relocation_info has no addend column: an x86_64 addend lives in
+    // the PATCHED FIELD (`relocationAddends: inPlace`). This test used to
+    // demand a refusal of a non-zero `.text` addend. Every x86_64 producer
+    // writes one there (✔MEASURED 2026-09-23: clang 18.1.3 writes `fc ff ff
+    // ff` for `movl $5, counter(%rip)`, SIGNED_4), and an assembler emitting
+    // that instruction needs it. So the writer STAMPS it through the one owner
+    // of the rule (`link/format/relocation_addend.hpp`), and the reader gives
+    // it back. An arm64 instruction field still cannot hold one; that refusal
+    // belongs to the helper and is pinned with the arm64 relocations.
     auto loaded = loadShipped();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -2218,11 +2229,25 @@ TEST(MachOWriter, NonZeroAddendFailsLoud) {
     rel.addend = -4;
     caller.relocations.push_back(rel);
     mod.functions.push_back(std::move(caller));
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "_caller", SymbolBinding::Global,
+                                SymbolVisibility::Default}};
+    mod.externImports = {ExternImport{SymbolId{2}, "_callee", "", /*isData=*/false}};
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    std::vector<std::uint8_t> const stamped{0xE8, 0xFC, 0xFF, 0xFF, 0xFF};
+    EXPECT_NE(std::search(bytes.begin(), bytes.end(), stamped.begin(), stamped.end()),
+              bytes.end())
+        << "the call's field must hold the addend -4 in place";
+
+    DiagnosticReporter rrep;
+    auto read = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(read.has_value()) << "errors=" << rrep.errorCount();
+    ASSERT_EQ(read->functions.size(), 1u);
+    ASSERT_EQ(read->functions[0].relocations.size(), 1u);
+    EXPECT_EQ(read->functions[0].relocations[0].addend, -4);
 }
 
 // ── Multi-function module exercises running-offset arithmetic ──
@@ -3433,6 +3458,8 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -3621,6 +3648,8 @@ loadChainedFixupsExecFormat() {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -3680,6 +3709,8 @@ loadChainedFixupsExecFormatWithData() {
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392},
         {"kind":"data","name":"__data","segment":"__DATA","type":0,"flags":0,"addrAlign":8,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -3902,6 +3933,8 @@ loadLegacyBindingExecFormat() {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -4105,6 +4138,8 @@ loadDataImportExecFormat(bool useChainedFixups) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -4953,6 +4988,8 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},

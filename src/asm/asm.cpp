@@ -1160,6 +1160,106 @@ bool validateAssembledData(std::span<AssembledData const> items,
     return ok;
 }
 
+bool validateInputSectionUnits(AssembledModule const& module,
+                               DiagnosticReporter&    reporter) {
+    auto refuse = [&](std::string msg) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_InputSectionSplit;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(msg);
+        reporter.report(std::move(d));
+    };
+    bool ok = true;
+
+    // CODE: consecutive, in increasing offset, contiguous — what a writer's
+    // back-to-back concatenation needs to reproduce the section. A unit whose
+    // members are not together has been split. So has one whose next member
+    // does not start where the previous one's bytes end, because the
+    // concatenation would close the gap.
+    std::unordered_set<std::uint32_t> closedUnits;
+    for (std::size_t k = 0; k < module.functions.size(); ++k) {
+        auto const& slice = module.functions[k].inputSection;
+        if (!slice.has_value()) continue;
+        bool const continues =
+            k > 0 && module.functions[k - 1].inputSection.has_value()
+            && module.functions[k - 1].inputSection->section == slice->section;
+        if (!continues) {
+            if (!closedUnits.insert(slice->section).second) {
+                refuse(std::format(
+                    "code unit #{} (one input section of a relocatable object) "
+                    "resumes at function #{} after other code: its members are "
+                    "not consecutive, so the writers' concatenation would put "
+                    "other bytes inside the section and move every member after "
+                    "them.",
+                    slice->section, k));
+                ok = false;
+            }
+            continue;
+        }
+        auto const& prev = module.functions[k - 1];
+        std::uint64_t const prevEnd = prev.inputSection->offset + prev.bytes.size();
+        if (slice->offset != prevEnd) {
+            refuse(std::format(
+                "code unit #{} (one input section of a relocatable object): "
+                "function #{} starts at section offset {}, but the member before "
+                "it ends at {}. Concatenated, the section would not keep its "
+                "layout, and code the producer assembled against it would reach "
+                "the wrong bytes.",
+                slice->section, k, slice->offset, prevEnd));
+            ok = false;
+        }
+    }
+
+    // DATA: one data-section kind per unit, and members that do not overlap.
+    // `buildExecDataSection` places a unit's members by their offsets.
+    struct DataMember {
+        std::uint64_t   offset = 0;
+        std::uint64_t   size   = 0;
+        std::size_t     index  = 0;
+        DataSectionKind kind   = DataSectionKind::Rodata;
+    };
+    std::unordered_map<std::uint32_t, std::vector<DataMember>> dataUnits;
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const& d = module.dataItems[i];
+        if (!d.inputSection.has_value()) continue;
+        dataUnits[d.inputSection->section].push_back(DataMember{
+            d.inputSection->offset, d.sizeInSection(), i, d.section});
+    }
+    for (auto& [unit, members] : dataUnits) {
+        std::sort(members.begin(), members.end(),
+                  [](DataMember const& a, DataMember const& b) {
+                      return a.offset < b.offset;
+                  });
+        for (std::size_t k = 0; k < members.size(); ++k) {
+            if (members[k].kind != members.front().kind) {
+                refuse(std::format(
+                    "data unit #{} (one input section of a relocatable object) "
+                    "holds item #{} in section kind '{}' and item #{} in '{}'. "
+                    "One input section is laid out as one block, so it cannot "
+                    "be placed in two output sections.",
+                    unit, members.front().index,
+                    dataSectionKindName(members.front().kind), members[k].index,
+                    dataSectionKindName(members[k].kind)));
+                ok = false;
+                break;
+            }
+            if (k > 0 && members[k].offset < members[k - 1].offset + members[k - 1].size) {
+                refuse(std::format(
+                    "data unit #{} (one input section of a relocatable object): "
+                    "item #{} at section offset {} overlaps item #{}, which "
+                    "runs from {} to {}. Two items cannot own the same bytes of "
+                    "one section.",
+                    unit, members[k].index, members[k].offset,
+                    members[k - 1].index, members[k - 1].offset,
+                    members[k - 1].offset + members[k - 1].size));
+                ok = false;
+                break;
+            }
+        }
+    }
+    return ok;
+}
+
 namespace {
 
 // ── D-CSUBSET-ENUM-GLOBAL-CODEGEN: the MATERIAL kind a type ENCODES as ──

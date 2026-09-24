@@ -373,9 +373,16 @@ enum class AsmOperandRole : std::uint8_t {
     Indirect,    // `*%rax`           → an indirect branch/call target
     Scalar,      // `42` / `foo`      → the value inside an immediate or displacement
     NegNumber,   // `-8`              → a negated integer
+    // `+4` / `-8` after a NAME (`msg+4`, `.LC0-8`) → the constant added to the
+    // symbol's address (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    // ★ A ROLE OF ITS OWN BECAUSE `NegNumber` CANNOT BE IT: the scalar decode
+    // reads a `NegNumber` anywhere under a scalar as the whole value's sign,
+    // so `sym-8` bound to it would read as the number -8 and lose the symbol.
+    // The decode takes an addend off FIRST, and only the name remains.
+    Addend,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 7>
+inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 8>
     kAsmOperandRoleNames{{
         {"register", AsmOperandRole::Register},
         {"immediate", AsmOperandRole::Immediate},
@@ -384,11 +391,12 @@ inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 7>
         {"indirect", AsmOperandRole::Indirect},
         {"scalar", AsmOperandRole::Scalar},
         {"negNumber", AsmOperandRole::NegNumber},
+        {"addend", AsmOperandRole::Addend},
     }};
 inline constexpr std::size_t kAsmOperandRoleCount =
     kAsmOperandRoleNames.size();
 static_assert(kAsmOperandRoleCount
-                  == static_cast<std::size_t>(AsmOperandRole::NegNumber) + 1,
+                  == static_cast<std::size_t>(AsmOperandRole::Addend) + 1,
               "every AsmOperandRole enumerator needs a config spelling — a role "
               "with no name is unbindable, and the loader's REQUIRE-ALL check "
               "would silently stop covering it");
@@ -1310,6 +1318,11 @@ struct DSS_EXPORT AssemblyConfig {
     //
     // Returns a bitmask over `AsmOperandRole` (bit i = role i).
     [[nodiscard]] std::uint8_t rolesForRule(RuleId rule) const noexcept {
+        // One bit per role in a byte: the eighth role (`addend`) fills it, and
+        // a ninth must widen the mask rather than wrap a bit away.
+        static_assert(kAsmOperandRoleCount <= 8,
+                      "rolesForRule packs one bit per AsmOperandRole into a "
+                      "std::uint8_t — widen the mask before adding a role");
         if (!rule.valid()) return 0;
         std::uint8_t mask = 0;
         for (std::size_t i = 0; i < kAsmOperandRoleCount; ++i) {

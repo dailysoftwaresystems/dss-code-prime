@@ -69,6 +69,7 @@ import json
 import os
 import re
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -442,8 +443,8 @@ def build(root):
         if bucket == BUCKET_ARCHIVE:
             sys.exit("burndown-queue: FAIL -- %s is OPEN in the ARCHIVE (%s). The two "
                      "working registries are what this queue reads; a live row filed in "
-                     "the archive can never be picked up. Move it back with:\n"
-                     "    python .harness-config/runner/actions/anchors/anchors.py set %s --status open --apply"
+                     "the archive can never be picked up. Move it back with the door:\n"
+                     "    dssharness set-anchor %s --status open"
                      % (key.split("#")[-1], rel, key.split("#")[-1]))
         # ★★★ THE BAND IS A DECLARATION WHERE ONE EXISTS, AND THE SIEVE ONLY WHERE IT
         # DOES NOT. Every registry row has carried an explicit `Priority` cell since

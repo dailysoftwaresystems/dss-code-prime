@@ -710,6 +710,10 @@ PredefinedTypeFacts predefinedTypeFactsFor(TargetSchema const&       target,
             facts.abiTypedefs.emplace_back(std::string{name}, *core);
         }
     }
+    // P68 round 9: plain `char`'s signedness on this pair, for the language's
+    // `type-unsigned` rows (`__CHAR_UNSIGNED__`) — read from the target's one
+    // key, so the macro and the char→int promotion cannot disagree.
+    facts.charIsUnsigned = target.charIsUnsigned(format.kind());
     return facts;
 }
 

@@ -105,6 +105,7 @@ import statistics
 import subprocess
 import sys
 import time
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 for _s in (sys.stdout, sys.stderr):
     try:

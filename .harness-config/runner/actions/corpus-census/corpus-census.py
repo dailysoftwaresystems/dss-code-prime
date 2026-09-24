@@ -140,6 +140,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ── OUTPUT ENCODING, AT IMPORT, BEFORE ANYTHING BELOW CAN PRINT ─────────────────
 # ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, both streams pipes -- how the

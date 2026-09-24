@@ -53,6 +53,7 @@ import importlib.util
 import os
 import re
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # guard_output_encoding_guard: this script prints non-cp1252 characters, and a
 # pipe on the Windows leg would otherwise MANGLE or DROP them -- a guard whose

@@ -946,9 +946,13 @@ struct Parser::Impl {
         // MULTIPLE bindings — `typedef int A, *B;` binds both — hence the
         // vector; legacy rows yield 0 or 1.)
         std::vector<BinderName> binderNames;
+        // P68 round 9 (lane `cs`): a lifted field row (an enumeration constant)
+        // binds in the enclosing namespace scope — see `BinderSketch::record`.
+        bool liftToEnclosingScope = false;
         if (sketch.enabled()) {
             if (auto const* decl = sketch.binderFor(rule)) {
                 binderNames = extractBinderNames_(*decl);
+                liftToEnclosingScope = decl->liftToEnclosingScope;
             }
         }
         walker.leaveRule(SourceSpan::empty(0), rule);
@@ -958,7 +962,8 @@ struct Parser::Impl {
         if (sketch.enabled()) {
             if (sketch.isScopeRule(rule)) sketch.closeScope();
             for (auto& bn : binderNames) {
-                sketch.record(std::move(bn.name), bn.isType, bn.span);
+                sketch.record(std::move(bn.name), bn.isType, bn.span,
+                              liftToEnclosingScope);
             }
         }
     }

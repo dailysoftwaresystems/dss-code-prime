@@ -72,7 +72,11 @@ THE CONTRACT, and every clause is a way the index can lie:
      other direction (a runner's action must resolve) only when a runner is used;
  11. no `.sh` and no `.ps1` sits anywhere under the actions root: an action's entry point
      is its `.yml`, and what the `.yml` starts is Python (operator ruling 2026-09-21, "they
-     are specific per OS"); the tool's run directories are ignored output and exempt.
+     are specific per OS"); the tool's run directories are ignored output and exempt;
+ 12. every PROGRAM (a file with a `__main__` guard) that loads another program -- by path,
+     through `sys.path`, or by importing a module beside it -- switches bytecode writing off
+     at MODULE level before its first load: a `__pycache__` written beside another action
+     moves the inputs of a `requireInputsUnmoved` action (see `bytecode_refusal`).
 
 ⚠ Clauses 5-8 exist because an INDEPENDENT AUDIT got the first draft of this
 guard to report GREEN over each of them, and clause 9's arm was passing for the
@@ -90,7 +94,9 @@ Usage:
 """
 from __future__ import annotations
 
+import ast
 import contextlib
+import functools
 import importlib.util
 import io
 import json
@@ -99,6 +105,7 @@ import re
 import shutil
 import sys
 import tempfile
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ── OUTPUT ENCODING — NOT COSMETIC, AND THE STREAM IS HALF THE FACT ─────────────
 # ✔MEASURED 2026-08-23 (CPython 3.14.3, Windows, BOTH streams PIPES, which is
@@ -316,6 +323,268 @@ def bytecode_husk(path):
     return True
 
 
+# ★★★ CLAUSE 12: A PROGRAM THAT LOADS ANOTHER PROGRAM SWITCHES BYTECODE WRITING OFF FIRST, AT MODULE LEVEL.
+# Python writes `__pycache__` beside every module it loads by path or imports, unless
+# `sys.dont_write_bytecode` is already set -- and such a cache lands in ANOTHER action's directory (or in
+# the program's own), while an action is `requireInputsUnmoved`. ✔MEASURED 2026-09-23 (lane mig): 34 of the
+# 44 programs that loaded another program never switched it off, and one repo-guard run left `__pycache__`
+# beside anchors/, burndown-queue/ and check-anchor-balance/.
+# ⚠ WHY NOT ONE LOADER THAT SWITCHES IT OFF, which was tried on paper first: the flag is process-global and
+# must precede the process's FIRST load, which in most programs is the bootstrap load of owning-tree itself
+# -- a loader cannot load itself -- and which load comes first differs by entry point. ✔MEASURED the same
+# day: `apply-registry-row --self-test` loads anchors.py before owning-tree, and wrote
+# `anchors/__pycache__/anchors.cpython-314.pyc` (18:50:20) although its owning-tree loader comes first in
+# the file. No static check could have proved a loader-based owner.
+# ⇒ Each program switches it off at MODULE level, textually before its first load construct. That is
+# EXACT: module-level statements run in order, and a load inside a function runs only after the function's
+# definition has run. A LIBRARY (no `__main__` guard) is judged by the program that imports it.
+# ★★ AND THE SAME RULE ACROSS A PROCESS BOUNDARY (12b). The switch reaches only its own process. ✔MEASURED
+# 2026-09-23 (lane mig), after the 34 switches landed: holding every existing cache aside and running
+# repo-guard plus the harness entries left exactly ONE new one, `check-no-abort-in-tests/__pycache__/` -- its
+# pipe-encoding self-test loads ITS OWN FILE in a `python -c` child, which writes bytecode unless its own
+# argv says `-B`. So a child told to load a file of this action's directory -- its inline code, or an
+# argument after it, built from `__file__` -- passes `-B` before `-c`, or hands the child an environment
+# that moves the cache (PYTHONPYCACHEPREFIX, as check-plan-citations' own bytecode-ON control does), or
+# switches it off inside the code. This half binds a LIBRARY too: whoever spawns the child owns it.
+# ✔MEASURED the same day over all 67 `.py` files under the actions root: 55 argv displays carry `-c`, and
+# the rule refused exactly two -- that self-load, and test-corpus-census' child, which loads a COPY whose
+# SOURCE path is built from `__file__`. The second is this rule's deliberate over-approximation (it cannot
+# tell a copy's source from its destination) and costs one harmless `-B`; the opposite choice would fail
+# toward clean.
+# ⓘ OUT OF SCOPE BY CONSTRUCTION: a child loading a COPY in a temporary directory with no `__file__` in its
+# path (the deliberate bytecode-ON negatives, e.g. check-guard-output-encoding's) writes its cache there.
+LOAD_CALLS = ("spec_from_file_location", "SourceFileLoader", "import_module", "exec_module", "run_path")
+CHILD_LOAD_MARKS = LOAD_CALLS + ("sys.path.insert", "sys.path.append")
+BYTECODE_ENV = ("PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE")
+BINDING_DEPTH = 4
+
+
+def _is_bytecode_off(node):
+    """`sys.dont_write_bytecode = True`, as a statement."""
+    return (isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and node.targets[0].attr == "dont_write_bytecode"
+            and isinstance(node.targets[0].value, ast.Name) and node.targets[0].value.id == "sys"
+            and isinstance(node.value, ast.Constant) and node.value.value is True)
+
+
+def first_load(tree, beside):
+    """-> (line, what) of the first construct in `tree` that loads another program, or None: a
+    by-path load (`LOAD_CALLS`), a `sys.path.insert/append`, or an import of a module that sits
+    beside the program (`beside`: those modules' names)."""
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+            if name in LOAD_CALLS:
+                found.append((node.lineno, name))
+            elif (name in ("insert", "append") and isinstance(f, ast.Attribute)
+                  and isinstance(f.value, ast.Attribute) and f.value.attr == "path"
+                  and isinstance(f.value.value, ast.Name) and f.value.value.id == "sys"):
+                found.append((node.lineno, "sys.path." + name))
+        elif isinstance(node, ast.Import):
+            hits = [a.name for a in node.names if a.name.split(".")[0] in beside]
+            if hits:
+                found.append((node.lineno, "import " + hits[0]))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module and node.module.split(".")[0] in beside:
+                found.append((node.lineno, "from %s import" % node.module))
+    return min(found) if found else None
+
+
+def _const_str(node):
+    """A string constant's value, else None (an `ast.Index` wrapper is unwrapped for old Pythons)."""
+    node = getattr(node, "value", node) if type(node).__name__ == "Index" else node
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _dict_keys(node):
+    """The string keys a `dict(...)` call or a `{...}` display gives -- the environment it builds."""
+    keys = set()
+    if isinstance(node, ast.Dict):
+        keys.update(k for k in (_const_str(k) for k in node.keys if k is not None) if k)
+    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+        keys.update(kw.arg for kw in node.keywords if kw.arg)
+        for arg in node.args:
+            keys |= _dict_keys(arg)
+    return keys
+
+
+def _scope_facts(node):
+    """-> (bindings, env_keys) of one scope: `name -> [value expressions]` for plain and annotated
+    assignments, and `name -> {keys}` stored into it (`env["K"] = v`, `env.update(K=v)`, or given by the
+    `dict(...)`/`{...}` it was bound to). A function's scope is its whole body; the module's is every
+    statement outside its functions."""
+    if isinstance(node, ast.Module):
+        nodes, stack = [], list(node.body)
+        while stack:
+            n = stack.pop()
+            nodes.append(n)
+            stack.extend(c for c in ast.iter_child_nodes(n)
+                         if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)))
+    else:
+        nodes = list(ast.walk(node))
+    bindings, env_keys = {}, {}
+    for n in nodes:
+        if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+            for target in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                if isinstance(target, ast.Name):
+                    bindings.setdefault(target.id, []).append(n.value)
+                    env_keys.setdefault(target.id, set()).update(_dict_keys(n.value))
+                elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                    key = _const_str(target.slice)
+                    if key:
+                        env_keys.setdefault(target.value.id, set()).add(key)
+        elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "update"
+              and isinstance(n.func.value, ast.Name)):
+            keys = {kw.arg for kw in n.keywords if kw.arg}
+            for arg in n.args:
+                keys |= _dict_keys(arg)
+            env_keys.setdefault(n.func.value.id, set()).update(keys)
+    return bindings, env_keys
+
+
+def _lookup(name, scopes):
+    """The value expressions `name` is bound to in the innermost scope that binds it."""
+    for bindings, _env in scopes:
+        if name in bindings:
+            return bindings[name]
+    return []
+
+
+def _derives_from_file(expr, scopes, depth=0):
+    """Is `expr` built from `__file__`, directly or through names bound to such expressions? Bounded by
+    BINDING_DEPTH, so a self-referencing binding (`s = s + "..."`) cannot loop."""
+    for n in ast.walk(expr):
+        if isinstance(n, ast.Name):
+            if n.id == "__file__":
+                return True
+            if depth < BINDING_DEPTH and any(_derives_from_file(v, scopes, depth + 1)
+                                              for v in _lookup(n.id, scopes)):
+                return True
+    return False
+
+
+def _code_text(expr, scopes, depth=0):
+    """Every string constant `expr` is built from, following names bound to other expressions."""
+    parts = []
+    for n in ast.walk(expr):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str):
+            parts.append(n.value)
+        elif isinstance(n, ast.Name) and depth < BINDING_DEPTH:
+            parts.extend(_code_text(v, scopes, depth + 1) for v in _lookup(n.id, scopes))
+    return "\n".join(p for p in parts if p)
+
+
+def child_bytecode_refusals(tree, name):
+    """Clause 12b: every argv display in `tree` that runs inline Python (`-c`) told to load a file of this
+    action's own directory -- the code, or an argument after it, built from `__file__` -- with bytecode
+    writing on. Inline code whose text cannot be read at all is judged as loading: this clause cannot tell
+    what it runs, so it does not assume it runs nothing."""
+    parents = {}
+    for p in ast.walk(tree):
+        for c in ast.iter_child_nodes(p):
+            parents[c] = p
+    facts = {}
+
+    def scopes_of(node):
+        chain, cur = [], node
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                if cur not in facts:
+                    facts[cur] = _scope_facts(cur)
+                chain.append(facts[cur])
+            cur = parents.get(cur)
+        return chain
+
+    def env_moves_the_cache(node, scopes):
+        cur = parents.get(node)
+        while cur is not None and not isinstance(cur, ast.stmt):
+            if isinstance(cur, ast.Call):
+                for kw in cur.keywords:
+                    if kw.arg != "env":
+                        continue
+                    keys = set(_dict_keys(kw.value))
+                    if isinstance(kw.value, ast.Name):
+                        for _bindings, env in scopes:
+                            keys |= env.get(kw.value.id, set())
+                    if keys & set(BYTECODE_ENV):
+                        return True
+            cur = parents.get(cur)
+        return False
+
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        elts = node.elts
+        at = [i for i, e in enumerate(elts) if _const_str(e) == "-c"]
+        if not at or at[0] + 1 >= len(elts):
+            continue
+        i = at[0]
+        scopes = scopes_of(node)
+        if not any(_derives_from_file(e, scopes) for e in elts[i + 1:]):
+            continue
+        text = _code_text(elts[i + 1], scopes)
+        if text and not any(mark in text for mark in CHILD_LOAD_MARKS):
+            continue
+        if "dont_write_bytecode" in text or any(_const_str(e) == "-B" for e in elts[:i]):
+            continue
+        if env_moves_the_cache(node, scopes):
+            continue
+        out.append("%s line %d: a child Python (`-c`) loads by path, and its code or an argument after it "
+                   "is built from `__file__` -- so what it loads may sit in an action's directory -- with "
+                   "bytecode writing ON: the child writes `__pycache__` beside whatever it loads. Pass `-B` "
+                   "before `-c`, or hand the child an environment that sets %s."
+                   % (name, node.lineno, " or ".join(BYTECODE_ENV)))
+    return out
+
+
+def bytecode_refusal(path):
+    """Why the file at `path` would write bytecode beside an action, or None (clause 12): a PROGRAM
+    that loads another with the switch still on, and -- in ANY file, a library too -- a child Python
+    told to load a file of this action's directory with bytecode writing on (12b). A file that does
+    not read or parse is refused by name -- never skipped."""
+    name = os.path.basename(path)
+    try:
+        text = io.open(path, "r", encoding="utf-8", newline="").read()
+    except (UnicodeDecodeError, ValueError) as exc:
+        return "%s cannot be read, so whether it caches bytecode cannot be told: %s" % (path, exc)
+    beside = frozenset(os.path.splitext(f)[0] for f in os.listdir(os.path.dirname(path))
+                       if os.path.splitext(f)[1] in SCRIPT_EXTS) - {os.path.splitext(name)[0]}
+    return _bytecode_verdict(text, beside, name)
+
+
+# ★ MEMOIZED ON ITS WHOLE INPUT -- the file's text, the modules beside it, its name -- because the self-test
+# re-runs the scan over a mirror whose files are byte-identical to the tree's except the one an arm sabotages.
+# ✔MEASURED 2026-09-23: one pass of this clause over the 67 files costs ~4 s (the parse alone ~1.8 s), and the
+# self-test makes ~55 passes; unmemoized, 12b took the ctest entry from ~83 s to ~160 s and past its 315 s
+# budget under load. A verdict is a pure function of these three inputs, so a changed byte is a cache miss.
+@functools.lru_cache(maxsize=None)
+def _bytecode_verdict(text, beside, name):
+    try:
+        tree = ast.parse(text, filename=name)
+    except (SyntaxError, ValueError) as exc:
+        return "%s cannot be parsed, so whether it caches bytecode cannot be told: %s" % (name, exc)
+    whys = []
+    if any(isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+           and isinstance(n.test.left, ast.Name) and n.test.left.id == "__name__"
+           for n in tree.body):
+        load = first_load(tree, beside)
+        flags = [n.lineno for n in tree.body if _is_bytecode_off(n)]
+        if load is not None and not (flags and flags[0] < load[0]):
+            whys.append(
+                "%s loads another program at line %d (%s) with bytecode writing ON%s. Python then writes "
+                "`__pycache__` beside that program, inside an action's directory. Put "
+                "`sys.dont_write_bytecode = True` at MODULE level, before line %d."
+                % (name, load[0], load[1],
+                   "" if not flags else " (the module-level switch at line %d comes after it)" % flags[0],
+                   load[0]))
+    whys.extend(child_bytecode_refusals(tree, name))
+    return "\n    ".join(whys) if whys else None
+
+
 def read_purpose(path):
     """The single `PURPOSE:` declaration in a file's header.
 
@@ -397,6 +666,12 @@ def _scan_action(root, base, directory, afile):
     sibs = sorted(f for f in os.listdir(directory)
                   if os.path.isfile(os.path.join(directory, f))
                   and os.path.splitext(f)[1] in SCRIPT_EXTS)
+
+    # CLAUSE 12: nothing here loads a program -- in this process or in a child -- with bytecode writing on.
+    caching = [why for why in (bytecode_refusal(os.path.join(directory, s)) for s in sibs) if why]
+    if caching:
+        raise Collapse("%s/: %d file(s) would write bytecode beside an action:\n    %s"
+                       % (rel, len(caching), "\n    ".join(caching)))
 
     # A PROGRAM MAY STAY SILENT, BUT IT MAY NOT DISAGREE. Requiring every program to
     # repeat the declaration would be dozens of copies of one sentence; letting one
@@ -816,7 +1091,7 @@ def _newcomer(tmp, rel, runner):
 # defeated its own purpose: deleting a document from DOC_RELS then lowered BOTH
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
-EXPECTED_ARMS = 46
+EXPECTED_ARMS = 54
 
 
 def selftest(root):
@@ -1070,6 +1345,63 @@ def selftest(root):
         ok &= _arm("20c RUN-OUTPUT-SHELL-IS-EXEMPT", tmp, EXIT_OK,
                    not_says="shell/PowerShell program")
         shutil.rmtree(os.path.join(acts, SELFTEST_SUBJECT, "build"))
+
+        # ── clause 12: no program loads another with bytecode writing on (EXIT_COLLAPSE) ──
+        # ★ Each arm sabotages a REAL program in the mirror -- one loading by path, one through
+        # sys.path, a library made a program, and one importing a module beside it -- and the
+        # GREEN arms around them are the control: every other program of this tree complies.
+        def _unswitch(rel):
+            path = os.path.join(acts, *rel.split("/"))
+            text = _read(path)
+            line = [ln for ln in text.splitlines() if ln.startswith("sys.dont_write_bytecode = True")]
+            _write(path, _sabotage(text, line[0] if line else "sys.dont_write_bytecode = True",
+                                   "# (the bytecode switch, removed by the self-test)"))
+            return path, text
+        path, text = _unswitch("check-scripts-index/check-scripts-index.py")
+        ok &= _arm("21 BYTECODE-ON-AT-FIRST-LOAD", tmp, EXIT_COLLAPSE,
+                   says="check-scripts-index.py loads another program at line")
+        _write(path, text)
+        path, text = _unswitch("check-stale-blockers/check-stale-blockers.py")
+        ok &= _arm("21b SYS-PATH-LOADER", tmp, EXIT_COLLAPSE, says="(sys.path.insert)")
+        _write(path, text)
+        lib = os.path.join(acts, "real-examples", "c", "sqlite", "sqlite_compiler.py")
+        lib_text = _read(lib)
+        _write(lib, lib_text + '\n\nif __name__ == "__main__":\n    pass\n')
+        ok &= _arm("21c A-LIBRARY-MADE-A-PROGRAM", tmp, EXIT_COLLAPSE,
+                   says="sqlite_compiler.py loads another program")
+        _write(lib, lib_text)
+        importer = os.path.join(acts, "real-examples", "c", "sqlite", "zz_selftest_importer.py")
+        _write(importer, 'import sqlite_common\n\nif __name__ == "__main__":\n    pass\n')
+        ok &= _arm("21d IMPORTS-A-MODULE-BESIDE-IT", tmp, EXIT_COLLAPSE, says="(import sqlite_common)")
+        os.remove(importer)
+
+        # ── clause 12b: the same rule across a process boundary ──
+        # ★ Two REAL children, each stripped of the one thing that keeps it clean: the self-load's `-B`,
+        # and the bytecode-ON control's environment that moves the cache -- the second proves the
+        # environment is honoured rather than ignored. Then a LIBRARY spawning a child whose ARGUMENT is
+        # built from `__file__`, and its control: the same child pointed at a temporary copy stays green.
+        nabort = os.path.join(acts, "check-no-abort-in-tests", "check-no-abort-in-tests.py")
+        nabort_text = _read(nabort)
+        _write(nabort, _sabotage(nabort_text, "[sys.executable, '-B', '-c', driver]",
+                                 "[sys.executable, '-c', driver]"))
+        ok &= _arm("21e CHILD-SELF-LOAD-WITHOUT-B", tmp, EXIT_COLLAPSE,
+                   says="check-no-abort-in-tests.py line")
+        _write(nabort, nabort_text)
+        plan = os.path.join(acts, "check-plan-citations", "check-plan-citations.py")
+        plan_text = _read(plan)
+        _write(plan, _sabotage(plan_text, '        env["PYTHONPYCACHEPREFIX"] = prefix\n', ""))
+        ok &= _arm("21f CHILD-CACHE-MOVED-BY-ENV", tmp, EXIT_COLLAPSE, says="check-plan-citations.py line")
+        _write(plan, plan_text)
+        # (Both are APPENDED to a real library rather than written as a new file: a new file changes the
+        # tree the index describes, and the green arm would then prove the index, not this clause.)
+        body = ('\n\ndef _zz_selftest_spawn():\n    import tempfile\n'
+                '    return subprocess.run([sys.executable, "-c", "import runpy, sys; runpy.run_path(sys.argv[1])",\n'
+                '                           %s])\n')
+        _write(lib, lib_text + body % 'os.path.join(os.path.dirname(os.path.abspath(__file__)), "x.py")')
+        ok &= _arm("21g A-LIBRARY-SPAWNS-A-FILE-CHILD", tmp, EXIT_COLLAPSE, says="sqlite_compiler.py line")
+        _write(lib, lib_text + body % 'os.path.join(tempfile.mkdtemp(), "copy.py")')
+        ok &= _arm("21h A-CHILD-OF-A-TEMP-COPY", tmp, EXIT_OK, not_says="sqlite_compiler.py line")
+        _write(lib, lib_text)
 
         ok &= _arm("19 GREEN-AFTER-RESTORE", tmp, EXIT_OK)
     finally:

@@ -127,6 +127,14 @@ struct DSS_EXPORT AsmTextModule {
     // later binder, and an EXEC image — where nothing binds later — rejects
     // LOUD naming the symbol. One policy, one implementation, two source
     // languages.
+    //
+    // ★★ THE ROW RECORDS WHAT THE REFERENCE SAID ABOUT CODE-vs-DATA, AND AN
+    // ADDRESS SAYS NOTHING. A call states code (`ExternKindOrigin::Stated`,
+    // `isData` false). An address operand, a memory displacement or a data slot
+    // states no kind, so its row is `Pending` until a definition decides it:
+    // the driver's binder from the library it binds, the linker from a sibling
+    // unit. A reference nothing decides is refused by name at the link
+    // (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL).
     std::vector<ExternImport> externImports;
 
     // D-ASM-NO-DATA-DEFINING-DIRECTIVE: the data items the file's data-defining

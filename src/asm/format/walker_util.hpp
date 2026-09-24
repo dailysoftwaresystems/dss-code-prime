@@ -210,6 +210,16 @@ filterToLirKind(OperandKindFilter f) noexcept {
 // Per-position kind-equality check: variant's `operandKinds` filter
 // list must match the LIR instruction's source-operand kinds (same
 // length AND per-position kind translation).
+//
+// ★★ A `memoffset` POSITION TAKES A SYMBOLIC DISPLACEMENT TOO
+// (`LirOperandKind::MemSymbolOffset`, `msg+4(%rip)` —
+// D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The filter names the
+// displacement POSITION of a memory operand, and a displacement is a number or
+// a link-time address; which one reaches the field is the encoder's business
+// (a literal, or a relocation). Accepting both here is what lets every memory
+// form a target declares take a symbolic displacement with no variant of its
+// own — and the value axes still refuse it wherever a variant bounds its
+// displacement, because a link-time value has no magnitude to check.
 [[nodiscard]] inline bool
 operandsMatchGuard(std::span<LirOperand const>          instOps,
                    std::span<OperandKindFilter const>   guard) noexcept {
@@ -217,7 +227,12 @@ operandsMatchGuard(std::span<LirOperand const>          instOps,
     for (std::size_t i = 0; i < guard.size(); ++i) {
         auto const wanted = filterToLirKind(guard[i]);
         if (!wanted.has_value()) return false;
-        if (instOps[i].kind != *wanted) return false;
+        if (instOps[i].kind == *wanted) continue;
+        if (guard[i] == OperandKindFilter::MemOffset
+            && instOps[i].kind == LirOperandKind::MemSymbolOffset) {
+            continue;
+        }
+        return false;
     }
     return true;
 }

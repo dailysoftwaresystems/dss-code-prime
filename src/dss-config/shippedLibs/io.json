@@ -41,7 +41,7 @@
     { "name": "_chsize",  "signature": "fn(i32, i32 \"long\") -> i32", "kind": "function", "linkage": "external" }
   ],
   "typedefs": [
-    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "type": "u16" }] },
+    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "abiTypedef": "wchar_t" }] },
     { "name": "intptr_t", "variants": [
         { "when": { "dataModel": "LLP64", "format": "pe" }, "type": "i64 \"long long\"" }
     ] }

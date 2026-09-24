@@ -1016,6 +1016,8 @@ TEST(RelocatableObjectReader, DuplicateNativeIdInSchemaFailsLoudAtLoad) {
             "outputExtension": ".o",
             "format":{"name":"elf-collide","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocationAddends": "explicit",
+            "inputSectionPlacement": "unit",
             "relocations":[{"name":"A","kind":1,"nativeId":7},
                            {"name":"B","kind":2,"nativeId":7}]})");
     ASSERT_FALSE(collide.has_value())
@@ -1041,6 +1043,8 @@ TEST(RelocatableObjectReader, EmitOnlyAliasLoadsAndDecodesThroughTheRealRow) {
             "outputExtension": ".o",
             "format":{"name":"elf-alias","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocationAddends": "explicit",
+            "inputSectionPlacement": "unit",
             "relocations":[{"name":"A","kind":1,"nativeId":7},
                            {"name":"B","kind":2,"nativeId":7,"emitOnly":true}]})");
     ASSERT_TRUE(aliased.has_value())
@@ -1071,6 +1075,8 @@ TEST(RelocatableObjectReader, EmitOnlyRowThatAliasesNothingFailsLoud) {
             "outputExtension": ".o",
             "format":{"name":"elf-orphan","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocationAddends": "explicit",
+            "inputSectionPlacement": "unit",
             "relocations":[{"name":"A","kind":1,"nativeId":7},
                            {"name":"B","kind":2,"nativeId":9,"emitOnly":true}]})");
     ASSERT_FALSE(orphan.has_value());
@@ -1100,6 +1106,8 @@ TEST(RelocatableObjectReader, IsCallOnAnEmitOnlyAliasFailsLoud) {
             "outputExtension": ".wasm",
             "format":{"name":"elf-role-ok","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocationAddends": "explicit",
+            "inputSectionPlacement": "unit",
             "relocations":[{"name":"A","kind":1,"nativeId":7,"isCall":true},
                            {"name":"B","kind":2,"nativeId":7,"emitOnly":true}]})");
     ASSERT_TRUE(ok.has_value())
@@ -1115,6 +1123,8 @@ TEST(RelocatableObjectReader, IsCallOnAnEmitOnlyAliasFailsLoud) {
             "outputExtension": ".wasm",
             "format":{"name":"elf-role-bad","kind":"elf"},
             "elf":{"class":"elf64","data":"lsb","osabi":"sysv","abiVersion":0,"machine":62},
+            "relocationAddends": "explicit",
+            "inputSectionPlacement": "unit",
             "relocations":[{"name":"A","kind":1,"nativeId":7},
                            {"name":"B","kind":2,"nativeId":7,"emitOnly":true,"isCall":true}]})");
     ASSERT_FALSE(bad.has_value())

@@ -22,7 +22,7 @@
 // `void *`, and glibc spells `gettimeofday`'s second parameter `void *__tz`.
 // A fix that swept `ptr<void>` would have replaced a laxness defect with a
 // strictness one, so this file carries an ACCEPTING arm for every genuine
-// `void *` it left alone, beside the refusal for every one it typed.
+// `void *` it left alone, beside the diagnostic for every one it typed.
 //
 // ★★ WHY IT NEEDED A SECOND READER CHANGE, ON TOP OF THE ONE THAT MADE A STRUCT
 // SPELLABLE AT ALL. Moving the `structs` decode ahead of `symbols`
@@ -71,7 +71,8 @@
 // PARAMETER type has NO runtime signature at all — `struct stat *` converts to
 // `void *` and back silently (C 6.3.2.3p1) — so no runnable program can tell
 // the two spellings apart, and the parameter half of this row is observable
-// ONLY as a refusal. Refusals live here, each beside its nearest ACCEPTING
+// ONLY as a diagnostic (a refusal until P68 round 9, the warning every reference
+// gives since). The diagnostics live here, each beside its nearest ACCEPTING
 // twin, because a type check fails in two opposite directions and only the pair
 // separates a fix that landed from one that over-reached.
 
@@ -682,7 +683,7 @@ TEST(ShippedStatTypedSurface, WindowsRowsAreTypedOverTheStructsThisFileDeclares)
     }
 }
 
-// ══ 4. THE SEMANTIC TIER — the refusals, each beside its accepting twin ══════
+// ══ 4. THE SEMANTIC TIER — the diagnostics, each beside its accepting twin ═══
 
 namespace {
 
@@ -711,6 +712,16 @@ namespace {
                           DataModel::Llp64, "x86_64");
 }
 
+// ★ P68 round 9 — A GOOD SIDE IS PROVEN BY THE ABSENCE OF THE CONVERSION CODES.
+// An incompatible pointer conversion now BUILDS with its diagnostic (the warning
+// every reference gives), so `!hasErrors()` and `!S_TypeMismatch` can no longer
+// see a descriptor that lost its pointer type. This can.
+[[nodiscard]] bool diagnosesAPointerConversion(DiagnosticReporter const& r) {
+    return hasCode(r, DiagnosticCode::S_IncompatiblePointerConversion)
+        || hasCode(r, DiagnosticCode::S_IncompatiblePointerIntegerPointee)
+        || hasCode(r, DiagnosticCode::S_IntegerPointerConversion);
+}
+
 }  // namespace
 
 // ★★★ THE CLOSING TEST THE ROW NAMES, PARAMETER SIDE. A pointer of the wrong
@@ -720,13 +731,14 @@ namespace {
 //
 // ★ THE ASSERTION IS ON THE DIAGNOSTIC, NEVER ON ITS SEVERITY, AND THAT IS A
 //   MEASURED DECISION RATHER THAN A HEDGE. gcc, clang and mingw-w64 each
-//   DIAGNOSE an incompatible object-pointer argument and each EXIT 0; DSS
-//   answers an error. That strictness is the pre-existing house posture for
-//   every such assignment — the FILE control below proves it on a surface typed
-//   long before this row — so pinning Error severity here would pin a
-//   divergence this lane did not introduce and would red the day it is
-//   correctly relaxed. What the row claims, and what all references agree on,
-//   is that the program must not pass in SILENCE.
+//   DIAGNOSE an incompatible object-pointer argument and each EXIT 0. DSS
+//   answered an error (S_TypeMismatch) until P68 round 9, when it began building
+//   the incompatible pointer conversion with S_IncompatiblePointerConversion,
+//   the warning the references give. That is the relaxation this comment
+//   anticipated, and the pins below moved with it rather than going silent.
+//   What the row claims, and what all references agree on, is that the program
+//   must not pass in SILENCE — and a good side is proven by the ABSENCE of the
+//   conversion codes (`diagnosesAPointerConversion`), never by `!hasErrors()`.
 TEST(ShippedStatTypedSurface, AWrongPointerNoLongerReachesTheStatFamily) {
     for (char const* call : {"stat(\".\", bad)", "lstat(\".\", bad)",
                              "fstat(0, bad)"}) {
@@ -734,7 +746,8 @@ TEST(ShippedStatTypedSurface, AWrongPointerNoLongerReachesTheStatFamily) {
                                 + "int main(void){ int *bad = 0; return "
                                 + call + "; }\n";
         auto const m = elfC(src);
-        EXPECT_TRUE(hasCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch))
+        EXPECT_TRUE(hasCode(m.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerConversion))
             << call << ": a void-typed parameter could not see this at all";
     }
     auto const good = elfC(
@@ -744,34 +757,42 @@ TEST(ShippedStatTypedSurface, AWrongPointerNoLongerReachesTheStatFamily) {
         " return (int)(st.st_mode != 0); }\n");
     EXPECT_FALSE(hasCode(good.diagnostics(), DiagnosticCode::S_TypeMismatch))
         << "the shape every real caller is written in must stay accepted";
+    EXPECT_FALSE(diagnosesAPointerConversion(good.diagnostics()))
+        << "`struct stat *` IS the parameter type: nothing to diagnose";
     EXPECT_FALSE(good.diagnostics().hasErrors());
 }
 
-// The UCRT tag split, as a refusal. ✔MEASURED through the CLI on
+// The UCRT tag split, as a diagnosed conversion. ✔MEASURED through the CLI on
 // x86_64:pe64-x86_64-windows-exec before this fixture existed: passing a
-// `struct stat *` to `_stat64` OR to `_stat64i32` is refused, and each
-// underscore row accepts its own tag. That `_stat64i32` refuses `struct stat *`
-// despite the IDENTICAL field list is the interesting half — it means two UCRT
-// tags of the same layout stay distinct types, which is exactly what the UCRT's
-// own casting forwarder says they are.
+// `struct stat *` to `_stat64` OR to `_stat64i32` was refused (since P68 round 9
+// it builds with S_IncompatiblePointerConversion, as the references build an
+// incompatible pointer argument), and each underscore row accepts its own tag.
+// That `_stat64i32` diagnoses `struct stat *` despite the IDENTICAL field list is
+// the interesting half — it means two UCRT tags of the same layout stay distinct
+// types, which is exactly what the UCRT's own casting forwarder says they are.
 TEST(ShippedStatTypedSurface, ThePeUnderscoreRowsRefuseTheUserFacingTag) {
     for (char const* fn : {"_stat64", "_stat64i32"}) {
         std::string const src = std::string{"#include <sys/stat.h>\n"}
                                 + "int main(void){ struct stat st; return "
                                 + fn + "(\"x\", &st); }\n";
         auto const m = peC(src);
-        EXPECT_TRUE(hasCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch))
+        EXPECT_TRUE(hasCode(m.diagnostics(),
+                            DiagnosticCode::S_IncompatiblePointerConversion))
             << fn << " takes its OWN UCRT tag, not `struct stat *`";
     }
     auto const a = peC("#include <sys/stat.h>\n"
                        "int main(void){ struct _stat64 s; return _stat64(\"x\", &s); }\n");
     EXPECT_FALSE(a.diagnostics().hasErrors()) << "_stat64 with its own tag";
+    EXPECT_FALSE(diagnosesAPointerConversion(a.diagnostics())) << "_stat64 with its own tag";
     auto const b = peC("#include <sys/stat.h>\n"
                        "int main(void){ struct _stat s; return _stat64i32(\"x\", &s); }\n");
     EXPECT_FALSE(b.diagnostics().hasErrors()) << "_stat64i32 with its own tag";
+    EXPECT_FALSE(diagnosesAPointerConversion(b.diagnostics())) << "_stat64i32 with its own tag";
     auto const c = peC("#include <sys/stat.h>\n"
                        "int main(void){ struct stat s; return stat(\"x\", &s); }\n");
     EXPECT_FALSE(c.diagnostics().hasErrors())
+        << "the user-facing pe row must still take `struct stat *`";
+    EXPECT_FALSE(diagnosesAPointerConversion(c.diagnostics()))
         << "the user-facing pe row must still take `struct stat *`";
 }
 
@@ -812,6 +833,9 @@ TEST(ShippedStatTypedSurface, ThePeLegacyStat64TagIsTheUcrtTagNotASecondRecord) 
     EXPECT_FALSE(hasCode(corpus.diagnostics(), DiagnosticCode::S_TypeMismatch))
         << "`struct __stat64 *` must reach `_fstat64` — this is the line that "
            "kept pe64-x86_64 the last poisoned leg of the SQLite matrix";
+    EXPECT_FALSE(diagnosesAPointerConversion(corpus.diagnostics()))
+        << "`struct __stat64 *` IS `_fstat64`'s parameter type — a second record "
+           "would now build with a warning, which only this assertion sees";
     EXPECT_FALSE(corpus.diagnostics().hasErrors());
 
     // (b) ONE TYPE, so a pointer crosses in BOTH directions with no cast.
@@ -822,6 +846,8 @@ TEST(ShippedStatTypedSurface, ThePeLegacyStat64TagIsTheUcrtTagNotASecondRecord) 
             " return (p != 0) + (q != 0); }\n");
     EXPECT_FALSE(both.diagnostics().hasErrors())
         << "two look-alike tags would refuse this even with identical members";
+    EXPECT_FALSE(diagnosesAPointerConversion(both.diagnostics()))
+        << "two look-alike tags would DIAGNOSE this even with identical members";
 
     // (c) THE OVER-REACH DETECTOR. `_stat64i32` shares the field list and must
     // stay a distinct tag — the same claim `ThePeUnderscoreRowsRefuseTheUserFacingTag`
@@ -829,7 +855,8 @@ TEST(ShippedStatTypedSurface, ThePeLegacyStat64TagIsTheUcrtTagNotASecondRecord) 
     auto const distinct =
         peC("#include <sys/stat.h>\n"
             "int main(void){ struct __stat64 x; return _stat64i32(\"x\", &x); }\n");
-    EXPECT_TRUE(hasCode(distinct.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(distinct.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion))
         << "the alias must make ONE pair of spellings one type, not collapse "
            "every UCRT record of the same shape";
 
@@ -856,22 +883,24 @@ TEST(ShippedStatTypedSurface, ATypedReturnNoLongerAssignsToAnyPointer) {
     auto const badTm = elfC("#include <time.h>\n"
                             "int main(void){ time_t t = 0; int *x = localtime(&t);"
                             " return x != 0; }\n");
-    EXPECT_TRUE(hasCode(badTm.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(badTm.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "localtime yields `struct tm *`, not any pointer at all";
     auto const goodTm = elfC("#include <time.h>\n"
                              "int main(void){ time_t t = 0; struct tm *p = localtime(&t);"
                              " return p != 0; }\n");
     EXPECT_FALSE(goodTm.diagnostics().hasErrors());
+    EXPECT_FALSE(diagnosesAPointerConversion(goodTm.diagnostics()));
 
     auto const badPw = elfC("#include <sys/types.h>\n#include <pwd.h>\n"
                             "int main(void){ int *x = getpwuid((uid_t)0);"
                             " return x != 0; }\n");
-    EXPECT_TRUE(hasCode(badPw.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(badPw.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "getpwuid yields `struct passwd *`";
     auto const goodPw = elfC("#include <sys/types.h>\n#include <pwd.h>\n"
                              "int main(void){ struct passwd *p = getpwuid((uid_t)0);"
                              " return p != 0; }\n");
     EXPECT_FALSE(goodPw.diagnostics().hasErrors());
+    EXPECT_FALSE(diagnosesAPointerConversion(goodPw.diagnostics()));
 }
 
 // ⚠ THE MATCHED CONTROL, PRINTED BY NAME. The same constraint violation through
@@ -883,7 +912,7 @@ TEST(ShippedStatTypedSurface, TheFileControlDiagnosesTheSameShape) {
     auto const bad = elfC("#include <stdio.h>\n"
                           "int main(void){ FILE *f = fopen(\"x\", \"r\"); int *p;\n"
                           " if (f == 0) return 1; p = f; (void)p; fclose(f); return 0; }\n");
-    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "the control must diagnose, or it is not a control";
 }
 
@@ -896,19 +925,25 @@ TEST(ShippedStatTypedSurface, TheFileControlDiagnosesTheSameShape) {
 //     exactly what `examples/c/shipped_utimes` does);
 //   • `gettimeofday`'s `tz` — a REAL `void *` in glibc and the macOS SDK — must
 //     still accept a pointer of any type, while its `tv` in the SAME CALL is
-//     refused for the wrong type. One signature, two verdicts. ✔MEASURED
-//     through the CLI: rc 0 and rc 1 respectively.
+//     diagnosed for the wrong type. One signature, two verdicts. ✔MEASURED
+//     through the CLI when this was written: rc 0 and rc 1 respectively (since
+//     P68 round 9 the typed one builds with its warning, as every reference
+//     builds it — the verdict is the diagnostic, which is what is asserted).
 TEST(ShippedStatTypedSurface, TheGenuineVoidStarsWereLeftAloneAndStillAcceptAnything) {
     auto const viaVoid = elfC(
         "#include <sys/stat.h>\n"
         "int main(void){ struct stat st; void *p = &st; return stat(\".\", p); }\n");
     EXPECT_FALSE(viaVoid.diagnostics().hasErrors())
         << "void * -> T * is a standard implicit conversion and must stay one";
+    EXPECT_FALSE(diagnosesAPointerConversion(viaVoid.diagnostics()))
+        << "void * -> T * is a standard implicit conversion and must stay one";
 
     auto const outToVoid = elfC(
         "#include <time.h>\n"
         "int main(void){ time_t t = 0; void *p = localtime(&t); return p != 0; }\n");
     EXPECT_FALSE(outToVoid.diagnostics().hasErrors())
+        << "T * -> void * is the other direction of the same conversion";
+    EXPECT_FALSE(diagnosesAPointerConversion(outToVoid.diagnostics()))
         << "T * -> void * is the other direction of the same conversion";
 
     auto const nullArg = elfC(
@@ -917,6 +952,8 @@ TEST(ShippedStatTypedSurface, TheGenuineVoidStarsWereLeftAloneAndStillAcceptAnyt
     EXPECT_FALSE(nullArg.diagnostics().hasErrors())
         << "a null pointer constant converts to any pointer type; this is the "
            "shape examples/c/shipped_utimes is written in";
+    EXPECT_FALSE(diagnosesAPointerConversion(nullArg.diagnostics()))
+        << "a null pointer constant is not an integer-to-pointer conversion";
 
     auto const genuineTz = elfC(
         "#include <sys/time.h>\n"
@@ -925,11 +962,14 @@ TEST(ShippedStatTypedSurface, TheGenuineVoidStarsWereLeftAloneAndStillAcceptAnyt
     EXPECT_FALSE(genuineTz.diagnostics().hasErrors())
         << "glibc spells this parameter `void *__tz`; refusing it would be an "
            "invented extension, not a fix";
+    EXPECT_FALSE(diagnosesAPointerConversion(genuineTz.diagnostics()))
+        << "glibc spells this parameter `void *__tz`; diagnosing it would be an "
+           "invented extension, not a fix";
 
     auto const typedTv = elfC(
         "#include <sys/time.h>\n"
         "int main(void){ int notATimeval = 0; return gettimeofday(&notATimeval, 0); }\n");
-    EXPECT_TRUE(hasCode(typedTv.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(typedTv.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "the OTHER parameter of the SAME signature is typed — one call, two "
            "verdicts, which is the census applied per signature";
 }
@@ -946,12 +986,15 @@ TEST(ShippedStatTypedSurface, TheWindowsSurfaceKeptItsRealVoidStars) {
     EXPECT_FALSE(genuine.diagnostics().hasErrors())
         << "LPCVOID takes any object pointer, and the NULL lpOverlapped is the "
            "shape hello_writefile is written in";
+    EXPECT_FALSE(diagnosesAPointerConversion(genuine.diagnostics()))
+        << "LPCVOID takes any object pointer, and the NULL lpOverlapped is the "
+           "shape hello_writefile is written in";
 
     auto const typedSlot = peC(
         "#include <windows.h>\n"
         "int main(void){ unsigned long n = 0; int bad = 0;\n"
         " void *h = GetStdHandle(0u); return WriteFile(h, \"x\", 1u, &n, &bad); }\n");
-    EXPECT_TRUE(hasCode(typedSlot.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(typedSlot.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "lpOverlapped is `OVERLAPPED *` — one call, two verdicts again";
 
     auto const sync = peC(
@@ -960,10 +1003,12 @@ TEST(ShippedStatTypedSurface, TheWindowsSurfaceKeptItsRealVoidStars) {
         " AcquireSRWLockExclusive(p); ReleaseSRWLockExclusive(p); return 0; }\n");
     EXPECT_FALSE(sync.diagnostics().hasErrors())
         << "the retyped POINTER TYPEDEF must still be the type the API takes";
+    EXPECT_FALSE(diagnosesAPointerConversion(sync.diagnostics()))
+        << "the retyped POINTER TYPEDEF must still be the type the API takes";
 
     auto const badSync = peC(
         "#include <windows.h>\n"
         "int main(void){ int bad = 0; InitializeSRWLock(&bad); return 0; }\n");
-    EXPECT_TRUE(hasCode(badSync.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(badSync.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "an SRWLOCK slot is no longer any pointer at all";
 }

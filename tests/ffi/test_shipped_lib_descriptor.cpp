@@ -5040,29 +5040,52 @@ static std::optional<ShippedLibDescriptor> decodeShippedFor(
 // pinned from the REAL stddef.json through the REAL layout engine.
 // RED-ON-DISABLE: drop the pe variant → wchar_t decodes at the elf i32 → the
 // pe width assert fails.
+//
+// P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): the row no longer carries
+// the core — it is `{"name": "wchar_t", "abiTypedef": "wchar_t"}`, realized from
+// the TARGET's `abiTypedefs` for the pair, the one source `L'…'` reads too. So the
+// descriptor is decoded here as the analyzer decodes it: with the pair's facts
+// (the shipped x86_64 target's table for `fmt`, and the format's own data model).
+// Without them the row is UNREALIZED — declared by no one, never guessed — which
+// the last assertion pins.
 TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty());
-    auto widthFor = [&](ObjectFormatKind fmt) -> std::uint64_t {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto widthFor = [&](ObjectFormatKind fmt, bool withPairFacts) -> std::uint64_t {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry typeReg;
-        auto desc = decodeShippedFor(root / "stddef.json", interner, typeReg, fmt);
+        DataModel const model = fmt == ObjectFormatKind::Pe ? DataModel::Llp64 : DataModel::Lp64;
+        ShippedPairFacts facts;
+        facts.dataModel = model;
+        for (std::string_view const name : (*targetR)->abiTypedefNames()) {
+            if (auto const core = (*targetR)->abiTypedefCore(name, fmt); core.has_value()) {
+                facts.abiTypedefs.emplace_back(std::string{name}, *core);
+            }
+        }
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(root / "stddef.json", interner, typeReg, rep, model,
+                                             std::string_view{"x86_64"}, fmt, {}, nullptr,
+                                             withPairFacts ? &facts : nullptr);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
         if (!desc) return 0;
         for (auto const& td : desc->typedefs) {
             if (td.name == "wchar_t") {
-                auto layout = computeLayout(td.type, interner, kNatural16,
-                                            DataModel::Lp64);
+                auto layout = computeLayout(td.type, interner, kNatural16, model);
                 EXPECT_TRUE(layout.has_value());
                 return layout ? layout->size : 0;
             }
         }
-        ADD_FAILURE() << "wchar_t typedef absent from stddef.json";
         return 0;
     };
-    EXPECT_EQ(widthFor(ObjectFormatKind::Pe), 2u)
+    EXPECT_EQ(widthFor(ObjectFormatKind::Pe, true), 2u)
         << "pe wchar_t is the 16-bit Windows code unit";
-    EXPECT_EQ(widthFor(ObjectFormatKind::Elf), 4u);
-    EXPECT_EQ(widthFor(ObjectFormatKind::MachO), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::Elf, true), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::MachO, true), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::Elf, false), 0u)
+        << "without the pair's ABI table, wchar_t must be declared by no one — never guessed";
 }
 
 // c113 (D-CSUBSET-INTRINSIC-BARRIER): the shipped <intrin.h> descriptor.

@@ -217,6 +217,8 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992,"isCall":true},
         {"name":"ARM64_RELOC_PAGE21","kind":2,"nativeId":889192448},
@@ -248,6 +250,8 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},

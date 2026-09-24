@@ -67,6 +67,7 @@ void report(LirVerdict& verdict, std::string actual,
         case LirOperandKind::LiteralIndex:    return "LiteralIndex";
         case LirOperandKind::ByValueStackAgg: return "ByValueStackAgg";
         case LirOperandKind::SpillSlotRef:    return "SpillSlotRef";
+        case LirOperandKind::MemSymbolOffset: return "MemSymbolOffset";
     }
     return "<unknown>";
 }
@@ -147,14 +148,22 @@ enum class MemAddressForm : std::uint8_t {
     Malformed,         // neither — or both, which is a half-rewritten address
 };
 
+// ★ A SYMBOLIC DISPLACEMENT (`MemSymbolOffset`, `msg+4(%rip)`) IS A
+// DISPLACEMENT: it closes the base+displacement form exactly as a `MemOffset`
+// does, and it is not a `SymbolRef` — its symbol rides a pool entry, so the
+// two forms stay disjoint.
+[[nodiscard]] bool isMemDisplacement(LirOperandKind k) noexcept {
+    return k == LirOperandKind::MemOffset
+        || k == LirOperandKind::MemSymbolOffset;
+}
+
 [[nodiscard]] MemAddressForm
 classifyMemAddressForm(std::span<LirOperand const> ops) {
     bool hasSymbol = false;
     bool hasBaseOrOffset = false;
     for (auto const& o : ops) {
         if (o.kind == LirOperandKind::SymbolRef) hasSymbol = true;
-        if (o.kind == LirOperandKind::MemBase
-            || o.kind == LirOperandKind::MemOffset) {
+        if (o.kind == LirOperandKind::MemBase || isMemDisplacement(o.kind)) {
             hasBaseOrOffset = true;
         }
     }
@@ -166,7 +175,7 @@ classifyMemAddressForm(std::span<LirOperand const> ops) {
     // can turn into a ModR/M byte.
     if (ops.size() >= 2
         && ops[ops.size() - 2].kind == LirOperandKind::MemBase
-        && ops[ops.size() - 1].kind == LirOperandKind::MemOffset) {
+        && isMemDisplacement(ops[ops.size() - 1].kind)) {
         return MemAddressForm::BaseDisplacement;
     }
     return MemAddressForm::Malformed;
@@ -526,7 +535,10 @@ void checkSideStructureIntegrity(Lir const& lir, LirVerdict& verdict) {
                     }
                 }
                 for (auto const& o : lir.instOperands(inst)) {
-                    if (o.kind != LirOperandKind::LiteralIndex) continue;
+                    if (o.kind != LirOperandKind::LiteralIndex
+                        && o.kind != LirOperandKind::MemSymbolOffset) {
+                        continue;
+                    }
                     if (o.litIndex >= lir.literalPool().size()) {
                         report(verdict, std::format(
                             "LirVerifier: inst {} references literal pool entry "
@@ -535,6 +547,24 @@ void checkSideStructureIntegrity(Lir const& lir, LirVerdict& verdict) {
                             "(a rebuild that did not carry the pool across)",
                             inst.v, o.litIndex, lir.literalPool().size()),
                             DiagnosticCode::L_SideStructureIndexDangling);
+                        continue;
+                    }
+                    // ★ A SYMBOLIC DISPLACEMENT MUST NAME A SYMBOL ADDRESS, and
+                    // a wide constant must NOT: the two operand kinds index one
+                    // pool, so an index that lands on the other kind's arm is a
+                    // value the encoder would read as something it is not.
+                    bool const isSymbolAddress = std::holds_alternative<
+                        LirSymbolAddress>(lir.literalValue(o.litIndex).value);
+                    if (isSymbolAddress
+                        != (o.kind == LirOperandKind::MemSymbolOffset)) {
+                        report(verdict, std::format(
+                            "LirVerifier: inst {} operand {} names literal pool "
+                            "entry lit#{}, which {} a symbol address — a "
+                            "MemSymbolOffset must name one and a LiteralIndex "
+                            "must not",
+                            inst.v, lirOperandKindName(o.kind), o.litIndex,
+                            isSymbolAddress ? "is" : "is not"),
+                            DiagnosticCode::L_MemOperandMalformed);
                     }
                 }
                 std::uint32_t const h = lir.instRegConstraintHandle(inst);
@@ -671,7 +701,10 @@ struct SideStructureCensus {
             for (std::uint32_t i = 0; i < n; ++i) {
                 LirInstId const inst = lir.blockInstAt(bb, i);
                 for (auto const& o : lir.instOperands(inst)) {
-                    if (o.kind == LirOperandKind::LiteralIndex) ++c.literalRefs;
+                    if (o.kind == LirOperandKind::LiteralIndex
+                        || o.kind == LirOperandKind::MemSymbolOffset) {
+                        ++c.literalRefs;
+                    }
                 }
                 if (lir.instRegConstraintHandle(inst) != kLirNoRegConstraints) {
                     ++c.constraintRefs;

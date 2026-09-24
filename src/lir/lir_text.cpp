@@ -176,6 +176,11 @@ renderLiteralValue(LirLiteralValue const& v) {
                 return std::format("f64 {}", payload);
             } else if constexpr (std::is_same_v<T, std::string>) {
                 return "str " + renderEscapedString(payload);
+            } else if constexpr (std::is_same_v<T, LirSymbolAddress>) {
+                // `symaddr @<symbol> <addend>` — the symbol in the operand
+                // sigil every other symbol reference uses.
+                return std::format("symaddr @{} {}", payload.symbol.v,
+                                   payload.addend);
             } else {
                 return renderAggregateLiteral(payload);
             }
@@ -194,6 +199,7 @@ renderLiteralValue(LirLiteralValue const& v) {
 //   * `MemBase`       — `*<scale>`
 //   * `MemOffset`     — `+<offset>` or `-<offset>` for signed
 //   * `LiteralIndex`  — `lit#<index>`
+//   * `MemSymbolOffset` — `memsym#<index>` (a pool `symaddr` entry)
 //   * `None`          — `_`
 // The (reserved) enum slot 3 (formerly `ImmFloat`) is unreachable; the
 // switch is `[[nodiscard]]`-exhaustive over the live variants.
@@ -241,6 +247,8 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
             // this arm is a diagnostic aid, not a round-tripped codec (the
             // class is not re-parsed, mirroring the ByValueStackAgg exhaust byte).
             return std::format("spill#{}", op.spillSlotV);
+        case LirOperandKind::MemSymbolOffset:
+            return std::format("memsym#{}", op.litIndex);
     }
     // Fall-through is a substrate-corruption signal — the discriminator
     // landed on the reserved slot 3 (formerly ImmFloat) or on an out-of-
@@ -292,6 +300,14 @@ collectReachableSymbols(Lir const& lir) {
                     }
                 }
             }
+        }
+    }
+    // A symbolic displacement names its symbol through a pool entry, not an
+    // operand, and the `symbols` section must still declare it.
+    auto const& pool = lir.literalPool();
+    for (std::uint32_t i = 0; i < pool.size(); ++i) {
+        if (auto const* a = std::get_if<LirSymbolAddress>(&pool.at(i).value)) {
+            seen.insert(a->symbol.v);
         }
     }
     seen.erase(0);  // slot 0 is the invalid-symbol sentinel
@@ -1597,6 +1613,18 @@ private:
                      std::format("expected string after 'str', got '{}'", v.text));
             }
             lv.value = std::move(v.text);
+        } else if (tag.text == "symaddr") {
+            // `symaddr @<symbol> <addend>` — the emitter's arm, read back.
+            LirSymbolAddress a;
+            if (!expect(TokKind::At)) return lv;
+            Tok s = lex_.take();
+            a.symbol = SymbolId{parseNumber<std::uint32_t>(s.text, "symaddr symbol")};
+            bool const neg = (lex_.peek().kind == TokKind::Minus);
+            if (neg) lex_.take();
+            Tok v = lex_.take();
+            a.addend = parseNumber<std::int64_t>(v.text, "symaddr addend");
+            if (neg) a.addend = -a.addend;
+            lv.value = a;
         } else if (tag.text == "agg") {
             if (!expect(TokKind::LBracket)) return lv;
             LirAggregateValue agg;
@@ -2084,6 +2112,13 @@ private:
                     Tok n = lex_.take();
                     return LirOperand::makeByValueStackAgg(
                         parseNumber<std::uint32_t>(n.text, "ByValueStackAgg bytes"));
+                }
+                if (pk.text == "memsym") {
+                    lex_.take();
+                    (void)expect(TokKind::Hash);
+                    Tok n = lex_.take();
+                    return LirOperand::makeMemSymbolOffset(
+                        parseNumber<std::uint32_t>(n.text, "MemSymbolOffset"));
                 }
                 return LirOperand::makeReg(parseRegOperand());
             }

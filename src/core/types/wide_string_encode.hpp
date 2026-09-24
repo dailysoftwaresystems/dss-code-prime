@@ -26,11 +26,11 @@
 
 namespace dss {
 
-// NOTE: the wchar_t (`L"…"`) element width is FORMAT-keyed, but that resolution is
-// CONFIG-DRIVEN — declared per language via `LiteralPrefixEntry::elementCoreByFormat`
-// (mirroring builtinTypes' `coreByDataModel`) and resolved by a pure config-map
-// lookup (`resolveElementCore`). This header holds only the format-INVARIANT encode
-// machinery; it intentionally does NOT branch on `ObjectFormatKind`.
+// NOTE: the wchar_t (`L"…"`) element width is a (processor × platform) fact —
+// the language's wide rows name `abiTypedef: wchar_t`, and the semantic tier
+// resolves it from the TARGET's `abiTypedefs` for the build pair. This header
+// holds only the width-INVARIANT encode machinery; it never branches on a
+// processor or an `ObjectFormatKind`.
 
 // Why a wide-string encode failed. Each maps to a caller diagnostic; the code
 // unit count / bytes are NOT produced on failure (no guessed size).

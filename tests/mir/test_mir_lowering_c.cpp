@@ -6697,9 +6697,12 @@ TEST(MirLoweringC, MixedSignCompareLowersUnsignedWithExplicitCast) {
 // REALIZES as a Ptr→Ptr Cast — a bitcast that HIR→MIR maps to a no-op, changing NO
 // bits. And admit⟺realize by construction: the semantic tier ADMITS (model clean)
 // AND the HIR verifier stays clean — because the coerce arm RETYPED the arg node to
-// the param type. If the coerce mark→bitcast arm were neutered, `L.hir->ok` would
-// go FALSE (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param
-// `ptr<i64>`) — so this pin is the automated form of that realize red-on-disable.
+// the param type. If that arm were neutered, `L.hir->ok` would go FALSE
+// (H_VerifierFailure: the arg `ptr<i64 "long long">` != the param `ptr<i64>`) — so
+// this pin is the automated form of that realize red-on-disable. (P68 round 9: the
+// arm is `coerce`'s diagnosed-conversion realize, driven by the types through the
+// one classifier; it used to be a node mark the semantic tier set for this one
+// call-argument shape.)
 //
 // The witness is at the HIR (where coerce runs): the full MIR lowering of a call to
 // an UNDEFINED shipped extern needs the FFI-synthesis the unit `lowerToMir` harness
@@ -6746,6 +6749,67 @@ TEST(MirLoweringC, DirectCallIntPointeeArgRealizesAsPtrBitcast) {
     EXPECT_TRUE(foundRealizeCast)
         << "the admitted arg must realize as a Ptr<I64>→Ptr<I64> Cast (a same-rep, "
            "distinct-identity bitcast) — never a width op";
+}
+
+// P68 round 9 (lane `cs`),
+// [[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]: an
+// integer from a pointer and a pointer from an integer — conversions the language
+// admits WITH A DIAGNOSTIC — realize as the explicit cast's own MIR opcodes,
+// PtrToInt and IntToPtr, and the function verifies. Without the realize, `coerce`
+// passed the operand through with its own type and the store of a Ptr into the
+// `long` slot is what the MIR verifier refuses (I_StoreValueTypeMismatch).
+TEST(MirLoweringC, DiagnosedIntegerPointerConversionsRealizeAsTheCastsOwnOpcodes) {
+    auto L = lowerC(
+        "int f(void) { int x = 42; long v = &x; int *p = v; return *p; }");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "admitted with S_IntegerPointerConversion warnings, never refused";
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::PtrToInt), 1u) << "`long v = &x;`";
+    EXPECT_EQ(countOp(L.mir.mir, MirOpcode::IntToPtr), 1u) << "`int *p = v;`";
+}
+
+// P68 round 9 (lane `cs`): the two POINTER-MIXED compound assignments gcc builds
+// (with its int-conversion warning; C 6.5.17.3p1 refuses them) compute the BINARY
+// operator's value and only then convert it to the lvalue's type: `x += p` is the
+// stride-scaled pointer sum `p + x` (a Gep) turned into an integer, `p -= q` the
+// element difference (a Sub divided by the element size) turned into a pointer.
+// ✔MEASURED (`.temp/probe/r7d`, every build RUN): the compound arms computed
+// `x += p` as an UNSCALED integer add and `p -= q` as the `p - n` stride with `q`
+// the index — DSS exit 1 where gcc exits 42; examples/c/
+// pointer_mixed_compound_assignment_values pins the values on every target. Both
+// the statement arm (`lowerCompoundAssign`) and the value arm (the driver's
+// `finishAssign`) take the route.
+TEST(MirLoweringC, APointerMixedCompoundAssignmentComputesTheBinaryOperatorsValue) {
+    auto sum = lowerC("long long f(int *p) { long long x = 3; x += p; return x; }");
+    ASSERT_FALSE(sum.model.hasErrors()) << "admitted with S_IntegerPointerConversion";
+    ASSERT_TRUE(sum.hir->ok);
+    ASSERT_TRUE(sum.mir.ok);
+    EXPECT_EQ(countOp(sum.mir.mir, MirOpcode::Gep), 1u) << "`p + x`: the stride-scaled sum";
+    EXPECT_EQ(countOp(sum.mir.mir, MirOpcode::PtrToInt), 1u) << "… converted to `x`'s type";
+    EXPECT_EQ(countOp(sum.mir.mir, MirOpcode::Add), 0u) << "never an unscaled integer add";
+
+    auto diff = lowerC("int *f(int *p, int *q) { p -= q; return p; }");
+    ASSERT_FALSE(diff.model.hasErrors()) << "admitted with S_IntegerPointerConversion";
+    ASSERT_TRUE(diff.hir->ok);
+    ASSERT_TRUE(diff.mir.ok);
+    EXPECT_EQ(countOp(diff.mir.mir, MirOpcode::SDiv), 1u) << "`p - q`: the element difference";
+    EXPECT_EQ(countOp(diff.mir.mir, MirOpcode::IntToPtr), 1u) << "… converted to `p`'s type";
+    EXPECT_EQ(countOp(diff.mir.mir, MirOpcode::Gep), 0u)
+        << "never the `p - n` stride with `q` as the index";
+
+    // VALUE position: the same two routes inside an expression.
+    auto sumV = lowerC("long long f(int *p) { long long z = 1; return (z += p) + 0; }");
+    ASSERT_FALSE(sumV.model.hasErrors());
+    ASSERT_TRUE(sumV.mir.ok);
+    EXPECT_EQ(countOp(sumV.mir.mir, MirOpcode::Gep), 1u) << "`(z += p)`: the stride-scaled sum";
+    EXPECT_EQ(countOp(sumV.mir.mir, MirOpcode::PtrToInt), 1u);
+    auto diffV = lowerC("int *f(int *p, int *q) { return (p -= q); }");
+    ASSERT_FALSE(diffV.model.hasErrors());
+    ASSERT_TRUE(diffV.mir.ok);
+    EXPECT_EQ(countOp(diffV.mir.mir, MirOpcode::SDiv), 1u) << "`(p -= q)`: the element difference";
+    EXPECT_EQ(countOp(diffV.mir.mir, MirOpcode::IntToPtr), 1u);
+    EXPECT_EQ(countOp(diffV.mir.mir, MirOpcode::Gep), 0u);
 }
 
 // `char + 1` promotes char to int (the `alsoPromote` config row): the

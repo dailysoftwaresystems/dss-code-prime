@@ -1520,23 +1520,25 @@ enum class DiagnosticCode : std::uint16_t {
     // would refuse C that a reference compiles — the TF-C77 lesson, again.
     S_AttributeIgnoredForDeclarationKind = 0xE05F,
 
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a DIRECT call argument
-    // whose pointee is an integer of the SAME REPRESENTATION as the parameter's
-    // but a DIFFERENT IDENTITY — `long long*` into `long*` on LP64, `int*` into
-    // `long*` on LLP64. C 6.5.2.2p7 makes it a constraint violation requiring a
-    // diagnostic; gcc (`-Wincompatible-pointer-types`), clang (same) and MSVC
-    // (C4133) all WARN, and DSS matches them rather than refusing code the
-    // platform toolchains compile. ✔MEASURED 2026-08-07: Apple clang 21.0.0
-    // compiles sqlite's `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` with
-    // exactly this warning and rc=0, on all four macOS SDKs present.
+    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (TF-C135): a pointer converted to a
+    // pointer whose pointee is an integer of the SAME REPRESENTATION but a
+    // DIFFERENT IDENTITY — `long long*` into `long*` on LP64, `int*` into `long*`
+    // on LLP64. C makes it a constraint violation requiring a diagnostic; gcc
+    // (`-Wincompatible-pointer-types`), clang (same) and MSVC (C4133) all WARN, and
+    // DSS matches them rather than refusing code the platform toolchains compile.
+    // ✔MEASURED 2026-08-07: Apple clang 21.0.0 compiles sqlite's
+    // `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` with exactly this warning
+    // and rc=0, on all four macOS SDKs present.
     //
     // WARNING, NOT ERROR, and the reasoning is recorded so it can be argued with:
     // the representations are identical, so no load, store or call ABI changes —
     // the realized Ptr→Ptr bitcast is a no-op — which means silence would be the
-    // dangerous choice and an error the merely-unportable one. `S_TypeMismatch`
-    // remains the ERROR for every mismatch this predicate does NOT admit
-    // (different width, different signedness, non-integer pointees, and the
-    // init/assign/return and indirect-call boundaries, which never relax).
+    // dangerous choice and an error the merely-unportable one.
+    // ★ P68 round 9 (lane `cs`): this code was a DIRECT call argument's only. It is
+    // now the narrower report of one class the language converts with a diagnostic
+    // at EVERY site (initialization, assignment, argument, return, `==`, `?:`) —
+    // the classifier `diagnosedConversion` names it; every other incompatible
+    // pointer pair reports S_IncompatiblePointerConversion (0xE083).
     //
     // SUPPRESSIBLE, deliberately — `--warnings-as-errors` restores the strict
     // pre-TF-C135 posture. Do NOT add it to `unsuppressable_codes.cpp`: a program
@@ -2478,6 +2480,64 @@ enum class DiagnosticCode : std::uint16_t {
     //   definition or declaration") and clang 18.1.3 (-Wvisibility) warn, MSVC 19.51
     //   is silent. A WARNING, suppressible: the program means what it says.
     S_TagDeclaredInParameterList     = 0xE082,
+    // S_IncompatiblePointerConversion (P68 round 9, lane `cs` —
+    //   D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS): a
+    //   pointer converted to — or paired, at `==`/`!=`/relational or `?:`, with — a
+    //   pointer to an INCOMPATIBLE type without a cast: object pointers of different
+    //   types, an object pointer beside a function pointer, a function pointer of
+    //   another signature (an array or a function designator contributing its decayed
+    //   pointer). C23 6.5.17.2p1 / 6.5.10p2 / 6.5.16p3 make it a constraint
+    //   violation, which needs a diagnostic and nothing more. ✔MEASURED 2026-09-23,
+    //   every program RUN: gcc 13.3.0, mingw-w64 13.2.0 and MSVC 19.51 build every
+    //   shape with a warning, clang 18.1.3 the object-pointer ones. A WARNING,
+    //   suppressible, reported at every site by the one classifier
+    //   (`diagnosedConversion`, type_rules.hpp); `--warnings-as-errors` restores the
+    //   refusal (GCC 14's default). Two distinct INTEGER pointees of one
+    //   representation keep their narrower S_IncompatiblePointerIntegerPointee.
+    S_IncompatiblePointerConversion  = 0xE083,
+    // S_IntegerPointerConversion (P68 round 9, lane `cs`, the same row): a pointer
+    //   from an integer that is not a null pointer constant, or an integer from a
+    //   pointer, without a cast — and a pointer compared with such an integer. C
+    //   6.3.2.3p5-p6 give both conversions an implementation-defined result, the one
+    //   the explicit cast gives; ✔MEASURED 2026-09-23 gcc 13.3.0, mingw-w64 13.2.0 and
+    //   MSVC 19.51 build them with a warning (clang 18.1.3 refuses by default). A
+    //   WARNING, suppressible; `--warnings-as-errors` restores the refusal.
+    S_IntegerPointerConversion       = 0xE084,
+    // S_PredefinedIdentifierOutsideFunction (P68 round 9, lane `cs`): a predefined
+    //   function-name identifier (`__func__`, a configured alias) used OUTSIDE a
+    //   function body. C 6.4.2.2 declares it only inside a function definition, so
+    //   ISO C has nothing to name there; gcc 13.3.0 and clang 18.1.3 both accept it
+    //   with a warning and agree it is the EMPTY string ("", sizeof 1) — ✔MEASURED
+    //   2026-09-23, every program run; MSVC 19.51 refuses (C2065). DSS takes gcc's
+    //   and clang's meaning with their warning: suppressible, and
+    //   `--warnings-as-errors` makes it MSVC's refusal.
+    S_PredefinedIdentifierOutsideFunction = 0xE085,
+    // S_AbiTypedefUndeclared (P68 round 9, lane `lm` —
+    //   D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): a construct takes its TYPE from a
+    //   platform ABI typedef the TARGET declares per object format (`abiTypedefs`
+    //   in `<arch>.target.json`) — a literal-prefix row's `abiTypedef`, `L"…"` and
+    //   `L'…'` → `wchar_t` — and the active target declares no such typedef, so on
+    //   this (target, format) pair the construct has no type. The analogue of
+    //   S_LongDoubleFormatUndeclared for `20.0L` on a format with no `long double`:
+    //   never a guessed width. Named for the MECHANISM, not for `wchar_t` (the
+    //   coordinator's ruling): every construct that reads a type through
+    //   `abiTypedef` refuses through this one code. Unreachable with the shipped
+    //   targets (both declare `wchar_t` on every format, pinned); it is the
+    //   fail-loud arm for a custom target. Always an Error, so never silenced
+    //   (`effectiveSeverity` refuses to silence an Error).
+    S_AbiTypedefUndeclared           = 0xE086,
+    // S_ExcessInitializerElements (P68 round 9, lane `cs`): a brace initializer
+    //   with more POSITIONAL elements than its aggregate has slots — `int a[2] =
+    //   {1, 2, 3}`, `struct P p = {40, 2, 7}`, and a character array initialized by
+    //   a string followed by more elements (`char s[] = {"a", "b"}`). C 6.7.9p2 makes
+    //   it a constraint violation. ✔MEASURED 2026-09-23, every program RUN: gcc
+    //   13.3.0, mingw-w64 13.2.0 and clang 18.1.3 at -std=c2x build the aggregate
+    //   shapes with a warning (clang alone the string one; gcc makes that one an
+    //   error), and each excess element is DROPPED UNEVALUATED — a call in it never
+    //   runs (`.temp/probe/r8f`); MSVC 19.51 refuses (C2078). A WARNING, suppressible;
+    //   `--warnings-as-errors` restores the refusal (-pedantic-errors' posture). A
+    //   DESIGNATED index past the end stays refused, as gcc refuses it.
+    S_ExcessInitializerElements           = 0xE087,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -5150,7 +5210,34 @@ enum class DiagnosticCode : std::uint16_t {
     //   directly refuse alike. UNSUPPRESSABLE on prong (2): the link still
     //   fails without it, and it is the only statement of why.
     K_InvalidRunpathRequest        = 0x8028,
-    // K-NEXT-SLOT: 0x8029 — grep this marker before adding a K_* code.
+    // K_InputSectionSplit (P68 round 9) — ERROR. The link would split an input
+    //   section that the object's format makes the unit of placement
+    //   (`inputSectionPlacement`; see `InputSectionSlice` in `asm/asm.hpp`).
+    //   Cases: a code unit whose members are not consecutive, in offset order
+    //   and contiguous in the module the writers concatenate; a data unit whose
+    //   members span two data-section kinds or overlap; a unit that a writer's
+    //   excluded items would cut in two. Every one of those moves bytes that
+    //   the producer's code reaches by DISTANCE, with no relocation to repair
+    //   the reference, so the image would run a different program. Refused
+    //   rather than emitted. Always an Error, so it needs no row in the
+    //   unsuppressable table (that table's own rule for a new Error code).
+    K_InputSectionSplit            = 0x8029,
+    // K_ImportReferenceUnbindable (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL,
+    //   P68 round 9) — ERROR, once per import row, by name. An assembly reference
+    //   that states no code-vs-data kind (a `.s` address operand or data slot
+    //   naming a symbol the file does not define: `ExternKindOrigin::Pending`)
+    //   reached the link bound in a way no writer can honour:
+    //   (a) no definition stated the kind — no linked unit defines the name and
+    //       the library that binds it reports none (a stripped `.so` NOTYPE, a PE
+    //       forwarder); unbound, the same row is `K_SymbolUndefined`, as before;
+    //   (b) the definition is a library DATUM, named DIRECTLY (`leaq x(%rip)`,
+    //       `movq x(%rip)`, `.quad x`). That needs a copy relocation (gcc makes
+    //       one, -no-pie and -pie alike), which DSS does not make, and DSS binds
+    //       library data through a GOT slot, so the reference would silently
+    //       yield the SLOT's address.
+    //   Always an Error, so it needs no row in the unsuppressable table.
+    K_ImportReferenceUnbindable    = 0x802A,
+    // K-NEXT-SLOT: 0x802B — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

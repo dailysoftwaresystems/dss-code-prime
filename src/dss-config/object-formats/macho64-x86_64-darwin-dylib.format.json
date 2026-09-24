@@ -148,6 +148,10 @@
     }
   ],
 
+  "$relocationAddendsComment": "P68 round 9: WHERE a relocatable object of this format keeps a relocation's addend — `inPlace`: the record has no addend column, so the PATCHED FIELD holds DSS's addend (the format's own formula carries the bias the target declares). ✔MEASURED 2026-09-23: clang 18.1.3 writes `fc ff ff ff` into the field of `movl $5, counter(%rip)`. Read and written only through `link/format/relocation_addend.hpp` — the reader that assumed every foreign `.text` addend was 0 is what this closed.",
+  "relocationAddends": "inPlace",
+  "$inputSectionPlacementComment": "P68 round 9: an input section of a relocatable object in this format may be split at symbols ONLY when the object declares it divisible (MH_SUBSECTIONS_VIA_SYMBOLS in the mach_header, ld64's own rule; N_ALT_ENTRY still marks a symbol that is not a boundary). An object that does not declare it is read with every section as one unit, kept and dropped whole.",
+  "inputSectionPlacement": "subsectionsWhenDeclared",
   "relocations": [
     {
       "$comment": "X86_64_RELOC_BRANCH -- the extern-call reloc on a __stubs entry (a plain rel32 branch). kind = 1 matches x86_64.target.json's `rel32` row (nativeId is the packed (type<<28)|(length<<25)|(pcrel<<24)). ⚠⚠ VALUE CORRECTED 2026-08-20 (D-CONFIG-MACHO-X86_64-EXEC-DYLIB-RELOC-NATIVEID-CONTRADICTS-ITS-OWN-ROW): this row declared nativeId 369098752 = 0x16000000, which under the packing THIS COMMENT ITSELF states -- (type<<28)|(length<<25)|(pcrel<<24) -- decodes to r_type=1 (X86_64_RELOC_SIGNED), r_length=3 (8 bytes), r_pcrel=0. Every one of those three fields contradicts the row's own name and stated intent: BRANCH is r_type=2, 4 bytes, PC-relative. The `-darwin` and `-staticlib` siblings have always carried the correct 620756992 = 0x25000000 = (2<<28)|(2<<25)|(1<<24), and the arm64 family agrees on that same packed value for its own BRANCH26. ⓘ THE DEFECT WAS LATENT, NOT LIVE, AND IT IS WORTH SAYING WHICH: relocation_info records are emitted only by the MH_OBJECT writer, which reads the `-darwin`/`-staticlib` documents, so nothing consumed this number. It is corrected rather than left alone because the exec format serves a real `cli` profile with a real run leg, and a wrong declared value that no consumer reads today is precisely the shape that becomes a silent miscompile the day one does. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
@@ -167,6 +171,17 @@
       "name": "X86_64_RELOC_UNSIGNED_4",
       "kind": 3,
       "nativeId": 67108864
+    },
+    {
+      "$comment": "P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the target's `riprel32` — a memory operand's displacement from the NEXT instruction, a DATA reference, which Mach-O never writes as X86_64_RELOC_BRANCH. ✔MEASURED 2026-09-23, clang 18.1.3: X86_64_RELOC_SIGNED (type 1) when the field ends the instruction, SIGNED_1/_2/_4 (types 6/7/8) when 1/2/4 bytes follow it; r_pcrel 1, r_length 2. nativeId packs (type<<28)|(2<<25)|(1<<24).",
+      "name": "X86_64_RELOC_SIGNED",
+      "kind": 8,
+      "nativeId": 352321536,
+      "nativeIdByBytesAfterField": [
+        { "bytesAfterField": 1, "nativeId": 1694498816 },
+        { "bytesAfterField": 2, "nativeId": 1962934272 },
+        { "bytesAfterField": 4, "nativeId": 2231369728 }
+      ]
     }
   ]
 }

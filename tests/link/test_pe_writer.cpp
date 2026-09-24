@@ -1055,6 +1055,8 @@ namespace {
     }
     json += R"(
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -1649,11 +1651,18 @@ TEST(PeFormatJson, ZeroMachineRejectedByValidate) {
 
 // ── PE relocation addend=non-zero fails loud ───────────────────
 
-TEST(PeWriter, NonZeroAddendFailsLoud) {
-    // PE has no addend field on IMAGE_RELOCATION (addend lives in
-    // the patch bytes). If the assembler stamped a non-zero addend
-    // (ELF convention) the walker MUST surface a diagnostic instead
-    // of silently dropping (silent-failure C2 convergence).
+TEST(PeWriter, NonZeroAddendIsWrittenIntoThePatchedField) {
+    // PE has no addend field on IMAGE_RELOCATION: the addend lives in the
+    // PATCHED BYTES (`relocationAddends: inPlace`). This test used to demand a
+    // REFUSAL of a non-zero `.text` addend, and that refusal was the whole
+    // reason the COFF reader assumed "every `.text` addend is 0" -- which is
+    // false of every other producer (✔MEASURED 2026-09-23: clang writes
+    // `fc ff ff ff` into `movl $5, counter(%rip)`'s field, and a clang object
+    // linked by DSS ran to 32 instead of 42). The writer now STAMPS the addend
+    // where the format keeps it (`link/format/relocation_addend.hpp`), which is
+    // what an assembler emitting `movl $imm, sym(%rip)` needs. So this pins
+    // the other direction: nothing is refused and nothing is dropped. The
+    // addend is in the field, and the reader gives it back.
     auto loaded = loadShipped();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -1667,11 +1676,25 @@ TEST(PeWriter, NonZeroAddendFailsLoud) {
     rel.addend = -4;
     caller.relocations.push_back(rel);
     mod.functions.push_back(std::move(caller));
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "caller", SymbolBinding::Global,
+                                SymbolVisibility::Default}};
+    mod.externImports = {ExternImport{SymbolId{2}, "callee", "", /*isData=*/false}};
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    std::vector<std::uint8_t> const stamped{0xE8, 0xFC, 0xFF, 0xFF, 0xFF};
+    EXPECT_NE(std::search(bytes.begin(), bytes.end(), stamped.begin(), stamped.end()),
+              bytes.end())
+        << "the call's field must hold the addend -4 in place";
+
+    DiagnosticReporter rrep;
+    auto read = pe::readRelocatableObject(bytes, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(read.has_value()) << "errors=" << rrep.errorCount();
+    ASSERT_EQ(read->functions.size(), 1u);
+    ASSERT_EQ(read->functions[0].relocations.size(), 1u);
+    EXPECT_EQ(read->functions[0].relocations[0].addend, -4);
 }
 
 // ── End-to-end via the format-blind `link()` dispatch ──────────
@@ -2923,6 +2946,8 @@ TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
     })");
     ASSERT_TRUE(fmt.has_value());
@@ -3462,6 +3487,8 @@ namespace {
       "sections": [
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_ARM64_BRANCH26","kind":1,"nativeId":3},
         {"name":"IMAGE_REL_ARM64_ADDR64","kind":2,"nativeId":14},
@@ -5332,6 +5359,8 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
         {"kind":"strtab","name":".strtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0},
         {"kind":"shstrtab","name":".shstrtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_X86_64_PC32","kind":1,"nativeId":2},
         {"name":"R_X86_64_64","kind":2,"nativeId":1},
@@ -5738,6 +5767,8 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
       "sections": [
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -5831,6 +5862,8 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096},
         {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -6245,6 +6278,8 @@ namespace {
       "sections": [
         {"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -6484,6 +6519,8 @@ peObjSectionDefAux(std::vector<std::uint8_t> const& obj,
       "sections": [
         {"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},

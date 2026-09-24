@@ -310,3 +310,13 @@ dss_add_test(NAME ffi/test_shipped_library_role
 # Pure byte decoding: nothing is built, nothing is run, so every host answers.
 dss_add_test(NAME ffi/test_binary_architecture_field
              SOURCES test_binary_architecture_field.cpp)
+
+# P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): the LATTICE-DERIVED
+# `constants` row (`{name, of, limit}`) through both seams of the one decode — the
+# value and the type follow the pair (data model, plain-char signedness, the
+# language's promotions), `of` names the descriptor's own typedef first, a row the
+# missing pair decides is not realized, every malformed shape is refused, and the
+# shipped `limits.json` realizes all its rows on every pair shape. Reads the
+# shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME ffi/test_shipped_derived_constants
+             SOURCES test_shipped_derived_constants.cpp)

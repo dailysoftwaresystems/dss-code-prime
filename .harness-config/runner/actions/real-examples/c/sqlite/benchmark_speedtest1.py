@@ -525,8 +525,9 @@ def select_dss(repo_root, explicit, explicit_by, allow_nonrelease, log):
                 "--legs <a release leg; dssharness legs lists them>\n      Searched for dsscp[.exe] "
                 "at any depth under: %s" % "; ".join(searched))
         origin = "the newest eligible of %d candidate(s), selected by BUILD TYPE" % len(cands)
-    built = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.mtime)) if info.mtime
-             else "<unknown>")
+    # The CODE's stamp, naming the image file it came from -- the one rule Step 5 reports by
+    # (`sqlite_compiler.built_stamp`), never the launcher's own time.
+    built = COMP.built_stamp(info)
     note = "  (compiler build type: %s)" % info.type
     if not COMP.is_release(info.type):
         if not allow_nonrelease:
@@ -743,16 +744,17 @@ def substitute_main_tu(tus_file, speedtest1_c, write=None):
     return after
 
 
-def refuse_amalgamation(archive, ar_argv=None):
+def refuse_amalgamation(archive):
     """An archive built without USE_AMALGAMATION=0 holds ONE member, `sqlite3.o` -- the
     amalgamation, under exactly the right file name. Recovering the subject from it would benchmark
     the amalgamation under a full-source label, the one thing this benchmark exists not to do. A
-    COUNT cannot say which thing is in there; the member NAME can. (`ar` failing is refused by
-    `sqlite_base.archive_members` -- it is never an empty archive.)"""
+    COUNT cannot say which thing is in there; the member NAME can. (The names are READ from the
+    archive by `sqlite_base.archive_members`, the same on every host; a file that is not an archive
+    is refused there -- it is never an empty archive.)"""
     if not os.path.isfile(archive):
         return
     try:
-        members = BASE.archive_members(archive, ar_argv=ar_argv)
+        members = BASE.archive_members(archive)
     except BASE.RecipeRefused as exc:
         die(str(exc))
     if AMALGAMATION_OBJECT in members:
@@ -847,7 +849,7 @@ def translate_manifest(manifest, spell):
     return len(m["sources"]) + len(m["includes"])
 
 
-Tools = collections.namedtuple("Tools", ["make", "configure", "ar", "python", "gen"])
+Tools = collections.namedtuple("Tools", ["make", "configure", "python", "gen"])
 DeriveConfig = collections.namedtuple(
     "DeriveConfig", ["sqlite_dir", "out_dir", "spec", "transform", "reserve", "stage", "jobs",
                      "style", "tools", "spell", "log"])
@@ -857,7 +859,7 @@ Derived = collections.namedtuple(
 
 
 def default_tools(sqlite_dir):
-    return Tools(("make",), (os.path.join(sqlite_dir, "configure"),), None, sys.executable,
+    return Tools(("make",), (os.path.join(sqlite_dir, "configure"),), sys.executable,
                  C.MANIFEST_GEN)
 
 
@@ -921,7 +923,7 @@ def derive(cfg):
     archive = os.path.join(bld, "libsqlite3.a")
     if os.path.isfile(os.path.join(bld, ".libs", "libsqlite3.a")):
         archive = os.path.join(bld, ".libs", "libsqlite3.a")
-    refuse_amalgamation(archive, tools.ar)
+    refuse_amalgamation(archive)
     # The .sh's call, flag for flag: link-line + -B + the recipe token scope (without them the -D
     # set is read off the link line alone and loses SQLITE_CORE), the archive filtered to the
     # objects the link names, the three search roots, and its floors.
@@ -932,7 +934,7 @@ def derive(cfg):
             token_scope="recipe", archive=archive, archive_from_span=True,
             search_roots=[os.path.join(sqlite, "src"), os.path.join(sqlite, "ext"), bld],
             min_tus=MIN_TUS, min_defines=MIN_DEFINES, out_tus=tus_file, out_defines=defs_file,
-            out_includes=incs_file, make_argv=tools.make, ar_argv=tools.ar)
+            out_includes=incs_file, make_argv=tools.make)
     except BASE.RecipeRefused as exc:
         die("the full-source recipe derivation FAILED %s see %s\n%s" % (DASH, recipe, exc))
     except BASE.HarnessUsageError as exc:
@@ -1463,13 +1465,6 @@ with open("Makefile", "w", encoding="utf-8", newline="\n") as fh:
 sys.exit(cfg.get("exit", 0))
 '''
 
-_FAKE_AR = r'''import sys
-a = sys.argv[1:]
-members = [m for m in a[1].split(",") if m] if a and a[0] == "--members" else []
-for m in members:
-    print(m)
-'''
-
 _FAKE_CORE = r'''import sys
 sys.stdout.write("fake measurement core: exit %d\n")
 sys.exit(%d)
@@ -1611,7 +1606,6 @@ class _Fx:
         self.host = C.host_os()
         self.fake_make = self.script("fake_make.py", _FAKE_MAKE)
         self.fake_configure = self.script("fake_configure.py", _FAKE_CONFIGURE)
-        self.fake_ar = self.script("fake_ar.py", _FAKE_AR)
         self.silent = self.script("silent.py", _SILENT)
         self.cores = {rc: self.script("core_%d.py" % rc, _FAKE_CORE % (rc, rc)) for rc in (0, 1, 3)}
         self.make = shutil.which("make")
@@ -1634,8 +1628,19 @@ class _Fx:
         buf = io.StringIO()
         return C.Log(stream=buf), buf
 
-    def ar(self, members):
-        return (self.py, self.fake_ar, "--members", ",".join(members))
+    def archive_text(self, members):
+        """A real GNU-format archive holding `members` (each body its name), as TEXT -- every byte
+        of it is ASCII -- for the fake make to write where the reference build would."""
+        path = os.path.join(self.fresh("archive"), "lib.a")
+        BASE._write_gnu_ar(path, [(m, m.encode("ascii")) for m in members])
+        with open(path, "rb") as fh:
+            return fh.read().decode("ascii")
+
+    def archive(self, members):
+        """The same archive as a FILE, for the arms that hand refuse_amalgamation a path."""
+        path = os.path.join(self.fresh("archive"), "libsqlite3.a")
+        BASE._write_gnu_ar(path, [(m, m.encode("ascii")) for m in members])
+        return path
 
     def legs(self, host_os, host_arch):
         key = (host_os, host_arch)
@@ -1673,7 +1678,9 @@ class _Fx:
             "" if no_shell else "shell.c ", " ".join(objects))
         recipe = os.path.join(root, "recipe.txt")
         _put(recipe, "cc -o jimsh /tool/jimsh0.c\n%s\n%s\n" % (compile_line, link))
-        gen = {"shell.c": "int main(void){return 0;}\n", "libsqlite3.a": "!<arch>\n"}
+        gen = {"shell.c": "int main(void){return 0;}\n",
+               "libsqlite3.a": self.archive_text(members if members is not None
+                                                 else objects + ["zz_notlinked.o"])}
         if generate_h:
             gen["sqlite3.h"] = "#define SQLITE_VERSION \"x\"\n"
         rec = os.path.join(root, "make-calls.jsonl")
@@ -1684,7 +1691,6 @@ class _Fx:
         conf_cfg = os.path.join(root, "configure.json")
         _put(conf_cfg, json.dumps({"record": conf_rec, "exit": configure_exit}))
         tools = Tools((self.py, self.fake_make, make_cfg), (self.py, self.fake_configure, conf_cfg),
-                      self.ar(members if members is not None else objects + ["zz_notlinked.o"]),
                       self.py, C.MANIFEST_GEN)
         log, buf = self.log()
         cfg = DeriveConfig(sqlite, os.path.join(root, "out"), "x86_64:elf64-x86_64-linux-exec", "none",
@@ -2161,17 +2167,18 @@ def _st_capabilities(A, fx):
           "benchmark checked only SQLITE_CORE)",
           lambda: (no_fts5 is not None and "MISSING declared capabilities: SQLITE_ENABLE_FTS5" in no_fts5, no_fts5))
     d = fx.fresh("archive")
-    arc = os.path.join(d, "libsqlite3.a")
-    _put(arc, "!<arch>\n")
-    amal = _dies(lambda: refuse_amalgamation(arc, fx.ar(["sqlite3.o"])))
-    full_src = _dies(lambda: refuse_amalgamation(arc, fx.ar(["alter.o", "analyze.o"])))
-    absent = _dies(lambda: refuse_amalgamation(os.path.join(d, "none.a"), fx.ar(["sqlite3.o"])))
+    amal = _dies(lambda: refuse_amalgamation(fx.archive(["sqlite3.o"])))
+    full_src = _dies(lambda: refuse_amalgamation(fx.archive(["alter.o", "analyze.o"])))
+    absent = _dies(lambda: refuse_amalgamation(os.path.join(d, "none.a")))
     A.arm("n38 an archive holding sqlite3.o (the AMALGAMATION) is REFUSED by member name (control: a "
           "full-source archive, and an absent one, pass here)",
           lambda: (amal is not None and "AMALGAMATION" in amal and full_src is None and absent is None, amal))
-    failing_ar = _dies(lambda: refuse_amalgamation(arc, (fx.py, "-c", "import sys; sys.exit(3)")))
-    A.arm("n39 an ar that FAILS is refused, never read as an empty archive",
-          lambda: (failing_ar is not None and "exited 3" in failing_ar, failing_ar))
+    not_archive = os.path.join(d, "libsqlite3.a")
+    _put(not_archive, "not an archive\n")
+    unreadable = _dies(lambda: refuse_amalgamation(not_archive))
+    A.arm("n39 a file that is NOT an archive is refused, never read as an empty archive (the member "
+          "names are read from the file, not asked of the host's ar)",
+          lambda: (unreadable is not None and "NOT an empty archive" in unreadable, unreadable))
 
 
 # ── new: the derivation end to end, every tool a fake child process ──────────────────

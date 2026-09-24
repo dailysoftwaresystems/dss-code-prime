@@ -132,12 +132,14 @@ The rules the two verbs encode:
 
   * ALL OR NOTHING. `row/` is parsed strictly -- every entry is `<ANCHOR>.<status |
     trigger | closing | crossrefs | bucket | priority>`, and every anchor has all four of
-    status, trigger, closing and crossrefs -- and EVERY row is dry-run through the row
-    writer before ANY is written. A write that still fails RESTORES the three registries
-    byte-for-byte.
-  * THROUGH THE SANCTIONED WRITER, CELLS BY FILE: `.harness-config/runner/actions/anchors/anchors.py write
-    --trigger-file/--closing-file/--cross-refs-file`, never a hand-assembled row. The
-    status and priority vocabularies are that file's own, loaded, never re-typed here.
+    status, trigger, closing and crossrefs -- and EVERY row is dry-run through the door
+    before ANY is written. A write that still fails RESTORES the registries byte-for-byte.
+  * THROUGH THE ONE DOOR, CELLS BY FILE: `dssharness write-anchor` for a new row and
+    `set-anchor` for an existing one, composed by the target tree's launcher
+    (`anchors.door_write`), never a hand-assembled row. An update names only the fields that
+    CHANGE, so a cell the lane did not change keeps its stored bytes. The status and
+    priority vocabularies are that file's own, loaded, never re-typed here; a NEW row with no
+    `.priority` is given the burndown sieve's band (the door requires one), and says so.
   * BUCKETS: a row that exists keeps its own home, and a `.bucket` contradicting it
     REFUSES; an ARCHIVED row needs an explicit `.bucket`, naming its archive table; a
     NEW row takes its `.bucket` or the verb's default. `.priority` wins over the stored
@@ -1097,9 +1099,10 @@ def load_anchors_module(root):
     """-> the TARGET tree's `.harness-config/runner/actions/anchors/anchors.py`, loaded as a module.
 
     ★ ITS VOCABULARY IS USED, NEVER RE-TYPED HERE: `normalise_status`,
-    `normalise_priority`, `WORKING`, `find`, the cell indices. Rows are still WRITTEN
-    through its command line -- one process per row, cells by file -- because that is the
-    sanctioned door and it keeps every refusal the writer owns in one place.
+    `normalise_priority`, `WORKING`, `find`, the cell indices, `suggest_band`. Rows are
+    WRITTEN by the door, `dssharness write-anchor` / `set-anchor`, through that file's one
+    launcher (`door_write`) -- one door call per row, cells by file -- so every refusal the
+    door and the launcher own lives in one place.
     ⓘ The target tree's copy, not this file's sibling: `anchors.py` has no `--repo`, and
     its registries are the ones beside its own file.
     """
@@ -1256,8 +1259,15 @@ def plan_rows(root, wt, lane, default_bucket, anchors):
         else:
             bucket = declared_bucket or default_bucket
             priority = declared_priority
-            source = ("declared" if declared_priority
-                      else "none declared -- the writer seeds one and says so")
+            source = "declared"
+            if not priority:
+                # The door REQUIRES a priority. The sieve's band is a SUGGESTION, written as
+                # the declaration a human then corrects -- and said here, so it is never silent.
+                probe = "| x | x | x | %s | %s | %s |" % (flat["trigger"], flat["closing"],
+                                                         flat["crossrefs"])
+                priority, why = anchors.suggest_band(anchor, probe, bucket)
+                source = ("none declared -- SEEDED from the burndown sieve (%s); correct it with "
+                          "`dssharness set-anchor %s --priority <band>`" % (why, anchor))
             action = "insert"
         plans.append(RowPlan(anchor,
                              dict((k, have[k]) for k in ("trigger", "closing", "crossrefs")),
@@ -1280,30 +1290,44 @@ def plan_rows(root, wt, lane, default_bucket, anchors):
 
 
 def _run_writer(root, plan, apply_it):
-    """-> (returncode, output) of ONE `anchors.py write` for `plan`. The only place a row is
-    written.
+    """-> (returncode, output) of ONE door call for `plan` -- `dssharness write-anchor` for a
+    NEW row, `set-anchor` for an existing one -- through the target tree's launcher,
+    `anchors.door_write`. The only place a row is written.
 
-    ★ CELLS GO BY FILE, NEVER BY ARGUMENT. ✔MEASURED 2026-09-15 (P66, lane `bl`): a row of
-    about 48 KB crossed Windows' 32,767-character command line and died with exit 126
-    before the writer ever ran.
+    ★ AN UPDATE NAMES ONLY WHAT CHANGES. A field whose declaration already equals the stored
+    row (cells compared the way `verify_rows` compares them) is not sent, so the door carries
+    the stored cell through byte for byte -- a run of spaces or a tab a lane did not touch is
+    never rewritten.
+    ★ CELLS GO BY FILE, NEVER BY ARGUMENT (the launcher writes them). ✔MEASURED 2026-09-15
+    (P66, lane `bl`): a row of about 48 KB crossed Windows' 32,767-character command line and
+    died with exit 126 before the writer ever ran.
     ⓘ A module-level function on purpose: the self-test replaces it to inject the failures
-    a dry run cannot foresee.
+    a dry run cannot foresee. It reads the cells from `plan.files` at CALL time, so an
+    injected plan is written as injected.
     """
-    argv = [sys.executable, os.path.join(root, ACTIONS_REL, "anchors", "anchors.py"), "write",
-            "--" + plan.bucket, plan.anchor, "--status", plan.status_word,
-            "--trigger-file", plan.files["trigger"],
-            "--closing-file", plan.files["closing"],
-            "--cross-refs-file", plan.files["crossrefs"]]
+    anchors = load_anchors_module(root)
+    try:
+        texts = dict((k, _read_cell(plan.files[k])) for k in ("trigger", "closing", "crossrefs"))
+    except (OSError, UnicodeDecodeError) as exc:
+        return 2, "a cell file cannot be read as UTF-8 (%s)" % exc
+    fields = {"status": plan.status_word, "trigger": texts["trigger"],
+              "closing": texts["closing"], "cross_refs": texts["crossrefs"]}
     if plan.priority:
-        argv += ["--priority", plan.priority]
-    if plan.action == "insert":
-        argv.append("--insert")
-    if apply_it:
-        argv.append("--apply")
-    # ⓘ A child process, handed this process's environment WITHOUT the caller's git selection,
-    # like every process this tool starts.
-    proc = subprocess.run(argv, capture_output=True, env=_owning_tree().git_environment())
-    return proc.returncode, (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        fields["priority"] = plan.priority
+    stored = None
+    if plan.action != "insert":
+        rows = anchors.find(root, plan.anchor)
+        stored = rows[0] if len(rows) == 1 else None
+    if stored is not None:
+        if stored.status == plan.status_cell:
+            del fields["status"]
+        if fields.get("priority") == stored.priority:
+            del fields["priority"]
+        for key, column in (("trigger", anchors.C_TRIGGER), ("closing", anchors.C_CLOSING),
+                            ("cross_refs", anchors.C_XREF)):
+            if _flat(stored.cell(column)) == _flat(fields[key]):
+                del fields[key]
+    return anchors.door_write(root, plan.anchor, fields, plan.action == "insert", apply_it)
 
 
 def _restore_registries(snapshot):
@@ -2521,6 +2545,38 @@ def self_test():
         pin(rv == 2 and "VERIFY FAILED" in out and "NEW2" in out,
             "(r4) a row whose stored cells do not re-read as the lane's files FAILS "
             "verification", "rv=%r out=%s" % (rv, out[-400:]))
+
+        # (r5) AN UPDATE NAMES ONLY WHAT CHANGES. A stored row whose closing cell holds a run
+        # of spaces and an escaped pipe is CLOSED by the lane, whose closing file says the
+        # same words with ONE space (a lane file's own spelling). That cell did not change, so
+        # the door is not asked to write it, and its stored bytes survive the MOVE to the
+        # archive. ⓘ Injected as RAW TEXT inside the table, the way the stored rows holding a
+        # run were written, so the door is measured on a row it did not make.
+        RUNS_ = FX + "-RUNS"
+        raw_runs = ("| `%s` | P2 | 🟠 OPEN | 🟠 **OPEN** a runs row | see  for details \\| piped "
+                    "| r |" % RUNS_)
+        prod_text = text(REGS[0])
+        write_atomic(REGS[0], prod_text.replace(SEP + "\n", SEP + "\n" + raw_runs + "\n", 1))
+        # A lane of its own: the `rows` lane still holds (r4)'s deliberately mis-verified row.
+        wrows2 = make_lane(r3, "rows2")
+        cells(wrows2, "rows2", RUNS_, "✅ CLOSED", "✅ **CLOSED** a runs row",
+              closing="see for details | piped", crossrefs="r")
+        # (r6) ...and a NEW row with no `.priority` is given the sieve's band -- the door
+        # requires one -- and the application SAYS it was seeded.
+        cells(wrows2, "rows2", FX + "-SEEDED", "🟠 OPEN", "🟠 **OPEN** a row with no declared band")
+        rv, out = quiet(cmd_apply_rows, r3, "rows2", "production", True)
+        moved = [ln for ln in text(REGS[1]).split("\n") if (RUNS_ + "`") in ln]
+        pin(rv == 0 and len(moved) == 1 and "| see  for details \\| piped |" in moved[0]
+            and not any((RUNS_ + "`") in ln for ln in text(REGS[0]).split("\n")),
+            "(r5) a lane closing a row does not rewrite a cell it did not change -- the stored "
+            "run of spaces and escaped pipe survive the move byte for byte",
+            "rv=%r moved=%s out=%s" % (rv, moved, out[out.find("REFUSED"):][:900] if "REFUSED" in out
+                                       else out[-400:]))
+        seeded = A3.find(r3, FX + "-SEEDED")
+        pin(rv == 0 and len(seeded) == 1 and seeded[0].priority in ("P0", "P1", "P2", "P3", "P4", "P5")
+            and "SEEDED from the burndown sieve" in out,
+            "(r6) a NEW row with no .priority gets the burndown sieve's band, and the output "
+            "says so", "rows=%s out=%s" % ([(r.priority, r.status) for r in seeded], out[-300:]))
 
         # (l1) THE WHOLE LANDING.
         wl1 = make_lane(r3, "land1")

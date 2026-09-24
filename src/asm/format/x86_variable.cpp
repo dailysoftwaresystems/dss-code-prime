@@ -215,6 +215,17 @@ struct EncodingState {
     // literal + a reloc in one variant fails loud (validate() rejects
     // the schema; the emit-time check is the defense-in-depth half).
     std::optional<PendingRelocSlot> memRelocDisp32;
+    // ★★ THE PROGRAM COUNTER IS THIS MEMORY OPERAND'S BASE
+    // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the base wire named the
+    // target's `pcRelativeMemoryBase` register, so ModR/M takes the mod=00
+    // rm=101 form and the displacement — a number or a relocation — is
+    // relative to the NEXT instruction. Distinct from `RipRelDisp32`'s mode,
+    // which is reached from a bare `SymbolRef` and emits its field last.
+    bool pcRelativeBase = false;
+    // A SYMBOLIC displacement (`MemSymbolOffset`): its symbol and the constant
+    // written after it. Resolved to `memRelocDisp32` once the base is known,
+    // because the relocation kind depends on the base.
+    std::optional<LirSymbolAddress> symbolicDisplacement;
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
     // intra-function block-relative branch targets. Each entry
     // emits its `prefixBytes` then 4 zero placeholder bytes,
@@ -921,6 +932,48 @@ bool encode(Lir const&                  lir,
                                           encodingSlotKindName(wire.slotKind),
                                           reporter);
             if (!hw.has_value()) return false;
+            // ★★★ THE PROGRAM COUNTER AS A MEMORY BASE
+            // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The target
+            // lists the fields that take it (`pcRelativeMemoryBase`), and the
+            // ModR/M rule is this format's: mod=00 with rm = the register's
+            // encoding (101) is `[rip + disp32]`, a 32-bit displacement from
+            // the NEXT instruction — never the mod=10 base form `wireSlot`
+            // would pick, which with rm=101 addresses through RBP.
+            // ⚠ ANYWHERE ELSE THE REGISTER IS REFUSED, and here rather than
+            // only at the election: its number is RBP's, so a field that took
+            // it would silently encode RBP.
+            if (srcOp.reg.isPhysical != 0
+                && schema.pcRelativeMemoryBase() != nullptr
+                && schema.pcRelativeMemoryBase()->registerOrdinal
+                       == static_cast<std::uint16_t>(srcOp.reg.id)) {
+                if (!schema.isPcRelativeMemoryBase(
+                        static_cast<std::uint16_t>(srcOp.reg.id),
+                        wire.slotKind)) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': field '{}' names the "
+                                       "program counter, which this target "
+                                       "admits only as the base of a memory "
+                                       "operand ('pcRelativeMemoryBase') — its "
+                                       "encoding is another register's in "
+                                       "every other field",
+                                       info->mnemonic,
+                                       encodingSlotKindName(wire.slotKind)));
+                    return false;
+                }
+                if (rejectDoubleWrite(st.wroteModRmRm, info->mnemonic,
+                                      "ModR/M.rm (the program-counter base)",
+                                      reporter)) {
+                    return false;
+                }
+                st.hasModRm       = true;
+                st.modRmRm3       = static_cast<std::uint8_t>(*hw & 0x7u);
+                st.rexB           = (*hw & 0x8u) != 0u;
+                st.wroteModRmRm   = true;
+                st.modMode        = EncodingState::ModMode::RipRel;
+                st.pcRelativeBase = true;
+                continue;
+            }
             if (!wireSlot(st, wire.slotKind, *hw,
                           info->mnemonic, reporter)) {
                 return false;
@@ -1007,6 +1060,50 @@ bool encode(Lir const&                  lir,
                                       info->mnemonic, reporter)) {
                 return false;
             }
+        } else if (srcOp.kind == LirOperandKind::MemSymbolOffset) {
+            // ★ A SYMBOLIC DISPLACEMENT (`msg+4(%rip)`): the field holds a
+            // RELOCATION, whose kind depends on the base — resolved after the
+            // loop, when the base wire has been seen whatever the wire order.
+            if (wire.slotKind != EncodingSlotKind::Disp32Mem) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': a symbolic displacement is "
+                                   "wired into slot '{}', which is not a "
+                                   "memory displacement",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            if (st.disp32Mem.has_value() || st.symbolicDisplacement.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': second writer to the memory "
+                                   "displacement — a memory operand has one",
+                                   info->mnemonic));
+                return false;
+            }
+            if (srcOp.litIndex >= lir.literalPool().size()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': symbolic displacement names "
+                                   "literal pool entry {} of {} — the index "
+                                   "outlived the pool it names",
+                                   info->mnemonic, srcOp.litIndex,
+                                   lir.literalPool().size()));
+                return false;
+            }
+            auto const* addr = std::get_if<LirSymbolAddress>(
+                &lir.literalValue(srcOp.litIndex).value);
+            if (addr == nullptr) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': symbolic displacement names "
+                                   "literal pool entry {}, which is not a "
+                                   "symbol address", info->mnemonic,
+                                   srcOp.litIndex));
+                return false;
+            }
+            st.symbolicDisplacement = *addr;
         } else if (srcOp.kind == LirOperandKind::BlockRef) {
             // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1):
             // intra-function block-relative branch target. The slot
@@ -1132,6 +1229,39 @@ bool encode(Lir const&                  lir,
                                static_cast<int>(srcOp.kind)));
             return false;
         }
+    }
+
+    // ★★ THE SYMBOLIC DISPLACEMENT'S RELOCATION, now that the base is known.
+    // Against the program counter it is the distance to the symbol — the kind
+    // the target names for it (`pcRelativeMemoryBase`). Against any other base
+    // it would be the symbol's ABSOLUTE address (gas: `movl sym(%rax), %eax` is
+    // R_X86_64_32S), a relocation no target row declares for this field — so it
+    // is refused rather than encoded as the PC-relative distance it is not.
+    if (st.symbolicDisplacement.has_value()) {
+        if (!st.pcRelativeBase) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': a symbolic displacement against a "
+                               "base that is not the program counter is an "
+                               "ABSOLUTE address, and target '{}' declares no "
+                               "relocation for one in a memory displacement",
+                               info->mnemonic, schema.name()));
+            return false;
+        }
+        st.memRelocDisp32 = PendingRelocSlot{
+            schema.pcRelativeMemoryBase()->symbolicDisplacementRelocation,
+            st.symbolicDisplacement->symbol};
+    }
+    // An index register beside the program counter: x86-64's RIP-relative form
+    // has no SIB, so there is no field for one (gas: "`8(%rip,%rax)' is not a
+    // valid base/index expression").
+    if (st.pcRelativeBase && st.sibIndex3.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': a program-counter-relative memory "
+                           "operand takes no index register — its ModR/M form "
+                           "has no SIB byte", info->mnemonic));
+        return false;
     }
 
     // D-CSUBSET-COMPUTED-GOTO: a block-address `lea` carries a trailing
@@ -1467,7 +1597,29 @@ bool encode(Lir const&                  lir,
     if (st.absSibDisp32.has_value()) {
         asm_byte_emit::appendImm32LE(out, *st.absSibDisp32);
     }
-    if (st.modMode == EncodingState::ModMode::MemDisp32) {
+    // ★ THE PROGRAM-COUNTER BASE'S DISPLACEMENT SITS WHERE EVERY MEMORY
+    // DISPLACEMENT SITS — after ModR/M, BEFORE any immediate (✔MEASURED, gas
+    // 2.42: `movl $5, x(%rip)` = c7 05 <disp32> <imm32>). A symbolic one is a
+    // relocation whose addend is completed below, once the bytes after it are
+    // known.
+    std::optional<std::size_t> pcRelativeRelocIndex;
+    if (st.pcRelativeBase) {
+        if (st.memRelocDisp32.has_value()) {
+            pcRelativeRelocIndex = relocs.size();
+            walker_util::appendPendingReloc(relocs, out, *st.memRelocDisp32);
+            asm_byte_emit::appendU32LE(out, 0u);
+        } else if (st.disp32Mem.has_value()) {
+            asm_byte_emit::appendImm32LE(out, *st.disp32Mem);
+        } else {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': a program-counter-relative memory "
+                               "operand reached the encoder with no "
+                               "displacement — its form always carries 32 bits "
+                               "of one", info->mnemonic));
+            return false;
+        }
+    } else if (st.modMode == EncodingState::ModMode::MemDisp32) {
         if (st.disp32Mem.has_value() && st.memRelocDisp32.has_value()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
@@ -1595,6 +1747,31 @@ bool encode(Lir const&                  lir,
             island,
         });
         asm_byte_emit::appendU32LE(out, 0u);
+    }
+
+    // ★★★ "RELATIVE TO THE NEXT INSTRUCTION" — THIS ISA's RULE, APPLIED ONCE
+    // (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER). The CPU adds the
+    // displacement to the address of the byte AFTER the instruction, while a
+    // relocation kind's bias counts only to the end of its own field; the bytes
+    // between (an immediate) are subtracted from the addend here, and recorded
+    // for the one format that also spells them in the relocation type.
+    // ✔MEASURED, gas 2.42: `movl $5, counter(%rip)` is R_X86_64_PC32
+    // `counter-8` (the -4 of the field plus 4 immediate bytes).
+    if (pcRelativeRelocIndex.has_value()) {
+        auto& rel = relocs[*pcRelativeRelocIndex];
+        std::size_t const fieldEnd = static_cast<std::size_t>(rel.offset) + 4u;
+        std::size_t const after = out.size() - fieldEnd;
+        if (after > 0xFFu) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': {} bytes follow a relocated "
+                               "displacement — more than any instruction of "
+                               "this format carries", info->mnemonic, after));
+            return false;
+        }
+        rel.addend = st.symbolicDisplacement->addend
+                   - static_cast<std::int64_t>(after);
+        rel.bytesAfterField = static_cast<std::uint8_t>(after);
     }
 
     return true;

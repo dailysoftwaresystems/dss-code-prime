@@ -54,14 +54,19 @@ WHAT THE UNION DECIDED (each pinned by a self-test arm; the old behaviour is nam
   * The build-host tool guard refuses a TU whose IMMEDIATE parent directory is named `tool` (and
     is not the build dir itself), or any `lempar.c`. The old `(^|/)tool/` refused every file of a
     checkout that merely sat under some `tool/` directory.
-  * `ar t` has its exit code checked (a failing `ar` looked like an empty archive); the source
-    walk is sorted (it was `find | head -1`, directory-listing order); a second candidate source
-    for one archive member, and a path the basename dedup removes, are both REPORTED.
+  * An archive's members are READ from its bytes (`archive_members`), GNU and BSD alike, never
+    listed by the host's `ar t` -- whose spelling of a name is a property of the host (✔MEASURED
+    2026-09-23: the Mac's `ar` keeps the GNU `/` terminator, and every member then left the TU
+    set in silence). A file that is not an archive is refused, never read as an empty one (as a
+    failing `ar` once was); a member that is not a `.o` is NOTED, never skipped in silence; the
+    source walk is sorted (it was `find | head -1`, directory-listing order); a second candidate
+    source for one archive member, and a path the basename dedup removes, are both REPORTED.
   * Exit 2 means the ARGUMENTS are malformed -- an unknown flag, a missing value, a switch that
     is not 0/1, a floor that is not a non-negative integer (the bash twin's `[ -lt ]` on a
     non-number switched the floor OFF), an unknown mode or scope -- and all of it is refused
     BEFORE make runs. Exit 1 means well-formed arguments the world refuses: a missing build dir,
-    search root or archive, a make or ar that cannot start or fails, an unwritable output, a
+    search root or archive, a make that cannot start, an archive that cannot be read or is
+    not one, an unwritable output, a
     missing link line (`NoLinkLine`; the bash twin returned 2 with NO message), the guards and
     the floors. Every "is required" message names the REAL flag (5 of the 6 did not).
   * The manifest's recipe transform and stack reserve are REQUIRED: the PowerShell twin omitted
@@ -345,23 +350,103 @@ def span_tus(span, build_dir, ledger):
     return out
 
 
-def archive_members(path, *, ar_argv=None):
-    """The member names `ar t` lists for `path`, in archive order. `ar`'s exit code is CHECKED:
-    an ar that cannot start or that fails is a NAMED refusal, never an empty archive."""
-    argv = list(ar_argv) if ar_argv else ["ar"]
-    argv += ["t", path]
+# ── WHAT IS IN AN ARCHIVE: READ FROM ITS BYTES, NEVER ASKED OF THE HOST'S `ar` ─────────────
+#
+# ✔MEASURED 2026-09-23: the Mac's `ar` (cctools, BSD; `/usr/bin/ar`, no version flag) lists a
+# GNU-format archive's members WITH the GNU name terminator -- `b'a.o/\n'` where GNU ar prints
+# `b'a.o\n'` -- so every member failed the `.o` test below and the archive's translation units
+# left the TU set IN SILENCE. What `ar t` prints is a property of the HOST; the members are a
+# property of the FILE. So the file is read, by one rule on every host, and whatever this reader
+# does not understand is a NAMED refusal:
+#   * `!<arch>\n`, then per member a 60-byte header -- name 16, date 12, uid 6, gid 6, mode 8,
+#     size 10, the magic "`\n" -- and `size` bytes of data padded to an even offset;
+#   * a GNU/SysV/COFF name ends with `/`, and `/N` is the name at offset N of the long-name
+#     table (the member `//`, each entry ending `/\n` -- or NUL, as some writers end it);
+#   * a BSD (Apple) name is space-padded with no terminator, and `#1/N` puts the name in the
+#     FIRST N bytes of the data (NUL-padded, and counted in the size);
+#   * the archive's OWN bookkeeping is never a member: the symbol indexes `/`, `/SYM64/`,
+#     `__.SYMDEF`, `__.SYMDEF SORTED`, `__.SYMDEF_64`, `__.SYMDEF_64 SORTED`, and the table `//`;
+#   * the pad byte after the LAST member may be missing (it carries nothing); any other short
+#     read is a truncation;
+#   * refused by name: a file that is not an archive (it is NOT an empty one), a THIN archive
+#     (its members live outside it), a truncated header or body, a header without its magic, a
+#     size that is not a number, a long name the archive does not hold, an empty name.
+AR_MAGIC = b"!<arch>\n"
+AR_THIN_MAGIC = b"!<thin>\n"
+AR_HEADER_SIZE = 60
+AR_HEADER_MAGIC = b"`\n"
+AR_INDEX_MEMBERS = frozenset(["/", "/SYM64/", "__.SYMDEF", "__.SYMDEF SORTED", "__.SYMDEF_64",
+                              "__.SYMDEF_64 SORTED"])
+AR_LONG_NAMES = "//"
+
+
+def archive_members(path):
+    """The member names of the archive `path`, in archive order, read from its bytes (see the
+    note above); the archive's symbol indexes and long-name table are not members. Anything the
+    reader cannot account for is a `RecipeRefused` naming the byte it stopped at."""
     try:
-        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
+        with open(path, "rb") as fh:
+            data = fh.read()
     except OSError as exc:
-        _refuse("could not run '%s' to list the members of the archive '%s': %s"
-                % (argv[0], path, exc))
-    if p.returncode != 0:
-        why = C.last_lines(p.stderr.decode("utf-8", "replace"), 6) or "(it printed nothing)"
-        _refuse("'%s' exited %d listing the members of the archive '%s' %s a failing ar is NOT "
-                "an empty archive:" % (" ".join(argv), p.returncode, path, DASH),
-                *("    " + line for line in why.split("\n")))
-    return [line.strip() for line in _lines(p.stdout.decode("utf-8", "replace")) if line.strip()]
+        _refuse("could not read the archive '%s': %s" % (path, exc))
+    if data.startswith(AR_THIN_MAGIC):
+        _refuse("'%s' is a THIN archive: its members live outside it, so none of them can be read "
+                "from it." % path)
+    if not data.startswith(AR_MAGIC):
+        _refuse("'%s' is not an ar archive: it does not begin with '!<arch>\\n' %s a file that is "
+                "not an archive is NOT an empty archive." % (path, DASH))
+    names, table, pos = [], None, len(AR_MAGIC)
+    while pos < len(data):
+        head = data[pos:pos + AR_HEADER_SIZE]
+        if len(head) < AR_HEADER_SIZE:
+            _refuse("'%s' is TRUNCATED: the member header at byte %d holds %d byte(s), not %d."
+                    % (path, pos, len(head), AR_HEADER_SIZE))
+        if head[58:60] != AR_HEADER_MAGIC:
+            _refuse("'%s' is malformed: the member header at byte %d does not end with the header "
+                    "magic '`\\n' (it ends %r)." % (path, pos, head[58:60]))
+        field = head[0:16].decode("latin-1").rstrip(" ")
+        size_text = head[48:58].decode("latin-1").strip()
+        if not size_text.isdigit():
+            _refuse("'%s' is malformed: the member header at byte %d gives the size %r, which is "
+                    "not a number." % (path, pos, size_text))
+        size, start = int(size_text), pos + AR_HEADER_SIZE
+        if start + size > len(data):
+            _refuse("'%s' is TRUNCATED: the member at byte %d claims %d byte(s), and the file ends "
+                    "%d byte(s) after its header." % (path, pos, size, len(data) - start))
+        body = data[start:start + size]
+        at, pos = pos, start + size + (size & 1)
+        if field == AR_LONG_NAMES:
+            table = body
+            continue
+        if field.startswith("#1/"):
+            count = field[3:]
+            if not count.isdigit() or int(count) > size:
+                _refuse("'%s' is malformed: the member header at byte %d names '%s', but its name "
+                        "does not fit in its %d byte(s)." % (path, at, field, size))
+            name = body[:int(count)].split(b"\0", 1)[0].decode("utf-8", "replace")
+        elif field.startswith("/") and field not in AR_INDEX_MEMBERS:
+            offset = field[1:]
+            if not offset.isdigit():
+                _refuse("'%s' holds a member at byte %d named '%s': neither a long-name "
+                        "reference ('/N') nor an index this reader knows." % (path, at, field))
+            if table is None or int(offset) >= len(table):
+                _refuse("'%s' names the long name at offset %s (member at byte %d), but %s."
+                        % (path, offset, at, "it has no long-name table ('//') before it"
+                           if table is None else "its long-name table holds only %d byte(s)"
+                           % len(table)))
+            entry = table[int(offset):].split(b"\n", 1)[0].split(b"\0", 1)[0]
+            name = entry[:-1] if entry.endswith(b"/") else entry
+            name = name.decode("utf-8", "replace")
+        elif field.endswith("/") and field not in AR_INDEX_MEMBERS:
+            name = field[:-1]
+        else:
+            name = field
+        if name in AR_INDEX_MEMBERS:
+            continue
+        if not name:
+            _refuse("'%s' holds a member with an EMPTY name at byte %d." % (path, at))
+        names.append(name)
+    return names
 
 
 def _in_tsrc(path):
@@ -385,7 +470,7 @@ def _source_index(roots, names):
     return found
 
 
-def archive_tus(archive, filter_names, roots, ledger, *, ar_argv=None):
+def archive_tus(archive, filter_names, roots, ledger):
     """The `.c` each `.o` member of `archive` was compiled from, searched under `roots`.
 
     DSS cannot consume a gcc `.a`, so the core sources compiled into it are recovered as SOURCE.
@@ -394,12 +479,21 @@ def archive_tus(archive, filter_names, roots, ledger, *, ar_argv=None):
     staging tree duplicates generated sources under `bld/tsrc/`; `bld/` is the copy make
     compiles); a member found only under `tsrc/` is still recovered. A member found NOWHERE is an
     `archive-member` drop -- a LOST TU; a member whose preferred tier (outside `tsrc/`, else
-    inside it) holds more than one candidate is an `archive-candidate` note naming every one.
+    inside it) holds more than one candidate is an `archive-candidate` note naming every one; a
+    member that is not a `.o` is an `archive-not-object` note (✔MEASURED 2026-09-23: a name this
+    test did not recognise used to leave in SILENCE, and on the Mac that was every member).
     An absent archive yields nothing (a caller that NAMED one is refused by `emit_recipe` before
     this runs)."""
     if not archive or not os.path.isfile(archive):
         return []
-    members = [m for m in archive_members(archive, ar_argv=ar_argv) if m.endswith(".o")]
+    members = []
+    for m in archive_members(archive):
+        if m.endswith(".o"):
+            members.append(m)
+        else:
+            ledger.note("archive-not-object",
+                        "archive '%s' has member '%s', which is not a '.o' %s no source is "
+                        "recovered for it" % (archive, m, DASH))
     wanted = set(filter_names) if filter_names else None
     picked = [m for m in members if wanted is None or m in wanted]
     index = _source_index(roots, sorted({m[:-2] + ".c" for m in picked}))
@@ -490,7 +584,7 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
                 out_defines=None, out_includes=None, make_vars=(), search_roots=(),
                 prereq_mode="whole-blob", always_make=False, token_scope="all", archive=None,
                 archive_from_span=False, min_tus=0, min_defines=0, make_argv=("make",),
-                ar_argv=None, err=None):
+                err=None):
     """Derive ONE make target's recipe into three files, in the bash twin's order:
       1. `[*make_argv, "-n", ("-B"), "-o", "Makefile", make_target, *make_vars]` with cwd =
          the build dir (`-o Makefile`: a dry run never REMAKES the makefile), stdout
@@ -593,7 +687,7 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
                 if not os.path.isdir(root):
                     _refuse("recipe derivation for '%s': the search root '%s' is not a "
                             "directory." % (target, root))
-            collected += archive_tus(archive, filter_names, search_roots, ledger, ar_argv=ar_argv)
+            collected += archive_tus(archive, filter_names, search_roots, ledger)
         tus = dedup_by_basename(collected, ledger=ledger)
     finally:
         try:
@@ -753,14 +847,17 @@ def reported_artifact(log_path, spec):
 # ── BUILD ONE ARTIFACT ───────────────────────────────────────────────────────────────
 
 def generate_manifest(gen, output, artifact_name, spec, tus_file, includes_file, defines_file,
-                      recipe_transform, stack_reserve, lib_argv=(), python=sys.executable):
+                      recipe_transform, stack_reserve, lib_argv=(), python=sys.executable,
+                      tu_preludes=""):
     """The ONE manifest generator both artefacts share, called in ONE argument order:
     `<python> <gen> --tus T --includes I --defines D --target S <lib argv...> --artifact-name N
-    --recipe-transform X --stack-reserve R --output O`. The library argv passes through as
-    TOKENS, never re-spelled (a resolved library may carry `<path>=<import-name>`, a vocabulary
-    this module must not know). The transform and the reserve are REQUIRED: an omitted flag takes
-    the generator's pe64 defaults. -> `Result(rc, out, err)`, the generator's output merged into
-    `out`; `manifest_error(result)` states a failure."""
+    --recipe-transform X --stack-reserve R [--tu-preludes P] --output O`. The library argv passes
+    through as TOKENS, never re-spelled (a resolved library may carry `<path>=<import-name>`, a
+    vocabulary this module must not know). The transform and the reserve are REQUIRED: an omitted
+    flag takes the generator's pe64 defaults. `tu_preludes` is the path of a leg's declared
+    `build.tuPreludes` written as JSON, or "" for a leg that declares none -- whose argv is then
+    the one it always had, byte for byte. -> `Result(rc, out, err)`, the generator's output
+    merged into `out`; `manifest_error(result)` states a failure."""
     named = (("gen", gen), ("output", output), ("artifact_name", artifact_name),
              ("tus_file", tus_file), ("includes_file", includes_file),
              ("defines_file", defines_file), ("python", python))
@@ -781,7 +878,10 @@ def generate_manifest(gen, output, artifact_name, spec, tus_file, includes_file,
             "--defines", defines_file, "--target", spec]
     argv += [str(a) for a in lib_argv]
     argv += ["--artifact-name", artifact_name, "--recipe-transform", str(recipe_transform),
-             "--stack-reserve", str(stack_reserve), "--output", output]
+             "--stack-reserve", str(stack_reserve)]
+    if tu_preludes:
+        argv += ["--tu-preludes", tu_preludes]
+    argv += ["--output", output]
     return C.capture(argv, env_=C.child_env(python=True), merge=True)
 
 
@@ -807,7 +907,7 @@ def compile_time_suffix(text):
     return "  (%s)" % hits[-1] if hits else ""
 
 
-def build_artifact(dss, manifest, config, outdir, log, spec):
+def build_artifact(dss, manifest, config, outdir, log, spec, diagnostic_cap=None):
     """Run `<dss> --project M --config=C --output D --time`, its stdout and stderr written to
     `log` as RAW BYTES, and judge the LOG -> BuildResult(code, ok, path, err_count, first_errors,
     time_suffix, error, log, exit_code):
@@ -818,7 +918,10 @@ def build_artifact(dss, manifest, config, outdir, log, spec):
     path or an argv prefix. The compiler's exit code is RECORDED, never judged: dsscp exits 0 on
     some fatal errors, so the log is the verdict. Whether the file is EXECUTABLE is not asked
     here -- that is not target-agnostic (a static library leg's artefact is not); the caller
-    that intends to exec it asks."""
+    that intends to exec it asks.
+    `diagnostic_cap` (a positive count, or None for dsscp's own defaults) is passed as BOTH
+    `--max-diagnostics` and `--max-per-code`: a caller that reads the log per TU (the round-close
+    recompile) must see the whole stream, because dsscp's caps are run-wide and hide whole TUs."""
     prefix = [dss] if isinstance(dss, str) else list(dss or ())
     if not prefix or not all(isinstance(a, str) and a for a in prefix):
         _usage("build_artifact: the compiler (a path or an argv prefix) is required")
@@ -826,8 +929,14 @@ def build_artifact(dss, manifest, config, outdir, log, spec):
                         ("log", log)):
         if not value:
             _usage("build_artifact: %s is required" % name)
+    if diagnostic_cap is not None and (isinstance(diagnostic_cap, bool)
+                                       or not isinstance(diagnostic_cap, int) or diagnostic_cap < 1):
+        _usage("build_artifact: diagnostic_cap must be a positive count or None (got %r)"
+               % (diagnostic_cap,))
     _marker(spec)
     argv = prefix + ["--project", manifest, "--config=%s" % config, "--output", outdir, "--time"]
+    if diagnostic_cap is not None:
+        argv += ["--max-diagnostics", str(diagnostic_cap), "--max-per-code", str(diagnostic_cap)]
     try:
         fh = open(log, "wb")
     except OSError as exc:
@@ -978,7 +1087,7 @@ def main(argv=None):
 # generator is a Python script run by this interpreter; the REAL `make` and `ar` run where they
 # exist (a named SKIP, counted, where they do not).
 
-EXPECTED_ARMS = 134        # 41 sh + 23 ps + 70 new
+EXPECTED_ARMS = 141        # 41 sh + 23 ps + 77 new
 
 _SKIP = object()
 
@@ -1006,20 +1115,6 @@ if say:
         sys.stdout.buffer.write(fh.read())
     sys.stdout.flush()
 sys.exit(code)
-'''
-
-_FAKE_AR = r'''import sys
-a = sys.argv[1:]
-members, code = [], 0
-while a and a[0] in ("--members", "--exit"):
-    k, v, a = a[0], a[1], a[2:]
-    if k == "--members": members = [m for m in v.split(",") if m]
-    else: code = int(v)
-if code:
-    sys.stderr.write("fake ar: cannot read the archive %s\n" % (a[-1] if a else "?"))
-    sys.exit(code)
-for m in members:
-    print(m)
 '''
 
 _ECHO_GEN = r'''import json, sys
@@ -1060,16 +1155,72 @@ def _raised(fn, exc_type):
     return None
 
 
-def _write_gnu_ar(path, members):
-    """A GNU-format archive written byte by byte (`!<arch>\\n`, then per member a 60-byte header
-    -- name/ 16, mtime 12, uid 6, gid 6, mode 8, size 10, the magic `\\x60\\n` -- and the data,
-    padded to an even offset), so no fixture depends on the host `ar` to EXIST."""
+def _ar_member(field, body):
+    """One archive member, byte by byte: the 60-byte header -- name 16, mtime 12, uid 6, gid 6,
+    mode 8, size 10, the magic `\\x60\\n` -- then the body, padded to an even offset."""
+    hdr = (field.ljust(16) + "0".ljust(12) + "0".ljust(6) + "0".ljust(6) + "644".ljust(8)
+           + str(len(body)).ljust(10)).encode("ascii") + b"\x60\n"
+    return [hdr, body] + ([b"\n"] if len(body) % 2 else [])
+
+
+def _write_gnu_ar(path, members, index=False):
+    """A GNU-format archive, so no fixture depends on the host `ar` to exist: `name/` in the
+    header; a name too long for it (16 bytes with its `/`) in the `//` table as `/N`; and, with
+    `index`, a `/` symbol index first (an empty one: four zero bytes)."""
+    table, fields = b"", []
+    for name, _data in members:
+        if len(name) + 1 > 16:
+            fields.append("/%d" % len(table))
+            table += (name + "/\n").encode("utf-8")
+        else:
+            fields.append(name + "/")
     out = [b"!<arch>\n"]
-    for name, data in members:
-        hdr = ((name + "/").ljust(16) + "0".ljust(12) + "0".ljust(6) + "0".ljust(6)
-               + "644".ljust(8) + str(len(data)).ljust(10)).encode("ascii") + b"\x60\n"
-        out += [hdr, data] + ([b"\n"] if len(data) % 2 else [])
+    if index:
+        out += _ar_member("/", b"\0\0\0\0")
+    if table:
+        out += _ar_member("//", table)
+    for field, (_name, data) in zip(fields, members):
+        out += _ar_member(field, data)
     _put(path, b"".join(out))
+
+
+def _write_bsd_ar(path, members, index=False):
+    """A BSD-format archive, the layout Apple's tools write: a space-padded name with NO
+    terminator; a name longer than 16 bytes, or holding a space, as `#1/N` with the name in the
+    first N bytes of the body, NUL-padded to a multiple of four; and, with `index`, a
+    `__.SYMDEF SORTED` symbol index first (a name with a space, so it too goes through `#1/`)."""
+    def member(name, data):
+        if len(name) > 16 or " " in name:
+            raw = name.encode("utf-8")
+            raw += b"\0" * (-len(raw) % 4)
+            return _ar_member("#1/%d" % len(raw), raw + data)
+        return _ar_member(name, data)
+    out = [b"!<arch>\n"]
+    if index:
+        out += member("__.SYMDEF SORTED", b"\0" * 8)
+    for name, data in members:
+        out += member(name, data)
+    _put(path, b"".join(out))
+
+
+def _ar_headers(path, limit=24):
+    """The raw header fields of an archive -- the byte, the name field, the size field -- read
+    WITHOUT interpretation, for a failing arm to print what the file actually holds."""
+    try:
+        data = _get(path)
+    except OSError as exc:
+        return ["  (cannot read %s: %s)" % (path, exc)]
+    lines = ["  %d byte(s); begins %r" % (len(data), data[:8])]
+    pos = 8
+    while pos + 60 <= len(data) and len(lines) <= limit:
+        head = data[pos:pos + 60]
+        size_text = head[48:58].decode("latin-1").strip()
+        lines.append("  byte %d: name field %r, size field %r, magic %r"
+                     % (pos, head[0:16].decode("latin-1"), size_text, head[58:60]))
+        if not size_text.isdigit():
+            break
+        pos += 60 + int(size_text) + (int(size_text) & 1)
+    return lines
 
 
 class _Arms:
@@ -1128,6 +1279,75 @@ def _eq(want, got):
     return want == got, "want: %r\ngot : %r" % (want, got)
 
 
+# ── WHAT A FAILING ARM PRINTS ABOUT THE HOST TOOL IT JUDGED ───────────────────────────────
+# ✔MEASURED 2026-09-23: four arms failed on macOS and the gate received their NAMES only, from a
+# host reachable through a runner alone. So an arm that judges a host tool's output prints, when
+# it fails, what it EXPECTED and what it OBSERVED, then the tool itself: the argv, the exit code,
+# the raw stdout and stderr (repr, so a trailing `/`, a CR or a space shows), which program
+# answered to that name, and what that program says its version is.
+
+def _verdict(ok, want, got, facts=lambda: ()):
+    """(ok, detail) for `_Arms.arm`. The detail -- EXPECTED, OBSERVED, then `facts()` -- is built
+    for a FAILED arm only, so a passing run never pays for probing the host tool."""
+    if ok:
+        return True, ""
+    return False, "\n".join(["EXPECTED: %s" % want, "OBSERVED: %s" % got] + list(facts()))
+
+
+def _raw(data, cap=1500):
+    s = repr(data)
+    return s if len(s) <= cap else s[:cap] + "...<%d more chars>" % (len(s) - cap)
+
+
+def _run_facts(argv, timeout=60):
+    """One run of `argv`, as report lines: the argv, its exit code, its raw stdout and stderr."""
+    lines = ["  argv   : %r" % (list(argv),)]
+    try:
+        p = subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return lines + ["  could not run it: %s: %s" % (type(exc).__name__, exc)]
+    return lines + ["  exit   : %d" % p.returncode, "  stdout : %s" % _raw(p.stdout),
+                    "  stderr : %s" % _raw(p.stderr)]
+
+
+def _tool_facts(name):
+    """Which program answers to `name` here, and what it says its version is. A GNU tool answers
+    `--version`; a BSD one may refuse it and answer `-V`, or answer neither. Both probes print
+    their exit code and first lines, so no probe's silence passes for an answer."""
+    path = name if os.path.isabs(name) else shutil.which(name)
+    if not path:
+        return ["  tool   : %r is not on this PATH" % name]
+    real = os.path.realpath(path)
+    lines = ["  tool   : %s%s" % (path, "" if real == path else " -> %s" % real)]
+    for flag in ("--version", "-V"):
+        probe = "`%s %s`" % (os.path.basename(path), flag)
+        try:
+            p = subprocess.run([path, flag], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            lines.append("  version: %s could not run: %s" % (probe, exc))
+            continue
+        said = p.stdout.decode("utf-8", "replace").strip().splitlines()[:3]
+        lines.append("  version: %s exit %d: %s" % (probe, p.returncode,
+                                                    " | ".join(said) or "(nothing)"))
+    return lines
+
+
+def _archive_facts(archive):
+    """What an archive arm judged: the reader's answer (or its refusal), the file's raw headers,
+    and -- as a witness only, never as the answer -- what this host's `ar t` says of it."""
+    try:
+        said = "archive_members -> %r" % (archive_members(archive),)
+    except RecipeRefused as exc:
+        said = "archive_members REFUSED: %s" % exc
+    lines = ["the archive %s:" % archive, "  " + said] + _ar_headers(archive)
+    if shutil.which("ar"):
+        lines += ["the host's `ar t`, for comparison:"] + _run_facts(["ar", "t", archive])
+        lines += _tool_facts("ar")
+    return lines
+
+
 class _Fx:
     """The self-test's scratch world: one temp root, the fake programs, fresh subdirectories."""
 
@@ -1136,7 +1356,6 @@ class _Fx:
         self.n = 0
         self.sink = io.StringIO()
         self.fake_tool = self._script("fake_tool.py", _FAKE_TOOL)
-        self.fake_ar = self._script("fake_ar.py", _FAKE_AR)
         self.echo_gen = self._script("echo_gen.py", _ECHO_GEN)
         self.fail_gen = self._script("fail_gen.py", _FAIL_GEN)
         self.host_ar = shutil.which("ar")
@@ -1172,9 +1391,11 @@ class _Fx:
         """A compiler argv prefix whose run prints `say` (str or raw bytes)."""
         return self._tool(say, exit_code, stderr, record)
 
-    def ar(self, members, exit_code=0):
-        return (sys.executable, self.fake_ar, "--members", ",".join(members),
-                "--exit", str(exit_code))
+    def archive(self, tag, members):
+        """A fresh GNU-format archive holding `members` (names; each body is the name's bytes)."""
+        path = os.path.join(self.fresh(tag), "lib.a")
+        _write_gnu_ar(path, [(m, m.encode("utf-8")) for m in members])
+        return path
 
     def emit(self, build_dir, recipe, **kw):
         """emit_recipe over a fake make printing `recipe`; outputs in a fresh directory."""
@@ -1602,19 +1823,33 @@ def _st_drops(A, fx):
                              if k == "recipe-token" and "missing-tu.c" in m)))
     libx = os.path.join(t, "libx.a")
     _write_gnu_ar(libx, [("lost.o", b"\x00obj")])
-    ar_argv = None if fx.host_ar else fx.ar(["lost.o"])
-    via = "via the host ar" if fx.host_ar else "via a stand-in ar: none on this PATH"
 
     def lost_reported():
         led2 = DropLedger(stream=fx.sink)
-        archive_tus(libx, None, [t], led2, ar_argv=ar_argv)
-        return (sum(1 for k, m in led2.entries if k == "archive-member" and "lost.o" in m) == 1,
-                "%s; entries %r" % (via, led2.entries))
+        try:
+            archive_tus(libx, None, [t], led2)
+            refused = None
+        except RecipeRefused as exc:
+            refused = exc
+        hits = [m for k, m in led2.entries if k == "archive-member" and "lost.o" in m]
+        got = ("RecipeRefused: %s" % refused if refused is not None else
+               "%d such entr%s; every entry %r" % (len(hits), "y" if len(hits) == 1 else "ies",
+                                                  led2.entries))
+        return _verdict(refused is None and len(hits) == 1,
+                        "exactly 1 'archive-member' entry naming lost.o", got,
+                        lambda: _archive_facts(libx))
     A.arm("sh39 archive_tus REPORTS a member whose .c is nowhere", lost_reported)
-    A.arm("sh40 emit_recipe FAILS on a LOST archive member",
-          lambda: ("LOST 1 archive member(s)" in str(_raised(
-              lambda: fx.emit(t, "cc -o prog real.c\n", archive=libx, search_roots=[t],
-                              ar_argv=ar_argv), RecipeRefused)), via))
+
+    def lost_refused():
+        try:
+            res, _o = fx.emit(t, "cc -o prog real.c\n", archive=libx, search_roots=[t])
+            got = "no refusal: emit_recipe RETURNED %r, drops %r" % (res.summary, res.drops)
+        except RecipeRefused as exc:
+            got = "RecipeRefused: %s" % exc
+        return _verdict("LOST 1 archive member(s)" in got and got.startswith("RecipeRefused"),
+                        "RecipeRefused naming 'LOST 1 archive member(s)'", got,
+                        lambda: _archive_facts(libx))
+    A.arm("sh40 emit_recipe FAILS on a LOST archive member", lost_refused)
     A.arm("sh41 emit_recipe FAILS on an --archive that does not exist",
           lambda: "which does NOT exist" in str(_raised(
               lambda: fx.emit(t, "cc -o prog real.c\n", archive=os.path.join(t, "no-such.a"),
@@ -1642,38 +1877,139 @@ def _st_archive(A, fx):
     lib = os.path.join(t, "lib3.a")
     _write_gnu_ar(lib, [("a.o", b"A"), ("b.o", b"BB"), ("c.o", b"C"), ("notes.txt", b"n")])
 
-    def host_lists():
-        if not fx.host_ar:
-            return _SKIP, "no ar on this PATH"
-        return _eq(["a.o", "b.o", "c.o", "notes.txt"], archive_members(lib))
-    A.arm("n28 archive_members lists a Python-written archive's members EXACTLY (the host ar)",
-          host_lists)
+    def lists(path, want):
+        try:
+            got = archive_members(path)
+        except RecipeRefused as exc:
+            got = "RecipeRefused: %s" % exc
+        return _verdict(got == want, repr(want), repr(got), lambda: _archive_facts(path))
+    A.arm("n28 archive_members lists a GNU-format archive's members EXACTLY, read from its bytes "
+          "on EVERY host (the GNU `/` name terminator is not part of a name)",
+          lambda: lists(lib, ["a.o", "b.o", "c.o", "notes.txt"]))
+    bsd = os.path.join(t, "bsd.a")
+    bsd_names = ["a.o", "fts3_tokenizer1.o", "with space.o", "sqlite3session.o"]
+    _write_bsd_ar(bsd, [(n, n.encode("utf-8")) for n in bsd_names], index=True)
+    A.arm("n68 ...a BSD-format archive (Apple's layout: `#1/N` for a name past 16 bytes or with a "
+          "space, a 16-byte name bare, a `__.SYMDEF SORTED` index) EXACTLY, the index left out",
+          lambda: lists(bsd, bsd_names))
+    gnu_long = os.path.join(t, "gnu-long.a")
+    long_names = ["fts3_tokenizer1.o", "abcdefghijklm.o", "sqlite3session.o", "a.o"]
+    _write_gnu_ar(gnu_long, [(n, n.encode("utf-8")) for n in long_names], index=True)
+    A.arm("n69 ...a GNU-format archive with a `/` index and a `//` long-name table (and a 15-byte "
+          "name that just fits its header) EXACTLY, neither table a member",
+          lambda: lists(gnu_long, long_names))
 
-    def host_fails():
-        if not fx.host_ar:
-            return _SKIP, "no ar on this PATH"
-        junk = os.path.join(t, "junk.a")
-        _put(junk, "this is not an archive\n")
-        exc = _raised(lambda: archive_members(junk), RecipeRefused)
-        return exc is not None and "NOT an empty archive" in str(exc), "raised %r" % exc
-    A.arm("n29 the host ar FAILING on a non-archive is a named refusal, not an empty archive",
-          host_fails)
-    A.arm("n30 a failing ar (a stand-in exiting 3) is a named refusal carrying its stderr",
-          lambda: ("exited 3" in str(_raised(lambda: archive_members(lib, ar_argv=fx.ar([], 3)),
-                                             RecipeRefused))))
-    A.arm("n31 an ar that cannot START is a named refusal",
-          lambda: "could not run" in str(_raised(
-              lambda: archive_members(lib, ar_argv=[os.path.join(t, "no-such-ar")]),
-              RecipeRefused)))
+    # ✔MEASURED 2026-09-23 on the Mac: `/usr/bin/ar rc` of files that are NOT Mach-O exits 0,
+    # warns "ranlib: warning: archive member 'a.o' not a mach-o file", and writes an archive that
+    # holds ONLY its `__.SYMDEF SORTED` index -- the members are gone. So the witness is built the
+    # way production builds one: real objects, from this host's own compiler, archived by its ar.
+    def host_written():
+        cc = shutil.which("gcc")
+        if not fx.host_ar or not cc:
+            return _SKIP, "no %s on this PATH" % ("ar" if not fx.host_ar else "gcc")
+        d = fx.fresh("host-ar")
+        names = ["a.o", "fts3_tokenizer1.o", "sqlite3session.o"]
+        steps = []
+        for n in names:
+            _put(os.path.join(d, n[:-2] + ".c"), "int %s_x = 1;\n" % n[:-2])
+            steps.append([cc, "-c", n[:-2] + ".c", "-o", n])
+        steps.append([fx.host_ar, "rc", "host.a"] + names)
+        path = os.path.join(d, "host.a")
+        ran = []
+        for argv in steps:
+            try:
+                p = subprocess.run(argv, cwd=d, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=120)
+                ran.append((argv, p.returncode, "exit %d, stdout %s, stderr %s"
+                            % (p.returncode, _raw(p.stdout), _raw(p.stderr))))
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                ran.append((argv, None, "could not run it: %s" % exc))
+            if ran[-1][1] != 0:
+                break
+
+        def facts():
+            return (["in %s:" % d] + ["  %r: %s" % (argv, said) for argv, _rc, said in ran]
+                    + _tool_facts(cc) + _tool_facts(fx.host_ar)
+                    + (_archive_facts(path) if os.path.isfile(path) else []))
+        if ran[-1][1] != 0 or len(ran) != len(steps):
+            return _verdict(False, "this host's gcc and ar build the archive (every step exit 0)",
+                            ran[-1][2], facts)
+        try:
+            got = archive_members(path)
+        except RecipeRefused as exc:
+            got = "RecipeRefused: %s" % exc
+        return _verdict(got == names, repr(names), repr(got), facts)
+    A.arm("n70 ...an archive THIS HOST'S ar WROTE from objects THIS HOST'S gcc compiled (its own "
+          "layout, its own symbol index, long names included) EXACTLY, the index left out -- the one "
+          "arm that needs host tools, as a WITNESS of the host's format", host_written)
+
+    def refused_with(path, needle):
+        exc = _raised(lambda: archive_members(path), RecipeRefused)
+        return _verdict(exc is not None and needle in str(exc), "RecipeRefused naming %r" % needle,
+                        "no refusal: %r" % (archive_members(path),) if exc is None else
+                        "RecipeRefused: %s" % exc, lambda: _ar_headers(path))
+    junk = os.path.join(t, "junk.a")
+    _put(junk, "this is not an archive\n")
+    A.arm("n29 a file that is not an archive is a named refusal, NOT an empty archive",
+          lambda: refused_with(junk, "NOT an empty archive"))
+    cut_head = os.path.join(t, "cut-head.a")
+    _put(cut_head, _get(lib)[:-3])
+    cut_body = os.path.join(t, "cut-body.a")
+    _put(cut_body, b"".join([b"!<arch>\n"] + _ar_member("long.o/", b"0123456789"))[:-5])
+
+    def truncated():
+        a, b = refused_with(cut_head, "is TRUNCATED"), refused_with(cut_body, "is TRUNCATED")
+        return (a[0] and b[0], "cut inside the last HEADER: %s\ncut inside the last BODY: %s"
+                % (a[1] or "refused as TRUNCATED", b[1] or "refused as TRUNCATED"))
+    A.arm("n30 a TRUNCATED archive -- cut inside a member's header, or inside its body -- is a "
+          "named refusal (control: the whole archive reads, n28)", truncated)
+    A.arm("n31 an archive that cannot be READ (a directory) is a named refusal",
+          lambda: refused_with(t, "could not read the archive"))
+    thin = os.path.join(t, "thin.a")
+    _put(thin, b"!<thin>\n")
+    A.arm("n71 a THIN archive (its members live outside it) is a named refusal",
+          lambda: refused_with(thin, "is a THIN archive"))
+
+    def malformed():
+        whole = _get(lib)
+        cases = []
+        no_magic = os.path.join(t, "no-magic.a")
+        _put(no_magic, whole[:8 + 58] + b"XX" + whole[8 + 60:])
+        cases.append((no_magic, "does not end with the header magic"))
+        bad_size = os.path.join(t, "bad-size.a")
+        _put(bad_size, whole[:8 + 48] + b"12x".ljust(10) + whole[8 + 58:])
+        cases.append((bad_size, "which is not a number"))
+        no_table = os.path.join(t, "no-table.a")
+        _put(no_table, b"!<arch>\n" + b"".join(_ar_member("/0", b"AB")))
+        cases.append((no_table, "it has no long-name table ('//') before it"))
+        got = []
+        for path, needle in cases:
+            exc = _raised(lambda: archive_members(path), RecipeRefused)
+            got.append((os.path.basename(path), exc is not None and needle in str(exc),
+                        str(exc) if exc is not None else "NOT refused"))
+        return _verdict(all(ok for _n, ok, _e in got), "each case refused, naming its cause",
+                        "; ".join("%s: %s" % (n, "ok" if ok else e) for n, ok, e in got))
+    A.arm("n72 a header without its magic, a size that is not a number, and a long name with no "
+          "table are each a named refusal", malformed)
     root = os.path.join(t, "root")
     for name in ("a.c", "b.c", "c.c"):
         _put(os.path.join(root, "src", name), "")
-    stand_in = fx.ar(["a.o", "b.o", "c.o", "notes.txt"])
+
+    def not_object_noted():
+        led = DropLedger(stream=fx.sink)
+        got = archive_tus(lib, None, [root], led)
+        notes = [m for k, m in led.entries if k == "archive-not-object"]
+        want = [os.path.join(root, "src", n) for n in ("a.c", "b.c", "c.c")]
+        return _verdict(len(notes) == 1 and "'notes.txt'" in notes[0] and got == want,
+                        "1 'archive-not-object' entry naming notes.txt, and a.c b.c c.c recovered",
+                        "entries %r; recovered %r" % (led.entries, got))
+    A.arm("n73 a member that is not a .o is NOTED, never skipped in silence (control: the three "
+          ".o members are recovered)", not_object_noted)
 
     def span_filter():
         led = DropLedger(stream=fx.sink)
-        got = archive_tus(lib, ["a.o", "c.o"], [root], led, ar_argv=stand_in)
-        every = archive_tus(lib, None, [root], led, ar_argv=stand_in)
+        got = archive_tus(lib, ["a.o", "c.o"], [root], led)
+        every = archive_tus(lib, None, [root], led)
         return (got == [os.path.join(root, "src", "a.c"), os.path.join(root, "src", "c.c")]
                 and len(every) == 3, "filtered %r / every %r" % (got, every))
     A.arm("n32 the archive-from-span filter recovers ONLY the named members (control: no filter "
@@ -1685,7 +2021,7 @@ def _st_archive(A, fx):
         _put(os.path.join(r2, "bld", "x.c"), "")
         _put(os.path.join(r2, "bld", "tsrc", "y.c"), "")
         led = DropLedger(stream=fx.sink)
-        got = archive_tus(lib, None, [r2], led, ar_argv=fx.ar(["x.o", "y.o"]))
+        got = archive_tus(fx.archive("xy", ["x.o", "y.o"]), None, [r2], led)
         return (got == [os.path.join(r2, "bld", "x.c"), os.path.join(r2, "bld", "tsrc", "y.c")]
                 and not led.entries, "got %r, entries %r" % (got, led.entries))
     A.arm("n33 a source outside tsrc/ is PREFERRED, and a tsrc-only member is still recovered",
@@ -1697,8 +2033,8 @@ def _st_archive(A, fx):
         _put(os.path.join(r3, "src", "z.c"), "")
         _put(os.path.join(r3, "src", "solo.c"), "")
         led = DropLedger(stream=fx.sink)
-        got = archive_tus(lib, None, [os.path.join(r3, "src"), os.path.join(r3, "ext")], led,
-                          ar_argv=fx.ar(["z.o", "solo.o"]))
+        got = archive_tus(fx.archive("z-solo", ["z.o", "solo.o"]), None,
+                          [os.path.join(r3, "src"), os.path.join(r3, "ext")], led)
         notes = [m for k, m in led.entries if k == "archive-candidate"]
         return (got == [os.path.join(r3, "src", "z.c"), os.path.join(r3, "src", "solo.c")]
                 and len(notes) == 1 and "z.o" in notes[0], "got %r, notes %r" % (got, notes))
@@ -1710,20 +2046,20 @@ def _st_archive(A, fx):
         _put(os.path.join(r4, "b", "w.c"), "")
         _put(os.path.join(r4, "a", "w.c"), "")
         led = DropLedger(stream=fx.sink)
-        got = archive_tus(lib, None, [r4], led, ar_argv=fx.ar(["w.o"]))
+        got = archive_tus(fx.archive("w", ["w.o"]), None, [r4], led)
         return _eq([os.path.join(r4, "a", "w.c")], got)
     A.arm("n35 within a root the walk is SORTED ('a/' before 'b/', whatever the creation order)",
           sorted_walk)
     A.arm("n36 a search root that does not exist is a named refusal",
           lambda: "is not a directory" in str(_raised(
               lambda: archive_tus(lib, None, [os.path.join(t, "no-root")],
-                                  DropLedger(stream=fx.sink), ar_argv=stand_in), RecipeRefused)))
+                                  DropLedger(stream=fx.sink)), RecipeRefused)))
 
     def through_emit():
         bld = fx.fresh("emit-span")
         _put(os.path.join(bld, "shell.c"), "")
         res, _o = fx.emit(bld, "cc -o prog shell.c a.o c.o\n", archive=lib,
-                          archive_from_span=True, search_roots=[root], ar_argv=stand_in)
+                          archive_from_span=True, search_roots=[root])
         want = sorted([os.path.join(bld, "shell.c"), os.path.join(root, "src", "a.c"),
                        os.path.join(root, "src", "c.c")])
         return _eq(want, res.tus)
@@ -1737,14 +2073,36 @@ def _st_make(A, fx):
 
     def argv_and_cwd():
         rec = os.path.join(fx.fresh("rec"), "argv.json")
-        fx.emit(t, "cc -o prog one.c\n", always_make=True, make_vars=["A=1", "OPTIONS=-DX"],
-                make_argv=fx.make("cc -o prog one.c\n", record=rec))
+        make_argv = fx.make("cc -o prog one.c\n", record=rec)
+        res, _o = fx.emit(t, "cc -o prog one.c\n", always_make=True,
+                          make_vars=["A=1", "OPTIONS=-DX"], make_argv=make_argv)
         with open(rec, encoding="utf-8") as fh:
             got = json.load(fh)
-        return (got["argv"] == ["-n", "-B", "-o", "Makefile", "prog", "A=1", "OPTIONS=-DX"]
-                and _norm(got["cwd"]) == _norm(t), "got %r" % got)
+        want_argv = ["-n", "-B", "-o", "Makefile", "prog", "A=1", "OPTIONS=-DX"]
+        # The cwd is judged by IDENTITY, never by spelling: the recorder reports the kernel's
+        # spelling (`os.getcwd()`), and ✔MEASURED 2026-09-23 on the Mac that is `/private/var/...`
+        # for the `/var/...` the driver passed -- one directory, two names.
+        try:
+            same = os.path.samefile(got["cwd"], t)
+        except OSError as exc:
+            same = "cannot tell: %s" % exc
+
+        def facts():
+            return (["the stand-in make the driver ran (exit 0 by construction):",
+                     "  argv   : %r" % (list(make_argv) + list(got["argv"]),),
+                     "  output : %s (the recipe file: stdout and stderr, merged)"
+                     % _raw(_get(res.recipe_file)),
+                     "the cwd as each side spells it, and as realpath resolves it:",
+                     "  expected %r -> %r" % (t, os.path.realpath(t)),
+                     "  observed %r -> %r" % (got["cwd"], os.path.realpath(got["cwd"])),
+                     "  the same directory (os.path.samefile): %s" % same,
+                     "context, the host make (this arm drives a stand-in; n47 drives the host's):"]
+                    + _tool_facts("make"))
+        return _verdict(got["argv"] == want_argv and same is True,
+                        "argv %r, cwd the directory %r" % (want_argv, t),
+                        "argv %r, cwd %r" % (got["argv"], got["cwd"]), facts)
     A.arm("n38 make runs as [*make_argv, -n, -B, -o Makefile, target, *vars] with cwd = the "
-          "build dir",
+          "build dir (the same DIRECTORY, however the host spells it)",
           argv_and_cwd)
 
     def no_b():
@@ -1985,9 +2343,9 @@ def _st_suffix(A, fx):
 def _st_manifest(A, fx):
     spec = "x86_64:elf64-x86_64-linux-exec"
 
-    def gen(transform, reserve, script=None, lib_argv=()):
+    def gen(transform, reserve, script=None, lib_argv=(), tu_preludes=""):
         return generate_manifest(script or fx.echo_gen, "o", "sqlite3", spec, "t", "i", "d",
-                                 transform, reserve, lib_argv=lib_argv)
+                                 transform, reserve, lib_argv=lib_argv, tu_preludes=tu_preludes)
     g = gen("none", 0)
     A.arm("ps22 manifest argv carries --recipe-transform none and --stack-reserve 0 EXPLICITLY "
           "(was: omits --recipe-transform when $null)",
@@ -2010,6 +2368,16 @@ def _st_manifest(A, fx):
         return _eq(want, json.loads(r.out))
     A.arm("n66 the generator argv is the bash twin's ORDER, the library argv passed through as "
           "tokens", order)
+
+    def preludes():
+        r = gen("none", 0, tu_preludes="p.json")
+        got = json.loads(r.out)
+        want = ["--tus", "t", "--includes", "i", "--defines", "d", "--target", spec,
+                "--artifact-name", "sqlite3", "--recipe-transform", "none", "--stack-reserve", "0",
+                "--tu-preludes", "p.json", "--output", "o"]
+        return _eq(want, got)
+    A.arm("n74 a leg's declared TU preludes reach the generator as --tu-preludes, just before "
+          "--output (a leg without them: n66's argv, byte for byte)", preludes)
 
     def failing():
         r = gen("none", 0, script=fx.fail_gen)

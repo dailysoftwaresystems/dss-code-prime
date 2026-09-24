@@ -362,6 +362,18 @@ enum class LirOperandKind : std::uint8_t {
     // LirSpillSlot.v) + `spillSlotClass` (the value's LirRegClass, so callconv
     // picks the class-correct load).
     SpillSlotRef = 10,
+    // ★★★ A MEMORY DISPLACEMENT THAT IS A SYMBOL'S ADDRESS PLUS A CONSTANT —
+    // the `msg+4` of `msg+4(%rip)` (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    // It stands where a `MemOffset` stands, and is one: a variant guard's
+    // `memoffset` position accepts either, so every memory form a target already
+    // declares takes a symbolic displacement with no variant of its own. The
+    // encoder writes a RELOCATION into the displacement field instead of a
+    // number. `litIndex` names the module literal pool's `LirSymbolAddress`
+    // entry, because the symbol and the addend together do not fit 8 bytes.
+    // ⚠ NO VALUE AXIS READS IT: its value is a link-time address, so a variant
+    // bounding its displacement (`immMin`/`immMax`) never matches it — the
+    // strict reading, since no bound can be proven of a value nobody knows yet.
+    MemSymbolOffset = 11,
 };
 
 // One slot in the operand pool. The tag picks the active field.
@@ -409,7 +421,7 @@ struct LirOperand {
         std::uint32_t symbolV;    // 4 — kind == SymbolRef → SymbolId.v
         std::uint32_t scale;      // 4 — kind == MemBase (1/2/4/8)
         std::int32_t  offset;     // 4 — kind == MemOffset
-        std::uint32_t litIndex;   // 4 — kind == LiteralIndex (into LirLiteralPool)
+        std::uint32_t litIndex;   // 4 — kind == LiteralIndex / MemSymbolOffset (into LirLiteralPool)
         std::uint32_t byValueAggBytes; // 4 — kind == ByValueStackAgg (aggregate byte size)
         std::uint32_t spillSlotV; // 4 — kind == SpillSlotRef (LirSpillSlot.v)
     };
@@ -474,6 +486,14 @@ struct LirOperand {
     [[nodiscard]] static constexpr LirOperand makeLiteralIndex(std::uint32_t idx) noexcept {
         LirOperand o{};
         o.kind     = LirOperandKind::LiteralIndex;
+        o.litIndex = idx;
+        return o;
+    }
+    // A symbolic memory displacement: `idx` names the module literal pool's
+    // `LirSymbolAddress` entry. See `LirOperandKind::MemSymbolOffset`.
+    [[nodiscard]] static constexpr LirOperand makeMemSymbolOffset(std::uint32_t idx) noexcept {
+        LirOperand o{};
+        o.kind     = LirOperandKind::MemSymbolOffset;
         o.litIndex = idx;
         return o;
     }

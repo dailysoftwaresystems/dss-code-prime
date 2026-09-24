@@ -346,7 +346,16 @@ variantAcceptsRegisterProfile(TargetSchema const&          target,
         // reason — the SP-reading `rn` field takes any non-31 register.
         if (op.reg.isPhysical != 0) {
             auto const ordinal = static_cast<std::uint16_t>(op.reg.id);
-            if (!target.registerFitsFieldRole(ordinal, w.regRole)) return false;
+            // ★ THE PROGRAM COUNTER FITS A MEMORY-BASE FIELD ITS TARGET LISTS
+            // (`pcRelativeMemoryBase`, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER)
+            // and no other: its role is no field's default, so the role test
+            // alone refuses it everywhere, and this is the one exception —
+            // asked of the SAME predicate the encoder asks before it writes the
+            // PC-relative form.
+            if (!target.registerFitsFieldRole(ordinal, w.regRole)
+                && !target.isPcRelativeMemoryBase(ordinal, w.slotKind)) {
+                return false;
+            }
             if (!sawRequiredRole
                 && target.registerEncodingRole(ordinal) == v.requiresRegRole) {
                 sawRequiredRole = true;

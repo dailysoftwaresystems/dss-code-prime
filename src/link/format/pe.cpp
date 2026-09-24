@@ -9,6 +9,7 @@
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/object_symbol_names.hpp"
+#include "link/format/relocation_addend.hpp"
 #include "link/format/string_table.hpp"
 // The ONE scanner that answers "which relocation row patches an unwind table's
 // code-pointer field" — shared with `dwarf_cfi.hpp`'s FDE pointer
@@ -1265,6 +1266,11 @@ encode(AssembledModule const&    module,
         // carries its bytes directly, because no producer ever handed them
         // over as an `AssembledData`.
         std::optional<std::size_t> fnIndex;
+        // A weak function's body as this section SERIALIZES it — a copy of
+        // `module.functions[fnIndex].bytes`, because a relocation's addend is
+        // written into its field in place (`relocationAddends: inPlace`) and
+        // the assembled module is not this writer's to mutate.
+        std::vector<std::uint8_t> fnBytes;
         std::optional<link::format::ExecDataSectionLayout> dataLayout;
         std::optional<std::vector<std::uint8_t>> rawBytes;
         // D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO: a COMDAT that exists to
@@ -1303,6 +1309,7 @@ encode(AssembledModule const&    module,
         rec.spanSize =
             static_cast<std::uint64_t>(module.functions[fi].bytes.size());
         rec.fnIndex = fi;
+        rec.fnBytes = module.functions[fi].bytes;
         comdats.push_back(std::move(rec));
     }
     // A weak DATA item's COMDAT is laid out by the SAME shared substrate the
@@ -2332,6 +2339,29 @@ encode(AssembledModule const&    module,
     // the section, and its VirtualAddress column is an offset WITHIN that
     // section. `funcTextStart[fi]` is already 0 for such a function, so the
     // arithmetic is shared; only the destination table differs.
+    // ★ THE ADDEND IS WRITTEN INTO THE PATCHED FIELD (the format declares
+    // `relocationAddends: inPlace`) by the ONE owner of that rule — the same
+    // helper the COFF reader reads it back through. ✔MEASURED 2026-09-23: the
+    // references put the addend there (mingw gas writes `0c 00 00 00` for
+    // `movl $5, counter(%rip)` against `.data` at offset 16; clang `fc ff ff
+    // ff` against the symbol), and this writer used to REFUSE any non-zero one.
+    auto const addendStorage = fmt.relocationAddendStorage();
+    // Required only where a relocation will be written: an object with none
+    // has no addend to place, and a format with no relocations states no
+    // storage (the loader requires the key exactly when `relocations` is
+    // non-empty).
+    bool const writesARelocation =
+        std::ranges::any_of(module.functions,
+                            [](auto const& f) { return !f.relocations.empty(); })
+        || std::ranges::any_of(module.dataItems,
+                               [](auto const& d) { return !d.relocations.empty(); });
+    if (!addendStorage.has_value() && writesARelocation) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::format("PE writer: object format '{}' declares no "
+                         "'relocationAddends', so where a relocation's addend "
+                         "belongs is unstated", fmt.name()));
+        return {};
+    }
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
@@ -2343,18 +2373,37 @@ encode(AssembledModule const&    module,
             inComdat ? comdats[cit->second].relocs : textRelocs;
         std::uint32_t& relocCountOut =
             inComdat ? comdats[cit->second].relocCount : textRelocCount;
+        std::vector<std::uint8_t>& sectionBytes =
+            inComdat ? comdats[cit->second].fnBytes : text;
         for (auto const& rel : fn.relocations) {
-            if (rel.addend != 0) {
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (tri == nullptr) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                     std::string{"PE writer: relocation in symbol #"}
-                         + std::to_string(fn.symbol.v)
-                         + " carries addend=" + std::to_string(rel.addend)
-                         + " but PE/COFF stores addends in the section's "
-                           "patch bytes, not on IMAGE_RELOCATION. The "
-                           "assembler must pre-stamp the addend into "
-                           ".text (or emit addend=0 for the call/jmp "
-                           "rel32 case where link.exe applies the RIP "
-                           "bias intrinsically).");
+                     std::format("PE writer: relocation kind {} has no "
+                                 "TargetRelocationInfo on target schema '{}'",
+                                 rel.kind.v, targetSchema.name()));
+                return {};
+            }
+            std::size_t const fieldAt =
+                static_cast<std::size_t>(fnStart + rel.offset);
+            std::size_t const fieldWidth =
+                link::format::relocationFieldHoldsAnAddend(*tri)
+                    ? tri->widthBytes : 0u;
+            if (fieldAt + fieldWidth > sectionBytes.size()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("PE writer: relocation at offset {} in symbol "
+                                 "#{} overruns its section", fieldAt,
+                                 fn.symbol.v));
+                return {};
+            }
+            auto const placed = link::format::placeRelocationAddend(
+                *addendStorage, *tri, rel.addend,
+                std::span<std::uint8_t>{sectionBytes.data() + fieldAt,
+                                        fieldWidth});
+            if (!placed.has_value()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("PE writer: relocation in symbol #{}: {}",
+                                 fn.symbol.v, placed.error()));
                 return {};
             }
             auto const* fmtReloc = fmt.relocationByKind(rel.kind);
@@ -2469,13 +2518,19 @@ encode(AssembledModule const&    module,
                     return false;
                 }
                 // In-place addend (see the block comment above): the slot
-                // bytes carry A; link.exe computes S + slot. addend 0
-                // rewrites the producer's zero slot — a no-op by
-                // construction.
-                auto const a = static_cast<std::uint64_t>(rel.addend);
-                for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
-                    layout.bytes[static_cast<std::size_t>(patchOff) + b] =
-                        static_cast<std::uint8_t>((a >> (8u * b)) & 0xFFu);
+                // bytes carry A; link.exe computes S + slot — placed by the
+                // ONE owner of where a format keeps an addend.
+                auto const placed = link::format::placeRelocationAddend(
+                    *addendStorage, *tri, rel.addend,
+                    std::span<std::uint8_t>{
+                        layout.bytes.data() + static_cast<std::size_t>(patchOff),
+                        tri->widthBytes});
+                if (!placed.has_value()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data item "
+                                     "SymbolId={{ {} }}: {}", sectionLabel,
+                                     di.symbol.v, placed.error()));
+                    return false;
                 }
                 appendU32LE(relocsOut,
                             static_cast<std::uint32_t>(patchOff));
@@ -3003,8 +3058,7 @@ encode(AssembledModule const&    module,
     for (auto const& rec : comdats) {
         if (rec.zeroFill) continue;   // reserves span, stores no bytes
         if (rec.fnIndex.has_value()) {
-            auto const& fnBytes = module.functions[*rec.fnIndex].bytes;
-            bytes.insert(bytes.end(), fnBytes.begin(), fnBytes.end());
+            bytes.insert(bytes.end(), rec.fnBytes.begin(), rec.fnBytes.end());
         } else {
             bytes.insert(bytes.end(), rec.dataLayout->bytes.begin(),
                          rec.dataLayout->bytes.end());

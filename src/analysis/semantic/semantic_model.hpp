@@ -602,10 +602,11 @@ struct DSS_EXPORT SymbolRecord {
     // pointer-arg relaxation on whether a callee came from a shipped FFI descriptor.
     // That made the admission a property of the DECLARATION'S PROVENANCE rather than
     // of the TYPES, and a real header (Darwin `tcl.h`, where `Tcl_WideInt` is `long`)
-    // hits the identical shape and was still refused. The gate is now "is this a
-    // DIRECT call", threaded as a parameter at the one call site that knows, so no
-    // per-symbol field is needed. If you find yourself re-adding a provenance flag to
-    // widen or narrow a TYPE rule, that is the same mistake — narrow the PREDICATE.
+    // hits the identical shape and was still refused. Since P68 round 9 no callee
+    // property gates it at all: the conversion is one instance of a class the
+    // language admits with a diagnostic at every site, decided by the types. If you
+    // find yourself re-adding a provenance flag to widen or narrow a TYPE rule, that
+    // is the same mistake — narrow the PREDICATE.
     // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
     // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
     // declaration's specifier prefix carries the language's
@@ -764,6 +765,14 @@ struct DSS_EXPORT SymbolRecord {
     // string literal's pool entry). Meaningful only when
     // `isPredefinedFunctionName` is set; empty otherwise.
     std::string     predefinedFunctionNameText;
+    // P68 round 9 (lane `cs`): TRUE for the FILE-SCOPE twin of a predefined
+    // function-name symbol — bound once per spelling in the language's builtin
+    // scope, so it is what a use OUTSIDE every function body resolves to (a
+    // function definition's own symbol shadows it inside the body). Its text is
+    // empty: gcc 13.3.0 and clang 18.1.3 both accept such a use with a warning and
+    // agree it names "" (sizeof 1); every use reports
+    // S_PredefinedIdentifierOutsideFunction. Default false.
+    bool            predefinedFunctionNameAtFileScope = false;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern
@@ -1016,7 +1025,6 @@ public:
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
-                  UnitAttribute<bool>                    intPointeeCompatNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -1049,7 +1057,6 @@ public:
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
-          intPointeeCompatNodes_(std::move(intPointeeCompatNodes)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
@@ -1156,21 +1163,6 @@ public:
     // structural literal `0`, which the coerce arm admits directly).
     [[nodiscard]] bool isNullPointerConstant(NodeId id) const {
         return nullPointerConstantNodes_.has(id);
-    }
-
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: true iff `id` is a call-ARG source
-    // node the analyzer admitted via the shipped-FFI-descriptor integer-pointee
-    // pointer relaxation (a real C integer pointer — `long long*` etc. — passed to
-    // a descriptor `ptr<i64>`-style param whose pointee is same-REPRESENTATION but
-    // distinct-IDENTITY). The CST→HIR `coerce()` reads this to realize the Ptr→Ptr
-    // bitcast that retypes the arg to the param type (admit⟺realize parity, the
-    // `isNullPointerConstant` precedent). False for every other node — the mark is
-    // set ONLY when the relaxation was WHAT admitted the arg (strict-fail-then-relax-
-    // succeed), so a strictly-compatible arg is never marked. Callers MUST guard
-    // `id.valid()` before calling (the UnitAttribute routes by arenaTag; an untagged
-    // InvalidNode is ambiguous in a multi-tree CU).
-    [[nodiscard]] bool isIntPointeeCompat(NodeId id) const {
-        return intPointeeCompatNodes_.has(id);
     }
 
     // The full attributes — convenient for tooling / forEach iteration.
@@ -1306,12 +1298,6 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: call-arg source nodes the analyzer
-    // admitted via the shipped-descriptor integer-pointee pointer relaxation. The
-    // CST→HIR lowerer reads `isIntPointeeCompat` to materialize the Ptr→Ptr
-    // bitcast retyping the arg to the param type. TREE-KEYED UnitAttribute for the
-    // same cross-tree-aliasing reason as `nullPointerConstantNodes_`.
-    UnitAttribute<bool>                                   intPointeeCompatNodes_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.

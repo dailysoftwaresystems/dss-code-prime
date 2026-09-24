@@ -125,6 +125,7 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 
 # ── output encoding ─────────────────────────────────────────────────────────

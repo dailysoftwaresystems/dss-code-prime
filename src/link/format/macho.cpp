@@ -11,6 +11,7 @@
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_indirect_symbols.hpp"
 #include "link/format/macho_symtab_bands.hpp"
+#include "link/format/relocation_addend.hpp"
 #include "core/types/config_key_vocabulary.hpp"
 #include "core/types/enum_name_table.hpp"
 #include "link/format/macho_codesign.hpp"
@@ -2070,11 +2071,31 @@ encode(AssembledModule const&    module,
     // |(pcrel<<24); the walker ORs in (1<<27) for r_extern + the
     // 24-bit symbol index.
     //
-    // Same discipline as PE: Mach-O's `relocation_info` has no
-    // addend column (per `<mach-o/reloc.h>`); addends live in the
-    // section's patch bytes. ELF Rela is the outlier with its
-    // explicit `r_addend`. Fail loud on non-zero addend so an
-    // ELF-shaped input cannot silently drop the addend here.
+    // Mach-O's `relocation_info` has no addend column (per
+    // `<mach-o/reloc.h>`): the format declares `relocationAddends: inPlace`,
+    // and the addend is written into the patched field by the ONE owner of
+    // that rule (`link/format/relocation_addend.hpp`) — a plain byte field
+    // takes it (x86_64 SIGNED: ✔MEASURED 2026-09-23, clang 18.1.3 writes
+    // `fc ff ff ff` for `movl $5, counter(%rip)`), and an arm64 instruction
+    // field cannot, so a non-zero addend there is still refused, now by the
+    // helper and naming the relocation.
+    auto const addendStorage = fmt.relocationAddendStorage();
+    // Required only where a relocation will be written: an object with none
+    // has no addend to place, and a format with no relocations states no
+    // storage (the loader requires the key exactly when `relocations` is
+    // non-empty).
+    bool const writesARelocation =
+        std::ranges::any_of(module.functions,
+                            [](auto const& f) { return !f.relocations.empty(); })
+        || std::ranges::any_of(module.dataItems,
+                               [](auto const& d) { return !d.relocations.empty(); });
+    if (!addendStorage.has_value() && writesARelocation) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::format("Mach-O writer: object format '{}' declares no "
+                         "'relocationAddends', so where a relocation's addend "
+                         "belongs is unstated", fmt.name()));
+        return {};
+    }
 
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
@@ -2082,13 +2103,33 @@ encode(AssembledModule const&    module,
         auto const& fn = module.functions[fi];
         std::uint64_t const fnStart = funcTextStart[fi];
         for (auto const& rel : fn.relocations) {
-            if (rel.addend != 0) {
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (tri == nullptr) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-                     std::string{"Mach-O writer: relocation in symbol #"}
-                         + std::to_string(fn.symbol.v)
-                         + " carries addend=" + std::to_string(rel.addend)
-                         + " but Mach-O stores addends in the section's "
-                           "patch bytes, not on relocation_info");
+                     std::format("Mach-O writer: relocation kind {} has no "
+                                 "TargetRelocationInfo on target schema '{}'",
+                                 rel.kind.v, targetSchema.name()));
+                return {};
+            }
+            std::size_t const fieldAt =
+                static_cast<std::size_t>(fnStart + rel.offset);
+            std::size_t const fieldWidth =
+                link::format::relocationFieldHoldsAnAddend(*tri)
+                    ? tri->widthBytes : 0u;
+            if (fieldAt + fieldWidth > textBody.size()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("Mach-O writer: relocation at text offset {} "
+                                 "in symbol #{} overruns __text", fieldAt,
+                                 fn.symbol.v));
+                return {};
+            }
+            auto const placed = link::format::placeRelocationAddend(
+                *addendStorage, *tri, rel.addend,
+                std::span<std::uint8_t>{textBody.data() + fieldAt, fieldWidth});
+            if (!placed.has_value()) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("Mach-O writer: relocation in symbol #{}: {}",
+                                 fn.symbol.v, placed.error()));
                 return {};
             }
             // The `nullptr` / missing-symbol branches mirror ELF's
@@ -2125,8 +2166,12 @@ encode(AssembledModule const&    module,
             // nativeId; OR in r_extern (bit 27) + r_symbolnum
             // (low 24 bits). All Mach-O relocs in cycle scope are
             // extern (point at a symbol), so r_extern = 1.
+            // ★ THE TYPE BY THE BYTES AFTER THE FIELD (X86_64_RELOC_SIGNED vs
+            // SIGNED_1/_2/_4) is the format row's declaration, read for the
+            // count the walker recorded — never re-derived here.
             std::uint32_t const rInfo =
-                fmtReloc->nativeId | (1u << 27) | (symIdx & 0x00FFFFFFu);
+                fmtReloc->nativeIdFor(rel.bytesAfterField) | (1u << 27)
+                | (symIdx & 0x00FFFFFFu);
             appendU32LE(textRelocs, rAddress);
             appendU32LE(textRelocs, rInfo);
             ++textRelocCount;
@@ -2237,13 +2282,19 @@ encode(AssembledModule const&    module,
                     return false;
                 }
                 // In-place addend (see the block comment above): the slot
-                // bytes carry A; ld64 computes S + A. addend 0 rewrites the
-                // producer's zero slot — a no-op by construction.
-                std::uint64_t const a =
-                    static_cast<std::uint64_t>(rel.addend);
-                for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
-                    layout.bytes[static_cast<std::size_t>(patchOff) + b] =
-                        static_cast<std::uint8_t>((a >> (8u * b)) & 0xFFu);
+                // bytes carry A; ld64 computes S + A — placed by the ONE owner
+                // of where a format keeps an addend.
+                auto const placed = link::format::placeRelocationAddend(
+                    *addendStorage, *tri, rel.addend,
+                    std::span<std::uint8_t>{
+                        layout.bytes.data() + static_cast<std::size_t>(patchOff),
+                        tri->widthBytes});
+                if (!placed.has_value()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("macho::encode (MH_OBJECT): {} data item "
+                                     "SymbolId={{ {} }}: {}", sectionLabel,
+                                     di.symbol.v, placed.error()));
+                    return false;
                 }
                 appendU32LE(relocsOut,
                             static_cast<std::uint32_t>(patchOff));

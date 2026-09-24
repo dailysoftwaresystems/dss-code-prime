@@ -1,0 +1,42 @@
+{
+  "$comment": "★★★ AN ELF OR PE/COFF INPUT SECTION IS ONE UNIT OF PLACEMENT (P68 round 9, D-LK-INPUT-SECTION-SPLIT-INTO-FREELY-PLACED-ATOMS). The archive is built by the REFERENCE compilers from `static int t[4] = {1, 2, 3, 4}; static int x = 1; static int y = 2; static volatile int w = 3; void dss_unit_set(void) { w = 11; y = 5; x = 7; t[1] = 9; } int dss_unit_get(void) { return x + y + t[1] + w + 10; }` (7 + 5 + 9 + 11 + 10 = 42). Every store has an imm32 AFTER its displacement, and gas reduces each one to `.data` + offset with those 4 bytes folded into the addend. `w` sits at offset 0, so its store names offset -4, before every object; `y = 5` names the last 4 bytes of `w`. Both are right only while the section keeps its layout. ✔MEASURED 2026-09-23 on the same shapes at the round-9 base: the ELF link ran to 33 (the merge moved `y` and `x` apart from `w`, and the stores landed in padding) or was refused at offset -4; the COFF link was refused (mingw gas reduces EVERY same-file reference to the section symbol, and the reader left that symbol as the target). gcc's own link of the ELF archive runs to 42. Pins that compute each store's address from the reader's module are in `tests/link/test_input_section_units.cpp`. The `release` arm pins that optimizing the DSS half does not disturb the foreign one.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ],
+      "prebuiltLibraries": [
+        {
+          "$comment": "mingw-w64 gcc 13.2.0 `-O2 -c` + x86_64-w64-mingw32-ar `rcs`. The witness is the member's own function name: an archive that is not this object cannot pass.",
+          "path": "tests/link/data/libforeign_section_unit_x86_64_pe.a",
+          "containerWitness": "dss_unit_get"
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13 `-O2 -fno-pie -c` + `ar rcs`. The witness is the member's own function name.",
+          "path": "tests/link/data/libforeign_section_unit_x86_64_elf.a",
+          "containerWitness": "dss_unit_get"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

@@ -225,22 +225,13 @@ public:
             return false;
         }
         if (hit.kind == LabelLookup::NotALabel) {
-            // ⚠ REFUSED RATHER THAN IMPORTED, for the reason
-            // `bindPendingDataSymbols` states: `ExternImport::isData` selects
-            // the linker's indirection slot and an address-materializing
-            // instruction says nothing about code-vs-data. Anchored:
-            // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL.
-            sink_.fail(at,
-                 std::format("'{}' takes the address of '{}', which this file "
-                             "defines no label for. An undefined name would "
-                             "have to become an import, and an import states "
-                             "whether it is CODE or DATA — which selects the "
-                             "linker's indirection slot — while an address "
-                             "operand says neither. A CALL is the one reference "
-                             "that answers it, which is why only a call mints "
-                             "one today{}", mnemonic, symbol,
-                             sink_.pairSuffix()));
-            return false;
+            // A name this file does not define is an IMPORT whose kind the
+            // definition decides (`internExtern`,
+            // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). An address
+            // operand states no kind, and neither does gas's relocation for it.
+            out.push_back(LirOperand::makeSymbolRef(
+                internExtern(symbol, ExternReference::Address).v));
+            return true;
         }
         std::size_t const labelIdx = hit.index;
         auto const&       L        = labels_[labelIdx];
@@ -269,6 +260,47 @@ public:
         out.push_back(LirOperand::makeSymbolRef(sym.v));
         out.push_back(LirOperand::makeBlockRef(labels_[labelIdx].block.v));
         return true;
+    }
+
+    // ★★★ THE SYMBOL A SYMBOLIC MEMORY DISPLACEMENT IS RELATIVE TO
+    // (`movq msg(%rip), %rax`, `leaq 1f(%rip), %rcx` —
+    // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    //   * a DATA or FUNCTION label carries its symbol already;
+    //   * an INTERIOR label is a block: its symbol is minted here — making the
+    //     block address-taken, which is exactly what `leaq 1f(%rip), %rcx; jmp
+    //     *%rcx` means — and BOUND to the block after the emit walk, through
+    //     `blockSymbolBindings`, the channel a data slot naming one uses. There
+    //     is no trailing BlockRef on a memory operand for the encoder to bind
+    //     it from, and a label in ANOTHER function binds the same way, because
+    //     the binding names its function rather than a function-local slot.
+    [[nodiscard]] std::optional<SymbolId>
+    resolveDisplacementSymbol(std::string const& symbol, NodeId at,
+                              std::string_view mnemonic) override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind == LabelLookup::UnresolvedLocal) {
+            sink_.fail(at, unresolvedLocalMessage(symbol, mnemonic));
+            return std::nullopt;
+        }
+        if (hit.kind == LabelLookup::NotALabel) {
+            // An import whose kind the definition decides, exactly as for an
+            // address operand (`internExtern`): `movq x(%rip)` states no kind,
+            // and gas's relocation for it states none either.
+            return internExtern(symbol, ExternReference::Address);
+        }
+        std::size_t const labelIdx = hit.index;
+        auto const&       L        = labels_[labelIdx];
+        if (L.isEntry || L.isData) return L.symbol;
+        if (L.functionLabel == kNoLabel) {
+            sink_.fail(at,
+                 std::format("'{}' addresses memory relative to '{}', a label "
+                             "inside no function — its address is part of no "
+                             "function's bytes{}", mnemonic, symbol,
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        SymbolId const sym = symbolForAddressedLabel(labelIdx);
+        displacedLabels_.push_back(DisplacedLabel{labelIdx, at});
+        return sym;
     }
 
     // ⚠ A BRANCH TARGET IS FUNCTION-LOCAL: `LirOperand::makeBlockRef` names a
@@ -346,7 +378,8 @@ public:
         // GUESS. See `AsmTextModule::externImports` for why gas has no extern
         // directive and why `libraryPath` stays empty; the reference gate at
         // the link tier is what judges the reference.
-        return LirOperand::makeSymbolRef(internExtern(symbol).v);
+        return LirOperand::makeSymbolRef(
+            internExtern(symbol, ExternReference::Call).v);
     }
 
     [[nodiscard]] std::vector<LirBlockId>
@@ -550,10 +583,17 @@ private:
         std::size_t    itemIndex  = 0;  // index into `dataItems_`
         std::uint32_t  byteOffset = 0;  // offset of the slot within that item
         std::string    name;            // the label the directive named
+        // The constant written after the name (`.quad table+8`), carried into
+        // the relocation's addend — the slot holds that address, never the
+        // label's.
+        std::int64_t   addend = 0;
         NodeId         at{};            // the operand's span, for the diagnostic
         RelocationKind kind{};          // the target's absolute reloc of this width
         std::string    spelling;        // the directive that wrote it
         std::size_t    labelIndex = kNoLabel;  // resolved in pass 1c
+        // Set instead of `labelIndex` when the name is one this file does not
+        // define: the import row it names (`internExtern`).
+        SymbolId       importSymbol{};
     };
 
     // ★★★ A DOT-PREFIXED NAME IS A LABEL WHENEVER IT CARRIES A LABEL TAIL.
@@ -1196,6 +1236,7 @@ private:
         pending.itemIndex  = itemIdx;
         pending.byteOffset = static_cast<std::uint32_t>(item.bytes.size());
         pending.name       = operand.symbol;
+        pending.addend     = operand.symbolAddend;
         pending.at         = operand.node;
         pending.kind       = *kind;
         pending.spelling   = std::string{spelling};
@@ -2435,18 +2476,40 @@ private:
     // so applying a format's C mangling here would rename what the programmer
     // wrote. That is also why there is no format branch anywhere in this
     // function: there is nothing per-format left to decide.
-    [[nodiscard]] SymbolId internExtern(std::string const& name) {
+    //
+    // ★★ WHAT THE REFERENCE SAYS ABOUT CODE-vs-DATA IS RECORDED, NOT GUESSED
+    // (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). A CALL states
+    // CODE. An address operand or data slot states nothing, which is exactly
+    // what gas records (✔MEASURED 2026-09-23: one R_X86_64_PC32 whether the
+    // name is a datum or a function). Such a row is minted `Pending`: the link
+    // takes the kind from the DEFINITION it finds, as ld does, and refuses the
+    // row BY NAME if none states it (`ExternKindOrigin`). A later call to a
+    // `Pending` name states CODE, and that settles it. An address taken after a
+    // call leaves the call's answer standing.
+    enum class ExternReference : std::uint8_t { Call, Address };
+    [[nodiscard]] SymbolId internExtern(std::string const& name,
+                                        ExternReference reference) {
         if (auto const it = externIndex_.find(name); it != externIndex_.end()) {
-            return externs_[it->second].symbol;
+            ExternImport& known = externs_[it->second];
+            if (reference == ExternReference::Call
+                && known.kindOrigin == ExternKindOrigin::Pending) {
+                known.isData     = false;
+                known.kindOrigin = ExternKindOrigin::Stated;
+            }
+            return known.symbol;
         }
         ExternImport row;
         row.symbol      = mintSymbol();
         row.mangledName = name;
-        // `libraryPath` / `version` stay EMPTY (unbound), `isEagerImport` false
-        // (nothing shipped this row, so the reference gate may drop it when
-        // nothing references it), and `isData` false — this row exists because
-        // a CALL named it, and a call target is code.
-        row.isData = false;
+        // `libraryPath` / `version` stay EMPTY (unbound), and `isEagerImport`
+        // stays false: nothing shipped this row, so the reference gate may drop
+        // it when nothing references it.
+        // `isData` is false: a CALL states code, and for an address it is not
+        // read until a definition decides it (`Pending`).
+        row.isData     = false;
+        row.kindOrigin = reference == ExternReference::Call
+                             ? ExternKindOrigin::Stated
+                             : ExternKindOrigin::Pending;
         externIndex_.emplace(name, externs_.size());
         externs_.push_back(std::move(row));
         return externs_.back().symbol;
@@ -2494,28 +2557,17 @@ private:
                 return false;
             }
             if (hit.kind == LabelLookup::NotALabel) {
-                // ★ A NAME THIS FILE DEFINES NOWHERE IS REFUSED RATHER THAN
-                // IMPORTED. `internExtern` mints a row whose `isData` drives
-                // the linker's GOT-vs-PLT slot choice (`elf.cpp`), and a data
-                // directive states nothing about whether the thing it points
-                // at is code or data — so the import would be a guess with a
-                // wire-format consequence. Anchored:
-                // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL —
-                // ONE row holds both this data-slot site and the address-
-                // operand site so the decision cannot be answered twice
-                // differently; the sibling spelling this comment used to
-                // carry named no row at all.
-                sink_.fail(p.at,
-                     std::format("'.{}' names '{}', which this file defines no "
-                                 "label for. A data slot holding an address "
-                                 "must name something this translation unit "
-                                 "defines: an undefined name would have to be "
-                                 "imported, and an import states whether it is "
-                                 "CODE or DATA (which selects the linker's "
-                                 "indirection slot), while a data directive "
-                                 "says neither{}",
-                                 p.spelling, p.name, sink_.pairSuffix()));
-                return false;
+                // ★ A NAME THIS FILE DEFINES NOWHERE IS AN IMPORT, the same
+                // decision the address-operand site makes: a data directive
+                // states no kind, so the row is minted `Pending` and the
+                // DEFINITION decides it at the link (`internExtern`,
+                // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). It
+                // used to be refused here because an import had to state a kind
+                // at birth; ✔MEASURED 2026-09-23, gas writes `.quad sib_fn` as
+                // R_X86_64_64 with no kind, and gcc runs it to 42 with the
+                // definition in a sibling object.
+                p.importSymbol = internExtern(p.name, ExternReference::Address);
+                continue;
             }
             p.labelIndex = hit.index;
             auto const& L = labels_[p.labelIndex];
@@ -2556,10 +2608,17 @@ private:
     // INTERIOR label, the block-symbol binding the driver needs.
     void emitPendingDataRelocations() {
         for (auto const& p : pendingDataRelocs_) {
+            if (p.importSymbol.valid()) {
+                // A name this file does not define: the slot relocates
+                // against its import row.
+                dataItems_[p.itemIndex].relocations.push_back(
+                    Relocation{p.byteOffset, p.importSymbol, p.kind, p.addend});
+                continue;
+            }
             if (p.labelIndex == kNoLabel) continue;   // pass 1c already failed
             auto const& L = labels_[p.labelIndex];
             dataItems_[p.itemIndex].relocations.push_back(
-                Relocation{p.byteOffset, L.symbol, p.kind, /*addend=*/0});
+                Relocation{p.byteOffset, L.symbol, p.kind, p.addend});
             if (L.isEntry || L.isData) continue;
             // ★★★ M4 — THE ONE CHANNEL THAT DID NOT ALREADY EXIST. An interior
             // label named ONLY from data emits no instruction, so the encoder
@@ -2585,6 +2644,23 @@ private:
                                  "so this slot's relocation would name a symbol "
                                  "with no address{}",
                                  p.spelling, p.name, sink_.pairSuffix()));
+                return;
+            }
+            blockSymbolBindings_.push_back(AsmBlockSymbolBinding{
+                functionOrdinalOf(L.functionLabel), L.block.v, L.symbol});
+        }
+        // The interior labels a symbolic memory displacement named — bound the
+        // same way, for the same reason: the instruction that names them
+        // carries no BlockRef for the encoder to bind them from. The driver
+        // binds a symbol once, however many sites named it.
+        for (auto const& d : displacedLabels_) {
+            auto const& L = labels_[d.labelIndex];
+            if (!L.block.valid()) {
+                sink_.fail(d.at,
+                     std::format("internal: a memory operand is relative to "
+                                 "'{}', which reserved no basic block — the emit "
+                                 "walk never opened the function that contains "
+                                 "it{}", L.name, sink_.pairSuffix()));
                 return;
             }
             blockSymbolBindings_.push_back(AsmBlockSymbolBinding{
@@ -2757,6 +2833,15 @@ private:
     // name. Both empty for a `.s` whose data holds no addresses.
     std::vector<PendingDataReloc>               pendingDataRelocs_;
     std::vector<AsmBlockSymbolBinding>          blockSymbolBindings_;
+    // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER: interior labels a
+    // SYMBOLIC MEMORY DISPLACEMENT named (`leaq 1f(%rip), %rcx`), bound to their
+    // blocks with the data slots' bindings once the emit walk has created every
+    // block.
+    struct DisplacedLabel {
+        std::size_t labelIndex = 0;
+        NodeId      at{};
+    };
+    std::vector<DisplacedLabel>                 displacedLabels_;
     std::optional<DataSectionKind>              scanSection_;
     std::optional<DataSectionKind>              emitSection_;
     std::size_t                                 openDataItem_      = kNoLabel;

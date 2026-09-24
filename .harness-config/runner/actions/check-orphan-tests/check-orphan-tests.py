@@ -89,6 +89,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # A Windows pipe comes up cp1252 and dies printing a glyph; reconfigure BEFORE anything can
 # print (`guard_output_encoding_guard` imports this module in a child to probe exactly

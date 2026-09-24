@@ -3,6 +3,8 @@
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
+#include "link/format/relocation_addend.hpp"
+#include "link/format/section_relative_target.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -280,23 +282,6 @@ struct Interval {
     std::size_t   outIdx = 0;
 };
 
-// Sign-extend the low `width` bytes of `raw` to a signed 64-bit value --
-// the inverse of the writer truncating an `int64` addend to `widthBytes`
-// LE in the patched data slot (macho.cpp's IN-PLACE data-slot addend
-// convention -- see `buildDataRelocTable`'s block comment: Mach-O has no
-// RELA addend column, so a DATA slot carries its own addend and the final
-// value is S + slot). width is 4 or 8 (the
-// non-pcrel Linear kinds a data slot uses -- schema invariant (a)).
-[[nodiscard]] std::int64_t signExtendLE(std::uint64_t raw, std::uint8_t width) noexcept {
-    if (width >= 8u) return static_cast<std::int64_t>(raw);
-    unsigned const bits = static_cast<unsigned>(width) * 8u;
-    std::uint64_t const mask = (static_cast<std::uint64_t>(1) << bits) - 1u;
-    std::uint64_t v = raw & mask;
-    std::uint64_t const signBit = static_cast<std::uint64_t>(1) << (bits - 1u);
-    if ((v & signBit) != 0u) v |= ~mask;  // extend the sign into the high bytes
-    return static_cast<std::int64_t>(v);
-}
-
 } // namespace
 
 std::optional<AssembledModule>
@@ -390,6 +375,27 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // see `kMhSubsectionsViaSymbols` and step (6)'s classification.
     bool const subsectionsViaSymbols =
         (rdU32(bytes, kHdrFlagsOff) & kMhSubsectionsViaSymbols) != 0u;
+    // ...and the SAME flag decides whether this object's sections are units of
+    // placement, by the format's declared rule (`inputSectionPlacement`):
+    // ld64 moves the blocks independently only when the producer declared them
+    // movable. An object that did not declare it has every section laid out as
+    // one block, each atom stamped with where it sits (`InputSectionSlice`).
+    auto const placement = objectFormatSchema.inputSectionPlacement();
+    if (!placement.has_value()) {
+        return fail(DiagnosticCode::F_CorruptedBinary,
+            "macho::readRelocatableObject: Mach-O format '"
+            + std::string{objectFormatSchema.name()}
+            + "' declares no 'inputSectionPlacement', so whether this object's "
+              "sections may be split into independently placed atoms is "
+              "unstated.");
+    }
+    bool const sectionsAreUnits =
+        link::format::inputSectionsAreUnits(*placement, subsectionsViaSymbols);
+    auto sliceOf = [&](std::uint32_t ordinal, std::uint64_t offset)
+        -> std::optional<InputSectionSlice> {
+        if (!sectionsAreUnits) return std::nullopt;
+        return InputSectionSlice{ordinal, offset};
+    };
     if (rangeExceedsBuffer(kMachHeader64Sz, sizeofcmds, bytes.size())) {
         return fail(DiagnosticCode::F_CorruptedBinary,
             "macho::readRelocatableObject: sizeofcmds="
@@ -1106,6 +1112,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 fn.symbol = SymbolId{defs[k].symIdx};
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + static_cast<std::size_t>(len));
+                fn.inputSection = sliceOf(ordinal, off);
                 funcIntervalsBySec[ordinal].push_back(
                     Interval{off, len, mod.functions.size()});
                 mod.functions.push_back(std::move(fn));
@@ -1134,6 +1141,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             di.symbol    = SymbolId{defs[k].symIdx};
             di.section   = *dk;
             di.alignment = alignFromLog2(sec.align);
+            di.inputSection = sliceOf(ordinal, off);
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
             } else {
@@ -1318,36 +1326,48 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + " -- refusing to silently drop it.");
             }
 
-            // Addend. Mach-O has no RELA addend column:
-            //   * a DATA-section reloc's addend lives IN the patched slot bytes
-            //     (widthBytes LE at r_address -- the writer's in-place
-            //     convention); the target-schema addendBias is un-baked so a
-            //     re-emission re-adds it once (0 for the non-pcrel absolute
-            //     kinds a data slot uses -- schema invariant (c)).
-            //   * a __text call/branch reloc carries addend 0 (the writer
-            //     rejects a non-zero __text addend -- an arm64 instruction
-            //     immediate cannot hold one in place).
-            std::int64_t addend = 0;
-            if (patchesData) {
-                std::uint8_t const w = tri->widthBytes;
-                if (w == 0u
-                    || rangeExceedsBuffer(rAddress, w, sec.size)
-                    || rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) {
-                    return fail(DiagnosticCode::F_CorruptedBinary,
-                        "macho::readRelocatableObject: data relocation at "
-                        "section offset " + std::to_string(rAddress) + " in '"
-                        + sec.segName + "," + sec.sectName + "' has a "
-                        + std::to_string(w) + "-byte slot that runs past the "
-                        "section -- cannot read the in-place addend.");
-                }
-                std::uint64_t raw = 0;
-                std::size_t const slot = static_cast<std::size_t>(sec.offset + rAddress);
-                for (std::uint8_t b = 0; b < w; ++b) {
-                    raw |= static_cast<std::uint64_t>(bytes[slot + b]) << (8u * b);
-                }
-                addend = signExtendLE(raw, w)
-                       - static_cast<std::int64_t>(tri->addendBias);
+            // Addend. Mach-O has no RELA addend column: the format declares
+            // `relocationAddends: inPlace`, and the addend is read out of the
+            // patched field by the ONE owner of that rule
+            // (`link/format/relocation_addend.hpp`) — a plain byte field (an
+            // x86_64 SIGNED displacement, a data slot) holds it, and an arm64
+            // instruction field holds instruction bits and carries none.
+            // ⚠ THIS USED TO TAKE EVERY __text ADDEND AS 0 "because the writer
+            // rejects a non-zero __text addend" — DSS's writer's rule, never
+            // the format's: ✔MEASURED 2026-09-23, clang 18.1.3 writes
+            // `fc ff ff ff` into the field of an X86_64_RELOC_SIGNED_4.
+            auto const storage = objectFormatSchema.relocationAddendStorage();
+            if (!storage.has_value()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: Mach-O format '"
+                    + std::string{objectFormatSchema.name()}
+                    + "' declares no 'relocationAddends', so where a "
+                      "relocation's addend lives is unstated.");
             }
+            std::size_t const fieldWidth =
+                link::format::relocationFieldHoldsAnAddend(*tri)
+                    ? tri->widthBytes : 0u;
+            if (rangeExceedsBuffer(rAddress, fieldWidth, sec.size)
+                || rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: relocation at section offset "
+                    + std::to_string(rAddress) + " in '" + sec.segName + ","
+                    + sec.sectName + "' has a " + std::to_string(fieldWidth)
+                    + "-byte field that runs past the section -- cannot read "
+                      "the in-place addend.");
+            }
+            auto const recovered = link::format::recoverRelocationAddend(
+                *storage, *tri, std::nullopt,
+                std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(sec.offset + rAddress),
+                    fieldWidth});
+            if (!recovered.has_value()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "macho::readRelocatableObject: relocation at section offset "
+                    + std::to_string(rAddress) + " in '" + sec.segName + ","
+                    + sec.sectName + "': " + recovered.error());
+            }
+            std::int64_t const addend = *recovered;
 
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(rAddress - iv->start);

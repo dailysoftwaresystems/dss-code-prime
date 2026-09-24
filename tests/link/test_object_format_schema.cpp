@@ -110,6 +110,8 @@ constexpr std::string_view kElfMinimal = R"({
     "kind": "elf"
   },
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+  "relocationAddends": "explicit",
+  "inputSectionPlacement": "unit",
   "relocations": [
     { "name": "R_X86_64_PC32",  "kind": 1, "nativeId": 2 },
     { "name": "R_X86_64_PLT32", "kind": 2, "nativeId": 4 }
@@ -276,6 +278,8 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "got",
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[ {"name":"r","kind":1,"nativeId":1} ]
     })");
     ASSERT_TRUE(ok.has_value());
@@ -296,6 +300,8 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "plt",
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[ {"name":"r","kind":1,"nativeId":1} ]
     })");
     EXPECT_FALSE(bad.has_value())
@@ -321,6 +327,8 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_FOO","kind":1,"nativeId":1},
         {"name":"R_FOO","kind":2,"nativeId":2}
@@ -353,6 +361,8 @@ TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"$comment":"prose is always allowed",
                       "name":"R_OK","kind":1,"nativeId":1,"isCall":true}]
     })");
@@ -370,6 +380,8 @@ TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_TYPO","kind":1,"nativeId":1,"iscall":true}]
     })");
     ASSERT_FALSE(r.has_value())
@@ -395,6 +407,8 @@ TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_BAD","kind":0,"nativeId":1}]
     })");
     ASSERT_FALSE(r.has_value())
@@ -417,6 +431,8 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_A","kind":7,"nativeId":1},
         {"name":"R_B","kind":7,"nativeId":2}
@@ -507,6 +523,8 @@ TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": "oops"
     })");
     ASSERT_FALSE(r.has_value()) << "'relocations' as a non-array must reject";
@@ -800,6 +818,8 @@ TEST(LibrarySynthesis, UnknownVehicleRejected) {
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": [],
       "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
       "librarySynthesis": { "vehicle": "bogus", "role": "cLibrary" }
@@ -827,6 +847,8 @@ TEST(LibrarySynthesis, MissingRoleRejected) {
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": [],
       "$runtimeLibrariesComment": "DELIBERATELY ABSENT. Declaring a row here would add a SECOND error -- the loader also rejects a role-table row NO block names -- and both would trace to this fixture's ONE property (the missing role), so the test would stop pinning a single defect. Absent, the only complaint is the omitted `role`, which is exactly what this test is for.",
       "librarySynthesis": { "vehicle": "pthread" }

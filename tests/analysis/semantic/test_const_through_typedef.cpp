@@ -5,9 +5,10 @@
 // `const` / `restrict` that typedef carries, exactly as the same declaration with
 // the typedef written out would. Neither qualifier is interned (type_interner.hpp),
 // so the TypeId a typedef name resolves to has no trace of them; the claim rides
-// the typedef's OWN row (`typedefDecl`'s `constMarker` / `restrictMarker` in
-// `c.lang.json`), and the semantic tier applies it wherever a head NAMES the
-// typedef (semantic_analyzer.cpp, "A QUALIFIER REACHED THROUGH A TYPEDEF").
+// the typedef's OWN row (`typedefDecl`, which derives `constMarker` /
+// `restrictMarker` from `c.lang.json`'s semantics block since P68 round 9), and
+// the semantic tier applies it wherever a head NAMES the typedef
+// (semantic_analyzer.cpp, "A QUALIFIER REACHED THROUGH A TYPEDEF").
 //
 // ✔REFERENCE VOTES, 2026-09-23, each case one translation unit probed SEPARATELY
 // (`.temp/constdef/` in the lane's tree): gcc 13.3.0 and clang 18.1.3 at
@@ -23,7 +24,9 @@
 // head's typedef name is looked for anywhere but the head's own base position.
 //
 // ── RED-ON-DISABLE (the lane's transcript carries each build and its names) ──
-//   * the row's `constMarker` removed from `typedefDecl` → every refusal here;
+//   * the row's `constMarker` removed from `typedefDecl` → every refusal here
+//     (since P68 round 9 the row DERIVES it from `semantics.constMarker`; the
+//     equivalent mutant skips that derivation for the typedef row);
 //   * the resolver's alias record not written → every refusal here;
 //   * the Pass-1.5 application skipped → the object / deeper-level / fold pins;
 //   * the redeclaration harvest without the typedef → the redeclaration pin;

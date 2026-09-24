@@ -78,6 +78,13 @@ BASE_INC_ROOTS = ("/usr/include", "/usr/local/include", "/opt/homebrew/include")
 BASE_LIB_ROOTS = ("/usr/lib", "/lib", "/usr/local/lib", "/opt/homebrew/lib")
 BASE_CFG_ROOTS = ("/usr/lib", "/usr/lib64", "/usr/local/lib", "/opt/homebrew/lib")
 KEG_FORMULAE = ("zlib", "tcl-tk", "tcl-tk@8")
+# `brew` where a PATH does not name it: Homebrew's own default prefixes (Apple Silicon, then Intel).
+# A NON-LOGIN shell -- how a harness reaches a Mac over ssh -- never sources Homebrew's shellenv, so
+# its PATH has no brew even where Homebrew is installed (✔MEASURED 2026-09-23: that Mac's leg PATH
+# is the system dirs plus emsdk's, while /opt/homebrew/lib/tclConfig.sh is there). Candidates,
+# tried IN ORDER ON EVERY HOST the way `ldconfig_dirs` tries /sbin/ldconfig: a hit is used, a miss
+# costs nothing -- never a decision keyed on the host's name.
+BREW_CANDIDATES = ("brew", "/opt/homebrew/bin/brew", "/usr/local/bin/brew")
 # sqlite resolves a third of its corpus relative to testdir (`$testdir/../ext/<dir>/*.test` under
 # `glob -nocomplain`): a stage whose test dir is not ext's sibling silently runs none of them.
 TESTDIR_SIBLINGS = ("rtree", "fts5/test", "session")
@@ -229,19 +236,21 @@ def _sort_n(field):
     return int(m.group(1)) if m else 0
 
 
+def _tcl_order(entry):
+    """The .sh's `sort -t. -k1,1nr -k2,2nr` key over a "<version> <path>" line: numeric major, then
+    numeric minor, both descending; a tie goes to the code-point-smallest line."""
+    line = "%s %s" % entry
+    parts = line.split(".")
+    return (-_sort_n(parts[0]), -_sort_n(parts[1] if len(parts) > 1 else ""), line)
+
+
 def highest_tcl(inventory):
     """The .sh's `sort -t. -k1,1nr -k2,2nr | sed -n 1p` over "<version> <path>" lines: numeric
     major, then numeric minor, both descending (never `sort -V`, and never a string sort, which
     puts 9.1 above 10.0 and 8.6 above 8.10); a tie goes to the code-point-smallest line."""
     if not inventory:
         return ("", "")
-
-    def key(entry):
-        line = "%s %s" % entry
-        parts = line.split(".")
-        return (-_sort_n(parts[0]), -_sort_n(parts[1] if len(parts) > 1 else ""), line)
-
-    return sorted(inventory, key=key)[0]
+    return sorted(inventory, key=_tcl_order)[0]
 
 
 def select_tcl(inventory, pin, tclsh_ver):
@@ -518,17 +527,20 @@ class PkgInstaller:
     def __call__(self, apt_pkg, brew_pkg=None):
         brew_pkg = brew_pkg or apt_pkg
         manager = "brew" if self.host_os == "darwin" else "apt-get"
-        if not shutil.which(manager, path=self.env.get("PATH") or os.defpath):
+        path = self.env.get("PATH") or os.defpath
+        exe = (resolve_brew(lambda n: shutil.which(n, path=path)) if manager == "brew"
+               else shutil.which(manager, path=path))
+        if not exe:
             if manager == "brew":
-                C.die("Homebrew not found — install from https://brew.sh, then re-run (needed for: %s)."
-                      % brew_pkg)
+                C.die("Homebrew not found — on PATH or at %s — install from https://brew.sh, then re-run "
+                      "(needed for: %s)." % (", ".join(BREW_CANDIDATES[1:]), brew_pkg))
             C.die("apt-get not found — this harness targets Debian/Ubuntu/WSL + macOS\n"
                   "      (host OS identified as: %s). Install manually: %s"
                   % (self.host_os or "UNIDENTIFIED", apt_pkg))
         if manager == "brew":
             self.log.info("installing (brew): %s" % brew_pkg)
-            if C.capture(["brew", "list", brew_pkg], env_=self.env).rc != 0:
-                C.run_checked(["brew", "install", brew_pkg], "brew install %s" % brew_pkg, env_=self.env)
+            if C.capture([exe, "list", brew_pkg], env_=self.env).rc != 0:
+                C.run_checked([exe, "install", brew_pkg], "brew install %s" % brew_pkg, env_=self.env)
             return
         root = hasattr(os, "geteuid") and os.geteuid() == 0
         sudo = [] if root else ["sudo"]
@@ -916,12 +928,22 @@ def _sibling(name, what):
               % (what, name, exc))
 
 
+def resolve_brew(which):
+    """The first of BREW_CANDIDATES that `which` finds, "" when none is there."""
+    for cand in BREW_CANDIDATES:
+        found = which(cand)
+        if found:
+            return found
+    return ""
+
+
 def brew_prefix(ctx, formula):
     """`brew --prefix <f>` -- the WOULD-BE prefix even when the formula is not installed, "" when
     there is no brew (so on Linux every caller degrades to nothing)."""
-    if not ctx.which("brew"):
+    brew = resolve_brew(ctx.which)
+    if not brew:
         return ""
-    return ctx.run(["brew", "--prefix", formula], timeout=120).out.strip()
+    return ctx.run([brew, "--prefix", formula], timeout=120).out.strip()
 
 
 def sdk_prefix(ctx):
@@ -1015,10 +1037,40 @@ def tclsh_bin_for(ctx, want):
     return ""
 
 
+def installed_tclsh(ctx):
+    """-> (interpreter, version, tclConfig.sh) of the NEWEST installed Tcl >= 8.6 in the run's
+    inventory whose OWN interpreter answers its version (`tclsh_bin_for`), or ("", "", "")."""
+    for ver, _cfg in sorted(ctx.inventory, key=_tcl_order):
+        if awk_num(ver) < 8.6:
+            continue
+        sh = tclsh_bin_for(ctx, ver)
+        if sh:
+            return sh, ver, tcl_cfg_for(ctx.inventory, ver)
+    return "", "", ""
+
+
+def choose_tclsh(ctx):
+    """The tclsh an UNPINNED stage runs -> (interpreter, version, how): PATH's `tclsh` when it
+    reports >= 8.6 (`path`); else the newest INSTALLED Tcl >= 8.6 whose own interpreter answers
+    (`installed`) -- ✔MEASURED 2026-09-23 on the Mac a harness reaches: PATH's tclsh is Apple's
+    8.5 while /opt/homebrew/lib/tclConfig.sh declares 9.0, and installing over an installed Tcl
+    was the old answer; else nothing (`none`: the caller installs)."""
+    path_sh = ctx.which("tclsh") or ""
+    ver = tclsh_version(ctx) if path_sh else ""
+    if ver and awk_num(ver) >= 8.6:
+        return path_sh, ver, "path"
+    sh, inst_ver, _cfg = installed_tclsh(ctx)
+    if sh:
+        return sh, inst_ver, "installed"
+    return "", ver, "none"
+
+
 def ensure_tclsh(ctx):
     """R56-R59. PINNED (DSS_TCL_VERSION): EXACTLY that version on PATH, through the shim when the
     plain name is another one; nothing installed (an absent pin is the operator's decision).
-    UNPINNED: tclsh >= 8.6, installing tcl when it is missing or older. -> (pin_sh, pin_cfg)."""
+    UNPINNED: `choose_tclsh` -- PATH's tclsh >= 8.6, else an INSTALLED one >= 8.6 put first on the
+    run's PATH through the same shim a pin uses (and carried into configure, like a pin), else
+    install tcl. -> (sh, cfg): what configure must be told, ("", "") when PATH's tclsh is used."""
     pin = ctx.cfg.tcl_version
     ver = tclsh_version(ctx) if ctx.which("tclsh") else ""
     if pin:
@@ -1048,9 +1100,19 @@ def ensure_tclsh(ctx):
                   % (ver or "<none>", pin, _j(ctx.cfg.out_dir, "tcl-pin")))
         ctx.log.info("tclsh %s (%s) — PINNED by DSS_TCL_VERSION" % (ver, ctx.which("tclsh")))
         return pin_sh, pin_cfg
+    chosen_sh, chosen_ver, how = choose_tclsh(ctx)
+    if how == "installed":
+        d = write_pin_shim(chosen_sh, ctx.cfg.out_dir, ctx.env)
+        ctx.path_prefix.insert(0, d)
+        chosen_cfg = tcl_cfg_for(ctx.inventory, chosen_ver)
+        ctx.log.info("tclsh on PATH %s — using the INSTALLED Tcl %s: %s (%s)"
+                     % ("reports %s (< 8.6)" % ver if ver else "is absent", chosen_ver, chosen_sh,
+                        chosen_cfg))
+        return chosen_sh, chosen_cfg
     if not ver or awk_num(ver) < 8.6:
         if ver:
-            ctx.log.info("tclsh %s is < 8.6 — installing a newer tcl" % ver)
+            ctx.log.info("tclsh %s is < 8.6 and no installed Tcl >= 8.6 answers — installing a newer tcl"
+                         % ver)
         ctx.pkg_install("tcl", "tcl-tk")
         if ctx.cfg.host_os == "darwin":
             # HOST fact: Homebrew's tcl-tk is KEG-ONLY, so its bin/ is not on PATH after an install.
@@ -1066,6 +1128,27 @@ def ensure_tclsh(ctx):
     return "", ""
 
 
+def tcl_configure_args(tclsh, tcl_config):
+    """What sqlite's configure is told about the Tcl this run chose -- a pin, or an INSTALLED Tcl
+    taken over an older PATH tclsh (`ensure_tclsh`'s answer) -- as autosetup's --with-tclsh and
+    --with-tcl, or configure may bake another Tcl's -I dirs into the recipe, ahead of the staged
+    headers. [] when PATH's own tclsh is the one used."""
+    args = []
+    if tclsh:
+        args.append("--with-tclsh=" + tclsh)
+    if tcl_config:
+        args.append("--with-tcl=" + posixpath.dirname(tcl_config))
+    return args
+
+
+def zlib_keg(ctx):
+    """Homebrew's zlib keg when it holds zlib.h AND a libz, else "" (no brew, or not installed)."""
+    p = brew_prefix(ctx, "zlib")
+    if p and os.path.isfile(_j(p, "include", "zlib.h")) and dir_holds_lib(_j(p, "lib"), "z"):
+        return p
+    return ""
+
+
 def ensure_dev_headers(ctx):
     """The Tcl dev files (tclConfig.sh: configure detects Tcl through it) and zlib's -- a HOST
     fact which package manager provides them. dpkg answers on Debian/Ubuntu/WSL; without dpkg the
@@ -1073,8 +1156,14 @@ def ensure_dev_headers(ctx):
     if ctx.cfg.host_os == "darwin":
         # macOS ships NO libz a program can OPEN (only the dyld shared cache and .tbd stubs), so
         # Homebrew's zlib is a hard prerequisite, not an optional extra.
-        ctx.pkg_install("tcl", "tcl-tk")
-        ctx.pkg_install("zlib1g-dev", "zlib")
+        # ★ What is ALREADY there is not installed again -- a host that has it all installs
+        # nothing, as dpkg makes it so below (✔MEASURED 2026-09-23: this branch asked for both on
+        # every run). The Tcl dev files are there when the Tcl the run uses has its tclConfig.sh in
+        # the inventory; Homebrew's zlib when its keg holds zlib.h and a libz.
+        if not tcl_cfg_for(ctx.inventory, tclsh_version(ctx)):
+            ctx.pkg_install("tcl", "tcl-tk")
+        if not zlib_keg(ctx):
+            ctx.pkg_install("zlib1g-dev", "zlib")
         return
     for pkg, brew in (("tcl-dev", "tcl-tk"), ("zlib1g-dev", "zlib")):
         if not (ctx.which("dpkg") and ctx.run(["dpkg", "-s", pkg], timeout=120).rc == 0):
@@ -1568,15 +1657,11 @@ def _stage_locked(cfg, log, lock):
     ensure_dev_headers(ctx)
     bld = _j(clone, "bld-dss")
     os.makedirs(bld, exist_ok=True)
-    configure_args = []
-    if cfg.tcl_version:
-        # Carry the pin INTO sqlite's own Tcl detection (autosetup's with-tclsh / with-tcl), or
-        # configure may bake another Tcl's -I dirs into the recipe, ahead of the staged headers.
-        if pin_sh:
-            configure_args.append("--with-tclsh=" + pin_sh)
-        if pin_cfg:
-            configure_args.append("--with-tcl=" + posixpath.dirname(pin_cfg))
-        log.info("configure: pinning sqlite's Tcl detection — %s" % (" ".join(configure_args) or "<none resolvable>"))
+    configure_args = tcl_configure_args(pin_sh, pin_cfg)
+    if cfg.tcl_version or configure_args:
+        log.info("configure: %s sqlite's Tcl detection — %s"
+                 % ("pinning" if cfg.tcl_version else "carrying the chosen Tcl into",
+                    " ".join(configure_args) or "<none resolvable>"))
     configure_args += cfg.configure_flags
     log.info("configure: stage capabilities — %s%s" % (
         " ".join(cfg.configure_flags), ("   make OPTIONS=" + mo) if mo else ""))
@@ -2050,8 +2135,8 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
 
 ARMS = ("mk_var", "tcl_h_version", "tcl_select", "pin_shim", "stamp", "required_defines",
         "capabilities", "ldflags", "find", "zlib_headers", "tcl_headers", "stage_build", "config",
-        "stage_dir", "staging", "json", "translate", "derive_cli", "git", "sourcing", "tclsh_real",
-        "probe_link", "pin_exec", "orchestration")
+        "stage_dir", "staging", "json", "translate", "derive_cli", "git", "sourcing", "tcl_choice",
+        "tclsh_real", "probe_link", "pin_exec", "orchestration")
 
 _GOOD_SB = {"configureFlags": ["--enable-all", "--fts3"], "makeOptions": "-DSQLITE_ENABLE_STAT4",
             "optionDefines": ["SQLITE_ENABLE_STAT4"],
@@ -2829,6 +2914,75 @@ def _st_posix_only(t):
             t.check("a name that is not a shell identifier is refused (it is spliced into sh text)", died)
             shutil.rmtree(tmp, ignore_errors=True)
 
+    with t.arm("tcl_choice"):
+        # The Mac's case, built from FAKE interpreters so every POSIX host proves it: PATH's tclsh
+        # reports 8.5, an installed Tcl 9.0 answers from its own prefix, brew is off the PATH.
+        if not have_sh:
+            t.skip("choose_tclsh / ensure_tclsh / the darwin dev files over FAKE interpreters",
+                   "needs a POSIX `sh` (this module runs on the POSIX side)")
+        else:
+            tmp = _tmp("tc")
+            _w(_j(tmp, "old", "tclsh"), "#!/bin/sh\necho 8.5\n", 0o755)
+            keg = _j(tmp, "keg")
+            new_sh = _w(_j(keg, "bin", "tclsh9.0"), "#!/bin/sh\necho 9.0\n", 0o755)
+            cfgf = _w(_j(keg, "lib", "tclConfig.sh"), "TCL_VERSION='9.0'\nTCL_EXEC_PREFIX='%s'\n" % keg)
+            base_path = os.pathsep.join([_j(tmp, "old"), "/usr/bin", "/bin"])
+
+            def ctx_for(path, host_os="linux", roots=(_j(keg, "lib"),)):
+                got = []
+                c, _l = _ctx(tmp, environ=dict(os.environ, PATH=path), host_os=host_os,
+                             pkg_install=lambda a, b=None: got.append((a, b)))
+                c.cfg_roots = tuple(roots)
+                c.inventory = tcl_inventory(c)
+                return c, got
+            ctx, installs = ctx_for(base_path)
+            t.check("an older PATH tclsh (8.5) gives way to the INSTALLED Tcl 9.0 whose own interpreter answers",
+                    choose_tclsh(ctx) == (new_sh, "9.0", "installed"), choose_tclsh(ctx))
+            chosen = ensure_tclsh(ctx)
+            t.check("...ensure_tclsh USES it -- nothing installed -- and configure is told its tclsh and tclConfig.sh",
+                    chosen == (new_sh, cfgf) and installs == []
+                    and tcl_configure_args(*chosen) == ["--with-tclsh=" + new_sh, "--with-tcl=" + _j(keg, "lib")],
+                    (chosen, installs))
+            t.check("...and the plain name `tclsh` on the run's PATH now answers 9.0 (the pin shim)",
+                    tclsh_version(ctx) == "9.0", tclsh_version(ctx))
+            ok_dir = _j(tmp, "ok")
+            _w(_j(ok_dir, "tclsh"), "#!/bin/sh\necho 8.6\n", 0o755)
+            ctx2, _i2 = ctx_for(ok_dir + os.pathsep + base_path)
+            t.check("CONTROL: a PATH tclsh >= 8.6 is used as it is, and configure is told nothing",
+                    choose_tclsh(ctx2)[1:] == ("8.6", "path") and tcl_configure_args(*ensure_tclsh(ctx2)) == [],
+                    choose_tclsh(ctx2))
+            ctx3, _i3 = ctx_for(base_path, roots=(_j(tmp, "no-such-root"),))
+            t.check("with no installed Tcl >= 8.6 the choice is `none` -- the caller installs",
+                    choose_tclsh(ctx3)[2] == "none", choose_tclsh(ctx3))
+            zkeg = _j(tmp, "zlib-keg")
+            _w(_j(zkeg, "include", "zlib.h"), "/* zlib */\n")
+            libz = _w(_j(zkeg, "lib", "libz.a"), "")
+            brewbin = _j(tmp, "brewbin")
+            fake_brew = _w(_j(brewbin, "brew"),
+                           '#!/bin/sh\n[ "$1" = --prefix ] && [ "$2" = zlib ] && { echo "%s"; exit 0; }\n'
+                           'echo "%s/$2"\n' % (zkeg, _j(tmp, "no-such-keg")), 0o755)
+            ctxd, inst = ctx_for(brewbin + os.pathsep + base_path, host_os="darwin")
+            ensure_tclsh(ctxd)
+            ensure_dev_headers(ctxd)
+            t.check("darwin: a host whose Tcl has its tclConfig.sh and whose Homebrew zlib is there installs NOTHING",
+                    inst == [], inst)
+            os.remove(libz)
+            ctxz, instz = ctx_for(brewbin + os.pathsep + base_path, host_os="darwin")
+            ensure_tclsh(ctxz)
+            ensure_dev_headers(ctxz)
+            t.check("CONTROL: without Homebrew's libz, exactly zlib is installed (and Tcl is not)",
+                    instz == [("zlib1g-dev", "zlib")], instz)
+            saved = globals()["BREW_CANDIDATES"]
+            globals()["BREW_CANDIDATES"] = ("brew", fake_brew)
+            try:
+                ctxb, _ib = ctx_for(base_path)
+                found = resolve_brew(ctxb.which)
+            finally:
+                globals()["BREW_CANDIDATES"] = saved
+            t.check("brew OFF the PATH is found at a default prefix (a candidate path), as the Mac's ssh PATH needs",
+                    found == fake_brew and not ctxb.which("brew"), found)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     with t.arm("tclsh_real"):
         why = _posix_skip_reason(have_sh, ("tclsh",))
         if why:
@@ -2836,9 +2990,13 @@ def _st_posix_only(t):
         else:
             tmp = _tmp("tr")
             ctx, _log = _ctx(tmp)
-            ver = tclsh_version(ctx)
-            t.check("tclsh reports a version >= 8.6", awk_num(ver) >= 8.6, ver)
-            inv = tcl_inventory(ctx)
+            discover_roots(ctx)
+            ctx.inventory = inv = tcl_inventory(ctx)
+            sh, ver, how = choose_tclsh(ctx)
+            t.check("the tclsh the stage would run (PATH's when it reports >= 8.6, else the newest INSTALLED Tcl "
+                    "whose own interpreter answers) reports a version >= 8.6",
+                    awk_num(ver) >= 8.6 and how != "none",
+                    "%r via %s (%s)%s" % (ver, sh or "nothing", how, _host_tcl_facts(ctx)))
             if not inv:
                 t.skip("the inventory holds the tclsh's own installation", "no tclConfig.sh under the CFG roots")
             else:
@@ -2846,7 +3004,8 @@ def _st_posix_only(t):
                 t.check("every entry's version is what sourcing it says",
                         all(tcl_config_values(ctx, c, ("TCL_VERSION",))["TCL_VERSION"] == v for v, c in inv))
                 sel = select_tcl(inv, "", ver)
-                t.check("the tclsh's own installation is selected", sel[0] == ver and sel[2] == "tclsh", sel)
+                t.check("that tclsh's own installation is selected", sel[0] == ver and sel[2] == "tclsh",
+                        "%r%s" % (sel, _host_tcl_facts(ctx)))
             shutil.rmtree(tmp, ignore_errors=True)
 
     with t.arm("probe_link"):
@@ -2997,6 +3156,30 @@ def _posix_skip_reason(have_sh, tools):
     return ("absent on PATH: %s" % ", ".join(absent)) if absent else None
 
 
+def _host_tcl_facts(ctx):
+    """What a failing HOST arm prints -- the only way to read a host reached through a runner:
+    the PATH, the tclsh on it and what it reports, every installed Tcl with its own interpreter,
+    where brew is and its keg prefixes, Homebrew's zlib, and the SDK. One line each, indented
+    under the FAIL line so the driver's Step 0 report carries them."""
+    lines = ["PATH: %s" % ctx.env.get("PATH", "")]
+    path_sh = ctx.which("tclsh") or ""
+    lines.append("tclsh on PATH: %s%s" % (path_sh or "none",
+                                          (" reports %r" % tclsh_version(ctx)) if path_sh else ""))
+    lines.append("CFG roots: %s" % " ".join(ctx.cfg_roots))
+    for ver, cfg in (ctx.inventory or tcl_inventory(ctx)):
+        pfx = tcl_config_values(ctx, cfg, ("TCL_EXEC_PREFIX",))["TCL_EXEC_PREFIX"]
+        lines.append("installed Tcl %s: %s (TCL_EXEC_PREFIX %r) -> its own interpreter: %s"
+                     % (ver, cfg, pfx, tclsh_bin_for(ctx, ver) or "none that answers"))
+    lines.append("brew: %s (candidates: %s)" % (resolve_brew(ctx.which) or "none", ", ".join(
+        "%s %s" % (c, "found" if ctx.which(c) else "absent") for c in BREW_CANDIDATES)))
+    for f in KEG_FORMULAE:
+        p = brew_prefix(ctx, f)
+        lines.append("brew --prefix %s: %r (%s)" % (f, p, "a directory" if p and os.path.isdir(p) else "absent"))
+    lines.append("Homebrew zlib (zlib.h + libz): %s" % (zlib_keg(ctx) or "none"))
+    lines.append("xcrun SDK: %s" % (sdk_prefix(ctx) or "none"))
+    return "".join("\n        " + ln for ln in lines)
+
+
 def _st_orchestration(t, have_sh):
     why = _posix_skip_reason(have_sh, ("git", "make", "tclsh", "cc"))
     if why:
@@ -3073,7 +3256,13 @@ def _st_orchestration_body(t):
         t.check("the stamp was written", read_stamp(_j(bld, STAGE_STAMP)) == r.stage_identity and r.stage_identity.startswith("tclsh="))
         t.check("an unresolvable TCL_LIBS -l is a reference-link WARNING, not a stop",
                 any("no_such_lib_p4s2" in w for w in r.ref_link_warnings), r.ref_link_warnings)
-        t.check("nothing was installed on a host that has it all", installs == [], installs)
+        def host_facts():
+            fctx = _Ctx(cfg, C.Log(io.StringIO()))
+            discover_roots(fctx)
+            fctx.inventory = tcl_inventory(fctx)
+            return _host_tcl_facts(fctx)
+        t.check("nothing was installed on a host that has it all", installs == [],
+                ("%r%s" % (installs, host_facts())) if installs else "")
         t.check("the Tcl header dir holds tcl.h and agrees with the version",
                 os.path.isfile(_j(r.tcl_inc, "tcl.h")) and tcl_h_version(_j(r.tcl_inc, "tcl.h")) == r.tcl_version)
         t.check("tcl_lib_file is the chosen tclConfig.sh's TCL_LIB_FILE",
@@ -3098,7 +3287,7 @@ def _st_orchestration_body(t):
                           "--sqlite-repo-url", bare, "--jobs", "2"],
                          lock_factory=lambda c: lk, translator=lambda p: "W:" + p, out=out, err=err, environ=env,
                          host_os=C.host_os())
-        t.check("the derive exits 0", rc == 0, err.getvalue()[-600:])
+        t.check("the derive exits 0", rc == 0, (err.getvalue()[-600:] + host_facts()) if rc != 0 else "")
         if rc == 0:
             d = StageResult.from_json(open(_j(stage_dir, RESULT_FILE), encoding="utf-8").read())
             t.check("the stamp matched: no rebuild this time", not any("rebuilt from scratch" in w for w in d.warnings), d.warnings)

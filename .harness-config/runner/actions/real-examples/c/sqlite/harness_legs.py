@@ -78,6 +78,7 @@ import shlex
 import shutil
 import stat
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CATALOGUE = os.path.join(HERE, "legs.json")
@@ -5507,28 +5508,25 @@ def reference_oracle_argv(cc, manifest, output, link_flags, surface_dir=""):
 # ── THE REFERENCE IS HANDED DSS'S OWN DECLARED HEADER EDGES ─────────────────
 #
 #
-# ★★★ WHY pe64 STILL HAD NO ORACLE AFTER `--build-reference-oracle` EXISTED.
-# ✔MEASURED 2026-09-15: a `-dumpmachine`-verified mingw-w64 gcc given the pe64
-# leg's own 189-TU manifest fails ONE TU, `ext/misc/fileio.c` (31 errors, 24
-# warnings, identical with the `windows-selfconfig` transform reverted, so the
-# recipe is not the cause). The cause is upstream, and that leg's
-# `matches: build-tu` row names it. dss compiles the TU only because its
-# shipped pe descriptors DECLARE three header edges mingw's own headers lack:
-# <direct.h> pulls <dirent.h>, <dirent.h> pulls <windows.h>, and <sys/stat.h>
-# defines S_ISLNK. A reference without them compiles a DIFFERENT HEADER GRAPH:
-# it could not build the fixture, and had it built one, it would not stand for
-# dss in a runtime comparison.
+# ★★ A REFERENCE WITHOUT AN EDGE DSS TAKES COMPILES A DIFFERENT HEADER GRAPH:
+# it may not build the fixture, and had it built one, it would not stand for dss
+# in a runtime comparison. So a leg NAMES, in `build.referenceSurface`, the edges
+# dsscp's shipped descriptors declare on its format that the reference's own
+# headers lack. Their CONTENT is read here from the shipped descriptors, selected
+# for the leg's own object-format kind by the format-only `when` rule dsscp
+# applies to exactly these two surfaces, and written as one `#include_next` shim
+# per header into a directory searched first. Nothing is typed twice: an edge the
+# descriptors do not declare ACTIVE on that format is a lint finding and a refused
+# build, so a shim cannot outlive the declaration it copies.
 #
-# ★★ THE FIX HANDS THE REFERENCE THE SAME EDGES, READ FROM THE SAME DECLARATION.
-# A leg NAMES the edges it needs in `build.referenceSurface`. Their CONTENT is
-# read here from the shipped descriptors, selected for the leg's own
-# object-format kind by the format-only `when` rule dsscp applies to exactly
-# these two surfaces, and written as one `#include_next` shim per header into a
-# directory searched first. Nothing is typed twice: an edge the descriptors do
-# not declare ACTIVE on that format is a lint finding and a refused build, so a
-# shim cannot outlive the declaration it copies. ✔MEASURED 2026-09-15 with those
-# three edges as shadow headers: all 189 TUs built, the fixture ran, and its
-# `PRAGMA compile_options` equalled dss's but for COMPILER.
+# ⓘ NO SHIPPED LEG DECLARES ONE SINCE 2026-09-23. It was written for pe64
+# (✔MEASURED 2026-09-15: a `-dumpmachine`-verified mingw-w64 gcc given the leg's
+# 189-TU manifest failed ONE TU, `ext/misc/fileio.c`, which dss then compiled only
+# through three pe edges its descriptors declared: <direct.h> -> <dirent.h>,
+# <dirent.h> -> <windows.h>, and `S_ISLNK` in <sys/stat.h>). Those edges are in NO
+# reference's headers, and they left dss's descriptors; what fileio.c needs is now
+# the harness's own declaration, handed to BOTH compilers (`build.tuPreludes`,
+# below). The mechanism stays for an edge dss takes that a reference lacks.
 #
 # ⚠ WHAT THIS IS NOT, ALSO MEASURED: an MSVC reference. `cl -dumpmachine` exits
 # 2, so `resolve_target_cc` cannot verify it; `cl` compiles fileio.c's
@@ -5952,6 +5950,81 @@ def write_reference_surface(shims, root):
     return target
 
 
+# ── A TU COMPILED AFTER LINES ITS LEG DECLARES FOR IT (`build.tuPreludes`) ────
+#
+# ★★★ WHY THIS EXISTS BESIDE `referenceSurface`, AND IS NOT A SECOND COPY OF IT.
+# `referenceSurface` hands the REFERENCE the edges DSS'S OWN DESCRIPTORS declare,
+# for header-graph parity. A TU prelude is the HARNESS's declaration for ONE TU
+# that NEITHER compiler's headers make compilable: upstream's own configuration
+# hole, compensated with upstream's own lines. ✔MEASURED 2026-09-23, mingw-w64
+# gcc 13.2.0 on the pe testfixture manifest: `ext/misc/fileio.c` alone fails (31
+# errors), because its Windows arm keys everything on `_MSC_VER`
+# (`ext/misc/windirent.h`), while upstream compiles the very same code on mingw
+# only INSIDE shell.c, after `src/shell.c.in`'s `__MINGW32__` arm (<dirent.h>, an
+# `S_ISLNK` fallback) and its `_WIN32` <windows.h> block. Handed exactly those
+# lines, the TU compiles with 0 errors and 0 warnings; each of the three is
+# necessary. The generator compiles the TU through a wrapper holding them, and
+# BOTH compilers read that manifest. A diagnostic raised inside the real TU names
+# the REAL file, so the build attribution maps each wrapper back to the TU it
+# compiles (`manifest_tu_paths`, reading the generator's own wrapper).
+# ★ ONE CHECK: the shape and the rules are gen-pe64-manifest.py's
+# `check_tu_preludes`, the same function the generator runs before it writes a
+# wrapper; `--lint` runs it too, and adds the one CATALOGUE fact the generator
+# cannot know -- which artefacts the driver builds.
+TU_PRELUDE_ARTIFACTS = ("testfixture", "sqlite3")
+
+
+def _manifest_generator():
+    """gen-pe64-manifest.py beside this file, loaded BY PATH through `_sibling_module`
+    (so bytecode writing is off first: no `__pycache__` beside the action). It owns the
+    TU-prelude wrapper: `check_tu_preludes` is the one shape check of `build.tuPreludes`,
+    and `prelude_wrapper_target` the one reader of a wrapper it wrote."""
+    return _sibling_module("gen-pe64-manifest")
+
+
+def manifest_tu_paths(manifest_sources):
+    """The TU paths the reference was asked about, in `normalise_tu_path` spelling: every
+    manifest source, and for each generated TU-prelude wrapper (`build.tuPreludes`) ALSO
+    the real TU it compiles -- a diagnostic raised inside that TU names the REAL file,
+    never the wrapper, and both compilers compiled it. A wrapper-shaped source the
+    generator does not recognise RAISES LegError: which TU it compiles is not guessed."""
+    gen = _manifest_generator()
+    out = set()
+    for source in manifest_sources or []:
+        out.add(normalise_tu_path(source))
+        try:
+            real = gen.prelude_wrapper_target(source)
+        except gen.PreludeRefused as exc:
+            raise LegError("the manifest source %s cannot be attributed: %s" % (source, exc))
+        if real:
+            out.add(normalise_tu_path(real))
+    return out
+
+
+def tu_prelude_findings(leg):
+    """Everything wrong with a leg's declared `build.tuPreludes`, as lint findings;
+    [] for a leg that declares none. Every finding names `build.tuPreludes`."""
+    entries = leg.get("build", {}).get("tuPreludes")
+    if entries is None:
+        return []
+    head = "leg '%s': build.tuPreludes" % leg.get("label", "<unlabelled>")
+    gen = _manifest_generator()
+    try:
+        checked = gen.check_tu_preludes(entries)
+    except gen.PreludeRefused as exc:
+        return ["%s: %s" % (head, exc)]
+    findings = []
+    for tu, arts, _lines in checked:
+        unknown = sorted(set(arts) - set(TU_PRELUDE_ARTIFACTS))
+        if unknown:
+            findings.append("%s <%s>: artifacts %s are not artefacts this driver builds "
+                            "(known: %s), so the prelude would reach no build"
+                            % (head, tu, ", ".join(unknown), ", ".join(TU_PRELUDE_ARTIFACTS)))
+        if len(set(arts)) != len(arts):
+            findings.append("%s <%s>: artifacts %r names one artefact twice" % (head, tu, arts))
+    return findings
+
+
 def _spawn_capturing(argv):
     """(rc, combined output bytes). rc DIRECTLY off the process, never after a
     pipe."""
@@ -6267,13 +6340,18 @@ def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
 
     `manifest_sources` is the manifest's `sources` list — the SAME file dss
     consumed and the oracle compiled. A TU dss names that is not in it was never
-    put to the reference, so it cannot be attributed however the logs read.
+    put to the reference, so it cannot be attributed however the logs read. A
+    source that is a generated TU-prelude wrapper stands for the real TU it
+    compiles as well (`manifest_tu_paths`).
 
     Returns a report dict. Never raises for a LOG it cannot read: an unreadable
     log is a REPORTED finding (`parserGap`), because raising would take the whole
-    leg's account down with it and the harness must survive everything."""
+    leg's account down with it and the harness must survive everything. A
+    wrapper-shaped source the generator does not recognise RAISES LegError — a
+    manifest, not a log."""
     attempted = oracle_status in ORACLE_STATUSES_ATTEMPTED
-    sources = {normalise_tu_path(s) for s in (manifest_sources or [])}
+    n_sources = len({normalise_tu_path(s) for s in (manifest_sources or [])})
+    sources = manifest_tu_paths(manifest_sources)
     dss_rows = [r for r in dss_build_diagnostics(dss_log_text)
                 if r["severity"] == "error"]
     ref_rows = reference_build_diagnostics(reference_log_text)
@@ -6337,7 +6415,7 @@ def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
                 "no oracle was attempted for this leg (status %r)" % oracle_status
                 if not attempted else
                 "this TU is not among the %d sources the oracle compiled, so the "
-                "reference was never asked about it" % len(sources))
+                "reference was never asked about it" % n_sources)
         elif ref["error"] < 1:
             verdict, why = "dss", (
                 "the reference compiled this TU with %d error(s) and %d "
@@ -6434,6 +6512,309 @@ def build_attribution_report_lines(report):
                 "NOT individually attributable by this comparison; they neither "
                 "granted nor denied the verdict above."
                 % (label, t["dssCascade"]))
+    return lines
+
+
+# ── THE ROUND-CLOSE RECOMPILE: WHICH TRANSLATION UNITS EACH COMPILER ACCEPTS ──
+#
+# ★ WHAT IT IS FOR. A round close compiles one leg's testfixture manifest with the
+# dsscp under review AND with the leg's same-platform reference (the oracle, built
+# from the SAME manifest), and a TU the reference compiles that dsscp refuses is a
+# MERGE BLOCKER. ✔MEASURED round 8: `T *const p[]` then `p++` was refused in two
+# sqlite TUs that every leg's testfixture needs, and the unit gate compiles none of
+# them. The driver's `--recompile` mode (`sqlite_recompile.py`) runs both compilers
+# and asks this census, through `--recompile-verdicts`, which TUs each accepted.
+#
+# ★ IT IS NOT `attribute_build_failure`, AND THE DIFFERENCE IS THE POINT. That one
+# asks "whose failure is this build?" about the TUs dss rejected, and grants an
+# amnesty only through an earned `build-tu` row. This one asks an earlier question
+# about EVERY TU of the manifest -- did each compiler accept it? -- and grants
+# nothing: a TU both compilers reject is not a blocker, and it is printed as one
+# both reject, whatever any row says.
+#
+# ★★ IT REFUSES TO BE CLEAN WHEN IT CANNOT SEE. A per-TU census read off two logs
+# has three blind spots, and each one fails toward CLEAN, so each is a named
+# INCOMPLETE reason (and a non-zero exit), never a silent zero:
+#   1. dsscp caps its diagnostic stream RUN-WIDE (`maxPerCode`, `maxDiagnostics` in
+#      DiagnosticReporter::Config; each CU's diagnostics are copied into the run's
+#      reporter), so a code raised in many TUs hides the LAST TUs whole. The driver
+#      asks for the whole stream; a stream that still carries `P_TooManyDiagnostics`,
+#      or a `P_DiagnosticsElided` that COALESCED anything, is incomplete. Its
+#      dedup-only form drops exact repeats at one span of one buffer (a TU's own
+#      first error always shows), and ✔MEASURED 2026-09-23 it fires on a CLEAN pe64
+#      build, so refusing it would refuse every run.
+#   2. dsscp prints NO include chain: an error located in a header names the header,
+#      never the TU that included it. It is UNPLACED, listed with its file:line, and
+#      the census is incomplete.
+#   3. gcc names a header error's TU only in its `In file included from` chain,
+#      printed once per include context per cc1 process; `reference_tu_rows`
+#      carries that state. A reference that FAILED with no compile error parsed and
+#      no failed link is a log this reader cannot read, and the census is
+#      incomplete.
+RECOMPILE_VERDICTS = {
+    "accepted": "both compilers compiled this TU with no error",
+    "BLOCKER": "the reference compiled this TU with no error and dsscp REFUSED it -- "
+               "a merge blocker",
+    "rejected-by-both": "both compilers refused this TU: not a blocker, and not "
+                        "evidence about dsscp either way",
+    "reference-rejects": "the reference refused this TU and dsscp compiled it",
+    "no-reference": "NO reference ran on this host, so this TU cannot be judged either way -- "
+                    "and a TU nothing judged is never counted as accepted by the reference",
+}
+# dsscp's own build outcome, as the driver read it off `sqlite_base.build_artifact`:
+# `built` (an artefact, no error), `errors` (error diagnostics), `failed` (no
+# artefact and no error: the log says why).
+RECOMPILE_DSS_BUILDS = ("built", "errors", "failed")
+# The two elision markers dsscp's reporter emits (`parse_diagnostic.hpp`). The
+# per-code one says how many it COALESCED past the cap in its own prose, and that
+# count is read, because its dedup-only form is harmless and routine.
+DSS_CAP_MARKER = "P_TooManyDiagnostics"
+DSS_ELISION_MARKER = "P_DiagnosticsElided"
+_DSS_COALESCED = re.compile(r"\b(\d+) coalesced past the per-code cap\b")
+# gcc's include chain: `In file included from <file>:<line>[:<col>],` then zero or
+# more `                 from <file>:<line>[:<col>],` lines, the LAST one (the TU)
+# ending in `:`. The path is taken NON-greedily up to the trailing number(s), so a
+# drive letter's colon stays in the path.
+GNU_INCLUDED_FROM = re.compile(r"^In file included from (.+?):(\d+)(?::\d+)?([,:])\s*$")
+GNU_INCLUDED_FROM_MORE = re.compile(r"^\s+from (.+?):(\d+)(?::\d+)?([,:])\s*$")
+# The driver's own line when every TU compiled and the LINK failed.
+GNU_LINK_FAILED = re.compile(r"(?:^|[\\/])collect2(?:\.exe)?: error: ld returned \d+ "
+                             r"exit status\s*$")
+
+
+def recompile_tu_index(manifest_sources):
+    """-> (tus, index): the manifest's TUs in manifest order, each spelled as its REAL
+    TU (`normalise_tu_path`), and {every spelling that names one: that TU} -- the source
+    as listed, and for a generated TU-prelude wrapper ALSO the real TU it compiles (a
+    diagnostic raised inside that TU names the real file). A TU listed twice, or a
+    wrapper-shaped source the generator does not recognise, RAISES LegError: which TU
+    a line of a log belongs to is never guessed."""
+    gen = _manifest_generator()
+    tus, index = [], {}
+    for source in manifest_sources or []:
+        try:
+            real = gen.prelude_wrapper_target(source)
+        except gen.PreludeRefused as exc:
+            raise LegError("the manifest source %s cannot be placed: %s" % (source, exc))
+        key = normalise_tu_path(real or source)
+        if key in tus:
+            raise LegError("the manifest names the TU %s twice, so a per-TU census would "
+                           "count it twice" % key)
+        tus.append(key)
+        index[key] = key
+        index[normalise_tu_path(source)] = key
+    return tus, index
+
+
+def reference_tu_rows(log_text, index):
+    """[(tu or None, row)] for every `reference_build_diagnostics` row of a gcc log, in
+    log order, each placed in the TU gcc was compiling when it raised it. gcc prints an
+    include chain exactly when a diagnostic's include context differs from the last one
+    it printed, and each cc1 process (one per TU) starts with none, so:
+      a chain just before the row  -> the chain's OUTERMOST file (the TU; it wins even
+                                      when the row's own file is a TU another TU
+                                      includes);
+      the same file as the row before -> the same context: that row's TU;
+      else its own file, when that is a TU (an empty include stack: the main file);
+      else None -- a header diagnostic with no chain of its own. Unplaced, never
+      guessed: the caller counts an unplaced ERROR as a reason it cannot vouch.
+    Lines between a chain and its diagnostic (a `In function` context, a source
+    excerpt) do not consume the chain."""
+    out = []
+    current, context, chain_last = None, None, None
+    for line in (log_text or "").splitlines():
+        m = GNU_INCLUDED_FROM.match(line)
+        if m:
+            chain_last = normalise_tu_path(m.group(1))
+            continue
+        m = GNU_INCLUDED_FROM_MORE.match(line)
+        if m and chain_last is not None:
+            chain_last = normalise_tu_path(m.group(1))
+            continue
+        rows = reference_build_diagnostics(line)
+        if not rows:
+            continue
+        where = rows[0]["file"]
+        if chain_last is not None:
+            tu, chain_last = index.get(chain_last), None
+            current = tu
+        elif where == context:
+            tu = current
+        elif where in index:
+            tu = current = index[where]
+        else:
+            tu = current = None
+        context = where
+        out.append((tu, rows[0]))
+    return out
+
+
+def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_text,
+                       oracle_status, label="<unlabelled>", dss_detail=""):
+    """THE ROUND-CLOSE CENSUS: per TU of the manifest, did the reference accept it,
+    did dsscp? -> a report dict: `tus` (one row per TU, manifest order, each with a
+    RECOMPILE_VERDICTS verdict), `counts` {tus, referenceOk, dssOk, blockers},
+    `incomplete` (every reason the census cannot vouch for a TU it did not see
+    refused; see the header), `unplacedDss` / `unplacedReference`, `clean`.
+
+    `dss_build` is one of RECOMPILE_DSS_BUILDS, `dss_detail` its reason when
+    `failed`; `oracle_status` is `--build-reference-oracle`'s own status, verbatim.
+    Only `built` and `build-failed` mean the reference RAN."""
+    tus, index = recompile_tu_index(manifest_sources)
+    incomplete = []
+    if dss_build not in RECOMPILE_DSS_BUILDS:
+        raise LegError("the dsscp build outcome %r is not one of %s"
+                       % (dss_build, ", ".join(RECOMPILE_DSS_BUILDS)))
+
+    def tally():
+        return dict((tu, {"errors": 0, "warnings": 0, "firstError": ""}) for tu in tus)
+
+    # ── the reference ────────────────────────────────────────────────────────
+    ref, unplaced_ref = tally(), []
+    ref_errors = 0
+    for tu, r in reference_tu_rows(reference_log_text, index):
+        if r["severity"] not in ("error", "warning"):
+            continue
+        if r["severity"] == "error":
+            ref_errors += 1
+        if tu is None:
+            if r["severity"] == "error":
+                unplaced_ref.append(r)
+            continue
+        ref[tu][r["severity"] + "s"] += 1
+        if r["severity"] == "error" and not ref[tu]["firstError"]:
+            ref[tu]["firstError"] = "%s:%d:%d: error: %s" % (r["file"], r["line"], r["col"],
+                                                             r["message"])
+    link_failed = any(GNU_LINK_FAILED.search(line)
+                      for line in (reference_log_text or "").splitlines())
+    if oracle_status not in ORACLE_STATUSES_ATTEMPTED:
+        incomplete.append("NO REFERENCE RAN for this leg (oracle status %r): nothing says which "
+                          "TUs the reference accepts, so no TU dsscp refuses can be told from a "
+                          "blocker" % (oracle_status,))
+    elif oracle_status == ORACLE_STATUS_BUILT and ref_errors:
+        incomplete.append("the reference BUILT, yet %d error line(s) were read off its log -- the "
+                          "reader and the compiler disagree, so neither count is trusted"
+                          % ref_errors)
+    elif oracle_status == ORACLE_STATUS_BUILD_FAILED and not ref_errors and not link_failed:
+        incomplete.append("the reference build FAILED, and its log yields no compile error and no "
+                          "failed link: a log this reader cannot read. Read it by hand and widen "
+                          "the reader")
+    if unplaced_ref:
+        incomplete.append("%d reference error(s) could not be placed in a TU of the manifest (first: "
+                          "%s:%d: %s)" % (len(unplaced_ref), unplaced_ref[0]["file"],
+                                          unplaced_ref[0]["line"], unplaced_ref[0]["message"]))
+
+    # ── dsscp ────────────────────────────────────────────────────────────────
+    dss, unplaced_dss = tally(), []
+    dss_errors = 0
+    for r in dss_build_diagnostics(dss_log_text):
+        if r["code"] == DSS_CAP_MARKER:
+            incomplete.append("dsscp's diagnostic stream hit its GLOBAL cap (%s): every diagnostic "
+                              "past it is hidden, so a TU that shows none may still be refused"
+                              % DSS_CAP_MARKER)
+            continue
+        if r["code"] == DSS_ELISION_MARKER:
+            m = _DSS_COALESCED.search(r["subject"])
+            if m is None:
+                incomplete.append("a %s marker whose count this reader cannot read (%r): whether it "
+                                  "hid a TU's errors is unknown" % (DSS_ELISION_MARKER, r["subject"]))
+            elif int(m.group(1)):
+                incomplete.append("dsscp COALESCED %s diagnostic(s) past its per-code cap (%s): a TU "
+                                  "whose only errors were coalesced shows none"
+                                  % (m.group(1), r["subject"]))
+            continue
+        if r["severity"] not in ("error", "warning"):
+            continue
+        if r["severity"] == "error":
+            dss_errors += 1
+        tu = index.get(r["file"])
+        if tu is None:
+            if r["severity"] == "error":
+                unplaced_dss.append(r)
+            continue
+        dss[tu][r["severity"] + "s"] += 1
+        if r["severity"] == "error" and not dss[tu]["firstError"]:
+            dss[tu]["firstError"] = "error[%s] %s:%d:%d: %s" % (r["code"], r["file"], r["line"],
+                                                                r["col"], r["subject"])
+    if dss_build == "built" and dss_errors:
+        incomplete.append("dsscp reported an artefact, yet %d error diagnostic(s) were read off its "
+                          "log -- the two disagree, so neither is trusted" % dss_errors)
+    elif dss_build == "errors" and not dss_errors:
+        incomplete.append("the build reader counted error diagnostics in dsscp's log, and this "
+                          "reader parsed none: a log shape this reader cannot read")
+    elif dss_build == "failed":
+        incomplete.append("dsscp produced NO usable artefact and NO error diagnostic (%s): the "
+                          "build failed where no TU can be named" % (dss_detail or "no detail"))
+    if unplaced_dss:
+        first = unplaced_dss[0]
+        incomplete.append("%d dsscp error(s) are located in no TU of the manifest -- dsscp names "
+                          "no include chain, so the TUs they break cannot be named (first: "
+                          "error[%s] %s:%d: %s)"
+                          % (len(unplaced_dss), first["code"], first["file"] or "<no location>",
+                             first["line"], first["subject"]))
+
+    # ── per TU ───────────────────────────────────────────────────────────────
+    # A reference that did not RUN accepted nothing: its TUs are `no-reference`, and neither
+    # `referenceOk` nor a blocker is counted from a control that is absent.
+    ran = oracle_status in ORACLE_STATUSES_ATTEMPTED
+    rows = []
+    for tu in tus:
+        ref_ok, dss_ok = ran and ref[tu]["errors"] == 0, dss[tu]["errors"] == 0
+        verdict = ("no-reference" if not ran else "accepted" if ref_ok and dss_ok else
+                   "BLOCKER" if ref_ok else "rejected-by-both" if not dss_ok else
+                   "reference-rejects")
+        rows.append({"tu": tu, "verdict": verdict, "referenceOk": ref_ok, "dssOk": dss_ok,
+                     "reference": ref[tu], "dss": dss[tu]})
+    counts = {"tus": len(tus),
+              "referenceOk": sum(1 for r in rows if r["referenceOk"]),
+              "dssOk": sum(1 for r in rows if r["dssOk"]),
+              "blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}
+    return {"leg": label, "oracleStatus": oracle_status, "dssBuild": dss_build,
+            "tus": rows, "counts": counts, "incomplete": incomplete,
+            "unplacedDss": unplaced_dss, "unplacedReference": unplaced_ref,
+            "clean": counts["blockers"] == 0 and not incomplete}
+
+
+def recompile_summary_line(report):
+    """The ONE summary line a round close reads."""
+    c = report["counts"]
+    return ("recompile: %s tus=%d reference_ok=%d dss_ok=%d blockers=%d"
+            % (report["leg"], c["tus"], c["referenceOk"], c["dssOk"], c["blockers"]))
+
+
+def recompile_report_lines(report):
+    """The lines the driver PRINTS verbatim: every TU (a TU that vanished from the table
+    would read as one that compiled), each blocker's first dsscp error, every
+    INCOMPLETE reason, and the summary line LAST."""
+    label = report["leg"]
+    rows = report["tus"]
+    root = ""
+    if rows:
+        try:
+            root = os.path.commonpath([r["tu"] for r in rows]).replace("\\", "/")
+        except ValueError:
+            root = ""
+    lines = ["[%s] per-TU census (reference = the leg's same-platform oracle, status %s; "
+             "dsscp build: %s)%s" % (label, report["oracleStatus"] or "<not run>",
+                                     report["dssBuild"],
+                                     ("; TUs relative to %s" % root) if root else "")]
+    width = max([len(v) for v in RECOMPILE_VERDICTS] or [0])
+    for r in rows:
+        shown = r["tu"][len(root):].lstrip("/") if root and r["tu"].startswith(root) else r["tu"]
+        lines.append("[%s]   %-*s  ref %de/%dw  dss %de/%dw  %s"
+                     % (label, width, r["verdict"], r["reference"]["errors"],
+                        r["reference"]["warnings"], r["dss"]["errors"], r["dss"]["warnings"], shown))
+        if r["verdict"] == "BLOCKER":
+            lines.append("[%s]     %s" % (label, r["dss"]["firstError"]))
+    for u in report["unplacedDss"]:
+        lines.append("[%s]   UNPLACED dsscp error[%s] %s:%d: %s"
+                     % (label, u["code"], u["file"] or "<no location>", u["line"], u["subject"]))
+    for u in report["unplacedReference"]:
+        lines.append("[%s]   UNPLACED reference error %s:%d: %s"
+                     % (label, u["file"], u["line"], u["message"]))
+    for why in report["incomplete"]:
+        lines.append("[%s] INCOMPLETE: %s" % (label, why))
+    lines.append(recompile_summary_line(report))
     return lines
 
 
@@ -11196,6 +11577,8 @@ def lint(path=CATALOGUE):
         # call: an edge the descriptors stopped declaring must turn the catalogue
         # red before a run spends an hour building a reference from it.
         findings.extend(reference_surface_findings(leg))
+        # ── A TU COMPILED AFTER ITS LEG'S DECLARED LINES (both compilers) ──────
+        findings.extend(tu_prelude_findings(leg))
         if not build.get("sharedLibFlags"):
             findings.append("leg '%s': no sharedLibFlags" % label)
         # ── the object format the helper is EMITTED in ────────────────────────
@@ -13030,32 +13413,71 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             return thunk(), ""
         except LegError as exc:
             return default, "raised: %s" % exc
-    _rs_shims, _rs_why = _rs_try(
-        lambda: reference_surface_shims(_pe_leg_for_oracle), {})
+    # ★ NO LEG DECLARES A SURFACE SINCE 2026-09-23: the pe leg's three edges left dsscp's
+    # descriptors (none of them is in any reference's headers) and fileio.c's need moved
+    # to `build.tuPreludes`. The MECHANISM stays, so it is driven here over the SHIPPED
+    # descriptors with a surface of edges dsscp still TAKES on pe -- <unistd.h> pulls
+    # <io.h> and <process.h>, <sys/stat.h> pulls <io.h> and injects `S_ISBLK` -- on a
+    # COPY of the pe leg. ⚠ If a descriptor stops declaring one of these, the arms below
+    # go red by name: pick another edge dsscp takes, never delete the arm.
+    _rs_pe = json.loads(json.dumps(_pe_leg_for_oracle))
+    _rs_pe["build"]["referenceSurface"] = [
+        {"header": "unistd.h", "includes": ["io.h", "process.h"]},
+        {"header": "sys/stat.h", "includes": ["io.h"], "macros": ["S_ISBLK"]}]
+    _rs_shims, _rs_why = _rs_try(lambda: reference_surface_shims(_rs_pe), {})
 
     def _rs_directives(text):
         return [ln for ln in (text or "").splitlines() if ln.startswith("#")]
-    check("the pe64 surface derives exactly its three shims from the shipped descriptors",
-          sorted(_rs_shims) == ["direct.h", "dirent.h", "sys/stat.h"],
+    check("a pe surface of edges dsscp takes derives exactly its two shims from the shipped descriptors",
+          sorted(_rs_shims) == ["sys/stat.h", "unistd.h"],
           "got %r %s" % (sorted(_rs_shims), _rs_why))
-    check("...<direct.h> continues to the reference's own header, then takes dsscp's edge to <dirent.h>",
-          _rs_directives(_rs_shims.get("direct.h"))
-          == ["#include_next <direct.h>", "#include <dirent.h>"],
-          "%r" % _rs_shims.get("direct.h"))
-    check("...<dirent.h> takes dsscp's edge to <windows.h>",
-          _rs_directives(_rs_shims.get("dirent.h"))
-          == ["#include_next <dirent.h>", "#include <windows.h>"],
-          "%r" % _rs_shims.get("dirent.h"))
-    check("...and <sys/stat.h> gains the S_ISLNK dsscp injects on pe, its body read from the descriptor",
+    check("...<unistd.h> continues to the reference's own header, then takes dsscp's edges to <io.h> and <process.h>",
+          _rs_directives(_rs_shims.get("unistd.h"))
+          == ["#include_next <unistd.h>", "#include <io.h>", "#include <process.h>"],
+          "%r" % _rs_shims.get("unistd.h"))
+    check("...and <sys/stat.h> gains the S_ISBLK dsscp injects on pe, its body read from the descriptor, then its edge",
           _rs_directives(_rs_shims.get("sys/stat.h"))
-          == ["#include_next <sys/stat.h>", "#define S_ISLNK(m) (0)"],
+          == ["#include_next <sys/stat.h>", "#define S_ISBLK(m) (((m) & 61440) == 12288)",
+              "#include <io.h>"],
           "%r" % _rs_shims.get("sys/stat.h"))
-    check("the shipped pe64 surface has no lint finding (the control)",
-          reference_surface_findings(_pe_leg_for_oracle) == [],
-          "%r" % reference_surface_findings(_pe_leg_for_oracle))
+    check("that surface has no lint finding (the control)",
+          reference_surface_findings(_rs_pe) == [], "%r" % reference_surface_findings(_rs_pe))
+    check("the SHIPPED pe leg declares no surface, and so gets no shims and no finding",
+          "referenceSurface" not in _pe_leg_for_oracle["build"]
+          and reference_surface_shims(_pe_leg_for_oracle) == {}
+          and reference_surface_findings(_pe_leg_for_oracle) == [])
     check("a leg that declares no surface gets no shims and no finding (the ELF control)",
           reference_surface_shims(legs[0]) == {}
           and reference_surface_findings(legs[0]) == [])
+
+    # ── build.tuPreludes: the SHIPPED pe declaration lints clean, the ELF leg
+    # declares none, and each way a declaration can be wrong is a finding that
+    # names the key (the shape rules are the generator's own check_tu_preludes).
+    check("the shipped pe leg declares a TU prelude for ext/misc/fileio.c and it lints clean",
+          [e.get("tu") for e in _pe_leg_for_oracle["build"].get("tuPreludes", [])]
+          == ["ext/misc/fileio.c"] and tu_prelude_findings(_pe_leg_for_oracle) == [],
+          "%r" % tu_prelude_findings(_pe_leg_for_oracle))
+    check("a leg that declares no TU prelude has no finding (the ELF control)",
+          "tuPreludes" not in legs[0]["build"] and tu_prelude_findings(legs[0]) == [])
+
+    def _tp_findings_for(entries):
+        _l = json.loads(json.dumps(_pe_leg_for_oracle))
+        _l["build"]["tuPreludes"] = entries
+        return tu_prelude_findings(_l)
+    _tp_ok = {"tu": "ext/misc/fileio.c", "artifacts": ["testfixture"],
+              "lines": ["#include <dirent.h>"]}
+    for _tp_why, _tp_bad in (
+            ("an EMPTY declaration (a second spelling of none)", []),
+            ("a line that is CODE, not a directive", [dict(_tp_ok, lines=["int x;"])]),
+            ("a QUOTED include (searched from the wrapper's directory)",
+             [dict(_tp_ok, lines=['#include "windirent.h"'])]),
+            ("an artefact this driver does not build", [dict(_tp_ok, artifacts=["libsqlite3"])]),
+            ("one artefact named twice", [dict(_tp_ok, artifacts=["testfixture", "testfixture"])]),
+            ("an absolute TU path", [dict(_tp_ok, tu="/src/fileio.c")]),
+            ("one TU declared twice", [_tp_ok, dict(_tp_ok)])):
+        _tp_f = _tp_findings_for(_tp_bad)
+        check("build.tuPreludes: %s is a finding naming the key" % _tp_why,
+              bool(_tp_f) and all("build.tuPreludes" in f for f in _tp_f), "%r" % _tp_f)
 
     def _rs_findings_for(leg, surface, config_dir=None):
         _l = json.loads(json.dumps(leg))
@@ -13064,15 +13486,22 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     # ★ KEYED ON THE LEG'S FORMAT, NEVER ON THE HOST, and shown on the SHIPPED
     # descriptors in all three places a format decides: whether the header is
     # served at all, whether an edge is taken, and which macro body is injected.
+    # Each refusal arm below carries exactly ONE fault: its entry is otherwise one dsscp
+    # takes on pe (an unconditional or pe edge the shipped descriptors declare).
     _rs_elf = json.loads(json.dumps(legs[0]))
-    _rs_elf["build"]["referenceSurface"] = [{"header": "direct.h",
-                                             "includes": ["dirent.h"]}]
+    _rs_elf["build"]["referenceSurface"] = [{"header": "windows.h",
+                                             "includes": ["stdlib.h"]}]
     _rs_f = reference_surface_findings(_rs_elf)
-    check("a pe-only header declared on an ELF leg is REFUSED: dsscp serves <direct.h> on no ELF target",
-          any("<direct.h>" in f and "not available on format kind 'elf'" in f
+    check("a pe-only header declared on an ELF leg is REFUSED: dsscp serves <windows.h> on no ELF target",
+          any("<windows.h>" in f and "not available on format kind 'elf'" in f
               for f in _rs_f), "%r" % _rs_f)
     check("...and generating it RAISES rather than writing a shim dss would not have",
           _raises(lambda: reference_surface_shims(_rs_elf)))
+    check("...while the pe leg takes that same unconditional edge (the control)",
+          _rs_findings_for(_pe_leg_for_oracle,
+                           [{"header": "windows.h", "includes": ["stdlib.h"]}]) == [],
+          "%r" % _rs_findings_for(_pe_leg_for_oracle,
+                                  [{"header": "windows.h", "includes": ["stdlib.h"]}]))
     _rs_f = _rs_findings_for(legs[0], [{"header": "sys/stat.h",
                                         "includes": ["io.h"]}])
     check("an edge dsscp takes only on pe is REFUSED on an ELF leg, on a header served on both",
@@ -13083,38 +13512,44 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                            [{"header": "sys/stat.h", "includes": ["io.h"]}]) == [])
     _rs_elf_macro = json.loads(json.dumps(legs[0]))
     _rs_elf_macro["build"]["referenceSurface"] = [{"header": "sys/stat.h",
-                                                   "macros": ["S_ISLNK"]}]
+                                                   "macros": ["S_ISBLK"]}]
     _rs_elf_shims, _rs_why = _rs_try(
         lambda: reference_surface_shims(_rs_elf_macro), {})
-    check("...and the same macro declaration renders the ELF body on an ELF leg: the format picks the arm",
+    check("...and the same macro declaration renders the ELF body on an ELF leg (24576, where pe's is 12288): the format picks the arm",
           _rs_directives(_rs_elf_shims.get("sys/stat.h"))
           == ["#include_next <sys/stat.h>",
-              "#define S_ISLNK(m) (((m) & 61440) == 40960)"],
+              "#define S_ISBLK(m) (((m) & 61440) == 24576)"],
           "%r %s" % (_rs_elf_shims, _rs_why))
     for _surface, _needle, _what in (
             ([{"header": "direct.h", "includes": ["stdio.h"]}], "<stdio.h>",
              "an edge the descriptor does not declare"),
             ([{"header": "sys/stat.h", "macros": ["S_ISSOCK"]}], "S_ISSOCK",
              "a macro dsscp injects on no pe arm"),
-            ([{"header": "direct.h", "includes": ["dirent.h"], "defines": ["X"]}],
+            ([{"header": "unistd.h", "includes": ["io.h"], "defines": ["X"]}],
              "unknown key(s) defines", "an entry key nothing reads"),
-            ([{"header": "no-such-header.h", "includes": ["dirent.h"]}],
+            ([{"header": "no-such-header.h", "includes": ["io.h"]}],
              "no shipped descriptor", "a header dsscp ships no descriptor for"),
-            ([{"header": "../direct.h", "includes": ["dirent.h"]}],
-             "'../direct.h'", "a header name that climbs out of the descriptor tree"),
-            ([{"header": "direct.h"}], "neither includes nor macros",
+            ([{"header": "../unistd.h", "includes": ["io.h"]}],
+             "'../unistd.h'", "a header name that climbs out of the descriptor tree"),
+            ([{"header": "unistd.h"}], "neither includes nor macros",
              "an entry that adds nothing"),
-            ([{"header": "direct.h", "includes": ["dirent.h"]},
-              {"header": "direct.h", "includes": ["dirent.h"]}], "second time",
+            ([{"header": "unistd.h", "includes": ["io.h"]},
+              {"header": "unistd.h", "includes": ["io.h"]}], "second time",
              "the same header declared twice"),
             ([], "non-empty list", "an empty surface"),
     ):
         _rs_f = _rs_findings_for(_pe_leg_for_oracle, _surface)
         check("the surface lint REFUSES %s" % _what,
               any(_needle in f for f in _rs_f), "%r" % _rs_f)
+    _own_rs = "\n".join(oracle_report_lines(
+        _rs_pe, _elf_ref, "/out/reference-testfixture",
+        {"path": "/out/pe64/reference-testfixture.exe",
+         "cc": "x86_64-w64-mingw32-gcc", "triple": "x86_64-w64-mingw32"}))
     check("a leg whose oracle carries dsscp's declared edges SAYS so in its report, naming each header",
-          "declared header edges" in _own and "<direct.h>" in _own
-          and "<dirent.h>" in _own and "<sys/stat.h>" in _own, _own)
+          "declared header edges" in _own_rs and "<unistd.h>" in _own_rs
+          and "<sys/stat.h>" in _own_rs, _own_rs)
+    check("...and the SHIPPED pe leg, which declares none, does not claim any",
+          "declared header edges" not in _own, _own)
     _own_elf = "\n".join(oracle_report_lines(
         legs[0], _elf_ref, "/out/reference-testfixture",
         {"path": "/out/elf64/reference-testfixture", "cc": "cc",
@@ -13224,14 +13659,14 @@ def self_test(path=CATALOGUE, out=sys.stdout):
             return sorted(os.path.relpath(os.path.join(dp, f), d).replace(os.sep, "/")
                           for dp, _dn, fs in os.walk(d) for f in fs)
         check("the writer puts exactly the declared shims under one directory",
-              _rs_files(_rs_d1) == ["direct.h", "dirent.h", "sys/stat.h"],
+              _rs_files(_rs_d1) == ["sys/stat.h", "unistd.h"],
               "%r" % _rs_files(_rs_d1))
         check("...named by its own content: the same declaration lands in the same place",
               write_reference_surface(_rs_shims, _rs_out) == _rs_d1)
         _rs_fewer = dict((k, v) for k, v in _rs_shims.items() if k != "sys/stat.h")
         _rs_d2 = write_reference_surface(_rs_fewer, _rs_out)
         check("...and a changed declaration in ANOTHER, so a shim an earlier build wrote can never sit on this build's include path",
-              _rs_d2 != _rs_d1 and _rs_files(_rs_d2) == ["direct.h", "dirent.h"],
+              _rs_d2 != _rs_d1 and _rs_files(_rs_d2) == ["unistd.h"],
               "%r / %r" % (_rs_d2, _rs_d1))
         if _rs_d1:
             with open(os.path.join(_rs_d1, "stray.h"), "w", encoding="utf-8") as _fh:
@@ -13258,8 +13693,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         os.makedirs(_rs_pe_dir)
         (_rs_rep, _rs_rc, _rs_notes), _rs_why = _rs_try(
             lambda: build_reference_oracle(
-                _pe_leg_for_oracle, _rs_manifest,
-                os.path.join(_rs_pe_dir, reference_oracle_name(_pe_leg_for_oracle)),
+                _rs_pe, _rs_manifest,
+                os.path.join(_rs_pe_dir, reference_oracle_name(_rs_pe)),
                 os.path.join(_rs_pe_dir, "reference-oracle.log"),
                 runner=lambda argv: (0, "x86_64-w64-mingw32\n"),
                 which=lambda name: "/fixture/bin/" + name, spawn=_rs_spawn),
@@ -13274,7 +13709,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               "rc=%r report=%r argv=%r notes=%r"
               % (_rs_rc, _rs_rep, _rs_argv, _rs_notes))
         check("...and its report names the headers and the tree they were read from",
-              _rs_rep.get("referenceSurface") == ["direct.h", "dirent.h", "sys/stat.h"]
+              _rs_rep.get("referenceSurface") == ["sys/stat.h", "unistd.h"]
               and bool(_rs_rep.get("referenceSurfaceConfig"))
               and os.path.isfile(os.path.join(_rs_sd, "sys", "stat.h")),
               "%r" % (_rs_rep,))
@@ -13616,6 +14051,48 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         _t = [t for t in _a["tus"] if t["tu"] == _tu_up][0]
         check("an amnesty is REFUSED when %s" % _what,
               _t["attribution"] == "unattributable", "%s -> %r" % (_what, _t))
+    # ★ A TU COMPILED THROUGH A GENERATED PRELUDE WRAPPER (`build.tuPreludes`): the
+    # manifest names the WRAPPER, while a diagnostic raised inside the real TU names the
+    # REAL file. Both compilers compiled it, so its verdict is the MEASURED one -- never
+    # "unattributable, the reference was never asked" for a TU the reference was asked
+    # about. The wrapper is the generator's own, written by its own `apply_tu_preludes`.
+    import tempfile as _tf_wr
+    _wr_dir = _tf_wr.mkdtemp(prefix="dss-wrapper-attr-")
+    try:
+        _wr_real = os.path.join(_wr_dir, "s", "ext", "misc", "fileio.c")
+        os.makedirs(os.path.dirname(_wr_real))
+        with open(_wr_real, "w", encoding="utf-8") as _fh:
+            _fh.write("int dss_wrapper_attr;\n")
+        _wr_n = normalise_tu_path(_wr_real)
+        _wr_sources, _wr_notes = _manifest_generator().apply_tu_preludes(
+            [_wr_real, _tu_dss], [{"tu": "ext/misc/fileio.c", "artifacts": ["testfixture"],
+                                   "lines": ["#include <dirent.h>"]}],
+            "testfixture", _wr_dir)
+        _wr_dss = _dss_log.replace(_tu_up, _wr_n)
+        _wr_att = attribute_build_failure(_wr_dss, _ref_log.replace(_tu_up, _wr_n),
+                                          "build-failed", _wr_sources, _decs, "L")
+        _wr_t = [t for t in _wr_att["tus"] if t["tu"] == _wr_n]
+        check("a TU the manifest names through its prelude WRAPPER is attributed against the "
+              "reference -- the same UPSTREAM verdict as when it is named directly",
+              normalise_tu_path(_wr_sources[0]) != _wr_n and len(_wr_t) == 1
+              and _wr_t[0]["attribution"] == "upstream", "%r %r" % (_wr_sources, _wr_t))
+        _wr_ok = attribute_build_failure(_wr_dss, "cc -o ref\n", "built", _wr_sources, _decs, "L")
+        _wr_t2 = [t for t in _wr_ok["tus"] if t["tu"] == _wr_n]
+        check("...and a wrapped TU the reference BUILT that dss rejects is charged to dss as "
+              "ACCEPTED-what-dss-rejected, never as a TU the reference was not asked about",
+              len(_wr_t2) == 1 and _wr_t2[0]["attribution"] == "dss"
+              and "ACCEPTED what dss rejected" in _wr_t2[0]["why"], "%r" % (_wr_t2,))
+        _wr_forged = os.path.join(_wr_dir, "forged", "tu-preludes", "0123456789abcdef",
+                                  "ext", "misc", "fileio.c")
+        os.makedirs(os.path.dirname(_wr_forged))
+        with open(_wr_forged, "w", encoding="utf-8") as _fh:
+            _fh.write('#include "%s"\n' % _wr_n)
+        check("a wrapper-shaped source the generator did not write is REFUSED by name, never "
+              "mapped to a guessed TU",
+              _raises(lambda: attribute_build_failure(_wr_dss, _ref_log, "build-failed",
+                                                      [_wr_forged, _tu_dss], _decs, "L")))
+    finally:
+        shutil.rmtree(_wr_dir, ignore_errors=True)
     # An unreadable reference log (a shape this reader does not know) must SAY so
     # and still refuse every amnesty — a silent empty parse would deny amnesties
     # for a reason no reader could see.
@@ -13633,8 +14110,165 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               dict(_row_up, pattern=r"ext/misc/fileio\.c"))))
     check("the lint REFUSES a `build-tu` row with no `upstreamSubjects` key, "
           "because missing cannot be told from empty",
-          any("upstreamSubjects" in f for f in build_tu_row_findings("L", 
+          any("upstreamSubjects" in f for f in build_tu_row_findings("L",
               {k: v for k, v in _row_up.items() if k != "upstreamSubjects"})))
+    # ── THE ROUND-CLOSE RECOMPILE'S PER-TU CENSUS (`recompile_verdicts`) ─────
+    # Every arm drives the REAL census over synthetic logs in the two compilers' own
+    # shapes; the summary line is compared EXACTLY, because a round close reads it.
+    _rc_a, _rc_b, _rc_d = "C:/s/src/alter.c", "C:/s/src/test1.c", "C:/s/src/where.c"
+    _rc_h = "C:/s/src/sqliteInt.h"
+    # Header paths travel through format arguments: a literal `<name>.h:<line>` here would read as a
+    # positional citation to the plan-citations guard, which is lexical by design.
+    _rc_tcl, _rc_btree = "C:/s/tclinc/tcl.h", "C:/s/src/btreeInt.h"
+    _rc_src = [_rc_a, _rc_b, _rc_d]
+
+    def _rc_dss(*diags):
+        """A dsscp log: each (severity, code, file, line, subject)."""
+        return "".join("%s[%s]: [target=x86_64:pe64-x86_64-windows-exec] %s\n  --> %s:%d:5\n   |\n"
+                       % (sev, code, subj, f, ln) for sev, code, f, ln, subj in diags)
+
+    _rc_clean_dss = ("dsscp: artifact x86_64:pe64-x86_64-windows-exec C:/o/testfixture.exe\n"
+                     + _rc_dss(("info", "P_SchemaCursorDesync", _rc_tcl, 63, "desync"),
+                               ("warning", "H_UnknownLinkageSpecifier", _rc_a, 12, "linkage"))
+                     + "info[P_DiagnosticsElided]: P000D (P_SchemaCursorDesync) diagnostics were "
+                       "ELIDED and NOT shown, so any count you have for this code is a FLOOR and not "
+                       "a total: 0 coalesced past the per-code cap of 50, 45 dropped as recent "
+                       "duplicates. Raise the cap above 50 to see them.\n"
+                       "  --> %s:63:1\n" % _rc_tcl)
+    _rc_clean_ref = ("gcc -o ref.exe %s\n%s: In function 'f':\n%s:40:3: warning: unused variable "
+                     "'x' [-Wunused-variable]\n" % (" ".join(_rc_src), _rc_d, _rc_d))
+    _rc = recompile_verdicts(_rc_src, _rc_clean_dss, "built", _rc_clean_ref, "built", "L")
+    check("recompile: a clean pair -- every TU accepted, a dedup-only elision marker (the shape a "
+          "CLEAN pe64 build carries) is NOT a reason, and the summary line is exact",
+          _rc["clean"] and not _rc["incomplete"]
+          and [t["verdict"] for t in _rc["tus"]] == ["accepted"] * 3
+          and recompile_summary_line(_rc)
+          == "recompile: L tus=3 reference_ok=3 dss_ok=3 blockers=0"
+          and _rc["tus"][2]["reference"]["warnings"] == 1
+          and _rc["tus"][0]["dss"]["warnings"] == 1, "%r" % (_rc,))
+    _rc_blk_dss = _rc_dss(("error", "S_ConstViolation", _rc_b, 4335,
+                           "increment or decrement of `objv`, a const-qualified object"))
+    _rc_blk = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", _rc_clean_ref, "built", "L")
+    _rc_blk_lines = recompile_report_lines(_rc_blk)
+    check("recompile: a TU the reference BUILT and dsscp refused is a BLOCKER, COUNTED in the "
+          "summary, the census not clean, and its first dsscp error printed under it",
+          [t["verdict"] for t in _rc_blk["tus"]] == ["accepted", "BLOCKER", "accepted"]
+          and _rc_blk["counts"] == {"tus": 3, "referenceOk": 3, "dssOk": 2, "blockers": 1}
+          and not _rc_blk["clean"] and not _rc_blk["incomplete"]
+          and _rc_blk_lines[-1] == "recompile: L tus=3 reference_ok=3 dss_ok=2 blockers=1"
+          and any("S_ConstViolation" in ln and "4335" in ln for ln in _rc_blk_lines),
+          "%r\n%s" % (_rc_blk["counts"], "\n".join(_rc_blk_lines)))
+    _rc_both_ref = ("gcc -o ref.exe x\n%s: In function 'g':\n%s:4335:9: error: increment of "
+                    "read-only parameter 'objv'\n" % (_rc_b, _rc_b))
+    _rc_both = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", _rc_both_ref, "build-failed", "L")
+    check("recompile: a TU BOTH compilers refuse is not a blocker, and the census stays clean",
+          [t["verdict"] for t in _rc_both["tus"]] == ["accepted", "rejected-by-both", "accepted"]
+          and _rc_both["counts"]["blockers"] == 0 and _rc_both["clean"], "%r" % (_rc_both,))
+    # gcc names a header error's TU only in its include chain: the outermost `from`.
+    _rc_chain_ref = ("gcc -o ref.exe x\n"
+                     "In file included from %s:3,\n"
+                     "                 from %s:14:\n"
+                     "%s:10:5: error: unknown type name 'u99'\n"
+                     "%s:11:5: error: unknown type name 'u98'\n"
+                     "%s:7:1: warning: no newline\n"
+                     "In file included from %s:5:\n"
+                     "%s:9:1: error: redefinition of 'q'\n"
+                     % (_rc_btree, _rc_d, _rc_h, _rc_h, _rc_a, _rc_a, _rc_b))
+    _rc_rows = [(tu, r["file"], r["severity"]) for tu, r in reference_tu_rows(
+        _rc_chain_ref, recompile_tu_index(_rc_src)[1])]
+    check("recompile: gcc's include chain places a HEADER error in the TU that included it, a "
+          "chain-less repeat in the same file stays in that TU, a TU-located line switches TU, and "
+          "a chain wins over the row's own file even when that file is itself a TU",
+          _rc_rows == [(_rc_d, _rc_h, "error"), (_rc_d, _rc_h, "error"), (_rc_a, _rc_a, "warning"),
+                       (_rc_a, _rc_b, "error")], "%r" % (_rc_rows,))
+    _rc_unpl_ref = "gcc -o ref.exe x\n%s:10:5: error: unknown type name 'u99'\n" % _rc_h
+    _rc_unpl = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", _rc_unpl_ref, "build-failed", "L")
+    check("recompile: a reference error in a header with NO chain is UNPLACED and the census is "
+          "INCOMPLETE -- never charged to a guessed TU",
+          len(_rc_unpl["unplacedReference"]) == 1 and not _rc_unpl["clean"]
+          and any("could not be placed" in w for w in _rc_unpl["incomplete"]), "%r" % (_rc_unpl,))
+    _rc_hdr = recompile_verdicts(_rc_src, _rc_dss(("error", "S_TypeMismatch", _rc_h, 10, "u99")),
+                                 "errors", _rc_clean_ref, "built", "L")
+    check("recompile: a dsscp error located in a HEADER (dsscp names no include chain) is UNPLACED "
+          "and the census is INCOMPLETE, though no TU row shows an error",
+          _rc_hdr["counts"]["blockers"] == 0 and len(_rc_hdr["unplacedDss"]) == 1
+          and not _rc_hdr["clean"]
+          and any("no include chain" in w for w in _rc_hdr["incomplete"])
+          and any(ln.startswith("[L]   UNPLACED dsscp error[S_TypeMismatch]")
+                  for ln in recompile_report_lines(_rc_hdr)), "%r" % (_rc_hdr,))
+    for _rc_mark, _rc_why in (
+            ("error[P_TooManyDiagnostics]: too many diagnostics (1000); 12 more not shown\n",
+             "GLOBAL cap"),
+            ("info[P_DiagnosticsElided]: P0B01 (S_TypeMismatch) diagnostics were ELIDED and NOT "
+             "shown: 7 coalesced past the per-code cap of 50, 0 dropped as recent duplicates.\n",
+             "COALESCED 7"),
+            ("info[P_DiagnosticsElided]: the elision prose changed shape\n", "cannot read")):
+        _rc_e = recompile_verdicts(_rc_src, _rc_blk_dss + _rc_mark, "errors", _rc_clean_ref,
+                                   "built", "L")
+        check("recompile: an elision marker that may hide a TU (%s) makes the census INCOMPLETE"
+              % _rc_why, not _rc_e["clean"] and any(_rc_why in w for w in _rc_e["incomplete"]),
+              "%r" % (_rc_e["incomplete"],))
+    for _rc_args, _rc_why in (
+            ((_rc_clean_dss, "failed", _rc_clean_ref, "built", "no artefact reported"),
+             "NO usable artefact"),
+            (("dsscp: compile time 1s\n", "errors", _rc_clean_ref, "built", ""),
+             "parsed none"),
+            ((_rc_blk_dss, "built", _rc_clean_ref, "built", ""), "yet 1 error"),
+            ((_rc_clean_dss, "built", _rc_clean_ref, "no-reference-compiler", ""),
+             "NO REFERENCE RAN"),
+            ((_rc_clean_dss, "built", _rc_clean_ref, "", ""), "NO REFERENCE RAN"),
+            ((_rc_clean_dss, "built", _rc_both_ref, "built", ""), "the reference BUILT, yet"),
+            ((_rc_clean_dss, "built", "gcc: fatal error: no input files\n", "build-failed", ""),
+             "cannot read")):
+        _rc_i = recompile_verdicts(_rc_src, _rc_args[0], _rc_args[1], _rc_args[2], _rc_args[3],
+                                   "L", _rc_args[4])
+        check("recompile: INCOMPLETE when %s" % _rc_why,
+              not _rc_i["clean"] and any(_rc_why in w for w in _rc_i["incomplete"]),
+              "%r" % (_rc_i["incomplete"],))
+    _rc_nr = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", "", "no-reference-compiler", "L")
+    check("recompile: with NO reference, every TU is `no-reference` -- none counted as accepted by a "
+          "reference that never ran, none a blocker -- and the census is not clean",
+          [t["verdict"] for t in _rc_nr["tus"]] == ["no-reference"] * 3
+          and _rc_nr["counts"] == {"tus": 3, "referenceOk": 0, "dssOk": 2, "blockers": 0}
+          and not _rc_nr["clean"]
+          and recompile_summary_line(_rc_nr)
+          == "recompile: L tus=3 reference_ok=0 dss_ok=2 blockers=0", "%r" % (_rc_nr,))
+    _rc_link = recompile_verdicts(
+        _rc_src, _rc_dss(("error", "S_ConstViolation", _rc_a, 3, "x")), "errors",
+        "gcc -o ref.exe x\nC:/mingw/bin/ld.exe: a.o:alter.c:(.text+0x1): undefined reference to "
+        "`zz'\ncollect2.exe: error: ld returned 1 exit status\n", "build-failed", "L")
+    check("recompile: a reference that failed only at LINK compiled every TU, so a TU dsscp "
+          "refuses is a BLOCKER (not an unreadable log)",
+          _rc_link["counts"]["referenceOk"] == 3 and _rc_link["counts"]["blockers"] == 1
+          and not _rc_link["incomplete"], "%r" % (_rc_link,))
+    check("recompile: a TU the manifest lists twice, and a build outcome outside the vocabulary, "
+          "are REFUSED",
+          _raises(lambda: recompile_tu_index([_rc_a, _rc_a.replace("/", "\\")]))
+          and _raises(lambda: recompile_verdicts(_rc_src, "", "maybe", "", "built", "L")))
+    import tempfile as _tf_rc
+    _rc_dir = _tf_rc.mkdtemp(prefix="dss-recompile-")
+    try:
+        _rc_real = os.path.join(_rc_dir, "s", "ext", "misc", "fileio.c")
+        os.makedirs(os.path.dirname(_rc_real))
+        with open(_rc_real, "w", encoding="utf-8") as _fh:
+            _fh.write("int dss_recompile_census;\n")
+        _rc_rn = normalise_tu_path(_rc_real)
+        _rc_wsrc, _rc_wnotes = _manifest_generator().apply_tu_preludes(
+            [_rc_a, _rc_real], [{"tu": "ext/misc/fileio.c", "artifacts": ["testfixture"],
+                                 "lines": ["#include <dirent.h>"]}], "testfixture", _rc_dir)
+        _rc_wrapper = normalise_tu_path(_rc_wsrc[1])
+        _rc_w = recompile_verdicts(
+            _rc_wsrc, _rc_dss(("error", "S_UnknownType", _rc_rn, 296, "LPFILETIME")), "errors",
+            "gcc -o r x\nIn file included from %s:5:\n%s:296:3: error: unknown type name "
+            "'LPFILETIME'\n" % (_rc_wrapper, _rc_rn), "build-failed", "L")
+        check("recompile: a TU compiled through its prelude WRAPPER is ONE row under its REAL path; "
+              "dsscp's error in the real file and gcc's (reached through the wrapper's chain) meet "
+              "in it",
+              _rc_wrapper != _rc_rn and [t["tu"] for t in _rc_w["tus"]] == [_rc_a, _rc_rn]
+              and _rc_w["tus"][1]["verdict"] == "rejected-by-both" and _rc_w["clean"],
+              "%r" % (_rc_w,))
+    finally:
+        shutil.rmtree(_rc_dir, ignore_errors=True)
     # A mistyped match kind must be REFUSED, never defaulted — a row meant for an
     # abort that quietly became a unit row excuses nothing and reads as coverage.
     check("an unknown `matches` value RAISES rather than defaulting to `unit`",
@@ -17327,24 +17961,33 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                      r for r in e.get("requires", [])
                      if "ld-linux" not in r.get("path", "")])),
              _interp_cross_check),
-            # ★ RED ON DISABLE FOR build.referenceSurface
-            # on the SHIPPED catalogue and the SHIPPED descriptors: an edge they
-            # do not declare, a macro dsscp injects on no pe arm, and the pe edges
-            # on a leg whose format takes none of them. Each would hand a
-            # reference a header graph dss does not have.
+            # ★ RED ON DISABLE FOR build.referenceSurface, against the SHIPPED
+            # descriptors. No shipped leg declares a surface since 2026-09-23 (the
+            # pe leg's three edges left dsscp's descriptors), so each row ADDS one
+            # carrying exactly one fault: an edge the descriptor does not declare,
+            # a macro dsscp injects on no pe arm, and an edge dsscp takes only on
+            # pe declared on a leg whose format does not take it. Each would hand
+            # a reference a header graph dss does not have.
             ("windows", "referenceSurface",
              "a surface edge dsscp's descriptor does not declare",
-             lambda l: [e.update(includes=["stdio.h"])
-                        for e in l["build"]["referenceSurface"]
-                        if e.get("header") == "direct.h"]),
+             lambda l: l["build"].update(referenceSurface=[
+                 {"header": "unistd.h", "includes": ["stdio.h"]}])),
             ("windows", "referenceSurface",
              "a surface macro dsscp injects on no pe arm",
-             lambda l: [e.update(macros=["S_ISSOCK"])
-                        for e in l["build"]["referenceSurface"]
-                        if e.get("header") == "sys/stat.h"]),
-            ("linux", "referenceSurface", "the pe surface declared on a Linux leg",
              lambda l: l["build"].update(referenceSurface=[
-                 {"header": "direct.h", "includes": ["dirent.h"]}])),
+                 {"header": "sys/stat.h", "macros": ["S_ISSOCK"]}])),
+            ("linux", "referenceSurface", "a pe-only edge declared on a Linux leg",
+             lambda l: l["build"].update(referenceSurface=[
+                 {"header": "unistd.h", "includes": ["io.h"]}])),
+            # ★ RED ON DISABLE FOR build.tuPreludes, on the SHIPPED pe declaration:
+            # a line of code smuggled into the prelude, and the prelude sent to an
+            # artefact the driver never builds (it would reach no build at all).
+            ("windows", "tuPreludes", "a TU prelude line that is code, not a directive",
+             lambda l: [e["lines"].append("int injected;")
+                        for e in l["build"].get("tuPreludes", [])]),
+            ("windows", "tuPreludes", "a TU prelude for an artefact the driver does not build",
+             lambda l: [e.update(artifacts=["libsqlite3"])
+                        for e in l["build"].get("tuPreludes", [])]),
         ):
             _os, _key, _variant, _mutate = _row[:4]
             _checker = _row[4] if len(_row) > 4 else lint
@@ -17630,6 +18273,23 @@ def main(argv=None):
                         "that TU AND an earned `matches: build-tu` row names it.")
     p.add_argument("--compile-log", default="", metavar="PATH",
                    help="dss's own build log for this leg")
+    # ── THE ROUND-CLOSE RECOMPILE'S PER-TU CENSUS ───────────────────────────
+    p.add_argument("--recompile-verdicts", default=None, metavar="LABEL",
+                   help="the round-close census: for EVERY TU of LABEL's manifest, "
+                        "did the reference accept it, did dsscp? Needs --manifest, "
+                        "--compile-log (dsscp's log), --dss-build (built | errors | "
+                        "failed, as the driver's build reader judged it), "
+                        "--oracle-log and --oracle-status (from THIS run's "
+                        "--build-reference-oracle). Prints a JSON report with the "
+                        "driver's report lines (the per-TU table, then ONE line "
+                        "`recompile: <leg> tus=N reference_ok=N dss_ok=N "
+                        "blockers=N`); rc 0 = no blocker and a census that saw "
+                        "everything, rc 3 = a blocker or an INCOMPLETE census.")
+    p.add_argument("--dss-build", default="", metavar="OUTCOME",
+                   help="dsscp's build outcome for --recompile-verdicts: %s"
+                        % " | ".join(RECOMPILE_DSS_BUILDS))
+    p.add_argument("--dss-build-detail", default="", metavar="TEXT",
+                   help="why dsscp's build `failed`, for --recompile-verdicts")
     p.add_argument("--oracle-status", default="", metavar="STATUS",
                    help="--build-reference-oracle's reported `status`, verbatim. "
                         "Only `built`/`build-failed` mean the control RAN; "
@@ -17928,6 +18588,7 @@ def main(argv=None):
             or args.resolve_target_cc or args.build_loadext_helper
             or args.oracle_report or args.build_reference_oracle
             or args.classify_abort or args.attribute_build
+            or args.recompile_verdicts
             or args.loadext_builder or args.tcl_coherence
             or args.run_filesystems or args.run_fidelities or args.run_dir_plan
             or args.corroborate_run_dir or args.measure_run_dir
@@ -17947,7 +18608,7 @@ def main(argv=None):
                 "--registry-controls / "
                 "--acquire / --acquire-plan / --resolve-library-argv / "
                 "--resolve-target-cc / --oracle-report / --classify-abort / "
-                "--attribute-build / "
+                "--attribute-build / --recompile-verdicts / "
                 "--build-reference-oracle / --build-loadext-helper / "
                 "--loadext-builder / --tcl-coherence / --run-filesystems / "
                 "--run-fidelities / "
@@ -18189,6 +18850,53 @@ def main(argv=None):
                 sys.stderr.write("%s\n" % line)
             sys.stdout.write(json.dumps(report) + "\n")
             return rc
+        if args.recompile_verdicts:
+            leg = leg_by_label(load_catalogue(args.catalogue),
+                               args.recompile_verdicts, args.catalogue)
+            for flag, value in (("--manifest", args.manifest),
+                                ("--compile-log", args.compile_log),
+                                ("--dss-build", args.dss_build),
+                                ("--oracle-log", args.oracle_log)):
+                if not value:
+                    p.error("--recompile-verdicts requires %s" % flag)
+            if not args.oracle_status:
+                p.error("--recompile-verdicts requires --oracle-status, verbatim from THIS "
+                        "run's --build-reference-oracle: a log left by another run would "
+                        "otherwise stand for a reference this run never ran.")
+            _texts = []
+            for _path, _what, _needed in (
+                    (args.compile_log, "dsscp's compile log", True),
+                    # A reference that did not RUN wrote no log (rc 4: no compiler on this
+                    # host targets the leg); the census then says NO REFERENCE RAN. One that
+                    # ran and left no readable log is refused like dsscp's.
+                    (args.oracle_log, "the reference oracle's log",
+                     args.oracle_status in ORACLE_STATUSES_ATTEMPTED)):
+                if not _needed:
+                    _texts.append("")
+                    continue
+                # UNREADABLE IS REFUSED, not read as empty: an empty dsscp log would
+                # read as a dsscp that refused nothing -- a census toward CLEAN.
+                try:
+                    with open(_path, "r", encoding="utf-8", errors="replace") as fh:
+                        _texts.append(fh.read())
+                except OSError as exc:
+                    raise LegError("--recompile-verdicts could not read %s at %s (%s)"
+                                   % (_what, _path, exc))
+            try:
+                with open(args.manifest, "r", encoding="utf-8") as fh:
+                    _sources = json.load(fh).get("sources")
+            except (OSError, ValueError) as exc:
+                raise LegError("--recompile-verdicts could not read the manifest %s (%s): it is "
+                               "the list of TUs the census is ABOUT" % (args.manifest, exc))
+            if not isinstance(_sources, list) or not _sources:
+                raise LegError("the manifest %s names no sources, so the census would count "
+                               "nothing and call it clean" % args.manifest)
+            _report = recompile_verdicts(_sources, _texts[0], args.dss_build, _texts[1],
+                                         args.oracle_status, leg.get("label"),
+                                         args.dss_build_detail)
+            _report["report"] = recompile_report_lines(_report)
+            sys.stdout.write(json.dumps(_report, indent=1, sort_keys=True) + "\n")
+            return 0 if _report["clean"] else 3
         if args.loadext_builder:
             sys.stdout.write("%s\n"
                              % loadext_helper_builder(args.helper_builder))

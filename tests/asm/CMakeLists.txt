@@ -449,3 +449,31 @@ target_link_libraries(dss_asm_test_asm_reference_accepted_spellings
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_reference_accepted_spellings
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P68 round 9 (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the program
+# counter as a memory base and a symbol as a displacement — `leaq msg(%rip)`,
+# `movl $5, counter(%rip)`, `msg+4` / `msg-8` — to the reference's bytes and
+# relocations through the SHIPPED dialect and target, the refusals (`%rip` as an
+# operand, an index beside it, a constant after a symbol outside a
+# displacement), and the red-on-disable arms that remove each declared fact.
+# Reads the shipped documents and mutates the target, so it must run through
+# ctest.
+dss_add_test(NAME asm/test_asm_pc_relative_memory
+             SOURCES test_asm_pc_relative_memory.cpp)
+target_link_libraries(dss_asm_test_asm_pc_relative_memory
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_pc_relative_memory
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P68 round 9 (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL): a `.s`
+# naming, by address, a symbol it does not define. The import is minted with
+# its code-vs-data kind PENDING for an address operand, a memory displacement
+# and a data slot; a call states code and settles an earlier address; a name
+# the file defines is never imported. Reads the shipped documents, so it must
+# run through ctest.
+dss_add_test(NAME asm/test_asm_undefined_symbol_reference
+             SOURCES test_asm_undefined_symbol_reference.cpp)
+target_link_libraries(dss_asm_test_asm_undefined_symbol_reference
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_undefined_symbol_reference
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

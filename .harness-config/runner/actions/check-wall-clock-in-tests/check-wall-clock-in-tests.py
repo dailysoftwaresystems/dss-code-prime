@@ -72,6 +72,7 @@ import io
 import os
 import re
 import sys
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 
 def _own_tree():

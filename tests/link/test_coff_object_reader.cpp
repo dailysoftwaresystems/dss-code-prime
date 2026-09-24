@@ -304,7 +304,13 @@ TEST(CoffObjectReader, DssWriterRoundTripReconstructsEveryFieldClass) {
                                "vs a dropped symbol parse)";
     ASSERT_NE(rGreet, nullptr);
     EXPECT_EQ(rAdd->bytes, add.bytes) << "`.text` sliced by sorted Value";
-    EXPECT_EQ(rGreet->bytes, greet.bytes);
+    // ★ The relocation FIELDS come back holding their addends, not the NOP
+    // filler. COFF keeps an addend in the patched field (`relocationAddends:
+    // inPlace`), so the writer stamps each relocation's addend (0 here) into
+    // its field. The filler bytes that used to survive there would have been
+    // READ AS ADDENDS by any COFF linker. The three fields (REL32 at 0, ADDR64
+    // over [4, 12), REL32 at 8) cover all 12 bytes, so all 12 are the addend 0.
+    EXPECT_EQ(rGreet->bytes, std::vector<std::uint8_t>(12, 0x00));
     EXPECT_TRUE(rAdd->relocations.empty());
 
     // -- `.text` relocations (offset relative to function start, kind mapped
@@ -740,10 +746,29 @@ TEST(CoffObjectReader, EmitOnlyAliasIsHonouredNotRefused) {
                     std::istreambuf_iterator<char>{});
     }
     ASSERT_FALSE(text.empty());
-    ASSERT_EQ(text.find("\"emitOnly\""), std::string::npos)
-        << "no shipped PE document declares an emission alias -- if one now "
-           "does, this fixture is no longer the 'plus one row' it claims to "
-           "be, and the gap it pins was no longer latent";
+    // ⓘ THE SHIPPED DOCUMENT NOW DECLARES AN EMISSION ALIAS OF ITS OWN (P68
+    // round 9): `IMAGE_REL_AMD64_REL32_RIPREL`, the target's `riprel32` written
+    // as REL32. So the gap this test pins is no longer latent, and the CONTROL
+    // below already reads through a real alias. The fixture stays "the shipped
+    // rows plus exactly one more". What is asserted here is that every alias
+    // the document ships shares the wire id of a row that DECODES, which is
+    // the only shape `relocationDecodeTable` accepts.
+    {
+        nlohmann::json const shipped = nlohmann::json::parse(text);
+        std::vector<std::uint32_t> decodable;
+        for (auto const& row : shipped.at("relocations")) {
+            if (!row.value("emitOnly", false)) {
+                decodable.push_back(row.at("nativeId").get<std::uint32_t>());
+            }
+        }
+        for (auto const& row : shipped.at("relocations")) {
+            if (!row.value("emitOnly", false)) continue;
+            EXPECT_NE(std::ranges::find(decodable, row.at("nativeId").get<std::uint32_t>()),
+                      decodable.end())
+                << "shipped emission alias '" << row.at("name").get<std::string>()
+                << "' names a wire id no decoding row owns";
+        }
+    }
 
     // CONTROL: unmodified, these bytes decode to kind 1. Without this the
     // assertion below could not be attributed to the added row.
@@ -2870,8 +2895,11 @@ TEST(CoffWeakExternalNative, RealMingwWeakAliasBindsBothNamesToOneBody) {
 // clang 18.1.3 emits the weak external for BOTH forms and BOTH windows triples.
 // The fixture below is the FUNCTION form, which is the half gcc gets right.
 //
-// ⚠⚠ AND THE OBJECT STILL DOES NOT READ — FOR A DIFFERENT, PRE-EXISTING REASON
-// THAT THIS PIN NOW NAMES INSTEAD OF HIDING. Flipping the weak arm exposed it:
+// ✅ RESOLVED P68 round 9: the long section name below is now read from the
+// string table, the object READS, and the pin was flipped as it asked. The
+// paragraph is kept because it is the measurement that named the blocker.
+// ⚠⚠ AND THE OBJECT STILL DID NOT READ — FOR A DIFFERENT, PRE-EXISTING REASON
+// THAT THIS PIN THEN NAMED INSTEAD OF HIDING. Flipping the weak arm exposed it:
 // mingw routes the address of `maybe` through a COMDAT indirection section
 // `.rdata$.refptr.maybe`, whose LONG name the reader surfaces unresolved as
 // `/15`, and the section-kind gate refuses a body it cannot classify. ✔MEASURED
@@ -2917,18 +2945,25 @@ TEST(CoffWeakExternalNative, RealMingwWeakUndefinedReferenceNoLongerRefusesOnWea
         << "and it must no longer cite the row that has been closed by carrying "
            "the missing fact";
 
-    // (2) THE REMAINING BLOCKER, PINNED BY NAME so it cannot be mistaken for the
-    // one above. When this goes red because `.refptr` gained a section kind, this
-    // test must FLIP to asserting the read and the import's Weak binding -- the
-    // same flip its own two predecessors made.
-    EXPECT_FALSE(got.has_value())
-        << "if a mingw `.refptr` object now reads, delete this expectation and "
-           "assert `externImports` carries `maybe` with SymbolBinding::Weak";
-    EXPECT_TRUE(sawDetail(rep, "no known code/data section kind"))
-        << "the ONLY refusal left on this object must be the section-kind gate on "
-           "mingw's `.rdata$.refptr.<name>` COMDAT indirection -- a pre-existing "
-           "limitation that fires on any object using `.refptr`, weak or not, and "
-           "is a loud refusal of the whole object rather than a silent drop.";
+    // (2) THE BLOCKER IS GONE, AND THE FLIP THIS TEST ASKED FOR IS MADE (P68
+    // round 9). The blocker was never `.refptr` itself. The section is
+    // `.rdata$.refptr.maybe`, longer than 8 bytes, so its header spells it
+    // "/15", a DECIMAL offset into the string table (PE/COFF §4). The reader
+    // read "/15" as the NAME, and a name that is not a section name resolves
+    // to no kind. With the header's long name decoded, the section resolves
+    // through its base name `.rdata` like any other, and the object reads.
+    ASSERT_TRUE(got.has_value())
+        << "a mingw `.refptr` object must read once its section's long name is "
+           "decoded; errors=" << rep.errorCount();
+    EXPECT_FALSE(sawDetail(rep, "no known code/data section kind"));
+    bool sawMaybe = false;
+    for (auto const& ext : got->externImports) {
+        if (ext.mangledName != "maybe") continue;
+        sawMaybe = true;
+        EXPECT_EQ(ext.binding, SymbolBinding::Weak)
+            << "`maybe` is a WEAK undefined reference: it may resolve to nothing";
+    }
+    EXPECT_TRUE(sawMaybe) << "the weak reference must read back as an import of `maybe`";
 #endif
 }
 

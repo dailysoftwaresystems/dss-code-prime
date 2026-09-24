@@ -52,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 
 def _own_tree():
@@ -427,7 +428,9 @@ def _pipe_arm() -> bool:
                   'sys.exit(m.main())\n' % os.path.abspath(__file__))
         env = dict(os.environ)
         env['PYTHONIOENCODING'] = 'cp1252'
-        p = subprocess.run([sys.executable, '-c', driver], cwd=root, env=env,
+        # `-B`: the child loads THIS file by path, which writes bytecode beside it -- into this
+        # action's directory -- unless the child is told not to (check-scripts-index clause 12b).
+        p = subprocess.run([sys.executable, '-B', '-c', driver], cwd=root, env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out = (p.stdout + p.stderr).decode('utf-8', 'replace')
         died = 'UnicodeEncodeError' in out

@@ -11,8 +11,8 @@
         { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" }
     ] }
   ],
-  "constants": [
-    { "name": "NULL", "value": 0, "type": "i64" }
+  "macros": [
+    { "name": "NULL", "replacement": "((void*)0)" }
   ],
   "symbols": [
     { "name": "strdup",  "signature": "fn(ptr<char>) -> ptr<char>",            "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },

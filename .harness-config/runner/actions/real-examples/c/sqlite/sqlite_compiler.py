@@ -10,10 +10,13 @@ that can be told what to do and still proves what it got:
   * `DSS_BIN`         an explicitly named binary is USED, never searched for; a name that is not a
                       file is a refusal (never silently replaced by a searched binary);
   * `SKIP_DSS_BUILD=1` reuse the eligible candidate, never build; none eligible is a refusal;
-  * default           refresh the located Release tree (`cmake --build <its tree> --config Release
-                      --target dsscp`), or configure and build `build/rel` when nothing is
-                      eligible. A FAILED refresh is FATAL -- falling back to the binary found is
-                      precisely the defect of a reused compiler older than the sources it compiles.
+  * default           refresh the located Release tree through ITS OWNER (`refresh_argv`): a tree
+                      DssHarness built for a leg whose toolchain declares a developer environment
+                      (MSVC) is rebuilt by `dssharness build --legs <that leg>`, which enters it;
+                      any other tree by `cmake --build <its tree> --config Release --target
+                      dsscp`. With nothing eligible, configure and build `build/rel`. A FAILED
+                      refresh is FATAL -- falling back to the binary found is precisely the defect
+                      of a reused compiler older than the sources it compiles.
 Every branch reaches ONE gate: the build type is READ from the binary's own tree (never inferred
 from a directory name or from the command that preceded it), printed beside the path, and a
 non-Release binary is refused unless `DSS_ALLOW_NONRELEASE_COMPILER` says otherwise -- which then
@@ -32,11 +35,13 @@ import datetime
 import importlib.util
 import os
 import re
+import shutil
 import sys
 
 import sqlite_common as C
 
-Candidate = collections.namedtuple("Candidate", ["path", "mtime", "type", "tree", "source", "detail"])
+Candidate = collections.namedtuple("Candidate", ["path", "mtime", "type", "tree", "source", "detail",
+                                                 "image"])
 Compiler = collections.namedtuple("Compiler", ["path", "type", "source", "detail", "tree", "origin",
                                                 "built", "build_type_note"])
 
@@ -45,6 +50,20 @@ Compiler = collections.namedtuple("Compiler", ["path", "type", "source", "detail
 # under a developer environment a plain refresh cannot reproduce, so it is named by DSS_BIN).
 SEARCH_ROOTS = ("build/rel", "build/dbg", "build-rel", "build", "build-dbg")
 BINARY_NAMES = ("dsscp.exe", "dsscp")
+# ★ THE COMPILER'S CODE IS NOT ALWAYS THE FILE THAT RUNS. The build puts it in a shared library of the
+# executable's own name beside a small launcher. ✔MEASURED 2026-09-22: `dsscp.exe` 11 KB, built 13:58,
+# beside `dsscp.dll` rebuilt 22:56 by a later build that left the launcher alone -- and the report said
+# "built 13:58" (the WSL tree's pair is `dsscp` + `libdsscp.so`). So a candidate's stamp is its CODE's:
+# the newest of these libraries that exist beside it, or the executable itself when none does (then it
+# IS the code). The launcher's own time is never the stamp -- it orders the candidates too, and a
+# rebuilt launcher over older code must not win the selection. ✔READ 2026-09-23, one spelling per
+# toolchain family this project builds with: MSVC `dsscp.dll`, MinGW `libdsscp.dll` (build/mig,
+# build/dbg), ELF `libdsscp.so` (the WSL tree), Mach-O `libdsscp.dylib`.
+COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")
+# DssHarness's own marker in a build directory it made: line 2 is the leg variant the tree was built
+# for (✔READ in build/x86_64-msvc-release: `clean`, then `x86_64-msvc-release`, then input digests).
+HARNESS_BUILD_MARKER = ".harness-build"
+HARNESS_NAMES = ("dssharness", "DssHarness")
 
 _BT_READER = None
 
@@ -100,11 +119,24 @@ def build_type(binary):
             detail = ("the cache also carries CMAKE_BUILD_TYPE=%s, which a MULTI-config generator "
                       "IGNORES -- it is not the answer here and is printed only so the "
                       "disagreement is visible" % bt.group(1).strip())
-    try:
-        mtime = os.path.getmtime(binary)
-    except OSError:
-        mtime = 0.0
-    return Candidate(os.path.abspath(binary), mtime, btype, tree, source, detail)
+    stamped = []
+    for image in image_files(binary):
+        try:
+            stamped.append((os.path.getmtime(image), image))
+        except OSError:
+            pass
+    mtime, image = max(stamped) if stamped else (0.0, os.path.abspath(binary))
+    return Candidate(os.path.abspath(binary), mtime, btype, tree, source, detail, image)
+
+
+def image_files(binary):
+    """The files holding the compiler's CODE: each `COMPANION_LIBRARIES` spelling of the executable's
+    own name that exists beside it -- or, when none does, the executable itself."""
+    path = os.path.abspath(binary)
+    folder = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    beside = [os.path.join(folder, pattern.format(stem=stem)) for pattern in COMPANION_LIBRARIES]
+    return [p for p in beside if os.path.isfile(p)] or [path]
 
 
 def is_release(btype):
@@ -171,11 +203,16 @@ def _stamp(t):
     return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S") if t else "<unknown>"
 
 
+def built_stamp(cand):
+    """When the candidate's CODE was built, naming the image file that says so."""
+    return "%s (%s)" % (_stamp(cand.mtime), os.path.basename(cand.image or cand.path))
+
+
 def format_candidates(cands):
     if not cands:
         return "        <none>"
     return "\n".join("        %s\n            build type: %s   built: %s\n            read from : %s"
-                     % (c.path, c.type, _stamp(c.mtime), c.source) for c in cands)
+                     % (c.path, c.type, built_stamp(c), c.source) for c in cands)
 
 
 def search_note(searched):
@@ -212,18 +249,103 @@ def refresh_located(tree, binary, built_when, jobs, invoke_build):
     return tree
 
 
-def _cmake_build(tree, jobs):
-    """The real refresh: an incremental Release build of the `dsscp` target, output to the log."""
-    C.LOG.info("cmake --build %s --config Release --target dsscp -j %d" % (tree, jobs))
-    r = C.capture(["cmake", "--build", tree, "--config", "Release", "--target", "dsscp",
-                   "-j", str(jobs)], merge=True)
+def harness_executable(environ=None):
+    """The DssHarness executable -> a path, or "" when none is installed: PATH first, then the tool
+    installer's own directory (`<home>/.dotnet/tools`), both spellings of the name -- the places the
+    root CMakeLists.txt's `find_program` searches, for the reason recorded there (the directory is on
+    a LOGIN path only, and the file's case followed the release). Both searches are `shutil.which`'s,
+    so the host's own executable suffixes (PATHEXT on Windows) decide the file name, as `find_program`
+    does -- no suffix is spelled here."""
+    env = os.environ if environ is None else environ
+    for name in HARNESS_NAMES:
+        hit = shutil.which(name, path=env.get("PATH", os.defpath))
+        if hit:
+            return hit
+    for var in ("HOME", "USERPROFILE"):
+        home = env.get(var, "")
+        if not home:
+            continue
+        for name in HARNESS_NAMES:
+            hit = shutil.which(name, path=os.path.join(home, ".dotnet", "tools"))
+            if hit:
+                return hit
+    return ""
+
+
+def _host_leg_os(host_os):
+    """The driver's host-OS word -> the word a DssHarness leg declares (`darwin` is `macos` there)."""
+    return {"darwin": "macos"}.get(host_os, host_os)
+
+
+def refresh_argv(repo_root, tree, jobs, host_os=None, harness=None):
+    """-> (argv, why): HOW a located Release tree is refreshed, decided by the tree's OWNER.
+
+    ★ A TREE DSSHARNESS BUILT FOR A LEG WHOSE TOOLCHAIN DECLARES A DEVELOPER ENVIRONMENT IS REBUILT BY
+    DSSHARNESS. ✔MEASURED (lane mig, 2026-09-22): without `DSS_BIN` on a Windows host, Step 5 selects
+    `build/x86_64-msvc-release` -- MSVC under the Visual Studio developer environment -- and a plain
+    `cmake --build` of it needs that environment whenever anything is stale (`cl.exe` finds no headers
+    without it), so the refresh failed. The tree's marker names the variant it was built for; the leg
+    declared for that variant on this host names its toolchain; the toolchain's `developerEnvironment`
+    in `.harness-config/config.json` says whether one is needed -- every fact read, none typed here.
+    ⚠ `dssharness build` builds the leg's whole project, and rebuilds from CLEAN when any input changed
+    (DssHarness report #2), so this refresh can cost a full MSVC build where an incremental `cmake
+    --build` would not -- that cost is the tool's to fix, and the instruction stays correct.
+    Every other tree -- no marker, a toolchain with no developer environment, or a variant no single
+    leg on this host declares -- is refreshed as it always was: `cmake --build <tree> --config Release
+    --target dsscp`, whose failure is as FATAL as the tool's."""
+    plain = (["cmake", "--build", tree, "--config", "Release", "--target", "dsscp", "-j", str(jobs)])
+    marker = os.path.join(tree, HARNESS_BUILD_MARKER)
+    try:
+        with open(marker, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return plain, "no DssHarness marker in the tree: a plain incremental build"
+    variant = lines[1].strip() if len(lines) > 1 else ""
+    cfg = _harness_config(repo_root, tree)
+    legs = cfg.get("legs") or {}
+    toolchains = cfg.get("toolchains") or {}
+    want_os = _host_leg_os(host_os or C.host_os())
+    named = sorted(name for name, leg in legs.items() if isinstance(leg, dict)
+                   and leg.get("os") == want_os
+                   and "%s-%s-%s" % (leg.get("processor"), leg.get("toolchain"), leg.get("config")) == variant)
+    if len(named) != 1:
+        return plain, ("DssHarness built this tree for variant %r, which %d declared leg(s) on this host "
+                       "name (%s): a plain incremental build" % (variant, len(named), ", ".join(named) or "none"))
+    leg = named[0]
+    toolchain = legs[leg].get("toolchain")
+    environment = (toolchains.get(toolchain) or {}).get("developerEnvironment")
+    if not environment:
+        return plain, ("DssHarness built this tree for leg %s, whose toolchain %s declares no developer "
+                       "environment: a plain incremental build" % (leg, toolchain))
+    exe = harness or harness_executable()
+    if not exe:
+        C.die("the located Release tree %s was built by DssHarness for leg %s, whose toolchain %s needs the "
+              "developer environment %r -- a plain `cmake --build` outside it cannot compile -- and no "
+              "DssHarness is installed here to enter it. Install it (`dotnet tool install --global "
+              "DssHarness`), name a compiler with DSS_BIN, or set SKIP_DSS_BUILD=1 to reuse one on purpose."
+              % (tree, leg, toolchain, environment))
+    return ([exe, "build", "--legs", leg, "-C", repo_root, "--no-prompt"],
+            "DssHarness built this tree for leg %s, whose toolchain %s needs the developer environment "
+            "%r: the tool rebuilds it inside that environment" % (leg, toolchain, environment))
+
+
+def _refresh_build(repo_root, tree, jobs, log=C.LOG):
+    """The real refresh: `refresh_argv`'s command for the tree, its output to the log -> its exit code."""
+    argv, why = refresh_argv(repo_root, tree, jobs)
+    log.info("refresh: %s" % why)
+    log.info(" ".join(argv))
+    r = C.capture(argv, merge=True)
     for line in C.last_lines(r.out, 30).splitlines():
-        C.LOG.info("   " + line)
+        log.info("   " + line)
     return r.rc
 
 
-def obtain(repo_root, jobs, allow_nonrelease, log=C.LOG, invoke_build=_cmake_build):
-    """-> Compiler: the one this run uses, by the union policy above, through the ONE gate."""
+def obtain(repo_root, jobs, allow_nonrelease, log=C.LOG, invoke_build=None):
+    """-> Compiler: the one this run uses, by the union policy above, through the ONE gate.
+    `invoke_build(tree, jobs) -> exit code` refreshes a located tree; by default through the tree's
+    owner (`refresh_argv`) -- injected by the contract tests, which drive this without a build."""
+    if invoke_build is None:
+        invoke_build = lambda tree, j: _refresh_build(repo_root, tree, j, log)  # noqa: E731
     origin = "origin UNSTATED — a branch of Step 5 did not say how it obtained this binary"
     info, cands, searched = None, [], []
     named = C.env("DSS_BIN").strip()
@@ -276,7 +398,7 @@ def obtain(repo_root, jobs, allow_nonrelease, log=C.LOG, invoke_build=_cmake_bui
         else:
             log.info("refreshing the located Release compiler (%s) — a located binary is not "
                      "evidence it was built from these sources" % info.tree)
-            refresh_located(info.tree, info.path, _stamp(info.mtime), jobs, invoke_build)
+            refresh_located(info.tree, info.path, built_stamp(info), jobs, invoke_build)
             # RE-READ rather than assume the build moved it: the timestamp reported must be the
             # one on disk NOW, and a build that landed elsewhere must not be reported as this one.
             cands, searched = find_candidates(repo_root)
@@ -286,7 +408,7 @@ def obtain(repo_root, jobs, allow_nonrelease, log=C.LOG, invoke_build=_cmake_bui
         C.die("no RELEASE dsscp binary after the build step.\n      %s\n      candidates found (build "
               "type read from each tree's CMakeCache.txt):\n%s"
               % (search_note(searched), format_candidates(cands)))
-    built = _stamp(info.mtime)
+    built = built_stamp(info)
     log.info("compiler  : %s  (built %s)" % (info.path, built))
     log.info("build type: %s" % info.type)
     log.info("  read from: %s" % info.source)
@@ -374,7 +496,20 @@ def assert_current(core, compiler, config_root, specs, rebuild_cmd, python=sys.e
 
 def rebuild_command(compiler, repo_root):
     """The rebuild instruction for THIS binary's own tree (never a spelling of where a Release
-    tree is usually kept -- a DSS_BIN from another checkout reaches this line too)."""
+    tree is usually kept -- a DSS_BIN from another checkout reaches this line too): the command
+    `refresh_argv` would run for it, so the advice and the refresh cannot disagree."""
     tree = compiler.tree or os.path.join(repo_root, "build", "rel")
-    return ("cmake --build %s --config Release --target dsscp   (or: dssharness build --legs "
-            "<a release leg>)" % tree)
+    argv, _why = refresh_argv(repo_root, tree, "<jobs>", harness=harness_executable() or "dssharness")
+    return " ".join(argv)
+
+
+def _harness_config(repo_root, tree):
+    """`.harness-config/config.json` of the tree under test -- REQUIRED once a tree carries DssHarness's
+    marker: which leg built it, and whether that leg needs a developer environment, are read there."""
+    ot = C.owning_tree_module()
+    try:
+        return ot.load_jsonc(os.path.join(repo_root, ".harness-config", "config.json"))
+    except ot.Refusal as exc:
+        C.die("the located Release tree %s was built by DssHarness, and how to refresh it is decided by "
+              "the leg declared for it in .harness-config/config.json, which cannot be read: %s"
+              % (tree, exc))

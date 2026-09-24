@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -129,7 +130,9 @@ def main(argv):
         def census(extra):
             env = dict(base, GIT_CEILING_DIRECTORIES=box, **extra)
             try:
-                p = subprocess.run([sys.executable, "-c", _DRIVER, copy], cwd=box, env=env, capture_output=True,
+                # `-B`: a child that loads by path writes no bytecode (check-scripts-index clause 12b).
+                p = subprocess.run([sys.executable, "-B", "-c", _DRIVER, copy], cwd=box, env=env,
+                                   capture_output=True,
                                    text=True, encoding="utf-8", errors="replace", timeout=180)
                 said = (p.stdout or "") + (p.stderr or "")
             except subprocess.TimeoutExpired:

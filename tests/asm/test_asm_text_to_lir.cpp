@@ -19,6 +19,7 @@
 #include "asm_test_support.hpp"
 #include "mutate_target_schema.hpp"
 #include "asm/asm.hpp"
+#include "core/types/extern_import.hpp"
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_node.hpp"
@@ -3051,26 +3052,40 @@ TEST(AsmTextToLir, FunctionAddressReusesTheFunctionSymbol) {
     EXPECT_TRUE(seen);
 }
 
-// ── the fail-loud arms ────────────────────────────────────────────────────
-
-// ★ A NAME THIS FILE DEFINES NOWHERE IS REFUSED, NOT IMPORTED — because an
-// import states CODE-vs-DATA (which selects the linker's indirection slot) and
-// an address operand states neither.
-TEST(AsmTextToLir, AddressOfAnUndefinedNameIsRefused) {
+// ★ A NAME THIS FILE DEFINES NOWHERE IS AN IMPORT WHOSE KIND IS PENDING
+// (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL, P68 round 9). These two
+// tests pinned the old REFUSAL ("an import states CODE-vs-DATA and an address
+// operand states neither"); the expectation MOVED when the kind started coming
+// from the DEFINITION, at the link, as it does for ld. The link half, and every
+// case it refuses by name, is `tests/link/test_import_kind_from_definition.cpp`.
+TEST(AsmTextToLir, AddressOfAnUndefinedNameIsAPendingImport) {
     auto const run = lowerAsmText(baseDialectDoc(), src(
         ".globl main\n.func main\nmain:\n"
         "  leaq nowhere, %rax\n"
         "  ret\n"));
     ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
-    EXPECT_FALSE(run->module.has_value());
-    EXPECT_NE(messages(*run).find("'nowhere'"), std::string::npos)
-        << messages(*run);
-    EXPECT_NE(messages(*run).find("CODE or DATA"), std::string::npos)
-        << messages(*run);
-    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 0u);
+    ASSERT_EQ(run->module->externImports.size(), 1u);
+    auto const& ext = run->module->externImports[0];
+    EXPECT_EQ(ext.mangledName, "nowhere");
+    EXPECT_EQ(ext.kindOrigin, ExternKindOrigin::Pending)
+        << "an address operand states no code-vs-data kind";
+    auto const& lir  = run->module->lir;
+    auto const  lea  = op(*run->target, "lea");
+    bool        seen = false;
+    for (auto const inst : flatInsts(lir)) {
+        if (lir.instOpcode(inst) != lea) continue;
+        seen = true;
+        auto const ops = lir.instOperands(inst);
+        ASSERT_EQ(ops.size(), 1u);
+        EXPECT_EQ(ops[0].kind, LirOperandKind::SymbolRef);
+        EXPECT_EQ(ops[0].symbolV, ext.symbol.v) << "the lea must name the import";
+    }
+    EXPECT_TRUE(seen);
 }
 
-TEST(AsmTextToLir, DataSlotNamingAnUndefinedSymbolIsRefused) {
+TEST(AsmTextToLir, DataSlotNamingAnUndefinedSymbolIsAPendingImport) {
     auto const run = lowerAsmText(jumpTableDoc(), src(
         ".data\n"
         "tbl:\n"
@@ -3078,11 +3093,25 @@ TEST(AsmTextToLir, DataSlotNamingAnUndefinedSymbolIsRefused) {
         ".text\n"
         ".globl main\n.func main\nmain:\n  ret\n"));
     ASSERT_TRUE(parsedCleanly(*run)) << parseMessages(*run);
-    EXPECT_FALSE(run->module.has_value());
-    EXPECT_NE(messages(*run).find("'nowhere'"), std::string::npos)
-        << messages(*run);
-    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 1u);
+    ASSERT_TRUE(run->module.has_value()) << messages(*run);
+    EXPECT_EQ(countDiagnostics(run->reporter, kAsmCode), 0u);
+    ASSERT_EQ(run->module->externImports.size(), 1u);
+    auto const& ext = run->module->externImports[0];
+    EXPECT_EQ(ext.mangledName, "nowhere");
+    EXPECT_EQ(ext.kindOrigin, ExternKindOrigin::Pending)
+        << "a data slot states no code-vs-data kind";
+    std::size_t slots = 0;
+    for (auto const& d : run->module->dataItems) {
+        for (auto const& r : d.relocations) {
+            ++slots;
+            EXPECT_EQ(r.target.v, ext.symbol.v)
+                << "the slot must relocate against the import";
+        }
+    }
+    EXPECT_EQ(slots, 1u);
 }
+
+// ── the fail-loud arms ────────────────────────────────────────────────────
 
 // ★ AN INTERIOR LABEL OF ANOTHER FUNCTION IS REFUSED FOR THE SAME REASON A
 // CROSS-FUNCTION BRANCH IS: `makeBlockRef` names a block SLOT, and a slot from

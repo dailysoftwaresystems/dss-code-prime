@@ -198,7 +198,89 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     //   the reader's runtime discovery into a LOAD-TIME invariant (at most
     //   one non-alias row per nativeId).
     bool           emitOnly = false;
+    // ── THE WIRE TYPE BY THE BYTES THAT FOLLOW THE FIELD ────────────────────
+    // (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER) — the JSON
+    // key `nativeIdByBytesAfterField`, a list of `{ bytesAfterField, nativeId }`.
+    //
+    // A format may spell, in the relocation TYPE, how many bytes of the
+    // instruction follow the patched field. Mach-O x86_64 does:
+    // X86_64_RELOC_SIGNED when the field ends the instruction, SIGNED_1/_2/_4
+    // when 1, 2 or 4 bytes follow it (✔MEASURED 2026-09-23, clang 18.1.3:
+    // `movl $5, counter(%rip)` is SIGNED_4, `addl $1, counter(%rip)` SIGNED_1).
+    // The emitter writes the entry matching `Relocation::bytesAfterField`, and
+    // `nativeId` when none does; a reader decodes every entry back to this
+    // row's kind. The ADDEND is the same in every case (the x86 walker has
+    // already lowered it by those bytes), so the entries differ in the type
+    // alone — the same shape `pltNativeId` has. Empty on every other row.
+    struct BytesAfterFieldNativeId {
+        std::uint8_t  bytesAfterField = 0;
+        std::uint32_t nativeId        = 0;
+    };
+    std::vector<BytesAfterFieldNativeId> nativeIdByBytesAfterField;
+
+    // The wire type for a site with `bytesAfterField` bytes after its field.
+    [[nodiscard]] std::uint32_t
+    nativeIdFor(std::uint8_t bytesAfterField) const noexcept {
+        for (auto const& e : nativeIdByBytesAfterField) {
+            if (e.bytesAfterField == bytesAfterField) return e.nativeId;
+        }
+        return nativeId;
+    }
 };
+
+// ★★★ WHERE A RELOCATABLE OBJECT KEEPS A RELOCATION's ADDEND — a FORMAT fact,
+// the root key `relocationAddends` (P68 round 9).
+//   * `explicit` — the relocation RECORD has an addend column (ELF RELA's
+//     `r_addend`), which carries the psABI's full implicit addend: DSS's addend
+//     plus the target kind's `addendBias`;
+//   * `inPlace` — the record has none (COFF IMAGE_RELOCATION, Mach-O
+//     relocation_info), and the PATCHED FIELD holds the addend: DSS's addend,
+//     because the format's own formula carries the bias the target declares
+//     (IMAGE_REL_AMD64_REL32 is S + field - (P + 4)).
+// ⚠ ONE OWNER: `link/format/relocation_addend.hpp` is the only code that
+// writes or reads an addend by this rule, so a writer and a reader cannot
+// disagree about it — the defect this closed was a reader that assumed "the
+// writer rejects a non-zero `.text` addend" and dropped every foreign one.
+enum class RelocationAddendStorage : std::uint8_t {
+    Explicit,
+    InPlace,
+};
+
+inline constexpr EnumNameTable<RelocationAddendStorage, 2>
+    kRelocationAddendStorageTable{{{
+        { RelocationAddendStorage::Explicit, "explicit" },
+        { RelocationAddendStorage::InPlace,  "inPlace"  },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kRelocationAddendStorageTable);
+
+// ★★★ WHETHER AN INPUT SECTION MAY BE CUT APART — a FORMAT fact, the root key
+// `inputSectionPlacement` (P68 round 9). A relocatable-object reader slices each
+// section into symbol-bounded atoms. This key says whether the link may then place
+// those atoms independently, or must keep every one at its offset from the others.
+//   * `unit` — never split: the input section is the unit of placement, as it
+//     is for every ELF and PE/COFF linker. Code in the object can depend on the
+//     section's layout with nothing a reader can see: a reference gas reduced
+//     to "section symbol + offset", a `sym+off` that runs into the next object,
+//     an array of objects walked between two labels.
+//   * `subsectionsWhenDeclared` — split at symbols ONLY when the object itself
+//     declares its sections divisible, which is ld64's rule for Mach-O's
+//     MH_SUBSECTIONS_VIA_SYMBOLS. How an object declares it is a wire fact, so
+//     the format's reader owns it. An object that does not declare it gets the
+//     `unit` treatment, and a format with no such declaration never splits.
+// Where a section is a unit, its atoms carry `InputSectionSlice`, and the link
+// keeps or drops the section WHOLE. A member that dedup or weak resolution
+// discards keeps its bytes, so nothing after it moves.
+enum class InputSectionPlacement : std::uint8_t {
+    Unit,
+    SubsectionsWhenDeclared,
+};
+
+inline constexpr EnumNameTable<InputSectionPlacement, 2>
+    kInputSectionPlacementTable{{{
+        { InputSectionPlacement::Unit,                    "unit"                    },
+        { InputSectionPlacement::SubsectionsWhenDeclared, "subsectionsWhenDeclared" },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kInputSectionPlacementTable);
 
 // ── THE DECODE SIDE OF `relocations[]`, BUILT ONCE ────────────────
 //
@@ -1478,6 +1560,16 @@ struct DSS_EXPORT ObjectFormatData {
     std::vector<ObjectFormatRelocationInfo> relocations;
     substrate::TransparentStringMap<std::uint16_t> relocationNameIndex;
     std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
+    // Where this format's relocatable objects keep an addend (the
+    // `relocationAddends` root key — see `RelocationAddendStorage`). REQUIRED
+    // whenever `relocations` is non-empty (`validate()`), because both answers
+    // produce a well-formed object and only one of them is the format.
+    std::optional<RelocationAddendStorage> relocationAddendStorage;
+    // Whether a relocatable object's input sections may be split into
+    // independently placed atoms (the `inputSectionPlacement` root key — see
+    // `InputSectionPlacement`). REQUIRED whenever `relocations` is non-empty
+    // (`validate()`): a format whose objects the link reads must say it.
+    std::optional<InputSectionPlacement> inputSectionPlacement;
 
     // Sections row (D-LK4-2). The walker reads sections by
     // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
@@ -2333,6 +2425,22 @@ public:
         auto it = d_.relocationKindIndex.find(kind);
         if (it == d_.relocationKindIndex.end()) return nullptr;
         return &d_.relocations[it->second];
+    }
+
+    // Where this format keeps a relocation's addend (`relocationAddends`), or
+    // nullopt for a document that declares no relocations. Read ONLY through
+    // `link/format/relocation_addend.hpp`.
+    [[nodiscard]] std::optional<RelocationAddendStorage>
+    relocationAddendStorage() const noexcept {
+        return d_.relocationAddendStorage;
+    }
+
+    // Whether this format's input sections may be split into independently
+    // placed atoms (`inputSectionPlacement`), or nullopt for a document that
+    // declares no relocations. Read by the relocatable-object readers.
+    [[nodiscard]] std::optional<InputSectionPlacement>
+    inputSectionPlacement() const noexcept {
+        return d_.inputSectionPlacement;
     }
 
     [[nodiscard]] ObjectFormatRelocationInfo const*

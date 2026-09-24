@@ -19,8 +19,11 @@
 #include "link/symbol_kind.hpp"
 #include "lir/lir_pass_util.hpp"
 
+#include <algorithm>
 #include <format>
 #include <limits>
+#include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -1608,7 +1611,20 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
                 // the WRONG model — a PLT stub standing in for a data object, or a
                 // pointer slot standing in for a function. `isThreadLocal` likewise selects the (unimplemented,
                 // walker-rejected) initial-exec TLS model — D-CSUBSET-THREAD-LOCAL.
-                if (kept.isData != ext.isData) {
+                // ★ A `Pending` row STATES NO KIND (`ExternKindOrigin`: a `.s`
+                // address operand naming a symbol its file does not define), so
+                // it cannot disagree. It ADOPTS the other row's kind, which is a
+                // statement, instead of being compared against it. Two `Pending`
+                // rows stay `Pending`, and the link's gate judges the survivor.
+                // The MIR-tier twin needs no such rule: only a `.s` unit mints a
+                // `Pending` row, and a `.s` unit never enters the MIR merge.
+                if (kept.kindOrigin == ExternKindOrigin::Pending
+                    && ext.kindOrigin != ExternKindOrigin::Pending) {
+                    kept.isData     = ext.isData;
+                    kept.kindOrigin = ext.kindOrigin;
+                } else if (kept.kindOrigin != ExternKindOrigin::Pending
+                           && ext.kindOrigin != ExternKindOrigin::Pending
+                           && kept.isData != ext.isData) {
                     conflict(ext, "`isData` (data object vs function import)",
                              boolStr(kept.isData), boolStr(ext.isData));
                 }
@@ -1756,12 +1772,39 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     // rather than an encoded string so injectivity is structural, not an argument about
     // separators.
     std::set<std::pair<std::uint32_t, std::string>> seenMergedSymRows;
+
+    // ★★★ AN INPUT SECTION THE FORMAT MAKES A UNIT IS KEPT OR DROPPED WHOLE
+    // (`InputSectionSlice`, the format's `inputSectionPlacement`). Two things
+    // follow here, and both are what ld does with an ELF or COFF input section:
+    //   * a unit key is unique only within its own module, so each (module,
+    //     key) pair gets a fresh merged key: two objects' `.data` are two units;
+    //   * a unit member that LOSES its name to another definition is not
+    //     dropped. Its bytes stay where they are, under a fresh id that no name
+    //     and no relocation reaches, because dropping them would move every
+    //     member after it. The name still resolves to the winner: every
+    //     reference goes through `mergedIdFor`, which answers with the
+    //     winner's id.
+    std::map<std::pair<std::size_t, std::uint32_t>, std::uint32_t> mergedUnitKey;
+    auto remapUnit = [&](std::size_t modIdx, std::optional<InputSectionSlice>& slice) {
+        if (!slice.has_value()) return;
+        auto const [it, fresh] = mergedUnitKey.try_emplace(
+            std::pair{modIdx, slice->section},
+            static_cast<std::uint32_t>(mergedUnitKey.size()));
+        slice->section = it->second;
+    };
+    // The id a shadowed unit member keeps its bytes under: fresh, and the SAME
+    // counter `mergedIdFor` mints from, so it collides with nothing.
+    auto keptShadowedId = [&]() { return SymbolId{nextId++}; };
+
     for (std::size_t i = 0; i < modules.size(); ++i) {
         auto const& m = modules[i];
         for (auto const& fn : m.functions) {
-            if (isShadowedAtom(i, fn.symbol)) continue;  // shadowed weak body — drop
+            bool const shadowed = isShadowedAtom(i, fn.symbol);
+            if (shadowed && !fn.inputSection.has_value()) continue;  // shadowed weak body — drop
             AssembledFunction out = fn;  // bytes + relocations + sourceMap copied
-            out.symbol = SymbolId{mergedIdFor(i, fn.symbol)};
+            out.symbol = shadowed ? keptShadowedId()
+                                  : SymbolId{mergedIdFor(i, fn.symbol)};
+            remapUnit(i, out.inputSection);
             // ★★★ THE BLOCK SYMBOLS ARE REMAPPED TOO, AND OMITTING THEM WAS A
             // WHOLE-PROGRAM LINK FAILURE. D-LINK-MERGE-DOES-NOT-REMAP-BLOCK-SYMBOLS
             // `AssembledFunction out = fn` copies `blockSymbols` VERBATIM, so before
@@ -1788,9 +1831,12 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             combined.functions.push_back(std::move(out));
         }
         for (auto const& di : m.dataItems) {
-            if (isShadowedAtom(i, di.symbol)) continue;  // shadowed global data — drop
+            bool const shadowed = isShadowedAtom(i, di.symbol);
+            if (shadowed && !di.inputSection.has_value()) continue;  // shadowed global data — drop
             AssembledData out = di;
-            out.symbol = SymbolId{mergedIdFor(i, di.symbol)};
+            out.symbol = shadowed ? keptShadowedId()
+                                  : SymbolId{mergedIdFor(i, di.symbol)};
+            remapUnit(i, out.inputSection);
             retargetRelocs(i, out.relocations);  // same chokepoint as the function path
             combined.dataItems.push_back(std::move(out));
         }
@@ -1825,6 +1871,42 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             if (!seenMergedSymRows.emplace(mergedId, ms.name).second) continue;
             combined.symbols.push_back(ModuleSymbol{
                 SymbolId{mergedId}, ms.name, ms.binding, ms.visibility});
+        }
+    }
+    // ★ A CODE UNIT's MEMBERS, TOGETHER AND IN OFFSET ORDER. Every writer
+    // concatenates `functions`, so a code unit keeps its layout only if its members
+    // sit consecutively in the order of their offsets. The readers emit them that
+    // way, with one exception: the ELF geometry fallback APPENDS a body it
+    // recovers. A stable reorder places each unit's members at the position of
+    // its first member, sorted by offset, and leaves everything else in its
+    // relative order. An already-ordered module is untouched byte for byte, since
+    // the permutation is then the identity. Contiguity itself is checked, not
+    // assumed (`validateInputSectionUnits`).
+    {
+        std::unordered_map<std::uint32_t, std::size_t> unitFirstPosition;
+        for (std::size_t k = 0; k < combined.functions.size(); ++k) {
+            if (auto const& slice = combined.functions[k].inputSection) {
+                unitFirstPosition.try_emplace(slice->section, k);
+            }
+        }
+        if (!unitFirstPosition.empty()) {
+            auto keyOf = [&](std::size_t k) -> std::pair<std::size_t, std::uint64_t> {
+                auto const& slice = combined.functions[k].inputSection;
+                if (!slice.has_value()) return {k, 0u};
+                return {unitFirstPosition.at(slice->section), slice->offset};
+            };
+            std::vector<std::size_t> order(combined.functions.size());
+            std::iota(order.begin(), order.end(), std::size_t{0});
+            std::stable_sort(order.begin(), order.end(),
+                             [&](std::size_t a, std::size_t b) {
+                                 return keyOf(a) < keyOf(b);
+                             });
+            std::vector<AssembledFunction> ordered;
+            ordered.reserve(combined.functions.size());
+            for (std::size_t k : order) {
+                ordered.push_back(std::move(combined.functions[k]));
+            }
+            combined.functions = std::move(ordered);
         }
     }
     combined.expectedFuncCount = combined.functions.size();
@@ -1867,6 +1949,77 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
     }
     // combined.cuId stays default — the merged image is not a single CU.
     return combined;
+}
+
+// ★★ A REFERENCE THAT STATED NO KIND, JUDGED ON THE DEFINITION THAT SURVIVES
+// (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). A `.s` address operand
+// or data slot naming a symbol its file does not define mints an import whose
+// code-vs-data is `Pending` until a definition decides it (`ExternKindOrigin`).
+// gas and ld work the same way: gas records the name alone, and ld reads the
+// kind from what it resolves. A sibling unit's definition decides by winning
+// the name here, and the reference binds to it directly whatever it is. What is
+// left is the library binding, and two outcomes of it cannot be honoured:
+//   (a) the row is still `Pending`: the library that binds it states no kind (a
+//       stripped `.so`'s NOTYPE, a PE forwarder). A writer needs one to choose a
+//       slot, and a default would be a guess with a wire consequence;
+//   (b) the library says DATUM. A direct `leaq x(%rip)` / `movq x(%rip)` / `.quad
+//       x` against a library datum needs a COPY relocation. ✔MEASURED
+//       2026-09-23: gcc makes one (R_X86_64_COPY), -no-pie and -pie alike, and
+//       runs the program to 42. DSS makes none: it binds library data through
+//       a GOT slot, and a direct reference would silently read the SLOT.
+// A library FUNCTION is honoured: its address is the stub the format's call
+// dispatch provides, the same address every other DSS reference to that
+// function gets. ✔MEASURED 2026-09-23: GNU ld gives `leaq puts(%rip)` a PLT
+// entry it does NOT make canonical, as here; lld makes it canonical. That the
+// stub is not the address the rest of the process sees is not this gate's
+// question: C's `&puts` has it too (D-LK-LIBRARY-FUNCTION-ADDRESS-IS-THE-IMAGE-STUB).
+// Judged per MODULE, before the merge folds this row into a C unit's `Stated` one
+// (which carries a kind but says nothing about how THIS unit's references read
+// it). An unbound row is left to the reference gate's `K_SymbolUndefined`.
+// Returns false after reporting.
+[[nodiscard]] bool refuseUnbindableImportReferences(
+        std::span<AssembledModule const>                        modules,
+        std::unordered_map<std::string, LinkedSymbolKey> const& siblingWinners,
+        DiagnosticReporter&                                     reporter) {
+    bool ok = true;
+    for (auto const& m : modules) {
+        for (auto const& ext : m.externImports) {
+            if (ext.kindOrigin == ExternKindOrigin::Stated) continue;
+            if (ext.libraryPath.empty()) continue;              // K_SymbolUndefined's
+            if (siblingWinners.contains(ext.mangledName)) continue;  // a sibling decides
+            if (ext.kindOrigin == ExternKindOrigin::Pending) {
+                report(reporter, DiagnosticCode::K_ImportReferenceUnbindable,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "'{}' is named by an assembly reference that states no "
+                           "code-vs-data kind (an address operand or data slot), "
+                           "and nothing that defines it states one either: no "
+                           "linked unit defines it, and its library '{}' reports "
+                           "no kind for it. The link takes the kind from the "
+                           "definition, as ld does, and will not guess one.",
+                           ext.mangledName, ext.libraryPath));
+                ok = false;
+                continue;
+            }
+            if (ext.isData) {
+                report(reporter, DiagnosticCode::K_ImportReferenceUnbindable,
+                       DiagnosticSeverity::Error,
+                       std::format(
+                           "'{}' is a DATUM of library '{}', and an assembly "
+                           "reference names it directly (an address operand or "
+                           "data slot). That needs a copy relocation, which this "
+                           "link does not make: library data binds through a "
+                           "loader-filled slot, so the reference would read the "
+                           "slot instead of the datum. gcc links this with a "
+                           "copy relocation, PIE or not. Define "
+                           "the object in a linked unit, or read it through a "
+                           "compiled translation unit.",
+                           ext.mangledName, ext.libraryPath));
+                ok = false;
+            }
+        }
+    }
+    return ok;
 }
 
 } // namespace
@@ -1961,6 +2114,17 @@ LinkedImage link(std::span<AssembledModule const> modules,
             return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
         }
         selectedInput = &mergedStorage;
+    }
+    // D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL: a reference that
+    // stated no kind is judged on the SURVIVING definition, per module, before
+    // the merge folds its row into a C unit's (see the function's docblock).
+    // IMAGES only: a relocatable object keeps the undefined name for the linker
+    // that consumes it, exactly as gas does, and that linker judges it.
+    if (objectFormatSchema.isImageFlavor()
+        && !refuseUnbindableImportReferences(modules, image.resolvedGlobalDefs,
+                                             reporter)) {
+        image.resolvedFuncCount = 0;
+        return image;
     }
     // D-LINK-EXTERN-IMPORT-REFERENCE-GATE (generalizes c86): the extern-import
     // reference gate, on the FINAL emission module (post-merge — a sibling-
@@ -2561,6 +2725,13 @@ LinkedImage link(std::span<AssembledModule const> modules,
             image.resolvedFuncCount = 0;
             return image;
         }
+    }
+    // An input section the format makes a unit must reach the writers whole
+    // (`InputSectionSlice`): checked on the module they receive, merged or not,
+    // before any of them lays out a byte.
+    if (!validateInputSectionUnits(module, reporter)) {
+        image.resolvedFuncCount = 0;
+        return image;
     }
 
     // ── Per-format walker capability gate for `dataItems` ──────

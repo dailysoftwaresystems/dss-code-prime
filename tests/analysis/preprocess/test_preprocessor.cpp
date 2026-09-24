@@ -10,6 +10,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/char_decode.hpp"
+#include "core/types/data_model.hpp"         // kDataModelTable: CHAR_BIT realized under every data model
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"   // c105: per-format prologue tests
@@ -17,6 +18,7 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
 #include "core/types/unsuppressable_codes.hpp"  // TF-C86: the refusal's closed-table pin
+#include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibConstants: the lattice-derived CHAR_BIT (P68 round 9)
 #include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
@@ -4065,8 +4067,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // pins the family itself). Un-gated because whether each is defined is the
     // PAIR's question — answered by whether the pair realizes the type — not a
     // format filter's. 39 un-gated, 13 pe-gated, 3 macho-gated = 55.
-    EXPECT_EQ(pms.size(), 55u)
-        << "c declares 39 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): +3 UN-GATED rows, the
+    // `type-unsigned` family — `__CHAR_UNSIGNED__` (moved here from
+    // arm64.target.json, where it was a hand-gated `["elf"]` constant),
+    // `__WCHAR_UNSIGNED__`, `__WINT_UNSIGNED__`; each names a TYPE and is defined
+    // where the PAIR makes it unsigned (test_type_unsigned_predefines pins the
+    // family). 42 un-gated, 13 pe-gated, 3 macho-gated = 58.
+    EXPECT_EQ(pms.size(), 58u)
+        << "c declares 42 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -4103,8 +4111,10 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 39u)
-        << "the 13 `__SIZEOF_*__` type-size rows "
+    EXPECT_EQ(ungated, 42u)
+        << "the 3 `type-unsigned` rows (__CHAR_UNSIGNED__/__WCHAR_UNSIGNED__/"
+           "__WINT_UNSIGNED__, P68 round 9, realized per pair) + "
+           "the 13 `__SIZEOF_*__` type-size rows "
            "(D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING, realized per pair) + "
            "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
            "kind) + the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
@@ -8726,9 +8736,17 @@ TEST(Preprocessor, EmbedParametersLoaderRefusesMalformedBlocks) {
 }
 
 // C23 6.10.4.1p6: the embed element width is CHAR_BIT. `CHAR_BIT` has exactly
-// ONE owner in this tree (`shippedLibs/limits.json`) and the width is an engine
-// constant rather than a second declaration of it -- this pin is the coupling
-// made visible: it goes red the day either side moves.
+// ONE owner in this tree and the width is an engine constant rather than a
+// second declaration of it -- this pin is the coupling made visible: it goes red
+// the day either side moves.
+//
+// ★ P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): THAT OWNER IS
+// NOW THE LATTICE. `limits.json`'s CHAR_BIT no longer states `8`; it is the row
+// `{ "of": "char", "limit": "width" }`, realized per pair from the language's
+// `char`. So this pin no longer reads a `value` out of the JSON text (there is
+// none to read) — it asks the REAL descriptor reader to realize CHAR_BIT under
+// every data model and both plain-`char` signednesses, which is every pair the
+// lattice can describe, and requires each answer to be the embed width.
 //
 // ⚠ SAY WHAT `kEmbedElementWidthBits` IS: a TRIPWIRE ANCHOR, not a width
 // parameter. ✔MEASURED -- no engine site reads its VALUE to decide anything; the
@@ -8736,40 +8754,37 @@ TEST(Preprocessor, EmbedParametersLoaderRefusesMalformedBlocks) {
 // in `handleEmbed`'s splice loop (which spells one byte per element), and a
 // `static_assert` at that loop refuses to compile if the constant ever moves off
 // 8. So this pin is the OTHER half of the tripwire — the half that watches
-// `limits.json` — and neither half claims the constant is a knob.
+// CHAR_BIT's owner — and neither half claims the constant is a knob.
 TEST(Preprocessor, EmbedElementWidthIsTheOneCharBitOwner) {
     auto const root = dss::test::findConfigRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
-    std::ifstream in(*root / "shippedLibs" / "limits.json", std::ios::binary);
-    ASSERT_TRUE(in.is_open());
-    std::string const text{std::istreambuf_iterator<char>(in),
-                           std::istreambuf_iterator<char>()};
-    // ⚠ THE SEARCH IS BOUNDED TO CHAR_BIT'S OWN OBJECT, AND THAT IS THE WHOLE
-    // POINT OF THIS BLOCK. An unbounded `find("\"value\":", name)` reads the
-    // NEXT constant's value the day CHAR_BIT's row loses or renames the field --
-    // and SCHAR_MIN's -128 or SCHAR_MAX's 127 is not 8, so it would go red...
-    // unless the next row happened to hold an 8, in which case the pin passes
-    // while measuring the wrong macro. An instrument that can fail toward CLEAN
-    // is not an instrument: every step below refuses instead of guessing.
-    auto const constants = text.find("\"constants\"");
-    ASSERT_NE(constants, std::string::npos)
-        << "limits.json no longer has a `constants` array";
-    auto const name = text.find("\"CHAR_BIT\"", constants);
-    ASSERT_NE(name, std::string::npos) << "limits.json no longer declares CHAR_BIT";
-    auto const rowEnd = text.find('}', name);
-    ASSERT_NE(rowEnd, std::string::npos) << "CHAR_BIT's row is unterminated";
-    auto const value = text.find("\"value\":", name);
-    ASSERT_NE(value, std::string::npos);
-    ASSERT_LT(value, rowEnd)
-        << "CHAR_BIT's OWN row no longer carries a `value` field -- this pin "
-           "would otherwise have read the next constant's";
-    char const* const digits = text.c_str() + value + std::string{"\"value\":"}.size();
-    char*             parsed = nullptr;
-    std::uint64_t const charBit = std::strtoull(digits, &parsed, 10);
-    ASSERT_NE(parsed, digits) << "CHAR_BIT's `value` is not a decimal number";
-    EXPECT_EQ(charBit, kEmbedElementWidthBits)
-        << "the resource reader yields octets; a target with another CHAR_BIT "
-           "needs another reader, not a config knob";
+    auto const limits = *root / "shippedLibs" / "limits.json";
+    std::size_t pairs = 0;
+    for (auto const& [model, modelName] : kDataModelTable.rows) {
+        for (bool const charIsUnsigned : {false, true}) {
+            SCOPED_TRACE(std::string{modelName}
+                         + (charIsUnsigned ? " / unsigned char" : " / signed char"));
+            ffi::ShippedPairFacts const pair{cSubset().get(), model, charIsUnsigned};
+            DiagnosticReporter rep;
+            auto const consts = ffi::readShippedLibConstants(
+                limits, rep, std::nullopt, std::nullopt, &pair);
+            ASSERT_TRUE(consts.has_value())
+                << "limits.json no longer reads: "
+                << (rep.all().empty() ? std::string{"<no diagnostic>"}
+                                      : rep.all().front().actual);
+            std::size_t seen = 0;
+            for (auto const& k : *consts) {
+                if (k.name != "CHAR_BIT") continue;
+                ++seen;
+                EXPECT_EQ(static_cast<std::uint64_t>(k.value), kEmbedElementWidthBits)
+                    << "the resource reader yields octets; a target with another "
+                       "CHAR_BIT needs another reader, not a config knob";
+            }
+            EXPECT_EQ(seen, 1u) << "limits.json must realize CHAR_BIT exactly once";
+            ++pairs;
+        }
+    }
+    EXPECT_EQ(pairs, 2u * kDataModelTable.rows.size());
     EXPECT_EQ(embedResourceWidthBytes(8, std::nullopt), 8u);
     EXPECT_EQ(embedResourceWidthBytes(8, 3), 3u);
     EXPECT_EQ(embedResourceWidthBytes(8, 100), 8u);
@@ -11009,18 +11024,14 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
                "are UNGATED, so they appear on macho alongside the Apple-only "
                "identity pair; `__BIG_ENDIAN__` must appear on NO leg";
     }
-    // arm64 on ELF: the Apple-only pair is GONE, and `__CHAR_UNSIGNED__`
-    // APPEARS — the two gates point in OPPOSITE directions on the same target,
-    // which is the whole reason the gate is per-entry.
+    // arm64 on ELF: the Apple-only pair is GONE.
     //
-    // ★ `__CHAR_UNSIGNED__` is not an identity spelling: it is the
-    // PREPROCESSOR-VISIBLE face of the target's `charIsUnsigned` key
-    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM), whose `default` is `true` and
-    // whose macho/pe overrides are `false`. So it must be defined on exactly
-    // the leg where the default is the effective answer. MEASURED 2026-07-28
-    // with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang
-    // 21.0.0): DEFINED for aarch64-linux-gnu; NOT defined for
-    // arm64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc.
+    // ★ P68 round 9: `__CHAR_UNSIGNED__` is no longer in the TARGET half. It
+    // was a target row gated `["elf"]` by hand — the preprocessor face of the
+    // target's `charIsUnsigned` in a second notation — and is now the
+    // LANGUAGE's `type-unsigned` row naming `char`, realized per pair from that
+    // key (defined on arm64 × elf alone; pinned per pair by
+    // test_type_unsigned_predefines, against gcc/clang `-dM`).
     {
         auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
                                        (*arm)->predefinedMacros(), {},
@@ -11029,16 +11040,13 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
                   (std::vector<std::string>{"__ARM_ARCH_ISA_A64",
                                             "__BYTE_ORDER__",
-                                            "__CHAR_UNSIGNED__",
                                             "__LITTLE_ENDIAN__",
                                             "__aarch64__"}))
             << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto "
-               "ELF, while `__CHAR_UNSIGNED__` is ELF-only and MUST appear "
-               "there — it is the preprocessor face of the target's "
-               "`charIsUnsigned` default, which macho/pe override to signed. "
-               "TF-C115: the two endianness rows are UNGATED and therefore "
-               "appear on BOTH legs — the negative that matters is "
-               "`__BIG_ENDIAN__`, which appears on none";
+               "ELF; `__CHAR_UNSIGNED__` is the language's type-unsigned row "
+               "now, not the target's. TF-C115: the two endianness rows are "
+               "UNGATED and therefore appear on BOTH legs — the negative that "
+               "matters is `__BIG_ENDIAN__`, which appears on none";
     }
     // x86_64: the same four spellings on every format.
     for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,

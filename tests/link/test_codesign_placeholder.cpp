@@ -397,6 +397,8 @@ TEST(MachOCodeSignPlaceholder, DynamicPathEmitsLcCodeSignatureWithZeroReservatio
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -513,6 +515,8 @@ TEST(MachOCodeSignPlaceholder, ZeroSizeOmitsLcCodeSignature) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -987,6 +991,8 @@ TEST(PeCertPlaceholder, WalkerEmitsSecurityDirAndZeroReservation) {
       "sections":[
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -1105,6 +1111,8 @@ TEST(PeCertPlaceholder, CertTableLandsAfterIdataWhenImportsPresent) {
       "sections":[
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},

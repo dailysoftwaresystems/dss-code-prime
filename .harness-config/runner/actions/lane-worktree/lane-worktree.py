@@ -103,6 +103,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+sys.dont_write_bytecode = True  # a by-path load must not write __pycache__ beside another action (the rule: check-scripts-index)
 
 # ── OUTPUT ENCODING ──────────────────────────────────────────────────────────────────
 # Under ctest both streams are PIPES, and on Windows that brings them up as cp1252: a path or a

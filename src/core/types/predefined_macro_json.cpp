@@ -210,11 +210,14 @@ predefinedMacroDocumentDisagreements(std::string_view configRootDir) {
 // ★ The SIZE is `scalarByteSize` — the function `sizeof` and the aggregate
 // layout use for a scalar — so the macro cannot state a size the type does not
 // have. A pointer core takes the data model's pointer width there.
-std::optional<std::uint64_t>
-predefinedTypeSize(PredefinedMacroDef const& row,
-                   PredefinedTypeFacts const& facts) noexcept {
-    if (row.kind != PredefinedMacroKind::TypeSize) return std::nullopt;
-    PredefinedSizedType const& t = row.sizedType;
+namespace {
+
+// The core a row's TYPE has on the pair `facts` describes, or nullopt when the
+// pair does not realize it. ONE selection for both type-naming kinds
+// (`type-size` sizes this core, `type-unsigned` asks its signedness), so the
+// two cannot pick different cores for the same `type`.
+[[nodiscard]] std::optional<TypeKind>
+realizedCoreOf(PredefinedSizedType const& t, PredefinedTypeFacts const& facts) noexcept {
     std::optional<TypeKind> core;
     switch (t.source) {
         case PredefinedTypeSource::None:
@@ -248,8 +251,51 @@ predefinedTypeSize(PredefinedMacroDef const& row,
             }
             break;
     }
+    return core;
+}
+
+}  // namespace
+
+std::optional<std::uint64_t>
+predefinedTypeSize(PredefinedMacroDef const& row,
+                   PredefinedTypeFacts const& facts) noexcept {
+    if (row.kind != PredefinedMacroKind::TypeSize) return std::nullopt;
+    auto const core = realizedCoreOf(row.sizedType, facts);
     if (!core.has_value()) return std::nullopt;
     return scalarByteSize(*core, facts.dataModel);
+}
+
+// Declared in `core/types/preprocess_config.hpp`. The ONE place a
+// `type-unsigned` row's answer is computed (P68 round 9,
+// D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX). ✔MEASURED 2026-09-23 (`-dM -E -x c`):
+// clang 18.1.3 defines `__CHAR_UNSIGNED__` / `__WCHAR_UNSIGNED__` /
+// `__WINT_UNSIGNED__` on exactly the triples where the type is unsigned, and
+// gcc 13.3.0 the same rule for `__CHAR_UNSIGNED__` in C (and for
+// `__WCHAR_UNSIGNED__` in C++) — so the answer is the TYPE's, read here.
+std::optional<bool>
+predefinedTypeIsUnsigned(PredefinedMacroDef const& row,
+                         PredefinedTypeFacts const& facts) noexcept {
+    if (row.kind != PredefinedMacroKind::TypeUnsigned) return std::nullopt;
+    auto const core = realizedCoreOf(row.sizedType, facts);
+    if (!core.has_value()) return std::nullopt;
+    switch (*core) {
+        case TypeKind::Char:
+            // Plain `char`: neither signed nor unsigned by itself (C 6.2.5p15);
+            // the PAIR decides, through the target's one key.
+            return facts.charIsUnsigned;
+        case TypeKind::Bool:
+        case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
+        case TypeKind::U64: case TypeKind::U128:
+            return true;
+        case TypeKind::I8: case TypeKind::I16: case TypeKind::I32:
+        case TypeKind::I64: case TypeKind::I128:
+            return false;
+        default:
+            // Not an integer type: the language load refuses a row naming one,
+            // so this is a pair-declared core outside the integer set — no
+            // signedness, no macro, never a guess.
+            return std::nullopt;
+    }
 }
 
 namespace detail {
@@ -699,19 +745,20 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                   "predefinedMacros entry", kVersionKindName));
             continue;
         }
-        // ── `type` — REQUIRED iff kind == type-size, refused on every other
-        // kind (P68 round 8, D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) ──
+        // ── `type` — REQUIRED iff the kind names a type (`type-size`, and
+        // `type-unsigned` since P68 round 9), refused on every other kind (P68
+        // round 8, D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) ──
         //
-        // The row names the TYPE; the merge computes the number. So a `value`
+        // The row names the TYPE; the merge derives the value. So a `value`
         // beside a `type` is refused rather than ignored: it would be a second
         // statement of the same fact, and the one the merge does not read is
         // the one that would silently go stale.
-        bool const isTypeSize = (pm.kind == PredefinedMacroKind::TypeSize);
+        bool const namesAType = predefinedMacroKindNamesAType(pm.kind);
+        bool const isTypeUnsigned = (pm.kind == PredefinedMacroKind::TypeUnsigned);
         std::string const typePath =
             std::format("{}/{}", mpath, kSizedTypeKey);
-        if (isTypeSize) {
-            std::string_view const kindSpelling =
-                predefinedMacroKindName(PredefinedMacroKind::TypeSize);
+        if (namesAType) {
+            std::string_view const kindSpelling = predefinedMacroKindName(pm.kind);
             if (!typeVocabularyInScope) {
                 coll.emit(entryCode, mpath + "/kind",
                           std::format(
@@ -726,18 +773,27 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             if (!e.contains(kSizedTypeKey)) {
                 coll.emit(DiagnosticCode::C_MissingField, typePath,
                           std::format("a '{}' predefinedMacros entry requires "
-                                      "'{}' — the type whose size it states",
-                                      kindSpelling, kSizedTypeKey));
+                                      "'{}' — the type whose {} it states",
+                                      kindSpelling, kSizedTypeKey,
+                                      isTypeUnsigned ? "signedness" : "size"));
                 continue;
             }
             if (e.contains("value")) {
                 coll.emit(entryCode, mpath + "/value",
-                          std::format("a '{}' entry states a TYPE, never a "
-                                      "number: its value is the size of '{}' "
-                                      "on the build's (target, format) pair, "
-                                      "computed by the layout `sizeof` uses. "
-                                      "Remove 'value'",
-                                      kindSpelling, kSizedTypeKey));
+                          isTypeUnsigned
+                              ? std::format("a '{}' entry states a TYPE, never a "
+                                            "value: the macro is defined (as 1) "
+                                            "exactly where '{}' is an unsigned "
+                                            "integer type on the build's (target, "
+                                            "format) pair, and undefined "
+                                            "elsewhere. Remove 'value'",
+                                            kindSpelling, kSizedTypeKey)
+                              : std::format("a '{}' entry states a TYPE, never a "
+                                            "number: its value is the size of '{}' "
+                                            "on the build's (target, format) pair, "
+                                            "computed by the layout `sizeof` uses. "
+                                            "Remove 'value'",
+                                            kindSpelling, kSizedTypeKey));
                 continue;
             }
             json const& tv = e.at(kSizedTypeKey);
@@ -789,6 +845,18 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                           chosen->key));
                     continue;
                 }
+                // A pointer has a size but no signedness: a `type-unsigned`
+                // row naming one would be a question with no answer on any
+                // pair, i.e. a macro silently never defined.
+                if (isTypeUnsigned && chosen->source == PredefinedTypeSource::PointerTo) {
+                    coll.emit(entryCode,
+                              std::format("{}/{}", typePath, chosen->key),
+                              std::format("a '{}' entry asks an INTEGER type's "
+                                          "signedness, and a '{}' type is a "
+                                          "pointer, which has none",
+                                          kindSpelling, chosen->key));
+                    continue;
+                }
                 pm.sizedType.source  = chosen->source;
                 pm.sizedType.spelled = nv.get<std::string>();
             } else {
@@ -801,11 +869,13 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             }
         } else if (e.contains(kSizedTypeKey)) {
             coll.emit(entryCode, typePath,
-                      std::format("'{}' is valid only on a '{}' "
+                      std::format("'{}' is valid only on a '{}' or '{}' "
                                   "predefinedMacros entry",
                                   kSizedTypeKey,
                                   predefinedMacroKindName(
-                                      PredefinedMacroKind::TypeSize)));
+                                      PredefinedMacroKind::TypeSize),
+                                  predefinedMacroKindName(
+                                      PredefinedMacroKind::TypeUnsigned)));
             continue;
         }
         // `value` -- REQUIRED iff kind==constant; the static replacement
@@ -1039,10 +1109,12 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
             // prologue is built from the merged list — so the lowered line is
             // `#define __SIZEOF_LONG__ 8`, the reference's own `<built-in>`
             // line, and never an empty one (an unrealized row is not in the
-            // merged list at all).
+            // merged list at all). `type-unsigned` (P68 round 9) qualifies for
+            // the same reason: a realized row is `#define __WCHAR_UNSIGNED__ 1`,
+            // and a signed or unrealized one is not in the merged list.
             if (pm.programRedefinition == PredefinedMacroRedefinition::Ordinary
                 && pm.kind != PredefinedMacroKind::Constant
-                && pm.kind != PredefinedMacroKind::TypeSize) {
+                && !predefinedMacroKindNamesAType(pm.kind)) {
                 coll.emit(entryCode,
                           std::format("{}/{}", mpath, kProgramRedefinitionKey),
                           std::format(

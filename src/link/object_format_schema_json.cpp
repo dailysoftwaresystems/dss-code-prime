@@ -366,7 +366,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // ten `runpath` documents and the two `runpathUnsupportedReason` ones land
     // in the same change. 39 + 2 = 41 — the array's declared extent, checked
     // by `DSS_CHECK_KEY_VOCABULARY`, not by this sentence.
-    static constexpr std::array<std::string_view, 41> kFormatDocumentKeys{
+    // 41 -> 42 (P68 round 9): `relocationAddends`, where a relocatable object of
+    // this format keeps a relocation's addend (`RelocationAddendStorage`).
+    // 42 -> 43 (P68 round 9): `inputSectionPlacement`, whether the link may split
+    // a relocatable object's input section into independently placed atoms
+    // (`InputSectionPlacement`).
+    static constexpr std::array<std::string_view, 43> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
@@ -451,7 +456,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // it at all.
         "weakDefinition",
         // section / relocation description
-        "sections", "relocations", "supportedDataSections",
+        "sections", "relocations", "relocationAddends", "inputSectionPlacement",
+        "supportedDataSections",
         // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
         // with the program-entry cluster in spirit — it answers a question about
@@ -3637,6 +3643,61 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
                 info.emitOnly = r.at("emitOnly").get<bool>();
             }
+            // P68 round 9: the wire type by the bytes that follow the patched
+            // field (Mach-O X86_64_RELOC_SIGNED_1/_2/_4) — see
+            // `ObjectFormatRelocationInfo::nativeIdByBytesAfterField`. What the
+            // entries must BE is `validate()`'s; this reads their shape.
+            if (r.contains("nativeIdByBytesAfterField")) {
+                auto const& arr = r.at("nativeIdByBytesAfterField");
+                auto const base =
+                    std::format("/relocations/{}/nativeIdByBytesAfterField", i);
+                if (!arr.is_array()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, base,
+                           "'nativeIdByBytesAfterField' must be an array of "
+                           "{ bytesAfterField, nativeId }");
+                    return false;
+                }
+                for (std::size_t j = 0; j < arr.size(); ++j) {
+                    auto const& e = arr[j];
+                    auto const path = std::format("{}/{}", base, j);
+                    static constexpr std::array<std::string_view, 2>
+                        kBytesAfterKeys{"bytesAfterField", "nativeId"};
+                    DSS_CHECK_KEY_VOCABULARY(kBytesAfterKeys);
+                    if (!e.is_object()
+                        || !e.contains("bytesAfterField")
+                        || !e.at("bytesAfterField").is_number_integer()
+                        || !e.contains("nativeId")
+                        || !e.at("nativeId").is_number_integer()) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               "each entry is { \"bytesAfterField\": <1..255>, "
+                               "\"nativeId\": <wire type> }");
+                        return false;
+                    }
+                    bool entryClean = true;
+                    detail::rejectUnknownKeys(e, kBytesAfterKeys,
+                        "a nativeIdByBytesAfterField entry",
+                        [&](std::string_view key, std::string message) {
+                            c.emit(DiagnosticCode::C_MalformedJson,
+                                   std::format("{}/{}", path, key),
+                                   std::move(message));
+                            entryClean = false;
+                        });
+                    if (!entryClean) return false;
+                    std::int64_t const n = e.at("bytesAfterField").get<std::int64_t>();
+                    std::int64_t const v = e.at("nativeId").get<std::int64_t>();
+                    if (n < 0 || n > 0xFF || v < 0 || v > 0xFFFFFFFFLL) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               std::format("bytesAfterField ({}) must be in "
+                                           "[0, 255] and nativeId ({}) in "
+                                           "[0, 2^32)", n, v));
+                        return false;
+                    }
+                    info.nativeIdByBytesAfterField.push_back(
+                        ObjectFormatRelocationInfo::BytesAfterFieldNativeId{
+                            static_cast<std::uint8_t>(n),
+                            static_cast<std::uint32_t>(v)});
+                }
+            }
             // ── TYPO DISCRIMINATOR FOR THE RELOCATION ROW ────────────────
             //
             // Every field above is read with `r.contains(...)`, so an
@@ -3667,8 +3728,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // (`opt/optimizer_json.cpp`, `ffi/shipped_lib_descriptor.cpp`)
             // missing the `$`-prose carve-out outright. The TABLE stays here,
             // with the fields it describes — only the loop moved.
-            static constexpr std::array<std::string_view, 6> kRelocationRowKeys{
-                "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly"};
+            static constexpr std::array<std::string_view, 7> kRelocationRowKeys{
+                "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly",
+                "nativeIdByBytesAfterField"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationRowKeys);
             bool rowClean = true;
             detail::rejectUnknownKeys(r, kRelocationRowKeys, "a relocation row",
@@ -3687,6 +3749,48 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 });
             return rowClean;
         });
+
+    // relocationAddends — WHERE a relocatable object of this format keeps a
+    // relocation's addend (`RelocationAddendStorage`, P68 round 9). Required
+    // alongside a non-empty `relocations` (`validate()`); read here by name
+    // through the closed table, so a typo is refused naming the values.
+    if (doc.contains("relocationAddends")) {
+        auto const& v = doc.at("relocationAddends");
+        auto const storage =
+            v.is_string()
+                ? kRelocationAddendStorageTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!storage.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/relocationAddends",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kRelocationAddendStorageTable),
+                                      ", ")));
+        } else {
+            data.relocationAddendStorage = *storage;
+        }
+    }
+
+    // inputSectionPlacement — whether the link may split a relocatable object's
+    // input section into independently placed atoms (`InputSectionPlacement`,
+    // P68 round 9). Required alongside a non-empty `relocations` (`validate()`);
+    // read by name through the closed table.
+    if (doc.contains("inputSectionPlacement")) {
+        auto const& v = doc.at("inputSectionPlacement");
+        auto const placement =
+            v.is_string()
+                ? kInputSectionPlacementTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!placement.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/inputSectionPlacement",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kInputSectionPlacementTable),
+                                      ", ")));
+        } else {
+            data.inputSectionPlacement = *placement;
+        }
+    }
 
     // sections[] — D-LK4-2 schema row. Each entry maps a universal
     // SectionKind to format-native name + structural fields.

@@ -129,44 +129,37 @@ struct DSS_EXPORT ExtensionKindEntry {
 // prefixed string types as `Array<elementCore, codeUnitCount+1>` and lowers each
 // code point into that element width.
 //
-// `elementCoreByFormat` is the per-object-format OVERRIDE of `elementCore`,
-// mirroring `BuiltinTypeMapping::coreByDataModel` exactly: `elementCore` is the
-// BASE/default, and a key for the ACTIVE format replaces it. This is how `L"…"`
-// (wchar_t) declares its FORMAT-keyed width AS CONFIG DATA (elf/macho→I32, pe→U16 —
-// D-FFI-STDDEF-WCHAR-PE-WIDTH, the SAME per-format axis the shipped stddef.json
-// wchar_t typedef declares via its `when.format` variants), so no engine tier ever
-// hardcodes a `format == …` branch. Empty ⇒ the opener's core is format-invariant
-// (the narrow `"` and the u"/U"/u8" forms). The loader AUTO-SEEDS row 0 from
-// `stringStartToken` (elementCore=Char, no format map) when absent, so a narrow-only
-// schema is byte-identical.
+// An element type that differs by PLATFORM is not stated here as a number per
+// format: it is a platform ABI typedef the TARGET declares (`abiTypedef` below).
+// P68 round 9 DELETED the per-format override this struct used to carry
+// (`elementCoreByFormat`): its one use, `wchar_t`, is a (processor × platform)
+// fact no format-keyed map can hold — `elf` is x86_64's `int` and aarch64's
+// `unsigned int` — and the loader now refuses the key by name. The loader
+// AUTO-SEEDS row 0 from `stringStartToken` (elementCore=Char) when absent, so a
+// narrow-only schema is byte-identical.
 struct DSS_EXPORT LiteralPrefixEntry {
     SchemaTokenId startToken{};
     std::string   startTokenName;   // source-text token name, for diagnostics
     TypeKind      elementCore = TypeKind::Char;
-    std::unordered_map<ObjectFormatKind, TypeKind> elementCoreByFormat;
-    // The opener's effective element core under the active object format: the
-    // per-format override if declared, else the base `elementCore`. A pure config-
-    // map lookup — NO hardcoded format identity. `nullopt` (direct-API / format-
-    // agnostic caller) falls back to the base `elementCore`.
+    // ── P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX) ─────────────────────
+    // The element type is a PLATFORM ABI TYPEDEF the TARGET declares per object
+    // format (`abiTypedefs` in `<arch>.target.json`) — `wchar_t` for `L"…"` and
+    // `L'…'`. Empty (every other row) ⇒ `elementCore` decides.
     //
-    // ★ D-HIR-RESOLVE-ELEMENT-CORE-UNKNOWN-AS-KEY: the parameter is a
-    // `SelectableObjectFormatKind`, so "no format" has ONE spelling here. Typed
-    // `std::optional<ObjectFormatKind>` it had two — `nullopt`, and an engaged
-    // `Unknown` that the lookup took for a real key — and only the first was the
-    // one the comment above describes. Handing this the sentinel, or an
-    // `std::optional<ObjectFormatKind>`, is now a compile error; a caller holding
-    // the wider type converts through `selectableObjectFormat`, which refuses the
-    // engaged sentinel loudly.
-    [[nodiscard]] TypeKind
-    resolveElementCore(std::optional<SelectableObjectFormatKind> fmt) const {
-        if (fmt) {
-            if (auto it = elementCoreByFormat.find(fmt->kind());
-                it != elementCoreByFormat.end()) {
-                return it->second;
-            }
-        }
-        return elementCore;
-    }
+    // ★ WHY THE TARGET AND NOT A FORMAT-KEYED MAP (the deleted
+    // `elementCoreByFormat`): the fact is per PROCESSOR × platform, and a
+    // format-keyed map cannot hold it — `elf` serves x86_64, whose
+    // `wchar_t` is `int`, and aarch64, whose `wchar_t` is `unsigned int`. The map
+    // said `elf → I32` for both, so on aarch64 Linux `(wchar_t)-1 > 0` was false
+    // under DSS and true under gcc and clang (✔MEASURED, lane `fo` round 8). The
+    // target's table already stated it right for `__SIZEOF_WCHAR_T__`; this makes
+    // it the ONE source, shared with `<stddef.h>`'s `wchar_t` typedef.
+    // ★ Resolved by the tier that HAS the pair (the semantic analyzer), through
+    // `TargetSchema::abiTypedefCore`; `elementCore` stays the row's answer only
+    // when NO pair is named (the LSP without a target, the direct API). A row
+    // naming a typedef is a WIDE row by declaration — the typedef's core is the
+    // pair's to choose, so the narrow/wide classification cannot wait for it.
+    std::string   abiTypedef;
 };
 
 // One operator-token → HIR target. Used for the three Pratt wrapper rules
@@ -284,11 +277,11 @@ struct DSS_EXPORT HirLoweringConfig {
     // and the C23 prefixes give `L'x'`→wchar_t, `u'x'`→char16_t (U16), `U'x'`→
     // char32_t (U32), `u8'x'`→char8_t (U8). Row 0 (the narrow opener) is AUTO-SEEDED
     // by the loader from `charStartToken` so a narrow-only schema is byte-identical.
-    // WideCharStart (wchar_t) carries the SAME FORMAT-keyed `elementCoreByFormat`
-    // (pe→U16, elf/macho→I32) as the wide-STRING row — one config axis, resolved by
-    // `resolveElementCore`. The semantic tier keys the WIDE openers only (the narrow
-    // row stays in the flat `literalTypeIds` int path); the HIR tier reads the
-    // resolved core back off the semantic-stamped body token.
+    // WideCharStart (wchar_t) names the SAME `abiTypedef: wchar_t` as the wide-
+    // STRING row — one source, the target's `abiTypedefs`, resolved per pair by the
+    // semantic tier. That tier keys the WIDE openers only (the narrow row stays in
+    // the flat `literalTypeIds` int path); the HIR tier reads the resolved core back
+    // off the semantic-stamped body token.
     std::vector<LiteralPrefixEntry> charLiteralPrefixes;
 
     // HR10 — extension kinds + flat-expression + NULL literal (SQL et al.):

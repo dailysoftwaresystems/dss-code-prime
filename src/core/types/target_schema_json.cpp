@@ -1395,7 +1395,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // (`wchar_t`, `wint_t`) per object format — `charIsUnsigned`'s shape.
     // 21 -> 22 (P68 round 8): `isaFeatures`, what an inline-asm template form
     // that depends on the ISA (x86's `%~`) reads.
-    static constexpr std::array<std::string_view, 22> kTargetDocumentKeys{
+    // 22 -> 23 (P68 round 9): `pcRelativeMemoryBase`, the program counter as a
+    // memory base (D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    static constexpr std::array<std::string_view, 23> kTargetDocumentKeys{
         // identity + loader gates
         "dssTargetVersion", "target",
         // per-target LANGUAGE-affecting semantics
@@ -1431,6 +1433,10 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // `TargetSchemaData::AsmValueCarriageRow`. Undeclared ⇒ no class
         // carries one, and such an operand is refused by name.
         "asmValueCarriage",
+        // The program counter as a memory base: which register, which memory
+        // fields take it, and the relocation a symbolic displacement against it
+        // takes — see `TargetSchemaData::PcRelativeMemoryBase`.
+        "pcRelativeMemoryBase",
         // machine description
         "opcodes", "registers", "registerClassOps", "relocations",
         "condCodeEncoding",
@@ -4016,6 +4022,110 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
                 if (ok) data.asmValueCarriage.push_back(std::move(row));
             }
+        }
+    }
+
+    // ── pcRelativeMemoryBase (the program counter as a memory base) ─────
+    //
+    // See `TargetSchemaData::PcRelativeMemoryBase`. Shape:
+    // `{ "register": "<register row>", "memoryBaseSlots": ["<slot kind>", …],
+    //    "symbolicDisplacementRelocation": "<relocation row>" }`. OPTIONAL: a
+    // processor with no PC-relative memory base declares none. Read after
+    // `registers` and `relocations`, whose NAMES it resolves; what the names
+    // must BE (a non-allocatable register with a role, a PC-relative relocation,
+    // slots whose walker encodes the form) is `validate()`'s to judge.
+    if (doc.contains("pcRelativeMemoryBase")) {
+        auto const& pc = doc.at("pcRelativeMemoryBase");
+        std::string const root{"/pcRelativeMemoryBase"};
+        if (!pc.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, root,
+                      "'pcRelativeMemoryBase' must be an object { register, "
+                      "memoryBaseSlots, symbolicDisplacementRelocation }");
+        } else {
+            static constexpr std::array<std::string_view, 3> kPcBaseKeys{
+                "register", "memoryBaseSlots", "symbolicDisplacementRelocation"};
+            DSS_CHECK_KEY_VOCABULARY(kPcBaseKeys);
+            rejectUnknownKeys(pc, kPcBaseKeys, root,
+                              "the 'pcRelativeMemoryBase' object", coll);
+            detail::TargetSchemaData::PcRelativeMemoryBase out;
+            bool ok = true;
+            if (!pc.contains("register") || !pc.at("register").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson, root + "/register",
+                          "'register' is required and must name a 'registers' "
+                          "row");
+                ok = false;
+            } else {
+                auto const name = pc.at("register").get<std::string>();
+                auto const it = data.registerIndex.find(name);
+                if (it == data.registerIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, root + "/register",
+                              std::format("'{}' names no row of this target's "
+                                          "'registers'", name));
+                    ok = false;
+                } else {
+                    out.registerOrdinal = it->second;
+                }
+            }
+            if (!pc.contains("memoryBaseSlots")
+                || !pc.at("memoryBaseSlots").is_array()
+                || pc.at("memoryBaseSlots").empty()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          root + "/memoryBaseSlots",
+                          "'memoryBaseSlots' is required and must be a non-empty "
+                          "array of encoding slot kinds — a program counter no "
+                          "field accepts is a base nothing can name");
+                ok = false;
+            } else {
+                auto const& slots = pc.at("memoryBaseSlots");
+                for (std::size_t i = 0; i < slots.size(); ++i) {
+                    auto const path = std::format("{}/memoryBaseSlots/{}", root, i);
+                    auto const sk = slots[i].is_string()
+                        ? encodingSlotKindFromName(slots[i].get<std::string>())
+                        : std::nullopt;
+                    if (!sk.has_value()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("expected one of: {}",
+                                              detail::renderAllowedList(
+                                                  allNames(kEncodingSlotKindTable),
+                                                  " / ")));
+                        ok = false;
+                        continue;
+                    }
+                    if (std::find(out.memoryBaseSlots.begin(),
+                                  out.memoryBaseSlots.end(), *sk)
+                        != out.memoryBaseSlots.end()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson, path,
+                                  std::format("slot kind '{}' is listed twice",
+                                              encodingSlotKindName(*sk)));
+                        ok = false;
+                        continue;
+                    }
+                    out.memoryBaseSlots.push_back(*sk);
+                }
+            }
+            if (!pc.contains("symbolicDisplacementRelocation")
+                || !pc.at("symbolicDisplacementRelocation").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          root + "/symbolicDisplacementRelocation",
+                          "'symbolicDisplacementRelocation' is required and must "
+                          "name a 'relocations' row");
+                ok = false;
+            } else {
+                auto const name =
+                    pc.at("symbolicDisplacementRelocation").get<std::string>();
+                auto const it = data.relocationNameIndex.find(name);
+                if (it == data.relocationNameIndex.end()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              root + "/symbolicDisplacementRelocation",
+                              std::format("'{}' names no row of this target's "
+                                          "'relocations'", name));
+                    ok = false;
+                } else {
+                    out.symbolicDisplacementRelocation =
+                        data.relocations[it->second].kind;
+                }
+            }
+            if (ok) data.pcRelativeMemoryBase = std::move(out);
         }
     }
 

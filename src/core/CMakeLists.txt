@@ -38,6 +38,10 @@ add_library(core OBJECT
     types/grammar_schema.cpp
     types/grammar_schema_json.cpp
     types/predefined_macro_json.cpp
+    # The ONE resolver of a language type NAME (`"unsigned long"` -> its
+    # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor
+    # reader at USE (a lattice-derived constant's `of`), P68 round 9.
+    types/type_name_resolve.cpp
     # The ONE `.dss-project.json` reader. It lived in `src/program/` until
     # 2026-08-13, when the LSP tier's `workspace_project.cpp` — which reads the
     # same manifest to learn a workspace's assembly dialect — had to reach UP

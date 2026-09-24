@@ -182,3 +182,52 @@ dss_add_test(NAME analysis/preprocess/test_model_limit_macros
              SOURCES test_model_limit_macros.cpp)
 target_link_libraries(dss_analysis_preprocess_test_model_limit_macros
     PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): `<limits.h>`
+# realized per (target, format) pair from the lattice — every one of the 32 names
+# with the TYPE and VALUE gcc/clang (per arch), mingw/MSVC (pe) and Darwin give it,
+# plus its `#if` arms, COMPILED FOR EVERY REAL PAIR through the driver's two halves;
+# the `<stdint.h>`/`NULL`/`clock_t` identities the typed shipped-constant splice
+# decides; `#undef` removing a shipped constant like any macro; and the splice's
+# refusal of a declared type no literal of the language has. Reads the shipped
+# config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_limits_h_lattice
+             SOURCES test_limits_h_lattice.cpp)
+target_include_directories(dss_analysis_preprocess_test_limits_h_lattice
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): `wchar_t` — the `<stddef.h>`
+# typedef and the type of `L'…'`/`L"…"` — from ONE source, the target's platform
+# ABI typedef table, on every real (target, format) pair; every shipped target
+# declares it; and a stripped custom target that does not REACHES
+# S_AbiTypedefUndeclared at the literal. Reads the shipped config, so it runs
+# through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_wchar_t_abi_typedef
+             SOURCES test_wchar_t_abi_typedef.cpp)
+
+# P68 round 9 (D-CONFIG-SYS-STAT-OVER-DECLARES-S-ISLNK-ON-PE, the coordinator's
+# ruling (a), and the <sys/stat.h> family found incomplete while measuring it): on
+# every real pair `<sys/stat.h>` defines exactly the mode names — with their values
+# — the platform's own reference defines (glibc, Darwin, mingw-w64 ∪ MSVC), and on
+# pe `<direct.h>`/`<dirent.h>` pull only what the Windows references pull. Reads the
+# shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_platform_header_surface
+             SOURCES test_platform_header_surface.cpp)
+
+# P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION +
+# D-PP-IF-NARROW-CHARACTER-CONSTANT-IGNORES-PLAIN-CHAR-SIGNEDNESS): `L'…'`, `u'…'`,
+# `U'…'` and `u8'…'` are integer constant expressions in every ICE position and in
+# `#if`, and a character constant reads in `#if` as signed iff its element type is —
+# on every real pair, through the driver's own front halves and the CST→HIR tier.
+# Reads the shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_prefixed_char_constant
+             SOURCES test_prefixed_char_constant.cpp)
+
+# P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX, the preprocessor face): the
+# `type-unsigned` predefine kind — `__CHAR_UNSIGNED__`, `__WCHAR_UNSIGNED__` and
+# `__WINT_UNSIGNED__` are defined on exactly the real pairs where gcc/clang `-dM`
+# define them, which is exactly where the type is unsigned; the merge realizes them
+# from the pair's facts alone; and the loader refuses every malformed row. Reads
+# the shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_type_unsigned_predefines
+             SOURCES test_type_unsigned_predefines.cpp)

@@ -1381,6 +1381,16 @@ struct SynthBuilder {
     // `preprocess()` dead-filters, then expands the transitive `includes` closure +
     // dedups once into `PreprocessResult`. EMIT-ONLY.
     std::vector<std::pair<fs::path, ByteOffset>>& resolvedDescriptorsOut;
+    // P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): the ACTIVE
+    // PAIR's facts — the language, the data model and plain `char`'s signedness —
+    // that `preprocess()` already received for the `type-size` macros and the
+    // `#if` character constants. The shipped-constant splice below needs them
+    // TWICE: to realize a lattice-derived row (`LONG_MAX` is `of: "long"`), and to
+    // pick the literal whose phase-7 TYPE is each constant's declared type — the
+    // data model decides what `2147483647l` types to. Before this the splice had
+    // no target at all and spelled a constant by its signedness alone. Built once
+    // per run and shared by const-ref down the builder tree, like the prefix.
+    ffi::ShippedPairFacts const& pairFacts;
     PreprocessConfig const& cfg() const { return schema->preprocess(); }
 
     // Quote-include resolution for the PRE-SCAN. Historically this was a
@@ -1603,18 +1613,53 @@ struct SynthBuilder {
         // REFUSES the descriptor rather than splicing a literal whose signedness
         // it could not confirm — a wrong branch in silence is the one outcome
         // this whole seam exists to prevent.
+        //
+        // ★★ P68 ROUND 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): AND
+        // WHOSE PHASE-7 TYPE IS THE CONSTANT'S OWN. A `#define` IS the constant
+        // everywhere after the `#include` — every use of the name expands to the
+        // spelled literal before the semantic tier sees it — so the literal's C
+        // type IS the macro's type. The splice used to match signedness alone,
+        // and the least-decorated literal of the right signedness typed to
+        // whatever the ladder said: `<stdint.h>`'s `INT64_MAX` came out `long`
+        // on Mach-O, where `int64_t` is `long long` (✔MEASURED by `_Generic`,
+        // lane `fo`, round 8). Now a spelling is accepted only when BOTH hold:
+        //   (a) phase 4: `preprocessorLiteralSignedness` — the rule the `#if`
+        //       evaluator uses — gives the declared signedness (`#if -1 <
+        //       UINT_MAX` stays false);
+        //   (b) phase 7: `typeIntegerLiteral`, the ladder both typing tiers run,
+        //       types it to exactly the declared (core, vocabulary tag) under the
+        //       PAIR's data model — `2147483647l` is `long` on LLP64 and
+        //       `9223372036854775807ll` is `long long` everywhere.
+        // With NO pair (no data model: the LSP without a target, the direct API)
+        // (b) must hold under EVERY data model, so a constant whose literal type
+        // the model decides is not spliced at all (`Unrealized`, silent — the
+        // semantic tier, which has the pair, owns any loud answer); one it cannot
+        // decide (`int`) still is.
+        enum class SpellOutcome { Spelled, Unrealized, Unspellable };
+        struct Spelling {
+            SpellOutcome outcome = SpellOutcome::Unspellable;
+            std::string  text;
+        };
+        std::vector<DataModel> spellModels;
+        if (pairFacts.dataModel.has_value()) {
+            spellModels.push_back(*pairFacts.dataModel);
+        } else {
+            for (auto const& [m, mName] : kDataModelTable.rows) {
+                (void)mName;
+                spellModels.push_back(m);
+            }
+        }
         auto const spellConstant =
-            [this](ffi::ShippedPpConstant const& k) -> std::optional<std::string> {
+            [this, &spellModels](ffi::ShippedPpConstant const& k) -> Spelling {
             auto const rules = schema->semantics().integerLiteralTyping;
-            if (rules.empty()) return std::nullopt;
+            if (rules.empty()) return {};
             NumberStyle const* const ns = schema->numberStyle();
 
-            // The first suffix spelling whose PHASE-4 signedness matches, for a
-            // literal of this magnitude. Iterates the rules in CONFIG ORDER, so
-            // the least-decorated spelling that works wins.
+            // The first suffix spelling whose PHASE-4 signedness AND PHASE-7 type
+            // both match, for a literal of this magnitude. Iterates the rules in
+            // CONFIG ORDER, so the least-decorated spelling that works wins.
             auto const suffixFor =
-                [&](std::uint64_t magnitude, bool wantUnsigned)
-                -> std::optional<std::string> {
+                [&](std::uint64_t magnitude) -> std::optional<std::string> {
                 for (auto const& r : rules) {
                     // The unsuffixed rule is spelled by the EMPTY string; every
                     // other rule contributes each of its own spellings.
@@ -1625,10 +1670,31 @@ struct SynthBuilder {
                         std::string const text = std::to_string(magnitude) + s;
                         auto const sgn = preprocessorLiteralSignedness(
                             text, ns, rules, magnitude);
-                        if (sgn.has_value() && (*sgn != wantUnsigned)) return s;
+                        if (!sgn.has_value() || *sgn == k.isUnsigned) continue;
+                        bool typed = true;
+                        for (DataModel const m : spellModels) {
+                            IntegerLadderResult const t =
+                                typeIntegerLiteral(text, ns, rules, m, magnitude);
+                            if (t.status != IntegerLadderStatus::Typed
+                                || t.kind != k.core
+                                || t.vocabularyName != k.vocabularyName) {
+                                typed = false;
+                                break;
+                            }
+                        }
+                        if (typed) return s;
                     }
                 }
                 return std::nullopt;
+            };
+            // Nothing verified: loud when the pair was known (a config defect —
+            // no literal of this language HAS the declared type), silent when
+            // it was not (the model decides it; there is no model).
+            auto const missing = [&]() -> Spelling {
+                return Spelling{pairFacts.dataModel.has_value()
+                                    ? SpellOutcome::Unspellable
+                                    : SpellOutcome::Unrealized,
+                                {}};
             };
 
             if (k.isUnsigned) {
@@ -1637,30 +1703,32 @@ struct SynthBuilder {
                         ? static_cast<std::uint64_t>(k.value)
                         : (static_cast<std::uint64_t>(k.value)
                            & ((std::uint64_t{1} << k.width) - 1));
-                auto const sfx = suffixFor(mag, /*wantUnsigned=*/true);
-                if (!sfx.has_value()) return std::nullopt;
-                return std::to_string(mag) + *sfx;
+                auto const sfx = suffixFor(mag);
+                if (!sfx.has_value()) return missing();
+                return {SpellOutcome::Spelled, std::to_string(mag) + *sfx};
             }
 
             std::int64_t const v = k.value;   // already sign-correct in the carrier
             if (v >= 0) {
-                auto const sfx = suffixFor(static_cast<std::uint64_t>(v),
-                                           /*wantUnsigned=*/false);
-                if (!sfx.has_value()) return std::nullopt;
-                return std::to_string(v) + *sfx;
+                auto const sfx = suffixFor(static_cast<std::uint64_t>(v));
+                if (!sfx.has_value()) return missing();
+                return {SpellOutcome::Spelled, std::to_string(v) + *sfx};
             }
             // Negative. `-v` as a MAGNITUDE, computed in uint64 so the most
             // negative value does not overflow on its way to being spelled.
+            // The verified literal is the MAGNITUDE's; unary minus keeps its type,
+            // and the compensating `- 1` (an `int`) converts to it — every type
+            // this form is reached for ranks at or above `int`.
             std::uint64_t const mag =
                 ~static_cast<std::uint64_t>(v) + 1u;   // two's-complement negate
             bool const mostNegative =
                 (k.width <= 64) && (mag == (std::uint64_t{1} << (k.width - 1)));
             std::uint64_t const spelled = mostNegative ? (mag - 1u) : mag;
-            auto const sfx = suffixFor(spelled, /*wantUnsigned=*/false);
-            if (!sfx.has_value()) return std::nullopt;
+            auto const sfx = suffixFor(spelled);
+            if (!sfx.has_value()) return missing();
             std::string body = "-" + std::to_string(spelled) + *sfx;
             if (mostNegative) body += " - 1";
-            return "(" + body + ")";
+            return {SpellOutcome::Spelled, "(" + body + ")"};
         };
 
         auto const spliceMacro = [&out](ffi::ShippedMacro const& macro) {
@@ -1772,7 +1840,7 @@ struct SynthBuilder {
                 // correct answer anyway: they share the same discard discipline
                 // and the same owner downstream.
                 auto consts = ffi::readShippedLibConstants(
-                    p, macroRep, std::nullopt, activeFormat);
+                    p, macroRep, std::nullopt, activeFormat, &pairFacts);
                 if (!consts) {
                     // The macros read above already decides Malformed for the
                     // parent; a constants-only defect is surfaced by the
@@ -1781,8 +1849,14 @@ struct SynthBuilder {
                     return;
                 }
                 for (auto const& k : *consts) {
-                    auto const spelled = spellConstant(k);
-                    if (!spelled.has_value()) {
+                    Spelling const spelled = spellConstant(k);
+                    if (spelled.outcome == SpellOutcome::Unrealized) {
+                        // No pair, and the data model decides this literal's
+                        // type: not a constant on an unnamed pair — the same
+                        // answer a derived row gets there.
+                        continue;
+                    }
+                    if (spelled.outcome == SpellOutcome::Unspellable) {
                         // FAIL LOUD, and on the LIVE-branch condition only —
                         // the same dead-branch inertness the malformed-macro
                         // arm keeps. A constant whose spelling this language's
@@ -1795,12 +1869,17 @@ struct SynthBuilder {
                                    std::string{"shipped-header descriptor constant '"}
                                        + k.name + "' has no literal spelling this "
                                          "language's integerLiteralTyping ladder "
-                                         "verifies (descriptor "
+                                         "verifies as its declared type ("
+                                       + std::string{typeKindNameOrEmpty(k.core)}
+                                       + (k.vocabularyName.empty()
+                                              ? std::string{}
+                                              : " \"" + k.vocabularyName + "\"")
+                                       + ") (descriptor "
                                        + core::genericSpelling(p) + ")");
                         }
                         continue;
                     }
-                    out.append("#define " + k.name + " " + *spelled + "\n");
+                    out.append("#define " + k.name + " " + spelled.text + "\n");
                 }
             },
             [&](std::string const&, HeaderSearchResult const&) {
@@ -3021,7 +3100,7 @@ struct SynthBuilder {
                                        rep, depth + 1, includeStack,
                                        includeOnce, fatal,
                                        preScanDefinePrefix, oracle,
-                                       resolvedDescriptorsOut};
+                                       resolvedDescriptorsOut, pairFacts};
                     child.build(headerBuf, out, map, headerPre);
                     includeStack.pop_back();
                     out.push_back(newline);
@@ -3265,7 +3344,7 @@ struct SynthBuilder {
                                headerNameMatching, headerSearch, rep,
                                depth + 1, includeStack, includeOnce, fatal,
                                preScanDefinePrefix, oracle,
-                               resolvedDescriptorsOut};
+                               resolvedDescriptorsOut, pairFacts};
             child.build(headerBuf, out, map, headerPre);
             includeStack.pop_back();
 
@@ -3576,15 +3655,16 @@ public:
                   // test/helper constructions compile unchanged; `preprocess()`
                   // always passes the merged list.
                   std::span<PredefinedMacroDef const> effectivePredefines = {},
-                  // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the ACTIVE
-                  // (target x object format)'s plain-`char` signedness, relayed
-                  // to the `#if` ICE evaluator. C 6.4.4.4p10 makes
-                  // `#if 'ÿ' < 0` answer differently per target and nothing
-                  // else in this pass can know it. Defaulted (like
-                  // `activeFormat` above) so every test/helper construction
-                  // compiles unchanged; absent is NOT "signed" -- a character
-                  // constant above 0x7F then refuses, loud.
-                  std::optional<bool> charIsUnsigned = std::nullopt)
+                  // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] + P68 round 9: the
+                  // ACTIVE (target x object format)'s character-constant facts,
+                  // relayed to the `#if` ICE evaluator — plain `char`'s
+                  // signedness and each wide/UTF opener's element core (see
+                  // `PpCharConstantFacts`). Nothing else in this pass can know
+                  // them. Defaulted (like `activeFormat` above) so every
+                  // test/helper construction compiles unchanged; absent is NOT
+                  // a guessed pair -- a narrow constant above 0x7F and every
+                  // wide/UTF constant then refuse, loud.
+                  PpCharConstantFacts charFacts = {})
         : synth_(std::move(synth)), schema_(std::move(schema)), rep_(rep),
           prefixLen_(prefixLen), lineMap_(lineMap),
           includeDirs_(includeDirs), systemDirs_(systemDirs),
@@ -3592,7 +3672,7 @@ public:
           headerNameMatching_(headerNameMatching),
           headerSearch_(headerSearch),
           includingDir_(std::move(includingDir)),
-          charIsUnsigned_(charIsUnsigned) {
+          charFacts_(std::move(charFacts)) {
         // FC15b (predefined macros; C 6.10.8): seed the predefined-macro map
         // (name -> def) from config. An identifier that is NOT a `#define`d
         // macro but IS a predefined name materializes its configured value (see
@@ -5519,7 +5599,7 @@ private:
         IfCallbacks const cb = makeIfCallbacks();
         auto v = evaluateIfExpression(operand, *schema_, expandCb, cb.defined,
                                       cb.hasInclude, *synth_, cb.product, rep_,
-                                      cb.hasEmbed, cb.revoked, charIsUnsigned_);
+                                      cb.hasEmbed, cb.revoked, charFacts_);
         return v.has_value() && *v;
     }
 
@@ -5975,7 +6055,7 @@ private:
                 lineSpan.subspan(lim->clauseBegin, lim->clauseEnd - lim->clauseBegin),
                 line[lim->nameIndex], *schema_, expandCb, cb.defined,
                 cb.hasInclude, *synth_, cb.product, rep_, cb.hasEmbed, cb.revoked,
-                charIsUnsigned_, textOf, failParam);
+                charFacts_, textOf, failParam);
             if (!limit.has_value()) return;   // reported through failParam
         }
 
@@ -8336,6 +8416,16 @@ private:
                         "mergePredefinedMacros may produce the effective list");
             }
             return materializeSignificant(def.value);
+        case PredefinedMacroKind::TypeUnsigned:
+            // P68 round 9: `1`, written by `mergePredefinedMacros`, which keeps
+            // the row only where its type is unsigned on the pair. An empty
+            // value is a row that bypassed the merge — the same fatal as above.
+            if (def.value.empty()) {
+                ppFatal("materializePredefined: a 'type-unsigned' predefined "
+                        "macro reached expansion unrealized — only "
+                        "mergePredefinedMacros may produce the effective list");
+            }
+            return materializeSignificant(def.value);
         case PredefinedMacroKind::Date:
             return materializeSignificant(quoteCString(dateString_));
         case PredefinedMacroKind::Time:
@@ -9217,9 +9307,9 @@ private:
     // compile's view of the include tree those searches read through.
     HeaderSearchCache&                   headerSearch_;
     fs::path                             includingDir_;
-    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: relayed to
+    // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] + P68 round 9: relayed to
     // `evaluateIfExpression`; see the constructor parameter.
-    std::optional<bool>                  charIsUnsigned_{};
+    PpCharConstantFacts                  charFacts_{};
     // FC14: the conditional-compilation frame stack (one frame per open
     // `#if`/`#ifdef`/`#ifndef`). See CondFrame + handleIf/Elif/Else/Endif.
     std::vector<CondFrame>               condStack_;
@@ -9471,6 +9561,21 @@ MergedPredefinedMacros mergePredefinedMacros(
                 if (!size.has_value()) continue;
                 PredefinedMacroDef realized = pm;
                 realized.value = std::to_string(*size);
+                out.effective.push_back(std::move(realized));
+                continue;
+            }
+            // (g) P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): a
+            // `type-unsigned` row is DEFINED, as `1`, exactly where its type is
+            // an unsigned integer type on this pair, and DROPPED everywhere else
+            // — a signed type, a type the pair does not realize, or no pair at
+            // all. The answer is the type's own (`predefinedTypeIsUnsigned`), so
+            // `#ifdef __WCHAR_UNSIGNED__` and `(wchar_t)-1 > 0` cannot disagree.
+            if (pm.kind == PredefinedMacroKind::TypeUnsigned) {
+                if (typeFacts == nullptr) continue;
+                auto const isUnsigned = predefinedTypeIsUnsigned(pm, *typeFacts);
+                if (!isUnsigned.value_or(false)) continue;
+                PredefinedMacroDef realized = pm;
+                realized.value = "1";
                 out.effective.push_back(std::move(realized));
                 continue;
             }
@@ -9887,6 +9992,39 @@ PreprocessResult preprocessRun(
     // worth strictly less than obeying the rule: the caps cost nothing on a
     // stream that is discarded, and one fewer allowlisted shape is one fewer
     // thing a later reader has to re-litigate.
+    // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
+    // the pair's character-constant facts for every `#if` this run evaluates
+    // (`PpCharConstantFacts`) — plain `char`'s signedness, and each wide/UTF
+    // opener's element core: a prefix row's own `elementCore`, or — when the row
+    // names a platform ABI typedef (`L'` → `wchar_t`) — that typedef's core as the
+    // pair declares it. That is the rule the semantic tier's `pairElementCore`
+    // types the same literal by, read here from the `abiTypedefs` the `type-size`
+    // macros read, so a constant's `#if` reading and its type agree (pinned on
+    // every real pair by `test_prefixed_char_constant`). A typedef the pair does
+    // not declare leaves its opener out — it then refuses in `#if`, loud; no pair
+    // at all (`typeFacts` null) takes each row's base core, as the semantic tier
+    // does with no target. BOTH expanders get the SAME facts, so the pre-scan
+    // oracle that gates quote-includes cannot read a `#if` differently from the
+    // authoritative pass.
+    PpCharConstantFacts charFacts;
+    charFacts.charIsUnsigned = charIsUnsigned;
+    {
+        SchemaTokenId const narrowOpener = schema->hirLowering().charStartToken;
+        for (auto const& px : schema->hirLowering().charLiteralPrefixes) {
+            if (!px.startToken.valid()) continue;
+            if (narrowOpener.valid() && px.startToken.v == narrowOpener.v) continue;
+            if (px.abiTypedef.empty() || typeFacts == nullptr) {
+                charFacts.wideCoreByOpener.emplace_back(px.startToken, px.elementCore);
+                continue;
+            }
+            for (auto const& [name, core] : typeFacts->abiTypedefs) {
+                if (name == px.abiTypedef) {
+                    charFacts.wideCoreByOpener.emplace_back(px.startToken, core);
+                    break;
+                }
+            }
+        }
+    }
     DiagnosticReporter preScanScratch{budget.asConfig()};
     auto preScanOracleBuffer = SourceBuffer::fromString(
         std::string{}, "<pp-prescan-oracle>");
@@ -9901,7 +10039,8 @@ PreprocessResult preprocessRun(
                                 systemDirs,
                                 activeFormat,
                                 includingDirectoryOf(mainSource->name()),
-                                merged.effective};
+                                merged.effective,
+                                charFacts};
     // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the SynthBuilder is conditional-
     // aware ONLY to gate quote-`#include` splicing (a dead-branch quote include
     // must not resolve -- the P0016 fix). The dead-region byte set used to
@@ -9923,12 +10062,26 @@ PreprocessResult preprocessRun(
     // [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: that state is now the ORACLE built
     // above — one `MacroExpander`, threaded by reference into every child builder
     // exactly as the `SbMacro` map and the `#undef` set used to be.
+    // P68 round 9: the pair's facts for the shipped-constant splice (see the
+    // `SynthBuilder::pairFacts` member) — the SAME inputs the `type-size` macros
+    // and the `#if` character constants already read. No pair (`typeFacts` null:
+    // the LSP without a target, the direct API) is represented as no data model,
+    // never as a default one.
+    ffi::ShippedPairFacts const pairFacts{
+        schema.get(),
+        typeFacts != nullptr ? std::optional<DataModel>{typeFacts->dataModel}
+                             : std::optional<DataModel>{},
+        charIsUnsigned,
+        // The target's ABI typedefs for this format — what an `abiTypedef`
+        // descriptor typedef (`<stddef.h>`'s `wchar_t`) reads.
+        typeFacts != nullptr ? typeFacts->abiTypedefs
+                             : std::vector<std::pair<std::string, TypeKind>>{}};
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          headerNameMatching, headerSearch,
                          *result.diagnostics, 0, includeStack, includeOnce,
                          result.fatal,
                          preScanDefinePrefix, preScanOracle,
-                         resolvedParents};
+                         resolvedParents, pairFacts};
     {
         // D-PERF-1-PREPROCESSOR sub-timing: the synth-buffer splice (recursive concat of the
         // main file + every quote-#include, + the line-map). Nests under the
@@ -10003,9 +10156,10 @@ PreprocessResult preprocessRun(
                            // it must derive its includer dir the same way.
                            includingDirectoryOf(mainSource->name()),
                            merged.effective,
-                           // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the
-                           // target's plain-`char` sign, for the `#if` fold.
-                           charIsUnsigned};
+                           // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]] + P68 round 9:
+                           // the pair's character-constant facts, for the `#if`
+                           // fold — the same ones the pre-scan oracle got.
+                           charFacts};
     std::vector<Token> finalTokens;
     {
         // D-PERF-1-PREPROCESSOR sub-timing: the macro pass (table build + stream expansion +
