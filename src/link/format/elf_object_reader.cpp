@@ -476,7 +476,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return fail(DiagnosticCode::F_CorruptedBinary,
                     "elf::readRelocatableObject: " + decode.error());
     }
-    auto const& nativeToKind         = decode->nativeToKind;
     auto const& callSignalNativeIds  = decode->callSignalNativeIds;
 
     // -- (6) Reconstruct functions / data items / externs / symbols --
@@ -1239,16 +1238,33 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + "' names symbol #" + std::to_string(symIdx)
                     + " past the symbol table (" + std::to_string(numSyms) + ").");
             }
-            auto const kindIt = nativeToKind.find(rType);
-            if (kindIt == nativeToKind.end()) {
+            // The ONE decode (`RelocationDecodeTable::decode`); an ELF type
+            // names one kind, so the site is read only by a format that
+            // declares a wire type decoded by instruction.
+            std::span<std::uint8_t const> site{};
+            if (!rangeExceedsBuffer(rOffset, 4, patched.size)
+                && !rangeExceedsBuffer(patched.offset, patched.size, bytes.size())
+                && patched.type != kShtNobits) {
+                site = std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(patched.offset + rOffset), 4};
+            }
+            auto const decoded = decode->decode(rType, site);
+            if (!decoded.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "elf::readRelocatableObject: relocation type "
                     + std::to_string(rType) + " in '" + rela.name
-                    + "' is not declared by ELF format '"
-                    + std::string{objectFormatSchema.name()}
-                    + "' -- cannot map it back to a universal RelocationKind.");
+                    + (decoded.error() == RelocationDecodeTable::Miss::Undeclared
+                           ? "' is not declared by ELF format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' -- cannot map it back to a universal "
+                                   "RelocationKind."
+                           : "' is decoded by the instruction it patches, and "
+                             "no row of ELF format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' decodes the word at offset "
+                                 + std::to_string(rOffset) + "."));
             }
-            RelocationKind const kind = kindIt->second;
+            RelocationKind const kind = *decoded;
             // Un-bake the psABI bias the writer added (r_addend = addend +
             // addendBias) so the reconstructed addend is DSS-native.
             auto const* tri = targetSchema.relocationInfo(kind);

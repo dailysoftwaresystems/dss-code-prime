@@ -64,7 +64,34 @@ namespace dss {
 //               LANGUAGE family only, for `TypeSize`'s reason; realized per
 //               pair by `mergePredefinedMacros`, which DROPS it where the type
 //               is signed or not realized.
-enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter, TypeSize, TypeUnsigned };
+//   TypeName -- the SPELLING of a TYPE on the build's (target, format) pair: a
+//               type name the language's parser reads back as exactly that type
+//               (gcc's `__INT_FAST16_TYPE__`, `__SIZE_TYPE__`, `__WCHAR_TYPE__`
+//               family, which GCC documents as "the correct underlying types for
+//               the int8_t, …, typedefs"). The row names the TYPE — typically a
+//               SHIPPED typedef (`{"shippedTypedef": "int_fast16_t", "header":
+//               "stdint.h"}`), so the macro and the typedef read ONE fact — and
+//               the spelling comes from the language's `typeNameSpellings`
+//               (P68 round 9).
+//   TypeLimit -- a LIMIT of a TYPE on the pair — its maximum, minimum or width
+//               (`"limit": "max" | "min" | "width"`), the lattice value
+//               `<limits.h>`'s derived rows take, spelled as the literal whose
+//               type is the type's promoted type (`__INT_FAST16_MAX__`,
+//               `__LONG_WIDTH__`, `__WCHAR_MIN__`; P68 round 9).
+//   TypeSuffix -- the INTEGER-LITERAL SUFFIX of a TYPE's promoted type on the
+//               pair (clang's `__INT64_C_SUFFIX__`: `L` where `int_least64_t` is
+//               `long`), or — FUNCTION-LIKE, one parameter — that parameter
+//               pasted to the suffix (gcc's `__INT64_C(c)` → `c ## L`; C
+//               7.22.4.1). P68 round 9.
+//               All three: LANGUAGE family only, realized per pair by
+//               `mergePredefinedMacros` with the LANGUAGE in hand, DROPPED where
+//               the pair does not realize the type (or no pair/language was
+//               given), and REFUSED loud where the pair realizes a type the
+//               language cannot spell.
+enum class PredefinedMacroKind {
+    Line, File, Constant, Date, Time, Counter, TypeSize, TypeUnsigned,
+    TypeName, TypeLimit, TypeSuffix
+};
 
 // The kind's CONFIG SPELLING — the same verb `parsePredefinedMacroArray`
 // (`predefined_macro_json.cpp`) accepts for the `"kind"` key, in ONE table so the
@@ -81,7 +108,7 @@ enum class PredefinedMacroKind { Line, File, Constant, Date, Time, Counter, Type
 //
 // No fall-back row is reachable: `PredefinedMacroKind` has no invalid sentinel,
 // so every value the engine can hold is enumerated below.
-inline constexpr EnumNameTable<PredefinedMacroKind, 8> kPredefinedMacroKindTable{{{
+inline constexpr EnumNameTable<PredefinedMacroKind, 11> kPredefinedMacroKindTable{{{
     { PredefinedMacroKind::Line,         "line"          },
     { PredefinedMacroKind::File,         "file"          },
     { PredefinedMacroKind::Constant,     "constant"      },
@@ -90,20 +117,63 @@ inline constexpr EnumNameTable<PredefinedMacroKind, 8> kPredefinedMacroKindTable
     { PredefinedMacroKind::Counter,      "counter"       },
     { PredefinedMacroKind::TypeSize,     "type-size"     },
     { PredefinedMacroKind::TypeUnsigned, "type-unsigned" },
+    { PredefinedMacroKind::TypeName,     "type-name"     },
+    { PredefinedMacroKind::TypeLimit,    "type-limit"    },
+    { PredefinedMacroKind::TypeSuffix,   "type-suffix"   },
 }}};
 
-// The two kinds whose row names a TYPE (the `type` key) and whose value the
-// merge derives from that type on the build pair. One predicate, so the loader,
-// the language-load resolution and the merge cannot disagree on the set.
+// The kinds whose row names a TYPE (the `type` key) and whose value the merge
+// derives from that type on the build pair. One predicate, so the loader, the
+// language-load resolution and the merge cannot disagree on the set.
 [[nodiscard]] constexpr bool
 predefinedMacroKindNamesAType(PredefinedMacroKind k) noexcept {
-    return k == PredefinedMacroKind::TypeSize || k == PredefinedMacroKind::TypeUnsigned;
+    switch (k) {
+        case PredefinedMacroKind::TypeSize:
+        case PredefinedMacroKind::TypeUnsigned:
+        case PredefinedMacroKind::TypeName:
+        case PredefinedMacroKind::TypeLimit:
+        case PredefinedMacroKind::TypeSuffix:
+            return true;
+        case PredefinedMacroKind::Line:
+        case PredefinedMacroKind::File:
+        case PredefinedMacroKind::Constant:
+        case PredefinedMacroKind::Date:
+        case PredefinedMacroKind::Time:
+        case PredefinedMacroKind::Counter:
+            return false;
+    }
+    return false;   // unreachable: every enumerator has an arm above
 }
+
+// The kinds whose value needs the LANGUAGE as well as the pair — a spelling, a
+// literal suffix or a literal of the promoted type (P68 round 9). The merge
+// realizes them only when it is handed the language; `type-size` and
+// `type-unsigned` need the pair alone.
+[[nodiscard]] constexpr bool
+predefinedMacroKindNeedsLanguage(PredefinedMacroKind k) noexcept {
+    return k == PredefinedMacroKind::TypeName || k == PredefinedMacroKind::TypeLimit
+        || k == PredefinedMacroKind::TypeSuffix;
+}
+
+// ══ THE CLOSED LIMIT VOCABULARY OF AN INTEGER TYPE ════════════════════════════
+// (P68 round 9) `max` / `min` / `width` — what a lattice-derived constant states
+// about its type. ONE table for its two readers: a shipped descriptor's derived
+// `constants` row (`{ "name": "LONG_MAX", "of": "long", "limit": "max" }`, the
+// `<limits.h>` lattice) and a `type-limit` predefined macro (`__LONG_MAX__`). They
+// state the same fact about the same type, so they share its spelling — a second
+// table would be a retyped closed set that could drift.
+enum class IntegerTypeLimit : std::uint8_t { Max, Min, Width };
+inline constexpr EnumNameTable<IntegerTypeLimit, 3> kIntegerTypeLimitTable{{{
+    { IntegerTypeLimit::Max,   "max"   },
+    { IntegerTypeLimit::Min,   "min"   },
+    { IntegerTypeLimit::Width, "width" },
+}}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
 // spelling, no duplicate ENUMERATOR. An under-filled table is legal C++ and
 // would make "" a resolving spelling; see D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE.
 DSS_CHECK_ENUM_NAME_TABLE(kPredefinedMacroKindTable);
+DSS_CHECK_ENUM_NAME_TABLE(kIntegerTypeLimitTable);
 
 [[nodiscard]] constexpr std::string_view
 predefinedMacroKindName(PredefinedMacroKind k) noexcept {
@@ -566,15 +636,38 @@ predefinedNameChangeIsRefused(PredefinedMacroRedefinition r) noexcept {
 //                  declares per object format (`abiTypedefs` in the
 //                  `.target.json` — `wchar_t`, `wint_t`). Resolved per PAIR, in
 //                  the merge; nothing about it is known at language load.
+//   ShippedTypedef -- `{"shippedTypedef": <name>, "header": <header>}` (P68
+//                  round 9): a typedef as the pair's SHIPPED descriptor for
+//                  `header` declares it (`int_fast16_t` in `<stdint.h>`) — its
+//                  identity (core AND vocabulary tag, so `long` stays apart from
+//                  `long long`) decoded for the pair by the one typedef decode
+//                  the semantic tier injects the same typedef through. Resolved
+//                  per (language × pair), in the merge.
 enum class PredefinedTypeSource : std::uint8_t {
-    None, Vocabulary, Synthesized, PointerTo, AbiTypedef
+    None, Vocabulary, Synthesized, PointerTo, AbiTypedef, ShippedTypedef
 };
+
+// ── THE TYPE-REFERENCE NOTATION, ONE OWNER (P68 round 9, D-FFI-STDINT-LIMIT-MACROS)
+// Three config readers name a type DECLARED ELSEWHERE by the same keys: a predefined
+// macro's `type` (`__SIZE_MAX__` is `{ "shippedTypedef": "size_t", "header":
+// "stddef.h" }`, `__WINT_MAX__` is `{ "abiTypedef": "wint_t" }`), a shipped
+// descriptor's derived constant `of` (`<stdint.h>`'s `SIZE_MAX` and `WINT_MAX`, the
+// same two references), and a descriptor `typedefs` entry that takes the target's
+// ABI typedef (`{ "name": "wchar_t", "abiTypedef": "wchar_t" }`). The spellings live
+// HERE and every reader aliases them, so the notation cannot fork between loaders.
+inline constexpr std::string_view kTypeRefAbiTypedefKey     = "abiTypedef";
+inline constexpr std::string_view kTypeRefShippedTypedefKey = "shippedTypedef";
+inline constexpr std::string_view kTypeRefHeaderKey         = "header";   // shippedTypedef's companion
 
 struct DSS_EXPORT PredefinedSizedType {
     PredefinedTypeSource source = PredefinedTypeSource::None;
-    // The `type` value as written — the type name, the role, the pointee, or
-    // the ABI typedef name. For the diagnostics and the dump.
+    // The `type` value as written — the type name, the role, the pointee, the
+    // ABI typedef name, or the shipped typedef name. For the diagnostics and the
+    // dump.
     std::string spelled;
+    // ShippedTypedef only: the header whose shipped descriptor declares
+    // `spelled` (`stdint.h`), searched in the language's own system directories.
+    std::string header;
     // Vocabulary / Synthesized / PointerTo: set by the LANGUAGE loader once the
     // name resolved. A row that never resolved never reaches a merge (the load
     // fails), so an unresolved row there is a caller bug, and it realizes to
@@ -583,6 +676,63 @@ struct DSS_EXPORT PredefinedSizedType {
     TypeKind core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
     std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
+    // The type's vocabulary IDENTITY tag, besides its core (P68 round 9): the
+    // resolved name's tag for a Vocabulary row (`long` is (I64, "long"), never
+    // an anonymous I64), and per data model for a Synthesized one (`size_t` is
+    // `unsigned long` on LP64 and `unsigned long long` on LLP64). Empty = the
+    // anonymous type of the core. Read by the kinds that SPELL a type or type a
+    // literal by it; `type-size` and `type-unsigned` need the core alone.
+    std::string vocabularyName;
+    std::unordered_map<DataModel, std::string> vocabularyNameByDataModel;
+};
+
+// A type's IDENTITY on one pair — its core and vocabulary tag, the two halves the
+// type system interns a type on (D-LANG-TYPE-IDENTITY-VOCABULARY). Empty
+// `vocabularyName` = the anonymous type of the core. P68 round 9.
+struct DSS_EXPORT PredefinedTypeIdentity {
+    TypeKind    core = TypeKind::Void;
+    std::string vocabularyName;
+    friend bool operator==(PredefinedTypeIdentity const&, PredefinedTypeIdentity const&) = default;
+};
+
+// ══ HOW A LANGUAGE SPELLS A TYPE: `preprocess.typeNameSpellings` ══════════════
+// (P68 round 9) A `type-name` macro's VALUE is a type name the language's parser
+// reads back as exactly the realized type. The language declares its canonical
+// spellings as a LIST OF TYPE NAMES — `"short"`, `"unsigned int"`, `"long"` —
+// each resolved at LANGUAGE LOAD by the one resolver (`resolveLanguageTypeName`),
+// so a listed name can never mean a type other than the one the parser gives it:
+// the list only CHOOSES which of the vocabulary's many spellings of a type
+// (`short` / `short int` / `signed short`) the macro uses. No representation
+// fact is restated here. Two names resolving to ONE identity on some data model
+// are refused (the choice would be ambiguous); a pair realizing an identity no
+// listed name covers refuses loud in the merge (never a guessed spelling).
+struct DSS_EXPORT PredefinedTypeSpelling {
+    std::string spelled;   // the name as written — and the macro text it yields
+    bool        resolved = false;
+    TypeKind    core     = TypeKind::Void;
+    std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    std::string vocabularyName;
+    [[nodiscard]] PredefinedTypeIdentity identityUnder(DataModel dm) const {
+        auto const it = coreByDataModel.find(dm);
+        return PredefinedTypeIdentity{it != coreByDataModel.end() ? it->second : core,
+                                      vocabularyName};
+    }
+};
+
+// The listed name whose identity under `dm` is `identity`, or nullopt when the
+// language lists none. The ONE lookup a `type-name` row's value comes from.
+[[nodiscard]] DSS_EXPORT std::optional<std::string_view>
+spellPredefinedType(std::span<PredefinedTypeSpelling const> spellings,
+                    PredefinedTypeIdentity const& identity, DataModel dm) noexcept;
+
+// One typedef a SHIPPED descriptor declares, as decoded for one (language × pair):
+// the header it came from, its name, and its identity there. The merge decodes the
+// headers its `shippedTypedef` rows name and hands the result to
+// `predefinedTypeIdentity` (P68 round 9).
+struct DSS_EXPORT PredefinedShippedTypedef {
+    std::string            header;
+    std::string            name;
+    PredefinedTypeIdentity identity;
 };
 
 // The facts ONE (target, format) pair contributes to sizing a type: the
@@ -599,7 +749,25 @@ struct DSS_EXPORT PredefinedTypeFacts {
     // `type-unsigned` kind alone: a plain-`char` core has no signedness of its
     // own, so without the pair's answer it could only be guessed.
     bool             charIsUnsigned   = false;
+    // The pair fact a SHIPPED descriptor's typedefs are variant-selected by beyond
+    // the format (P68 round 9, the `shippedTypedef` type source): the target's
+    // NAME (a typedef variant may key `when: {arch}`). Empty ⇒ an arch-keyed
+    // variant matches nothing, never a guessed arch. (The header itself is found
+    // by `ffi::readShippedHeaderTypedefs`, matched exactly as the row spells it —
+    // a config cross-reference takes no per-format case folding.)
+    std::string targetName;
 };
+
+// The identity a type-naming row's TYPE has on the pair `facts` describes, or
+// nullopt when the pair does not realize it — the ONE selection the kinds that
+// spell or type by a type read (P68 round 9). The core is chosen by the rule
+// `predefinedTypeSize` uses (`realizedCoreOf`); the tag is the row's resolved one
+// for that data model; a `shippedTypedef` row takes the (header, name) entry of
+// `shippedTypedefs` — the decode of the pair's own descriptor — and nothing else.
+[[nodiscard]] DSS_EXPORT std::optional<PredefinedTypeIdentity>
+predefinedTypeIdentity(PredefinedSizedType const&                  type,
+                       PredefinedTypeFacts const&                   facts,
+                       std::span<PredefinedShippedTypedef const>    shippedTypedefs);
 
 // FC15b: one config-declared predefined macro (C 6.10.8). `name` is the macro
 // identifier (matched by TEXT, like the directive words); `kind` selects the
@@ -658,12 +826,16 @@ struct DSS_EXPORT PredefinedMacroDef {
     PredefinedMacroRedefinition programRedefinition =
         PredefinedMacroRedefinition::WarnIsoMacro;
 
-    // `type-size` and `type-unsigned` rows only (`predefinedMacroKindNamesAType`):
-    // the TYPE whose size — or whose signedness — this macro states (see
-    // `PredefinedSizedType`). `source == None` on every other kind. The merge
-    // writes the realized value into `value` (the size, or `1` for an unsigned
-    // type) and keeps the kind, so the dump can still say it was derived.
+    // The type-naming kinds only (`predefinedMacroKindNamesAType`): the TYPE
+    // whose size, signedness, spelling, limit or literal suffix this macro
+    // states (see `PredefinedSizedType`). `source == None` on every other kind.
+    // The merge writes the realized value into `value` (the size, `1` for an
+    // unsigned type, the spelling, the spelled limit, the suffix or `p ## sfx`)
+    // and keeps the kind, so the dump can still say it was derived.
     PredefinedSizedType sizedType;
+    // `type-limit` rows only: WHICH limit of `sizedType` the macro states — its
+    // `"limit"` key, from the one `kIntegerTypeLimitTable` (P68 round 9).
+    IntegerTypeLimit    typeLimit = IntegerTypeLimit::Max;
 
     // PROVENANCE — the JSON POINTER of this entry inside its declaring document
     // (e.g. "/preprocess/predefinedMacros/7"), set by the shared entry parser.
@@ -1302,6 +1474,13 @@ struct DSS_EXPORT PreprocessConfig {
     // `#define`/`#undef` of a predefined name is a constraint violation
     // (C 6.10.8.1) -> fail loud `P_PreprocessorPredefinedMacro`.
     std::vector<PredefinedMacroDef> predefinedMacros;
+
+    // P68 round 9: the language's canonical TYPE-NAME spellings, which a
+    // `type-name` predefined macro's value is chosen from (see
+    // `PredefinedTypeSpelling`). Parsed with the preprocess block, RESOLVED once
+    // `semantics`' type tables are read. OPTIONAL — empty means the language
+    // spells no type, and a `type-name` row then cannot load.
+    std::vector<PredefinedTypeSpelling> typeNameSpellings;
 
     // FC15c (`#pragma`; C 6.10.6): the PRAGMA directive WORD, matched by lexeme
     // TEXT against the token after `#` (like define/undef/include -- `pragma`

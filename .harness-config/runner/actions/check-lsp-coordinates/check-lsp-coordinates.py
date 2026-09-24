@@ -33,17 +33,34 @@ the primitive layer it is built from (`lsp_semantic_query.*`):
                                       against the ORIGIN buffer a span resolves
                                       to, which only the owner computes.
 
+⚠ ✔MEASURED 2026-09-24: the `.source()` rule could not match `tree.source()` or
+`tree->source()` until then -- a word-boundary lookbehind stood BEFORE the `.`/`->`,
+where an identifier always stands -- so only a spelling like `f().source()` was
+refused. Fixed; in code the spelling occurs only inside the exempt owner today, so
+no verdict changed. The self-test's first two arms keep it reachable.
+
 ⚠ COMMENTS AND STRINGS ARE EXEMPT, deliberately. The routed handlers explain
 themselves by NAMING the old spelling ("`tree.source()` does not appear below"),
 and a guard that punished its own documentation would be quietly deleted the
 first time it fired on prose. Only CODE is scanned.
+
+★ WHAT IS CODE IS DECIDED BY THE ONE SHARED SCANNER, IMPORTED, NOT COPIED:
+`check-no-abort-in-tests` owns what is code, what is a comment and what is a
+string for every guard that reads C++. ✔MEASURED 2026-09-24: this file carried
+its own copy until then, with no raw-string rule and no digit-separator rule --
+it read the body of a raw string in `json_rpc.cpp` as CODE -- while no verdict
+differed over the 20 files it scans; the switch changed none.
 
 ════════════════════════════════════════════════════════════════════════════
 RED-ON-DISABLE
 ════════════════════════════════════════════════════════════════════════════
 Put `positionToByteOffset(tree.source(), pos)` back into a handler in
 `src/lsp/lsp_server.cpp` and this exits 1 naming the file and the spelling.
-Exercised by `lsp/test_lsp_coordinates` through the ctest entry, not by reading.
+★ The no-argument form (the ctest entry `lsp_coordinate_ownership_guard`) verifies
+the tree AND THEN runs the self-test, so the entry cannot pass without proving the
+guard can fail: a banned spelling in CODE is found on its own line, and the same
+spelling in a comment, a string or a raw string is not. ✔MEASURED 2026-09-24: until
+then nothing exercised it -- `lsp/test_lsp_coordinates` never runs this script.
 
 POSIX-only twin: NONE, and that is deliberate — this is a `.py`, which runs
 unchanged on the Windows leg and in WSL, so a `.ps1` would be a second
@@ -101,7 +118,10 @@ EXEMPT = {"lsp_coordinates.cpp", "lsp_coordinates.hpp",
           "lsp_semantic_query.cpp", "lsp_semantic_query.hpp"}
 
 BANNED = [
-    (re.compile(r"(?<![\w])(?:\.|->)source\s*\("),
+    # `.`/`->` then `source(`, spaces allowed between them. NO word-boundary lookbehind
+    # before the `.`: an identifier ALWAYS stands there (`tree.source()`), so the one this
+    # line carried until 2026-09-24 made the rule's own spelling unreachable.
+    (re.compile(r"(?:\.|->)\s*source\s*\("),
      "a Tree's source() is the SYNTHESIZED buffer"),
     (re.compile(r"(?<![\w])positionToByteOffset\s*\("),
      "the inbound primitive"),
@@ -112,38 +132,37 @@ BANNED = [
 ]
 
 
-def strip_comments_and_strings(text):
-    """Blank out //, /* */, "..." and '...' so only CODE is scanned.
+def _load_stripper():
+    """The comment/string scanner of `check-no-abort-in-tests`, or a loud death (exit 2): a guard
+    that cannot tell code from prose must not scan at all, and a second copy here is the drift the
+    one owner exists to stop."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    sibling = os.path.join(os.path.dirname(here), "check-no-abort-in-tests",
+                           "check-no-abort-in-tests.py")
+    if not os.path.isfile(sibling):
+        print("check-lsp-coordinates: cannot find the shared comment/string scanner at %s -- this "
+              "guard reads code through it and nowhere else; restore the sibling, do NOT copy it "
+              "here" % sibling, file=sys.stderr)
+        sys.exit(2)
+    spec = importlib.util.spec_from_file_location("_no_abort_in_tests", sibling)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.strip_comments_and_strings
 
-    Replaces with spaces rather than deleting, so reported line numbers stay
-    the file's own.
-    """
+
+strip_comments_and_strings = _load_stripper()
+
+
+def findings_in(code):
+    """[(line, spelling, why)] for every banned spelling in the STRIPPED `code`, in line order: the
+    one predicate the tree check and the self-test share."""
     out = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        two = text[i:i + 2]
-        if two == "//":
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            out.append(" " * (j - i))
-            i = j
-        elif two == "/*":
-            j = text.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
-            i = j
-        elif c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c:
-                j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
-            i = j
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
+    for lineno, line in enumerate(code.split("\n"), start=1):
+        for pattern, why in BANNED:
+            m = pattern.search(line)
+            if m:
+                out.append((lineno, m.group(0).strip(), why))
+    return out
 
 
 def main():
@@ -156,11 +175,8 @@ def main():
         path = os.path.join(LSP, name)
         with open(path, encoding="utf-8", newline="") as fh:
             code = strip_comments_and_strings(fh.read())
-        for lineno, line in enumerate(code.split("\n"), start=1):
-            for pattern, why in BANNED:
-                m = pattern.search(line)
-                if m:
-                    violations.append((name, lineno, m.group(0).strip(), why))
+        for lineno, spelling, why in findings_in(code):
+            violations.append((name, lineno, spelling, why))
 
     if not violations:
         print("check-lsp-coordinates: OK - every conversion in src/lsp/ goes "
@@ -183,5 +199,54 @@ def main():
     return 1
 
 
+def selftest():
+    """Each arm fails LOUDLY if this guard stops reading code the way the shared scanner does. The
+    raw-string and digit-separator arms are the two shapes the private copy misread: red the day a
+    copy comes back."""
+    bad = 0
+
+    def arm(label, got, want):
+        nonlocal bad
+        ok = got == want
+        if not ok:
+            bad += 1
+        print("  [%s] %s%s" % ("ok " if ok else "FAIL", label,
+                               "" if ok else "\n         got  %r\n         want %r" % (got, want)))
+
+    def spelled(src):
+        return [(ln, sp) for ln, sp, _why in findings_in(strip_comments_and_strings(src))]
+
+    arm("a banned spelling in CODE is found, on its own line",
+        spelled("int a;\nauto p = positionToByteOffset(tree.source(), pos);\n"),
+        [(2, ".source("), (2, "positionToByteOffset(")])
+    arm("`tree.source()` and `tree->source()` are found (a misplaced word boundary had made them "
+        "unreachable)", spelled("auto a = tree.source();\nauto b = tree->source();\n"),
+        [(1, ".source("), (2, "->source(")])
+    arm("the same spellings in a COMMENT are not",
+        spelled("// tree.source() does not appear below\n/* spanToRange( */ int a;\n"), [])
+    arm("a spelling inside a STRING is not",
+        spelled('auto s = "positionToByteOffset(x)";\n'), [])
+    arm("a spelling inside a RAW string is not (the private copy read its body as code)",
+        spelled('auto m = R"(a "b x.source() c)";\nint z;\n'), [])
+    arm("code after a DIGIT SEPARATOR is still read (the private copy blanked it as a char literal)",
+        spelled("int n = 1'000;\nauto p = tree.source();\n"), [(2, ".source(")])
+    arm("a line after a literal that spans a line end keeps its number",
+        spelled('auto s = "one\\\ntwo";\nauto p = tree.source();\n'), [(3, ".source(")])
+    arm("the comment/string scanner is the SHARED one, not a copy",
+        strip_comments_and_strings.__module__, "_no_abort_in_tests")
+    print("check-lsp-coordinates selftest: %s (%d failure(s))" % ("FAIL" if bad else "OK", bad))
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if sys.argv[1:] == ["--selftest"]:
+        sys.exit(selftest())
+    if sys.argv[1:]:
+        print("check-lsp-coordinates: unknown argument(s): %s (the only one is --selftest)"
+              % " ".join(sys.argv[1:]), file=sys.stderr)
+        sys.exit(2)
+    # The ctest form: verify the tree, THEN prove the guard can fail -- both, unconditionally.
+    _rc = main()
+    print("")
+    _rc_self = selftest()
+    sys.exit(_rc or _rc_self)

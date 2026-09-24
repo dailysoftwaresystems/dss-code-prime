@@ -36,6 +36,14 @@ RULE 2 (secondary, and yes it IS an enumeration): a RESOLUTION call outside
 you would have to already be on the allowlist AND use a spelling nobody listed,
 and rule 1 is what makes the allowlist the thing you have to edit.
 
+★ WHAT IS CODE IS DECIDED BY THE ONE SHARED SCANNER, IMPORTED, NOT COPIED:
+`check-no-abort-in-tests` owns what is code, what is a comment and what is a
+string for every guard that reads C++. ✔MEASURED 2026-09-24: this file carried its
+own copy until then, with no character-literal, raw-string or digit-separator rule,
+and it flattened block comments -- its reading of code differed from the owner's in
+107 of the 503 files it scans (a `'"'` opened a string that hid the code after it;
+14 src files hold one) -- while no verdict differed; the switch changed none.
+
 Usage:
     python .harness-config/runner/actions/check-path-identity/check-path-identity.py            # check
     python .harness-config/runner/actions/check-path-identity/check-path-identity.py --selftest # prove the matcher detects
@@ -188,38 +196,28 @@ def rel(p: pathlib.Path) -> str:
     return p.relative_to(SRC).as_posix()
 
 
-def strip_comments_and_strings(text: str) -> str:
-    """Blank out // and /* */ comments and "..." literals.
+def _load_stripper():
+    """The comment/string scanner of `check-no-abort-in-tests`, or a loud death (exit 2).
 
     A rule that fires on a MENTION rather than a CALL trains people to reword
     their comments, which is worse than no rule: the next real occurrence hides
-    behind the habit.
+    behind the habit -- so this guard reads CODE only, through the one scanner every
+    guard shares, and a second copy here is the drift that owner exists to stop.
     """
-    out = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "/" and i + 1 < n and text[i + 1] == "/":
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-            out.append(" " * (j - i))
-            i = j
-        elif c == "/" and i + 1 < n and text[i + 1] == "*":
-            j = text.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            out.append(" " * (j - i))
-            i = j
-        elif c == '"':
-            j = i + 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-            out.append(" " * (j - i))
-            i = j
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
+    sibling = (pathlib.Path(__file__).resolve().parent.parent
+               / "check-no-abort-in-tests" / "check-no-abort-in-tests.py")
+    if not sibling.is_file():
+        print("check-path-identity: cannot find the shared comment/string scanner at %s -- this "
+              "guard reads code through it and nowhere else; restore the sibling, do NOT copy it "
+              "here" % sibling, file=sys.stderr)
+        sys.exit(2)
+    spec = importlib.util.spec_from_file_location("_no_abort_in_tests", str(sibling))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.strip_comments_and_strings
+
+
+strip_comments_and_strings = _load_stripper()
 
 
 INCLUDE_FS = re.compile(r"^\s*#\s*include\s*<filesystem>", re.M)
@@ -268,6 +266,9 @@ def selftest() -> int:
     bad_call = "int f() { return fs::weakly_canonical(p); }\n"
     ok_comment = "// mentions weakly_canonical in prose only\nint y;\n"
     ok_string = 'char const* s = "weakly_canonical";\n'
+    # The two shapes the private copy misread: red the day a copy comes back.
+    bad_after_char_quote = "char q = '\"'; auto r = fs::weakly_canonical(p);\n"
+    ok_raw_string = 'auto m = R"(a "b weakly_canonical c)";\n'
 
     failures = []
     if not INCLUDE_FS.search(strip_comments_and_strings(bad_include)):
@@ -279,12 +280,19 @@ def selftest() -> int:
                         "would train people to reword comments")
     if "weakly_canonical" in strip_comments_and_strings(ok_string):
         failures.append("a STRING literal was treated as a call")
+    if "weakly_canonical" not in strip_comments_and_strings(bad_after_char_quote):
+        failures.append("a character literal holding a double quote HID the real call after it "
+                        "(the private copy's reading)")
+    if "weakly_canonical" in strip_comments_and_strings(ok_raw_string):
+        failures.append("a RAW string's body was treated as a call (the private copy's reading)")
+    if strip_comments_and_strings.__module__ != "_no_abort_in_tests":
+        failures.append("the comment/string scanner is not the SHARED one")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}")
     if failures:
         return 1
-    print("check-path-identity selftest: OK (4 controls)")
+    print("check-path-identity selftest: OK (7 controls)")
     return 0
 
 

@@ -1069,3 +1069,66 @@ TEST(TypeRules, DefinitelyNotIndexIntegerCoversTheCComplementOnly) {
     // finding with a different message.
     EXPECT_FALSE(isDefinitelyNotIndexInteger(in, in.pointer(in.primitive(TypeKind::I32))));
 }
+
+// ── P68 round 10 (lane `cs`): C 6.3.1.8's FIFTH CONVERSION ────────────────────
+// Two operands of the SAME width whose SIGNED one has the higher conversion rank:
+// the signed type cannot represent every value of the unsigned one, so both
+// convert to the UNSIGNED COUNTERPART of the signed type (C 6.3.1.8; C 6.3.1.1
+// ranks by name). The width decides every other mixed-signedness pair; at equal
+// width the declared vocabulary ranks do. ✔MEASURED 2026-09-24 (the lane's
+// `.temp/probe/uac`, each reference separately, every build RUN): gcc 13.3.0 and
+// clang 18.1.3 (LP64) type `long long + unsigned long` as `unsigned long long`, and
+// mingw-w64 13.2.0 and MSVC 19.51 (LLP64) type `long + unsigned int` as `unsigned
+// long`; DSS named the UNSIGNED operand's own type. RED-ON-DISABLE: the equal-width
+// arm answering the unsigned operand's name (the pre-fix `uRank >= sRank`).
+TEST(TypeRules, UsualArithmeticCommonTypeTakesTheUnsignedCounterpartAtEqualWidth) {
+    auto in = makeInterner();
+    ResolvedArithmeticRules rules;
+    rules.minRank = TypeKind::I32;
+    in.declareVocabularyRank("long", 3);
+    in.declareVocabularyRank("unsigned long", 3);
+    in.declareVocabularyRank("long long", 4);
+    in.declareVocabularyRank("unsigned long long", 4);
+    rules.unsignedCounterpart = {{"long", "unsigned long"},
+                                 {"long long", "unsigned long long"}};
+    auto UAC = [&](TypeId a, TypeId b) { return usualArithmeticCommonType(in, a, b, rules); };
+    auto both = [&](TypeId a, TypeId b, TypeId want, char const* what) {
+        EXPECT_EQ(UAC(a, b).v, want.v) << what;
+        EXPECT_EQ(UAC(b, a).v, want.v) << what << " (the other operand order)";
+    };
+    // LP64: `long` and `long long` are both I64, their unsigned twins both U64.
+    TypeId const l64   = in.primitive(TypeKind::I64, "long");
+    TypeId const ll64  = in.primitive(TypeKind::I64, "long long");
+    TypeId const ul64  = in.primitive(TypeKind::U64, "unsigned long");
+    TypeId const ull64 = in.primitive(TypeKind::U64, "unsigned long long");
+    both(ll64, ul64, ull64, "LP64 `long long + unsigned long` is `unsigned long long` (the fifth conversion)");
+    both(l64, ull64, ull64, "LP64 `long + unsigned long long`: the unsigned rank is higher (the third)");
+    both(l64, ul64, ul64, "LP64 `long + unsigned long`: equal rank, the unsigned type (the third)");
+    // LLP64: `long` is I32, `unsigned long` U32; `int` / `unsigned int` stay anonymous.
+    TypeId const l32  = in.primitive(TypeKind::I32, "long");
+    TypeId const ul32 = in.primitive(TypeKind::U32, "unsigned long");
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const u32  = in.primitive(TypeKind::U32);
+    both(l32, u32, ul32, "LLP64 `long + unsigned int` is `unsigned long` (the fifth conversion)");
+    both(i32, ul32, ul32, "LLP64 `int + unsigned long`: the unsigned rank is higher (the third)");
+    both(i32, u32, u32, "`int + unsigned int`: both anonymous, the unsigned type (the third)");
+    both(ll64, ul32, ll64, "LLP64 `long long + unsigned long`: a WIDER signed type represents every "
+                           "value (the fourth)");
+    // A hand-built rule set WITHOUT the map (no loaded language reaches this: the
+    // loader refuses a named signed entry with no counterpart) still gets the
+    // unsigned type of the right width — anonymous, never the operand's name.
+    ResolvedArithmeticRules bare;
+    bare.minRank = TypeKind::I32;
+    EXPECT_EQ(usualArithmeticCommonType(in, ll64, ul64, bare).v, in.primitive(TypeKind::U64).v);
+    // An operand PROMOTED to another kind is the anonymous promoted type, whatever
+    // its own name ranked: a language that NAMED a 16-bit `short` (rank 1) still has
+    // `short + unsigned int` meet as `int + unsigned int` — the third conversion,
+    // `unsigned int` — never the fifth (no shipped name promotes; this pins the rule
+    // for a language that names one).
+    // (Its counterpart is IN the map, so a wrongly taken fifth conversion would name
+    // a type — it cannot hide behind the anonymous fallback above.)
+    in.declareVocabularyRank("short", 1);
+    rules.unsignedCounterpart.emplace("short", "unsigned short");
+    TypeId const namedShort = in.primitive(TypeKind::I16, "short");
+    both(namedShort, u32, u32, "a promoted operand carries the promoted type's rank, not its own");
+}

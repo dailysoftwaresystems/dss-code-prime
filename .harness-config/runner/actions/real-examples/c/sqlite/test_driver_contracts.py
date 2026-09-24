@@ -3059,7 +3059,7 @@ def pin_dc27(t, x):
                                  origin="the contract suite")
     mod = x.M.fresh("sqlite_recompile",
                     given_compiler=lambda _log: comp, pair_config_root=lambda _c, _log: root,
-                    coherence_gate=lambda _label: (lambda _dirs: (True, "")),
+                    coherence_gate=lambda _label, _checkout=None: (lambda _dirs: (True, "")),
                     CMP=Proxy(importlib.import_module("sqlite_compiler"),
                               assert_current=lambda *_a, **_k: leg_plan["spec"], rebuild_command=lambda *_a: ""),
                     LIBS=Proxy(importlib.import_module("sqlite_libs"), resolve_leg=resolve_leg,
@@ -3094,9 +3094,10 @@ def pin_dc27(t, x):
          "rc=%r why=%s\n%s\n%s" % (rc, why, "\n".join(lines[-6:]), logtext[-1500:]))
     argv = next((json.loads(ln[len("DTC-DSSCP-ARGV "):]) for ln in clog.splitlines()
                  if ln.startswith("DTC-DSSCP-ARGV ")), [])
-    t.ck("B02", "dsscp is asked for its WHOLE diagnostic stream: both caps raised to the recompile's own count",
-         argv and all(argv[argv.index(f) + 1] == str(RC.DIAGNOSTIC_CAP) for f in ("--max-diagnostics",
-                                                                                 "--max-per-code") if f in argv)
+    t.ck("B02", "dsscp is asked for its WHOLE diagnostic stream: both caps raised to the driver's one count "
+         "(`sqlite_base.DIAGNOSTIC_CAP`, every build's)",
+         argv and all(argv[argv.index(f) + 1] == str(RC.B.DIAGNOSTIC_CAP) for f in ("--max-diagnostics",
+                                                                                   "--max-per-code") if f in argv)
          and "--max-diagnostics" in argv and "--max-per-code" in argv, argv)
     vj = os.path.join(outd, "recompile-verdicts.json")
     rec = json.loads(read_text(vj)) if os.path.isfile(vj) else {}
@@ -3128,6 +3129,47 @@ def pin_dc27(t, x):
          rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=0 dss_ok=3 blockers=0" % DC27_LEG
          and any("INCOMPLETE: NO REFERENCE RAN" in ln for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-6:])))
+
+    # ── an IN-PLACE stage (a POSIX host's: its build reads the shared clone) is HELD -- the clone lock, for
+    # READ, to the recompile's end -- and JUDGED against that clone (the one-vintage gate with --checkout);
+    # a staged COPY (a Windows host's) is neither. Both read from `<out>/stage/`, the one layout.
+    held, asked = [], []
+
+    class _RecordingCloneLock:
+        def __init__(self, clone):
+            self.clone = clone
+
+        def read(self, what, log=None):
+            held.append(("read", self.clone))
+
+        def release(self):
+            held.append(("release", self.clone))
+
+    def _recording_gate(_label, checkout=None):
+        asked.append(checkout)
+        return lambda _dirs: (True, "")
+
+    def load_as(copy_to_stage):
+        del held[:], asked[:]
+        dd = copy.deepcopy(d)
+        dd["copy_to_stage"] = copy_to_stage
+        sub = x.sub("dc27-%s" % ("copy" if copy_to_stage else "in-place"))
+        write_json(os.path.join(S.stage_dir_of(sub), S.RESULT_FILE), dd)
+        m = x.M.fresh("sqlite_recompile", coherence_gate=_recording_gate,
+                      P=Proxy(importlib.import_module("sqlite_procs"), CloneLock=_RecordingCloneLock))
+        run = make_run(x, x.log(), os.path.join(sub, "unused"))
+        run.stage_root = sub
+        run.resolver = FakeResolver(answer, C)
+        r, got = refused(m.load_stage, run, C.Leg(copy.deepcopy(leg_plan)))
+        return r, got, list(held), list(asked), run.clone_lock
+
+    r_in, got_in, held_in, asked_in, lock_in = load_as(False)
+    r_cp, got_cp, held_cp, asked_cp, lock_cp = load_as(True)
+    t.ck("B08", "an IN-PLACE stage is HELD (its clone lock, for READ) and JUDGED against its clone "
+         "(--checkout); a staged COPY is neither -- both read from `<out>/stage/`",
+         not r_in and held_in == [("read", d["sqlite_dir_posix"])] and asked_in == [d["sqlite_dir"]]
+         and lock_in is not None and not r_cp and held_cp == [] and asked_cp == [None] and lock_cp is None,
+         (r_in, got_in if r_in else "", held_in, asked_in, r_cp, got_cp if r_cp else "", held_cp, asked_cp))
 
 
 def _read_lines(path):
@@ -3602,16 +3644,26 @@ REDS = (
         '"blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}',
         new='"blockers": 0}', expect=("B04", "B05"),
         stay_green=("A01", "A10", "A11", "B01", "B02", "B03", "B06", "B07")),
-    red("RD-54", "DC-27", "sqlite_recompile", "new (round-close recompile, 2026-09-23)",
+    red("RD-54", "DC-27", "sqlite_base", "moved to the owner (ruling b, 2026-09-24)",
         "read dsscp's CAPPED stream as if it were whole",
-        "                           diagnostic_cap=DIAGNOSTIC_CAP)\n",
-        new="                           )\n", expect=("B02",),
+        '                     "--max-diagnostics", str(DIAGNOSTIC_CAP), "--max-per-code", str(DIAGNOSTIC_CAP)]\n',
+        new="                     ]\n", expect=("B02",),
         stay_green=("A01", "A10", "A11", "B01", "B03", "B04", "B05", "B06", "B07")),
     red("RD-55", "DC-27", "sqlite_recompile", "new (round-close recompile, 2026-09-23)",
         "reuse a stage whose per-target headers were never staged",
         "    if os.path.isfile(st.sqlite_cfg_h):\n",
         new="    if False:\n", expect=("A10", "B06"),
         stay_green=("A01", "A09", "A11", "B01", "B02", "B03", "B04", "B05", "B07")),
+    red("RD-56", "DC-27", "sqlite_recompile", "new (ruling a, 2026-09-24)",
+        "reuse an IN-PLACE stage without holding its clone or naming its checkout",
+        "    if not st.copy_to_stage:\n",
+        new="    if False:\n", expect=("B08",),
+        stay_green=("A01", "A10", "A11", "B01", "B02", "B04", "B07")),
+    red("RD-57", "DC-27", "sqlite_recompile", "new (ruling a, 2026-09-24)",
+        "hold an IN-PLACE stage but judge it without its checkout",
+        "        checkout = st.sqlite_dir\n",
+        new="        checkout = None\n", expect=("B08",),
+        stay_green=("A01", "A10", "A11", "B01", "B02", "B04", "B07")),
 )
 
 
@@ -3720,9 +3772,9 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 27 pins + 62 red arms + 10 mutator arms. A registry that no longer
+# Every arm this file registers: 27 pins + 64 red arms + 10 mutator arms. A registry that no longer
 # adds up to this -- an arm deleted, or one added without this line -- is a FAILURE.
-DECLARED_TOTAL = 99
+DECLARED_TOTAL = 101
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

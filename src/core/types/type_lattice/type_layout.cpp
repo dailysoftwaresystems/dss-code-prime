@@ -848,10 +848,10 @@ std::int64_t wideIntWidthBits(TypeInterner const& interner, TypeId id) {
                 break;
         }
     }
+    // Anchored: D-CSUBSET-BITINT-C2-WIDE, D-CSUBSET-UINT128-TYPE.
     wideIntFatal("wideIntWidthBits: TypeId is not a WIDE integer — only a "
-                 "_BitInt(N>64), __int128 or unsigned __int128 is multi-limb "
-                 "(D-CSUBSET-BITINT-C2-WIDE / D-CSUBSET-UINT128-TYPE); the caller "
-                 "skipped its isWideInt gate");
+                 "_BitInt(N>64), __int128 or unsigned __int128 is multi-limb; "
+                 "the caller skipped its isWideInt gate");
 }
 
 bool wideIntIsSigned(TypeInterner const& interner, TypeId id) {
@@ -866,10 +866,10 @@ bool wideIntIsSigned(TypeInterner const& interner, TypeId id) {
                 break;
         }
     }
+    // Anchored: D-CSUBSET-BITINT-C2-WIDE, D-CSUBSET-UINT128-TYPE.
     wideIntFatal("wideIntIsSigned: TypeId is not a WIDE integer — only a "
-                 "_BitInt(N>64), __int128 or unsigned __int128 is multi-limb "
-                 "(D-CSUBSET-BITINT-C2-WIDE / D-CSUBSET-UINT128-TYPE); the caller "
-                 "skipped its isWideInt gate");
+                 "_BitInt(N>64), __int128 or unsigned __int128 is multi-limb; "
+                 "the caller skipped its isWideInt gate");
 }
 
 bool isComplex(TypeInterner const& interner, TypeId id) noexcept {

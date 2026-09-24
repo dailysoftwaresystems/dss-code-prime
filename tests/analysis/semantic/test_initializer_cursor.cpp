@@ -21,7 +21,8 @@
 // RED-ON-DISABLE: elision off (the value meets the aggregate as it is) → the elided
 // paths; the union not completing after one member → the union cases; the unnamed
 // bit-field not skipped → the bit-field case; the continuation after a designator
-// resuming at the top level → the deep-designator cases.
+// resuming at the top level → the deep-designator cases; an index compared at 32
+// bits, or the limit checks off → the index-space case.
 // ===========================================================================
 
 #include "analysis/semantic/initializer_cursor.hpp"
@@ -44,7 +45,7 @@ class FakeView final : public TypeView {
 public:
     struct Type {
         Shape                        shape = Shape::Scalar;
-        std::optional<std::uint32_t> count;     // members / elements; nullopt = unknown length
+        std::optional<std::uint64_t> count;     // members / elements; nullopt = unknown length
         std::vector<TypeId>          members;   // an array's element type is members[0]
         std::vector<bool>            unnamedBitField;
     };
@@ -52,17 +53,17 @@ public:
     FakeView() { types_.push_back({}); }   // TypeId{0} is the invalid id
 
     TypeId scalar() { return add({Shape::Scalar, std::nullopt, {}, {}}); }
-    TypeId array(TypeId elem, std::optional<std::uint32_t> n) {
+    TypeId array(TypeId elem, std::optional<std::uint64_t> n) {
         return add({Shape::Array, n, {elem}, {}});
     }
     TypeId record(Shape shape, std::vector<TypeId> members, std::vector<bool> unnamed = {}) {
-        auto const n = static_cast<std::uint32_t>(members.size());
-        if (unnamed.empty()) unnamed.assign(n, false);
+        auto const n = static_cast<std::uint64_t>(members.size());
+        if (unnamed.empty()) unnamed.assign(members.size(), false);
         return add({shape, n, std::move(members), std::move(unnamed)});
     }
 
     [[nodiscard]] Shape shape(TypeId t) const override { return types_[t.v].shape; }
-    [[nodiscard]] std::optional<std::uint32_t> count(TypeId t) const override {
+    [[nodiscard]] std::optional<std::uint64_t> count(TypeId t) const override {
         return types_[t.v].count;
     }
     [[nodiscard]] TypeId member(TypeId t, std::uint32_t i) const override {
@@ -87,19 +88,24 @@ private:
 // itself a brace list, and — for the whole-initialization question — the type its
 // value has (InvalidType for a scalar value, which initializes no aggregate whole).
 struct Elem {
-    std::vector<std::uint32_t> designator;
+    std::vector<std::uint64_t> designator;
     bool                       braceList = false;
     TypeId                     valueType{};
 };
 
-// Place every element; render each placement as "a.b.c", "EXCESS" or "OUT".
+// Place every element; render each placement as "a.b.c", "EXCESS", "OUT", or — past
+// the index space — "LENGTH <n>" (an array too long) / "INDEX <i>" (an index too far).
 std::vector<std::string> placeAll(Cursor& c, std::vector<Elem> const& elems) {
     std::vector<std::string> out;
     for (Elem const& e : elems) {
-        Placement const p = c.place(std::span<std::uint32_t const>{e.designator}, e.braceList,
+        Placement const p = c.place(std::span<std::uint64_t const>{e.designator}, e.braceList,
                                     [&](TypeId t) { return e.valueType.valid() && e.valueType == t; });
         if (p.kind == Placement::Kind::Excess) { out.push_back("EXCESS"); continue; }
         if (p.kind == Placement::Kind::OutOfRange) { out.push_back("OUT"); continue; }
+        if (p.kind == Placement::Kind::Unrepresentable) {
+            out.push_back((p.beyondIsLength ? "LENGTH " : "INDEX ") + std::to_string(p.beyond));
+            continue;
+        }
         std::string s;
         for (std::size_t i = 0; i < p.path.size(); ++i) {
             if (i != 0) s += '.';
@@ -113,7 +119,7 @@ std::vector<std::string> placeAll(Cursor& c, std::vector<Elem> const& elems) {
 Elem pos() { return Elem{}; }
 Elem posValue(TypeId t) { return Elem{{}, false, t}; }
 Elem brace() { return Elem{{}, true, {}}; }
-Elem at(std::vector<std::uint32_t> d) { return Elem{std::move(d), false, {}}; }
+Elem at(std::vector<std::uint64_t> d) { return Elem{std::move(d), false, {}}; }
 
 using V = std::vector<std::string>;
 
@@ -275,4 +281,52 @@ TEST(InitializerCursor, AnAggregateWithNoPositionalMemberStopsTheElision) {
     EXPECT_EQ(placeAll(c1, {pos(), pos()}), (V{"0", "1"}));
     Cursor c2{flex, v};
     EXPECT_EQ(placeAll(c2, {pos(), pos(), pos()}), (V{"0", "1", "EXCESS"}));
+}
+
+// ★ P68 round 9 (lane `cs`) — THE INDEX SPACE IS CHECKED, NEVER NARROWED. Both callers
+// narrowed a designator's index (and an array's length) to 32 bits, so `int a[2] =
+// {[4294967296] = 7}` placed the 7 at element 0 SILENTLY — gcc 13.3.0, clang 18.1.3 and
+// mingw-w64 13.2.0 refuse it in every mode, and MSVC 19.51 refuses the top-level form
+// (C2078) — and `int a[] = {[4294967296] = 7}` was one element long (✔MEASURED
+// 2026-09-23, the lane's `.temp/probe/dx`, every build RUN). The cursor now takes both at
+// full width: past a bounded end is OUT OF RANGE whatever the low 32 bits say, and an
+// array longer than `kMaxLength` — declared so, or sized so by an index or by positional
+// elements running past the last representable index — is refused as the
+// implementation limit it is ("LENGTH n" / "INDEX i" here), never placed.
+TEST(InitializerCursor, TheIndexSpaceIsCheckedNeverNarrowed) {
+    FakeView v;
+    TypeId const i = v.scalar();
+    std::uint64_t const k2p32 = std::uint64_t{1} << 32;
+    // A bounded array: an index that wraps to 0 or 1 is OUT, and the cursor has not moved.
+    Cursor bounded{v.array(i, 2), v};
+    EXPECT_EQ(placeAll(bounded, {at({k2p32}), at({k2p32 + 1}), at({std::uint64_t{1} << 31}), pos()}),
+              (V{"OUT", "OUT", "OUT", "0"}));
+    Cursor nested{v.array(v.array(i, 2), 2), v};
+    EXPECT_EQ(placeAll(nested, {at({0, k2p32})}), (V{"OUT"}));
+    // An unknown size: the last representable index places (the extent is the limit
+    // itself), the next index is past it — designated or positional.
+    Cursor open{v.array(i, std::nullopt), v};
+    EXPECT_EQ(placeAll(open, {at({k2p32}), at({kMaxLength}), at({kMaxLength - 1}), pos()}),
+              (V{"INDEX " + std::to_string(k2p32), "INDEX " + std::to_string(kMaxLength),
+                 std::to_string(kMaxLength - 1), "INDEX " + std::to_string(kMaxLength)}));
+    EXPECT_EQ(static_cast<std::uint64_t>(open.extent()), kMaxLength);
+    // A declared length past the limit: the object is refused before anything is placed.
+    Cursor tooLong{v.array(i, k2p32), v};
+    ASSERT_TRUE(tooLong.unrepresentableObjectLength().has_value());
+    EXPECT_EQ(*tooLong.unrepresentableObjectLength(), k2p32);
+    EXPECT_EQ(placeAll(tooLong, {pos(), at({0})}),
+              (V{"LENGTH " + std::to_string(k2p32), "LENGTH " + std::to_string(k2p32)}));
+    // Exactly the limit is representable: its last element places, one past it is OUT.
+    Cursor atLimit{v.array(i, kMaxLength), v};
+    EXPECT_FALSE(atLimit.unrepresentableObjectLength().has_value());
+    EXPECT_EQ(placeAll(atLimit, {pos(), at({kMaxLength - 1}), at({kMaxLength})}),
+              (V{"0", std::to_string(kMaxLength - 1), "OUT"}));
+    // A too-long array INSIDE the object: refused when elision or a designator enters it;
+    // a brace list at its position is the lowering's own level, which refuses it there.
+    TypeId const big = v.array(i, k2p32 + 1);
+    TypeId const holder = v.record(Shape::Struct, {big, i});
+    Cursor inside{holder, v};
+    EXPECT_EQ(placeAll(inside, {pos(), at({0, 7}), brace(), pos()}),
+              (V{"LENGTH " + std::to_string(k2p32 + 1), "LENGTH " + std::to_string(k2p32 + 1),
+                 "0", "1"}));
 }

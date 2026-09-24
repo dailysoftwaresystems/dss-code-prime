@@ -268,9 +268,30 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     // generalized from a memory displacement to any value-bearing operand;
     // the old spelling now lands here as an unknown key rather than being
     // read as `false`.
-    static constexpr std::array<std::string_view, 7> kGuardKeys{
+    // P68 round 9 (the aarch64 twins): OPTIONAL `symbolPart` — which part of a
+    // symbol's address this variant's symbolic field encodes. Absent ⇒ the
+    // whole address (every pre-existing variant). `whole` itself is refused:
+    // stating the default states nothing, the rule `immMultipleOf: 1` follows.
+    if (g.contains("symbolPart")) {
+        auto const& sp = g.at("symbolPart");
+        auto const path = std::format(
+            "/opcodes/{}/encoding/variants/{}/guard/symbolPart", opIdx, vi);
+        auto const part = sp.is_string()
+            ? symbolAddressPartFromName(sp.get<std::string>())
+            : std::nullopt;
+        if (!part.has_value() || *part == SymbolAddressPart::Whole) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      std::format("'symbolPart' must be '{}' or '{}' (the whole "
+                                  "address is the default and is not stated)",
+                                  symbolAddressPartName(SymbolAddressPart::Page),
+                                  symbolAddressPartName(SymbolAddressPart::PageOffset)));
+        } else {
+            variant.symbolPart = *part;
+        }
+    }
+    static constexpr std::array<std::string_view, 8> kGuardKeys{
         "operandKinds", "width", "immMin", "immMax", "negValue",
-        "immMultipleOf", "memoryDestination"};
+        "immMultipleOf", "memoryDestination", "symbolPart"};
     DSS_CHECK_KEY_VOCABULARY(kGuardKeys);
     rejectUnknownKeys(g, kGuardKeys,
                       std::format("/opcodes/{}/encoding/variants/{}/guard",
@@ -1659,9 +1680,9 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
             // belongs HERE rather than in the substrate — `ObjectFormatSchema`
             // drives the same substrate loader with a DIFFERENT extension set,
             // so a set placed there would reject the other family's keys.
-            static constexpr std::array<std::string_view, 8> kRelocationKeys{
+            static constexpr std::array<std::string_view, 9> kRelocationKeys{
                 "name", "kind", "formula", "widthBytes", "pcRelative",
-                "addendBias", "tls", "imageRelative"};
+                "addendBias", "tls", "imageRelative", "scaleLog2"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationKeys);
             rejectUnknownKeys(r, kRelocationKeys,
                               std::format("/relocations/{}", i),
@@ -1769,6 +1790,46 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                     return false;
                 }
                 info.imageRelative = r.at("imageRelative").get<bool>();
+            }
+            // P68 round 9: `scaleLog2` — the access size a SCALED page-offset
+            // field is measured in (`TargetRelocationInfo::scaleLog2`). The
+            // formula that reads it must have it, and no other formula may
+            // carry it: a scale nothing reads is a fact that silently does
+            // nothing, and a missing one would make every size a byte.
+            bool const readsScale =
+                info.formulaKind == RelocFormulaKind::Aarch64LdstAbsLo12;
+            if (r.contains("scaleLog2")) {
+                auto const path = std::format("/relocations/{}/scaleLog2", i);
+                if (!readsScale) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'scaleLog2' is read only by the '{}' "
+                                       "formula; formula '{}' has no scaled "
+                                       "field",
+                                       relocFormulaName(
+                                           RelocFormulaKind::Aarch64LdstAbsLo12),
+                                       relocFormulaName(info.formulaKind)));
+                    return false;
+                }
+                if (!r.at("scaleLog2").is_number_integer()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           "'scaleLog2' must be an integer");
+                    return false;
+                }
+                std::int64_t const s = r.at("scaleLog2").get<std::int64_t>();
+                if (s < 0 || s > 4) {
+                    c.emit(DiagnosticCode::C_MalformedJson, path,
+                           std::format("'scaleLog2' ({}) must be in [0, 4]: "
+                                       "an access of 1 to 16 bytes", s));
+                    return false;
+                }
+                info.scaleLog2 = static_cast<std::uint8_t>(s);
+            } else if (readsScale) {
+                c.emit(DiagnosticCode::C_MalformedJson,
+                       std::format("/relocations/{}", i),
+                       std::format("formula '{}' reads a scaled field, so the "
+                                   "row must declare 'scaleLog2' (0..4)",
+                                   relocFormulaName(info.formulaKind)));
+                return false;
             }
             // Non-Linear coherence + default widthBytes=4 (ARM64
             // instruction word).

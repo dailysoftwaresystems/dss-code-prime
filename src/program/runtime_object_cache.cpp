@@ -2,6 +2,7 @@
 
 #include "core/crypto/sha256.hpp"
 #include "core/substrate/path_identity.hpp"  // genericSpelling
+#include "core/types/config_path_walk.hpp"   // shippedConfigDocuments -- the ONE owner of a kind's documents
 #include "program/cross_validate_target_format.hpp"
 // D-PROGRAM-RUNTIME-CACHE-TEMP-CLAIM-ESCAPES-THROUGH-A-DANGLING-SYMLINK:
 // `detail::createExclusiveBinary` is the EXCLUSIVE-CREATE primitive the
@@ -957,49 +958,29 @@ resolveArchiveSiblingFormat(ObjectFormatSchema const&      buildFormat,
             buildFormat.name(), requester.anchor));
     }
 
-    // ── STEP 1: enumerate, then SORT BY FILENAME ────────────────────────────
+    // ── STEP 1: the documents, by the ONE owner of which files ARE format ──
+    // documents (`shippedConfigDocuments`: exactly `<stem>.format.json`, regular
+    // files, SORTED BY STEM), which refuses a listing that fails or stops
+    // part-way rather than truncating it -- a partial scan cannot prove the
+    // archive-writing sibling is unique. This was one of six hand-rolled
+    // enumerations of a config kind
+    // ([[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]).
     //
     // ★ The sort is for DETERMINISM OF THE MESSAGE, not of the answer — the
-    // answer cannot depend on order, because the scan below never stops early.
-    // But an ambiguity diagnostic that lists its candidates in
-    // `directory_iterator` order would read differently on NTFS (sorted) and
-    // ext4 (hash-ordered), and a diagnostic whose text depends on the host is
-    // a diagnostic nobody can pin in a test.
+    // answer cannot depend on order, because the scan below never stops early,
+    // and the matches are sorted again before any ambiguity report names them.
     std::vector<fs::path> documents;
     {
-        fs::directory_iterator it(objectFormatsDir, ec);
-        if (ec) {
+        auto const listed = shippedConfigDocuments(objectFormatsDir, ".format.json");
+        if (!listed.has_value()) {
             return std::unexpected(std::format(
-                "{}: could not open the object-format "
-                "directory '{}': {}. Anchored: {}.",
-                requester.label, core::genericSpelling(objectFormatsDir),
-                ec.message(), requester.anchor));
+                "{}: {}; a partial or failed scan cannot prove the "
+                "archive-writing sibling is unique, so this is a refusal. "
+                "Anchored: {}.",
+                requester.label, listed.error(), requester.anchor));
         }
-        for (fs::directory_iterator const end{}; it != end; it.increment(ec)) {
-            if (ec) {
-                return std::unexpected(std::format(
-                    "{}: the scan of object-format directory "
-                    "'{}' was interrupted after PARTIAL enumeration: {}. A "
-                    "partial scan cannot prove the archive-writing sibling is "
-                    "unique, so this is a refusal. Anchored: {}.",
-                    requester.label, core::genericSpelling(objectFormatsDir),
-                    ec.message(), requester.anchor));
-            }
-            // A dedicated error_code: `ec` carries the ITERATION's status and
-            // clobbering it here would let a probe failure masquerade as a
-            // scan failure on the next loop test.
-            std::error_code typeEc;
-            if (!it->is_regular_file(typeEc) || typeEc) continue;
-            if (!it->path().filename().string().ends_with(".format.json")) {
-                continue;
-            }
-            documents.push_back(it->path());
-        }
+        for (auto const& document : *listed) documents.push_back(document.path);
     }
-    std::sort(documents.begin(), documents.end(),
-              [](fs::path const& a, fs::path const& b) {
-                  return a.filename().string() < b.filename().string();
-              });
 
     // ── STEP 2: the TOTAL scan ──────────────────────────────────────────────
     //

@@ -591,9 +591,12 @@ def attribute_build(run, leg, log_path, manifest, outd):
             log.info(str(line))
     charged = [str(t) for t in rec.get("chargedToDss") or []]
     tus = rec.get("tus") or []
-    summary = "%d of %d rejected TU(s) charged to DSS%s" % (
+    gaps = rec.get("dssStreamGaps") or []
+    summary = "%d of %d rejected TU(s) charged to DSS%s%s" % (
         len(charged), len(tus),
-        "" if not charged else ": " + " ".join(t.replace("\\", "/").rsplit("/", 1)[-1] for t in charged))
+        "" if not charged else ": " + " ".join(t.replace("\\", "/").rsplit("/", 1)[-1] for t in charged),
+        "" if not gaps else " — INCOMPLETE: dsscp's stream was not whole (%d gap(s)), so a TU past it "
+                            "shows no error" % len(gaps))
     leg.build_attribution = summary
     return summary
 

@@ -443,6 +443,23 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  "reference whose direction could be routed",
                                  o.mnemonic, vi));
             }
+            // P68 round 9: the SYMBOL-PART axis routes on a symbolic operand, so
+            // a guard stating it must have a position one can stand in — a
+            // `symbol` or a `memoffset`. Without one the variant would match
+            // nothing, silently.
+            bool const hasSymbolicPosition = std::any_of(
+                v.operandKinds.begin(), v.operandKinds.end(),
+                [](OperandKindFilter f) {
+                    return f == OperandKindFilter::SymbolRef
+                        || f == OperandKindFilter::MemOffset;
+                });
+            if (v.symbolPart.has_value() && !hasSymbolicPosition) {
+                fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                     std::format("opcode '{}' variant {}: declares symbolPart "
+                                 "but its operandKinds carry no 'symbol' or "
+                                 "'memoffset' position for a symbol to stand in",
+                                 o.mnemonic, vi));
+            }
             // ── D-OPT-LIR-ARG-REGISTER-CLASS-MISMATCH-FAILLOUD ───────
             // TOTALITY of the register-bank declaration. Every field this
             // variant will hand a REGISTER to must resolve to exactly one
@@ -1501,6 +1518,13 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                     && *va.memoryDestination != *vb.memoryDestination) {
                     continue;
                 }
+                // P68 round 9: the SYMBOL-PART axis is a fifth disambiguator. A
+                // variant stating a part matches only a symbolic operand naming
+                // that part; one stating none matches only the whole address or
+                // no symbol at all. Different parts therefore route on disjoint
+                // instructions — `ldr x1, [x0, :lo12:msg]` beside `ldr x1, [x0,
+                // #8]`, same kinds and width.
+                if (va.symbolPart != vb.symbolPart) continue;
                 // Disjoint imm-ranges ⇒ value-distinguishable, never a
                 // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
                 // hiA < loB or hiB < loA.
@@ -2588,6 +2612,26 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                  r.name,
                                  relocFormulaName(r.formulaKind)));
             }
+        }
+        // Rule (f) — P68 round 9: `scaleLog2` is read by the scaled
+        // page-offset formula alone, and it is at most a 16-byte access.
+        // A scale on another formula is a fact the kernel never reads; the
+        // loader refuses it and this refuses it for a schema built past the
+        // loader.
+        if (r.formulaKind == RelocFormulaKind::Aarch64LdstAbsLo12) {
+            if (r.scaleLog2 > 4) {
+                fail(std::format("/relocations/{}/scaleLog2", i),
+                     std::format("relocation '{}': 'scaleLog2' {} is past a "
+                                 "16-byte access (at most 4).",
+                                 r.name, r.scaleLog2));
+            }
+        } else if (r.scaleLog2 != 0) {
+            fail(std::format("/relocations/{}/scaleLog2", i),
+                 std::format("relocation '{}': 'scaleLog2' is read only by "
+                             "formula '{}', and this row declares '{}'.",
+                             r.name,
+                             relocFormulaName(RelocFormulaKind::Aarch64LdstAbsLo12),
+                             relocFormulaName(r.formulaKind)));
         }
     }
 

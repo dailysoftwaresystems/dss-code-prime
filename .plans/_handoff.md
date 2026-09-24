@@ -77,6 +77,109 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ P68 ROUND 10 — READ THIS FIRST: four silent wrong results are gone, `extern` data read from a DSS static library no longer crashes, and a closed GOT row was reopened because its fix lived in a writer no real program reaches
+
+**THE LANES THIS COMMIT CARRIES**, in seven folds (F1–F7), each from a snapshot the lane cut at its fold point and
+md5-verified (a three-way merge wherever main had moved), its rows applied through `dssharness {write,set}-anchor`
+and read back identical, and main's own build + `repo-guard` label + full ctest run after every fold (2404 → 2431
+tests on MinGW Debug across the round):
+
+| lane | subject | what landed |
+|---|---|---|
+| `cs` | C semantics (fold 4, the UAC fold) | **The array operand of `+`/`-` decays** (C 6.3.2.1p3): the typer kept the ARRAY type, so `sizeof(a + 1)` was 40, not 8, and `_Generic(1 + a, …)` missed its pointer association — a SILENT wrong type (P1, born closed). **An index designator of 2^32 or more wrapped to a small index** and wrote the wrong element SILENTLY (P1, born closed; the limit is now a stated 2^32−1, `S_ArrayLengthOutOfRange`). 84 of 145 warning-blind pins now see the warning they claim. **Usual arithmetic conversions, same width, mixed signedness** (C 6.3.1.8): the result is the SIGNED type's unsigned counterpart (`aLong + anUnsignedInt` under LLP64 was `unsigned int`, not `unsigned long` — the same representation, a wrong type NAME that `_Generic` sees), derived from the declared `rank`s (no new key — the row's prescribed remedy had decayed); ONE resolver serves both tiers, and the semantic tier resolves it once per schema (✔MEASURED ~12% of the semantic phase). Disclosed: a brace-initialized array costs its LENGTH, not its initializer (a zeroed 1 GiB buffer would need ~200 GB) |
+| `xa` | assembler surface, relocations, linker (tranche 2 part 2, archive data) | The aarch64 twins of round 9's x86 addressing: `adrp`, `:lo12:`, `:pg_hi21:`, `@PAGE`/`@PAGEOFF`, `sym+N`, the one-word `adr`, scaled page-offset loads and stores. **A foreign Mach-O arm64 page-offset LOAD was patched as an ADD** — a load's 12-bit field counts ACCESS-SIZED units, an add's counts bytes — so a foreign object's load read the wrong address SILENTLY (P1, born closed). **Reading `extern int x` from a DSS-built static library crashed** — pe64 access violation, SIGSEGV on ELF x86_64 and on ELF aarch64 under qemu, with a clean build log (P1, born closed; found by lane `lm`, whose getopt work it blocked): the merge retargeted the whole slot read to the definition, so the code loaded the datum's own bytes as a pointer; the slot decision (`readThroughSlot`) is now recorded ONCE by the MIR→LIR lowering and read by both the merge and the object-slot pass, and slots are retargeted by relocation ROLE |
+| `lm` | limits, types, shipped headers | The GNU integer-type predefines — all **122** `__*_TYPE__`/`__*_MAX__`/`__*_WIDTH__`/`__*_C` macros every reference defines on every triple (DSS defined none; three new predefine kinds `type-name`, `type-limit`, `type-suffix`); **glibc's `int_fast16_t`/`int_fast32_t` are `long`**, and DSS said `short`/`int` on every pair, so `sizeof(int_fast16_t)` was 2 on ELF where every glibc object says 8 — SILENT (P1, born closed; Darwin and mingw keep `short`/`int`, ✔MEASURED); the whole C23 7.22.2/7.22.3 `<stdint.h>` limit family (84 names + `__STDC_VERSION_STDINT_H__`) derived from the pair's type lattice; the `abiTypedef`/`shippedTypedef`/`header` spellings have ONE owner |
+| `mig` | the harness and the diagnostics surface (Phase B, the scanner/recompile fold) | **ONE owner for a kind's config documents** (`shippedConfigDocuments`): a stray file named after a language (`c.lang.json.orig`) loaded as a second language document, and the refusal named neither file (P1, closed); `check-diagnostic-codes --cross-branch` reads the ordinals other worktrees and unmerged refs hold (P1, closed); a new guard, `check-emitted-anchor-ids`, ratchets anchor ids out of operator-facing C++ messages (69 burned out of 21 files; the inventory 646 → 577; its row stays disclosed with the rest as a tranche); the uncapped diagnostic stream for Step 7's attribution. **The stage result has ONE writer on every host** (`<out>/stage/`), which gave the FIRST COMPLETE non-pe recompile: `elf64-x86_64 189/189/189 blockers=0` on WSL, gcc the reference. `check-lsp-coordinates` and `check-path-identity` import the ONE shared scanner (their private copies lacked the raw-string and character-literal rules; verdicts unchanged), and `check-lsp-coordinates`' `.source()` pattern could never match its own docstring's example |
+
+**Also (orchestrator).**
+- **A closed row was REOPENED as disclosed** — `D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS`. Lane `xa`
+  MEASURED that its 2026-09-07 closure lives in the STATIC ET_EXEC writer, which only a module with no imports
+  reaches, while every shipped ELF exec/PIE document imports libc `exit` — so every real program takes the DYNAMIC
+  writer, where no GOT slot exists: a gcc member with a plain GOTPCREL is refused at link, and gcc's default
+  REX_GOTPCRELX is refused at read. Its tests called `elf::encode`, one level below the refusing check. The new
+  trigger and closing lead, the old cells stay verbatim beneath; lane `xa`'s GOT fold (dynamic-writer slots per image
+  kind, both ISAs, `:got:sym+N` decided by AAELF64's GDAT(S+A)) re-closes it with an end-to-end proof.
+- **Main's build broke at F7 and was fixed on main.** Lane `cs` changed `resolveArithmeticRules` to take the whole
+  `SemanticConfig` (returning an optional), while lane `lm`'s F5 had ADDED a caller in
+  `src/ffi/shipped_lib_descriptor.cpp` with the old argument — each lane's tree compiled alone; the pair only met on
+  main, and main's own verify caught it. The caller now passes the language's semantics and refuses
+  `NoIntegerPromotion` when no rules resolve. A fold that changes a SIGNATURE now greps MAIN for its callers first.
+- **Provenance.** The rows the lanes wrote before round 9's commit named "P68 round 9"; the ten that land CLOSED in
+  this commit now say round 10 in their verdict (found/measured dates unchanged).
+- **The host's memory floor moved.** After the gate's two clean WSL builds the WSL VM held 24 GB of commit with
+  nothing running, and the host sat at 76% idle — above the 70% the lanes' `wait_for_memory.ps1` waits for, so every
+  lane's build was blocked. Dropping WSL's page cache (as root, inside the VM) returned 8 GB (the VM to 16 GB; the host
+  to 69.6%); WSL is not shut down, because another session runs its tests there. The threshold is now **76%** (~27 GB
+  of headroom to the 113.7 GB limit), and an OK is re-checked after a random 15–90 s settle, so lanes waiting on one
+  threshold do not all start when it clears.
+
+**DssHarness.** Sent to repo-harness this round: a **#8 addendum** — a remote leg's output relays the host's own
+shell-startup output verbatim (the Mac's emsdk profile prints `PATH += /Users/<user>/…` on every session), a user name
+in the tool's output, the same class as #8's relayed pinned address; **#9** — the path-budget warning above. #8 itself
+(a worktree's first sync opens one ssh session per write) is still open, so Mac and VPS work runs from MAIN's copy,
+routed through the orchestrator.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **588 open at HEAD → 591**, "closed 4, opened 7 (created 0, disclosed-pre-existing 7)";
+banding **P0 0 · P1 58 · P2 189 · P3 329 · P4 11 · P5 4**; `read-anchors --lint` 0 findings. ✔MEASURED against HEAD
+(`registry_delta`): **13 new rows** — 7 born closed, 6 born open (all disclosed) — 4 rows open at HEAD closed, and 1
+closed row reopened (disclosed); the done registry 1587 → 1597 rows. Every opened row is HEAD's debt, found by the
+round's own work: the round surfaced more old debt than it retired.
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.9) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2.0 (C, CXX) · **2431 / 2431** | **MSVC 19.51.36260.0** (C, CXX; VS 18.10.12217.157, toolset 14.51.36231) · **2431 / 2431** |
+| WSL x86_64, gcc 13.3.0 (C, CXX) | **2399 / 2399** | **2399 / 2399** |
+| arm64 VPS, gcc 13.3.0 (C, CXX) | **2399 / 2399** | **2399 / 2399** |
+| macOS arm64, AppleClang 21.0.0 (C, CXX) | **2399 / 2399** | **2399 / 2399** |
+
+- **The round-close sqlite recompile** (`build_and_test.py --recompile pe64-x86_64`, this commit's dsscp against the
+  mingw reference oracle): **`tus=189 reference_ok=189 dss_ok=189 blockers=0`**.
+- **2399 = 2431 minus the 32-entry `repo-guard` label**, which the indirect legs leave out through
+  `remoteExcludes`. The six non-Mac legs ran as ONE invocation (its own summary: "6 of 8 leg(s) passed; 2 did no
+  work", exit 21 — the two Mac legs it found asleep); the Mac pair ran as a second only because the Mac,
+  awake at the 07:31 `legs` probe, was asleep at the 07:35 start (waited for, never skipped: it woke ~07:38). Both WSL
+  legs rebuilt from clean (a WSL2 clock step); no other leg did.
+- **Owed since round 9, now paid:** lane `xa`'s two arm64 Mach-O page-offset examples RAN on the Mac — READ from the
+  debug leg's `LastTest.log` through `read-leg-path`: `asm_arm64_page_and_page_offset_macho` and
+  `foreign_page_offset_loads_arm64` exit 42 on the baseline AND release arms, the release images byte-identical to the
+  baselines.
+- Every INCREMENTAL leg (Windows ×2, Mac ×2) warned a 174/176-character path under the build directory: the object
+  of the test lane `cs` renamed in F1. It is a STALE leftover — the source is gone, the object is round 9's (its mtime
+  is round 9's gate), this build's `compile_commands.json` and `build.ninja` never name it, and the two legs that
+  rebuilt from clean do not warn — so DssHarness's "this build produced a path … raise the reserve" is a
+  misattribution (report #9). The reserve is not raised.
+- **Instrument blindness found at this gate (routed to lane `cs`):** 144 `integrated_tests` per-example entries on
+  Windows print `[SKIP] … no target's runOn includes host=windows` and "N of N declared target arms NOT verified", then
+  read **Test Passed** — 144 of the 2431 verified none of their example's arms through the CLI (the in-process runner
+  compiles them, and every leg has its own share). They become classified skips (`SKIP_RETURN_CODE 77`), the rule the
+  adjudicator already follows.
+
+**NEXT — P68 ROUND 11.** The lanes hold:
+- `xa` — AT ITS FOLD POINT (`.temp/fold-got/`, 40 files; MinGW gated, 13 red-on-disable mutants), folding FIRST in
+  round 11: the GOT relocations lowered ONCE at link time (a slot per symbol and addend, an ordinary pointer item, the
+  reference rewritten to its direct twin; the static `.got` deleted, no writer changed), both ISAs end to end — it
+  RE-CLOSES the reopened x86 row; a direct reference to LIBRARY data (gcc's `stdout` via PC32, expecting a copy
+  relocation) is refused by name instead of reading the slot (HEAD exits 2 where gcc gives 42). Conditions before the
+  fold: its rows name round 11, the MSVC leg, the sqlite ELF LINK proven unaffected by the new refusal (no ctest
+  entry and no recompile links sqlite), and the slot fill's equivalence to GLOB_DAT documented from glibc's own
+  loader where it can be read (INFERRED until then; the programs run, MEASURED). Then Mach-O GOT_LOAD/GOT.
+- `mig` — row 6, `D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE`, implemented and building: pe follows MSVC's own order
+  (`_initialize_narrow_environment()`, then `_get_initial_narrow_environment()` as `envp`, the wide pair for `wmain`,
+  ✔MEASURED against UCRT); elf computes `envp = argv + argc + 1` in generated startup code; the Mach-O `apple` fourth
+  parameter only on Mach-O (clang refuses it on Linux, gcc and MSVC pass garbage — ✔MEASURED); the constructor
+  trampoline saves what the FORMAT's entry forms make live. Then row 3, `D-CONFIG-COMMENT-CLAIM-ROT` (29 rewrites and
+  the outright ban in one fold), after lm's getopt.
+- `lm` — getopt (unblocked by xa's archive-data fold), then `D-FFI-ENVIRON-NOT-SHIPPED` (its premise is stale:
+  `environ` ships on both ELF arches), `__linux__`/`__unix__`/`__ELF__` with an honest `impliedSurface`, and the
+  disclosed `<float.h>`, `<inttypes.h>`, `<signal.h>`, `<uchar.h>` rows.
+- `cs` — the bracket `volatile` (a visible wrong result, P1), the sparse aggregate, then the examples runners: the
+  declared-warning rule and the 144 vacuous passes above, and `&f()` reported as an unsupported lowering instead of a
+  constraint violation (P2, disclosed by xa's fold).
+
+---
+
 ### ★ P68 ROUND 9 — READ THIS FIRST: round 8 put an array's element `const` on its pointer and broke every sqlite testfixture; that and eight silent miscompiles are gone, and DssHarness 0.5.9 owns the anchor door's rules
 
 **THE LANES THIS COMMIT CARRIES**, in eleven folds (F1–F11), each from a snapshot the lane cut at its fold point and

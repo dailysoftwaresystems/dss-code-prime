@@ -202,9 +202,11 @@ TEST(LinkVeneerVocabulary, Arm64DeclaresTheAbisGrantAndTheReferenceBody) {
 // ...and GNU ld 2.42's long-branch mechanism second
 // ([[D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB]]): 📄 its stub is
 // `ldr ip0, 1f; adr ip1, #0; add ip0, ip0, ip1; br ip0; 1: .xword PREL64(X)+12`.
-// This target declares no `adr` and no literal `ldr`, so the same mechanism is
-// spelled with its own verbs — x17 holds the literal's address, so the literal
-// is a plain PREL64 at itself.
+// The body spells the same mechanism with this target's own verbs — the
+// two-word `lea` where GNU ld writes `adr ip1, #0` (the body predates the
+// one-word `adr` of P68 round 9, and keeps its bytes) and a `load` where GNU ld
+// writes a literal `ldr` — x17 holds the literal's address, so the literal is a
+// plain PREL64 at itself.
 TEST(LinkVeneerVocabulary, Arm64DeclaresGnuLdsLongBranchMechanismSecond) {
     auto const* lv = arm64().linkVeneers();
     ASSERT_NE(lv, nullptr);

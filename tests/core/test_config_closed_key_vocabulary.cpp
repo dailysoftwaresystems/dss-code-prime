@@ -189,9 +189,15 @@ constexpr Block kBlocks[] = {
     {"asm-arm64-gas", "/assembly/operandForms",      "the 'operandForms' map"},
     {"asm-arm64-gas", "/assembly/instructions/0",    "an 'instructions' row"},
     // ⚠ Re-aimed 40 → 42 (P68 round 8): the `ldaxr` / `stlxr` rows landed ahead
-    // of the first `cset` row, the first to carry `operandSelectors`.
-    {"asm-arm64-gas", "/assembly/instructions/42/operandSelectors/0",
+    // of the first `cset` row, the first to carry `operandSelectors`; 42 → 43
+    // (P68 round 9): the `adrp` row landed ahead of it too.
+    {"asm-arm64-gas", "/assembly/instructions/43/operandSelectors/0",
                                                      "an 'operandSelectors' entry"},
+    // P68 round 9 (the aarch64 twins): a row's implied address part (`adrp`)
+    // and the address-part spellings.
+    {"asm-arm64-gas", "/assembly/instructions/24/impliedSymbolPart",
+                                                     "an 'impliedSymbolPart' object"},
+    {"asm-arm64-gas", "/assembly/symbolParts/0",     "a 'symbolParts' row"},
     {"asm-arm64-gas", "/assembly/directives/0",      "a 'directives' row"},
     // P68 round 8: the numeric local labels' suffix pair, the template text
     // forms, and a lexer mode's own closed vocabulary.

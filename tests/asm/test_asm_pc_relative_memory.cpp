@@ -254,14 +254,78 @@ TEST(AsmPcRelativeMemory, AnIndexBesideTheInstructionPointerIsRefused) {
                                  : std::string{"no module"});
 }
 
-TEST(AsmPcRelativeMemory, AConstantAfterASymbolOutsideADisplacementIsRefused) {
-    for (std::string_view line : {"\tleaq\tmsg+4, %rax\n",
-                                  "\tjmp\tmain+2\n",
-                                  "\tcall\tmain+4\n"}) {
+TEST(AsmPcRelativeMemory, ABranchOrCallTargetWithAConstantIsRefused) {
+    // gas takes both (a transfer to an address inside `main`); a branch here
+    // names a successor BLOCK or a symbol, never a byte inside one, so both are
+    // refused loudly — the RIP row's recorded residual.
+    for (std::string_view line : {"\tjmp\tmain+2\n", "\tcall\tmain+4\n"}) {
         auto const a = assembleX86(program(line));
         ASSERT_TRUE(parsedCleanly(*a.run)) << line << parseMessages(*a.run);
         EXPECT_FALSE(a.run->module.has_value()) << line;
     }
+}
+
+TEST(AsmPcRelativeMemory, AConstantAddedToACodeLabelIsRefused) {
+    // ✔MEASURED 2026-09-23: `leaq Lnext+2(%rip), %rcx; jmp *%rcx` onto a `jmp`
+    // gas encodes in 2 bytes and this build in 5 runs to 42 under gas and
+    // clang and died SIGSEGV under DSS with a clean build log — the byte N past
+    // a code label is a distance in the reference's code layout.
+    auto const code = [](std::string_view target) {
+        return "\tleaq\t" + std::string{target} + "(%rip), %rcx\n\tjmp\t*%rcx\n"
+               "Lnext:\tjmp\tLout\n\tmovl\t$42, %eax\n\tret\n"
+               "Lout:\tmovl\t$7, %eax\n";
+    };
+    // Through a displacement, an entry label's operand, and a data slot.
+    std::string const dataSlot =
+        "\t.text\n\t.globl\tmain\n\t.type\tmain, @function\nmain:\n"
+        "\tleaq\tslot(%rip), %rax\n\tret\n"
+        "\t.data\nslot:\t.quad\tmain+4\n";
+    for (std::string const& source :
+         {program(code("Lnext+2")), program("\tleaq\tmain+4(%rip), %rax\n"), dataSlot}) {
+        auto const a = assembleX86(source);
+        ASSERT_TRUE(parsedCleanly(*a.run)) << source << parseMessages(*a.run);
+        EXPECT_FALSE(a.run->module.has_value()) << source;
+        EXPECT_NE(messages(*a.run).find("a location in this file's CODE"),
+                  std::string::npos)
+            << source << messages(*a.run);
+    }
+    // CONTROL: the label itself, and a DATA label plus a constant, assemble.
+    for (std::string const& source :
+         {program(code("Lnext")), program("\tleaq\tmsg+4(%rip), %rcx\n")}) {
+        auto const a = assembleX86(source);
+        ASSERT_TRUE(a.run->module.has_value()) << source << messages(*a.run);
+        EXPECT_EQ(a.assembleErrors, 0u) << source;
+    }
+}
+
+TEST(AsmPcRelativeMemory, AConstantAfterASymbolRidesTheAddressOperand) {
+    // P68 round 9: a symbol position takes a symbol plus a constant (the
+    // `adrp x0, msg+8` of the aarch64 twins), and the x86 walker carries the
+    // constant to the relocation as the fixed32 one does. `leaq msg+4, %rax`
+    // is the address msg+4, as `leaq msg, %rax` is msg; both take the
+    // RIP-relative form here where gas writes the absolute one (the recorded
+    // `leaq msg, %rax` divergence: the value agrees wherever both link).
+    auto const a = assembleX86(program("\tleaq\tmsg+4, %rax\n"));
+    ASSERT_TRUE(parsedCleanly(*a.run)) << parseMessages(*a.run);
+    ASSERT_TRUE(a.run->module.has_value()) << messages(*a.run);
+    ASSERT_TRUE(a.module.has_value());
+    ASSERT_EQ(a.assembleErrors, 0u);
+    auto const& fn = a.module->functions.at(0);
+    ASSERT_GE(fn.bytes.size(), 7u) << hex(fn.bytes);
+    EXPECT_EQ(fn.bytes[0], 0x48);
+    EXPECT_EQ(fn.bytes[1], 0x8D);
+    EXPECT_EQ(fn.bytes[2], 0x05) << "mod 00, rm 101: the RIP-relative form";
+    ASSERT_EQ(fn.relocations.size(), 1u);
+    EXPECT_EQ(fn.relocations[0].offset, 3u);
+    EXPECT_EQ(fn.relocations[0].target,
+              dataSymbolWithBytes(*a.run->module, kMsgBytes));
+    EXPECT_EQ(fn.relocations[0].addend, 4) << "the constant written after the name";
+    // CONTROL: the same address without the constant carries addend 0.
+    auto const b = assembleX86(program("\tleaq\tmsg, %rax\n"));
+    ASSERT_TRUE(b.module.has_value());
+    ASSERT_EQ(b.assembleErrors, 0u);
+    ASSERT_EQ(b.module->functions.at(0).relocations.size(), 1u);
+    EXPECT_EQ(b.module->functions.at(0).relocations[0].addend, 0);
 }
 
 // ── red-on-disable: the behaviour rests on the declared facts ──────────────

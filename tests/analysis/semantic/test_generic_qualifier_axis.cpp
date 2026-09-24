@@ -92,6 +92,8 @@ void expectSelects42(std::initializer_list<Case> cases) {
     for (Case const& c : cases) {
         auto model = analyzeC(c.src);
         EXPECT_FALSE(model.hasErrors()) << c.name << "\n" << c.src;
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_GenericSelectionAmbiguous), 0u)
             << c.name;
         bool took42 = false;

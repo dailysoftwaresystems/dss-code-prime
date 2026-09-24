@@ -2152,3 +2152,102 @@ TEST(LirTextBlockSlot, ABlockSlotPast32BitsIsRefusedNotWrapped) {
     EXPECT_TRUE(anyHas(actuals(rep), "block slot value '4294967297' does not fit its 32-bit field"))
         << listed(actuals(rep));
 }
+
+// ── P68 round 9, the aarch64 twins: the address operands a `.s` hands the encoder ──
+//
+// `adrp x0, msg` is a `SymbolRef` naming the PAGE of `msg` (`@N:page`); `adr x0,
+// msg+8` a `SymbolAddress` — the (symbol, constant) pair in the pool —
+// (`symaddr#N`); `ldr x1, [x0, :lo12:msg]` a `MemSymbolOffset` naming the PAGE
+// OFFSET (`memsym#N:pageOffset`); `adr x7, .+8` the location counter (`^.`) and
+// the constant beside it. The part of the address is the operand's own byte and
+// the election reads it (`guard.symbolPart`), so a text that dropped it would
+// re-read `adrp x0, msg` as the whole address, which no `adrp` variant encodes.
+TEST(LirTextRoundTrip, AddressPartsSymbolConstantsAndTheLocationCounterSurvive) {
+    auto const loaded = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(loaded.has_value());
+    TargetSchema const& sch = **loaded;
+    auto const adrp = sch.opcodeByMnemonic("adrp");
+    auto const adr  = sch.opcodeByMnemonic("adr");
+    auto const load = sch.opcodeByMnemonic("load");
+    auto const ret  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(adrp && adr && load && ret);
+    LirBuilder b{sch};
+    LirLiteralValue plus8;
+    plus8.value = LirSymbolAddress{SymbolId{7}, 8};
+    plus8.core  = TypeKind::Ptr;
+    std::uint32_t const plus8Idx = b.literalPoolAdd(std::move(plus8));
+    LirLiteralValue at0;
+    at0.value = LirSymbolAddress{SymbolId{7}, 0};
+    at0.core  = TypeKind::Ptr;
+    std::uint32_t const at0Idx = b.literalPoolAdd(std::move(at0));
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const x0 = makePhysicalReg(*sch.registerByName("x0"), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(*sch.registerByName("x1"), LirRegClass::GPR);
+    LirReg const x7 = makePhysicalReg(*sch.registerByName("x7"), LirRegClass::GPR);
+    std::array<LirOperand, 1> pageOps{
+        LirOperand::makeSymbolRef(7, SymbolAddressPart::Page)};
+    b.addInst(*adrp, x0, pageOps);
+    std::array<LirOperand, 1> adrOps{LirOperand::makeSymbolAddress(plus8Idx)};
+    b.addInst(*adr, x1, adrOps);
+    std::array<LirOperand, 3> loadOps{
+        LirOperand::makeReg(x0), LirOperand::makeMemBase(1),
+        LirOperand::makeMemSymbolOffset(at0Idx, SymbolAddressPart::PageOffset)};
+    b.addInst(*load, x1, loadOps);
+    std::array<LirOperand, 2> hereOps{LirOperand::makeLocationCounter(),
+                                      LirOperand::makeImmInt32(8)};
+    b.addInst(*adr, x7, hereOps);
+    b.addReturn(*ret, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(lir, sch, ctx, "address parts");
+    EXPECT_NE(text.find("adrp @7:page"), std::string::npos) << text;
+    EXPECT_NE(text.find(std::format("adr symaddr#{}", plus8Idx)), std::string::npos) << text;
+    EXPECT_NE(text.find(std::format("memsym#{}:pageOffset", at0Idx)), std::string::npos)
+        << text;
+    EXPECT_NE(text.find("adr ^., #8"), std::string::npos) << text;
+
+    // Parsed back, the part is the operand's own byte, not text decoration.
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(text, sch, rep);
+    ASSERT_TRUE(parsed->ok);
+    bool sawPage = false, sawPageOffset = false, sawHere = false;
+    Lir const& back = parsed->lir;
+    ASSERT_EQ(back.moduleFuncCount(), 1u);
+    LirFuncId const fn = back.funcAt(0);
+    for (std::uint32_t bi = 0; bi < back.funcBlockCount(fn); ++bi) {
+        LirBlockId const bb = back.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < back.blockInstCount(bb); ++ii) {
+            for (auto const& o : back.instOperands(back.blockInstAt(bb, ii))) {
+                if (o.kind == LirOperandKind::SymbolRef
+                    && o.symbolAddressPart() == SymbolAddressPart::Page) sawPage = true;
+                if (o.kind == LirOperandKind::MemSymbolOffset
+                    && o.symbolAddressPart() == SymbolAddressPart::PageOffset) {
+                    sawPageOffset = true;
+                }
+                if (o.kind == LirOperandKind::LocationCounter) sawHere = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawPage);
+    EXPECT_TRUE(sawPageOffset);
+    EXPECT_TRUE(sawHere);
+}
+
+TEST(LirTextParser, AnUnknownAddressPartIsRefusedNotReadAsTheWholeAddress) {
+    auto const loaded = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(loaded.has_value());
+    std::string const blocks =
+        "    block ^b0 [entry] -> [] {\n"
+        "      %v.1:gpr = adrp @7:pageoff ; payload=0 flags=0\n"
+        "      ret %v.1:gpr ; payload=0 flags=0\n"
+        "    }\n";
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(
+        oneFunctionLir(**loaded, "  %1 \"main\"\n  %7 \"msg\"\n", "%1 \"main\"", blocks),
+        **loaded, rep);
+    EXPECT_FALSE(parsed->ok);
+    EXPECT_TRUE(anyHas(actuals(rep), "'pageoff' is not a part of a symbol's address"))
+        << listed(actuals(rep));
+}

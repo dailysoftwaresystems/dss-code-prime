@@ -12,6 +12,11 @@ dss_add_test(NAME core/test_parse_diagnostic    SOURCES test_parse_diagnostic.cp
 dss_add_test(NAME core/test_asm_template_text_forms
              SOURCES test_asm_template_text_forms.cpp)
 dss_add_test(NAME core/test_config_path_walk    SOURCES test_config_path_walk.cpp)
+# The ONE owner of which files ARE the documents of a config kind: exact
+# `<stem><suffix>` regular files, sorted, a partial listing refused
+# (D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT).
+dss_add_test(NAME core/test_shipped_config_documents
+             SOURCES test_shipped_config_documents.cpp)
 # The ONE path-identity chokepoint (D-PATH-IDENTITY-8DOT3-SPELLINGS-SPLIT-KEYS).
 # Its 8.3 arms CONSTRUCT the hazard and SKIP LOUDLY where the volume cannot
 # stage it -- a test that merely hopes to meet a short name is a false green.

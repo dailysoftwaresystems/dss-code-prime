@@ -1024,6 +1024,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // "nothing declared", which that pass refuses loudly, rather than as a real layout it
     // could not tell from a genuine declaration. Consulted only if a stdio recipe appears.
     cuMir.vaListLayout = analyzeVaLayout;
+    // P68 round 9 (the aarch64 twins): the format kind, ONLY as the key an
+    // inline-asm template's address-part operators are read under — see the
+    // field.
+    cuMir.assemblyFormatKind = format.kind();
     return cuMir;
 }
 
@@ -1214,7 +1218,11 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // above; the NAMES the routing needs are built from
                          // `nameOf` right below, not threaded from the caller.
                          std::vector<SymbolBinding>                  preemptibleDefinitionBindings,
-                         DiagnosticReporter&                         reporter) {
+                         DiagnosticReporter&                         reporter,
+                         // P68 round 9: the format kind, ONLY as a key into
+                         // the assembly dialect's `symbolParts` (see
+                         // `CuMirModule::assemblyFormatKind`).
+                         std::optional<ObjectFormatKind>             assemblyFormatKind) {
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
     // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
     // definition. Built HERE because this is where names live — `nameOf` is
@@ -1290,7 +1298,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           // the format's declared preemptible-definition
                           // bindings, and the names the routing mints with.
                           std::move(preemptibleDefinitionBindings),
-                          std::move(definedSymbolNames));
+                          std::move(definedSymbolNames),
+                          // P68 round 9: the format kind, ONLY as a key into
+                          // the assembly dialect's `symbolParts`.
+                          assemblyFormatKind);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -2314,7 +2325,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
         atomicsRuntime, cuMir.indirectSlotBindings,
-        cuMir.preemptibleDefinitionBindings, reporter);
+        cuMir.preemptibleDefinitionBindings, reporter,
+        cuMir.assemblyFormatKind);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2362,7 +2374,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // the format's declared preemptible-definition
                       // bindings, pre-resolved one level up in program.cpp
                       // (same shape as `indirectSlotBindings` above).
-                      std::vector<SymbolBinding> preemptibleDefinitionBindings) {
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings,
+                      std::optional<ObjectFormatKind> assemblyFormatKind) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2379,7 +2392,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
         std::move(atomicsRuntime), std::move(indirectSlotBindings),
-        std::move(preemptibleDefinitionBindings), reporter);
+        std::move(preemptibleDefinitionBindings), reporter,
+        assemblyFormatKind);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -4116,8 +4130,11 @@ assembleAsmUnit(CompilationUnit const&     cu,
     AssembledModule merged;
     merged.cuId = cu.id();
     for (auto const& tree : cu.trees()) {
+        // P68 round 9: the format kind, ONLY as a key into the dialect's
+        // `symbolParts` / `impliedSymbolPart` (`:lo12:` on ELF, `@PAGEOFF` on
+        // Mach-O — each reference reads only its own format's spelling).
         auto lowered = lowerAsmTextToLir(tree, grammar, target, entryNames,
-                                         reporter);
+                                         reporter, format.kind());
         if (!lowered) return std::nullopt;
 
         // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +

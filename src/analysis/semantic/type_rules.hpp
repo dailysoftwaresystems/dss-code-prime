@@ -8,8 +8,10 @@
 #include "core/types/type_lattice/type_interner.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 // Header-only type-relation rules over `TypeInterner const&`. SE1 ships
 // the minimum the toy/c/tsql tests need: assignability, the
@@ -1688,10 +1690,24 @@ struct ResolvedArithmeticRules {
     // default false ⇒ a language without the flag keeps `usualArithmeticCommonType`
     // returning InvalidType for any BitInt pair (no accidental promotion).
     bool                  bitIntConversions = false;
+    // C 6.3.1.8's fifth conversion (P68 round 10, lane `cs`): each NAMED signed
+    // vocabulary entry's UNSIGNED COUNTERPART under this data model — derived from the
+    // language's `typeSpecifiers` by `deriveUnsignedCounterparts` (semantic_config.hpp),
+    // the derivation the loader checks complete. Empty for a hand-built rule set, which
+    // then never reaches the fifth conversion's name (see the RankPreferUnsigned arm).
+    std::unordered_map<std::string, std::string> unsignedCounterpart;
 };
 
-[[nodiscard]] inline ResolvedArithmeticRules
-resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
+// THE ONE RESOLVER, for both tiers (the semantic typer and the CST→HIR lowering):
+// nullopt for a language that declares no `arithmeticConversions` block (it keeps the
+// legacy `TypeInterner::commonType`), else the block resolved for `dm` together with
+// the two facts the block does not carry — the top-level `bitIntConversions` flag and
+// the unsigned-counterpart map. P68 round 10 (lane `cs`): the two call sites each
+// injected the flag by hand after resolving; they now ask this once.
+[[nodiscard]] inline std::optional<ResolvedArithmeticRules>
+resolveArithmeticRules(SemanticConfig const& sem, DataModel dm) {
+    if (!sem.arithmeticConversions.has_value()) return std::nullopt;
+    ArithmeticConversions const& cfg = *sem.arithmeticConversions;
     ResolvedArithmeticRules out;
     out.minRank = cfg.minRankType.resolveCore(dm);
     out.alsoPromote.reserve(cfg.alsoPromote.size());
@@ -1699,6 +1715,8 @@ resolveArithmeticRules(ArithmeticConversions const& cfg, DataModel dm) {
     out.mixedSignedness    = cfg.mixedSignedness;
     out.promoteComparisons = cfg.promoteComparisons;
     out.shiftResult        = cfg.shiftResult;
+    out.bitIntConversions  = sem.bitIntConversions;
+    out.unsignedCounterpart = deriveUnsignedCounterparts(sem.typeSpecifiers, dm).counterpartOf;
     return out;
 }
 
@@ -1801,12 +1819,18 @@ enumeratorValueFitsUnderlying(std::int64_t value, TypeKind underlying) noexcept 
 //      float side).
 //   2. integer promotion per `promoteIntegerKind` (floor + alsoPromote).
 //   3. same kind → it; same signedness → wider rank; mixed signedness
-//      per the closed verb. `rank-prefer-unsigned` (C): unsigned rank ≥
-//      signed rank → the unsigned kind at its rank; else the signed kind
-//      (a strictly-wider power-of-two signed type represents the whole
-//      unsigned range, so C's third branch — "the unsigned counterpart
-//      of the signed type" — is unreachable over width-distinct core
-//      kinds; it exists only for same-width different-rank ABO types).
+//      per the closed verb. `rank-prefer-unsigned` (C 6.3.1.8's last three
+//      conversions, on CONVERSION rank — C 6.3.1.1, by name): a strictly
+//      wider unsigned operand, or one of the same width and not lower rank →
+//      the unsigned type; a strictly wider signed operand represents every
+//      unsigned value → the signed type; the same width with the SIGNED
+//      operand ranked higher (LP64 `long long` vs `unsigned long`, LLP64
+//      `long` vs `unsigned int`) → the UNSIGNED COUNTERPART of the signed
+//      type. P68 round 10 (lane `cs`): that last conversion was taken for
+//      unreachable here — only the width decided, and the unsigned operand's
+//      own name won — so the sum was `unsigned long` where C says `unsigned
+//      long long` (LP64) and `unsigned int` where C says `unsigned long`
+//      (LLP64): the same value, the wrong type, observable through `_Generic`.
 [[nodiscard]] inline TypeId
 usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
                           ResolvedArithmeticRules const& rules) {
@@ -1962,12 +1986,30 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
     // so this switch is exhaustive over the declared vocabulary).
     switch (rules.mixedSignedness) {
         case MixedSignednessRule::RankPreferUnsigned: {
-            int const  uRank = sa ? rb : ra;
+            int const  uRank = sa ? rb : ra;   // WIDTH ranks, after promotion
             int const  sRank = sa ? ra : rb;
-            if (uRank >= sRank) {
-                return pick(kindAtRank(uRank, /*isSigned=*/false));
-            }
-            return pick(kindAtRank(sRank, /*isSigned=*/true));
+            if (uRank > sRank) return pick(kindAtRank(uRank, /*isSigned=*/false));
+            if (uRank < sRank) return pick(kindAtRank(sRank, /*isSigned=*/true));
+            // EQUAL WIDTH: the widths cannot decide; the CONVERSION ranks the
+            // language declares on its named entries do. An operand whose kind
+            // CHANGED under promotion is the anonymous promoted type (rank 0).
+            TypeId const   sOp = sa ? a : b;
+            TypeId const   uOp = sa ? b : a;
+            bool const     sKept = (sa ? ka : kb) == (sa ? pa : pb);
+            bool const     uKept = (sa ? kb : ka) == (sa ? pb : pa);
+            int const      sConv = sKept ? interner.vocabularyRank(sOp) : 0;
+            int const      uConv = uKept ? interner.vocabularyRank(uOp) : 0;
+            TypeKind const uKind = kindAtRank(uRank, /*isSigned=*/false);
+            if (uConv >= sConv) return pick(uKind);   // the unsigned operand's rank is not lower
+            // The signed operand ranks higher but, at the same width, cannot
+            // represent every unsigned value: its UNSIGNED COUNTERPART.
+            auto const cp = rules.unsignedCounterpart.find(
+                std::string{interner.vocabularyName(sOp)});
+            // Unreachable for a loaded language (the loader refuses a named signed
+            // entry with no counterpart); a hand-built rule set without the map
+            // gets the unsigned type of the right width, anonymous.
+            if (cp == rules.unsignedCounterpart.end()) return interner.primitive(uKind);
+            return interner.primitive(uKind, cp->second);
         }
     }
     return InvalidType;

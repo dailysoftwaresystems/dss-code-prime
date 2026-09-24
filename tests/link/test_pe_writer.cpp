@@ -6893,8 +6893,15 @@ namespace {
 // so every import took the slot); `Global` is the case the narrowing exists
 // for. One module shape serves both so the two answers are read off ONE
 // object, never off two fixtures that could drift apart.
+// ★ P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the slot
+// pass reads each row's `readThroughSlot` — MIR→LIR's own answer — and no
+// longer re-derives it, so each row here states the answer MIR→LIR gives on
+// `fmt`, asked of the same two facts MIR→LIR asks: a DATA import under a
+// got-indirect binding, and a FUNCTION import the format's dispatch routes
+// through a slot (`externRefTakesImportSlot`, that question's one owner).
 [[nodiscard]] AssembledModule
-dataImportModule(bool alsoCallAFunctionExtern,
+dataImportModule(ObjectFormatSchema const& fmt,
+                 bool alsoCallAFunctionExtern,
                  SymbolBinding fnBinding = SymbolBinding::Weak,
                  bool alsoCallASecondFunctionExtern = false,
                  SymbolBinding fn2Binding = SymbolBinding::Global) {
@@ -6934,6 +6941,8 @@ dataImportModule(bool alsoCallAFunctionExtern,
     data.mangledName = "ea";
     data.libraryPath = "somelib.dll";
     data.isData      = true;
+    data.readThroughSlot =
+        fmt.dataImportBinding() == DataImportBinding::GotIndirect;
     mod.externImports.push_back(std::move(data));
     if (alsoCallAFunctionExtern) {
         ExternImport fnImp;
@@ -6942,6 +6951,7 @@ dataImportModule(bool alsoCallAFunctionExtern,
         fnImp.libraryPath = "somelib.dll";
         fnImp.isData      = false;
         fnImp.binding     = fnBinding;
+        fnImp.readThroughSlot = fmt.externRefTakesImportSlot(fnBinding);
         mod.externImports.push_back(std::move(fnImp));
     }
     if (alsoCallASecondFunctionExtern) {
@@ -6951,9 +6961,19 @@ dataImportModule(bool alsoCallAFunctionExtern,
         fnImp2.libraryPath = "somelib.dll";
         fnImp2.isData      = false;
         fnImp2.binding     = fn2Binding;
+        fnImp2.readThroughSlot = fmt.externRefTakesImportSlot(fn2Binding);
         mod.externImports.push_back(std::move(fnImp2));
     }
     return mod;
+}
+
+// The row of `mod` that imports `symbol`.
+[[nodiscard]] ExternImport& importRow(AssembledModule& mod, std::uint32_t symbol) {
+    for (auto& e : mod.externImports) {
+        if (e.symbol.v == symbol) return e;
+    }
+    ADD_FAILURE() << "no import row for symbol #" << symbol;
+    return mod.externImports.front();
 }
 
 // The relocation whose patch site is `va`, in `sec`'s table.
@@ -6979,7 +6999,8 @@ TEST(PeObjDataImportSlot, DataExternCodeReferenceNamesTheCarriedComdatSlot) {
     ASSERT_TRUE(loaded.format->objectImportSlot().has_value());
     EXPECT_EQ(loaded.format->objectImportSlot()->symbolPrefix, ".refptr.");
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/false);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
@@ -7066,7 +7087,8 @@ TEST(PeObjDataImportSlot, AFunctionExternReachesItsImportThroughASlotToo) {
         << "the shipped pe64 `.obj` format must route a WEAK import through "
            "the slot — that is the P0 this file exists for, and a narrowing "
            "that excluded `weak` would make every assertion below vacuous";
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true,
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/true,
                                            SymbolBinding::Weak);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
@@ -7126,7 +7148,8 @@ TEST(PeObjDataImportSlot, AStrongFunctionExternKeepsItsDirectReferenceOnTheShipp
     ASSERT_FALSE(loaded.format->externRefTakesImportSlot(SymbolBinding::Global));
 
     AssembledModule mod =
-        dataImportModule(/*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
+        dataImportModule(*loaded.format,
+                         /*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
                          /*alsoCallASecondFunctionExtern=*/true,
                          SymbolBinding::Global);
     DiagnosticReporter rep;
@@ -7184,7 +7207,7 @@ TEST(PeObjDataImportSlot, AFunctionExternKeepsItsDirectReferenceUnderDirectPlt) 
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/true);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
@@ -7227,7 +7250,7 @@ TEST(PeObjDataImportSlot, IndirectSlotDispatchWithNoSlotSpellingFailsLoud) {
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/true);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)
@@ -7242,11 +7265,13 @@ TEST(PeObjDataImportSlot, AnAbsoluteDataInitializerReferenceIsNotRetargeted) {
     // DATA ITEM, which represents an absolute-0 target perfectly well and is
     // already correct. Pointing it at the slot would store the SLOT'S address
     // where the program asked for the object's — off by exactly the one
-    // indirection this row is about, in the opposite direction. The pass keys
-    // on PC-RELATIVE for that reason, and this is the pin that says so.
+    // indirection this row is about, in the opposite direction. The pass
+    // retargets CODE relocations only for that reason (it said "pc-relative"
+    // until P68 round 9 made it the role), and this is the pin that says so.
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/false);
     AssembledData ptr;
     ptr.symbol  = SymbolId{9};
     ptr.section = DataSectionKind::Data;
@@ -7280,6 +7305,112 @@ TEST(PeObjDataImportSlot, AnAbsoluteDataInitializerReferenceIsNotRetargeted) {
         << symTableDump(obj);
 }
 
+// ── P68 round 9: THE SLOT FOLLOWS THE ROW (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT)
+//
+// The pass used to decide WHICH imports get a carried slot by re-deriving
+// MIR→LIR's decision (`isData || externRefTakesImportSlot(binding)`); it now
+// reads the row's `readThroughSlot`, the answer MIR→LIR stamped where it chose
+// the shape. The two agree on every row MIR→LIR lowered, so these pins give the
+// pass rows on which they DISAGREE and read which one it followed.
+
+TEST(PeObjDataImportSlot, TheCarriedSlotFollowsTheRowNotTheImportsClass) {
+    // Three imports in ONE function, each row stating the opposite of what the
+    // import's class would re-derive: a DATA import and a WEAK function the
+    // code reaches DIRECTLY (what a `.s` writes — `movl ea(%rip)`, `call
+    // callee` — and what gas emits for it), and a STRONG function the code
+    // reads through a slot. A pass that re-derived the decision gives the first
+    // two a slot and the third none: every assertion below.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod =
+        dataImportModule(*loaded.format,
+                         /*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
+                         /*alsoCallASecondFunctionExtern=*/true,
+                         SymbolBinding::Global);
+    importRow(mod, 50).readThroughSlot = false;   // data, read directly
+    importRow(mod, 51).readThroughSlot = false;   // weak function, called directly
+    importRow(mod, 52).readThroughSlot = true;    // strong function, through a slot
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const dataRel    = relocAt(obj, *text, 3u);
+    auto const weakCall   = relocAt(obj, *text, 20u);
+    auto const strongCall = relocAt(obj, *text, 26u);
+    ASSERT_TRUE(dataRel.has_value() && weakCall.has_value() && strongCall.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, dataRel->symbolTableIndex), "ea")
+        << "a DIRECT read of a data import stays direct: sent to a slot it "
+           "would load the import's ADDRESS" << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, weakCall->symbolTableIndex), "callee")
+        << "a DIRECT call stays direct: sent to a slot it would call the "
+           "pointer's bytes" << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, strongCall->symbolTableIndex), ".refptr.callee2")
+        << "a call that dereferences a slot must find one, whatever the "
+           "import's binding — without it the code reads the import's own "
+           "address as the pointer" << symTableDump(obj);
+    std::size_t slotSections = 0;
+    ObjSectionHeader const* slotSec = nullptr;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) {
+            ++slotSections;
+            slotSec = &s;
+        }
+    }
+    ASSERT_EQ(slotSections, 1u)
+        << "exactly one carried slot — the row that states a slot read"
+        << symTableDump(obj);
+    auto const fill = relocAt(obj, *slotSec, 0u);
+    ASSERT_TRUE(fill.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, fill->symbolTableIndex), "callee2")
+        << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, EveryCodeRelocationOfASlotReadNamesTheSlot) {
+    // BY ROLE, NOT BY PC-RELATIVITY. The row says every CODE reference to the
+    // import is half of a slot read, so every code relocation naming it names
+    // the slot. On x86_64 those are all PC-relative, and the pass used to key
+    // on that; a target that addresses a slot with an `adrp` + an ABSOLUTE
+    // `add :lo12:` would then have the page pointed at the slot and the page
+    // offset at the import — an address that is neither (`mergeModules`' arm64
+    // twin, `SiblingDataImportSlot.Arm64PageAndPageOffsetBothAddressTheSlot`).
+    // The absolute half is stood in for here by an `abs64` in the same
+    // function; a DATA item's absolute relocation stays on the import
+    // (`AnAbsoluteDataInitializerReferenceIsNotRetargeted`).
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/false);
+    ASSERT_TRUE(importRow(mod, 50).readThroughSlot)
+        << "the shipped `.obj` format reads a data import through a slot";
+    Relocation absHalf;
+    absHalf.offset = 10;
+    absHalf.target = SymbolId{50};
+    absHalf.kind   = RelocationKind{2};   // x86_64 `abs64` — NOT pc-relative
+    mod.functions.front().relocations.push_back(absHalf);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+    auto const pcHalf  = relocAt(obj, *text, 3u);
+    auto const absSite = relocAt(obj, *text, 10u);
+    ASSERT_TRUE(pcHalf.has_value() && absSite.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, pcHalf->symbolTableIndex), ".refptr.ea")
+        << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, absSite->symbolTableIndex), ".refptr.ea")
+        << "the absolute code relocation of a slot-read import is the other "
+           "half of the same slot address; naming the import splits the pair"
+        << symTableDump(obj);
+}
+
 // ── THE PAIRING RULE, BOTH DIRECTIONS ──────────────────────────────────
 //
 // `dataImportBinding` and `objectImportSlot` are ONE decision spelled in two
@@ -7305,7 +7436,7 @@ TEST(PeObjDataImportSlot, RelocatableBindingWithNoSlotSpellingFailsLoud) {
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/false);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)
@@ -7325,7 +7456,7 @@ TEST(PeObjDataImportSlot, SlotSpellingWithNoBindingFailsLoud) {
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/false);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)

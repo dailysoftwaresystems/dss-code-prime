@@ -8,6 +8,7 @@
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (charIsUnsigned's per-format axis)
 #include "core/types/strong_ids.hpp"
+#include "core/types/symbol_address_part.hpp"  // SymbolAddressPart (guard.symbolPart)
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
 
 #include <array>
@@ -2417,11 +2418,25 @@ enum class EncodingSlotKind : std::uint8_t {
     // carries a marker bit, and the range is the field's own capacity: 5 bits
     // less the marker's position (4, 3, 2 or 1 index bits). Not symbol-bearing.
     ElementIndex = 34,
+    // P68 round 9 (the aarch64 twins): the one-word `ADR`'s 21-bit
+    // PC-relative field when it names a block of the SAME function (`adr x1,
+    // 1f`, `adr x7, .`) — resolved at ASSEMBLE time as gas and clang resolve it,
+    // so no relocation exists and none is needed on a format with no ADR
+    // relocation (Mach-O). SPLIT: immlo [30:29] + immhi [23:5], unscaled,
+    // ±1 MiB — `walker_util::BlockRelPatchKind::Arm64Adr21`. Block-relative,
+    // NOT symbol-bearing (the symbol form wires `sym.patch` with the
+    // `adr_prel_lo21` relocation instead).
+    AdrImm21 = 35,
+    // P68 round 9: the constant a program adds to a block's address (`adr x7,
+    // .+8`), carried as the ImmInt operand after the block reference. The
+    // walker writes no bits for it; it rides the SAME instruction's
+    // block-relative patch (`BlockRelPatch::addend`). Not symbol-bearing.
+    BlockAddend = 36,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 35> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 37> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -2457,6 +2472,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 35> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm16Bytes,   "imm16.bytes"    },
     { EncodingSlotKind::Imm14,        "imm14"          },
     { EncodingSlotKind::ElementIndex, "imm5.element"   },
+    { EncodingSlotKind::AdrImm21,     "imm21.adr"      },
+    { EncodingSlotKind::BlockAddend,  "block.addend"   },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -2480,7 +2497,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 35,
+static_assert(kEncodingSlotKindCount == 37,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -2559,6 +2576,10 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         // P68 round 8: the AdvSIMD element `imm5` is a bit-window inside a
         // 32-bit word, a fixed32 slot like every other field of that word.
         case EncodingSlotKind::ElementIndex:
+        // P68 round 9: the one-word ADR's block-relative field and the block
+        // addend that rides it are fixed32 slots.
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:
             return TargetEncodingShape::Fixed32;
     }
     return TargetEncodingShape::None;  // unreachable; satisfies non-exhaustive switches
@@ -2667,6 +2688,8 @@ memoryDisplacementField(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::Imm16Bytes:
         case EncodingSlotKind::Imm14:
         case EncodingSlotKind::ElementIndex:
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:
             return std::nullopt;
     }
     return std::nullopt;  // unreachable; satisfies non-exhaustive-switch rules
@@ -2962,6 +2985,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // P68 round 8: an element's size and index — a literal the walker
         // computes, never a relocated reference.
         case EncodingSlotKind::ElementIndex:
+        // P68 round 9: the ADR block field is resolved at assemble time, and
+        // the block addend is a literal riding it — neither is relocated.
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:
             // D-AS4-1 / D-AS4-5-ISCALL-IMPLICITRESULT-SEPARATION-AS4-INTRODUCES-ISCALL memory-addressing slots write immediate
             // displacements / register encodings (not symbol-relative).
             // The companion symbol-bearing slot for RIP-relative `lea`
@@ -3285,6 +3312,15 @@ struct DSS_EXPORT TargetEncodingVariant {
     // rejects the axis on a guard with no memory operand at all (nothing to
     // route) — the same coherence family as `negValue` and immMin/immMax.
     std::optional<bool>                memoryDestination;
+    // ── SYMBOL-PART routing axis — the JSON key `guard.symbolPart` (P68 round
+    // 9, the aarch64 twins): WHICH PART of a symbol's address this variant's
+    // symbolic field encodes — `page` (`adrp`) or `pageOffset` (the `add` or
+    // load/store that follows it). ABSENT ⇒ the whole address, which is every
+    // variant that existed before the axis and the only part they can take.
+    // PRESENT ⇒ the variant matches only when a symbolic operand is present
+    // and names that part (`walker_util::symbolPartsMatchGuard`). `whole` is
+    // not spellable here: stating the default would state nothing.
+    std::optional<SymbolAddressPart>   symbolPart;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -3689,6 +3725,26 @@ enum class RelocFormulaKind : std::uint8_t {
     // still the same discipline as the two arm64 GOT rows above; what changed
     // is that ONE walker now has an answer, not that the refusal was relaxed.
     X86_64GotPcRel        = 7,
+    // ARM64 R_AARCH64_ADR_PREL_LO21 (P68 round 9, the aarch64 twin of
+    // D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the ONE-word `adr`.
+    //   value = S + A - P, signed 21 bits (±1 MiB), UNSCALED: bits[1:0] →
+    //   immlo[30:29], bits[20:2] → immhi[23:5] — ADRP's split without the
+    //   page shift. ✔MEASURED 2026-09-23: gas 2.42 and clang 18 write
+    //   `adr x0, msg` as 0x10000000 + this relocation, where DSS's two-word
+    //   ADRP+ADD spelling of `adr` wrote 8 bytes.
+    Aarch64AdrPrelLo21    = 8,
+    // ARM64 R_AARCH64_LDST{8,16,32,64,128}_ABS_LO12_NC (P68 round 9): the
+    // page offset of a LOAD or STORE, whose unsigned-offset imm12 [21:10] is
+    // SCALED by the access size, 2^`TargetRelocationInfo::scaleLog2`:
+    //   value = ((S + A) & 0xFFF) >> scaleLog2
+    // and the low `scaleLog2` bits of (S + A) must be ZERO, or the scaled
+    // field cannot address the target: refused, as GNU ld refuses it
+    // ("relocation truncated to fit", ✔MEASURED 2026-09-23). ONE formula for
+    // the five sizes, the scale a fact of the row — Aarch64AddAbsLo12 is the
+    // ADD's page offset, which is never scaled, and reading a load's offset
+    // through it is exactly the defect
+    // D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD closed.
+    Aarch64LdstAbsLo12    = 9,
 };
 
 // Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
@@ -3697,7 +3753,7 @@ enum class RelocFormulaKind : std::uint8_t {
 // on size catches forgetting one half. (architect + type-design
 // 4-agent convergence at post-fold #2 — was previously 3 independent
 // hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
-inline constexpr EnumNameTable<RelocFormulaKind, 8> kRelocFormulaTable{{{
+inline constexpr EnumNameTable<RelocFormulaKind, 10> kRelocFormulaTable{{{
     { RelocFormulaKind::Linear,               "linear" },
     { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
     { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
@@ -3706,6 +3762,8 @@ inline constexpr EnumNameTable<RelocFormulaKind, 8> kRelocFormulaTable{{{
     { RelocFormulaKind::Aarch64AdrGotPage,    "aarch64_adr_got_page" },
     { RelocFormulaKind::Aarch64Ld64GotLo12,   "aarch64_ld64_got_lo12" },
     { RelocFormulaKind::X86_64GotPcRel,       "x86_64_gotpcrel" },
+    { RelocFormulaKind::Aarch64AdrPrelLo21,   "aarch64_adr_prel_lo21" },
+    { RelocFormulaKind::Aarch64LdstAbsLo12,   "aarch64_ldst_abs_lo12" },
 }}};
 
 // Well-formedness of the table itself: no empty spelling, no duplicate
@@ -3715,6 +3773,9 @@ DSS_CHECK_ENUM_NAME_TABLE(kRelocFormulaTable);
 
 [[nodiscard]] DSS_EXPORT std::string_view
     relocFormulaName(RelocFormulaKind k) noexcept;
+
+// `SymbolAddressPart` — which part of a symbol's address an operand denotes —
+// lives in `core/types/symbol_address_part.hpp` (the LIR operand carries it too).
 
 // ── D-LK10-ENTRY: ProcessExit substrate (plan 14 §2.13 Slice B) ────
 //
@@ -4298,6 +4359,12 @@ struct DSS_EXPORT TargetRelocationInfo {
     //   structurally while being the WRONG answer, so those scans
     //   exclude it explicitly rather than relying on table order.
     bool         imageRelative = false;
+    // P68 round 9: log2 of the access size a SCALED page-offset field is
+    // measured in — the JSON key `scaleLog2`, 0..4 (a byte .. a 128-bit
+    // register). REQUIRED on an `aarch64_ldst_abs_lo12` row and refused on
+    // every other formula, which reads no scale: one formula serves the five
+    // LDSTn_ABS_LO12_NC rows, and this is the fact that makes them five.
+    std::uint8_t scaleLog2   = 0;
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode

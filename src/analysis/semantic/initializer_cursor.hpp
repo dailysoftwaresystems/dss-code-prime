@@ -50,7 +50,29 @@
 //
 // ★ NOT RECURSIVE. The path is a vector; descending (elision) pushes, completing a
 // subaggregate pops (feedback-no-input-proportional-recursion).
+//
+// ★ THE INDEX SPACE IS 32-BIT, AND IT IS CHECKED HERE — NEVER NARROWED BY A CALLER.
+// A path step is a `std::uint32_t`, but a length (an int64 in the lattice) and an index
+// designator (an int64 constant) arrive at FULL width, and this cursor alone decides
+// what fits. P68 round 9 (lane `cs`): both callers narrowed — the designator index to
+// 32 bits after checking only its sign, and the array length likewise — so `int a[2] =
+// {[4294967296] = 7}` put the 7 in a[0] SILENTLY where gcc 13.3.0, clang 18.1.3 (both
+// modes) and mingw-w64 13.2.0 refuse it, `int a[] = {[4294967296] = 7}` was sized ONE
+// element, and a declared length of exactly 2^32 was refused as "zero slots"
+// (✔MEASURED 2026-09-23, the lane's `.temp/probe/dx`, every build RUN). Now a bounded
+// container compares the FULL index with its FULL length (past the end is C 6.7.9p6's
+// constraint, `OutOfRange`), and an array longer than `kMaxLength` elements — declared
+// so, or sized so by an index designator or by positional elements running past the
+// last representable index — is `Unrepresentable`: an IMPLEMENTATION LIMIT the caller
+// refuses LOUDLY. The limit is not widened to 64 bits because the HIR tier builds one
+// slot per element (✔MEASURED 2026-09-23, `.temp/probe/la`: about 195 bytes and 0.4 µs
+// per element — an 8M-element `{1}` took 1.6 GB), so a longer array would exhaust
+// memory rather than compile; a sparse slot tree is what would lift it.
 namespace dss::initializer_cursor {
+
+// The longest array this cursor places into: every element index fits a path step,
+// with one index to spare for the position after the last element.
+inline constexpr std::uint64_t kMaxLength = 0xFFFF'FFFFull;   // 2^32 - 1
 
 enum class Shape : std::uint8_t { Scalar, Struct, Union, Array };
 
@@ -61,9 +83,10 @@ class TypeView {
 public:
     virtual ~TypeView() = default;
     [[nodiscard]] virtual Shape shape(TypeId t) const = 0;
-    // A structure's or union's member count, an array's element count; nullopt for
-    // an array whose length is not a constant (unknown size, variable length).
-    [[nodiscard]] virtual std::optional<std::uint32_t> count(TypeId t) const = 0;
+    // A structure's or union's member count, an array's element count — the FULL
+    // length, never narrowed (the cursor owns the limit); nullopt for an array whose
+    // length is not a constant (unknown size, variable length).
+    [[nodiscard]] virtual std::optional<std::uint64_t> count(TypeId t) const = 0;
     // Member `i`'s type; an array's element type (for any `i`).
     [[nodiscard]] virtual TypeId member(TypeId t, std::uint32_t i) const = 0;
     // An UNNAMED bit-field, which positional initialization skips (C 6.7.9p9: "unnamed
@@ -75,13 +98,18 @@ public:
 
 struct Placement {
     enum class Kind : std::uint8_t {
-        Assign,       // the element initializes the subobject at `path`, of type `type`
-        Excess,       // a positional element after the object's last subobject (C 6.7.9p2)
-        OutOfRange,   // a designator that names no subobject of the object
+        Assign,            // the element initializes the subobject at `path`, of type `type`
+        Excess,            // a positional element after the object's last subobject (C 6.7.9p2)
+        OutOfRange,        // a designator that names no subobject of the object
+        Unrepresentable,   // past `kMaxLength` — an implementation limit (`beyond` says what)
     };
     Kind                       kind = Kind::Assign;
     std::vector<std::uint32_t> path;   // from the list's object; never empty for Assign
     TypeId                     type{};
+    // Unrepresentable only: the array LENGTH (`beyondIsLength`) or the element INDEX
+    // that does not fit, for the caller's diagnostic.
+    std::uint64_t              beyond = 0;
+    bool                       beyondIsLength = false;
 };
 
 class Cursor {
@@ -92,32 +120,47 @@ public:
         restartAtFirst();
     }
 
+    // The list's OBJECT is an array longer than `kMaxLength`: every placement into it is
+    // Unrepresentable, and a caller that builds one slot per element refuses the whole
+    // list BEFORE it builds any (the length it names is what the diagnostic says).
+    [[nodiscard]] std::optional<std::uint64_t> unrepresentableObjectLength() const noexcept {
+        return objectTooLong_;
+    }
+
     // Place ONE element. `designator` holds its resolved designation (a member or
-    // element index per step; empty for a positional element). `isBraceList`: the
-    // value is itself a brace-enclosed list, which initializes whatever subobject
-    // the position names — scalar or not — and is never elided through.
-    // `initializesWhole(t)`: whether the (non-list) value initializes an aggregate
-    // or union subobject of type `t` WHOLE; asked only while eliding.
+    // element index per step, at FULL width; empty for a positional element).
+    // `isBraceList`: the value is itself a brace-enclosed list, which initializes
+    // whatever subobject the position names — scalar or not — and is never elided
+    // through. `initializesWhole(t)`: whether the (non-list) value initializes an
+    // aggregate or union subobject of type `t` WHOLE; asked only while eliding.
     template <class InitializesWhole>
-    [[nodiscard]] Placement place(std::span<std::uint32_t const> designator,
+    [[nodiscard]] Placement place(std::span<std::uint64_t const> designator,
                                   bool isBraceList, InitializesWhole&& initializesWhole) {
+        if (objectTooLong_.has_value()) return tooLong(*objectTooLong_);
         std::vector<std::uint32_t> path;
         std::vector<TypeId>        containers;
         if (!designator.empty()) {
             TypeId t = object_;
             for (std::size_t d = 0; d < designator.size(); ++d) {
-                std::uint32_t const i = designator[d];
+                std::uint64_t const i = designator[d];
                 Shape const sh = view_->shape(t);
                 if (sh == Shape::Scalar) return Placement{Placement::Kind::OutOfRange, {}, {}};
-                std::optional<std::uint32_t> const n = view_->count(t);
+                std::optional<std::uint64_t> const n = view_->count(t);
                 bool const unbounded = !n.has_value() && d == 0 && sh == Shape::Array;
+                // C 6.7.9p6 at FULL width: an index past a bounded container's end is
+                // out of range whatever its low 32 bits say.
                 if (!unbounded && (!n.has_value() || i >= *n))
                     return Placement{Placement::Kind::OutOfRange, {}, {}};
+                if (sh == Shape::Array && n.has_value() && *n > kMaxLength) return tooLong(*n);
+                // Only an array of unknown size reaches this with an in-range index the
+                // path cannot hold: the designator would size it past the limit.
+                if (i >= kMaxLength) return indexBeyond(i);
                 containers.push_back(t);
-                path.push_back(i);
-                t = view_->member(t, i);
+                path.push_back(static_cast<std::uint32_t>(i));
+                t = view_->member(t, static_cast<std::uint32_t>(i));
             }
         } else {
+            if (positionalBeyond_.has_value()) return indexBeyond(*positionalBeyond_);
             if (exhausted_) return Placement{Placement::Kind::Excess, {}, {}};
             path       = pos_;
             containers = containers_;
@@ -130,11 +173,13 @@ public:
             // an unnamed bit-field, a flexible array member) stops the descent: the
             // value then meets that subobject as it is, and the lowering judges it.
             while (isAggregate(view_->shape(type)) && !initializesWhole(type)) {
-                auto const first = firstPositional(type, 0, /*isObject=*/false);
-                if (!first.has_value()) break;
+                if (auto const n = arrayLength(type); n.has_value() && *n > kMaxLength)
+                    return tooLong(*n);
+                Next const first = firstPositional(type, 0, /*isObject=*/false);
+                if (first.kind != Next::Kind::Found) break;
                 containers.push_back(type);
-                path.push_back(*first);
-                type = view_->member(type, *first);
+                path.push_back(first.index);
+                type = view_->member(type, first.index);
             }
         }
         extent_ = std::max<std::int64_t>(extent_, std::int64_t{path.front()} + 1);
@@ -147,42 +192,77 @@ public:
 
     // The largest top-level index any element initialized, plus one (C 6.7.9p22) —
     // the length an array of unknown size takes from this list. 0 when nothing was
-    // placed.
+    // placed. Never more than `kMaxLength`: a placement past it is Unrepresentable.
     [[nodiscard]] std::int64_t extent() const noexcept { return extent_; }
 
 private:
+    // The first member / element at or after `from` that positional initialization
+    // reaches: Found (its index), None (the container is complete), or Beyond (the
+    // next element of an array of unknown size would sit past the limit).
+    struct Next {
+        enum class Kind : std::uint8_t { None, Found, Beyond };
+        Kind          kind   = Kind::None;
+        std::uint32_t index  = 0;
+        std::uint64_t beyond = 0;
+    };
+
     [[nodiscard]] static bool isAggregate(Shape s) noexcept {
         return s == Shape::Struct || s == Shape::Union || s == Shape::Array;
     }
 
-    // The first member / element at or after `from` that positional initialization
-    // reaches, or nullopt when there is none. Only the list's OBJECT may be an array
-    // of unknown size (it is being sized); a nested one has no positional element.
-    [[nodiscard]] std::optional<std::uint32_t> firstPositional(TypeId t, std::uint32_t from,
-                                                               bool isObject) const {
+    [[nodiscard]] std::optional<std::uint64_t> arrayLength(TypeId t) const {
+        return view_->shape(t) == Shape::Array ? view_->count(t) : std::nullopt;
+    }
+
+    [[nodiscard]] static Placement tooLong(std::uint64_t length) {
+        Placement p{Placement::Kind::Unrepresentable, {}, {}};
+        p.beyond         = length;
+        p.beyondIsLength = true;
+        return p;
+    }
+
+    [[nodiscard]] static Placement indexBeyond(std::uint64_t index) {
+        Placement p{Placement::Kind::Unrepresentable, {}, {}};
+        p.beyond = index;
+        return p;
+    }
+
+    // Only the list's OBJECT may be an array of unknown size (it is being sized); a
+    // nested one has no positional element. `from` is 64-bit: the position after the
+    // last representable index is computed, never wrapped to 0.
+    [[nodiscard]] Next firstPositional(TypeId t, std::uint64_t from, bool isObject) const {
         Shape const sh = view_->shape(t);
-        std::optional<std::uint32_t> const n = view_->count(t);
+        std::optional<std::uint64_t> const n = view_->count(t);
         if (sh == Shape::Array) {
-            if (!n.has_value()) return isObject ? std::optional<std::uint32_t>{from} : std::nullopt;
-            return from < *n ? std::optional<std::uint32_t>{from} : std::nullopt;
+            if (n.has_value() ? from >= *n : !isObject) return {};
+            if (from >= kMaxLength) return Next{Next::Kind::Beyond, 0, from};
+            return Next{Next::Kind::Found, static_cast<std::uint32_t>(from), 0};
         }
-        if (sh != Shape::Struct && sh != Shape::Union) return std::nullopt;
-        if (!n.has_value()) return std::nullopt;
-        for (std::uint32_t i = from; i < *n; ++i)
-            if (!view_->unnamedBitField(t, i)) return i;
-        return std::nullopt;
+        if (sh != Shape::Struct && sh != Shape::Union) return {};
+        if (!n.has_value()) return {};
+        for (std::uint64_t i = from; i < *n && i < kMaxLength; ++i)
+            if (!view_->unnamedBitField(t, static_cast<std::uint32_t>(i)))
+                return Next{Next::Kind::Found, static_cast<std::uint32_t>(i), 0};
+        return {};
     }
 
     void restartAtFirst() {
         pos_.clear();
         containers_.clear();
         exhausted_ = false;
-        auto const first = firstPositional(object_, 0, /*isObject=*/true);
-        if (!first.has_value()) {
+        positionalBeyond_.reset();
+        objectTooLong_.reset();
+        if (auto const n = arrayLength(object_); n.has_value() && *n > kMaxLength) {
+            objectTooLong_ = *n;
+            exhausted_     = true;
+            return;
+        }
+        Next const first = firstPositional(object_, 0, /*isObject=*/true);
+        if (first.kind != Next::Kind::Found) {
             exhausted_ = true;
             return;
         }
-        pos_.push_back(*first);
+        pos_.push_back(first.index);
         containers_.push_back(object_);
     }
 
@@ -190,15 +270,22 @@ private:
     // initialization reaches: the next member / element at the deepest level, or —
     // once that level is complete — the next one of the level above. A UNION is
     // complete after one member. The list's object running out makes every further
-    // positional element excess.
+    // positional element excess; an array of unknown size running past the limit
+    // makes the next one Unrepresentable.
     void advance() {
         exhausted_ = false;
+        positionalBeyond_.reset();
         while (!pos_.empty()) {
             std::size_t const d = pos_.size() - 1;
             TypeId const container = containers_[d];
             if (view_->shape(container) != Shape::Union) {
-                if (auto const next = firstPositional(container, pos_[d] + 1, d == 0)) {
-                    pos_[d] = *next;
+                Next const next = firstPositional(container, std::uint64_t{pos_[d]} + 1, d == 0);
+                if (next.kind == Next::Kind::Found) {
+                    pos_[d] = next.index;
+                    return;
+                }
+                if (next.kind == Next::Kind::Beyond) {
+                    positionalBeyond_ = next.beyond;
                     return;
                 }
             }
@@ -212,12 +299,14 @@ private:
         exhausted_ = true;
     }
 
-    TypeView const*            view_;
-    TypeId                     object_;
-    std::vector<std::uint32_t> pos_;          // the next positional subobject
-    std::vector<TypeId>        containers_;   // containers_[d] holds pos_[d]
-    bool                       exhausted_ = false;
-    std::int64_t               extent_    = 0;
+    TypeView const*              view_;
+    TypeId                       object_;
+    std::vector<std::uint32_t>   pos_;          // the next positional subobject
+    std::vector<TypeId>          containers_;   // containers_[d] holds pos_[d]
+    bool                         exhausted_ = false;
+    std::optional<std::uint64_t> positionalBeyond_;   // the next positional index, past the limit
+    std::optional<std::uint64_t> objectTooLong_;      // the object's length, past the limit
+    std::int64_t                 extent_    = 0;
 };
 
 }  // namespace dss::initializer_cursor

@@ -124,6 +124,9 @@ struct AsmDecodedInstruction {
     std::string_view            mnemonic;
     NodeId                      node{};
     std::vector<AsmDecodedOperand> operands;
+    // Does this line's row take a BLOCK of its own function in an encoding
+    // field (`ResolvedRow::addressesBlocks`, P68 round 9)?
+    bool                        addressesBlocks = false;
 };
 
 // ★★ THE CONTROL-FLOW CLASS IS READ OFF THE TARGET, NEVER OFF THE DIALECT.
@@ -185,6 +188,23 @@ enum class CfClass : std::uint8_t {
     return false;
 }
 
+// Does a variant of this opcode WIRE a block operand to a field (P68 round 9)?
+// A branch does, and so does an instruction that addresses a block of its own
+// function — which of the two it is, is the opcode's class. An UNWIRED block
+// operand is an interior label's binding marker (`[symbol, blockref]`) and
+// states nothing about the field.
+[[nodiscard]] bool wiresABlockOperand(TargetOpcodeInfo const& info) noexcept {
+    for (auto const& v : info.encoding.variants) {
+        for (auto const& w : v.wires) {
+            if (w.index < v.operandKinds.size()
+                && v.operandKinds[w.index] == OperandKindFilter::BlockRef) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] constexpr std::string_view cfClassName(CfClass c) noexcept {
     switch (c) {
     case CfClass::Plain:       return "a plain instruction";
@@ -239,6 +259,14 @@ struct ResolvedRow {
     // whose candidates disagree is refused at resolve time — so the emit walk
     // can put a condition into the payload without re-deciding per election.
     bool                          consumesCond = false;
+    // ★★ DOES A CANDIDATE TAKE A LOCATION OF ITS OWN FUNCTION IN A FIELD — a
+    // non-branch opcode with a variant that WIRES a block operand (P68 round 9:
+    // the one-word `adr`, whose field is resolved at assemble time, the way gas
+    // and clang resolve `adr x1, 1f` and `adr x7, .`: a block, or the
+    // instruction's own address). Read off the target's encoding rows; an
+    // unwired block operand is the binding marker of an interior label's
+    // address (`[symbol, blockref]`), not this.
+    bool                          addressesBlocks = false;
 
     [[nodiscard]] bool anyClass() const noexcept {
         return directClass.has_value() || indirectClass.has_value();
@@ -391,6 +419,10 @@ struct AsmInstructionLowering::Impl {
                 if (!ordinal) continue;
                 auto const* info = target_.opcodeInfo(*ordinal);
                 if (info == nullptr) continue;
+                if (cfClassOf(*info) == CfClass::Plain
+                    && wiresABlockOperand(*info)) {
+                    out.addressesBlocks = true;
+                }
                 bool const consumesHere = consumesCondCode(*info);
                 if (!consumes.has_value()) {
                     consumes     = consumesHere;
@@ -934,7 +966,72 @@ struct AsmInstructionLowering::Impl {
             if (!decoded) return;
             ins.operands.push_back(std::move(*decoded));
         }
+        ins.addressesBlocks = resolved.addressesBlocks;
+        if (row.impliedSymbolPart.has_value()
+            && !applyImpliedSymbolPart(*row.impliedSymbolPart, ins)) {
+            return;
+        }
         buildLirInst(ins, row, resolved);
+    }
+
+    // ★★ WHAT A BARE SYMBOL OPERAND OF THIS ROW MEANS (P68 round 9 — the row's
+    // `impliedSymbolPart`). ✔MEASURED 2026-09-23: gas 2.42 and clang 18 for
+    // ELF read `adrp x0, msg` as the PAGE of `msg` (R_AARCH64_ADR_PREL_PG_HI21);
+    // clang for Darwin refuses it ("ADR/ADRP relocations must be GOT
+    // relative") and takes only `msg@PAGE`. So the row states the part and the
+    // format kinds it is implied on; on any other kind a bare operand is refused
+    // by name, with this format's own spelling of the part. An operand that
+    // wrote an operator keeps what it wrote.
+    [[nodiscard]] bool applyImpliedSymbolPart(AsmImpliedSymbolPart const& implied,
+                                              AsmDecodedInstruction& ins) {
+        auto const kind = host_.objectFormatKind();
+        bool const here =
+            kind.has_value()
+            && std::find(implied.formatKinds.begin(), implied.formatKinds.end(),
+                         *kind) != implied.formatKinds.end();
+        for (auto& op : ins.operands) {
+            if (op.isMemory || op.symbol.empty()
+                || op.symbolPart != SymbolAddressPart::Whole) {
+                continue;
+            }
+            if (here) {
+                op.symbolPart = implied.part;
+                continue;
+            }
+            std::string spellings;
+            if (kind.has_value()) {
+                for (auto const& sp : cfg_.symbolParts) {
+                    if (sp.part != implied.part) continue;
+                    if (std::find(sp.formatKinds.begin(), sp.formatKinds.end(),
+                                  *kind) == sp.formatKinds.end()) {
+                        continue;
+                    }
+                    if (!spellings.empty()) spellings += " or ";
+                    spellings += std::format("`{}`", sp.spelling);
+                }
+            }
+            std::string kinds;
+            for (auto const k : implied.formatKinds) {
+                if (!kinds.empty()) kinds += ", ";
+                kinds += objectFormatKindName(k);
+            }
+            sink_.fail(op.node,
+                 std::format("'{}' reads a bare symbol ('{}') as the {} of its "
+                             "address on {} objects only, and {}{}{}",
+                             ins.mnemonic, op.symbol,
+                             symbolAddressPartPhrase(implied.part), kinds,
+                             kind.has_value()
+                                 ? std::format("this build writes {} objects",
+                                               objectFormatKindName(*kind))
+                                 : std::string{"this build states no object "
+                                               "format"},
+                             spellings.empty()
+                                 ? std::string{}
+                                 : std::format(" — write the part: {}", spellings),
+                             sink_.pairSuffix()));
+            return false;
+        }
+        return true;
     }
 
     // The NAME text a node spells: the LAST visible token, because whatever
@@ -1158,7 +1255,7 @@ struct AsmInstructionLowering::Impl {
     }
 
     [[nodiscard]] AsmOperandRole resolveRole(NodeId node,
-                                             std::uint8_t mask) const {
+                                             AsmRoleMask mask) const {
         // ★ AN ELEMENT INDEX CAN ONLY FOLLOW A REGISTER (P68 round 8): on a rule
         // that is also a symbol's, `v1.d[1]` is still a register, and the decode
         // refuses precisely whatever its spelling gets wrong.
@@ -1179,7 +1276,32 @@ struct AsmInstructionLowering::Impl {
         // every multi-token spelling on a two-role node refused `%rax` too, the
         // moment a sigiled dialect bound a second role to its register rule
         // (`AsmTextToLir.RegisterAndSymbolMayShareOneRuleAndTheLookupDecides`).
-        if (AssemblyConfig::maskHas(mask, AsmOperandRole::Register)) {
+        // ★★ A NAME CARRYING AN ADDRESS-PART OPERATOR OR A CONSTANT IS A
+        // SYMBOL, WHATEVER IT SPELLS (P68 round 9): a register takes neither.
+        // ✔MEASURED 2026-09-23, one line per file: gas 2.42 and clang 18 for
+        // ELF assemble `add x0, x0, :lo12:b8` and `adr x0, b8+8` against a
+        // data label `b8` (and `:lo12:x1` against one named `x1`), clang 18
+        // for Darwin `add x0, x0, b8@PAGEOFF`; all three refuse `add x0, x0,
+        // x1+8`, which here reads as the symbol `x1` plus 8 that no `add`
+        // variant encodes. So the lookup below is not asked for such a name —
+        // on a rule that is ALSO a symbol's, where another role can take it.
+        bool const carriesSymbolTail =
+            [&] {
+                for (AsmOperandRole const tail :
+                     {AsmOperandRole::SymbolPart, AsmOperandRole::Addend}) {
+                    RuleId const r = cfg_.ruleForRole(tail);
+                    if (r.valid() && findDescendantOfRule(tree_, node, r).valid()) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+        bool const anotherRole =
+            (mask & ~static_cast<AsmRoleMask>(
+                        1u << static_cast<std::size_t>(AsmOperandRole::Register)))
+            != 0;
+        if (AssemblyConfig::maskHas(mask, AsmOperandRole::Register)
+            && !(carriesSymbolTail && anotherRole)) {
             auto const name = trailingNameOf(node);
             // ⚠ THE HOST ANSWERS, NOT THE TARGET TABLE DIRECTLY, and that is
             // the ONE line that makes a template operand reach this role at
@@ -1812,7 +1934,7 @@ struct AsmInstructionLowering::Impl {
         // The bound `attOperand`-style alt node wraps the chosen form; descend
         // to the first node whose rule the dialect bound to a role.
         NodeId cur = node;
-        std::uint8_t mask = cfg_.rolesForRule(tree_.rule(cur));
+        AsmRoleMask mask = cfg_.rolesForRule(tree_.rule(cur));
         while (mask == 0) {
             // ★ THE PLACEHOLDER IS TESTED BY RULE, NEVER BY TOKEN, AND ONLY AT
             // THE OPERAND'S OWN POSITION. The dialect names the rule
@@ -1860,6 +1982,7 @@ struct AsmInstructionLowering::Impl {
         out.node = cur;
         switch (role) {
         case AsmOperandRole::Register:
+            if (!registerCarriesNoSymbolTail(cur)) return std::nullopt;
             return decodeRegister(cur, std::move(out));
         case AsmOperandRole::Immediate: {
             NodeId const scalar =
@@ -1894,6 +2017,10 @@ struct AsmInstructionLowering::Impl {
                 // decides whether the base can carry one.
                 std::string dispSymbol = std::move(out.symbol);
                 out.symbol.clear();
+                // The part of the address, too (P68 round 9) — carried with the
+                // name, never dropped between the two fields.
+                SymbolAddressPart const dispPart = out.symbolPart;
+                out.symbolPart = SymbolAddressPart::Whole;
                 std::int64_t const constant =
                     dispSymbol.empty() ? out.value : out.symbolAddend;
                 out.symbolAddend = 0;
@@ -1904,16 +2031,24 @@ struct AsmInstructionLowering::Impl {
                 if (!decodeMemory(base, out)) return std::nullopt;
                 // A symbol OUTSIDE the memory form and a displacement INSIDE it
                 // say the address twice, the same refusal as two numbers below.
-                if (!dispSymbol.empty() && out.disp != 0) {
+                if (!dispSymbol.empty()
+                    && (out.disp != 0 || !out.dispSymbol.empty())) {
                     sink_.fail(cur,
                          std::format("this operand carries a symbolic "
                                      "displacement '{}' outside the memory form "
                                      "and a displacement {} inside it, and LIR "
                                      "addresses model exactly one{}",
-                                     dispSymbol, out.disp, sink_.pairSuffix()));
+                                     dispSymbol,
+                                     out.dispSymbol.empty()
+                                         ? std::format("{}", out.disp)
+                                         : std::format("'{}'", out.dispSymbol),
+                                     sink_.pairSuffix()));
                     return std::nullopt;
                 }
-                out.dispSymbol = std::move(dispSymbol);
+                if (!dispSymbol.empty()) {
+                    out.dispSymbol     = std::move(dispSymbol);
+                    out.dispSymbolPart = dispPart;
+                }
                 // ⚠ TWO DISPLACEMENTS ARE REFUSED, NOT MERGED. A dialect that
                 // writes one OUTSIDE the memory form and nests another INSIDE
                 // it has said the address twice, and picking either (or adding
@@ -1968,6 +2103,14 @@ struct AsmInstructionLowering::Impl {
             sink_.fail(cur, std::format("an addend (`+4`, `-8`) stands after a "
                                         "symbol name, never as an operand on "
                                         "its own{}", sink_.pairSuffix()));
+            return std::nullopt;
+        case AsmOperandRole::SymbolPart:
+            // The same for an address-part operator (P68 round 9): it names a
+            // part of a SYMBOL's address and is read with the name.
+            sink_.fail(cur, std::format("an address-part operator (`:lo12:`, "
+                                        "`@PAGEOFF`) stands beside a symbol "
+                                        "name, never as an operand on its own{}",
+                                        sink_.pairSuffix()));
             return std::nullopt;
         }
         sink_.fail(cur, "unhandled operand role");
@@ -2417,33 +2560,72 @@ struct AsmInstructionLowering::Impl {
             out.hasIndex = true;
             out.indexReg = indexDecoded->reg;
         }
-        // The displacement, when this dialect nests one inside the memory form.
+        // The displacement, when this dialect nests one inside the memory form:
+        // behind the immediate sigil (`[x29, #-8]`), or — on a dialect whose
+        // memory form admits one — as a bare scalar (`[x0, 8]`, `[x0,
+        // :lo12:msg]`, `[x0, msg@PAGEOFF]` — P68 round 9; gas 2.42 and clang 18
+        // both take `ldr x1, [x0, 8]` as `[x0, #8]`, ✔MEASURED 2026-09-23).
+        RuleId const scalarRule = cfg_.ruleForRole(AsmOperandRole::Scalar);
         NodeId const innerImm =
             findDescendantOfRule(tree_, memory,
                                  cfg_.ruleForRole(AsmOperandRole::Immediate));
-        if (innerImm.valid()) {
+        NodeId const offsetNode =
+            innerImm.valid() ? innerImm
+                             : findDescendantOfRule(tree_, memory, scalarRule);
+        if (offsetNode.valid()) {
             AsmDecodedOperand disp;
-            NodeId const   scalar =
-                findDescendantOfRule(tree_, innerImm,
-                                     cfg_.ruleForRole(AsmOperandRole::Scalar));
-            if (!decodeScalar(scalar.valid() ? scalar : innerImm, disp)) {
+            NodeId const scalar =
+                innerImm.valid() ? findDescendantOfRule(tree_, innerImm, scalarRule)
+                                 : offsetNode;
+            if (!decodeScalar(scalar.valid() ? scalar : offsetNode, disp)) {
                 return false;
             }
             if (!disp.hasValue) {
-                sink_.fail(innerImm,
-                     std::format("memory displacement '{}' is a symbol, and a "
-                                 "symbol-relative memory operand needs a "
-                                 "relocation this build does not reach from "
-                                 "assembly yet{}", disp.symbol, sink_.pairSuffix()));
-                return false;
+                // ⚠ A REGISTER WHERE THE OFFSET GOES (`[x0, x2]`) is the
+                // register-offset form, which gas and clang both take
+                // (✔MEASURED 2026-09-23, `ldr x1, [x0, x2]` = 0xf8626801) and
+                // this memory operand does not decode: refused as what it is,
+                // never read as a symbol that happens to share its spelling.
+                if (disp.symbolPart == SymbolAddressPart::Whole
+                    && disp.symbolAddend == 0
+                    && host_.namesRegister(registerLookupKey(
+                           splitArrangement(disp.symbol).base))) {
+                    sink_.fail(offsetNode,
+                         std::format("'{}' names a register, and a register "
+                                     "offset (`[base, {}]`) is a memory form "
+                                     "this build does not decode{}",
+                                     disp.symbol, disp.symbol,
+                                     sink_.pairSuffix()));
+                    return false;
+                }
+                // ★ A SYMBOL IN AN OFFSET FIELD MUST SAY WHICH PART OF ITS
+                // ADDRESS THE FIELD TAKES: the field holds a few bits of one.
+                // ✔MEASURED 2026-09-23: clang refuses `ldr x1, [x0, cnt]`, and
+                // gas ACCEPTS it and writes `cnt`'s SECTION OFFSET as a plain
+                // number with no relocation (`[x0, #8]` for a `cnt` at .data+8)
+                // — not the symbol's address in any program — so it is refused.
+                if (disp.symbolPart == SymbolAddressPart::Whole) {
+                    sink_.fail(offsetNode,
+                         std::format("memory displacement '{}' is a symbol, and an "
+                                     "offset field holds only PART of an address "
+                                     "— write which part (this dialect's "
+                                     "operators: {}){}", disp.symbol,
+                                     symbolPartSpellingList(), sink_.pairSuffix()));
+                    return false;
+                }
+                if (!fitsDisp(disp.symbolAddend, offsetNode)) return false;
+                out.dispSymbol     = std::move(disp.symbol);
+                out.dispSymbolPart = disp.symbolPart;
+                out.disp           = static_cast<std::int32_t>(disp.symbolAddend);
+            } else {
+                if (!fitsDisp(disp.value, offsetNode)) return false;
+                out.disp = static_cast<std::int32_t>(disp.value);
             }
-            if (!fitsDisp(disp.value, innerImm)) return false;
-            out.disp = static_cast<std::int32_t>(disp.value);
         }
         // The scale: numeric tokens outside every register subtree AND outside
         // the displacement read above.
         std::vector<std::string_view> numerics;
-        collectNumericTokensOutsideRegisters(memory, numerics);
+        collectNumericTokensOutsideRegisters(memory, numerics, offsetNode);
         if (numerics.size() > 1) {
             sink_.fail(memory,
                  std::format("this memory operand carries {} numeric fields; "
@@ -2494,9 +2676,32 @@ struct AsmInstructionLowering::Impl {
         }
     }
 
+    // ⚠ A REGISTER TAKES NO ADDRESS-PART OPERATOR AND NO ADDEND (P68 round 9):
+    // on a dialect whose register and symbol share one rule, `x0+8`,
+    // `x0@PAGEOFF` and `[x0+8]` parse, and reading them as the register would
+    // drop what was written after it with a clean build log. false ⇒ reported.
+    [[nodiscard]] bool registerCarriesNoSymbolTail(NodeId n) {
+        for (AsmOperandRole const tail :
+             {AsmOperandRole::SymbolPart, AsmOperandRole::Addend}) {
+            RuleId const r = cfg_.ruleForRole(tail);
+            if (!r.valid() || !findDescendantOfRule(tree_, n, r).valid()) continue;
+            sink_.fail(n,
+                 std::format("'{}' names a register, and {} applies to a "
+                             "symbol's address, never to a register{}",
+                             trailingNameOf(n),
+                             tail == AsmOperandRole::SymbolPart
+                                 ? "an address-part operator"
+                                 : "a constant added after a name",
+                             sink_.pairSuffix()));
+            return false;
+        }
+        return true;
+    }
+
     // One base or index register of a memory operand, from either spelling.
     std::optional<AsmDecodedOperand> decodeAddressRegister(NodeId n) {
         if (!isTemplatePlaceholderNode(n)) {
+            if (!registerCarriesNoSymbolTail(n)) return std::nullopt;
             AsmDecodedOperand scratch;
             return decodeRegister(n, scratch);
         }
@@ -2517,8 +2722,11 @@ struct AsmInstructionLowering::Impl {
     }
 
     void collectNumericTokensOutsideRegisters(
-        NodeId n, std::vector<std::string_view>& out) const {
+        NodeId n, std::vector<std::string_view>& out, NodeId skip = {}) const {
         if (!n.valid()) return;
+        // ⚠ AND OUTSIDE A SYMBOLIC PAGE OFFSET (P68 round 9): the `8` of
+        // `[x0, :lo12:msg+8]` is the symbol's addend, not a scale.
+        if (skip.valid() && n.v == skip.v) return;
         if (tree_.kind(n) == NodeKind::Internal
             && tree_.rule(n).v
                    == cfg_.ruleForRole(AsmOperandRole::Register).v) {
@@ -2546,7 +2754,7 @@ struct AsmInstructionLowering::Impl {
         }
         for (NodeId const c : tree_.children(n)) {
             if (isEmptySpace(tree_.flags(c))) continue;
-            collectNumericTokensOutsideRegisters(c, out);
+            collectNumericTokensOutsideRegisters(c, out, skip);
         }
     }
 
@@ -2593,20 +2801,56 @@ struct AsmInstructionLowering::Impl {
         // SEARCH, NOT AFTER: `sym-8`'s addend is a minus sign and a number, and
         // a negation search over the whole scalar would take the name for a
         // number and drop it.
+        // ★★ AND SO IS AN OPERATOR NAMING A PART OF THE ADDRESS (`:lo12:msg`,
+        // `msg@PAGEOFF` — P68 round 9, the aarch64 twins): the dialect's
+        // `symbolPart` rule is its text, `symbolParts` says what it means and on
+        // which object-format kinds, and what is left is the name.
         RuleId const addendRule = cfg_.ruleForRole(AsmOperandRole::Addend);
-        if (NodeId const addendNode = findDescendantOfRule(tree_, node, addendRule);
-            addendNode.valid() && addendNode.v != node.v) {
+        RuleId const partRule   = cfg_.ruleForRole(AsmOperandRole::SymbolPart);
+        NodeId addendNode{};
+        if (NodeId const a = findDescendantOfRule(tree_, node, addendRule);
+            a.valid() && a.v != node.v) {
+            addendNode = a;
+        }
+        NodeId partNode{};
+        if (NodeId const p = findDescendantOfRule(tree_, node, partRule);
+            p.valid() && p.v != node.v) {
+            partNode = p;
+        }
+        if (addendNode.valid() || partNode.valid()) {
             std::int64_t addend = 0;
-            if (!decodeAddend(addendNode, addend)) return false;
+            if (addendNode.valid() && !decodeAddend(addendNode, addend)) return false;
             std::string name;
-            forEachTokenOutside(node, addendNode,
-                                [&](std::string_view t) { name += t; });
-            if (name.empty() || (name.front() >= '0' && name.front() <= '9')) {
+            bool        partBeforeName = false;
+            splitSymbolOperand(node, partNode, addendNode, name, partBeforeName);
+            // A numeric local-label reference (`1f+4`, `:lo12:1f`) is a name
+            // though it begins with a digit — the dialect's own reference
+            // spelling, as the unsplit path below reads it.
+            bool const localRef =
+                !cfg_.localLabelBackwardSuffix.empty()
+                && asm_local_labels::parseReference(
+                       name, asm_local_labels::Suffixes{
+                                 cfg_.localLabelBackwardSuffix,
+                                 cfg_.localLabelForwardSuffix})
+                       .has_value();
+            if (name.empty()
+                || (!localRef && name.front() >= '0' && name.front() <= '9')) {
                 sink_.fail(node,
-                     std::format("'{}' writes a constant after something that is "
-                                 "not a symbol name — an addend adds to an "
-                                 "ADDRESS{}", name, sink_.pairSuffix()));
+                     std::format("'{}' writes {} beside something that is not a "
+                                 "symbol name — {}{}", name,
+                                 partNode.valid() ? "an address-part operator"
+                                                  : "a constant",
+                                 partNode.valid()
+                                     ? "a part of an address is a part of a "
+                                       "SYMBOL's address"
+                                     : "an addend adds to an ADDRESS",
+                                 sink_.pairSuffix()));
                 return false;
+            }
+            if (partNode.valid()) {
+                auto const part = resolveSymbolPart(partNode, partBeforeName, name);
+                if (!part.has_value()) return false;
+                out.symbolPart = *part;
             }
             out.symbol       = std::move(name);
             out.symbolAddend = addend;
@@ -2737,6 +2981,147 @@ struct AsmInstructionLowering::Impl {
             if (isEmptySpace(tree_.flags(c))) continue;
             forEachTokenOutside(c, excluded, fn);
         }
+    }
+
+    // The NAME of a symbol operand: every token of `node` outside the part
+    // operator and the addend, in order — and whether the operator came BEFORE
+    // it (`:lo12:msg`) or after it (`msg@PAGEOFF`). Bounded by one operand's
+    // few tokens.
+    void splitSymbolOperand(NodeId n, NodeId part, NodeId addend,
+                            std::string& name, bool& partBeforeName) const {
+        if (!n.valid() || n.v == addend.v) return;
+        if (n.v == part.v) {
+            if (name.empty()) partBeforeName = true;
+            return;
+        }
+        if (tree_.kind(n) == NodeKind::Token) { name += tree_.text(n); return; }
+        for (NodeId const c : tree_.children(n)) {
+            if (isEmptySpace(tree_.flags(c))) continue;
+            splitSymbolOperand(c, part, addend, name, partBeforeName);
+        }
+    }
+
+    // Why a constant added to a location in this file's CODE is refused (P68
+    // round 9; the operand, displacement and data-slot sites say it alike).
+    [[nodiscard]] std::string codePlusConstantMessage(std::string_view mnemonic,
+                                                      std::string const& symbol,
+                                                      std::int64_t addend) const {
+        return std::format("'{}' takes the address of '{}' plus {}, a location "
+                           "in this file's CODE, and this build does not lay "
+                           "code out as the reference assembler does (a jump it "
+                           "synthesizes at a block's end; x86's long branch and "
+                           "immediate forms), so the byte it names would not be "
+                           "the reference's — label the instruction you mean{}",
+                           mnemonic, symbol, addend, sink_.pairSuffix());
+    }
+
+    // Is `name` this dialect's location counter (`.` in GNU as)? False on a
+    // dialect that declares none, where `.` is an ordinary name.
+    [[nodiscard]] bool isLocationCounter(std::string_view name) const {
+        return !cfg_.locationCounter.empty()
+            && cfg_.spellingMatches(cfg_.locationCounter, name);
+    }
+
+    // See `AsmInstructionLowering::spellsLocationCounter`. Bounded by the
+    // statement's own operands.
+    [[nodiscard]] bool spellsLocationCounter(NodeId operandSeq) const {
+        if (cfg_.locationCounter.empty() || !operandSeq.valid()) return false;
+        RuleId const addendRule = cfg_.ruleForRole(AsmOperandRole::Addend);
+        RuleId const partRule   = cfg_.ruleForRole(AsmOperandRole::SymbolPart);
+        for (NodeId const op : visibleChildren(tree_, operandSeq)) {
+            if (tree_.kind(op) != NodeKind::Internal) continue;
+            NodeId const addend = findDescendantOfRule(tree_, op, addendRule);
+            NodeId const part   = findDescendantOfRule(tree_, op, partRule);
+            std::string name;
+            bool        partBeforeName = false;
+            splitSymbolOperand(op, part, addend, name, partBeforeName);
+            if (cfg_.spellingMatches(cfg_.locationCounter, name)) return true;
+        }
+        return false;
+    }
+
+    // Every address-part operator this dialect declares, for a diagnostic.
+    [[nodiscard]] std::string symbolPartSpellingList() const {
+        std::string all;
+        for (auto const& sp : cfg_.symbolParts) {
+            if (!all.empty()) all += ", ";
+            all += std::format("`{}`", sp.spelling);
+        }
+        return all.empty() ? std::string{"none"} : all;
+    }
+
+    // ★★★ WHAT AN ADDRESS-PART OPERATOR MEANS HERE (P68 round 9, the aarch64
+    // twins). Its text (`:lo12:`, `@PAGEOFF`) is looked up in the dialect's
+    // `symbolParts`, and it is read only when that row lists the object-format
+    // kind this build assembles for: the kind is a KEY into the list, never a
+    // branch. ✔MEASURED 2026-09-23: gas and clang-ELF refuse `@PAGEOFF`, and
+    // clang for Darwin refuses `:lo12:` — each reference reads only its own
+    // format's spelling, so accepting the other would accept what no reference
+    // accepts. The side it is written on is the row's too (`msg:lo12:` and
+    // `@PAGEOFF msg` are nobody's spelling).
+    [[nodiscard]] std::optional<SymbolAddressPart>
+    resolveSymbolPart(NodeId partNode, bool writtenBefore, std::string const& name) {
+        std::string text;
+        forEachTokenInOrder(partNode, [&](std::string_view t) { text += t; });
+        AsmSymbolPartSpelling const* row = nullptr;
+        for (auto const& sp : cfg_.symbolParts) {
+            if (cfg_.spellingMatches(sp.spelling, text)) row = &sp;
+        }
+        if (row == nullptr) {
+            sink_.fail(partNode,
+                 std::format("'{}' is not an operator this dialect declares for a "
+                             "part of a symbol's address (it declares {}){}",
+                             text, symbolPartSpellingList(), sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        if (row->writtenBefore != writtenBefore) {
+            sink_.fail(partNode,
+                 std::format("'{}' is written {} the name it applies to ('{}'), "
+                             "and this dialect spells it {} the name{}",
+                             text, writtenBefore ? "before" : "after", name,
+                             row->writtenBefore ? "before" : "after",
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        auto const kind = host_.objectFormatKind();
+        bool const readHere =
+            kind.has_value()
+            && std::find(row->formatKinds.begin(), row->formatKinds.end(), *kind)
+                   != row->formatKinds.end();
+        if (!readHere) {
+            std::string here;
+            if (kind.has_value()) {
+                for (auto const& sp : cfg_.symbolParts) {
+                    if (sp.part != row->part) continue;
+                    if (std::find(sp.formatKinds.begin(), sp.formatKinds.end(), *kind)
+                        == sp.formatKinds.end()) {
+                        continue;
+                    }
+                    if (!here.empty()) here += " or ";
+                    here += std::format("`{}`", sp.spelling);
+                }
+            }
+            std::string kinds;
+            for (auto const k : row->formatKinds) {
+                if (!kinds.empty()) kinds += ", ";
+                kinds += objectFormatKindName(k);
+            }
+            sink_.fail(partNode,
+                 std::format("'{}' spells the {} of an address for {} objects, "
+                             "and {}{}{}",
+                             text, symbolAddressPartPhrase(row->part), kinds,
+                             kind.has_value()
+                                 ? std::format("this build writes {} objects",
+                                               objectFormatKindName(*kind))
+                                 : std::string{"this build states no object "
+                                               "format to read it under"},
+                             here.empty()
+                                 ? std::string{}
+                                 : std::format(", which spell it {}", here),
+                             sink_.pairSuffix()));
+            return std::nullopt;
+        }
+        return row->part;
     }
 
     // The constant of an `addend` node: its LAST token is the magnitude — the
@@ -3389,7 +3774,7 @@ struct AsmInstructionLowering::Impl {
                 // takes it. An opcode with no symbol-shaped variant fails
                 // through the ordinary "no candidate target opcode encodes
                 // that shape" path, naming the candidates.
-                return sourceOperandForSymbol(src, ins.mnemonic, sources);
+                return sourceOperandForSymbol(src, ins, sources);
             }
             if (src.value < std::numeric_limits<std::int32_t>::min()
                 || src.value > std::numeric_limits<std::int32_t>::max()) {
@@ -3408,6 +3793,7 @@ struct AsmInstructionLowering::Impl {
         case AsmOperandRole::Memory:
         case AsmOperandRole::Indirect:
         case AsmOperandRole::Addend:
+        case AsmOperandRole::SymbolPart:
             break;
         }
         sink_.fail(src.node, std::format("this operand form is not yet "
@@ -3445,34 +3831,138 @@ struct AsmInstructionLowering::Impl {
     // arrangement a host could know about, and widening the virtual would ask
     // every override to answer a question none of them has.
     // [[D-ASM-ARRANGEMENT-ERASED-TO-A-WIDTH-BEFORE-ELECTION]].
-    [[nodiscard]] bool sourceOperandForSymbol(AsmDecodedOperand const& src,
-                                              std::string_view      mnemonic,
-                                              OperandList&          sources) {
+    [[nodiscard]] bool sourceOperandForSymbol(AsmDecodedOperand const&     src,
+                                              AsmDecodedInstruction const& ins,
+                                              OperandList&                 sources) {
+        std::string_view const mnemonic = ins.mnemonic;
         if (src.symbol.empty()) {
             sink_.fail(src.node,
                  std::format("'{}' reads an operand that is neither a value nor "
                              "a name{}", mnemonic, sink_.pairSuffix()));
             return false;
         }
-        // ⚠ AN ADDRESS WITH A CONSTANT AFTER IT (`leaq msg+4, %rax`, `$msg+4`)
-        // IS REFUSED, NOT TRUNCATED: the shapes below name a symbol's address
-        // and carry no addend, so taking one would drop the `+4` and address
-        // the wrong byte with a clean build log. Through the program counter
-        // (`msg+4(%rip)`) the same address IS expressible.
-        if (src.symbolAddend != 0) {
+        // ★★ A BLOCK OF THIS FUNCTION, ADDRESSED IN A FIELD (P68 round 9): where
+        // the row's opcode takes one (`addressesBlocks` — arm64's one-word
+        // `adr`), a label of the open function, a numeric local label and the
+        // location counter are resolved at ASSEMBLE time, the constant after
+        // them riding the field: ✔MEASURED 2026-09-23, gas 2.42 and clang 18
+        // (ELF and Darwin alike) write `adr x1, 1f` = 0x10000021, `adr x1,
+        // 1f+4` = 0x10000041, `adr x7, .` = 0x10000007 and `adr x7, .-4` =
+        // 0x10ffffe7, with no relocation. The host answers which names are
+        // such blocks; any other name takes the symbol route below.
+        // ★★ THE LOCATION COUNTER IS NOT A BLOCK: it is the address of THIS
+        // instruction, which the encoder knows when it writes the field
+        // (`LirOperandKind::LocationCounter`). Beginning a block at its line
+        // would put a fall-through jump in front of the line
+        // ([[D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP]]) and move every
+        // `.±N` that spans it — ✔MEASURED 2026-09-23 on the first cut, `nop;
+        // adr x10, .; adr x11, .-4` put x11 on that jump, not on x10.
+        if (ins.addressesBlocks && src.symbolPart == SymbolAddressPart::Whole) {
+            bool const here = isLocationCounter(src.symbol);
+            std::optional<LirBlockId> const block =
+                here ? std::nullopt : host_.resolveLocalBlock(src.symbol, src.node);
+            if (here || block.has_value()) {
+                if (src.symbolAddend < std::numeric_limits<std::int32_t>::min()
+                    || src.symbolAddend > std::numeric_limits<std::int32_t>::max()) {
+                    sink_.fail(src.node,
+                         std::format("'{}' adds {} to the address of '{}', which "
+                                     "does not fit the 32-bit constant a block "
+                                     "reference carries{}",
+                                     mnemonic, src.symbolAddend, src.symbol,
+                                     sink_.pairSuffix()));
+                    return false;
+                }
+                sources.push(here ? LirOperand::makeLocationCounter()
+                                  : LirOperand::makeBlockRef(block->v));
+                sources.push(LirOperand::makeImmInt32(
+                    static_cast<std::int32_t>(src.symbolAddend)));
+                return true;
+            }
+            if (!sink_.ok()) return false;
+        }
+        // ⚠ A CONSTANT ADDED TO A LOCATION IN THIS FILE'S CODE (P68 round 9) —
+        // `adr x0, main+4`, `adrp x0, main+8`, `leaq L+2, %rax` — outside the
+        // block-relative field above: the byte N past a code label is a
+        // distance in the REFERENCE assembler's code layout, which this build
+        // does not reproduce. ✔MEASURED 2026-09-23: `leaq Lnext+2(%rip),
+        // %rcx; jmp *%rcx` onto a `jmp` gas encodes in 2 bytes and this build in
+        // 5 ran to 42 under gas and clang and died SIGSEGV under DSS, with a
+        // clean build log. Refused, by name; labelling the instruction meant is
+        // always possible.
+        if (src.symbolAddend != 0 && host_.namesCodeHere(src.symbol, src.node)) {
+            sink_.fail(src.node, codePlusConstantMessage(mnemonic, src.symbol,
+                                                         src.symbolAddend));
+            return false;
+        }
+        // Anywhere else the location counter names no symbol and no field
+        // takes it: refused by name, never read as an import called `.`.
+        if (isLocationCounter(src.symbol)) {
             sink_.fail(src.node,
-                 std::format("'{}' takes the address '{}{:+}' as an operand of "
-                             "its own, and this build carries a constant added "
-                             "to a symbol only in a memory displacement "
-                             "(`{}{:+}(%rip)`-style){}",
-                             mnemonic, src.symbol, src.symbolAddend, src.symbol,
-                             src.symbolAddend, sink_.pairSuffix()));
+                 std::format("'{}' takes {} the location counter `{}`, and this "
+                             "build resolves the location counter only as a "
+                             "branch target or in a field that takes a location "
+                             "of its own function{}",
+                             mnemonic,
+                             src.symbolPart != SymbolAddressPart::Whole
+                                 ? std::format("the {} of",
+                                               symbolAddressPartPhrase(src.symbolPart))
+                                 : std::string{"the address of"},
+                             src.symbol, sink_.pairSuffix()));
             return false;
         }
         std::vector<LirOperand> appended;
         if (!host_.appendSymbolAddress(src.symbol, src.node, mnemonic,
                                        appended)) {
             return false;
+        }
+        // ★★ THE PART OF THE ADDRESS AND THE CONSTANT AFTER THE NAME RIDE THE
+        // ADDRESS OPERAND (P68 round 9): `adrp x0, msg+8` is the page of
+        // `msg+8`, `add x0, x0, :lo12:msg` its page offset, `adr x0, msg+8` the
+        // whole of it. A plain name stays the `SymbolRef` it always was; a
+        // constant makes it a `SymbolAddress` (the pair in the module's literal
+        // pool); the part is the operand's side byte, which the election reads
+        // (`guard.symbolPart`). An opcode with no variant for the result is
+        // refused by the election, naming the candidates.
+        if (src.symbolPart != SymbolAddressPart::Whole || src.symbolAddend != 0) {
+            // ⚠ AN INTERIOR LABEL ARRIVES AS `[SymbolRef, BlockRef]`, the
+            // BlockRef binding its minted symbol to the block — a shape no
+            // variant takes with a part or a constant yet. Refused by name
+            // rather than rebuilt into one nobody encodes.
+            if (appended.size() != 1
+                || appended.front().kind != LirOperandKind::SymbolRef) {
+                // ✔MEASURED 2026-09-23: gas 2.42 writes `adrp x0, 1f` /
+                // `add x0, x0, :lo12:1f` against the SECTION at the label's
+                // offset, a relocation this build does not write for a label.
+                sink_.fail(src.node,
+                     src.symbolPart != SymbolAddressPart::Whole
+                         ? std::format("'{}' takes the {} of '{}', a label inside "
+                                       "this function, and this build writes no "
+                                       "relocation for a part of such a label's "
+                                       "address — only its whole address, in a "
+                                       "field that takes a location of its own "
+                                       "function (`adr`){}",
+                                       mnemonic,
+                                       symbolAddressPartPhrase(src.symbolPart),
+                                       src.symbol, sink_.pairSuffix())
+                         : std::format("'{}' takes the address of '{}' plus {}, a "
+                                       "label inside this function, and this build "
+                                       "adds a constant to such a label only in a "
+                                       "field that takes a location of its own "
+                                       "function (`adr x1, 1f+4`){}",
+                                       mnemonic, src.symbol, src.symbolAddend,
+                                       sink_.pairSuffix()));
+                return false;
+            }
+            std::uint32_t const symbolV = appended.front().symbolV;
+            if (src.symbolAddend == 0) {
+                appended.front() = LirOperand::makeSymbolRef(symbolV, src.symbolPart);
+            } else {
+                LirLiteralValue value;
+                value.value = LirSymbolAddress{SymbolId{symbolV}, src.symbolAddend};
+                value.core  = TypeKind::Ptr;
+                appended.front() = LirOperand::makeSymbolAddress(
+                    builder_.literalPoolAdd(std::move(value)), src.symbolPart);
+            }
         }
         for (auto const& o : appended) sources.push(o);
         return true;
@@ -3503,14 +3993,37 @@ struct AsmInstructionLowering::Impl {
             operands.push(LirOperand::makeMemOffset(m.disp));
             return true;
         }
+        // ⚠ THE LOCATION COUNTER IS NO SYMBOL (P68 round 9): it names this
+        // instruction's own address, which a memory displacement could take
+        // only through a relocation against the section at this offset — a
+        // form this build does not write. Refused by name, never read as an
+        // import called `.`.
+        if (isLocationCounter(m.dispSymbol)) {
+            sink_.fail(m.node,
+                 std::format("'{}' addresses memory relative to the location "
+                             "counter `{}`, and this build resolves the "
+                             "location counter only as a branch target or in a "
+                             "field that takes a location of its own function{}",
+                             mnemonic, m.dispSymbol, sink_.pairSuffix()));
+            return false;
+        }
+        // A constant added to a location in this file's CODE (`leaq
+        // L+2(%rip)`): refused, as for an operand (`sourceOperandForSymbol`).
+        if (m.disp != 0 && host_.namesCodeHere(m.dispSymbol, m.node)) {
+            sink_.fail(m.node, codePlusConstantMessage(mnemonic, m.dispSymbol,
+                                                       m.disp));
+            return false;
+        }
         auto const symbol =
             host_.resolveDisplacementSymbol(m.dispSymbol, m.node, mnemonic);
         if (!symbol.has_value()) return false;
         LirLiteralValue value;
         value.value = LirSymbolAddress{*symbol, m.disp};
         value.core  = TypeKind::Ptr;
+        // The PART of the address the field takes (P68 round 9) rides the
+        // operand, where the variant matcher reads it (`guard.symbolPart`).
         operands.push(LirOperand::makeMemSymbolOffset(
-            builder_.literalPoolAdd(std::move(value))));
+            builder_.literalPoolAdd(std::move(value)), m.dispSymbolPart));
         return true;
     }
 
@@ -4089,6 +4602,10 @@ AsmBlockEffect AsmInstructionLowering::blockEffectOf(NodeId mnemonicNode,
     return impl_->blockEffectOf(mnemonicNode, operandSeq);
 }
 
+bool AsmInstructionLowering::spellsLocationCounter(NodeId operandSeq) const {
+    return impl_->spellsLocationCounter(operandSeq);
+}
+
 bool AsmInstructionLowering::decodeOperandInto(NodeId node,
                                                AsmDecodedOperand& out) {
     auto decoded = impl_->decodeOperand(node);
@@ -4225,10 +4742,34 @@ public:
                  AsmDiagnosticSink&                 sink,
                  TemplateLabels const*              labels  = nullptr,
                  Tree const*                        tree    = nullptr,
-                 LirBuilder*                        builder = nullptr)
+                 LirBuilder*                        builder = nullptr,
+                 std::optional<ObjectFormatKind>    formatKind = std::nullopt)
         : target_(target), bindings_(bindings),
           labelBindings_(labelBindings), sink_(sink), labels_(labels),
-          tree_(tree), builder_(builder) {}
+          tree_(tree), builder_(builder), formatKind_(formatKind) {}
+
+    // The object format the embedding program is built for (P68 round 9) —
+    // only a key into the dialect's `symbolParts`; see the interface.
+    [[nodiscard]] std::optional<ObjectFormatKind>
+    objectFormatKind() const override {
+        return formatKind_;
+    }
+
+    // ⓘ A TEMPLATE ADDRESSES NO BLOCK IN A FIELD YET: a symbol address inside
+    // a template is refused by `appendSymbolAddress` below, whatever the name,
+    // so there is no block to hand back — nullopt with no diagnostic sends the
+    // name down that one refusal.
+    [[nodiscard]] std::optional<LirBlockId>
+    resolveLocalBlock(std::string const&, NodeId) override {
+        return std::nullopt;
+    }
+
+    // ⓘ Never reached with a meaning: every symbol address in a template is
+    // refused by `appendSymbolAddress` / `resolveDisplacementSymbol` before the
+    // engine asks whether a constant was added to code.
+    [[nodiscard]] bool namesCodeHere(std::string const&, NodeId) const override {
+        return false;
+    }
 
     // ── the blocks that begin without a label ─────────────────────────────
     //
@@ -4675,6 +5216,7 @@ private:
     TemplateLabels const*              labels_ = nullptr;   // the template's own
     Tree const*                        tree_   = nullptr;   // for a reference's position
     LirBuilder*                        builder_ = nullptr;  // the body's own
+    std::optional<ObjectFormatKind>    formatKind_;         // a key, see above
     std::optional<LirBlockId>          pendingFallthrough_;
     std::size_t                        emitted_    = 0;
     bool                               terminated_ = false;
@@ -5074,7 +5616,8 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                               LirBuilder&                        builder,
                               DiagnosticReporter&                reporter,
                               std::span<AsmLabelBinding const>   labelBindings,
-                              std::vector<LirBlockId>*           syntheticFallthroughs) {
+                              std::vector<LirBlockId>*           syntheticFallthroughs,
+                              std::optional<ObjectFormatKind>    formatKind) {
     AsmDiagnosticSink sink{templateTree, dialect, target, reporter};
     auto const&       cfg = dialect.assembly();
     // ⚠ NOT AN ASSERT, for the reason the standalone entry states: a caller
@@ -5101,7 +5644,7 @@ bool lowerAsmTemplateToLirRun(Tree const&                        templateTree,
         return false;
     }
     TemplateHost           host{target, bindings, labelBindings, sink, &labels,
-                                &templateTree, &builder};
+                                &templateTree, &builder, formatKind};
     AsmInstructionLowering engine{templateTree, dialect, target,
                                   builder,      sink,   host};
     if (!engine.resolveRows()) return false;

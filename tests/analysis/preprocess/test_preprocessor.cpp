@@ -4073,8 +4073,15 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // `__WCHAR_UNSIGNED__`, `__WINT_UNSIGNED__`; each names a TYPE and is defined
     // where the PAIR makes it unsigned (test_type_unsigned_predefines pins the
     // family). 42 un-gated, 13 pe-gated, 3 macho-gated = 58.
-    EXPECT_EQ(pms.size(), 58u)
-        << "c declares 42 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // P68 round 9 (D-C-GNU-INTEGER-TYPE-PREDEFINES-MISSING): +122 UN-GATED rows,
+    // the GNU integer-type families — 36 `type-name` (`__*_TYPE__`), 66
+    // `type-limit` (`__*_MAX__`/`__*_MIN__`/`__*_WIDTH__`), 20 `type-suffix`
+    // (`__*_C(c)`/`__*_C_SUFFIX__`); each names a TYPE and is realized per (language
+    // × pair) — un-gated for the `type-size` rows' reason: whether one is defined
+    // is the pair's question (test_type_derived_predefines pins the family).
+    // 164 un-gated, 13 pe-gated, 3 macho-gated = 180.
+    EXPECT_EQ(pms.size(), 180u)
+        << "c declares 164 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
@@ -4111,8 +4118,10 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 42u)
-        << "the 3 `type-unsigned` rows (__CHAR_UNSIGNED__/__WCHAR_UNSIGNED__/"
+    EXPECT_EQ(ungated, 164u)
+        << "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
+           "round 9, realized per pair) + "
+           "the 3 `type-unsigned` rows (__CHAR_UNSIGNED__/__WCHAR_UNSIGNED__/"
            "__WINT_UNSIGNED__, P68 round 9, realized per pair) + "
            "the 13 `__SIZEOF_*__` type-size rows "
            "(D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING, realized per pair) + "

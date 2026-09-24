@@ -338,6 +338,27 @@ TEST(ShippedDerivedConstants, MalformedDerivedRowsAreRefused) {
                                 "not an integer type", true},
         {"uncarriable range",   R"({ "name": "X", "of": "unsigned __int128", "limit": "max" })",
                                 "64-bit constant carrier", true},
+        // P68 round 9 (D-FFI-STDINT-LIMIT-MACROS): the `of` REFERENCE shapes.
+        {"of neither string nor object", R"({ "name": "X", "of": 5, "limit": "max" })",
+                                "'of' must be one of", false},
+        {"empty of reference",  R"({ "name": "X", "of": {}, "limit": "max" })",
+                                "EXACTLY one of 'shippedTypedef' or 'abiTypedef'", false},
+        {"two sources",         R"({ "name": "X", "of": { "shippedTypedef": "size_t", "header": "stddef.h", "abiTypedef": "wint_t" }, "limit": "max" })",
+                                "EXACTLY one of 'shippedTypedef' or 'abiTypedef'", false},
+        {"unknown of key",      R"({ "name": "X", "of": { "typedef": "size_t" }, "limit": "max" })",
+                                "D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD", false},
+        {"shipped without header", R"({ "name": "X", "of": { "shippedTypedef": "size_t" }, "limit": "max" })",
+                                "requires 'header'", false},
+        {"header beside abi",   R"({ "name": "X", "of": { "abiTypedef": "wint_t", "header": "wchar.h" }, "limit": "max" })",
+                                "companion of 'shippedTypedef' alone", false},
+        {"empty shipped name",  R"({ "name": "X", "of": { "shippedTypedef": "", "header": "stddef.h" }, "limit": "max" })",
+                                "must be a non-empty string", false},
+        {"own header by header", R"({ "name": "X", "of": { "shippedTypedef": "x_t", "header": "bad.h" }, "limit": "max" })",
+                                "this very descriptor", false},
+        {"header not shipped",  R"({ "name": "X", "of": { "shippedTypedef": "size_t", "header": "no_such_header.h" }, "limit": "max" })",
+                                "no shipped descriptor for <no_such_header.h>", true},
+        {"typedef not declared", R"({ "name": "X", "of": { "shippedTypedef": "sizet", "header": "stddef.h" }, "limit": "max" })",
+                                "declares no typedef 'sizet' on any pair", true},
     };
     for (Bad const& b : cases) {
         SCOPED_TRACE(b.label);
@@ -407,5 +428,194 @@ TEST(ShippedDerivedConstants, TheShippedLimitsHeaderRealizesEveryRowOnEveryPairS
                 << (srep.all().empty() ? "" : srep.all().front().actual);
             EXPECT_EQ(desc->constants.size(), kDerivedRows);
         }
+    }
+}
+
+// ── (6) `of` NAMES ANOTHER SHIPPED HEADER'S TYPEDEF ──────────────────────────
+// (P68 round 9, D-FFI-STDINT-LIMIT-MACROS.) C 7.22.3 gives `<stdint.h>` the limits
+// of `ptrdiff_t`, `size_t` and `wchar_t` (from `<stddef.h>`) and of `sig_atomic_t`
+// (from `<signal.h>`), and `<stdint.h>` includes neither header. A row names such
+// a type BY its header, and the reader resolves it through the SHIPPED
+// descriptors the C language's system directories hold — the same
+// `readShippedHeaderTypedefs` the `__SIZE_MAX__` predefine asks — so the identity
+// is the pair's own: `size_t` is `unsigned long` on LP64 and `unsigned long long`
+// on pe; plain `wchar_t` follows the target's ABI table through `<stddef.h>`; and
+// where `<signal.h>` is not shipped (pe) the row is NOT realized (C 7.22.3p2:
+// "only the macros corresponding to those typedef names it actually provides").
+TEST(ShippedDerivedConstants, OfNamesATypedefOfAnotherShippedHeader) {
+    ASSERT_NE(cLanguage(), nullptr);
+    ScratchDir dir{Location::Temp, "derived-constants"};
+    auto const path = writeTemp(dir, "oth.json", R"JSON({
+        "header": "oth.h",
+        "constants": [
+          { "name": "O_SIZE_MAX",    "of": { "shippedTypedef": "size_t",       "header": "stddef.h" }, "limit": "max" },
+          { "name": "O_PTRDIFF_MIN", "of": { "shippedTypedef": "ptrdiff_t",    "header": "stddef.h" }, "limit": "min" },
+          { "name": "O_SIG_MAX",     "of": { "shippedTypedef": "sig_atomic_t", "header": "signal.h" }, "limit": "max" },
+          { "name": "O_WCHAR_MIN",   "of": { "shippedTypedef": "wchar_t",      "header": "stddef.h" }, "limit": "min" },
+          { "name": "O_WCHAR_WIDTH", "of": { "shippedTypedef": "wchar_t",      "header": "stddef.h" }, "limit": "width" }
+        ]
+    })JSON");
+    struct Case {
+        char const*      label;
+        DataModel        model;
+        ObjectFormatKind format;
+        TypeKind         wchar;          // the target's ABI `wchar_t` core on the pair
+        std::string_view sizeVocab;      // `size_t`'s identity there
+        std::string_view ptrdiffVocab;
+        bool             signalShips;
+        std::int64_t     wcharMin;
+        TypeKind         wcharMinCore;   // the PROMOTED type
+        std::int64_t     wcharWidth;
+    };
+    Case const cases[] = {
+        {"x86_64 elf", DataModel::Lp64,  ObjectFormatKind::Elf,   TypeKind::I32, "unsigned long",
+         "long", true, INT32_MIN, TypeKind::I32, 32},
+        {"arm64 elf",  DataModel::Lp64,  ObjectFormatKind::Elf,   TypeKind::U32, "unsigned long",
+         "long", true, 0, TypeKind::U32, 32},
+        {"x86_64 pe",  DataModel::Llp64, ObjectFormatKind::Pe,    TypeKind::U16, "unsigned long long",
+         "long long", false, 0, TypeKind::I32, 16},
+        {"macho",      DataModel::Lp64,  ObjectFormatKind::MachO, TypeKind::I32, "unsigned long",
+         "long", true, INT32_MIN, TypeKind::I32, 32},
+    };
+    for (Case const& c : cases) {
+        SCOPED_TRACE(c.label);
+        ShippedPairFacts pair{cLanguage().get(), c.model, false};
+        pair.abiTypedefs = {{"wchar_t", c.wchar}};
+        // The PREPROCESSOR seam.
+        DiagnosticReporter rep;
+        auto const pp = readShippedLibConstants(path, rep, std::nullopt, c.format, &pair);
+        ASSERT_TRUE(pp.has_value()) << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_FALSE(rep.hasErrors());
+        auto const* sz = ppRow(*pp, "O_SIZE_MAX");
+        auto const* pd = ppRow(*pp, "O_PTRDIFF_MIN");
+        auto const* wm = ppRow(*pp, "O_WCHAR_MIN");
+        auto const* ww = ppRow(*pp, "O_WCHAR_WIDTH");
+        ASSERT_TRUE(sz && pd && wm && ww);
+        EXPECT_EQ(static_cast<std::uint64_t>(sz->value), 0xFFFFFFFFFFFFFFFFull);
+        EXPECT_EQ(sz->core, TypeKind::U64);
+        EXPECT_EQ(sz->vocabularyName, c.sizeVocab) << "size_t's identity on this pair";
+        EXPECT_EQ(pd->value, INT64_MIN);
+        EXPECT_EQ(pd->vocabularyName, c.ptrdiffVocab);
+        EXPECT_EQ(wm->value, c.wcharMin);
+        EXPECT_EQ(wm->core, c.wcharMinCore)
+            << "an unsigned wchar_t's _MIN is 0 in its PROMOTED type (C 7.22.5)";
+        EXPECT_EQ(ww->value, c.wcharWidth);
+        EXPECT_EQ(ww->core, TypeKind::I32) << "a width is an int";
+        auto const* sig = ppRow(*pp, "O_SIG_MAX");
+        if (c.signalShips) {
+            ASSERT_NE(sig, nullptr);
+            EXPECT_EQ(sig->value, 2147483647);
+            EXPECT_EQ(sig->core, TypeKind::I32);
+        } else {
+            EXPECT_EQ(sig, nullptr)
+                << "<signal.h> is not shipped for this format, so neither is its type's limit";
+        }
+        // The SEMANTIC seam — the same rows, the same identities.
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter srep;
+        auto const desc = readShippedLibDescriptor(path, interner, typeReg, srep, c.model,
+                                                   std::nullopt, c.format, {}, nullptr, &pair);
+        ASSERT_TRUE(desc.has_value()) << (srep.all().empty() ? "" : srep.all().front().actual);
+        auto const* s = semRow(*desc, "O_SIZE_MAX");
+        ASSERT_NE(s, nullptr);
+        EXPECT_EQ(interner.vocabularyName(s->type), c.sizeVocab);
+        EXPECT_EQ(desc->constants.size(), pp->size()) << "the two seams realize one row set";
+    }
+}
+
+// ── (7) `of` NAMES THE TARGET'S PLATFORM ABI TYPEDEF ─────────────────────────
+// `wint_t` is declared by no shipped header; its type is the target's ABI fact
+// (`abiTypedefs`, the table `__WINT_MAX__` reads): unsigned 32-bit on Linux,
+// signed 32-bit on Darwin, unsigned 16-bit on Windows — whose limits PROMOTE to
+// `int` (C 7.22.5). A target that declares none for the format: not realized.
+TEST(ShippedDerivedConstants, OfNamesTheTargetsAbiTypedef) {
+    ASSERT_NE(cLanguage(), nullptr);
+    ScratchDir dir{Location::Temp, "derived-constants"};
+    auto const path = writeTemp(dir, "abi.json", R"JSON({
+        "header": "abi.h",
+        "constants": [
+          { "name": "A_MIN",   "of": { "abiTypedef": "wint_t" }, "limit": "min" },
+          { "name": "A_MAX",   "of": { "abiTypedef": "wint_t" }, "limit": "max" },
+          { "name": "A_WIDTH", "of": { "abiTypedef": "wint_t" }, "limit": "width" }
+        ]
+    })JSON");
+    struct Case {
+        TypeKind      wint;
+        std::int64_t  min;
+        std::uint64_t max;
+        TypeKind      type;   // the promoted type both limits have
+        std::int64_t  width;
+    };
+    for (Case const c : {Case{TypeKind::U32, 0, 4294967295ull, TypeKind::U32, 32},
+                         Case{TypeKind::I32, INT32_MIN, 2147483647ull, TypeKind::I32, 32},
+                         Case{TypeKind::U16, 0, 65535ull, TypeKind::I32, 16}}) {
+        SCOPED_TRACE(std::string{typeKindNameOrEmpty(c.wint)});
+        ShippedPairFacts pair{cLanguage().get(), DataModel::Lp64, false};
+        pair.abiTypedefs = {{"wint_t", c.wint}};
+        DiagnosticReporter rep;
+        auto const pp = readShippedLibConstants(path, rep, std::nullopt, std::nullopt, &pair);
+        ASSERT_TRUE(pp.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        auto const* mn = ppRow(*pp, "A_MIN");
+        auto const* mx = ppRow(*pp, "A_MAX");
+        auto const* w  = ppRow(*pp, "A_WIDTH");
+        ASSERT_TRUE(mn && mx && w);
+        EXPECT_EQ(mn->value, c.min);
+        EXPECT_EQ(static_cast<std::uint64_t>(mx->value), c.max);
+        EXPECT_EQ(mn->core, c.type);
+        EXPECT_EQ(mx->core, c.type);
+        EXPECT_EQ(w->value, c.width);
+    }
+    // No such ABI typedef on the pair: not realized, and not an error.
+    ShippedPairFacts const none{cLanguage().get(), DataModel::Lp64, false};
+    DiagnosticReporter rep;
+    auto const pp = readShippedLibConstants(path, rep, std::nullopt, std::nullopt, &none);
+    ASSERT_TRUE(pp.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(pp->empty());
+}
+
+// ── (8) THE SHIPPED stdint.json REALIZES ITS WHOLE FAMILY ON EVERY PAIR SHAPE ─
+// The typo guard for its 84 `of` references: every row resolves through the C
+// language on each real pair shape, with no diagnostic, at both seams — all 84 on
+// ELF (both `wchar_t` signednesses) and Mach-O; 81 on pe, where `<signal.h>` is
+// not shipped and the three `SIG_ATOMIC_*` rows are therefore not realized.
+TEST(ShippedDerivedConstants, TheShippedStdintHeaderRealizesItsFamilyOnEveryPairShape) {
+    ASSERT_NE(cLanguage(), nullptr);
+    auto const root = findConfigRoot();
+    ASSERT_TRUE(root.has_value()) << configRootDiagnostic();
+    auto const stdint = *root / "shippedLibs" / "stdint.json";
+    struct Shape {
+        char const*      label;
+        DataModel        model;
+        ObjectFormatKind format;
+        TypeKind         wchar;
+        TypeKind         wint;
+        std::size_t      rows;
+    };
+    Shape const shapes[] = {
+        {"x86_64 elf", DataModel::Lp64,  ObjectFormatKind::Elf,   TypeKind::I32, TypeKind::U32, 84},
+        {"arm64 elf",  DataModel::Lp64,  ObjectFormatKind::Elf,   TypeKind::U32, TypeKind::U32, 84},
+        {"macho",      DataModel::Lp64,  ObjectFormatKind::MachO, TypeKind::I32, TypeKind::I32, 84},
+        {"pe",         DataModel::Llp64, ObjectFormatKind::Pe,    TypeKind::U16, TypeKind::U16, 81},
+    };
+    for (Shape const& s : shapes) {
+        SCOPED_TRACE(s.label);
+        ShippedPairFacts pair{cLanguage().get(), s.model, false};
+        pair.abiTypedefs = {{"wchar_t", s.wchar}, {"wint_t", s.wint}};
+        DiagnosticReporter rep;
+        auto const pp = readShippedLibConstants(stdint, rep, std::nullopt, s.format, &pair);
+        ASSERT_TRUE(pp.has_value()) << (rep.all().empty() ? "" : rep.all().front().actual);
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(pp->size(), s.rows);
+        EXPECT_EQ(ppRow(*pp, "SIG_ATOMIC_MAX") != nullptr, s.rows == 84);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter srep;
+        auto const desc = readShippedLibDescriptor(stdint, interner, typeReg, srep, s.model,
+                                                   std::nullopt, s.format, {}, nullptr, &pair);
+        ASSERT_TRUE(desc.has_value()) << (srep.all().empty() ? "" : srep.all().front().actual);
+        EXPECT_EQ(desc->constants.size(), s.rows);
     }
 }

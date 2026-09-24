@@ -219,8 +219,9 @@ computeMirDomTree(Mir const&                                  mir,
         std::fprintf(stderr,
             "dss::computeMirDomTree fatal: MirDomScratch bound to module "
             "id=%u blocks=%u used with module id=%u blocks=%u — stale scratch "
-            "across a rebuild (D-OPT-DOMTREE-SCRATCH-REUSE contract).\n",
+            "across a rebuild: re-bind the scratch to the rebuilt module.\n",
             scratch.moduleIdV, scratch.blockCount, mir.id().v, bc);
+        // Anchored: D-OPT-DOMTREE-SCRATCH-REUSE (unreachable: the abort below).
         std::abort();
     }
     if (preds.size() != mir.blockCount()) {
@@ -462,9 +463,10 @@ computeMirPostDomTree(Mir const& mir, MirFuncId f, MirPostDomScratch& scratch) {
         std::fprintf(stderr,
             "dss::computeMirPostDomTree fatal: MirPostDomScratch bound to "
             "module id=%u blocks=%u used with module id=%u blocks=%u — stale "
-            "scratch across a rebuild (D-OPT-POSTDOM-SCRATCH-REUSE "
-            "contract).\n",
+            "scratch across a rebuild: re-bind the scratch to the rebuilt "
+            "module.\n",
             scratch.moduleIdV, scratch.blockCount, mir.id().v, bc);
+        // Anchored: D-OPT-POSTDOM-SCRATCH-REUSE (unreachable: the abort below).
         std::abort();
     }
 
@@ -609,8 +611,8 @@ mirDominanceFrontier(Mir const& mir,
         std::fprintf(stderr,
             "dss::mirDominanceFrontier fatal: scratch-frontier called with a "
             "tree that is NOT this scratch's own (the touched-slot sweep only "
-            "covers scratch.tree — "
-            "D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION).\n");
+            "covers scratch.tree).\n");
+        // Anchored: D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION.
         std::abort();
     }
     if (preds.size() != mir.blockCount()) {
@@ -662,8 +664,8 @@ mirDomTreeChildren(Mir const& mir, MirDomTree const& dom,
         std::fprintf(stderr,
             "dss::mirDomTreeChildren fatal: scratch-children called with a "
             "tree that is NOT this scratch's own (the touched-slot reset "
-            "contract only covers scratch.tree — "
-            "D-OPT-DOMTREE-SCRATCH-REUSE).\n");
+            "contract only covers scratch.tree).\n");
+        // Anchored: D-OPT-DOMTREE-SCRATCH-REUSE.
         std::abort();
     }
     // Idempotent per compute call (the fresh overload returns identical
@@ -773,7 +775,8 @@ naturalLoopsCore(Mir const& mir,
                     "dss::mirNaturalLoops fatal: body slot v=%u is "
                     "gaveUp — dominance is unsound; LICM hoisting "
                     "through this block would violate def-dominates-"
-                    "use (D-OPT6-LICM-GAVEUP-BODY-FILTER).\n", slot);
+                    "use.\n", slot);
+                // Anchored: D-OPT6-LICM-GAVEUP-BODY-FILTER.
                 std::abort();
             }
         }
@@ -814,8 +817,9 @@ mirNaturalLoops(Mir const& mir,
         if (s < 1u || s >= bc) {
             std::fprintf(stderr,
                 "dss::mirNaturalLoops fatal: candidateSources[%zu] = %u is "
-                "outside [1, blockCount=%u) — the scoped overload's contract "
-                "(D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN).\n", k, s, bc);
+                "outside [1, blockCount=%u) — the scoped overload's contract.\n",
+                k, s, bc);
+            // Anchored: D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN.
             std::abort();
         }
         if (k > 0 && s <= candidateSources[k - 1]) {
@@ -842,8 +846,9 @@ void mirBackEdgeCandidates(Mir const& mir, MirFuncId f,
     if (nb == 0) {
         std::fprintf(stderr,
             "dss::mirBackEdgeCandidates fatal: func #%u has no blocks — a "
-            "candidate set is only defined for a function with an entry "
-            "(D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN).\n", f.v);
+            "candidate set is only defined for a function with an entry.\n",
+            f.v);
+        // Anchored: D-OPT-NATURAL-LOOPS-MODULE-WIDE-SCAN.
         std::abort();
     }
     std::uint32_t const first = mir.funcBlockAt(f, 0).v;

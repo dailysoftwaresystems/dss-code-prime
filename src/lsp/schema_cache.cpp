@@ -42,25 +42,21 @@ namespace {
 
 } // namespace
 
-// Scan one `src/dss-config/sources` directory for `*.lang.json` stems.
-// Factored out so the DSS_CONFIG_ROOT branch and the cwd-walk branch below
-// cannot drift in what they consider a candidate language.
+// The `*.lang.json` stems of one `src/dss-config/sources` directory, named by
+// the ONE owner of which files ARE language documents
+// (`shippedConfigDocuments`: exactly `<stem>.lang.json`, sorted by stem). This
+// was a hand-rolled copy that matched the suffix exactly while the driver's
+// matched it as a SUBSTRING -- two enumerations of one directory disagreeing
+// ([[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]).
+// A directory that cannot be listed is REPORTED as such, never an empty corpus.
 [[nodiscard]] static ShippedDiscoveryResult scanSourcesDir(
     std::filesystem::path const& candidate) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
+    auto documents = dss::shippedConfigDocuments(candidate, ".lang.json");
+    if (!documents.has_value()) return {{}, candidate, std::move(documents).error()};
     std::vector<std::string> names;
-    for (auto const& entry : fs::directory_iterator(candidate, ec)) {
-        if (!entry.is_regular_file()) continue;
-        const auto name = entry.path().filename().string();
-        constexpr std::string_view kSuffix = ".lang.json";
-        if (name.size() <= kSuffix.size()) continue;
-        if (name.compare(name.size() - kSuffix.size(),
-                         kSuffix.size(), kSuffix) != 0) continue;
-        names.push_back(name.substr(0, name.size() - kSuffix.size()));
-    }
-    std::sort(names.begin(), names.end());
-    return {std::move(names), candidate};
+    names.reserve(documents->size());
+    for (auto& document : *documents) names.push_back(std::move(document.stem));
+    return {std::move(names), candidate, {}};
 }
 
 ShippedDiscoveryResult SchemaCache::discoverShippedLanguages(
@@ -102,8 +98,9 @@ SchemaCache::SchemaCache(std::optional<std::filesystem::path> schemaDir,
     // anywhere (08.55 cleanup).
     if (!schemaDir_.has_value()) {
         auto result = discoverShippedLanguages(std::move(discoveryStartPath));
-        shippedCandidates_ = std::move(result.names);
-        shippedDir_        = std::move(result.directory);
+        shippedCandidates_   = std::move(result.names);
+        shippedDir_          = std::move(result.directory);
+        shippedListingError_ = std::move(result.listingError);
     }
 }
 
@@ -312,6 +309,13 @@ SchemaResult SchemaCache::resolveByExtension(
                 "was not located within 8 parent levels of the working "
                 "directory; pass --schema-dir explicitly or invoke from "
                 "the repository"});
+        }
+        // A directory nobody could LIST is not an empty one: say which, or the
+        // operator populates a directory that is already full.
+        if (!shippedListingError_.empty()) {
+            return std::unexpected(SchemaResolveError{
+                SchemaResolveErrorKind::ShippedDirUnreadable,
+                "shipped-language discovery: " + shippedListingError_});
         }
         return std::unexpected(SchemaResolveError{
             SchemaResolveErrorKind::ShippedDirEmpty,

@@ -428,6 +428,20 @@ AssembledModule assemble(Lir const&                 lir,
         struct InstEnd { std::uint32_t endOffset; std::uint32_t instV; };
         std::vector<InstEnd> instEnds;
         instEnds.reserve(relaxBound);
+        // P68 round 9 — where THIS build's code layout is the reference
+        // assembler's, for an address that adds a constant to a location of
+        // this function (`adr x7, .-4`, `adr x2, 1f+4`). Within a block, up
+        // to (not including) its terminator, every instruction is one source
+        // line encoded as that line's reference encoding; the terminator may
+        // be a jump this build SYNTHESIZED (a label reached by falling, a
+        // conditional branch's fall-through word —
+        // [[D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP]]), and a branch-island
+        // cluster is bytes no source line wrote. `runEnd` is the start of each
+        // block's terminator, `runTakesTerminator` whether that first byte is
+        // still source-for-source, `clusterStarts` where each cluster begins.
+        std::unordered_map<std::uint32_t, std::uint32_t> runEnd;
+        std::unordered_map<std::uint32_t, bool>          runTakesTerminator;
+        std::vector<std::uint32_t> clusterStarts;
 
         // D-ASM-ENCODE-FAILURE-FUNCTION-ROLLBACK (step 13.5 cycle 1
         // post-fold, silent-failure-hunter CRITICAL #2): track
@@ -451,6 +465,23 @@ AssembledModule assemble(Lir const&                 lir,
                 LirInstId const inst = lir.blockInstAt(blk, ii);
                 std::size_t const preInstByteCount = outFn.bytes.size();
                 std::size_t const prePatchCount = blockPatches.size();
+                // The block's last instruction is its terminator (a LIR
+                // invariant): the run of source-for-source code ends at it,
+                // and takes its first byte too unless it is an unconditional
+                // branch to the block laid out next — the shape of the jump
+                // this build synthesizes for a label reached by falling, which
+                // no source line wrote.
+                if (ii + 1 == instCount) {
+                    runEnd[blk.v] = static_cast<std::uint32_t>(preInstByteCount);
+                    auto const* tinfo = schema.opcodeInfo(lir.instOpcode(inst));
+                    auto const succ = lir.blockSuccessors(blk);
+                    bool const fallsToNext =
+                        tinfo != nullptr
+                        && tinfo->terminatorKind == TargetTerminatorKind::Br
+                        && succ.size() == 1 && bi + 1 < blockCount
+                        && succ[0].v == lir.funcBlockAt(fn, bi + 1).v;
+                    runTakesTerminator[blk.v] = !fallsToNext;
+                }
                 bool const ok = encodeInst(lir, schema, inst,
                                  outFn.bytes, outFn.relocations,
                                  outFn.sourceMap, blockPatches,
@@ -462,8 +493,14 @@ AssembledModule assemble(Lir const&                 lir,
                 // keyed on instruction identity because byte offsets do not
                 // survive a re-layout, and a walker that forgot to stamp
                 // would silently key the whole fixed point on instruction 0.
-                for (std::size_t pi = prePatchCount; pi < blockPatches.size(); ++pi)
+                // P68 round 9: a self-relative patch (the location counter)
+                // names the block its instruction sits in, stamped here too.
+                for (std::size_t pi = prePatchCount; pi < blockPatches.size(); ++pi) {
                     blockPatches[pi].instV = inst.v;
+                    if (blockPatches[pi].selfRelative) {
+                        blockPatches[pi].targetBlock = blk.v;
+                    }
+                }
                 if (!ok) {
                     outFn.bytes.resize(preInstByteCount);
                     funcEncodeOk = false;
@@ -522,6 +559,7 @@ AssembledModule assemble(Lir const&                 lir,
                 auto const& over = siteLo->body;
                 auto const overStart =
                     static_cast<std::uint32_t>(outFn.bytes.size());
+                clusterStarts.push_back(overStart);
                 appendBody(over);
                 {
                     auto const g =
@@ -977,10 +1015,71 @@ AssembledModule assemble(Lir const&                 lir,
             // neither is in reach the aim falls back to the target itself, so
             // the refusal below quotes the displacement the programmer's
             // branch really needs rather than a pad's.
-            auto const aim = aimOffsetFor(patch,
-                                          static_cast<std::int64_t>(it->second));
+            // P68 round 9: the location counter aims at its OWN instruction
+            // (`BlockRelPatch::selfRelative`); every other patch at its block.
+            // Neither an address nor the location counter ever has a pad.
+            std::int64_t const base =
+                patch.selfRelative ? static_cast<std::int64_t>(patch.instStart)
+                                   : static_cast<std::int64_t>(it->second);
+            auto const aim = patch.selfRelative
+                                 ? std::optional<std::int64_t>{base}
+                                 : aimOffsetFor(patch, base);
+            // ★★ A CONSTANT ADDED TO A LOCATION OF THIS FUNCTION (`adr x7, .-4`,
+            // `adr x2, 1f+4`) IS A BYTE DISTANCE IN THE REFERENCE ASSEMBLER'S
+            // LAYOUT, and this build's layout is the reference's only across
+            // source-for-source code: inside one block, short of its terminator
+            // (which may be a jump this build synthesized), and across no
+            // branch-island cluster (`runEnd`, `clusterStarts`). ✔MEASURED
+            // 2026-09-23: `nop; 1: adr x7, .-4` put x7 on a synthesized `b` in
+            // front of `1:` where gas 2.42 puts it on the `nop` — a wrong
+            // address with a clean build log. Such an address is refused, by
+            // name, never written: the refusal lifts where the layouts agree
+            // ([[D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP]]).
+            if (patch.selfRelative || patch.addend != 0) {
+                std::int64_t const target = base + patch.addend;
+                std::int64_t const lo = std::min(base, target);
+                std::int64_t const hi = std::max(base, target);
+                auto const run = runEnd.find(patch.targetBlock);
+                bool inRun =
+                    run != runEnd.end()
+                    && lo >= static_cast<std::int64_t>(it->second)
+                    && (hi < static_cast<std::int64_t>(run->second)
+                        || (hi == static_cast<std::int64_t>(run->second)
+                            && runTakesTerminator[patch.targetBlock]));
+                for (auto const c : clusterStarts) {
+                    if (static_cast<std::int64_t>(c) >= lo
+                        && static_cast<std::int64_t>(c) <= hi) {
+                        inRun = false;
+                    }
+                }
+                if (!inRun) {
+                    report(reporter, DiagnosticCode::A_AsmTextUnsupported,
+                           DiagnosticSeverity::Error,
+                           std::format("fn '{}': an address {} {} bytes {} "
+                                       "reaches outside the run of source "
+                                       "instructions it starts in — past a "
+                                       "block's first or last instruction, or "
+                                       "across a branch-island cluster — where "
+                                       "this build lays code out differently "
+                                       "from the reference assembler (a jump it "
+                                       "synthesizes at a block's end), so the "
+                                       "byte it names is not the one the "
+                                       "reference's would be; name the "
+                                       "instruction with a label instead",
+                                       outFn.symbol.v,
+                                       patch.addend >= 0 ? "adding" : "subtracting",
+                                       patch.addend >= 0 ? patch.addend
+                                                         : -std::int64_t{patch.addend},
+                                       patch.selfRelative
+                                           ? "to the location counter"
+                                           : "to a label of this function"));
+                    patchOk = false;
+                    break;
+                }
+            }
             std::int64_t const delta =
-                aim.value_or(static_cast<std::int64_t>(it->second))
+                aim.value_or(base)
+              + static_cast<std::int64_t>(patch.addend)
               - (static_cast<std::int64_t>(patch.patchOffset)
                  + static_cast<std::int64_t>(g.pcBias));
             // A scaled field cannot represent a displacement that is not a

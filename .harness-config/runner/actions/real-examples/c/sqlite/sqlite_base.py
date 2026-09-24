@@ -900,6 +900,14 @@ BuildResult = collections.namedtuple(
 
 _CTIME = re.compile(r"compile time \S+")
 
+# ★ THE WHOLE STREAM, FOR EVERY BUILD. dsscp caps its diagnostics RUN-WIDE (50 per code, 1000 in all:
+# DiagnosticReporter::Config; each CU's diagnostics are copied into the run's reporter), so a code raised
+# in many TUs hides the LAST TUs whole -- and every caller here reads the log PER TU: Step 7's build
+# attribution charges each rejected TU, and the round-close recompile counts each accepted one. A count
+# no real build approaches, passed as BOTH caps. The readers still NAME a stream whose cap fired anyway
+# (`harness_legs.dss_stream_gaps`), so this is the request, not the proof.
+DIAGNOSTIC_CAP = 1000000
+
 
 def compile_time_suffix(text):
     """`"  (compile time X)"` from the LAST `compile time X` in `text`, or ""."""
@@ -907,8 +915,9 @@ def compile_time_suffix(text):
     return "  (%s)" % hits[-1] if hits else ""
 
 
-def build_artifact(dss, manifest, config, outdir, log, spec, diagnostic_cap=None):
-    """Run `<dss> --project M --config=C --output D --time`, its stdout and stderr written to
+def build_artifact(dss, manifest, config, outdir, log, spec):
+    """Run `<dss> --project M --config=C --output D --time --max-diagnostics N --max-per-code N`
+    (N = `DIAGNOSTIC_CAP`: the WHOLE diagnostic stream, for every build), its stdout and stderr written to
     `log` as RAW BYTES, and judge the LOG -> BuildResult(code, ok, path, err_count, first_errors,
     time_suffix, error, log, exit_code):
       0 built · 1 no artefact reported · 2 more than one (see `reported_artifact`) ·
@@ -918,10 +927,7 @@ def build_artifact(dss, manifest, config, outdir, log, spec, diagnostic_cap=None
     path or an argv prefix. The compiler's exit code is RECORDED, never judged: dsscp exits 0 on
     some fatal errors, so the log is the verdict. Whether the file is EXECUTABLE is not asked
     here -- that is not target-agnostic (a static library leg's artefact is not); the caller
-    that intends to exec it asks.
-    `diagnostic_cap` (a positive count, or None for dsscp's own defaults) is passed as BOTH
-    `--max-diagnostics` and `--max-per-code`: a caller that reads the log per TU (the round-close
-    recompile) must see the whole stream, because dsscp's caps are run-wide and hide whole TUs."""
+    that intends to exec it asks."""
     prefix = [dss] if isinstance(dss, str) else list(dss or ())
     if not prefix or not all(isinstance(a, str) and a for a in prefix):
         _usage("build_artifact: the compiler (a path or an argv prefix) is required")
@@ -929,14 +935,9 @@ def build_artifact(dss, manifest, config, outdir, log, spec, diagnostic_cap=None
                         ("log", log)):
         if not value:
             _usage("build_artifact: %s is required" % name)
-    if diagnostic_cap is not None and (isinstance(diagnostic_cap, bool)
-                                       or not isinstance(diagnostic_cap, int) or diagnostic_cap < 1):
-        _usage("build_artifact: diagnostic_cap must be a positive count or None (got %r)"
-               % (diagnostic_cap,))
     _marker(spec)
-    argv = prefix + ["--project", manifest, "--config=%s" % config, "--output", outdir, "--time"]
-    if diagnostic_cap is not None:
-        argv += ["--max-diagnostics", str(diagnostic_cap), "--max-per-code", str(diagnostic_cap)]
+    argv = prefix + ["--project", manifest, "--config=%s" % config, "--output", outdir, "--time",
+                     "--max-diagnostics", str(DIAGNOSTIC_CAP), "--max-per-code", str(DIAGNOSTIC_CAP)]
     try:
         fh = open(log, "wb")
     except OSError as exc:
@@ -2307,8 +2308,10 @@ def _st_build(A, fx):
         build(mk + real + "\n", record=rec)
         with open(rec, encoding="utf-8") as fh:
             got = json.load(fh)["argv"]
-        return _eq(["--project", "m.json", "--config=debug", "--output", t, "--time"], got)
-    A.arm("n58 the compiler argv is exactly --project M --config=C --output D --time", argv_shape)
+        return _eq(["--project", "m.json", "--config=debug", "--output", t, "--time",
+                    "--max-diagnostics", str(DIAGNOSTIC_CAP), "--max-per-code", str(DIAGNOSTIC_CAP)], got)
+    A.arm("n58 the compiler argv is exactly --project M --config=C --output D --time and BOTH diagnostic "
+          "caps raised to DIAGNOSTIC_CAP: every build asks for its WHOLE stream", argv_shape)
 
     def str_launch():
         r = build_artifact(sys.executable, "m.json", "debug", t, log, spec)

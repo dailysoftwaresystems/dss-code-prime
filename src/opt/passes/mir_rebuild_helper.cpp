@@ -83,9 +83,9 @@ void mirIdRemapOutOfRange(std::string_view which, std::uint32_t oldV,
     std::fputs(std::format(
         "dss::opt::passes::MirIdRemap fatal [map={}]: WRITE of old slot v={} "
         "outside this function's range [{}, {}) — the rebuild believes a "
-        "foreign id belongs to the function it is emitting "
-        "(D-PERF-OPT-REBUILD-REMAP-IS-A-HASH-MAP).\n",
+        "foreign id belongs to the function it is emitting.\n",
         which, oldV, base, base + extent).c_str(), stderr);
+    // Anchored: D-PERF-OPT-REBUILD-REMAP-IS-A-HASH-MAP (unreachable: the abort below).
     std::fflush(stderr);
     std::abort();
 }
@@ -94,8 +94,9 @@ void mirIdRemapAbsent(std::string_view which, std::uint32_t oldV) {
     std::fputs(std::format(
         "dss::opt::passes::MirIdRemap fatal [map={}]: checked read of old slot "
         "v={} which has no translation — a consumer read a rewrite entry the "
-        "rebuild never recorded (D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
+        "rebuild never recorded.\n",
         which, oldV).c_str(), stderr);
+    // Anchored: D-OPT2-REWRITE-MAP-COMPLETENESS (unreachable: the abort below).
     std::fflush(stderr);
     std::abort();
 }
@@ -148,8 +149,9 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
             d.severity = DiagnosticSeverity::Info;
             d.actual   = std::format(
                 "opt::{}: skipped — module has >= 1 runtime-init "
-                "global; func-id remap not yet implemented "
-                "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS).", passName);
+                "global; func-id remap not yet implemented, so the "
+                "module is left as it was.", passName);
+            // Anchored: D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS.
             reporter.report(std::move(d));
             return GlobalClonePrelude::CarvedOut;
         }
@@ -308,8 +310,8 @@ MirInstId MirFunctionRebuilder::rewriteOperand(MirInstId oldOp) const {
         rebuildFatal(kRebuilderSubject, policy_.passName(),
             std::format("rewriteOperand: old MirInstId v={} has no rewrite "
                         "entry — scan-order violation OR operand referenced a "
-                        "skipped instruction "
-                        "(D-OPT2-REWRITE-MAP-COMPLETENESS).", oldOp.v));
+                        "skipped instruction.", oldOp.v));
+        // Anchored: D-OPT2-REWRITE-MAP-COMPLETENESS (unreachable: `rebuildFatal` aborts).
     }
     return *mapped;
 }

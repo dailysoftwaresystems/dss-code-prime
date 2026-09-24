@@ -338,6 +338,30 @@ struct DSS_EXPORT ExternImport {
     // producer except a `.s` address operand or data slot naming a symbol the
     // file does not define.
     ExternKindOrigin kindOrigin = ExternKindOrigin::Stated;
+
+    // ★★★ THE CODE READS THIS IMPORT THROUGH A POINTER SLOT (P68 round 9, the
+    // archive-DATA crash routed from lane `lm`,
+    // D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT). The answer MIR→LIR
+    // gave when it chose the shape of every CODE reference to this import: a
+    // DATA import under the format's `dataImportBinding: got-indirect`, and an
+    // import the `indirect-slot` dispatch routes (its `indirectSlotBindings`).
+    // Each such reference is `lea <symbol>` + a load of the POINTER found there,
+    // so wherever the import is bound, something must HOLD its address at
+    // <symbol>: the image writer's GOT / IAT slot for a library import, the
+    // slot a relocatable object CARRIES where its format spells one
+    // (`materializeObjectImportSlots`, PE's `.refptr.<name>`), and a slot the
+    // merge mints (`mergeModules`) when a sibling module of the link DEFINES
+    // it — without one, the code loads the definition's first bytes as a
+    // pointer (✔MEASURED 2026-09-24 at the round's base, `int x = 42;` read
+    // from a DSS static archive: an access violation on pe64, SIGSEGV — exit
+    // 139 — on ELF x86_64 and ELF aarch64).
+    // ★ ONE OWNER: MIR→LIR sets it (`lowerToLir`); an object READER never does —
+    // a relocatable object's code states its own shape (a direct reference, a GOT
+    // relocation, or a slot of its own, like PE's object-carried one) — and the
+    // merge and the object-slot pass only read it. Deriving it there from
+    // "data + a got-indirect format" would send a DIRECT load (a pulled
+    // member's, a `.s`'s) to a slot and load the ADDRESS instead of the value.
+    bool readThroughSlot = false;
 };
 
 } // namespace dss

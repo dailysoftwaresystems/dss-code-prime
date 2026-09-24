@@ -299,11 +299,12 @@ public:
         for (std::uint32_t bi = 0; bi < nb; ++bi) {
             MirBlockId const oldB = src_.funcBlockAt(f, bi);
             if (!filled.count(oldB.v)) {
+                // Anchored: D-MERGE-UNREACHABLE-BLOCK.
                 std::fprintf(stderr,
                     "dss::mergeCuMirs fatal: CU %u function symbol v=%u block "
                     "v=%u is unreachable from the entry — the merge clones the "
                     "reachable CFG only (run DCE before merge to drop dead "
-                    "blocks; D-MERGE-UNREACHABLE-BLOCK).\n",
+                    "blocks).\n",
                     cuIdx_, src_.funcSymbol(f).v, oldB.v);
                 std::abort();
             }
@@ -656,9 +657,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
     // values and mint fresh ones for the destination's, which is a silently
     // renumbered module rather than an error.
     if (importFilter[0].has_value()) {
+        // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
         mergeFatal("cus[0] carries an importOnly filter — slot 0 is the merge "
-                   "DESTINATION and must be a full participant "
-                   "(D-OPT11-LAZY-IMPORT-EDGE).");
+                   "DESTINATION and must be a full participant.");
     }
     auto const isImportSource = [&](std::uint32_t ci) {
         return importFilter[ci].has_value();
@@ -1197,8 +1198,9 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
                                         : " (version \"" + e.version + "\")") +
                      " is declared with conflicting " + field +
                      " across compilation units (" + kept + " vs " + incoming +
-                     ") — one dynamic symbol cannot be imported two ways "
-                     "(D-LK11-EXTERN-IMPORT-DEDUP).";
+                     ") — one dynamic symbol cannot be imported two ways: declare "
+                     "it the same way in every compilation unit.";
+        // Anchored: D-LK11-EXTERN-IMPORT-DEDUP.
         reporter.report(std::move(d));
     };
     // `dataSizeBytes` / `dataAlignBytes` SIZE the ELF copy-relocation `.bss` slot
@@ -1246,12 +1248,12 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // drop one row's payload while its call sites still point elsewhere.
             // An internal invariant breach, not user error: abort, never report.
             if (kept.symbol.v != mergedSym.v) {
+                // Anchored: D-LK11-EXTERN-IMPORT-DEDUP.
                 std::fprintf(stderr,
                     "dss::mergeCuMirs fatal: CU %u extern import \"%s\" folds into "
                     "the dedup group canonicalized to merged symbol v=%u, but its "
                     "planned merged symbol is v=%u — step 3b's import-identity key "
-                    "and step 6's must be THE SAME key "
-                    "(D-LK11-EXTERN-IMPORT-DEDUP).\n",
+                    "and step 6's must be THE SAME key.\n",
                     ci, e.mangledName.c_str(), kept.symbol.v, mergedSym.v);
                 std::abort();
             }

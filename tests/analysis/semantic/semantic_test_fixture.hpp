@@ -64,6 +64,19 @@ namespace dss::sem_test {
                       [code](ParseDiagnostic const& d) { return d.code == code; }));
 }
 
+// P68 round 9 (lane `cs`) — THE VACUITY SWEEP. An incompatible pointer conversion
+// BUILDS with its diagnostic since row 1 (the warning every reference gives), so a
+// pin that proves two pointer types compatible by `!hasErrors()` or by counting
+// S_TypeMismatch can no longer see them turn incompatible: that is now a warning.
+// ✔MEASURED (the lane's WSL sweep: a mutant making every compatible pointer pair a
+// warning against one making it an error) — the pins the error mutant reddened and
+// the warning mutant did not assert this too.
+[[nodiscard]] inline bool hasDiagnosedPointerConversion(DiagnosticReporter const& r) {
+    return hasCode(r, DiagnosticCode::S_IncompatiblePointerConversion)
+        || hasCode(r, DiagnosticCode::S_IncompatiblePointerIntegerPointee)
+        || hasCode(r, DiagnosticCode::S_IntegerPointerConversion);
+}
+
 [[nodiscard]] inline std::shared_ptr<CompilationUnit const>
 buildShippedUnit(std::string_view langName,
                  std::initializer_list<std::string> sources) {

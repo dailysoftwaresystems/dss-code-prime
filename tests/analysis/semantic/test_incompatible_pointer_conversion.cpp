@@ -436,6 +436,8 @@ TEST(IncompatiblePointerConversion, ATypeNameNamingAnUndeclaredTagDeclaresIt) {
          }) {
         auto model = analyzeC(src);
         EXPECT_FALSE(model.hasErrors()) << src;
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u) << src;
     }
 }

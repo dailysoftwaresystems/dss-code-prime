@@ -1060,6 +1060,12 @@ struct Lowerer {
     // silent default — the wrong shape miscompiles).
     std::optional<ExternCallDispatch> externCallDispatch_;
 
+    // P68 round 9 (the aarch64 twins): the active object format's KIND, only
+    // as the key an inline-asm template's address-part operators are read
+    // under (`lowerAsmTemplateToLirRun`). Nothing in this lowering branches on
+    // it.
+    std::optional<ObjectFormatKind> assemblyFormatKind_;
+
     // D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH (LD-2): the ACTIVE object format's
     // DT_NEEDED library for the F128 softfloat helpers (`libgcc_s.so.1` on
     // elf), captured from `target.wideFloatSoftcallLibrary(formatKey)` one
@@ -1445,7 +1451,8 @@ struct Lowerer {
             std::optional<AtomicsRuntime> atomicsRuntime,
             std::vector<SymbolBinding> indirectSlotBindings,
             std::vector<SymbolBinding> preemptibleDefinitionBindings,
-            std::span<DefinedSymbolName const> definedSymbolNames)
+            std::span<DefinedSymbolName const> definedSymbolNames,
+            std::optional<ObjectFormatKind> assemblyFormatKind)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
@@ -1457,7 +1464,8 @@ struct Lowerer {
               std::move(preemptibleDefinitionBindings)),
           externAddrBinding_(externAddrBinding),
           tlsAccess_(tlsAccess), sehScopesIn_(sehScopes),
-          charIsUnsigned_(charIsUnsigned) {
+          charIsUnsigned_(charIsUnsigned),
+          assemblyFormatKind_(assemblyFormatKind) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
@@ -4998,7 +5006,8 @@ struct Lowerer {
         // with the fall-off-the-end one.
         std::vector<LirBlockId> fellIntoLabel;
         if (!lowerAsmTemplateToLirRun(tree, dialect, target, bindings, body,
-                                      reporter, stubBindings, &fellIntoLabel)) {
+                                      reporter, stubBindings, &fellIntoLabel,
+                                      assemblyFormatKind_)) {
             return false;
         }
         // The text ran off its end into the rest of the program: a branch the
@@ -16477,6 +16486,14 @@ struct Lowerer {
             // APPENDS the caller-supplied externImports after these, so the two
             // compose (the pre-wired propagation chain to the linker).
             .externImports        = std::move(newWideFloatExterns_),
+            // P68 round 9: which imports this lowering read through a slot —
+            // sorted, so the record is the same on every run.
+            .readThroughSlotSymbols = [&] {
+                std::vector<std::uint32_t> v(slotIndirectAddrSymbols_.begin(),
+                                             slotIndirectAddrSymbols_.end());
+                std::sort(v.begin(), v.end());
+                return v;
+            }(),
             .funcLocalAlignments  = std::move(funcLocalAlignments),
             .ok                   = !hadError()
         };
@@ -16532,7 +16549,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::vector<SymbolBinding> indirectSlotBindings,
                           std::vector<SymbolBinding>
                               preemptibleDefinitionBindings,
-                          std::vector<DefinedSymbolName> definedSymbolNames) {
+                          std::vector<DefinedSymbolName> definedSymbolNames,
+                          std::optional<ObjectFormatKind> assemblyFormatKind) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -16574,7 +16592,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
               tlsAccess, sehScopes,
               std::move(wideFloatSoftcallLibrary), charIsUnsigned,
               std::move(atomicsRuntime), std::move(indirectSlotBindings),
-              std::move(preemptibleDefinitionBindings), definedSymbolNames};
+              std::move(preemptibleDefinitionBindings), definedSymbolNames,
+              assemblyFormatKind};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /
@@ -16588,6 +16607,15 @@ MirToLirResult lowerToLir(Mir const&          mir,
     result.externImports.insert(result.externImports.end(),
                                 std::make_move_iterator(externImports.begin()),
                                 std::make_move_iterator(externImports.end()));
+    // ★★ P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): every
+    // row leaves stating whether THIS lowering read it through a pointer slot —
+    // the one owner of `ExternImport::readThroughSlot`. Assigned, never OR-ed: a
+    // row handed in carries no statement about this lowering's code.
+    for (auto& e : result.externImports) {
+        e.readThroughSlot = std::binary_search(result.readThroughSlotSymbols.begin(),
+                                               result.readThroughSlotSymbols.end(),
+                                               e.symbol.v);
+    }
     return result;
 }
 

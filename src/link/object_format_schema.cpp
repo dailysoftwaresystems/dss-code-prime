@@ -242,27 +242,18 @@ ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
             "cannot be assembled",
             member.name()));
     }
-    std::error_code ec;
-    std::vector<std::filesystem::path> documents;
-    for (std::filesystem::directory_iterator it{*dir, ec}, end; it != end;
-         it.increment(ec)) {
-        if (ec) break;
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        if (!it->path().filename().string().ends_with(".format.json")) continue;
-        documents.push_back(it->path());
-    }
-    if (ec) {
+    // THE ONE OWNER of which files ARE format documents (exactly `<stem>.format.json`,
+    // regular files, sorted by stem); a listing that fails or stops part-way is
+    // refused, because a partial scan cannot prove the family agrees.
+    auto const listed = shippedConfigDocuments(*dir, ".format.json");
+    if (!listed.has_value()) {
         return std::unexpected(std::format(
-            "the scan of object-format directory '{}' was interrupted after "
-            "PARTIAL enumeration ({}); a partial scan cannot prove the flavour "
-            "family of '{}' agrees, so it is refused",
-            dir->generic_string(), ec.message(), member.name()));
+            "{}; a partial or failed scan cannot prove the flavour family of "
+            "'{}' agrees, so it is refused",
+            listed.error(), member.name()));
     }
-    std::sort(documents.begin(), documents.end(),
-              [](std::filesystem::path const& a, std::filesystem::path const& b) {
-                  return a.filename().string() < b.filename().string();
-              });
+    std::vector<std::filesystem::path> documents;
+    for (auto const& document : *listed) documents.push_back(document.path);
 
     RuntimeLibraryTable      merged;
     std::vector<std::string> declaredBy;   // parallel to `merged.bindings`
@@ -359,6 +350,31 @@ ObjectFormatSchema::relocationDecodeTable() const {
         // guarantees the aliased row is present, so skipping never leaves the
         // wire id unmapped.
         if (r.emitOnly) continue;
+        // A wire type SEVERAL rows share, told apart by the instruction at the
+        // site (`decodeWhenInstruction`): `decode` reads the word. `validate()`
+        // guarantees every row sharing the type is patterned and that no two
+        // patterns can match one word, so the order kept here decides nothing.
+        if (!r.decodeWhenInstruction.empty()) {
+            if (table.nativeToKind.contains(r.nativeId)) {
+                return std::unexpected(
+                    "object format schema '" + std::string{name()}
+                    + "' decodes native reloc id " + std::to_string(r.nativeId)
+                    + " both by instruction and without one -- ambiguous "
+                      "reverse map.");
+            }
+            auto& rows = table.byInstruction[r.nativeId];
+            for (auto const& p : r.decodeWhenInstruction) {
+                rows.push_back(RelocationDecodeTable::InstructionKind{p, r.kind});
+            }
+            continue;
+        }
+        if (table.byInstruction.contains(r.nativeId)) {
+            return std::unexpected(
+                "object format schema '" + std::string{name()}
+                + "' decodes native reloc id " + std::to_string(r.nativeId)
+                + " both by instruction and without one -- ambiguous reverse "
+                  "map.");
+        }
         if (auto e = mapNative(r.nativeId, r.kind)) {
             return std::unexpected(std::move(*e));
         }
@@ -926,6 +942,9 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         std::unordered_map<std::uint32_t, std::size_t> primaryOf;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             if (relocations[i].emitOnly) continue;
+            // A row decoded BY INSTRUCTION shares its wire type on purpose; the
+            // block below states what such a family must be.
+            if (!relocations[i].decodeWhenInstruction.empty()) continue;
             auto const ins = primaryOf.emplace(relocations[i].nativeId, i);
             if (!ins.second) {
                 fail(std::format("/relocations/{}/nativeId", i),
@@ -1030,6 +1049,83 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                      "claimed by '{}' — a native wire id maps "
                                      "back to exactly ONE RelocationKind",
                                      r.name, e.nativeId, ins.first->second));
+                }
+            }
+        }
+    }
+
+    // ── decodeWhenInstruction (P68 round 9) ──────────────────────────────
+    // A wire type decoded BY INSTRUCTION is still a FUNCTION of the site: every
+    // row sharing the type must be patterned (a plain row beside them would
+    // claim every word no pattern names, and the reader could not tell which
+    // was meant), and no word may match two rows. A pattern is a real test —
+    // a zero mask matches every word, and a value with bits outside its mask
+    // matches none. The row's other decode-side declarations have no meaning
+    // for a shared type, so a patterned row may not carry them.
+    {
+        std::unordered_map<std::uint32_t, std::vector<std::size_t>> patterned;
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            auto const& r = relocations[i];
+            if (r.decodeWhenInstruction.empty()) continue;
+            auto const path =
+                std::format("/relocations/{}/decodeWhenInstruction", i);
+            if (r.emitOnly || r.isCall || r.pltNativeId != 0u
+                || !r.nativeIdByBytesAfterField.empty()) {
+                fail(path,
+                     std::format("relocation '{}' is decoded by instruction, "
+                                 "so it cannot also be an emission alias, a "
+                                 "call signal, a PLT variant or a "
+                                 "bytes-after-field family",
+                                 r.name));
+            }
+            for (std::size_t j = 0; j < r.decodeWhenInstruction.size(); ++j) {
+                auto const& p = r.decodeWhenInstruction[j];
+                if (p.mask == 0u || (p.value & ~p.mask) != 0u) {
+                    fail(std::format("{}/{}", path, j),
+                         std::format("relocation '{}': a pattern needs a "
+                                     "non-zero mask and a value inside it "
+                                     "(mask {:#010x}, value {:#010x})",
+                                     r.name, p.mask, p.value));
+                }
+            }
+            patterned[r.nativeId].push_back(i);
+        }
+        for (auto const& [nid, rows] : patterned) {
+            for (std::size_t i = 0; i < relocations.size(); ++i) {
+                auto const& r = relocations[i];
+                if (r.nativeId == nid && !r.emitOnly
+                    && r.decodeWhenInstruction.empty()) {
+                    fail(std::format("/relocations/{}/nativeId", i),
+                         std::format("relocation '{}' shares wire type {} with "
+                                     "rows decoded by instruction but declares "
+                                     "no pattern of its own",
+                                     r.name, nid));
+                }
+            }
+            for (std::size_t a = 0; a < rows.size(); ++a) {
+                for (std::size_t b = a + 1; b < rows.size(); ++b) {
+                    auto const& ra = relocations[rows[a]];
+                    auto const& rb = relocations[rows[b]];
+                    for (auto const& pa : ra.decodeWhenInstruction) {
+                        for (auto const& pb : rb.decodeWhenInstruction) {
+                            // Two patterns share a word iff they agree on
+                            // every bit both of them test.
+                            if (((pa.value ^ pb.value) & (pa.mask & pb.mask)) == 0u) {
+                                fail(std::format(
+                                         "/relocations/{}/decodeWhenInstruction",
+                                         rows[b]),
+                                     std::format(
+                                         "relocations '{}' and '{}' share wire "
+                                         "type {} and both decode the word "
+                                         "(mask {:#010x}, value {:#010x}) / "
+                                         "(mask {:#010x}, value {:#010x}) can "
+                                         "match — one word must decode to one "
+                                         "kind",
+                                         ra.name, rb.name, nid, pa.mask,
+                                         pa.value, pb.mask, pb.value));
+                            }
+                        }
+                    }
                 }
             }
         }

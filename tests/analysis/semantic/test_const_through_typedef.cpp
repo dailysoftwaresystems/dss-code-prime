@@ -211,6 +211,8 @@ TEST(ConstThroughTypedef, ObjectConstThroughATypedefMatchesTheDirectSpelling) {
         "CI *p;                 const int *pD;\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     for (auto const& [viaTypedef, direct] :
          {std::pair{"g", "gD"}, {"tab", "tabD"}, {"pt", "ptD"}, {"s", "sD"},
           {"ps", "psD"}}) {

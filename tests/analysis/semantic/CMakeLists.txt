@@ -494,10 +494,12 @@ target_include_directories(dss_analysis_semantic_test_const_designation_walk
 # is a value the parser's binder sketch never saw declared — the language's
 # predefined identifiers and the enumeration constants its enums lift — while a
 # type, and an unknown name, still take the type-name reading. Shares
-# `semantic_test_fixture.hpp`, so it needs the tests/ include root.
-dss_add_test(NAME analysis/semantic/test_sizeof_value_names_the_parser_never_saw_declared
-             SOURCES test_sizeof_value_names_the_parser_never_saw_declared.cpp)
-target_include_directories(dss_analysis_semantic_test_sizeof_value_names_the_parser_never_saw_declared
+# `semantic_test_fixture.hpp`, so it needs the tests/ include root. (Named short on
+# purpose: its object path, which spells the name twice, must stay inside the
+# worktree path budget — `worktrees.pathBudgetReserve`.)
+dss_add_test(NAME analysis/semantic/test_sizeof_undeclared_value_name
+             SOURCES test_sizeof_undeclared_value_name.cpp)
+target_include_directories(dss_analysis_semantic_test_sizeof_undeclared_value_name
                            PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 
 # P68 round 9 (lane `cs`): a predefined function-name identifier used outside every

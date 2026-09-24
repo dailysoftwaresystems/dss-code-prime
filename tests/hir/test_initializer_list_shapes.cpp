@@ -31,10 +31,16 @@
 //       after a deep designator, a union taking one member, designators through
 //       union and anonymous members. Its own section below carries its measurements.
 //
+//   (5) WHERE a value lands after an unnamed bit-field, read off the lowered values.
+//   (6) The placement cursor's index space — an index designator is never narrowed.
+//   (7) An array past that index space is refused before any slot or zero is built.
+//
 // RED-ON-DISABLE: the completion counting elements again → the designated sizes;
 // the braced-string arm (`openBraceLevel`) removed → `{ "abc" }` warns and holds the
 // wrong bytes; the excess arm refusing again → the excess cases fail to lower; the
-// cursor's elision off → every (4) elided shape fails to lower or mis-sizes.
+// cursor's elision off → every (4) elided shape fails to lower or mis-sizes; the
+// lowering's unnamed-bit-field answer off → (5); an index narrowed to 32 bits again,
+// in either tier or in the cursor → (6).
 // ===========================================================================
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
@@ -53,12 +59,15 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 
 using namespace dss;
 
@@ -106,9 +115,13 @@ void appendDiagnostics(std::string& out, DiagnosticReporter const& r) {
     return kTarget.get();
 }
 
+// Handed the lowered module while its model — whose lattice its types live in — is alive.
+using Inspect = std::function<void(SemanticModel const&, CstToHirResult const&)>;
+
 // c source → semantic model → HIR. A `_Static_assert` in the source pins a SIZE at
-// the semantic tier; the lowering pins what the walker makes of the list.
-[[nodiscard]] Lowered lowerC(std::string src) {
+// the semantic tier; the lowering pins what the walker makes of the list, and
+// `inspect` (when given) reads WHERE it put each value.
+[[nodiscard]] Lowered lowerC(std::string src, Inspect const& inspect = {}) {
     auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
     UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addSystemDir(dss::test::configRoot() / "shippedLibs");   // `#include <stddef.h>`
@@ -148,7 +161,30 @@ void appendDiagnostics(std::string& out, DiagnosticReporter const& r) {
     out.hirWarnings = countSeverity(r, DiagnosticSeverity::Warning);
     out.hirExcess = countCode(r, kExcess);
     appendDiagnostics(out.diagnostics, r);
+    if (inspect && res != nullptr && res->ok) inspect(model, *res);
     return out;
+}
+
+// The value of a lowered integer LITERAL (its literal-pool entry), or nullopt for any
+// other node — a zero-filled slot the lowering synthesized reads as whatever it is.
+[[nodiscard]] std::optional<std::int64_t> literalValue(CstToHirResult const& res, HirNodeId n) {
+    if (!n.valid() || res.hir.kind(n) != HirKind::Literal) return std::nullopt;
+    std::uint32_t const at = res.hir.payload(n);
+    if (at >= res.literalPool.size()) return std::nullopt;
+    if (auto const* v = std::get_if<std::int64_t>(&res.literalPool.at(at).value)) return *v;
+    return std::nullopt;
+}
+
+// The initializer of the first local declared in the module's first function body.
+[[nodiscard]] HirNodeId firstLocalInit(Hir const& hir) {
+    for (HirNodeId d : hir.moduleDecls(hir.root())) {
+        if (hir.kind(d) != HirKind::Function) continue;
+        for (HirNodeId s : hir.children(hir.functionBody(d))) {
+            if (hir.kind(s) != HirKind::VarDecl) continue;
+            if (auto const init = hir.varDeclInit(s)) return *init;
+        }
+    }
+    return HirNodeId{};
 }
 
 struct Case {
@@ -382,4 +418,153 @@ TEST(InitializerListShapes, AnonymousMembersAreMembers) {
          "struct T { int x; struct { int a, b; }; int y; };\n"
          "int main(void) { struct T t = { .a = 30, 10, 2 }; return t.y; }\n", 0},
     });
+}
+
+// ── (5) WHERE a value lands after an UNNAMED bit-field (C 6.7.9p9) ────────────
+// This tier answers the cursor's "is member i an unnamed bit-field" from its own
+// reading of the composite's scope (`unnamedBitFieldMask`). The cursor's unit test
+// proves it skips what it is told to skip, and "an unnamed bit-field is skipped" above
+// proves the list LOWERS; neither reads where the values went. This one does: with
+// the lowering's answer off, `{40, 2, 7, 8}` puts the 2 on the bit-field and every
+// later value one member early — which the fold-3 red-on-disable saw only through the
+// runnable example (P68 round 9, lane `cs`).
+TEST(InitializerListShapes, AValueAfterAnUnnamedBitFieldLandsInTheNextNamedMember) {
+    // `members[i]` of a lowered structure aggregate, as the literal value it holds.
+    auto memberValue = [](CstToHirResult const& res, HirNodeId agg, std::size_t i) {
+        auto const kids = res.hir.children(agg);
+        return i < kids.size() ? literalValue(res, kids[i]) : std::nullopt;
+    };
+    bool inspectedOne = false;
+    Lowered const one = lowerC(
+        "struct B { int a; unsigned : 3; int b; };\n"
+        "void f(void) { struct B s = { 40, 2 }; }\n",
+        [&](SemanticModel const&, CstToHirResult const& res) {
+            HirNodeId const init = firstLocalInit(res.hir);
+            ASSERT_TRUE(init.valid());
+            ASSERT_EQ(res.hir.kind(init), HirKind::ConstructAggregate);
+            ASSERT_EQ(res.hir.children(init).size(), 3u) << "a, the unnamed bit-field, b";
+            EXPECT_EQ(memberValue(res, init, 0), std::optional<std::int64_t>{40});
+            EXPECT_EQ(memberValue(res, init, 2), std::optional<std::int64_t>{2})
+                << "the value after `a` belongs to `b`, the next NAMED member";
+            EXPECT_NE(memberValue(res, init, 1), std::optional<std::int64_t>{2})
+                << "the unnamed bit-field takes no initializer";
+            inspectedOne = true;
+        });
+    EXPECT_TRUE(one.lowered) << one.diagnostics;
+    EXPECT_TRUE(inspectedOne);
+
+    bool inspectedArray = false;
+    Lowered const rows = lowerC(
+        "struct B { int a; unsigned : 3; int b; };\n"
+        "void f(void) { struct B bs[] = { 40, 2, 7, 8 }; }\n",
+        [&](SemanticModel const&, CstToHirResult const& res) {
+            HirNodeId const init = firstLocalInit(res.hir);
+            ASSERT_TRUE(init.valid());
+            ASSERT_EQ(res.hir.kind(init), HirKind::ConstructAggregate);
+            auto const elems = res.hir.children(init);
+            ASSERT_EQ(elems.size(), 2u) << "four values fill TWO structures";
+            EXPECT_EQ(memberValue(res, elems[0], 0), std::optional<std::int64_t>{40});
+            EXPECT_EQ(memberValue(res, elems[0], 2), std::optional<std::int64_t>{2});
+            EXPECT_EQ(memberValue(res, elems[1], 0), std::optional<std::int64_t>{7});
+            EXPECT_EQ(memberValue(res, elems[1], 2), std::optional<std::int64_t>{8});
+            inspectedArray = true;
+        });
+    EXPECT_TRUE(rows.lowered) << rows.diagnostics;
+    EXPECT_TRUE(inspectedArray);
+}
+
+// ── (6) the placement cursor's index space: an index is never narrowed ────────
+// ★ P68 round 9 (lane `cs`). Both tiers narrowed an index designator to 32 bits after
+// checking only its sign, so an index of 2^32 or more WRAPPED to a small one that was
+// in range — `int a[2] = {[4294967296] = 7}` put the 7 in a[0] and built SILENTLY, and
+// `int a[] = {[4294967296] = 7}` was one element long. ✔MEASURED 2026-09-23 (the lane's
+// `.temp/probe/dx`, each reference separately, every build RUN): gcc 13.3.0 and clang
+// 18.1.3 at `-std=c17 -pedantic-errors` and `-std=c2x`, and mingw-w64 13.2.0 at both,
+// REFUSE every bounded shape below ("array index in initializer exceeds array bounds");
+// MSVC 19.51 refuses the top-level ones (C2078) and builds the nested one while
+// DROPPING the value (it ran 0) — no semantics to follow. The unknown size: gcc builds
+// it and the run faults on its 16 GiB stack array, clang builds and runs it. DSS
+// refuses it as the implementation limit it is — the lowering builds one slot per
+// element (about 195 bytes each, ✔MEASURED `.temp/probe/la`), so four billion of them
+// cannot be built — rather than sizing it wrong.
+TEST(InitializerListShapes, AnIndexDesignatorIsNeverNarrowed) {
+    struct Refused {
+        char const* what;
+        char const* src;
+        bool        semantic;   // refused by the semantic tier's sizing, else by the lowering
+    };
+    for (Refused const& c : std::initializer_list<Refused>{
+             {"`[4294967296]` into `int a[2]` (wrapped to 0)",
+              "int main(void) { int a[2] = { [4294967296] = 7 }; return a[0]; }\n", false},
+             {"`[4294967297]` into `int a[2]` (wrapped to 1)",
+              "int main(void) { int a[2] = { [4294967297] = 7 }; return a[1]; }\n", false},
+             {"file scope", "static int g[2] = { [4294967296] = 7 };\nint main(void) { return g[0]; }\n",
+              false},
+             {"a NESTED index `[0][4294967296]`",
+              "int main(void) { int a[2][2] = { [0][4294967296] = 7 }; return a[0][0]; }\n", false},
+             {"an index written as `(long long)1 << 32`",
+              "int main(void) { int a[2] = { [(long long)1 << 32] = 7 }; return a[0]; }\n", false},
+             {"an unknown size an index designator sizes past the limit",
+              "int main(void) { int a[] = { [4294967296] = 7 }; return (int)sizeof a; }\n", true},
+         }) {
+        Lowered const l = lowerC(c.src);
+        if (c.semantic) {
+            EXPECT_GT(l.semanticErrors, 0u) << c.what << "\n" << c.src << l.diagnostics;
+            EXPECT_NE(l.diagnostics.find("S_ArrayLengthOutOfRange"), std::string::npos)
+                << c.what << ": the limit is named as an array-length refusal\n" << l.diagnostics;
+        } else {
+            EXPECT_EQ(l.semanticErrors, 0u) << c.what << "\n" << c.src << l.diagnostics;
+            EXPECT_GT(l.hirErrors, 0u) << c.what << ": must be REFUSED, never placed at the "
+                                          "wrapped index\n" << c.src << l.diagnostics;
+        }
+        EXPECT_EQ(l.hirExcess, 0u) << c.what << "\n" << l.diagnostics;
+    }
+    // THE CONTROLS: the same shapes in range still lower, and the value lands where the
+    // index says (not where a wrap would put it).
+    expectLowersCleanly({
+        {"`[1]` into `int a[2]`", "int main(void) { int a[2] = { [1] = 7 }; return a[1] + 35; }\n", 0},
+        {"`[0][1]` into `int a[2][2]`",
+         "int main(void) { int a[2][2] = { [0][1] = 7 }; return a[0][1] + 35; }\n", 0},
+        {"an unknown size sized by `[3]`",
+         "int main(void) { int a[] = { [3] = 7 };\n"
+         "  _Static_assert(sizeof(a) == 4 * sizeof(int), \"4\"); return a[3] + 35; }\n", 0},
+    });
+}
+
+// ── (7) an array past the index space is refused BEFORE anything is built ────
+// The lowering builds one slot per element (and one zero per unwritten element), so
+// an object or a member longer than `initializer_cursor::kMaxLength` must be refused
+// before either is built: the level's open asks the cursor about its object, the
+// cursor refuses to enter a longer member, and the zero-filler refuses to zero one.
+// ★ P68 round 9 (lane `cs`): a declared length was narrowed to 32 bits at the level's
+// open, so exactly 2^32 elements was refused as "zero slots" and 2^32 + 1 went on to
+// build four billion slots. ⚠ Every case here would exhaust memory if its guard were
+// missing; the red-on-disable runs them under an address-space cap.
+TEST(InitializerListShapes, AnArrayPastTheIndexSpaceIsRefusedBeforeAnythingIsBuilt) {
+    struct Refused {
+        char const* src;
+        char const* says;   // the refusal that names the length
+    };
+    for (Refused const& c : std::initializer_list<Refused>{
+             {"static char big[4294967297] = { 1 };\nint main(void) { return big[0] + 41; }\n",
+              "initializes an array of 4294967297 elements"},
+             {"static char big[4294967296] = { 1 };\nint main(void) { return big[0] + 41; }\n",
+              "initializes an array of 4294967296 elements"},
+             {"static char big[1099511627776] = { 1 };\nint main(void) { return big[0] + 41; }\n",
+              "initializes an array of 1099511627776 elements"},
+             {"struct H { char big[4294967297]; int k; };\n"
+              "static struct H h = { 1 };\nint main(void) { return h.k + 42; }\n",
+              "placed inside an array of 4294967297 elements"},
+             {"struct H { char big[4294967297]; int k; };\n"
+              "static struct H h = { 1 };\nint main(void) { return h.k + 42; }\n",
+              "zero-filling an array of 4294967297 elements"},
+         }) {
+        Lowered const l = lowerC(c.src);
+        EXPECT_EQ(l.semanticErrors, 0u) << c.src << l.diagnostics;
+        EXPECT_GT(l.hirErrors, 0u) << c.src << l.diagnostics;
+        EXPECT_NE(l.diagnostics.find(c.says), std::string::npos)
+            << "expected the refusal naming the length: `" << c.says << "`\n" << c.src << l.diagnostics;
+        EXPECT_EQ(l.diagnostics.find("internal invariant"), std::string::npos)
+            << "refused by the stated limit, not by a broken invariant\n" << l.diagnostics;
+    }
 }

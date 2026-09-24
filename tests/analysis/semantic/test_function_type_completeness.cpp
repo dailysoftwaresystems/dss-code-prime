@@ -98,6 +98,8 @@ void expectAccepted(std::vector<std::string> const& sources) {
         ASSERT_EQ(parseErrorsFor(src), 0u) << src;
         auto const model = analyzeC(src);
         EXPECT_FALSE(model.hasErrors()) << "must be accepted:\n" << src << errorsOf(model);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 

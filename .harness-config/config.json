@@ -808,6 +808,14 @@
       ],
       "action": "check-doc-census/check-doc-census.yml"
     },
+    "check-emitted-anchor-ids": {
+      "description": "Refuse a new anchor id inside a C++ string literal under `src/`: operator output states the condition and the action, never the bookkeeping.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "check-emitted-anchor-ids/check-emitted-anchor-ids.yml"
+    },
     "check-enum-name-table-guards": {
       "description": "Refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert.",
       "legs": [

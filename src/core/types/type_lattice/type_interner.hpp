@@ -650,9 +650,13 @@ public:
     // undeclared name (every anonymous primitive) ranks 0, so a named entry
     // always out-ranks the anonymous representative of the same kind.
     //
-    // Used ONLY to break a tie between two operands of the SAME kind and
-    // DIFFERENT vocabulary names; when the kinds differ the existing
-    // width-keyed rank tables decide, unchanged.
+    // Read by the usual arithmetic conversions (`usualArithmeticCommonType`)
+    // in exactly two places: (1) the tie-break between two operands of the
+    // SAME kind and DIFFERENT vocabulary names; (2) the mixed-signedness pair
+    // of the SAME WIDTH (different kinds, `I64` vs `U64`), where C 6.3.1.8
+    // decides by conversion rank — the signed operand ranked higher converts
+    // both to its UNSIGNED COUNTERPART (P68 round 10). Every other pair of
+    // differing kinds is decided by the width-keyed rank tables, unchanged.
     void declareVocabularyRank(std::string_view vocabularyName, int rank);
     [[nodiscard]] int vocabularyRank(TypeId id) const;
 

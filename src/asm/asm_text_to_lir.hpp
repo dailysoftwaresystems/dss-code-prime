@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"
 #include "core/types/target_schema.hpp"
 #include "core/types/tree.hpp"
 #include "lir/lir.hpp"
@@ -224,12 +225,19 @@ struct DSS_EXPORT AsmTextModule {
 // resolved them for the active format; a defined label matching one of them
 // becomes `userEntrySymbol`. Empty is legal (a relocatable/object build).
 //
+// `formatKind` is the object format kind the unit is assembled for (P68 round
+// 9) — only a KEY into the dialect's `symbolParts`: an address-part operator
+// (`:lo12:`, `@PAGEOFF`) is read only on the kinds its row lists, and a row's
+// `impliedSymbolPart` applies only on its own. nullopt ⇒ the caller states no
+// format, and every such spelling is refused by name.
+//
 // Returns nullopt on any failure, with at least one diagnostic reported.
 [[nodiscard]] DSS_EXPORT std::optional<AsmTextModule>
 lowerAsmTextToLir(Tree const&                   tree,
                   GrammarSchema const&          grammar,
                   TargetSchema const&           target,
                   std::span<std::string const>  entryNames,
-                  DiagnosticReporter&           reporter);
+                  DiagnosticReporter&           reporter,
+                  std::optional<ObjectFormatKind> formatKind = std::nullopt);
 
 } // namespace dss

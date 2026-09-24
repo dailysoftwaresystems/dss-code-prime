@@ -714,6 +714,10 @@ PredefinedTypeFacts predefinedTypeFactsFor(TargetSchema const&       target,
     // `type-unsigned` rows (`__CHAR_UNSIGNED__`) — read from the target's one
     // key, so the macro and the char→int promotion cannot disagree.
     facts.charIsUnsigned = target.charIsUnsigned(format.kind());
+    // P68 round 9: the fact a `shippedTypedef` predefine's typedefs are
+    // variant-selected by beyond the format — the target's NAME (a typedef variant
+    // may key `when: {arch}`), from the document that owns it.
+    facts.targetName = std::string{target.name()};
     return facts;
 }
 
@@ -780,7 +784,10 @@ void UnitBuilder::validatePredefinedMacroIdentity_() {
             pp.mutuallyExclusivePredefinedMacros,
             // P68 round 8: the same pair facts the preprocess pass realizes
             // the `type-size` rows with, so the two evaluations agree.
-            predefinedTypeFacts_.has_value() ? &*predefinedTypeFacts_ : nullptr);
+            predefinedTypeFacts_.has_value() ? &*predefinedTypeFacts_ : nullptr,
+            // P68 round 9: and the same language, so a type-derived row the
+            // pair cannot answer for is refused here even before a TU is read.
+            schema.get());
         for (std::string const& msg : merged.conflicts) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::C_ConflictingPredefinedMacro;

@@ -86,6 +86,11 @@ Usage:
     python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py
     python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --self-test
     python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --list-uncovered
+    python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --cross-branch
+
+`--cross-branch` is the ALLOCATION-TIME view across every place this repository can allocate an
+ordinal (the other worktrees' working headers and every ref not merged into HEAD); see
+`cross_branch_findings`. It is opt-in: the ctest form stays hermetic.
 
 Exit codes:  0 = pass   1 = gate failure   2 = usage / collapsed scan
 """
@@ -445,12 +450,301 @@ def read_test_code(root):
     return "\n".join(chunks), count
 
 
+# ── THE CROSS-BRANCH VIEW (opt-in: `--cross-branch`) ─────────────────────────
+#
+# ★★★ THE HAZARD, ✔MEASURED 2026-09-23 (P68 round 9): the gate above reads ONE header, so the "next free"
+# it prints is this tree's answer only. Over the eleven worktrees of that round -- each lane's WORKING header,
+# uncommitted allocations included -- the union's next free `S_` slot was 0xE088 while main's own tree said
+# 0xE086: a lane allocating from main's view that day would have taken two slots another tree already held.
+# Nothing collided only because the coordinator allocated by hand, which is the non-mechanism this view
+# replaces (the 0xD029 clash was the same shape inside one branch).
+#
+# ⇒ `--cross-branch` reads every OTHER place an ordinal can be allocated from this repository, through git
+# objects and the other worktrees' files -- never the network, so a ref is as fresh as the last fetch and the
+# report names each ref's commit:
+#   * each OTHER WORKTREE's working header (a lane in flight, uncommitted allocations included);
+#   * each branch and remote-tracking ref NOT merged into HEAD (a merged one adds nothing by definition).
+# Each is judged by what it ADDED since its merge-base with HEAD, as (name, value) pairs -- so a code present at
+# the fork and renamed on one side is shared identity, not a collision, and a squash-merged branch whose pairs
+# already sit in this tree adds nothing.
+#
+# A COLLISION is a value added under two names, or a name added at two values, by any two sides (this tree
+# included). A tree FAILS on the collisions IT must fix: one involving an allocation of its own that is not yet
+# PUBLISHED (in its working header, absent from its HEAD commit), or two LIVE worktrees colliding with each
+# other. A side colliding with a code this tree already PUBLISHED is that side's to fix before it merges, and
+# a collision between refs nobody is working on here is history: both are REPORTED, never failed.
+# ✔MEASURED 2026-09-24 on this host: without that split the view was red on every run -- a two-month-old
+# backup branch and an abandoned branch each held a pair that main had published differently long ago -- and
+# a guard every run trips is a disarmed guard. The append point per band is printed over the UNION of every
+# side, dead refs included (conservative: a slot anyone ever held is skipped).
+#
+# ⚠ OPT-IN, and the ctest form stays HERMETIC: a gate whose verdict depends on which branches happen to be
+# fetched on the host would go red for a reason no diff explains. The pure core is pinned by the self-test on
+# every run; the git layer by a synthetic repository.
+# ⓘ `RESERVED_ELSEWHERE` stays: a hand-written reservation still covers what no ref or worktree on this host
+# holds (a branch on another machine).
+
+
+def _pairs(rows):
+    """{name: value} for the valued enumerators of `rows`."""
+    return {n: v for n, v, _raw in rows if v is not None}
+
+
+def _clashes(left, right):
+    """Every identity two addition sets hold differently -> [(kind, key, left pair, right pair)], a pair being
+    (name, value): a value held under two names, or a name held at two values."""
+    out = []
+    by_value = {v: n for n, v in right.items()}
+    for n, v in sorted(left.items()):
+        m = by_value.get(v)
+        if m is not None and m != n:
+            out.append(("value", "0x%04X" % v, (n, v), (m, v)))
+        w = right.get(n)
+        if w is not None and w != v:
+            out.append(("name", n, (n, v), (n, w)))
+    return out
+
+
+def _render(label, pair):
+    return (label, "%s = 0x%04X" % pair)
+
+
+def cross_branch_findings(ours, published, sides):
+    """The PURE core of `--cross-branch`.
+
+    `ours`      -- {name: value}, this tree's WORKING header.
+    `published` -- {name: value}, this tree's header at its HEAD commit (what it has already published).
+    `sides`     -- [(label, base, theirs, live)]: `base` the {name: value} at that side's merge-base with this
+                   HEAD, `theirs` the side's own {name: value}, `live` True for a worktree (allocating on this
+                   host now), False for a ref.
+    -> (failures, notes, union_rows): each collision a (kind, key, (where, what), (where, what)) tuple;
+       `failures` = the collisions this tree must fix (one of its UNPUBLISHED pairs is in it, or two LIVE sides
+       collide); `notes` = every other one (a side colliding with a pair this tree PUBLISHED -- that side must
+       move before it merges -- or one only refs are in); `union_rows` = rows for `next_free_by_band` over this
+       tree plus every side's additions.
+    A side's ADDITIONS are its pairs absent from its own base, and THIS TREE's are judged against that same
+    base, so a code that existed at the fork -- renamed on one side or not -- is never counted as allocated
+    since it. Two sides are compared on the additions this tree does not already hold (a squash-merged pair is
+    shared)."""
+    published_pairs = set(published.items())
+    failures, notes, added = set(), set(), []
+    for label, base, theirs, live in sides:
+        base_pairs = set(base.items())
+        add = {n: v for n, v in theirs.items() if (n, v) not in base_pairs}
+        mine = {n: v for n, v in ours.items() if (n, v) not in base_pairs}
+        for kind, key, left, right in _clashes(mine, add):
+            finding = (kind, key, _render("this tree", left), _render(label, right))
+            (notes if left in published_pairs else failures).add(finding)
+        added.append((label, live, {n: v for n, v in add.items() if ours.get(n) != v}))
+    for i, (l1, live1, a1) in enumerate(added):
+        for l2, live2, a2 in added[i + 1:]:
+            for kind, key, left, right in _clashes(a1, a2):
+                finding = (kind, key, _render(l1, left), _render(l2, right))
+                (failures if live1 and live2 else notes).add(finding)
+    union_rows = ([(n, v, "") for n, v in ours.items()]
+                  + [(n, v, "") for _label, _live, add in added for n, v in add.items()])
+    return sorted(failures), sorted(notes), union_rows
+
+
+def _git(root, *args):
+    """`git -C <root> <args>` through the ONE git entry point (owning-tree's `run_git`)."""
+    return _owning_tree().run_git(["-C", root] + list(args), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+
+
+def _pairs_of_text(text):
+    body = extract_enum_body(text or "")
+    return _pairs(parse_enumerators(body)) if body else None
+
+
+def _pairs_at(root, rev):
+    p = _git(root, "show", "%s:%s" % (rev, HEADER_REL))
+    return _pairs_of_text(p.stdout) if p.returncode == 0 else None
+
+
+def read_cross_branch_sides(root):
+    """-> (sides, notes): the git layer of `--cross-branch` over the repository `root` belongs to. `sides` as
+    `cross_branch_findings` takes them; `notes` = what was skipped and why (a side with no header at its fork,
+    the merged refs), so the report states its own scope. Exits 2 when git cannot answer at all."""
+    head = _git(root, "rev-parse", "HEAD")
+    if head.returncode != 0:
+        print("check-diagnostic-codes --cross-branch: git cannot read HEAD in %s (%s)"
+              % (root, head.stderr.strip()))
+        sys.exit(2)
+    head = head.stdout.strip()
+    sides, notes = [], []
+
+    def fork_of(rev):
+        mb = _git(root, "merge-base", "HEAD", rev)
+        return mb.stdout.strip() if mb.returncode == 0 else ""
+
+    # (1) every OTHER worktree's WORKING header
+    listing = _git(root, "worktree", "list", "--porcelain")
+    if listing.returncode != 0:
+        print("check-diagnostic-codes --cross-branch: `git worktree list` failed in %s (%s)"
+              % (root, listing.stderr.strip()))
+        sys.exit(2)
+    entry = {}
+    for line in listing.stdout.splitlines() + [""]:
+        if line:
+            key, _sp, value = line.partition(" ")
+            entry[key] = value
+            continue
+        path, rev = entry.get("worktree"), entry.get("HEAD")
+        entry = {}
+        if not path or not rev or _owning_tree().same_path(path, root):
+            continue
+        header = os.path.join(path, HEADER_REL)
+        if not os.path.isfile(header):
+            notes.append("worktree %s: no %s (skipped)" % (path, HEADER_REL))
+            continue
+        with open(header, "r", encoding="utf-8", errors="replace") as fh:
+            theirs = _pairs_of_text(fh.read())
+        fork = fork_of(rev)
+        base = _pairs_at(root, fork) if fork else None
+        if theirs is None or base is None:
+            notes.append("worktree %s: header unreadable there or at its fork (skipped)" % path)
+            continue
+        sides.append(("worktree %s (working tree, fork %s)" % (path, fork[:8]), base, theirs, True))
+
+    # (2) every branch and remote-tracking ref NOT merged into HEAD
+    refs = _git(root, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads", "refs/remotes")
+    if refs.returncode != 0:
+        print("check-diagnostic-codes --cross-branch: `git for-each-ref` failed in %s (%s)"
+              % (root, refs.stderr.strip()))
+        sys.exit(2)
+    merged = 0
+    for line in refs.stdout.splitlines():
+        ref, _sp, obj = line.partition(" ")
+        if not ref or ref.endswith("/HEAD") or obj == head:
+            continue
+        if _git(root, "merge-base", "--is-ancestor", obj, "HEAD").returncode == 0:
+            merged += 1
+            continue
+        fork = fork_of(obj)
+        theirs = _pairs_at(root, obj)
+        base = _pairs_at(root, fork) if fork else None
+        if theirs is None or base is None:
+            notes.append("ref %s: no %s at the ref or at its fork (skipped)" % (ref, HEADER_REL))
+            continue
+        sides.append(("ref %s (%s, fork %s)" % (ref, obj[:8], fork[:8]), base, theirs, False))
+    notes.append("%d merged ref(s) add nothing and were not read" % merged)
+    return sides, notes
+
+
+def cross_branch_main(root, ours_rows):
+    """`--cross-branch`: print every side, FAIL on a collision this tree must fix, REPORT the rest, and print
+    the union's append points."""
+    sides, scope = read_cross_branch_sides(root)
+    published = _pairs_at(root, "HEAD")
+    if published is None:
+        print("check-diagnostic-codes --cross-branch: %s is unreadable at HEAD in %s, so which of this tree's "
+              "codes are already published cannot be told" % (HEADER_REL, root))
+        sys.exit(2)
+    failures, notes, union_rows = cross_branch_findings(_pairs(ours_rows), published, sides)
+    print("check-diagnostic-codes --cross-branch: %d side(s) beside this tree" % len(sides))
+    for label, base, theirs, _live in sides:
+        base_pairs = set(base.items())
+        print("  %3d added  %s" % (sum(1 for p in theirs.items() if p not in base_pairs), label))
+    for line in scope:
+        print("  (%s)" % line)
+    if notes:
+        print("\n  NOT this tree's to fix (%d): a side holding a code this tree already PUBLISHED at HEAD must "
+              "renumber before it merges; a collision only refs are in is history until one of them is "
+              "worked on:" % len(notes))
+        for kind, key, (w1, x1), (w2, x2) in notes:
+            print("    %s %s: %s in %s  |  %s in %s" % (kind, key, x1, w1, x2, w2))
+    if failures:
+        print("\nFAIL -- CROSS-BRANCH ORDINAL COLLISION: an allocation this tree has not published, or two "
+              "worktrees in flight, hold one identity differently.")
+        for kind, key, (w1, x1), (w2, x2) in failures:
+            print("    %s %s: %s in %s  |  %s in %s" % (kind, key, x1, w1, x2, w2))
+        print("  Move the side that has NOT published to the union's next free slot below.")
+    print("  next free ordinal per band over this tree AND every side (append point):")
+    print("    " + "   ".join("%s_ 0x%04X" % (letter, nxt)
+                              for letter, (_high, nxt) in next_free_by_band(union_rows).items()))
+    return 1 if failures else 0
+
+
 # ── the self-test: red-on-disable for the instrument itself ──────────────────
 
 def _enum(*lines):
     return ("enum class DiagnosticCode : std::uint16_t {\n"
             + "\n".join("    " + ln for ln in lines)
             + "\n};\n")
+
+
+def _cross_branch_git_arm():
+    """The git layer of `--cross-branch`, end to end, on a THROWAWAY repository -> (ok, detail).
+
+    main allocates S_Main; branch `feat` (not merged) allocates S_Feat at 0xE002; branch `done` is merged; a
+    second WORKTREE (`lane`, forked before main's commit) is read twice: first with its working header equal to
+    the fork (the CONTROL: nothing collides), then with an UNCOMMITTED S_Lane at 0xE002 -- the in-flight
+    allocation no ref can show, colliding with `feat`."""
+    import shutil
+    import stat
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="dss-xbranch-")
+    repo, lane = os.path.join(tmp, "repo"), os.path.join(tmp, "lane")
+
+    def git(*args):
+        p = _git(repo, *args)
+        if p.returncode != 0:
+            raise RuntimeError("git %s: %s" % (" ".join(args), (p.stderr or p.stdout).strip()))
+        return p.stdout
+
+    def header(root, *lines):
+        with open(os.path.join(root, *HEADER_REL.split("/")), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_enum(*lines))
+
+    def onerror(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+    try:
+        os.makedirs(os.path.join(repo, *os.path.dirname(HEADER_REL).split("/")))
+        hooks = os.path.join(tmp, "no-hooks")
+        os.makedirs(hooks)
+        git("init", "-q", "-b", "main")
+        for key, value in (("user.email", "selftest@example.invalid"), ("user.name", "selftest"),
+                           ("commit.gpgsign", "false"), ("core.hooksPath", hooks)):
+            git("config", key, value)
+        header(repo, "S_Old = 0xE001,")
+        git("add", HEADER_REL)
+        git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "feat")
+        header(repo, "S_Old = 0xE001,", "S_Feat = 0xE002,")
+        git("commit", "-q", "-am", "feat")
+        git("checkout", "-q", "main")
+        git("branch", "done")
+        git("worktree", "add", "-q", "-b", "lane", lane, "main")
+        header(repo, "S_Old = 0xE001,", "S_Main = 0xE003,")
+        git("commit", "-q", "-am", "main")
+        def view(root):
+            """-> (failures, notes, union, labels, scope) as `root`'s tree sees the repository."""
+            with open(os.path.join(root, *HEADER_REL.split("/")), encoding="utf-8") as fh:
+                ours = _pairs_of_text(fh.read())
+            sides, scope = read_cross_branch_sides(root)
+            f, n, u = cross_branch_findings(ours, _pairs_at(root, "HEAD"), sides)
+            return f, n, u, [label for label, _b, _t, _l in sides], scope
+
+        control = view(repo)
+        header(lane, "S_Old = 0xE001,", "S_Lane = 0xE002,")
+        main_view, lane_view = view(repo), view(lane)
+        kinds = lambda found: [(k, key) for k, key, _a, _b in found]   # noqa: E731
+        ok = (control[0] == [] and control[1] == []
+              # from main: the lane's in-flight slot collides with an unmerged REF -- the lane's to fix
+              and main_view[0] == [] and kinds(main_view[1]) == [("value", "0xE002")]
+              and sum(1 for lb in main_view[3] if lb.startswith("worktree ")) == 1
+              and sum(1 for lb in main_view[3] if lb.startswith("ref feat ")) == 1 and len(main_view[3]) == 2
+              and any(n.startswith("2 merged ref(s)") for n in main_view[4])
+              and next_free_by_band(main_view[2]).get("S") == (0xE003, 0xE004)
+              # from the lane: the same collision is ITS unpublished allocation -- a FAILURE
+              and kinds(lane_view[0]) == [("value", "0xE002")] and lane_view[1] == [])
+        return ok, "control=%r main=%r lane=%r" % (control[:2], main_view, lane_view[:2])
+    except (OSError, RuntimeError) as exc:
+        return False, "the synthetic repository could not be built: %s" % exc
+    finally:
+        shutil.rmtree(tmp, onerror=onerror)
 
 
 def self_test():
@@ -608,6 +902,57 @@ def self_test():
             print("  ok   %s" % why)
         check(why if ok else "%s -- %s" % (why, detail), ok, True)
 
+    # ── (f) THE CROSS-BRANCH VIEW -- the pure core on DATA, then the git layer on a throwaway repository ──
+    # ★ Every rule is a one-line fact: an addition is judged against ITS side's fork, a rename of a code that
+    # existed at the fork is shared identity, a pair this tree already holds is shared, two OTHER sides can
+    # collide with each other, and the union's append point steps past a slot another side took.
+    base = {"S_Old": 0xE001}
+    kinds = lambda found: [(k, key) for k, key, _a, _b in found]   # noqa: E731
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001, "S_Mine": 0xE002}, base,
+                                             [("lane", base, {"S_Old": 0xE001, "S_Theirs": 0xE002}, True)])
+    check("cross-branch: this tree's UNPUBLISHED allocation of a value a side holds under another name FAILS",
+          (kinds(fails), notes), ([("value", "0xE002")], []))
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001, "S_Twice": 0xE002}, base,
+                                             [("lane", base, {"S_Old": 0xE001, "S_Twice": 0xE003}, False)])
+    check("cross-branch: this tree's unpublished name at a value an unmerged REF holds it at FAILS too",
+          (kinds(fails), notes), ([("name", "S_Twice")], []))
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001, "S_Pub": 0xE002},
+                                             {"S_Old": 0xE001, "S_Pub": 0xE002},
+                                             [("dead", base, {"S_Old": 0xE001, "S_Stale": 0xE002}, False)])
+    check("cross-branch: a side holding a value this tree already PUBLISHED under another name is REPORTED, "
+          "not failed (that side renumbers before it merges)",
+          (fails, kinds(notes)), ([], [("value", "0xE002")]))
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001}, base,
+                                             [("lane", base, {"S_Renamed": 0xE001}, True)])
+    check("cross-branch: a code that existed at the fork, renamed on one side, is NOT a collision",
+          (fails, notes), ([], []))
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001, "S_Shared": 0xE002}, base,
+                                             [("squashed", base, {"S_Old": 0xE001, "S_Shared": 0xE002}, False)])
+    check("cross-branch: a pair this tree already holds (a squash-merged branch) is NOT a collision",
+          (fails, notes), ([], []))
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001}, base,
+                                             [("lane-a", base, {"S_Old": 0xE001, "S_A": 0xE002}, True),
+                                              ("lane-b", base, {"S_Old": 0xE001, "S_B": 0xE002}, True)])
+    check("cross-branch: two LIVE worktrees taking one slot FAILS -- a collision this tree can see",
+          (kinds(fails), notes), ([("value", "0xE002")], []))
+    fails, notes, _u = cross_branch_findings({"S_Old": 0xE001}, base,
+                                             [("ref-a", base, {"S_Old": 0xE001, "S_A": 0xE002}, False),
+                                              ("lane-b", base, {"S_Old": 0xE001, "S_B": 0xE002}, True)])
+    check("cross-branch: a worktree against an unmerged REF is REPORTED here (that lane fails on it in its own "
+          "tree)", (fails, kinds(notes)), ([], [("value", "0xE002")]))
+    _f, _n, union = cross_branch_findings({"S_Old": 0xE001}, base,
+                                          [("dead", base, {"S_Old": 0xE001, "S_Far": 0xE007}, False)])
+    check("cross-branch: the union's append point steps past a slot ANY side ever took, a dead ref's included",
+          next_free_by_band(union), {"S": (0xE007, 0xE008)})
+    ok, detail = _cross_branch_git_arm()
+    check("cross-branch: the git layer reads an in-flight worktree (control clean; then its UNCOMMITTED "
+          "allocation collides with an unmerged ref -- a note from main, a FAILURE from the lane), skips "
+          "merged refs, and steps the union's append point -- %s" % detail
+          if not ok else "cross-branch: the git layer, end to end", ok, True)
+    if ok:
+        print("  ok   cross-branch: the git layer, end to end (control clean; the lane's in-flight "
+              "collision is a note from main and a failure from the lane)")
+
     if failures:
         print("check-diagnostic-codes: SELF-TEST FAILED (%d case(s))" % len(failures))
         print("\n".join(failures))
@@ -625,6 +970,10 @@ def main():
                     help="run the instrument's own red-on-disable cases and exit")
     ap.add_argument("--list-uncovered", action="store_true",
                     help="print every uncovered code, baselined or not, and exit 0")
+    ap.add_argument("--cross-branch", action="store_true",
+                    help="ALSO read every other worktree's working header and every ref not merged into HEAD: "
+                         "fail on an ordinal two sides allocated differently, and print the append point "
+                         "per band over the UNION (opt-in; the ctest form stays hermetic)")
     args = ap.parse_args()
 
     if args.self_test:
@@ -715,6 +1064,12 @@ def main():
               "UNCOVERED_BASELINE line(s) should be deleted:" % len(retired))
         for name in retired:
             print("    %s" % name)
+
+    if args.cross_branch:
+        # The in-tree verdict above is printed first and still counts: the union's answer is for an
+        # allocator, and it is no excuse for a collision inside this tree.
+        print()
+        failed = cross_branch_main(root, rows) != 0 or failed
 
     if failed:
         return 1

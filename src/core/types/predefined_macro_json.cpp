@@ -222,6 +222,12 @@ realizedCoreOf(PredefinedSizedType const& t, PredefinedTypeFacts const& facts) n
     switch (t.source) {
         case PredefinedTypeSource::None:
             return std::nullopt;
+        case PredefinedTypeSource::ShippedTypedef:
+            // Decoded per (language × pair) in the merge, and read through
+            // `predefinedTypeIdentity` alone — the loader admits this source only
+            // on the kinds that realize through it, so a core-only question has
+            // no answer here, never a guess.
+            return std::nullopt;
         case PredefinedTypeSource::AbiTypedef:
             // A target that declares no such typedef has no such type on this
             // pair: the macro is not defined, as gcc does for a type a target
@@ -296,6 +302,62 @@ predefinedTypeIsUnsigned(PredefinedMacroDef const& row,
             // signedness, no macro, never a guess.
             return std::nullopt;
     }
+}
+
+// Declared in `core/types/preprocess_config.hpp` (P68 round 9). The core by the
+// rule `realizedCoreOf` owns, the vocabulary tag by the row's own resolution, and
+// a shipped typedef by the pair's decode alone.
+std::optional<PredefinedTypeIdentity>
+predefinedTypeIdentity(PredefinedSizedType const&                type,
+                       PredefinedTypeFacts const&                 facts,
+                       std::span<PredefinedShippedTypedef const>  shippedTypedefs) {
+    if (type.source == PredefinedTypeSource::ShippedTypedef) {
+        // The header AND the name: a typedef name alone is not an identity key —
+        // two descriptors could declare it, and the row says which one it reads.
+        for (PredefinedShippedTypedef const& s : shippedTypedefs) {
+            if (s.header == type.header && s.name == type.spelled) return s.identity;
+        }
+        return std::nullopt;   // the pair's descriptor does not declare it
+    }
+    auto const core = realizedCoreOf(type, facts);
+    if (!core.has_value()) return std::nullopt;
+    PredefinedTypeIdentity id{*core, {}};
+    switch (type.source) {
+        case PredefinedTypeSource::Vocabulary:
+            id.vocabularyName = type.vocabularyName;
+            break;
+        case PredefinedTypeSource::Synthesized:
+            if (auto const it = type.vocabularyNameByDataModel.find(facts.dataModel);
+                it != type.vocabularyNameByDataModel.end()) {
+                id.vocabularyName = it->second;
+            }
+            break;
+        case PredefinedTypeSource::None:
+        case PredefinedTypeSource::PointerTo:
+        case PredefinedTypeSource::AbiTypedef:
+        case PredefinedTypeSource::ShippedTypedef:
+            // A pointer and a target-declared ABI typedef are anonymous cores:
+            // the target states a representation, never a language's name.
+            break;
+    }
+    return id;
+}
+
+// Declared in `core/types/preprocess_config.hpp` (P68 round 9). A plain scan: the
+// list is a language's handful of canonical names, and the load already refused
+// two names that share an identity, so at most one can match.
+std::optional<std::string_view>
+spellPredefinedType(std::span<PredefinedTypeSpelling const> spellings,
+                    PredefinedTypeIdentity const& identity, DataModel dm) noexcept {
+    for (PredefinedTypeSpelling const& s : spellings) {
+        if (!s.resolved) continue;
+        auto const it = s.coreByDataModel.find(dm);
+        TypeKind const k = (it != s.coreByDataModel.end()) ? it->second : s.core;
+        if (k == identity.core && s.vocabularyName == identity.vocabularyName) {
+            return std::string_view{s.spelled};
+        }
+    }
+    return std::nullopt;
 }
 
 namespace detail {
@@ -381,18 +443,41 @@ constexpr std::string_view kProgramRedefinitionKey      = "programRedefinition";
 constexpr std::string_view kSizedTypeKey                = "type";
 constexpr std::string_view kSizedTypeSynthesizedKey     = "synthesized";
 constexpr std::string_view kSizedTypePointerToKey       = "pointerTo";
-constexpr std::string_view kSizedTypeAbiTypedefKey      = "abiTypedef";
+// The two references to a type declared ELSEWHERE are the shared notation
+// (`kTypeRef…Key`, `preprocess_config.hpp`) — a shipped descriptor's derived
+// constant names the same types by the same keys (P68 round 9).
+constexpr std::string_view kSizedTypeAbiTypedefKey      = kTypeRefAbiTypedefKey;
+// P68 round 9: a typedef a SHIPPED descriptor declares, with the header whose
+// descriptor it is (`{"shippedTypedef": "int_fast16_t", "header": "stdint.h"}`).
+// `header` is the arm's COMPANION key — refused beside any other arm.
+constexpr std::string_view kSizedTypeShippedTypedefKey  = kTypeRefShippedTypedefKey;
+constexpr std::string_view kSizedTypeHeaderKey          = kTypeRefHeaderKey;
 struct SizedTypeObjectArm {
     std::string_view     key;
     PredefinedTypeSource source;
 };
-constexpr std::array<SizedTypeObjectArm, 3> kSizedTypeObjectArms{{
-    {kSizedTypeSynthesizedKey, PredefinedTypeSource::Synthesized},
-    {kSizedTypePointerToKey,   PredefinedTypeSource::PointerTo},
-    {kSizedTypeAbiTypedefKey,  PredefinedTypeSource::AbiTypedef},
+constexpr std::array<SizedTypeObjectArm, 4> kSizedTypeObjectArms{{
+    {kSizedTypeSynthesizedKey,    PredefinedTypeSource::Synthesized},
+    {kSizedTypePointerToKey,      PredefinedTypeSource::PointerTo},
+    {kSizedTypeAbiTypedefKey,     PredefinedTypeSource::AbiTypedef},
+    {kSizedTypeShippedTypedefKey, PredefinedTypeSource::ShippedTypedef},
 }};
-constexpr std::array<std::string_view, 3> kSizedTypeObjectKeys{
-    kSizedTypeSynthesizedKey, kSizedTypePointerToKey, kSizedTypeAbiTypedefKey};
+// The arms' keys — what "names exactly ONE of" counts and renders.
+constexpr std::array<std::string_view, 4> kSizedTypeObjectArmKeys{
+    kSizedTypeSynthesizedKey, kSizedTypePointerToKey, kSizedTypeAbiTypedefKey,
+    kSizedTypeShippedTypedefKey};
+DSS_CHECK_KEY_VOCABULARY(kSizedTypeObjectArmKeys);
+// The kinds whose row names a TYPE, as the kind table spells them — the accepted
+// set the "`type` is valid only on …" refusal renders. The count is checked where
+// the array is built (`namesWhere<M>`), so a new type-naming kind fails the build
+// here rather than leaving the sentence a lie.
+constexpr auto kTypeNamingKindNames =
+    namesWhere<5>(kPredefinedMacroKindTable, predefinedMacroKindNamesAType);
+
+// Every key a `type` object may hold: the arms, and the one companion.
+constexpr std::array<std::string_view, 5> kSizedTypeObjectKeys{
+    kSizedTypeSynthesizedKey, kSizedTypePointerToKey, kSizedTypeAbiTypedefKey,
+    kSizedTypeShippedTypedefKey, kSizedTypeHeaderKey};
 DSS_CHECK_KEY_VOCABULARY(kSizedTypeObjectKeys);
 
 constexpr std::string_view kImpliedSurfaceKindKey       = "kind";
@@ -727,13 +812,42 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                   kVersionKindName, kModelLimitKindName));
             continue;
         }
-        // `limit` belongs to the `model-limit` kind alone — anywhere else it
-        // would be read by nothing, and the author meant a derived value.
-        if (kind != kModelLimitKindName && e.contains(kModelLimitKey)) {
+        // `limit` names a MODEL limit on a `model-limit` entry and a TYPE's limit
+        // on a `type-limit` one (P68 round 9: `max` / `min` / `width`, the one
+        // `kIntegerTypeLimitTable` a shipped descriptor's derived row reads).
+        // Anywhere else it would be read by nothing, and the author meant a
+        // derived value.
+        if (pm.kind == PredefinedMacroKind::TypeLimit) {
+            std::string const limitPath = std::format("{}/{}", mpath, kModelLimitKey);
+            std::string const accepted = detail::renderAllowedList(
+                allNames(kIntegerTypeLimitTable), " / ");
+            if (!e.contains(kModelLimitKey)) {
+                coll.emit(DiagnosticCode::C_MissingField, limitPath,
+                          std::format("a '{}' predefinedMacros entry requires "
+                                      "'{}' — which limit of its type it states "
+                                      "(one of {})",
+                                      predefinedMacroKindName(pm.kind),
+                                      kModelLimitKey, accepted));
+                continue;
+            }
+            json const& lv = e.at(kModelLimitKey);
+            std::optional<IntegerTypeLimit> const tl =
+                lv.is_string() ? kIntegerTypeLimitTable.fromName(lv.get<std::string>())
+                               : std::nullopt;
+            if (!tl.has_value()) {
+                coll.emit(entryCode, limitPath,
+                          std::format("unknown type limit {} — accepted: {}",
+                                      lv.dump(), accepted));
+                continue;
+            }
+            pm.typeLimit = *tl;
+        } else if (kind != kModelLimitKindName && e.contains(kModelLimitKey)) {
             coll.emit(entryCode, std::format("{}/{}", mpath, kModelLimitKey),
-                      std::format("'{}' is valid only on a '{}' "
+                      std::format("'{}' is valid only on a '{}' or '{}' "
                                   "predefinedMacros entry",
-                                  kModelLimitKey, kModelLimitKindName));
+                                  kModelLimitKey, kModelLimitKindName,
+                                  predefinedMacroKindName(
+                                      PredefinedMacroKind::TypeLimit)));
             continue;
         }
         // `componentWeights` belongs to the `version` kind alone. Silently
@@ -745,9 +859,10 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                   "predefinedMacros entry", kVersionKindName));
             continue;
         }
-        // ── `type` — REQUIRED iff the kind names a type (`type-size`, and
-        // `type-unsigned` since P68 round 9), refused on every other kind (P68
-        // round 8, D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) ──
+        // ── `type` — REQUIRED iff the kind names a type (`type-size`;
+        // `type-unsigned`, `type-name`, `type-limit` and `type-suffix` since P68
+        // round 9), refused on every other kind (P68 round 8,
+        // D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) ──
         //
         // The row names the TYPE; the merge derives the value. So a `value`
         // beside a `type` is refused rather than ignored: it would be a second
@@ -757,6 +872,17 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
         bool const isTypeUnsigned = (pm.kind == PredefinedMacroKind::TypeUnsigned);
         std::string const typePath =
             std::format("{}/{}", mpath, kSizedTypeKey);
+        // WHAT a type-naming row states about its type — one phrase per kind,
+        // for the sentences below.
+        auto const statesAbout = [](PredefinedMacroKind k) -> std::string_view {
+            switch (k) {
+                case PredefinedMacroKind::TypeUnsigned: return "signedness";
+                case PredefinedMacroKind::TypeName:     return "spelling";
+                case PredefinedMacroKind::TypeLimit:    return "limit";
+                case PredefinedMacroKind::TypeSuffix:   return "integer-literal suffix";
+                default:                                return "size";
+            }
+        };
         if (namesAType) {
             std::string_view const kindSpelling = predefinedMacroKindName(pm.kind);
             if (!typeVocabularyInScope) {
@@ -775,25 +901,37 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                           std::format("a '{}' predefinedMacros entry requires "
                                       "'{}' — the type whose {} it states",
                                       kindSpelling, kSizedTypeKey,
-                                      isTypeUnsigned ? "signedness" : "size"));
+                                      statesAbout(pm.kind)));
                 continue;
             }
             if (e.contains("value")) {
-                coll.emit(entryCode, mpath + "/value",
-                          isTypeUnsigned
-                              ? std::format("a '{}' entry states a TYPE, never a "
-                                            "value: the macro is defined (as 1) "
-                                            "exactly where '{}' is an unsigned "
-                                            "integer type on the build's (target, "
-                                            "format) pair, and undefined "
-                                            "elsewhere. Remove 'value'",
-                                            kindSpelling, kSizedTypeKey)
-                              : std::format("a '{}' entry states a TYPE, never a "
-                                            "number: its value is the size of '{}' "
-                                            "on the build's (target, format) pair, "
-                                            "computed by the layout `sizeof` uses. "
-                                            "Remove 'value'",
-                                            kindSpelling, kSizedTypeKey));
+                std::string why;
+                if (isTypeUnsigned) {
+                    why = std::format("a '{}' entry states a TYPE, never a "
+                                      "value: the macro is defined (as 1) "
+                                      "exactly where '{}' is an unsigned "
+                                      "integer type on the build's (target, "
+                                      "format) pair, and undefined "
+                                      "elsewhere. Remove 'value'",
+                                      kindSpelling, kSizedTypeKey);
+                } else if (pm.kind == PredefinedMacroKind::TypeSize) {
+                    why = std::format("a '{}' entry states a TYPE, never a "
+                                      "number: its value is the size of '{}' "
+                                      "on the build's (target, format) pair, "
+                                      "computed by the layout `sizeof` uses. "
+                                      "Remove 'value'",
+                                      kindSpelling, kSizedTypeKey);
+                } else {
+                    why = std::format("a '{}' entry states a TYPE, never a "
+                                      "value: its value is the {} of '{}' on the "
+                                      "build's (target, format) pair, derived by "
+                                      "the merge, and a 'value' beside it would "
+                                      "be the second copy of that fact. Remove "
+                                      "'value'",
+                                      kindSpelling, statesAbout(pm.kind),
+                                      kSizedTypeKey);
+                }
+                coll.emit(entryCode, mpath + "/value", std::move(why));
                 continue;
             }
             json const& tv = e.at(kSizedTypeKey);
@@ -833,7 +971,7 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                           "of {} (it names {}) — or spell a "
                                           "type name as a plain string",
                                           kSizedTypeKey,
-                                          renderAllowedList(kSizedTypeObjectKeys),
+                                          renderAllowedList(kSizedTypeObjectArmKeys),
                                           named));
                     continue;
                 }
@@ -845,16 +983,72 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                                           chosen->key));
                     continue;
                 }
-                // A pointer has a size but no signedness: a `type-unsigned`
-                // row naming one would be a question with no answer on any
-                // pair, i.e. a macro silently never defined.
-                if (isTypeUnsigned && chosen->source == PredefinedTypeSource::PointerTo) {
+                // P68 round 9: `header` is `shippedTypedef`'s companion — required
+                // beside it (the descriptor to decode), refused beside any other
+                // arm (it would be read by nothing).
+                bool const isShipped =
+                    (chosen->source == PredefinedTypeSource::ShippedTypedef);
+                std::string const headerPath =
+                    std::format("{}/{}", typePath, kSizedTypeHeaderKey);
+                if (isShipped) {
+                    if (!tv.contains(kSizedTypeHeaderKey)) {
+                        coll.emit(DiagnosticCode::C_MissingField, headerPath,
+                                  std::format("a '{}' type requires '{}' — the "
+                                              "header whose shipped descriptor "
+                                              "declares '{}'",
+                                              kSizedTypeShippedTypedefKey,
+                                              kSizedTypeHeaderKey,
+                                              nv.get<std::string>()));
+                        continue;
+                    }
+                    json const& hv = tv.at(kSizedTypeHeaderKey);
+                    if (!hv.is_string() || hv.get<std::string>().empty()) {
+                        coll.emit(entryCode, headerPath,
+                                  std::format("'{}' must be a non-empty header name",
+                                              kSizedTypeHeaderKey));
+                        continue;
+                    }
+                    pm.sizedType.header = hv.get<std::string>();
+                } else if (tv.contains(kSizedTypeHeaderKey)) {
+                    coll.emit(entryCode, headerPath,
+                              std::format("'{}' is the companion of '{}' alone — "
+                                          "beside '{}' it would be read by nothing",
+                                          kSizedTypeHeaderKey,
+                                          kSizedTypeShippedTypedefKey, chosen->key));
+                    continue;
+                }
+                // A shipped typedef resolves per (language × pair) through the
+                // descriptor decode, which only the kinds that need the language
+                // run; `type-size` / `type-unsigned` compute from a core alone.
+                if (isShipped && !predefinedMacroKindNeedsLanguage(pm.kind)) {
                     coll.emit(entryCode,
                               std::format("{}/{}", typePath, chosen->key),
-                              std::format("a '{}' entry asks an INTEGER type's "
-                                          "signedness, and a '{}' type is a "
-                                          "pointer, which has none",
+                              std::format("a '{}' entry cannot name a '{}': its "
+                                          "value comes from the type's core alone. "
+                                          "Name the type the typedef names instead",
                                           kindSpelling, chosen->key));
+                    continue;
+                }
+                // A pointer has a size but no signedness: a `type-unsigned`
+                // row naming one would be a question with no answer on any
+                // pair, i.e. a macro silently never defined. P68 round 9: nor a
+                // spelling this language lists, an integer-literal suffix, or a
+                // range — only its WIDTH (`__POINTER_WIDTH__`) is a fact of it.
+                if (chosen->source == PredefinedTypeSource::PointerTo
+                    && (isTypeUnsigned || pm.kind == PredefinedMacroKind::TypeName
+                        || pm.kind == PredefinedMacroKind::TypeSuffix
+                        || (pm.kind == PredefinedMacroKind::TypeLimit
+                            && pm.typeLimit != IntegerTypeLimit::Width))) {
+                    coll.emit(entryCode,
+                              std::format("{}/{}", typePath, chosen->key),
+                              std::format("a '{}' entry states an INTEGER type's "
+                                          "{}, and a '{}' type is a pointer, which "
+                                          "has none",
+                                          kindSpelling,
+                                          pm.kind == PredefinedMacroKind::TypeLimit
+                                              ? std::string_view{kIntegerTypeLimitTable.name(pm.typeLimit)}
+                                              : statesAbout(pm.kind),
+                                          chosen->key));
                     continue;
                 }
                 pm.sizedType.source  = chosen->source;
@@ -864,18 +1058,18 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
                           std::format("'{}' must be a type name string, or an "
                                       "object naming one of {}",
                                       kSizedTypeKey,
-                                      renderAllowedList(kSizedTypeObjectKeys)));
+                                      renderAllowedList(kSizedTypeObjectArmKeys)));
                 continue;
             }
         } else if (e.contains(kSizedTypeKey)) {
+            // The accepted set is the kind table's type-naming projection —
+            // rendered, never retyped.
             coll.emit(entryCode, typePath,
-                      std::format("'{}' is valid only on a '{}' or '{}' "
-                                  "predefinedMacros entry",
+                      std::format("'{}' is valid only on a {} predefinedMacros "
+                                  "entry",
                                   kSizedTypeKey,
-                                  predefinedMacroKindName(
-                                      PredefinedMacroKind::TypeSize),
-                                  predefinedMacroKindName(
-                                      PredefinedMacroKind::TypeUnsigned)));
+                                  detail::renderAllowedList(kTypeNamingKindNames,
+                                                            " / ")));
             continue;
         }
         // `value` -- REQUIRED iff kind==constant; the static replacement
@@ -895,15 +1089,31 @@ void parsePredefinedMacroArray(nlohmann::json const&           pms,
         }
         // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL `params` — a
         // FUNCTION-LIKE predefine (e.g. the MSVC-profile `__declspec(x)` →
-        // empty erase). Constant-kind only (the derived kinds are inherently
-        // object-like). Each param must be a non-empty unique string
-        // (C 6.10.3p6 duplicate-param parity with the directive handler,
-        // enforced HERE so a config typo fails at load).
+        // empty erase). Constant-kind — and, P68 round 9, `type-suffix`, whose
+        // function-like form pastes its ONE parameter to the suffix (`__INT64_C(c)`
+        // → `c ## L`, C 7.22.4.1); every other derived kind is object-like. Each
+        // param must be a non-empty unique string (C 6.10.3p6 duplicate-param
+        // parity with the directive handler, enforced HERE so a config typo
+        // fails at load).
+        bool const isTypeSuffix = (pm.kind == PredefinedMacroKind::TypeSuffix);
         if (e.contains("params")) {
-            if (!isConstant) {
+            if (!isConstant && !isTypeSuffix) {
                 coll.emit(entryCode, mpath + "/params",
-                          "'params' is valid only on a 'constant' "
-                          "predefinedMacros entry");
+                          std::format("'params' is valid only on a '{}' or '{}' "
+                                      "predefinedMacros entry",
+                                      predefinedMacroKindName(
+                                          PredefinedMacroKind::Constant),
+                                      predefinedMacroKindName(
+                                          PredefinedMacroKind::TypeSuffix)));
+                continue;
+            }
+            if (isTypeSuffix
+                && (!e.at("params").is_array() || e.at("params").size() != 1)) {
+                coll.emit(entryCode, mpath + "/params",
+                          std::format("a function-like '{}' entry takes exactly "
+                                      "ONE parameter — the constant its suffix is "
+                                      "pasted to (`name(c)` → `c ## <suffix>`)",
+                                      predefinedMacroKindName(pm.kind)));
                 continue;
             }
             json const& prs = e.at("params");

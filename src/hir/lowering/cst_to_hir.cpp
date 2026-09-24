@@ -1550,13 +1550,11 @@ struct Lowerer {
         longDoubleFormat_ = m.longDoubleFormat();
         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: so does plain `char`'s sign.
         charIsUnsigned_ = m.charIsUnsigned();
-        if (sem.arithmeticConversions.has_value()) {
-            arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
-            // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
-            // conversions is a SEPARATE top-level flag (keeps ArithmeticConversions'
-            // JSON unchanged) — inject it into the resolved rules here.
-            arith_->bitIntConversions = sem.bitIntConversions;
-        }
+        // THE ONE RESOLVER the semantic typer asks too (`resolveArithmeticRules`,
+        // type_rules.hpp): the block for this data model, the `_BitInt` flag and the
+        // unsigned-counterpart map. P68 round 10 (lane `cs`): both tiers injected
+        // the flag by hand after resolving; the resolver owns it now.
+        arith_ = resolveArithmeticRules(sem, dataModel_);
         for (RuleId r : cfg.deferredRules) deferred_.emplace(r.v, true);
         // HR10: register every declared extension kind up front, so a rule mapped
         // to one (or a NULL literal) lowers to a HirKind::Extension carrying its id.
@@ -8601,6 +8599,20 @@ struct Lowerer {
             //     VLA where C23 6.7.10p4 promises zeros — which is why the MIR side
             //     fails loud rather than falling through when it cannot size the
             //     object.
+            // P68 round 9 (lane `cs`): an array longer than the placement cursor's
+            // index space is not zero-filled here either. This arm mints one zero
+            // child per element, and a brace list reaches it for a member the cursor
+            // refused to enter (`struct H { char big[4294967297]; int k; } h = {1};`),
+            // which would otherwise build four billion of them — every caller that
+            // zeroes an ARRAY is a brace list's, so the stated limit is the same one.
+            if (len > 0 && static_cast<std::uint64_t>(len) > initializer_cursor::kMaxLength) {
+                out = reportedError(at,
+                    std::format("zero-filling an array of {} elements is past this "
+                                "implementation's limit of {} elements for an array a brace "
+                                "list initializes (the lowering builds one zero per element)",
+                                len, initializer_cursor::kMaxLength));
+                return true;
+            }
             f.type      = type;
             f.how       = ZeroAssemble::Aggregate;
             f.elemType  = elemT;
@@ -9939,10 +9951,18 @@ struct Lowerer {
     // previously-stored direct value (a later designator that addresses
     // a strict sub-position overrides the earlier wholesale write per
     // C99 §6.7.8p19's "later wins" rule).
-    void initSlotAsAggregate(InitSlot& s) {
-        if (!s.nested.empty()) return;
+    //   Returns false — building NOTHING — for an array longer than the placement
+    // cursor's index space (`initializer_cursor::kMaxLength`). One slot per element
+    // is the whole cost of a brace list here (✔MEASURED about 195 bytes each), and the
+    // cursor never addresses past that length, so a longer one is an internal
+    // invariant break its caller reports LOUD: the level's open refuses such an object
+    // before it gets here, and the cursor refuses to enter a longer member. P68 round
+    // 9 (lane `cs`): the guard is here, where the cost is incurred, so no single
+    // missing check can turn a declared length into billions of slots.
+    [[nodiscard]] bool initSlotAsAggregate(InitSlot& s) {
+        if (!s.nested.empty()) return true;
         s.value.reset();
-        if (!s.slotType.valid()) return;
+        if (!s.slotType.valid()) return true;
         TypeKind const k = interner.kind(s.slotType);
         if (k == TypeKind::Struct) {
             // Projected for the same reason as `slotType` in `lowerBraceInit`:
@@ -9968,11 +9988,14 @@ struct Lowerer {
             // into slots, so leave `nested` EMPTY: `flattenInitSlot` then routes the
             // slot through `synthZeroOrError`, which owns the two sentinels.
             if (!ops.empty() && !scals.empty() && scals[0] >= 0) {
+                if (static_cast<std::uint64_t>(scals[0]) > initializer_cursor::kMaxLength)
+                    return false;
                 s.nested.resize(static_cast<std::size_t>(scals[0]));
                 TypeId const elem = reprOf(ops[0]);
                 for (auto& n : s.nested) n.slotType = elem;
             }
         }
+        return true;
     }
     // Write `val` at the slot reachable from `s` by following the path of member /
     // element indices. A step into a UNION slot selects that member, replacing a
@@ -10003,8 +10026,7 @@ struct Lowerer {
                 }
                 cur = &cur->nested[0];
             } else {
-                initSlotAsAggregate(*cur);
-                if (path[0] >= cur->nested.size()) return false;
+                if (!initSlotAsAggregate(*cur) || path[0] >= cur->nested.size()) return false;
                 cur = &cur->nested[path[0]];
             }
             path = path.subspan(1);
@@ -10372,18 +10394,19 @@ struct Lowerer {
                 default:               return Shape::Scalar;
             }
         }
-        [[nodiscard]] std::optional<std::uint32_t> count(TypeId t) const override {
+        // The FULL length: the cursor owns the 32-bit limit (it narrowed silently here).
+        [[nodiscard]] std::optional<std::uint64_t> count(TypeId t) const override {
             using initializer_cursor::Shape;
             switch (shape(t)) {
                 case Shape::Struct:
                 case Shape::Union:
-                    return static_cast<std::uint32_t>(l_.interner.operands(t).size());
+                    return static_cast<std::uint64_t>(l_.interner.operands(t).size());
                 case Shape::Array: {
                     auto const scals = l_.interner.scalars(t);
                     // ★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT: a negative
                     // length is the incomplete / VLA sentinel — no element count.
                     if (scals.empty() || scals[0] < 0) return std::nullopt;
-                    return static_cast<std::uint32_t>(scals[0]);
+                    return static_cast<std::uint64_t>(scals[0]);
                 }
                 case Shape::Scalar: break;
             }
@@ -10679,12 +10702,26 @@ struct Lowerer {
                 return synthZeroOrError(braceInitListNode, contextType);
             }
         }
+        // The placement cursor judges the level's object FIRST: an array longer than its
+        // index space (`initializer_cursor::kMaxLength`) is refused here, BEFORE
+        // `initSlotAsAggregate` builds one slot per element. P68 round 9 (lane `cs`):
+        // the length was narrowed to 32 bits right here, so a declared length of
+        // exactly 2^32 was refused as "zero slots" and 2^32 + 1 went on to build four
+        // billion slots.
+        initializer_cursor::Cursor placement{contextType, braceView_};
+        if (auto const tooLong = placement.unrepresentableObjectLength()) {
+            return reportedError(braceInitListNode,
+                std::format("this brace initializer initializes an array of {} elements, past "
+                            "this implementation's limit of {} elements for an array a brace "
+                            "list initializes (the lowering builds one slot per element)",
+                            *tooLong, initializer_cursor::kMaxLength));
+        }
         if (!isUnion) {
-            std::uint32_t slotCount = 0;
+            std::uint64_t slotCount = 0;
             if (isStruct) {
-                slotCount = static_cast<std::uint32_t>(interner.operands(contextType).size());
+                slotCount = interner.operands(contextType).size();
             } else if (auto const scals = interner.scalars(contextType); !scals.empty()) {
-                slotCount = static_cast<std::uint32_t>(scals[0]);
+                slotCount = static_cast<std::uint64_t>(scals[0]);   // >= 0: the sentinels returned above
             }
             if (slotCount == 0) {
                 return reportedError(braceInitListNode,
@@ -10713,8 +10750,14 @@ struct Lowerer {
         f.root.slotType = contextType;
         // A structure's / array's aggregate has one child per member / element from
         // the start; a union's one member slot is made by the write that selects it.
-        if (!isUnion) initSlotAsAggregate(f.root);
-        f.placement.emplace(contextType, braceView_);
+        if (!isUnion && !initSlotAsAggregate(f.root)) {
+            // Unreachable while the cursor's verdict above holds: it is the slot
+            // builder's own refusal to build past the cursor's index space.
+            return reportedError(braceInitListNode,
+                "internal invariant broken: a brace initializer's object is longer than "
+                "the placement cursor's index space, and no slot was built for it");
+        }
+        f.placement.emplace(std::move(placement));
         for (NodeId elem : visible(braceInitListNode)) {
             if (isToken(elem)) continue;
             if (tree().kind(elem) != NodeKind::Internal) continue;
@@ -10745,7 +10788,10 @@ struct Lowerer {
             // so a chain like `.a.v = 1` resolves `.v` in field `.a`'s
             // scope (the InitSlot tree's `nested` substrate is what makes
             // the multi-step write semantically right).
-            std::vector<std::uint32_t> designatorPath;
+            // FULL width: the placement cursor, not this walk, decides what fits its
+            // index space (P68 round 9, lane `cs`: an index was narrowed to 32 bits
+            // here, so `{[4294967296] = 7}` landed in element 0).
+            std::vector<std::uint64_t> designatorPath;
             TypeId designatorCurrentType = f.contextType;
             bool designatorFailed = false;
             NodeId valueExprCst{};
@@ -10880,7 +10926,7 @@ struct Lowerer {
                         continue;
                     }
                     designatorCurrentType = ops[0];
-                    designatorPath.push_back(static_cast<std::uint32_t>(*idx));
+                    designatorPath.push_back(static_cast<std::uint64_t>(*idx));   // >= 0: lossless
                     continue;
                 }
                 valueExprCst = c;
@@ -10898,7 +10944,7 @@ struct Lowerer {
             // the cursor's, so a deep designator continues INSIDE its aggregate.
             NodeId const valueCore = peelToBraceInitOrCore(valueExprCst);
             initializer_cursor::Placement const placed = f.placement->place(
-                std::span<std::uint32_t const>{designatorPath}, isBraceInitList(valueCore),
+                std::span<std::uint64_t const>{designatorPath}, isBraceInitList(valueCore),
                 [&](TypeId t) { return initializesWhole(valueCore, t); });
             using PlacementKind = initializer_cursor::Placement::Kind;
             if (placed.kind == PlacementKind::Excess) {
@@ -10935,6 +10981,25 @@ struct Lowerer {
                 // misplaces the value (`r9d`), which is no semantics to follow.
                 reportedError(elem,
                     "init element targets position out of aggregate range");
+                continue;
+            }
+            if (placed.kind == PlacementKind::Unrepresentable) {
+                // P68 round 9 (lane `cs`): an element the cursor's index space cannot
+                // hold — an array inside this level longer than
+                // `initializer_cursor::kMaxLength`, or an index past it — is refused
+                // LOUDLY; it was narrowed to 32 bits and placed at the wrapped index.
+                reportedError(elem,
+                    placed.beyondIsLength
+                        ? std::format("this element is placed inside an array of {} elements, "
+                                      "past this implementation's limit of {} elements for an "
+                                      "array a brace list initializes (the lowering builds one "
+                                      "slot per element)",
+                                      placed.beyond, initializer_cursor::kMaxLength)
+                        : std::format("this element is placed at index {}, past this "
+                                      "implementation's limit of {} elements for an array a "
+                                      "brace list initializes (the lowering builds one slot per "
+                                      "element)",
+                                      placed.beyond, initializer_cursor::kMaxLength));
                 continue;
             }
             return BraceDescent{.path            = placed.path,

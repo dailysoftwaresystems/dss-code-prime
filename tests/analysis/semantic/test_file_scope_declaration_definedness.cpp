@@ -300,6 +300,8 @@ TEST(FileScopeDeclarationDefinedness, AutoFileScopeInfersTheInitializersType) {
         "auto c = (char)3;\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const& in = model.lattice().interner();
     auto const* d = symbolNamed(model, "d");
     auto const* s = symbolNamed(model, "s");

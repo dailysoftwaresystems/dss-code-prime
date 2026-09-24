@@ -49,11 +49,13 @@ public:
     AsmTextLowering(Tree const& tree, GrammarSchema const& grammar,
                     TargetSchema const& target,
                     std::span<std::string const> entryNames,
-                    DiagnosticReporter& reporter)
+                    DiagnosticReporter& reporter,
+                    std::optional<ObjectFormatKind> formatKind)
         : tree_(tree), grammar_(grammar), target_(target),
           cfg_(grammar.assembly()), entryNames_(entryNames),
           builder_(target), sink_(tree, grammar, target, reporter),
-          engine_(tree, grammar, target, builder_, sink_, *this) {}
+          engine_(tree, grammar, target, builder_, sink_, *this),
+          formatKind_(formatKind) {}
 
     std::optional<AsmTextModule> run() {
         // ⚠ NOT AN ASSERT. A driver that routes a non-dialect grammar here is a
@@ -303,6 +305,46 @@ public:
         return sym;
     }
 
+    // The object format this unit is assembled for (P68 round 9) — only a key
+    // into the dialect's `symbolParts`; see the interface.
+    [[nodiscard]] std::optional<ObjectFormatKind>
+    objectFormatKind() const override {
+        return formatKind_;
+    }
+
+    // ★★ A BLOCK OF THE OPEN FUNCTION, FOR AN INSTRUCTION THAT ADDRESSES ONE IN
+    // A FIELD (P68 round 9: `adr x1, 1f`). An interior label of this function —
+    // named or numeric — is one; an entry, a data label, another function's
+    // label and a name this file does not define are not, and take the symbol
+    // route (nullopt, no diagnostic). The location counter never reaches here:
+    // the engine takes it as the instruction's own address.
+    // ★ ITS ADDRESS IS TAKEN, so it carries a symbol, bound to its block after
+    // the walk exactly as a symbolic displacement's label is: that symbol is
+    // what `derivableIndirectSuccessors` reads, and `adr x1, 1f` + `br x1` is
+    // the computed jump that needs the block in the indirect branch's set.
+    [[nodiscard]] std::optional<LirBlockId>
+    resolveLocalBlock(std::string const& symbol, NodeId at) override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        if (hit.kind != LabelLookup::Found) return std::nullopt;
+        auto const& L = labels_[hit.index];
+        if (L.isEntry || L.isData || L.functionLabel != openFunctionLabel_
+            || L.functionLabel == kNoLabel) {
+            return std::nullopt;
+        }
+        (void)symbolForAddressedLabel(hit.index);
+        displacedLabels_.push_back(DisplacedLabel{hit.index, at});
+        return L.block;
+    }
+
+    // A function entry or a label inside a function — this file's CODE — as
+    // opposed to a data label or a name this file does not define. See the
+    // interface.
+    [[nodiscard]] bool namesCodeHere(std::string const& symbol,
+                                     NodeId at) const override {
+        LabelHit const hit = lookupLabel(symbol, at);
+        return hit.kind == LabelLookup::Found && isCodeLabel(labels_[hit.index]);
+    }
+
     // ⚠ A BRANCH TARGET IS FUNCTION-LOCAL: `LirOperand::makeBlockRef` names a
     // block slot, and a slot from another function would silently resolve to
     // whatever block sits at that index here.
@@ -441,7 +483,24 @@ private:
         return static_cast<std::uint32_t>(tree_.span(at).start());
     }
 
+    // Is `symbol` this dialect's location counter (`.` in GNU as)?
+    [[nodiscard]] bool isLocationCounter(std::string_view symbol) const {
+        return !cfg_.locationCounter.empty()
+            && cfg_.spellingMatches(cfg_.locationCounter, symbol);
+    }
+
     [[nodiscard]] LabelHit lookupLabel(std::string const& symbol, NodeId at) const {
+        // ★★ THE LOCATION COUNTER NAMES THE LINE BEING LOWERED (P68 round 9):
+        // the block pass 1 planned to begin at it (`planInstruction`). A line
+        // that spells it and has no such block is a plan/walk disagreement,
+        // reported as an unresolved reference — never an import named `.`.
+        if (isLocationCounter(symbol)) {
+            if (auto const it = locationLabelAt_.find(loweringStatement_.v);
+                it != locationLabelAt_.end()) {
+                return LabelHit{LabelLookup::Found, it->second};
+            }
+            return LabelHit{LabelLookup::UnresolvedLocal};
+        }
         if (auto const it = labelIndex_.find(symbol); it != labelIndex_.end()) {
             return LabelHit{LabelLookup::Found, it->second};
         }
@@ -456,6 +515,13 @@ private:
 
     [[nodiscard]] std::string unresolvedLocalMessage(std::string const& symbol,
                                                      std::string_view mnemonic) {
+        if (isLocationCounter(symbol)) {
+            return std::format(
+                "'{}' names the location counter `{}` where this build does not "
+                "resolve it — only a branch target, a field that takes a "
+                "location of its own function, or a data slot takes it{}",
+                mnemonic, symbol, sink_.pairSuffix());
+        }
         auto const ref  = localReference(symbol);
         bool const back = ref.has_value()
                        && ref->direction == asm_local_labels::Direction::Backward;
@@ -551,6 +617,12 @@ private:
         bool        isData   = false;
         std::size_t dataItem = kNoLabel;   // index into `dataItems_`
     };
+
+    // Does this label name a location in this file's CODE — a function entry,
+    // or a label inside a function (P68 round 9, `namesCodeHere`)?
+    [[nodiscard]] static bool isCodeLabel(LabelInfo const& L) noexcept {
+        return L.isEntry || (!L.isData && L.functionLabel != kNoLabel);
+    }
 
     // ★★★ THE BLOCK PLAN — WHERE EVERY BLOCK OF THE TEXT BEGINS, IN TEXT ORDER
     // (P68 round 8,
@@ -655,6 +727,7 @@ private:
             // A CODE label begins a block (see `BlockStart`).
             info.start = starts_.size();
             recordStart(BlockStart{labels_.size()});
+            freshLabelStart_ = labels_.size();
         }
         labels_.push_back(std::move(info));
         return true;
@@ -680,19 +753,49 @@ private:
     // lowering cannot disagree about a line. ⚠ The statement shape is read
     // exactly as `emitElement` reads it. An instruction in a DATA section is
     // refused by the emit walk and plans nothing.
+    //
+    // ★★ A LINE THAT BRANCHES TO THE LOCATION COUNTER (`b .`, `cbz x0, .` —
+    // P68 round 9) NAMES ITS OWN ADDRESS AS A SUCCESSOR, so a block must begin
+    // at it: the label just before it when it is the first line after one, and
+    // otherwise a label of its own, under a name no source can spell (`.#1`,
+    // the numeric labels' convention), which every later pass treats as the
+    // label it is — an interior block, entered by the emit walk before the
+    // line is lowered. ✔MEASURED 2026-09-23, gas 2.42 and clang 18: `b .` =
+    // 0x14000000, no relocation. ⚠ ONLY A BRANCH: a line that merely ADDRESSES
+    // the location counter (`adr x7, .+8`) takes it as the instruction's own
+    // address (`LirOperandKind::LocationCounter`) and begins no block, because
+    // a block here would put a fall-through jump in front of it and move every
+    // `.±N` that spans it (D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP).
     void planInstruction(NodeId statement) {
+        std::size_t const freshLabel = freshLabelStart_;
+        freshLabelStart_ = kNoLabel;
         if (scanSection_.has_value()) return;
         auto const kids = visibleChildren(tree_, statement);
         if (kids.empty()) return;
         NodeId const rawTail = kids.size() > 1 ? kids[1] : NodeId{};
-        if (planEffect_ != AsmBlockEffect::None) {
+        NodeId const operandSeq =
+            findDescendantOfRule(tree_, rawTail, cfg_.operandSeqRule);
+        AsmBlockEffect const effect = engine_.blockEffectOf(kids.front(), operandSeq);
+        if (effect != AsmBlockEffect::None
+            && engine_.spellsLocationCounter(operandSeq)) {
+            if (planEffect_ == AsmBlockEffect::None && freshLabel != kNoLabel) {
+                locationLabelAt_.emplace(statement.v, freshLabel);
+            } else {
+                std::size_t const index = labels_.size();
+                if (!collectLabel(std::format("{}#{}", cfg_.locationCounter,
+                                              ++locationLabelCount_),
+                                  statement)) {
+                    return;
+                }
+                freshLabelStart_ = kNoLabel;
+                locationLabelAt_.emplace(statement.v, index);
+            }
+        } else if (planEffect_ != AsmBlockEffect::None) {
             anonStartAt_.emplace(statement.v, starts_.size());
             recordStart(BlockStart{kNoLabel, statement,
                                    /*falseEdge=*/planCondBr_.valid()});
         }
-        planEffect_ = engine_.blockEffectOf(
-            kids.front(),
-            findDescendantOfRule(tree_, rawTail, cfg_.operandSeqRule));
+        planEffect_ = effect;
         if (planEffect_ == AsmBlockEffect::FallsThrough) planCondBr_ = statement;
     }
 
@@ -1231,12 +1334,48 @@ private:
                              sink_.pairSuffix()));
             return false;
         }
+        // A data slot holds a WHOLE address: a part of one (`.quad :lo12:msg`)
+        // is an instruction field's business (P68 round 9).
+        if (operand.symbolPart != SymbolAddressPart::Whole) {
+            sink_.fail(operand.node,
+                 std::format("'.{}' writes the {} of '{}', and a data slot holds "
+                             "a whole address — a part of one is what an "
+                             "instruction field takes{}",
+                             spelling, symbolAddressPartPhrase(operand.symbolPart),
+                             operand.symbol, sink_.pairSuffix()));
+            return false;
+        }
         auto& item = dataItems_[itemIdx];
         PendingDataReloc pending;
         pending.itemIndex  = itemIdx;
         pending.byteOffset = static_cast<std::uint32_t>(item.bytes.size());
         pending.name       = operand.symbol;
         pending.addend     = operand.symbolAddend;
+        // ★★ THE LOCATION COUNTER IN A DATA SLOT IS THE SLOT'S OWN ADDRESS (P68
+        // round 9): ✔MEASURED 2026-09-23, gas 2.42 writes `.quad .` as
+        // R_AARCH64_ABS64 against the item at the slot's offset. So it
+        // relocates against the label that opened this item, the slot's offset
+        // added to what was written after the dot. An item no label opened has
+        // no symbol to be relative to, and is refused by name.
+        if (isLocationCounter(operand.symbol)) {
+            std::size_t opener = kNoLabel;
+            for (std::size_t l = 0; l < labels_.size(); ++l) {
+                if (labels_[l].isData && labels_[l].dataItem == itemIdx) {
+                    opener = l;
+                }
+            }
+            if (opener == kNoLabel) {
+                sink_.fail(operand.node,
+                     std::format("'.{}' names the location counter `{}` in data "
+                                 "no label opened, so there is no symbol its "
+                                 "address could be written relative to — label "
+                                 "the data{}",
+                                 spelling, operand.symbol, sink_.pairSuffix()));
+                return false;
+            }
+            pending.name    = labels_[opener].name;
+            pending.addend += static_cast<std::int64_t>(pending.byteOffset);
+        }
         pending.at         = operand.node;
         pending.kind       = *kind;
         pending.spelling   = std::string{spelling};
@@ -1558,9 +1697,21 @@ private:
                 cur = elementInLabelTail(tail);
                 continue;
             }
+            // The block a line BRANCHING to the location counter begins, when
+            // pass 1 gave it a label of its own: entered here, where the text
+            // puts it (a fall-through into it is written down as for any
+            // label).
+            if (auto const it = locationLabelAt_.find(cur.v);
+                it != locationLabelAt_.end()
+                && labels_[it->second].at.v == cur.v) {
+                enterLabelIndex(it->second, cur);
+                if (!sink_.ok()) return;
+            }
+            loweringStatement_ = cur;
             engine_.lowerStatement(cur, name,
                                    findDescendantOfRule(tree_, rawTail,
                                                         cfg_.operandSeqRule));
+            loweringStatement_ = NodeId{};
             return;
         }
     }
@@ -2523,11 +2674,12 @@ private:
     // because carrying a symbol is exactly what
     // `derivableIndirectSuccessors()` reads as "this block's address was
     // taken". That is the obligation the comment below states, and it is why
-    // this function is private to the two callers that bind a relocation:
-    // `sourceOperandForSymbol` (an address-materializing instruction) and
-    // `bindPendingDataSymbols` (a symbol-valued data slot). A third caller with
-    // any other motive would WIDEN the successor set of every indirect branch
-    // in the function.
+    // this function is private to the callers that take a label's ADDRESS:
+    // `sourceOperandForSymbol` (an address-materializing instruction),
+    // `bindPendingDataSymbols` (a symbol-valued data slot), the symbolic
+    // displacement and `resolveLocalBlock` (an address resolved at assemble
+    // time — `adr x1, 1f`, P68 round 9). A caller with any other motive would
+    // WIDEN the successor set of every indirect branch in the function.
     [[nodiscard]] SymbolId symbolForAddressedLabel(std::size_t labelIdx) {
         auto& L = labels_[labelIdx];
         if (!L.symbol.valid()) L.symbol = mintSymbol();
@@ -2571,6 +2723,23 @@ private:
             }
             p.labelIndex = hit.index;
             auto const& L = labels_[p.labelIndex];
+            // ⚠ A CONSTANT ADDED TO A CODE LABEL (`.quad main+4`, `.quad 1f+8`
+            // — P68 round 9) is a byte distance in the reference assembler's
+            // code layout, which this build does not reproduce; refused rather
+            // than written as another byte. The same refusal the instruction
+            // engine makes for an operand (`namesCodeHere`).
+            if (p.addend != 0 && isCodeLabel(L)) {
+                sink_.fail(p.at,
+                     std::format("'.{}' writes the address of '{}' plus {}, a "
+                                 "location in this file's CODE, and this build "
+                                 "does not lay code out as the reference "
+                                 "assembler does (a jump it synthesizes at a "
+                                 "block's end; x86's long branch and immediate "
+                                 "forms), so the byte it names would not be the "
+                                 "reference's — label the instruction you mean{}",
+                                 p.spelling, p.name, p.addend, sink_.pairSuffix()));
+                return false;
+            }
             // An entry or data label already carries its symbol; only an
             // interior BLOCK label is minted here, and minting it is precisely
             // the act that makes its block address-taken.
@@ -2810,6 +2979,18 @@ private:
     std::unordered_map<std::uint32_t, std::size_t>  fallStartOf_;
     AsmBlockEffect                                  planEffect_ = AsmBlockEffect::None;
     NodeId                                          planCondBr_{};
+    // P68 round 9, the location counter as a BRANCH TARGET: the code label
+    // whose block no line has entered yet (the one a `b .` on the next line
+    // names), the label each line branching to `.` names (by statement node),
+    // how many such labels were minted, and the line the emit walk is lowering
+    // (what `.` means there).
+    std::size_t                                     freshLabelStart_ = kNoLabel;
+    std::unordered_map<std::uint32_t, std::size_t>  locationLabelAt_;
+    std::uint32_t                                   locationLabelCount_ = 0;
+    NodeId                                          loweringStatement_{};
+    // The object format kind this unit is assembled for — a KEY into the
+    // dialect's `symbolParts` (P68 round 9).
+    std::optional<ObjectFormatKind>                 formatKind_;
     // The emit walk's half: a false edge past the open function's last start
     // (`fallthroughAfter`), and whether the open block is one no control
     // reaches (`openBlockAfterTerminator`).
@@ -2879,8 +3060,10 @@ std::optional<AsmTextModule>
 lowerAsmTextToLir(Tree const& tree, GrammarSchema const& grammar,
                   TargetSchema const& target,
                   std::span<std::string const> entryNames,
-                  DiagnosticReporter& reporter) {
-    AsmTextLowering lowering{tree, grammar, target, entryNames, reporter};
+                  DiagnosticReporter& reporter,
+                  std::optional<ObjectFormatKind> formatKind) {
+    AsmTextLowering lowering{tree, grammar, target, entryNames, reporter,
+                             formatKind};
     return lowering.run();
 }
 

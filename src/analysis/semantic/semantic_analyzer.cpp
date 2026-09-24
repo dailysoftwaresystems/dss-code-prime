@@ -454,6 +454,22 @@ struct EngineState {
     // `coreByDataModel` overrides), the integer-literal ladder, and the
     // shipped-lib descriptor reader. Set ONCE before any index is built.
     DataModel                  dataModel = DataModel::Lp64;
+    // P68 round 10 (lane `cs`): the usual arithmetic conversions' rules, RESOLVED ONCE
+    // per schema for `dataModel` (`resolveArithmeticRules`, which now also derives the
+    // unsigned-counterpart map from the type-specifier rows — too dear to rebuild on
+    // every `subtreeType` call that misses its two fast exits, as the old per-call
+    // resolve did). Keyed by the schema's semantics block (a unit may mix schemas);
+    // `dataModel` is set before any index is built, so an entry never goes stale.
+    // Mutable for the reason `subtreeType` const-casts the interner: every caller owns
+    // a non-const EngineState.
+    mutable std::unordered_map<SemanticConfig const*, std::optional<ResolvedArithmeticRules>>
+                               arithRulesBySchema;
+    [[nodiscard]] std::optional<ResolvedArithmeticRules> const&
+    arithRulesFor(SemanticConfig const& sem) const {
+        auto [it, inserted] = arithRulesBySchema.try_emplace(&sem);
+        if (inserted) it->second = resolveArithmeticRules(sem, dataModel);
+        return it->second;
+    }
     // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the analysis-time `long double` axis
     // (`analyze()`'s parameter — effectiveLongDoubleFormat(target, format)).
     // Read by `buildIndexes` (the `coreByLongDoubleFormat` typeSpecifiers
@@ -11038,17 +11054,18 @@ public:
             default:               return Shape::Scalar;
         }
     }
-    [[nodiscard]] std::optional<std::uint32_t> count(TypeId t) const override {
+    // The FULL length: the cursor owns the 32-bit limit (it narrowed silently here).
+    [[nodiscard]] std::optional<std::uint64_t> count(TypeId t) const override {
         using initializer_cursor::Shape;
         TypeInterner const& in = s_.lattice.interner();
         switch (shape(t)) {
             case Shape::Struct:
             case Shape::Union:
-                return static_cast<std::uint32_t>(in.operands(t).size());
+                return static_cast<std::uint64_t>(in.operands(t).size());
             case Shape::Array: {
                 auto const scals = in.scalars(t);
                 if (scals.empty() || scals[0] < 0) return std::nullopt;   // unknown / VLA
-                return static_cast<std::uint32_t>(scals[0]);
+                return static_cast<std::uint64_t>(scals[0]);
             }
             case Shape::Scalar: break;
         }
@@ -11140,12 +11157,13 @@ private:
 }
 
 // One brace element's designation, resolved to member / element indices against
-// `object` — the path the placement cursor takes — and its value node. `resolved`
-// is false when a designator does not resolve (an unknown member, an index that is
-// not a non-negative integer constant, a step into a scalar): the element then
-// claims no size here and the HIR tier's walk refuses it loudly.
+// `object` — the path the placement cursor takes, at FULL width (the cursor, not this
+// resolver, decides what fits its index space) — and its value node. `resolved` is
+// false when a designator does not resolve (an unknown member, an index that is not
+// a non-negative integer constant, a step into a scalar): the element then claims no
+// size here and the HIR tier's walk refuses it loudly.
 struct ResolvedBraceElement {
-    std::vector<std::uint32_t> designator;
+    std::vector<std::uint64_t> designator;
     NodeId                     value{};
     bool                       resolved = true;
 };
@@ -11206,7 +11224,7 @@ resolveBraceElement(EngineState& s, Tree const& tree, NodeId element, TypeId obj
             }
             auto const kv = constIntExpr(s, tree, indexKids.front(), scope, &sem);
             if (!kv.has_value() || *kv < 0) { out.resolved = false; return out; }
-            out.designator.push_back(static_cast<std::uint32_t>(*kv));
+            out.designator.push_back(static_cast<std::uint64_t>(*kv));   // non-negative: lossless
             cur = interner.operands(cur)[0];
             continue;
         }
@@ -11364,8 +11382,8 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                 if (!el.resolved) continue;
                 bool const isList =
                     peelSingleChildrenTo(tree, el.value, idx.braceInitListRule).valid();
-                (void)cursor.place(
-                    std::span<std::uint32_t const>{el.designator}, isList, [&](TypeId t) {
+                initializer_cursor::Placement const placed = cursor.place(
+                    std::span<std::uint64_t const>{el.designator}, isList, [&](TypeId t) {
                         // C 6.7.9p13-p14: the value initializes the subobject WHOLE —
                         // a string for a character array, an expression of the
                         // structure's or union's own type — instead of being elided
@@ -11378,6 +11396,32 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                         TypeId const vt = subtreeType(s, tree, el.value, scope);
                         return vt.valid() && interner.stripVolatile(vt) == interner.stripVolatile(t);
                     });
+                // P68 round 9 (lane `cs`): an element the cursor cannot hold — an index
+                // designator (or the positional run after one) sizing this array past
+                // `kMaxLength`, or an array that long inside it — is refused HERE, loudly.
+                // The index was narrowed to 32 bits, so `int a[] = {[4294967296] = 7}`
+                // was sized ONE element and built SILENTLY (✔MEASURED `.temp/probe/dx`
+                // dx05; gcc 13.3.0 builds it and the run faults on its 16 GiB stack
+                // array, clang 18.1.3 builds it with a frame-size warning and runs).
+                if (placed.kind == initializer_cursor::Placement::Kind::Unrepresentable) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_ArrayLengthOutOfRange;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(e);
+                    d.actual   = placed.beyondIsLength
+                        ? std::format("this brace initializer places an element inside an array of "
+                                      "{} elements, past this implementation's limit of {} elements "
+                                      "for an array a brace list initializes",
+                                      placed.beyond, initializer_cursor::kMaxLength)
+                        : std::format("this brace initializer places an element at index {}, which "
+                                      "would size the array past this implementation's limit of {} "
+                                      "elements for an array a brace list initializes (C 6.7.9p22 "
+                                      "sizes it by its largest index plus one)",
+                                      placed.beyond, initializer_cursor::kMaxLength);
+                    s.reporter.report(std::move(d));
+                    return InvalidType;
+                }
             }
             std::int64_t const size = cursor.extent();
             if (size <= 0) return failUnsized();
@@ -20546,14 +20590,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     // `arithmeticConversions` engine when declared, else the legacy interner
     // rule (toy/tsql keep `TypeInterner::commonType` byte-identically).
     auto const& sem = tree.schema().semantics();
-    std::optional<ResolvedArithmeticRules> arith;
-    if (sem.arithmeticConversions.has_value()) {
-        arith = resolveArithmeticRules(*sem.arithmeticConversions, s.dataModel);
-        // D-CSUBSET-BITINT: inject the `_BitInt`-conversions flag (a separate
-        // top-level flag, mirroring the cst_to_hir resolve site) so the semantic-
-        // tier expression typer agrees with the HIR lowering on a BitInt common type.
-        arith->bitIntConversions = sem.bitIntConversions;
-    }
+    // THE ONE RESOLVER both tiers ask (`resolveArithmeticRules`, type_rules.hpp): the
+    // block for this data model, the `_BitInt` flag and the unsigned-counterpart map —
+    // resolved once per schema (`arithRulesFor`), not on every call.
+    std::optional<ResolvedArithmeticRules> const& arith = s.arithRulesFor(sem);
     auto const commonArithType = [&](TypeId a, TypeId b) -> TypeId {
         if (arith.has_value()) {
             return usualArithmeticCommonType(interner, a, b, *arith);
@@ -20752,15 +20792,29 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                                            s.dataModel, TypeKind::I64);
                 }
             }
-            // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): `n + p` (Int LHS, Ptr RHS,
-            // the commutative add form) is a POINTER, not the integer. `p + n`
-            // and `p - n` already fall through to `lt` (the Ptr) via the default
-            // below. This arm only fixes the int-on-LEFT add (else `n + p` would
-            // wrongly type as Int → a pointer-arg use would fail isAssignable).
-            if (*op == HirOpKind::Add && lt.valid() && rt.valid()
-                && interner.kind(lt) != TypeKind::Ptr
-                && interner.kind(rt) == TypeKind::Ptr) {
-                return rt;   // Ptr<T>
+            // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC): pointer ± integer is a POINTER,
+            // on either side of `+` (`n + p` is the commutative form).
+            // ★ P68 round 9 (lane `cs`; routed by the coordinator from lane mig's
+            // `int x = 1 + "never";`): an ARRAY operand of `+` / `-` decays FIRST (C
+            // 6.3.2.1p3), exactly as the HIR's Gep does — the arm tested `kind(rt) ==
+            // Ptr` only, so `n + arr` typed as the INTEGER and `arr ± n` as the ARRAY
+            // itself. The HIR was right (it builds the element pointer) and every reader
+            // of the SEMANTIC stamp was wrong: ✔MEASURED 2026-09-23 on each reference
+            // separately, every program RUN (`.temp/probe/sl`, `sl2`, `sl3`) —
+            // `sizeof(a + 1)` ran 40 and `sizeof(1 + a)` 4 on DSS where gcc 13.3.0,
+            // clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 all run 8 (for a string
+            // literal operand MSVC alone runs 6; ISO C and the other three run 8);
+            // `_Generic(1 + a, int *: …)` missed; `int x = 1 + "never";` drew NO
+            // diagnostic (gcc and mingw at c2x and MSVC warn, clang refuses) while
+            // `char const *s = 1 + "never";` drew a WRONG integer-to-pointer one.
+            if ((*op == HirOpKind::Add || *op == HirOpKind::Sub) && lt.valid()
+                && rt.valid()) {
+                TypeId const ltD = decayArray(lt);
+                TypeId const rtD = decayArray(rt);
+                bool const lP = interner.kind(ltD) == TypeKind::Ptr;
+                bool const rP = interner.kind(rtD) == TypeKind::Ptr;
+                if (*op == HirOpKind::Add && !lP && rP) return rtD;   // n + p, n + arr
+                if (lP && !rP) return ltD;                            // p ± n, arr ± n
             }
         }
         TypeId const common = commonArithType(lt, rt);

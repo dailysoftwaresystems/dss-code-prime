@@ -581,9 +581,11 @@ bool synthesizeSehFunclets(Mir&                                  mir,
                 if (foundEnd) break;
             }
             if (!foundEnd || r.bodyBlocks.empty()) {
+                // Anchored: D-CSUBSET-SEH-EARLY-EXIT (a return or goto out of a `__try`).
                 emitErr(reporter, "synthesizeSehFunclets: the guarded body has no "
-                        "SehTryEnd fall-through exit (an early return/goto out of a "
-                        "__try is D-CSUBSET-SEH-EARLY-EXIT) (D-WIN64-SEH-FUNCLETS)");
+                        "SehTryEnd fall-through exit (a return or goto that leaves a "
+                        "__try block is not supported: leave it through its end) "
+                        "(D-WIN64-SEH-FUNCLETS)");
                 return false;
             }
             // The scope PC range is [begin, end). SehParentPolicy lays the body out
@@ -616,6 +618,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
     // usable for every program that does not use SEH. The gate fires only when a
     // guarded region actually resolved and therefore actually needs a handler.
     if (!sehPersonality.has_value()) {
+        // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION (the personality routine's image).
         emitErr(reporter, std::format(
                     "synthesizeSehFunclets: {} SEH region(s) resolved but object "
                     "format '{}' declares NO `sehPersonality` block, so there is "
@@ -636,7 +639,7 @@ bool synthesizeSehFunclets(Mir&                                  mir,
                     "(the pe64 exec and dll arms do; both were witnessed by "
                     "RUNNING a guarded division-by-zero through to its "
                     "`__except`). See D-LK-PE-OBJ-ARM-CARRIES-NO-UNWIND-INFO. "
-                    "(D-WIN64-SEH-FUNCLETS + D-FFI-PE-CRT-UCRT-MIGRATION.)",
+                    "(D-WIN64-SEH-FUNCLETS.)",
                     regions.size(), formatName));
         return false;
     }

@@ -1401,11 +1401,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
     auto const errorsBeforeCuBuild = reporter.errorCount();
     auto const emitNullNoDiagnostic = [&](char const* where) {
         if (reporter.errorCount() == errorsBeforeCuBuild) {
+            // Anchored: D-CSUBSET-TESTTU-SILENT-EXIT1 (the fail-loud net).
             emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
                        std::string{"internal: "} + where
                            + " returned a null module without reporting any "
-                             "diagnostic — substrate-contract violation "
-                             "(D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net).");
+                             "diagnostic — substrate-contract violation: a "
+                             "failing tier must say why.");
         }
     };
     // ── plan 29 P4: THE `encode` PIPELINE ENTRY ────────────────────────────
@@ -2336,11 +2337,12 @@ compileOneTarget(                   std::span<CompilationUnit const> cus,
             }
             auto const family = dss::ffi::shimFamilyOf(bare);
             if (!family.has_value()) {
+                // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION.
                 dss::report(reporter, DiagnosticCode::D_SynthRecipeFamilyUnknown,
                             DiagnosticSeverity::Error,
                             std::format(
                                 "synthesize recipe '{}' (symbol {{ {} }}) belongs to no "
-                                "known shim family (D-FFI-PE-CRT-UCRT-MIGRATION) — "
+                                "known shim family — "
                                 "internal invariant breach: the descriptor loader should "
                                 "have rejected an unknown recipe id at read time "
                                 "(isKnownSynthesizeRecipe)",
@@ -2945,7 +2947,9 @@ class LanguageBlockExtensionReader {
 // The per-invocation memo for the shipped-source units' extension⇒language
 // resolution. TWO fields, and they answer different questions:
 //
-//   * `claimantsByExtension` — WHICH language documents declare each extension.
+//   * `claimantsByExtension` — WHICH language documents declare each extension,
+//     each claimant carried AS its document (the stem `loadShipped` takes and
+//     the file it was read from), so a refusal names the FILE an operator fixes.
 //     Read off the documents ONCE per invocation (the whole `sources/` corpus
 //     in one directory walk), because it is a property of the config tree, not
 //     of the file being resolved. Every additional realized unit is then a map
@@ -2960,7 +2964,7 @@ class LanguageBlockExtensionReader {
 // stable within one invocation would be an unstated assumption, and this is
 // cheaper than the assumption.
 struct ShippedSourceLanguageCache {
-    std::map<std::string, std::vector<std::string>>             claimantsByExtension;
+    std::map<std::string, std::vector<ShippedConfigDocument>>   claimantsByExtension;
     std::map<std::string, std::shared_ptr<GrammarSchema const>> grammarByName;
     fs::path                                                    indexedDir;
 };
@@ -3033,6 +3037,18 @@ struct ShippedSourceLanguage {
     [[nodiscard]] explicit operator bool() const { return grammar != nullptr; }
 };
 
+// Each claimant AND the document it was read from, for a refusal that has to be
+// actionable: the operator deletes or fixes a FILE, so the file is what is named.
+[[nodiscard]] std::string claimantDocuments(
+    std::vector<ShippedConfigDocument> const& claimants) {
+    std::string out;
+    for (auto const& claimant : claimants) {
+        if (!out.empty()) out += ", ";
+        out += "'" + claimant.stem + "' from " + core::genericSpelling(claimant.path);
+    }
+    return out;
+}
+
 [[nodiscard]] ShippedSourceLanguage resolveShippedSourceGrammar(
     fs::path const&             path,
     ShippedSourceLanguageCache& cache,
@@ -3050,38 +3066,41 @@ struct ShippedSourceLanguage {
 
     if (cache.indexedDir != *sourcesDir) {
         cache.claimantsByExtension.clear();
-        std::error_code ec;
-        for (fs::directory_iterator it{*sourcesDir, ec}, end; it != end;
-             it.increment(ec)) {
-            if (ec) break;
-            if (!it->is_regular_file(ec)) continue;
-            std::string const leaf = it->path().filename().generic_string();
-            auto const        dot  = leaf.find(".lang.json");
-            if (dot == std::string::npos) continue;
-            std::string const name = leaf.substr(0, dot);
-            for (auto const& declared : declaredFileExtensionsOf(it->path())) {
+        // THE ONE OWNER of which files ARE language documents: exactly
+        // `<stem>.lang.json`, so an editor's or a merge's stray beside them
+        // (`c.lang.json.orig`, `zz.lang.json.bak`) is no claimant; a listing that
+        // fails, or stops part-way, is refused rather than read as the corpus.
+        // [[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]
+        auto const documents = shippedConfigDocuments(*sourcesDir, ".lang.json");
+        if (!documents.has_value()) {
+            emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
+                       "shipped-source realization: " + documents.error()
+                           + ", so no front end can be chosen for '"
+                           + core::genericSpelling(path) + "'");
+            return {};
+        }
+        // The documents arrive in the owner's STEM order and are visited once
+        // each, so every claimant list is in stem order too: the claimant set is
+        // a property of the CORPUS, not of the host filesystem's iteration order
+        // (sorted on NTFS, hash-ordered on ext4).
+        for (auto const& document : *documents) {
+            for (auto const& declared : declaredFileExtensionsOf(document.path)) {
                 auto& claimants = cache.claimantsByExtension[declared];
                 // A document that declares one extension twice is ONE claimant.
-                if (std::find(claimants.begin(), claimants.end(), name)
-                    == claimants.end())
-                    claimants.push_back(name);
+                if (claimants.empty() || claimants.back().stem != document.stem)
+                    claimants.push_back(document);
             }
         }
-        // Sorted so the claimant set is a property of the CORPUS and not of the
-        // host filesystem's iteration order (sorted on NTFS, hash-ordered on
-        // ext4).
-        for (auto& entry : cache.claimantsByExtension)
-            std::sort(entry.second.begin(), entry.second.end());
         cache.indexedDir = *sourcesDir;
     }
 
-    static std::vector<std::string> const kNoClaimants;
+    static std::vector<ShippedConfigDocument> const kNoClaimants;
     auto const  found = cache.claimantsByExtension.find(ext);
     auto const& claimants =
         found == cache.claimantsByExtension.end() ? kNoClaimants : found->second;
 
     if (claimants.size() == 1) {
-        std::string const& name = claimants.front();
+        std::string const& name = claimants.front().stem;
         auto               got  = cache.grammarByName.find(name);
         if (got == cache.grammarByName.end()) {
             auto loaded = GrammarSchema::loadShipped(name);
@@ -3118,8 +3137,9 @@ struct ShippedSourceLanguage {
                          + "', so there is no front end to compile it"
                    : "shipped-source realization: " + std::to_string(claimants.size())
                          + " shipped languages claim the extension '" + ext
-                         + "' of '" + core::genericSpelling(path)
-                         + "', so the extension alone cannot name one — refusing "
+                         + "' of '" + core::genericSpelling(path) + "' ("
+                         + claimantDocuments(claimants)
+                         + "), so the extension alone cannot name one — refusing "
                            "rather than guessing which front end owns this file");
     return {};
 }
@@ -3388,10 +3408,10 @@ serveArtifactFromCache(ArtifactCacheTicket const& ticket,
             "dependency artifact cache: a VERIFIED entry for this build was "
             "found at '{}' but could not be placed at '{}': {}. The entry is "
             "this build's artifact, so this is a failure to produce it rather "
-            "than a reason to compile again. Anchored: "
-            "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.",
+            "than a reason to compile again: make the output path writable.",
             core::genericSpelling(**hit), core::genericSpelling(outPath),
             ec.message()));
+        // Anchored: D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.
     }
     return true;
 }
@@ -3571,8 +3591,9 @@ buildDependencyArtifactKey(
     std::string_view                     artifactSuffix,
     CompileOptions const&                compileOpts,
     ImageRequest const&                  imageRequest) {
-    static constexpr std::string_view kAnchor =
-        "D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION";
+    // Anchored (every refusal below): D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION.
+    // The id lives here, beside the refusals, and never in them: each message states
+    // what was not cached and why, and a row id there turns false the day it closes.
 
     // ⛔ AN INJECTED OPTIMIZER PIPELINE IS A REFUSAL, NOT A TERM. It is a raw
     // pointer to an in-memory pass list with no content identity to digest, and
@@ -3584,9 +3605,7 @@ buildDependencyArtifactKey(
         return std::unexpected(std::format(
             "dependency artifact cache: this build injects an optimizer "
             "pipeline directly, which changes the emitted bytes and carries no "
-            "content identity that could enter a cache key. Not cached. "
-            "Anchored: {}.",
-            kAnchor));
+            "content identity that could enter a cache key. Not cached."));
     }
 
     std::string const closure = unionInputDigest(cus);
@@ -3596,8 +3615,8 @@ buildDependencyArtifactKey(
             "— it builds {} translation unit(s), and a closure is available "
             "only when there is at least one and every one of them reports "
             "`CompilationUnit::inputDigest()`. An all-object link has nothing "
-            "parsed to digest. Not cached. Anchored: {}.",
-            targetSpec, cus.size(), kAnchor));
+            "parsed to digest. Not cached.",
+            targetSpec, cus.size()));
     }
 
     // The CONFIG ROOT — the cache anchor, and the directory the archive-sibling
@@ -3610,8 +3629,7 @@ buildDependencyArtifactKey(
             "dependency artifact cache: the shipped object-format directory "
             "(src/dss-config/object-formats) could not be located, so neither "
             "the cache root nor the archive-writing sibling can be resolved. "
-            "Not cached. Anchored: {}.",
-            kAnchor));
+            "Not cached."));
     }
     fs::path const configRoot = objectFormatsDir->parent_path();
 
@@ -3630,17 +3648,16 @@ buildDependencyArtifactKey(
         return std::unexpected(std::format(
             "dependency artifact cache: the archive-writing sibling format '{}' "
             "could not be loaded, so its content digest cannot enter the cache "
-            "key. Not cached. Anchored: {}.",
-            *siblingName, kAnchor));
+            "key. Not cached.",
+            *siblingName));
     }
 
     auto const parsedSpec = TargetSpec::parse(targetSpec);
     if (!parsedSpec.has_value()) {
         return std::unexpected(std::format(
             "dependency artifact cache: the target spec '{}' does not parse, so "
-            "the key's target term cannot be composed. Not cached. Anchored: "
-            "{}.",
-            targetSpec, kAnchor));
+            "the key's target term cannot be composed. Not cached.",
+            targetSpec));
     }
 
     dss::runtime::DependencyArtifactRequest request;
@@ -5532,25 +5549,22 @@ namespace {
 // different question (WHICH format to build a dependency with) and memoizes it
 // per resolve; this one runs at most once per build, immediately before the
 // driver returns 1.
-[[nodiscard]] std::optional<std::vector<std::string>>
+[[nodiscard]] std::expected<std::vector<std::string>, std::string>
 shippedFormatsServingProfile(std::string_view profile) {
     auto const dir = findShippedConfigDir("object-formats");
-    if (!dir) return std::nullopt;
-
-    std::error_code ec;
-    std::vector<std::string> names;
-    for (fs::directory_iterator it{*dir, ec}, end; !ec && it != end;
-         it.increment(ec)) {
-        std::string const file = it->path().filename().string();
-        constexpr std::string_view kSuffix = ".format.json";
-        if (file.size() <= kSuffix.size()) continue;
-        if (!std::string_view{file}.ends_with(kSuffix)) continue;
-        names.push_back(file.substr(0, file.size() - kSuffix.size()));
+    if (!dir) {
+        return std::unexpected(std::string{
+            "the shipped object-format directory ('src/dss-config/object-formats') "
+            "could not be located"});
     }
-    std::sort(names.begin(), names.end());
+    // THE ONE OWNER of which files ARE format documents; a listing that fails
+    // or stops part-way is the answer, never an inventory of whatever was read.
+    auto const documents = shippedConfigDocuments(*dir, ".format.json");
+    if (!documents.has_value()) return std::unexpected(documents.error());
 
     std::vector<std::string> serving;
-    for (auto const& n : names) {
+    for (auto const& document : *documents) {
+        std::string const& n = document.stem;
         auto loaded = ObjectFormatSchema::loadShipped(n);
         // A shipped document that will not LOAD serves nothing by definition,
         // and reporting its load failure here would put an unrelated format's
@@ -5689,9 +5703,8 @@ int Program::compileProject(
             // unknown — and an empty list would silently assert the stronger,
             // possibly false one. Report what actually went wrong instead.
             emitDriver(rep, DiagnosticCode::D_SchemaLoadFailed,
-                       "the shipped object-format directory "
-                       "('src/dss-config/object-formats') could not be located, "
-                       "so the artifact profile '" + pc.artifactProfile
+                       serving.error() + ", so the artifact profile '"
+                       + pc.artifactProfile
                        + "' could not be checked against the formats that serve "
                          "it. Set DSS_CONFIG_ROOT to the directory that contains "
                          "'src/dss-config', or run from inside the compiler's "

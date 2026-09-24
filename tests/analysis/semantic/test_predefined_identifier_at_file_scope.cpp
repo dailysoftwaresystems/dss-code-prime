@@ -116,6 +116,8 @@ TEST(PredefinedIdentifierAtFileScope, NamesTheEmptyStringWithAWarningAtEachUse) 
             "static const char *h = __func__;\n"
             "int main(void) { return g[0] == 0 && h[0] == 0 ? 42 : 1; }\n"});
         EXPECT_FALSE(model.hasErrors()) << "a file-scope pointer to __func__";
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         EXPECT_EQ(countCode(model.diagnostics(), kOutside), 2u);
     }
 }

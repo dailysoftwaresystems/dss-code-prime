@@ -826,11 +826,13 @@ TEST(DumpPredefinedMacros, FlagIsAModeRequiringALanguageAndATarget) {
 // emits round-trips back to its enumerator, so the printed word is always a word
 // an operator can write into a config.
 TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
-    constexpr std::array<PredefinedMacroKind, 8> kAll{
+    constexpr std::array<PredefinedMacroKind, 11> kAll{
         PredefinedMacroKind::Line, PredefinedMacroKind::File,
         PredefinedMacroKind::Constant, PredefinedMacroKind::Date,
         PredefinedMacroKind::Time, PredefinedMacroKind::Counter,
-        PredefinedMacroKind::TypeSize, PredefinedMacroKind::TypeUnsigned};
+        PredefinedMacroKind::TypeSize, PredefinedMacroKind::TypeUnsigned,
+        PredefinedMacroKind::TypeName, PredefinedMacroKind::TypeLimit,
+        PredefinedMacroKind::TypeSuffix};
     for (PredefinedMacroKind const k : kAll) {
         auto const name = predefinedMacroKindName(k);
         EXPECT_FALSE(name.empty());
@@ -852,6 +854,12 @@ TEST(DumpPredefinedMacros, EveryKindNameRoundTripsToItsEnumerator) {
     // size, a signedness) about the same `type` key and must stay apart.
     EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::TypeSize),
               predefinedMacroKindName(PredefinedMacroKind::TypeUnsigned));
+    // P68 round 9: the three language-realized type kinds state three different
+    // facts (a spelling, a limit, a literal suffix) about the same `type` key.
+    EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::TypeName),
+              predefinedMacroKindName(PredefinedMacroKind::TypeLimit));
+    EXPECT_NE(predefinedMacroKindName(PredefinedMacroKind::TypeLimit),
+              predefinedMacroKindName(PredefinedMacroKind::TypeSuffix));
     EXPECT_FALSE(predefinedMacroKindFromName("version").has_value())
         << "`version` is a LOAD-time lowering to Constant, not a runtime kind — "
            "a table row for it would claim a kind the engine cannot hold";

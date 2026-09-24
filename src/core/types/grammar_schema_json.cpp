@@ -19,6 +19,7 @@
 #include "core/types/enum_name_table.hpp"       // namesWhere — the `core` subset is a FILTERED PROJECTION, not a third list
 #include "core/types/type_lattice/core_type.hpp" // kTypeKindNameTable / isPrimitiveTypeKind — the TypeKind spellings' ONE owner
 #include "core/types/entry_shape.hpp"          // kDeclarableEntryParamShapeNames / kEntryMaterializationTable (entryFunctions rows)
+#include "core/types/integer_literal_ladder.hpp"  // int_ladder::integerWidth — which named signed entries survive integer promotion (the UAC counterpart check)
 #include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/section_kind.hpp"         // dataSectionKindFromName — the ONE data-section taxonomy (`assembly.directives[].section`)
@@ -7783,6 +7784,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         cfg.predefinedMacros, /*typeVocabularyInScope=*/true);
                 }
             }
+            // P68 round 9: `typeNameSpellings` — the language's canonical TYPE
+            // NAMES a `type-name` predefined macro's value is chosen from (see
+            // `PredefinedTypeSpelling`). Shape only here; each name is RESOLVED
+            // below, with the `type-size` rows, once `semantics`' type tables exist.
+            if (pp.contains("typeNameSpellings")) {
+                json const& tns = pp.at("typeNameSpellings");
+                constexpr char const* kPath = "/preprocess/typeNameSpellings";
+                if (!tns.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, kPath,
+                              "'preprocess.typeNameSpellings' must be an array of "
+                              "type-name strings");
+                } else {
+                    for (std::size_t si = 0; si < tns.size(); ++si) {
+                        if (!tns[si].is_string() || tns[si].get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      std::format("{}/{}", kPath, si),
+                                      "each 'typeNameSpellings' entry must be a "
+                                      "non-empty type name");
+                            continue;
+                        }
+                        PredefinedTypeSpelling s;
+                        s.spelled = tns[si].get<std::string>();
+                        cfg.typeNameSpellings.push_back(std::move(s));
+                    }
+                }
+            }
 
             // D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC: the MUTUAL-EXCLUSION
             // registry. Each row is `{macros: [>=2 unique non-empty names],
@@ -12950,6 +12977,62 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── C 6.3.1.8's FIFTH CONVERSION NEEDS EACH SIGNED ENTRY'S COUNTERPART ──
+            //
+            // P68 round 10 (lane `cs`, D-LANG-UAC-UNSIGNED-COUNTERPART-OF-SIGNED):
+            // under `rank-prefer-unsigned`, two operands of the SAME width whose
+            // signed one ranks higher convert to the UNSIGNED COUNTERPART of the
+            // signed type — the named entry of equal `rank` whose core is the
+            // unsigned twin of the signed entry's (`deriveUnsignedCounterparts`,
+            // semantic_config.hpp: the one derivation the conversions consult). A
+            // named signed entry with no such entry, or with two, under ANY data
+            // model, would leave that conversion no type to name: refused here, at
+            // load, never guessed at a use. Only an entry that SURVIVES integer
+            // promotion can meet an unsigned operand of its own width as ITSELF: one
+            // narrower than the promotion floor, or listed in `alsoPromote`, is the
+            // anonymous promoted type by then (the config's documented promotion —
+            // the rule `promoteIntegerKind` applies in the conversions), so it needs
+            // no counterpart and a language may name it freely.
+            if (cfg.arithmeticConversions.has_value()
+                && cfg.arithmeticConversions->mixedSignedness
+                       == MixedSignednessRule::RankPreferUnsigned) {
+                ArithmeticConversions const& uac = *cfg.arithmeticConversions;
+                for (auto const& [dm, dmName] : kDataModelTable.rows) {
+                    TypeKind const floorCore = uac.minRankType.resolveCore(dm);
+                    auto const promotes = [&](TypeKind k) {
+                        for (auto const& p : uac.alsoPromote)
+                            if (p.resolveCore(dm) == k) return true;
+                        return detail::int_ladder::integerWidth(k)
+                             < detail::int_ladder::integerWidth(floorCore);
+                    };
+                    UnsignedCounterparts const cps =
+                        deriveUnsignedCounterparts(cfg.typeSpecifiers, dm);
+                    for (auto const& e : cps.missing) {
+                        if (promotes(e.core)) continue;
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/typeSpecifiers",
+                                  std::format("the signed vocabulary entry '{}' has no "
+                                              "unsigned counterpart under the {} data "
+                                              "model: no named entry of the same 'rank' "
+                                              "whose core is the unsigned twin of its "
+                                              "own. C 6.3.1.8 converts a same-width pair "
+                                              "whose signed operand ranks higher to that "
+                                              "counterpart", e.name, dmName));
+                    }
+                    for (auto const& e : cps.ambiguous) {
+                        if (promotes(e.core)) continue;
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/typeSpecifiers",
+                                  std::format("the signed vocabulary entry '{}' has more "
+                                              "than one unsigned counterpart under the {} "
+                                              "data model: two named entries of its "
+                                              "'rank' share the unsigned twin of its "
+                                              "core, so C 6.3.1.8's conversion to 'the' "
+                                              "counterpart has no one type", e.name, dmName));
+                    }
+                }
+            }
+
             // ── D-LANG-TYPE-IDENTITY-VOCABULARY: synthesizedTypes ──────
             //
             // WHICH VOCABULARY ENTRY each ENGINE-SYNTHESIZED standard type
@@ -13138,7 +13221,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // resolved by the same arms, with one more requirement — every core
             // the type can take must be an INTEGER type (it has a signedness).
             // A `float` there would realize to nothing on every pair: a declared
-            // macro that is silently never defined.
+            // macro that is silently never defined. The same round's `type-name`,
+            // `type-limit` and `type-suffix` rows require it too (a spelling from
+            // an integer-only list, a lattice limit, a literal suffix) — except a
+            // POINTER's width, the one limit a pointer has (`__POINTER_WIDTH__`;
+            // the entry parser admits `pointerTo` there alone). Each row also
+            // keeps its type's VOCABULARY TAG, so `long` is spelled and typed as
+            // `long` where the data model makes it the width of `int`.
             typeSizeRowsReachedSemantics = true;
             auto const hasSignedness = [](TypeKind k) {
                 switch (k) {
@@ -13152,14 +13241,101 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         return false;
                 }
             };
+            // P68 round 9: `typeNameSpellings`, RESOLVED — each listed name to its
+            // identity under every data model, through the one resolver, so a
+            // `type-name` macro can only ever say a name the parser reads back as
+            // the realized type. INTEGER names only (the list serves the integer
+            // families), and ONE name per identity on every data model: two
+            // would make the spelling a matter of list order.
+            {
+                auto& spellings = data.preprocess.typeNameSpellings;
+                for (std::size_t si = 0; si < spellings.size(); ++si) {
+                    PredefinedTypeSpelling& s = spellings[si];
+                    std::string const spPath =
+                        std::format("/preprocess/typeNameSpellings/{}", si);
+                    DataModelTypeRef ref;
+                    if (!resolveTypeName(s.spelled, spPath, ref)) continue;
+                    bool integral = ref.coreByLongDoubleFormat.empty()
+                                    && hasSignedness(ref.core);
+                    for (auto const& [dm, k] : ref.coreByDataModel) {
+                        if (!hasSignedness(k)) integral = false;
+                    }
+                    if (!integral) {
+                        coll.emit(DiagnosticCode::C_InvalidPreprocess, spPath,
+                                  std::format("'typeNameSpellings' lists '{}', which "
+                                              "is not an integer type on every data "
+                                              "model — the list spells the integer "
+                                              "types a 'type-name' macro can realize",
+                                              s.spelled));
+                        continue;
+                    }
+                    s.core            = ref.core;
+                    s.coreByDataModel = ref.coreByDataModel;
+                    s.vocabularyName  = ref.vocabularyName;
+                    s.resolved        = true;
+                }
+                for (auto const& [dm, dmName] : kDataModelTable.rows) {
+                    for (std::size_t i = 0; i < spellings.size(); ++i) {
+                        if (!spellings[i].resolved) continue;
+                        for (std::size_t j = i + 1; j < spellings.size(); ++j) {
+                            if (!spellings[j].resolved) continue;
+                            if (!(spellings[i].identityUnder(dm)
+                                  == spellings[j].identityUnder(dm))) {
+                                continue;
+                            }
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      std::format("/preprocess/typeNameSpellings/{}", j),
+                                      std::format("'typeNameSpellings' lists '{}' and "
+                                                  "'{}', which name ONE type under data "
+                                                  "model {} — a type has one canonical "
+                                                  "spelling; remove one",
+                                                  spellings[i].spelled,
+                                                  spellings[j].spelled, dmName));
+                        }
+                    }
+                }
+            }
+            // A `type-name` row whose type the load already knows (a type name, a
+            // synthesized role) must be SPELLABLE on every data model it can take
+            // — refused here, once, rather than on the first pair that meets it.
+            auto const spellableEverywhere =
+                [&](PredefinedMacroDef const& pm,
+                    std::function<PredefinedTypeIdentity(DataModel)> const& idOn) {
+                if (pm.kind != PredefinedMacroKind::TypeName) return true;
+                for (auto const& [dm, dmName] : kDataModelTable.rows) {
+                    PredefinedTypeIdentity const id = idOn(dm);
+                    if (spellPredefinedType(data.preprocess.typeNameSpellings, id, dm)
+                            .has_value()) {
+                        continue;
+                    }
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              pm.declaredAt + "/type",
+                              std::format("predefined macro '{}' spells type '{}', "
+                                          "which under data model {} is {}{} — a type "
+                                          "'preprocess.typeNameSpellings' lists no "
+                                          "name for",
+                                          pm.name, pm.sizedType.spelled, dmName,
+                                          typeKindNameOrEmpty(id.core),
+                                          id.vocabularyName.empty()
+                                              ? std::string{}
+                                              : " \"" + id.vocabularyName + "\""));
+                    return false;
+                }
+                return true;
+            };
             for (PredefinedMacroDef& pm : data.preprocess.predefinedMacros) {
                 if (!predefinedMacroKindNamesAType(pm.kind)) continue;
-                bool const asksSignedness = (pm.kind == PredefinedMacroKind::TypeUnsigned);
+                // Every type-naming kind but `type-size` needs an INTEGER type
+                // (a pointer's width is admitted by the `pointerTo` arm alone).
+                bool const asksSignedness = (pm.kind != PredefinedMacroKind::TypeSize);
                 PredefinedSizedType& st = pm.sizedType;
                 std::string const typePath = pm.declaredAt + "/type";
                 switch (st.source) {
                     case PredefinedTypeSource::None:
                     case PredefinedTypeSource::AbiTypedef:
+                    case PredefinedTypeSource::ShippedTypedef:
+                        // Per PAIR (the target's ABI typedefs) or per (language ×
+                        // pair) (the shipped descriptor's decode): nothing here.
                         break;
                     case PredefinedTypeSource::Vocabulary: {
                         DataModelTypeRef ref;
@@ -13186,17 +13362,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         if (asksSignedness && !integral) {
                             coll.emit(DiagnosticCode::C_InvalidPreprocess, typePath,
-                                      std::format("predefined macro '{}' asks the "
-                                                  "signedness of type '{}', which is "
-                                                  "not an integer type — a '{}' row "
-                                                  "must name an integer type",
+                                      std::format("predefined macro '{}' names type "
+                                                  "'{}', which is not an integer type — "
+                                                  "a '{}' row must name an integer type",
                                                   pm.name, st.spelled,
                                                   predefinedMacroKindName(pm.kind)));
+                            break;
+                        }
+                        if (!spellableEverywhere(pm, [&](DataModel dm) {
+                                return PredefinedTypeIdentity{ref.resolveCore(dm),
+                                                              ref.vocabularyName};
+                            })) {
                             break;
                         }
                         st.core                   = ref.core;
                         st.coreByDataModel        = ref.coreByDataModel;
                         st.coreByLongDoubleFormat = ref.coreByLongDoubleFormat;
+                        st.vocabularyName         = ref.vocabularyName;
                         st.resolved               = true;
                         break;
                     }
@@ -13247,17 +13429,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         bool integral = true;
                         for (auto const& [dm, ref] : rule.byDataModel) {
                             st.coreByDataModel[dm] = ref.resolveCore(dm);
+                            st.vocabularyNameByDataModel[dm] = ref.vocabularyName;
                             if (!hasSignedness(st.coreByDataModel[dm])) integral = false;
                         }
                         if (asksSignedness && !integral) {
                             coll.emit(DiagnosticCode::C_InvalidPreprocess,
                                       typePath + "/synthesized",
-                                      std::format("predefined macro '{}' asks the "
-                                                  "signedness of synthesized role "
-                                                  "'{}', whose type is not an integer "
-                                                  "type on every data model",
-                                                  pm.name, st.spelled));
+                                      std::format("predefined macro '{}' names "
+                                                  "synthesized role '{}', whose type "
+                                                  "is not an integer type on every "
+                                                  "data model — a '{}' row must name "
+                                                  "an integer type",
+                                                  pm.name, st.spelled,
+                                                  predefinedMacroKindName(pm.kind)));
                             st.coreByDataModel.clear();
+                            st.vocabularyNameByDataModel.clear();
+                            break;
+                        }
+                        if (!spellableEverywhere(pm, [&](DataModel dm) {
+                                auto const it = rule.byDataModel.find(dm);
+                                return it == rule.byDataModel.end()
+                                           ? PredefinedTypeIdentity{}
+                                           : PredefinedTypeIdentity{
+                                                 it->second.resolveCore(dm),
+                                                 it->second.vocabularyName};
+                            })) {
+                            st.coreByDataModel.clear();
+                            st.vocabularyNameByDataModel.clear();
                             break;
                         }
                         st.core     = TypeKind::Void;
@@ -16954,12 +17152,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
     if (!typeSizeRowsReachedSemantics) {
         for (PredefinedMacroDef const& pm : data.preprocess.predefinedMacros) {
             if (!predefinedMacroKindNamesAType(pm.kind)) continue;
-            if (pm.sizedType.source == PredefinedTypeSource::AbiTypedef) continue;
+            // P68 round 9: a kind that SPELLS or TYPES by its type needs the
+            // language's tables even when the target names the type.
+            if (pm.sizedType.source == PredefinedTypeSource::AbiTypedef
+                && !predefinedMacroKindNeedsLanguage(pm.kind)) {
+                continue;
+            }
             coll.emit(DiagnosticCode::C_InvalidPreprocess, pm.declaredAt + "/type",
                       std::format("predefined macro '{}' names type '{}', but "
                                   "this language declares no 'semantics' block, "
                                   "so it has no type vocabulary to resolve it in",
                                   pm.name, pm.sizedType.spelled));
+        }
+        if (!data.preprocess.typeNameSpellings.empty()) {
+            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                      "/preprocess/typeNameSpellings",
+                      "'preprocess.typeNameSpellings' names types, but this language "
+                      "declares no 'semantics' block, so it has no type vocabulary "
+                      "to resolve them in");
         }
     }
 
@@ -17845,7 +18055,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // two keys the loader reads two hundred lines further down. One
             // owner per fact: the OPTIONALITY is a comment, the MEMBERSHIP is
             // the table.
-            static constexpr std::array<std::string_view, 24> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 26> kAssemblyKeys{
                 // required whenever the block is present
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
@@ -17873,7 +18083,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // OPTIONAL, and validated separately below: a dialect with no
                 // directive vocabulary refuses every directive by name, which
                 // is a coherent state.
-                "directives", "entryLabels"};
+                "directives", "entryLabels",
+                // OPTIONAL (P68 round 9, the aarch64 twins): the spellings of a
+                // PART of a symbol's address, per object-format kind, and the
+                // location counter's spelling.
+                "symbolParts", "locationCounter"};
             DSS_CHECK_KEY_VOCABULARY(kAssemblyKeys);
             (void)checkKeysAgainst(
                 as, kAssemblyKeys, "/assembly", "the 'assembly' block",
@@ -17883,6 +18097,65 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             AssemblyConfig cfg;
             bool assemblyClean = true;
+
+            // P68 round 9: a list of OBJECT-FORMAT KINDS, the key a symbol-part
+            // spelling is accepted under (`symbolParts[].formatKinds`, a row's
+            // `impliedSymbolPart.formatKinds`). Non-empty, each a real kind —
+            // the `unknown` sentinel resolves by name and matches no build, so
+            // it is refused as every format-name surface refuses it — and no
+            // kind twice.
+            auto const readFormatKinds =
+                [&](json const& arr, std::string const& path)
+                -> std::optional<std::vector<ObjectFormatKind>> {
+                if (!arr.is_array() || arr.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                              "'formatKinds' must be a non-empty array of "
+                              "object-format kind names");
+                    return std::nullopt;
+                }
+                std::vector<ObjectFormatKind> out;
+                for (std::size_t k = 0; k < arr.size(); ++k) {
+                    auto const kPath = std::format("{}/{}", path, k);
+                    auto const kind = arr[k].is_string()
+                        ? objectFormatKindFromName(arr[k].get<std::string>())
+                        : std::nullopt;
+                    if (!kind.has_value() || !isSelectableObjectFormatKind(*kind)) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, kPath,
+                                  std::format("'{}' is not an object-format kind "
+                                              "a build can have",
+                                              arr[k].is_string()
+                                                  ? arr[k].get<std::string>()
+                                                  : arr[k].dump()));
+                        return std::nullopt;
+                    }
+                    if (std::find(out.begin(), out.end(), *kind) != out.end()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, kPath,
+                                  std::format("object-format kind '{}' is listed "
+                                              "twice", objectFormatKindName(*kind)));
+                        return std::nullopt;
+                    }
+                    out.push_back(*kind);
+                }
+                return out;
+            };
+            // A PART of a symbol's address, by name — never `whole`, which is
+            // what a bare symbol already is and so states nothing.
+            auto const readSymbolPart =
+                [&](json const& v, std::string const& path)
+                -> std::optional<SymbolAddressPart> {
+                auto const part = v.is_string()
+                    ? symbolAddressPartFromName(v.get<std::string>())
+                    : std::nullopt;
+                if (!part.has_value() || *part == SymbolAddressPart::Whole) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                              std::format("'part' must be '{}' or '{}'",
+                                          symbolAddressPartName(SymbolAddressPart::Page),
+                                          symbolAddressPartName(
+                                              SymbolAddressPart::PageOffset)));
+                    return std::nullopt;
+                }
+                return part;
+            };
 
             // One landmark: required, must be a string, must name a rule that
             // exists. A landmark naming nothing is the "capability claim with no
@@ -19421,7 +19694,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // hundred lines earlier would have compared against an empty table
             // and passed on every document.
             if (cfg.templateOperandRule.valid()) {
-                std::uint8_t const mask =
+                AsmRoleMask const mask =
                     cfg.rolesForRule(cfg.templateOperandRule);
                 if (mask != 0) {
                     std::string roles;
@@ -19489,13 +19762,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 10>
+                    static constexpr std::array<std::string_view, 11>
                         kInstRowKeys{"spelling", "opcodes", "width",
                                      "unstatedWidth", "unstatedWidthWarns",
                                      "destWidth", "destWidthFromOperands",
                                      "cond",
                                      "opcodesAreRankedEncodings",
-                                     "operandSelectors"};
+                                     "operandSelectors", "impliedSymbolPart"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     // ★ NAME THE RENAME. `opcode` (a single string) was this
                     // key's shape until one mnemonic had to denote a SET of
@@ -19985,6 +20258,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         if (ambiguous) { assemblyClean = false; continue; }
                     }
+                    // ── impliedSymbolPart ── OPTIONAL (P68 round 9): what a BARE
+                    // symbol operand of this row means, on the listed format
+                    // kinds (gas reads `adrp x0, msg` as the page; clang for
+                    // Darwin refuses it — ✔MEASURED 2026-09-23).
+                    if (row.contains("impliedSymbolPart")) {
+                        json const& isp = row.at("impliedSymbolPart");
+                        auto const ispPath = path + "/impliedSymbolPart";
+                        static constexpr std::array<std::string_view, 2>
+                            kImpliedKeys{"part", "formatKinds"};
+                        DSS_CHECK_KEY_VOCABULARY(kImpliedKeys);
+                        if (!isp.is_object()
+                            || !checkKeysAgainst(isp, kImpliedKeys, ispPath,
+                                                 "an 'impliedSymbolPart' object",
+                                                 DiagnosticCode::C_InvalidHirLowering,
+                                                 coll)
+                            || !isp.contains("part")
+                            || !isp.contains("formatKinds")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, ispPath,
+                                      "'impliedSymbolPart' must be an object "
+                                      "{ part, formatKinds }");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        auto const part  = readSymbolPart(isp.at("part"), ispPath + "/part");
+                        auto const kinds = readFormatKinds(isp.at("formatKinds"),
+                                                           ispPath + "/formatKinds");
+                        if (!part.has_value() || !kinds.has_value()) {
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.impliedSymbolPart = AsmImpliedSymbolPart{*part, *kinds};
+                    }
                     rowJsonIndex.push_back(i);
                     cfg.instructions.push_back(std::move(ins));
                 }
@@ -20011,6 +20316,111 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         cfg.entryLabels.push_back(arr[i].get<std::string>());
                     }
+                }
+            }
+
+            // ── symbolParts ── OPTIONAL (P68 round 9, the aarch64 twins): the
+            // spellings of a PART of a symbol's address, each with the format
+            // kinds whose reference assembler reads it. The operator is the one
+            // Identifier of the `symbolPart` role's rule, so the role and this
+            // list come together: one without the other is a spelling nothing
+            // parses, or a parse nothing gives a meaning to.
+            if (as.contains("symbolParts")) {
+                json const& arr = as.at("symbolParts");
+                if (!arr.is_array() || arr.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/symbolParts",
+                              "'symbolParts' must be a non-empty array of "
+                              "{ spelling, part, position, formatKinds } rows");
+                    assemblyClean = false;
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        auto const path = std::format("/assembly/symbolParts/{}", i);
+                        json const& row = arr[i];
+                        static constexpr std::array<std::string_view, 4>
+                            kPartKeys{"spelling", "part", "position",
+                                      "formatKinds"};
+                        DSS_CHECK_KEY_VOCABULARY(kPartKeys);
+                        if (!row.is_object()
+                            || !checkKeysAgainst(row, kPartKeys, path,
+                                                 "a 'symbolParts' row",
+                                                 DiagnosticCode::C_InvalidHirLowering,
+                                                 coll)
+                            || !row.contains("spelling")
+                            || !row.at("spelling").is_string()
+                            || row.at("spelling").get<std::string>().empty()
+                            || !row.contains("part")
+                            || !row.contains("position")
+                            || !row.at("position").is_string()
+                            || (row.at("position").get<std::string>() != "before"
+                                && row.at("position").get<std::string>() != "after")
+                            || !row.contains("formatKinds")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'symbolParts' row is { spelling: "
+                                      "<operator as written>, part, position: "
+                                      "'before' | 'after' the name, formatKinds }");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        auto const part  = readSymbolPart(row.at("part"), path + "/part");
+                        auto const kinds = readFormatKinds(row.at("formatKinds"),
+                                                           path + "/formatKinds");
+                        if (!part.has_value() || !kinds.has_value()) {
+                            assemblyClean = false;
+                            continue;
+                        }
+                        AsmSymbolPartSpelling sp;
+                        sp.spelling    = row.at("spelling").get<std::string>();
+                        sp.part          = *part;
+                        sp.writtenBefore = row.at("position").get<std::string>() == "before";
+                        sp.formatKinds   = *kinds;
+                        bool dup = false;
+                        for (auto const& prior : cfg.symbolParts) {
+                            if (cfg.spellingMatches(prior.spelling, sp.spelling)) {
+                                dup = true;
+                            }
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/spelling",
+                                      std::format("symbol-part spelling '{}' is "
+                                                  "declared twice", sp.spelling));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        cfg.symbolParts.push_back(std::move(sp));
+                    }
+                }
+            }
+            {
+                bool const roleBound =
+                    cfg.operandFormRules[static_cast<std::size_t>(
+                        AsmOperandRole::SymbolPart)].valid();
+                if (roleBound != !cfg.symbolParts.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              roleBound ? "/assembly/symbolParts"
+                                        : "/assembly/operandForms/symbolPart",
+                              roleBound
+                                  ? "the 'symbolPart' operand role is bound to "
+                                    "a rule, but 'symbolParts' declares no "
+                                    "spelling for it to mean"
+                                  : "'symbolParts' declares spellings, but the "
+                                    "'symbolPart' operand role binds no rule to "
+                                    "parse them");
+                    assemblyClean = false;
+                }
+            }
+            // ── locationCounter ── OPTIONAL (P68 round 9): the spelling of the
+            // address being written (`.` in GNU as).
+            if (as.contains("locationCounter")) {
+                json const& lc = as.at("locationCounter");
+                if (!lc.is_string() || lc.get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/locationCounter",
+                              "'locationCounter' must be a non-empty spelling");
+                    assemblyClean = false;
+                } else {
+                    cfg.locationCounter = lc.get<std::string>();
                 }
             }
 

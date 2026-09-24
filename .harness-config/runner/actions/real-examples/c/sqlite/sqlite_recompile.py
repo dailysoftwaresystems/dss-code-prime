@@ -23,7 +23,7 @@ and the unit gate compiles none of sqlite's 189 TUs. This mode is that check as 
       composes it, and its (tcl, z) libraries resolved exactly as Step 6 resolves them;
   R5  the manifest through `sqlite_build.fixture_manifest` (the ONE composition Step 7 uses), the
       reference oracle from it (`sqlite_build.build_oracle`), and dsscp on it
-      (`sqlite_base.build_artifact`) asked for its WHOLE diagnostic stream (`DIAGNOSTIC_CAP`);
+      (`sqlite_base.build_artifact`, which asks EVERY build for its whole diagnostic stream);
   R6  the per-TU census, asked of its owner (`harness_legs.py --recompile-verdicts`) and printed
       verbatim: the table, every INCOMPLETE reason, and the summary line LAST --
       `recompile: <leg> tus=N reference_ok=N dss_ok=N blockers=N`.
@@ -56,12 +56,6 @@ import sqlite_libs as LIBS       # noqa: E402
 import sqlite_procs as P         # noqa: E402
 import sqlite_stage as S         # noqa: E402
 
-# ★ THE WHOLE STREAM. dsscp caps its diagnostics RUN-WIDE (50 per code, 1000 in all:
-# DiagnosticReporter::Config), so a regression that raises one code in many TUs hides the LAST
-# TUs whole -- and a census reading that log would count them accepted. The census refuses a
-# stream whose cap still fired (`harness_legs.recompile_verdicts`); this is the request that keeps
-# it from firing: a count no real build approaches, passed as BOTH caps.
-DIAGNOSTIC_CAP = 1000000
 # The mode's own subtree of the output tree a run left: `<OUT_DIR>/recompile/<leg>/`.
 RECOMPILE_DIR = "recompile"
 # The census's outcome for the reference when the oracle never reported one. Any status outside
@@ -216,32 +210,47 @@ def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherenc
     return why
 
 
-def coherence_gate(label):
-    """`coherence(dirs) -> (ok, report)`: `sqlite_coherence.py` over the STAGED directories, with
-    no --checkout -- the staged copy is self-contained, and the shared clone may have moved on."""
+def coherence_gate(label, checkout=None):
+    """`coherence(dirs) -> (ok, report)`: `sqlite_coherence.py` over the stage's directories. A staged COPY
+    is self-contained, so no --checkout (the shared clone may have moved on); an IN-PLACE stage is the
+    clone itself, so `checkout` names it and the stage's identity must be that checkout's."""
     def run(dirs):
+        pick = ["--checkout", checkout] if checkout else []
         r = C.capture(C.python_argv(os.path.join(C.HERE, "sqlite_coherence.py"), "--label", label,
-                                    *dirs), env_=C.child_env(python=True), merge=True)
+                                    *(pick + list(dirs))), env_=C.child_env(python=True), merge=True)
         return r.rc == 0, "\n".join("      " + ln for ln in (r.out or "").strip().splitlines())
     return run
 
 
 def load_stage(run, leg):
-    """R3: the stage a run left at `<stage root>/stage/`, refused unless it is current."""
+    """R3: the stage a run left at `<stage root>/stage/` (`sqlite_stage.stage_dir_of`, every host), refused
+    unless it is current."""
     log = run.log
-    path = os.path.join(run.stage_root, "stage", S.RESULT_FILE)
+    path = os.path.join(S.stage_dir_of(run.stage_root), S.RESULT_FILE)
     if not os.path.isfile(path):
-        C.die("no staged sqlite state at %s.\n      A run of this driver writes it (Steps 3-4: the "
-              "derive persists its result there); the recompile reuses it and never re-derives. Run "
+        C.die("no staged sqlite state at %s.\n      A run of this driver writes it (Steps 3-4 persist the "
+              "stage's result there, on every host); the recompile reuses it and never re-derives. Run "
               "the driver once for this output tree, or point OUT_DIR at the output tree of a run "
               "that staged it." % path)
     with open(path, "r", encoding="utf-8") as fh:
         st = S.StageResult.from_json(fh.read())
+    checkout = None
+    if not st.copy_to_stage:
+        # ★ IN PLACE (a POSIX host's stage): its sources and its build dir ARE the shared clone, which any run
+        # on this host may pull and re-configure -- so the recompile holds the clone lock for READ from here
+        # to its end (a writer waits for it), and the one-vintage gate compares the stage with that
+        # CHECKOUT. A staged copy (a Windows host's) is self-contained and needs neither.
+        run.clone_lock = P.CloneLock(st.sqlite_dir_posix)
+        run.clone_lock.read("build_and_test.py --recompile %s (reads the clone's build in place)"
+                            % leg.label, log)
+        log.info("clone lock: READ on %s -- this stage IS the clone (built in place): held to the "
+                 "recompile's end, and the stage is judged against that checkout" % st.sqlite_dir_posix)
+        checkout = st.sqlite_dir
     run.stage_build = run.resolver.json(["--stage-build", "--format", "json"],
                                         "the sqlite stage-build configuration (--stage-build)")
     zinc = _stage_zinc()
     why = stage_findings(st, S.parse_stage_build(run.stage_build), leg, zinc.verify_guards,
-                         zinc.verify_answers, coherence_gate("staged sqlite (recompile)"))
+                         zinc.verify_answers, coherence_gate("staged sqlite (recompile)", checkout))
     if why:
         C.die("the staged sqlite state at %s is NOT CURRENT for leg %s -- %d reason(s):\n%s\n      "
               "The recompile never re-derives. Re-stage it with a run of this driver (its Steps 3-6), "
@@ -321,8 +330,7 @@ def recompile(run, label, driver):
     log.info("[%s] manifest -> %s" % (leg.label, manifest))
     BLD.build_oracle(run, leg, manifest, outd)
     log_path = os.path.join(outd, "compile.log")
-    res = B.build_artifact(run.compiler.path, manifest, cfg.dss_config, outd, log_path, leg.spec,
-                           diagnostic_cap=DIAGNOSTIC_CAP)
+    res = B.build_artifact(run.compiler.path, manifest, cfg.dss_config, outd, log_path, leg.spec)
     dss_build = "built" if res.code == 0 else ("errors" if res.code == 3 else "failed")
     log.info("[%s] dsscp --config=%s: %s%s  (%s)"
              % (leg.label, cfg.dss_config, dss_build, res.time_suffix,
@@ -368,8 +376,10 @@ def main(label, driver):
               % traceback.format_exc(), file=sys.stderr, flush=True)
         return 1
     finally:
-        if run is not None and run.run_lock is not None:
+        for lock in ((run.clone_lock, run.run_lock) if run is not None else ()):
+            if lock is None:
+                continue
             try:
-                run.run_lock.release()
+                lock.release()
             except Exception:  # noqa: BLE001 -- a release failure must not mask the verdict
                 pass

@@ -795,7 +795,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return fail(DiagnosticCode::F_CorruptedBinary,
                     "pe::readRelocatableObject: " + decode.error());
     }
-    auto const& nativeToKind        = decode->nativeToKind;
     auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
     // -- (5) Decode every IMAGE_SYMBOL; assign SymbolId = symtab index ----
@@ -2086,16 +2085,32 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + sec.name + "' names symbol #" + std::to_string(symIdx)
                     + " which is an AUXILIARY record slot, not a symbol.");
             }
-            auto const kindIt = nativeToKind.find(nativeId);
-            if (kindIt == nativeToKind.end()) {
+            // The ONE decode (`RelocationDecodeTable::decode`); a COFF type
+            // names one kind, so the site is read only by a format that
+            // declares a wire type decoded by instruction.
+            std::span<std::uint8_t const> site{};
+            if (sec.rawPtr != 0u && !rangeExceedsBuffer(va, 4, sec.rawSize)
+                && !rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
+                site = std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(sec.rawPtr + va), 4};
+            }
+            auto const decoded = decode->decode(nativeId, site);
+            if (!decoded.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "pe::readRelocatableObject: relocation Type "
                     + std::to_string(nativeId) + " in section '" + sec.name
-                    + "' is not declared by PE format '"
-                    + std::string{objectFormatSchema.name()}
-                    + "' -- cannot map it back to a universal RelocationKind.");
+                    + (decoded.error() == RelocationDecodeTable::Miss::Undeclared
+                           ? "' is not declared by PE format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' -- cannot map it back to a universal "
+                                   "RelocationKind."
+                           : "' is decoded by the instruction it patches, and "
+                             "no row of PE format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' decodes the word at offset "
+                                 + std::to_string(va) + "."));
             }
-            RelocationKind const kind = kindIt->second;
+            RelocationKind const kind = *decoded;
             auto const* tri = targetSchema.relocationInfo(kind);
             if (tri == nullptr) {
                 return fail(DiagnosticCode::F_CorruptedBinary,

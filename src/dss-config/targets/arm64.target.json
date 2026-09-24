@@ -416,6 +416,28 @@
               { "index": 0, "slotKind": "rn", "regRole": "stackPointer", "wordIndex": 2 },
               { "index": 1, "slotKind": "imm32.movzmovk", "wordIndex": 0 }
             ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): ADD Xd, Xn, #:lo12:sym — the PAGE OFFSET of a symbol, `add x0, x0, :lo12:msg` (ELF) / `add x0, x0, msg@PAGEOFF` (Mach-O): 0x91000000 with R_AARCH64_ADD_ABS_LO12_NC / ARM64_RELOC_PAGEOFF12 on the imm12 field. Rd and Rn read encoding 31 as the stack pointer, as every ADD (immediate) does. ✔MEASURED 2026-09-23, gas 2.42 = clang 18 (0x91000000 / 0x11000000).",
+            "guard":      {"operandKinds": ["reg", "symbol"], "width": 64, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 2432696320 },
+            "resultSlot": "rd",
+            "resultRegRole": "stackPointer",
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 1, "slotKind": "sym.patch", "relocationKind": "add_abs_lo12_nc" }
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): ADD Wd, Wn, #:lo12:sym — the PAGE OFFSET of a symbol, `add x0, x0, :lo12:msg` (ELF) / `add x0, x0, msg@PAGEOFF` (Mach-O): 0x11000000 with R_AARCH64_ADD_ABS_LO12_NC / ARM64_RELOC_PAGEOFF12 on the imm12 field. Rd and Rn read encoding 31 as the stack pointer, as every ADD (immediate) does. ✔MEASURED 2026-09-23, gas 2.42 = clang 18 (0x91000000 / 0x11000000).",
+            "guard":      {"operandKinds": ["reg", "symbol"], "width": 32, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 285212672 },
+            "resultSlot": "rd",
+            "resultRegRole": "stackPointer",
+            "wires":      [
+              { "index": 0, "slotKind": "rn", "regRole": "stackPointer" },
+              { "index": 1, "slotKind": "sym.patch", "relocationKind": "add_abs_lo12_nc" }
+            ]
           }
         ]
       }
@@ -1842,6 +1864,50 @@
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12.scaled"   }
             ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-64 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST64_ABS_LO12_NC (the offset scaled by the 8-byte access). Same word 0xF9400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 64, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 4181721088 },
+            "resultSlot": "rd",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst64_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-8 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST8_ABS_LO12_NC (the offset scaled by the 1-byte access). Same word 0x39400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 8, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 960495616 },
+            "resultSlot": "rd",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst8_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-32 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST32_ABS_LO12_NC (the offset scaled by the 4-byte access). Same word 0xB9400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 32, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 3107979264 },
+            "resultSlot": "rd",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst32_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-16 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST16_ABS_LO12_NC (the offset scaled by the 2-byte access). Same word 0x79400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 16, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 2034237440 },
+            "resultSlot": "rd",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst16_abs_lo12_nc"}
+            ]
           }
         ]
       }
@@ -1901,6 +1967,50 @@
               { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-64 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST64_ABS_LO12_NC (the offset scaled by the 8-byte access). Same word 0xF9000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 4177526784 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst64_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-8 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST8_ABS_LO12_NC (the offset scaled by the 1-byte access). Same word 0x39000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 956301312 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst8_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-32 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST32_ABS_LO12_NC (the offset scaled by the 4-byte access). Same word 0xB9000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 3103784960 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst32_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-16 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST16_ABS_LO12_NC (the offset scaled by the 2-byte access). Same word 0x79000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 2030043136 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst16_abs_lo12_nc"}
             ]
           }
         ]
@@ -4322,6 +4432,66 @@
               { "index": 1, "slotKind": "membase.noscale" },
               { "index": 2, "slotKind": "imm12.scaled"   }
             ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-64 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST64_ABS_LO12_NC (the offset scaled by the 8-byte access). Same word 0xFD400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 64, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 4248829952 },
+            "resultSlot": "rd",
+            "resultRegClass": "fpr",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst64_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-32 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST32_ABS_LO12_NC (the offset scaled by the 4-byte access). Same word 0xBD400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 32, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 3175088128 },
+            "resultSlot": "rd",
+            "resultRegClass": "fpr",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst32_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-128 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST128_ABS_LO12_NC (the offset scaled by the 16-byte access). Same word 0x3DC00000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 128, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 1035993088 },
+            "resultSlot": "rd",
+            "resultRegClass": "fpr",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst128_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-16 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST16_ABS_LO12_NC (the offset scaled by the 2-byte access). Same word 0x7D400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 16, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 2101346304 },
+            "resultSlot": "rd",
+            "resultRegClass": "fpr",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst16_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-8 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST8_ABS_LO12_NC (the offset scaled by the 1-byte access). Same word 0x3D400000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "membase", "memoffset"], "width": 8, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 1027604480 },
+            "resultSlot": "rd",
+            "resultRegClass": "fpr",
+            "wires":      [
+              {"index": 0, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 1, "slotKind": "membase.noscale"},
+              {"index": 2, "slotKind": "sym.patch", "relocationKind": "ldst8_abs_lo12_nc"}
+            ]
           }
         ]
       }
@@ -4393,6 +4563,61 @@
               { "index": 1, "slotKind": "rn", "regRole": "stackPointer" },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "imm12.scaled"   }
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-64 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST64_ABS_LO12_NC (the offset scaled by the 8-byte access). Same word 0xFD000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 4244635648 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd", "regClass": "fpr"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst64_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-32 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST32_ABS_LO12_NC (the offset scaled by the 4-byte access). Same word 0xBD000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 3170893824 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd", "regClass": "fpr"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst32_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-128 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST128_ABS_LO12_NC (the offset scaled by the 16-byte access). Same word 0x3D800000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 128, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 1031798784 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd", "regClass": "fpr"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst128_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-16 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST16_ABS_LO12_NC (the offset scaled by the 2-byte access). Same word 0x7D000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 16, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 2097152000 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd", "regClass": "fpr"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst16_abs_lo12_nc"}
+            ]
+          },
+          {
+            "$comment": "P68 round 9 (the aarch64 twins): the width-8 form above with a symbolic PAGE OFFSET in its offset field — `[xN, :lo12:sym]` (ELF) / `[xN, sym@PAGEOFF]` (Mach-O) — the field taken by the linker as LDST8_ABS_LO12_NC (the offset scaled by the 1-byte access). Same word 0x3D000000; no magnitude keys, because a link-time offset has no magnitude here. ✔MEASURED 2026-09-23, gas 2.42 = clang 18.",
+            "guard":      {"operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 8, "symbolPart": "pageOffset"},
+            "template":   { "fixedWord": 1023410176 },
+            "wires":      [
+              {"index": 0, "slotKind": "rd", "regClass": "fpr"},
+              {"index": 1, "slotKind": "rn", "regRole": "stackPointer"},
+              {"index": 2, "slotKind": "membase.noscale"},
+              {"index": 3, "slotKind": "sym.patch", "relocationKind": "ldst8_abs_lo12_nc"}
             ]
           }
         ]
@@ -4923,6 +5148,68 @@
           }
         ]
       }
+    },
+    {
+      "$comment": "P68 round 9 (the aarch64 twins): ADR — the ONE-word, PC-relative address of a symbol or of a block of its own function, ±1 MiB. The dialect's `adr` spelled the two-word `lea` macro (ADRP+ADD) before this opcode existed, which is not what either reference writes: ✔MEASURED 2026-09-23, gas 2.42 and clang 18 assemble `adr x0, msg` as 0x10000000 with R_AARCH64_ADR_PREL_LO21 (msg+8: addend 8), `adr x1, 1f` as 0x10000021, `adr x7, .` as 0x10000007 and `adr x7, .+8` as 0x10000047 — a label of the same function resolved at assemble time, no relocation (clang for Darwin likewise, and it refuses a cross-section `adr`, which Mach-O has no relocation for). Rd reads encoding 31 as the ZERO register (`adr xzr, main` = 0x1000001F in gas).",
+      "mnemonic":      "adr",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "$comment": "The whole address of a symbol: ADR Xd, sym (0x10000000), the 21-bit PC-relative distance written by the linker as ADR_PREL_LO21.",
+            "guard":      { "operandKinds": ["symbol"] },
+            "template":   { "fixedWord": 268435456 },
+            "resultSlot": "rd",
+            "resultRegRole": "zeroRegister",
+            "wires":      [
+              { "index": 0, "slotKind": "sym.patch", "relocationKind": "adr_prel_lo21" }
+            ]
+          },
+          {
+            "$comment": "A location of this function plus a constant: ADR Xd, label+N — or the location counter, ADR Xd, .+N, the instruction's own address — the distance resolved at assemble time into immlo (bits 29..30) and immhi (bits 5..23), the constant riding the field (`block.addend`).",
+            "guard":      { "operandKinds": ["blockref", "imm32"] },
+            "template":   { "fixedWord": 268435456 },
+            "resultSlot": "rd",
+            "resultRegRole": "zeroRegister",
+            "wires":      [
+              { "index": 0, "slotKind": "imm21.adr" },
+              { "index": 1, "slotKind": "block.addend" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "P68 round 9 (the aarch64 twins): ADRP — the 4 KiB PAGE of a symbol's address, relative to the PC's page, ±4 GiB: 0x90000000 with R_AARCH64_ADR_PREL_PG_HI21 / ARM64_RELOC_PAGE21 (✔MEASURED 2026-09-23, gas 2.42 = clang 18 for ELF; clang for Darwin with `sym@PAGE`). The operand must NAME the page (`guard.symbolPart`): gas reads a bare `adrp x0, msg` as the page, which the dialect row states per format kind (`impliedSymbolPart`). Rd reads encoding 31 as the ZERO register.",
+      "mnemonic":      "adrp",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "registerClass": "gpr",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["symbol"], "symbolPart": "page" },
+            "template":   { "fixedWord": 2415919104 },
+            "resultSlot": "rd",
+            "resultRegRole": "zeroRegister",
+            "wires":      [
+              { "index": 0, "slotKind": "sym.patch", "relocationKind": "adr_prel_pg_hi21" }
+            ]
+          }
+        ]
+      }
     }
   ],
   "$condCodeEncodingComment": "D-AS3-COND-CODE-ARM64 (mirror of x86's table): per-cond-code nibble for the AArch64 B.cond instruction's bits [3:0]. Numeric values are the AArch64 condition codes (ARM ARM C1.2.4): EQ=0, NE=1, CS/HS=2, CC/LO=3, HI=8, LS=9, GE=10(0xA), LT=11(0xB), GT=12(0xC), LE=13(0xD). Signed comparisons map slt→LT(0xB)=11, sle→LE(0xD)=13, sgt→GT(0xC)=12, sge→GE(0xA)=10; unsigned map ult→CC/LO=3, ule→LS=9, ugt→HI=8, uge→CS/HS=2. The encoder ORs this nibble into word 0 bits 0..3 of the jcc macro (vs x86's low 4 bits of the opcode byte — same field-position abstraction, different ISA placement). The 10 integer arms are REQUIRED; the FC3.5 float arms (next comment) are per-entry optional.",
@@ -5385,9 +5672,17 @@
     { "$comment": "D-UNWIND-NO-EH-FRAME-IN-RELOCATABLE-OBJECTS: a 32-bit PC-relative reference with NO implicit bias — the DWARF FDE `initial_location` field in a relocatable `.eh_frame` (DW_EH_PE_pcrel|sdata4). Unlike every other arm64 row this patches a DATA word, not an instruction field, so the formula is plain Linear (S + A - P, 4 LE bytes) rather than one of the aarch64_* bit-shift variants. kind 9 matches both elf64-aarch64-linux{,-staticlib}.format.json's R_AARCH64_PREL32 (nativeId 261). ✔MEASURED 2026-08-13 against `aarch64-linux-gnu-gcc -c`: `readelf -r` shows `R_AARCH64_PREL32  .text + 0` on the first FDE — the reference toolchain's own choice, addend = the function's offset within .text.",
       "name": "pcrel32",          "kind": 9, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 4 },
     { "$comment": "D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB: a 64-bit PC-relative DATA word, S + A - P with P the word's own address — R_AARCH64_PREL64's semantics (AAELF64). Its one producer is the linker's long-range veneer body in `linkVeneers`, whose literal holds the distance from itself to the veneer's destination; being PC-relative it needs no dynamic relocation in any output kind, which is why GNU ld 2.42 carries its own long-branch stub's literal through R_AARCH64_PRELNN (bfd/elfnn-aarch64.c, read 2026-09-19). kind 10 matches the `R_AARCH64_PREL64` row of the three arm64 ELF IMAGE formats; the relocatable and staticlib formats declare no row, because a veneer never appears in an object file. The Mach-O formats declare none either: no Mach-O reference links a veneer past +-4 GiB (ld64.lld 18.1.3 refuses the shape or emits a thunk whose ADRP wrapped, MEASURED 2026-09-19), so there the long body is never a candidate.",
-      "name": "prel64",           "kind": 10, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 8 }
+      "name": "prel64",           "kind": 10, "formula": "linear", "pcRelative": true, "addendBias": 0, "widthBytes": 8 },
+    { "$comment": "P68 round 9 (the aarch64 twin of D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the ONE-word `adr` — S + A - P itself, signed 21 bits (±1 MiB), in ADR's immlo [30:29] / immhi [23:5] split. R_AARCH64_ADR_PREL_LO21. ✔MEASURED 2026-09-23: gas 2.42 and clang 18 write `adr x0, msg` as 0x10000000 with this relocation, and `adr x0, msg+8` with addend 8.",
+      "name": "adr_prel_lo21",    "kind": 11, "formula": "aarch64_adr_prel_lo21" },
+    { "$comment": "P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): the page offset of a LOAD or STORE. Its unsigned-offset imm12 counts ACCESS-SIZED units, so the byte offset is divided by the size, 2^scaleLog2 — the one fact that makes these five rows five. R_AARCH64_LDST8/16/32/64/128_ABS_LO12_NC; on Mach-O all five are ARM64_RELOC_PAGEOFF12, the scale read from the instruction. ✔MEASURED 2026-09-23 (gas 2.42 = clang 18 ELF): `ldrsb`/`ldr b0` take LDST8, `ldrsh`/`ldr h0` LDST16, `ldr w`/`ldr s0` LDST32, `ldr x`/`str x`/`ldr d0` LDST64, `ldr q0` LDST128. The ADD's page offset is `add_abs_lo12_nc` above, which is never scaled.",
+      "name": "ldst8_abs_lo12_nc",   "kind": 12, "formula": "aarch64_ldst_abs_lo12", "scaleLog2": 0 },
+    { "name": "ldst16_abs_lo12_nc",  "kind": 13, "formula": "aarch64_ldst_abs_lo12", "scaleLog2": 1 },
+    { "name": "ldst32_abs_lo12_nc",  "kind": 14, "formula": "aarch64_ldst_abs_lo12", "scaleLog2": 2 },
+    { "name": "ldst64_abs_lo12_nc",  "kind": 15, "formula": "aarch64_ldst_abs_lo12", "scaleLog2": 3 },
+    { "name": "ldst128_abs_lo12_nc", "kind": 16, "formula": "aarch64_ldst_abs_lo12", "scaleLog2": 4 }
   ],
-  "$linkVeneersComment": "D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH and D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB: what a LINKER may build, and clobber, to carry a branch past its field's reach. Every fact here is the ABI's, stated per RELOCATION KIND, never inferred from a register's name. AAPCS64 'Use of IP0 and IP1 by the linker': a veneer must preserve every register except IP0 (x16), IP1 (x17) and the condition flags, and a conforming program must assume one may be inserted at any branch exposed to a relocation that supports long branches — so both are granted, and a register listed here is one the linker WILL clobber. AAELF64 'Call and Jump relocations': a linker may use a veneer only for R_AARCH64_CALL26 / JUMP26 / PLT32; DSS spells CALL26 and JUMP26 with its one `call26` row, so that row is the routable one. `callerSaved` is NOT this grant: it describes calls, and a JUMP26 sibcall is not one. TWO bodies, cheapest first. The linker elects, PER VENEER, the first body that reaches that veneer's destination from where it stands and whose relocations the output format declares — GNU ld 2.42's own per-stub rule (it sizes every stub long and relaxes it to the ADRP form when the page delta fits). (1) `adrp-add-br` = `adrp x16, T; add x16, x16, :lo12:T; br x16`, bytes 10 00 00 90 / 10 02 00 91 / 00 02 1f d6, the body all three reference linkers emit within +-4 GiB (MEASURED 2026-09-19, lane vn): 12 bytes, reach +-4 GiB, the ADRP page field. (2) `prel64-literal` = `lea x17, literal; load x16, [x17]; add x16, x16, x17; br x16; literal: .xword T - literal` — GNU ld 2.42's long-branch stub (`ldr ip0, 1f; adr ip1, #0; add ip0, ip0, ip1; br ip0; 1: .xword PREL64(T)+12`, bfd/elfnn-aarch64.c) built from this target's own verbs, since it declares no `adr` and no literal `ldr`: the same two registers, the same unbounded PC-relative reach, no dynamic relocation in any output kind. x17 holds the literal's own address, so the literal is a plain PREL64 at itself. The linker lands the literal 8-aligned from the format's declared `.text` alignment, as GNU ld does. Every reach is DERIVED by the linker from the relocations the assembled template carries, never declared here. The Mach-O formats declare no `prel64` row, so a Mach-O image never elects (2): no Mach-O reference links past +-4 GiB (ld64.lld 18.1.3 refuses the shape, or emits a thunk whose ADRP wrapped, MEASURED 2026-09-19).",
+  "$linkVeneersComment": "D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH and D-LK-AARCH64-VENEER-CANNOT-REACH-PAST-FOUR-GIB: what a LINKER may build, and clobber, to carry a branch past its field's reach. Every fact here is the ABI's, stated per RELOCATION KIND, never inferred from a register's name. AAPCS64 'Use of IP0 and IP1 by the linker': a veneer must preserve every register except IP0 (x16), IP1 (x17) and the condition flags, and a conforming program must assume one may be inserted at any branch exposed to a relocation that supports long branches — so both are granted, and a register listed here is one the linker WILL clobber. AAELF64 'Call and Jump relocations': a linker may use a veneer only for R_AARCH64_CALL26 / JUMP26 / PLT32; DSS spells CALL26 and JUMP26 with its one `call26` row, so that row is the routable one. `callerSaved` is NOT this grant: it describes calls, and a JUMP26 sibcall is not one. TWO bodies, cheapest first. The linker elects, PER VENEER, the first body that reaches that veneer's destination from where it stands and whose relocations the output format declares — GNU ld 2.42's own per-stub rule (it sizes every stub long and relaxes it to the ADRP form when the page delta fits). (1) `adrp-add-br` = `adrp x16, T; add x16, x16, :lo12:T; br x16`, bytes 10 00 00 90 / 10 02 00 91 / 00 02 1f d6, the body all three reference linkers emit within +-4 GiB (MEASURED 2026-09-19, lane vn): 12 bytes, reach +-4 GiB, the ADRP page field. (2) `prel64-literal` = `lea x17, literal; load x16, [x17]; add x16, x16, x17; br x16; literal: .xword T - literal` — GNU ld 2.42's long-branch stub (`ldr ip0, 1f; adr ip1, #0; add ip0, ip0, ip1; br ip0; 1: .xword PREL64(T)+12`, bfd/elfnn-aarch64.c) built from this target's own verbs — the two-word `lea` where GNU ld writes `adr ip1, #0`, and a `load` through x17 where it writes a literal `ldr` (the body predates the one-word `adr` of P68 round 9, and keeps its bytes) — with the same two registers, the same unbounded PC-relative reach, no dynamic relocation in any output kind. x17 holds the literal's own address, so the literal is a plain PREL64 at itself. The linker lands the literal 8-aligned from the format's declared `.text` alignment, as GNU ld does. Every reach is DERIVED by the linker from the relocations the assembled template carries, never declared here. The Mach-O formats declare no `prel64` row, so a Mach-O image never elects (2): no Mach-O reference links past +-4 GiB (ld64.lld 18.1.3 refuses the shape, or emits a thunk whose ADRP wrapped, MEASURED 2026-09-19).",
   "linkVeneers": {
     "scratchRegisters": ["x16", "x17"],
     "routableRelocations": ["call26"],

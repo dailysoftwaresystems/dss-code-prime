@@ -1655,13 +1655,20 @@ struct DSS_EXPORT WeakDefinition {
 // linker-synthesized PLT/stub which performs the indirection itself;
 // the LIR opcode is the universal `call`.
 //
-// Three independent consumers select the call shape from this rule:
+// The consumers that select or check the call shape by this rule:
 //   * `mir_to_lir.cpp::lowerCall`     — user-level extern calls (FFI).
 //   * `entry_trampoline.cpp`          — the synthesized `_exit` /
 //                                       `ExitProcess` ByNameImport call.
-//   * `linker.cpp::mergeModules`      — the cross-CU merge's slot-vs-
-//                                       direct-bind decision (c154).
-// All call THIS function so the rule lives exactly once (no `if(arch)`,
+//   * `macho.cpp`                     — the Mach-O walker's refusal of an
+//                                       indirect-shaped dispatch its
+//                                       `__stubs` cannot serve.
+// ⚠ `linker.cpp::mergeModules` WAS LISTED HERE (c154) AND NO LONGER ASKS THIS
+// (P68 round 9, D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the
+// merge's slot-vs-direct-bind decision reads the referencing import row's
+// `ExternImport::readThroughSlot` — the answer MIR→LIR stamped when it chose
+// the shape — because a call's dispatch answers for FUNCTION calls only, and
+// a DATA import read through a got-indirect slot was bound to the object.
+// Each calls THIS function so the rule lives exactly once (no `if(arch)`,
 // no second copy that could drift to the opposite — and opposite is a
 // SIGSEGV: dereferencing a PLT stub's code as a pointer). Keyed on the
 // OBJECT FORMAT's dispatch model, never the CPU target.

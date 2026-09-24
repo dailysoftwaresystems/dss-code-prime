@@ -5,6 +5,7 @@
 #include "core/types/parse_diagnostic.hpp"
 
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -164,6 +165,41 @@ findShippedConfig(ShippedConfigLocator const& loc);
 findShippedConfigDir(
     std::string_view                            subdir,
     std::optional<std::filesystem::path> const& startPath = std::nullopt);
+
+// ── THE DOCUMENTS OF ONE KIND ────────────────────────────────────────────────
+// [[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]
+//
+// ★★★ THE DEFECT, ✔MEASURED 2026-09-23 (P68 round 9), and it was a DISAGREEMENT
+// BETWEEN ENUMERATIONS OF ONE DIRECTORY rather than a missing check. The driver's
+// shipped-source realization listed `sources/` by SUBSTRING (`find(".lang.json")`)
+// while the LSP's discovery listed the same directory by EXACT suffix. So a
+// `zz.lang.json.bak` -- an editor, merge or `cp` safety artifact -- was a SECOND
+// LANGUAGE to the driver: a pe64 build refused with "2 shipped languages claim the
+// extension '.c'" (once per runtime source) naming NEITHER document, and a same-stem
+// stray (`c.lang.json.orig`) was silently READ, its extension list binding to `c`.
+// Five hand-rolled enumerations of a config kind existed in src/ (two `.lang.json`,
+// three `.format.json`), each with its own idea of an iteration error.
+//
+// ⇒ ONE OWNER for "which files ARE the documents of this kind". The accepted form is
+// DEFINED -- a regular file named exactly `<stem><suffix>` with a non-empty stem -- and
+// its complement is refused, never a list of artifact suffixes (`.orig`, `.rej`,
+// `.bak`, `.tmp-*` ...) that the next tool would have to extend.
+//
+// The result is SORTED BY STEM, so every answer built from it (a claimant set, a
+// candidate list, the wording of an ambiguity report) is a property of the corpus and
+// not of the host filesystem's iteration order (sorted on NTFS, hash-ordered on ext4).
+//
+// ⚠ A PARTIAL ENUMERATION IS REFUSED, NEVER TRUNCATED. A listing error -- at the start
+// or mid-directory -- is the error, naming the directory: a claimant set built from half
+// a directory can answer "one claimant" where the whole has two, which is the silent
+// wrong answer this owner exists to end.
+struct DSS_EXPORT ShippedConfigDocument {
+    std::string           stem;   // "c" for `c.lang.json`: the name `loadShipped` takes
+    std::filesystem::path path;   // the document itself
+};
+
+[[nodiscard]] DSS_EXPORT std::expected<std::vector<ShippedConfigDocument>, std::string>
+shippedConfigDocuments(std::filesystem::path const& directory, std::string_view suffix);
 
 // THE RESOLVED SYSTEM-INCLUDE DIRS for `grammar`: its declared
 // `semantics.shippedLibDirs` strings mapped through `findShippedConfigDir` to

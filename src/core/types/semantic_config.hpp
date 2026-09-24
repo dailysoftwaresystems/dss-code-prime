@@ -2068,7 +2068,11 @@ struct DSS_EXPORT TypeSpecifierRule {
     // 0 = undeclared, which is also the rank of every anonymous primitive; a
     // named entry therefore always out-ranks the anonymous representative of
     // its own kind. Only meaningful with a `name` (loader rejects rank alone).
-    // Used ONLY as the tie-break between two operands of the SAME kind.
+    // Read by the usual arithmetic conversions in exactly two places: the
+    // tie-break between two operands of the SAME kind, and — P68 round 10 —
+    // the mixed-signedness decision between two operands of the SAME WIDTH
+    // (C 6.3.1.8's fifth conversion), which also pairs a signed entry with its
+    // unsigned counterpart of equal rank (`deriveUnsignedCounterparts` below).
     int                        rank = 0;
     TypeKind                   core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
@@ -2114,6 +2118,82 @@ struct DSS_EXPORT TypeSpecifierRule {
         return resolveCore(dm);
     }
 };
+
+// ── C 6.3.1.8's FIFTH CONVERSION: THE UNSIGNED COUNTERPART OF A SIGNED ENTRY ──
+//
+// When the operand of signed integer type has the greater conversion rank but cannot
+// represent every value of the unsigned operand's type — which, over power-of-two
+// widths, happens exactly when the two have the SAME width — both convert to "the
+// unsigned integer type corresponding to the type of the operand with signed integer
+// type": the unsigned type of the SAME conversion rank (C 6.3.1.1). The language
+// already declares that rank on each named entry (`rank`), so the counterpart of a
+// NAMED signed entry is the named entry of EQUAL rank whose core, under a data model,
+// is the unsigned twin of the signed entry's core — `long` -> `unsigned long`, `long
+// long` -> `unsigned long long`, `__int128` -> `unsigned __int128`. No config key:
+// the relation IS the equal rank. ONE derivation, read by the loader (which refuses a
+// named signed entry that SURVIVES integer promotion with no counterpart, or with two,
+// under any data model — a promoted operand is the anonymous promoted type before any
+// conversion decision, so it needs none) and by the arithmetic-rules resolver (which
+// builds the map the conversions consult).
+// P68 round 10, lane `cs` (D-LANG-UAC-UNSIGNED-COUNTERPART-OF-SIGNED).
+
+// The unsigned integer kind of a SIGNED integer kind's width; nullopt for every other.
+[[nodiscard]] constexpr std::optional<TypeKind> unsignedIntegerTwin(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::I8:   return TypeKind::U8;
+        case TypeKind::I16:  return TypeKind::U16;
+        case TypeKind::I32:  return TypeKind::U32;
+        case TypeKind::I64:  return TypeKind::U64;
+        case TypeKind::I128: return TypeKind::U128;
+        default:             return std::nullopt;
+    }
+}
+
+struct UnsignedCounterparts {
+    struct Entry {
+        std::string name;
+        TypeKind    core = TypeKind::Void;   // its signed core under the data model
+    };
+    std::unordered_map<std::string, std::string> counterpartOf;   // signed name -> unsigned name
+    // Named signed entries with NO counterpart, and with MORE than one. A pure pairing:
+    // whether an entry NEEDS one — it does not when integer promotion turns it into the
+    // anonymous promoted type before any conversion decision — is the caller's question
+    // (the loader asks it; the conversions never consult a promoted operand's name).
+    std::vector<Entry> missing;
+    std::vector<Entry> ambiguous;
+};
+
+[[nodiscard]] inline UnsignedCounterparts
+deriveUnsignedCounterparts(std::vector<TypeSpecifierRule> const& rows, DataModel dm) {
+    UnsignedCounterparts out;
+    auto const listed = [](std::vector<UnsignedCounterparts::Entry> const& v, std::string const& s) {
+        for (auto const& x : v)
+            if (x.name == s) return true;
+        return false;
+    };
+    for (auto const& s : rows) {
+        // A `complex` row's name rides its ELEMENT, and a long-double row is a float;
+        // neither is an integer entry.
+        if (s.name.empty() || s.complex || !s.coreByLongDoubleFormat.empty()) continue;
+        TypeKind const sCore = s.resolveCore(dm);
+        auto const twin = unsignedIntegerTwin(sCore);
+        if (!twin.has_value() || out.counterpartOf.contains(s.name)
+            || listed(out.missing, s.name) || listed(out.ambiguous, s.name))
+            continue;
+        std::string found;
+        bool twoNames = false;
+        for (auto const& u : rows) {
+            if (u.name.empty() || u.complex || !u.coreByLongDoubleFormat.empty()) continue;
+            if (u.rank != s.rank || u.resolveCore(dm) != *twin) continue;
+            if (found.empty()) found = u.name;
+            else if (u.name != found) twoNames = true;
+        }
+        if (twoNames)           out.ambiguous.push_back({s.name, sCore});
+        else if (found.empty()) out.missing.push_back({s.name, sCore});
+        else                    out.counterpartOf.emplace(s.name, found);
+    }
+    return out;
+}
 
 // ── FC3 c1: a LOAD-RESOLVED dataModel-aware type-name reference ──
 //
@@ -2287,10 +2367,15 @@ struct DSS_EXPORT FloatLiteralTypingRule {
 //     promotes both to int; the engine never hardcodes C's view of
 //     char). Resolved per data model like every other name here.
 //   * `mixedSignedness` — closed verb for the cross-signedness rule.
-//     `rank-prefer-unsigned` (C): unsigned rank ≥ signed rank → the
-//     unsigned type; else the signed type (which, at strictly higher
-//     width-rank, represents the whole unsigned range). The loader
-//     rejects unknown verbs — a typo can never silently no-op.
+//     `rank-prefer-unsigned` (C 6.3.1.8's last three conversions): the
+//     unsigned operand's rank ≥ the signed one's → the unsigned type; else a
+//     signed type that represents every unsigned value (a strictly WIDER one)
+//     → the signed type; else — the SAME width, the signed operand ranked
+//     higher (C 6.3.1.1, by name: LP64 `long long` vs `unsigned long`, LLP64
+//     `long` vs `unsigned int`) — the UNSIGNED COUNTERPART of the signed type
+//     (`deriveUnsignedCounterparts`). The loader rejects unknown verbs — a
+//     typo can never silently no-op — and a named signed entry without a
+//     counterpart.
 //   * `promoteComparisons` — when true (C), comparison operands run the
 //     same conversion (so `-1 > 0ul` compares as U64); the result stays
 //     Bool. When false, comparisons keep their raw operand types.

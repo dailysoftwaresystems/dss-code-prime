@@ -374,6 +374,29 @@ enum class LirOperandKind : std::uint8_t {
     // bounding its displacement (`immMin`/`immMax`) never matches it — the
     // strict reading, since no bound can be proven of a value nobody knows yet.
     MemSymbolOffset = 11,
+    // ★★ A SYMBOL'S ADDRESS PLUS A CONSTANT IN A **SYMBOL** POSITION — the
+    // `msg+8` of `adrp x0, msg+8` / `adr x0, msg-4` (P68 round 9, the aarch64
+    // twins). `SymbolRef` carries a symbol id and nothing else, so an addend
+    // rides the literal pool's `LirSymbolAddress` entry, exactly as
+    // `MemSymbolOffset` carries one in a displacement position; a guard's
+    // `symbol` position accepts either. A symbol with no constant stays a
+    // `SymbolRef`.
+    SymbolAddress = 12,
+    // ★★ THE ADDRESS OF THE INSTRUCTION THAT CARRIES IT — the location counter
+    // `.` of `adr x7, .` / `adr x7, .+8` (P68 round 9, the aarch64 twins). It is
+    // a LOCATION OF THIS FUNCTION, as a `BlockRef` is, and a guard's `blockref`
+    // position takes either: the field is resolved at assemble time, the
+    // constant after the dot rides the instruction's `block.addend` wire exactly
+    // as a block's does, and no relocation exists. ✔MEASURED 2026-09-23, gas
+    // 2.42 and clang 18 (ELF and Darwin): `adr x7, .` = 0x10000007, `adr x7,
+    // .+8` = 0x10000047, `adr x7, .-4` = 0x10FFFFE7. ★ IT IS NOT A BLOCK, and
+    // that is the point: a `.` is no label in the reference assemblers, so
+    // beginning a block at its line would put a fall-through jump in front of
+    // it (D-ASM-FALLTHROUGH-INTO-A-LABEL-EMITS-A-JUMP) and move every `.±N`
+    // that spans it. No payload: the field's distance is the addend alone.
+    // Never a branch target — a branch names a successor BLOCK, and `b .`
+    // reaches one (`LirOperandKind::BlockRef`).
+    LocationCounter = 13,
 };
 
 // One slot in the operand pool. The tag picks the active field.
@@ -385,7 +408,18 @@ struct LirOperand {
     // clamps the matching class cursor so a SUBSEQUENT arg/vararg of that class also
     // goes to memory (matching the callee's va_start clamp). Unused (0) for any other
     // operand kind. Repurposes one padding byte — no struct-size change.
-    std::uint8_t   byValueAggExhaust = 0;        // 1
+    union {
+        std::uint8_t byValueAggExhaust = 0;      // 1
+        // P68 round 9: for a `SymbolRef`, `SymbolAddress` or `MemSymbolOffset`,
+        // WHICH PART of the symbol's address the operand denotes
+        // (`SymbolAddressPart` as its underlying byte — `adrp`'s page, a load's
+        // page offset). Read through `symbolAddressPart()`. 0 is `Whole`, what
+        // every producer that states no part leaves, so a plain symbol operand
+        // is unchanged. The same padding byte `byValueAggExhaust` repurposes —
+        // the two kinds never meet on one operand, and `LirOperand` stays 8
+        // bytes.
+        std::uint8_t symbolPartByte;
+    };
     // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): for a SpillSlotRef operand, the
     // value's LirRegClass (as a uint8 — GPR/FPR/...) so callconv resolves the
     // class-correct load op. Repurposes one of the two padding bytes — no
@@ -421,7 +455,7 @@ struct LirOperand {
         std::uint32_t symbolV;    // 4 — kind == SymbolRef → SymbolId.v
         std::uint32_t scale;      // 4 — kind == MemBase (1/2/4/8)
         std::int32_t  offset;     // 4 — kind == MemOffset
-        std::uint32_t litIndex;   // 4 — kind == LiteralIndex / MemSymbolOffset (into LirLiteralPool)
+        std::uint32_t litIndex;   // 4 — kind == LiteralIndex / MemSymbolOffset / SymbolAddress (into LirLiteralPool)
         std::uint32_t byValueAggBytes; // 4 — kind == ByValueStackAgg (aggregate byte size)
         std::uint32_t spillSlotV; // 4 — kind == SpillSlotRef (LirSpillSlot.v)
     };
@@ -465,11 +499,41 @@ struct LirOperand {
         o.blockSlot = v;
         return o;
     }
-    [[nodiscard]] static constexpr LirOperand makeSymbolRef(std::uint32_t v) noexcept {
+    // The address of the instruction that carries it (`.`). See
+    // `LirOperandKind::LocationCounter`.
+    [[nodiscard]] static constexpr LirOperand makeLocationCounter() noexcept {
         LirOperand o{};
-        o.kind     = LirOperandKind::SymbolRef;
-        o.symbolV  = v;
+        o.kind = LirOperandKind::LocationCounter;
         return o;
+    }
+    [[nodiscard]] static constexpr LirOperand
+    makeSymbolRef(std::uint32_t v,
+                  SymbolAddressPart part = SymbolAddressPart::Whole) noexcept {
+        LirOperand o{};
+        o.kind           = LirOperandKind::SymbolRef;
+        o.symbolV        = v;
+        o.symbolPartByte = static_cast<std::uint8_t>(part);
+        return o;
+    }
+    // A symbol plus a constant in a symbol position: `idx` names the module
+    // literal pool's `LirSymbolAddress` entry. See `LirOperandKind::SymbolAddress`.
+    [[nodiscard]] static constexpr LirOperand
+    makeSymbolAddress(std::uint32_t idx,
+                      SymbolAddressPart part = SymbolAddressPart::Whole) noexcept {
+        LirOperand o{};
+        o.kind           = LirOperandKind::SymbolAddress;
+        o.litIndex       = idx;
+        o.symbolPartByte = static_cast<std::uint8_t>(part);
+        return o;
+    }
+    // Which part of a symbol's address a symbolic operand denotes; `Whole` for
+    // every operand kind that names no symbol.
+    [[nodiscard]] constexpr SymbolAddressPart symbolAddressPart() const noexcept {
+        if (kind != LirOperandKind::SymbolRef && kind != LirOperandKind::SymbolAddress
+            && kind != LirOperandKind::MemSymbolOffset) {
+            return SymbolAddressPart::Whole;
+        }
+        return static_cast<SymbolAddressPart>(symbolPartByte);
     }
     [[nodiscard]] static constexpr LirOperand makeMemBase(std::uint32_t scale) noexcept {
         LirOperand o{};
@@ -491,10 +555,13 @@ struct LirOperand {
     }
     // A symbolic memory displacement: `idx` names the module literal pool's
     // `LirSymbolAddress` entry. See `LirOperandKind::MemSymbolOffset`.
-    [[nodiscard]] static constexpr LirOperand makeMemSymbolOffset(std::uint32_t idx) noexcept {
+    [[nodiscard]] static constexpr LirOperand
+    makeMemSymbolOffset(std::uint32_t idx,
+                        SymbolAddressPart part = SymbolAddressPart::Whole) noexcept {
         LirOperand o{};
-        o.kind     = LirOperandKind::MemSymbolOffset;
-        o.litIndex = idx;
+        o.kind           = LirOperandKind::MemSymbolOffset;
+        o.litIndex       = idx;
+        o.symbolPartByte = static_cast<std::uint8_t>(part);
         return o;
     }
     // FC12a-struct: the by-value-aggregate stack-arg size marker. ALWAYS emitted

@@ -4,6 +4,9 @@
   "standard": "c89",
   "availableObjectFormats": ["elf", "macho"],
   "library": { "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
+  "typedefs": [
+    { "name": "sig_atomic_t", "type": "i32", "$comment": "P68 round 9: C 7.14p2 requires `sig_atomic_t` in <signal.h>, and this descriptor declared no typedefs at all. `int` on every reference, MEASURED 2026-09-23 by _Generic + sizeof: glibc (gcc 13.3.0 and clang 18.1.3, x86_64 and aarch64; gcc's `__SIG_ATOMIC_TYPE__` says `int`), Apple clang 21.0.0 (arm64 and x86_64), mingw-w64 13.2.0 and MSVC 14.51 (int, 4). `__SIG_ATOMIC_TYPE__`/`_MAX__`/`_MIN__`/`_WIDTH__` name this row, so they exist exactly where this header ships." }
+  ],
   "symbols": [
     { "name": "signal", "signature": "fn(i32, ptr<fn(i32) -> void>) -> ptr<fn(i32) -> void>", "kind": "function", "linkage": "external" },
     { "name": "raise",  "signature": "fn(i32) -> i32",                                        "kind": "function", "linkage": "external" }

@@ -62,9 +62,9 @@ bool summariesDescribeModules(std::span<LazyImportCu const> cus,
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::format(
             "summariesDescribeModules: {} module(s) but {} summary(ies) — the "
-            "index's module indices would name the wrong modules "
-            "(D-OPT11-LAZY-IMPORT-EDGE).",
+            "index's module indices would name the wrong modules.",
             cus.size(), summaries.size());
+        // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
         reporter.report(std::move(d));
         return false;
     }
@@ -92,8 +92,9 @@ bool summariesDescribeModules(std::span<LazyImportCu const> cus,
                 "#{} ({}). An on-demand body fetch resolves a name through this "
                 "summary's ORDINALS, so a summary paired with the wrong module "
                 "returns the WRONG BODY — which is a silent miscompile, not a "
-                "cache miss (D-OPT11-LAZY-IMPORT-EDGE).",
+                "cache miss.",
                 m, m, what);
+            // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
             reporter.report(std::move(d));
         };
         if (s.functions.size() != cu.mir->moduleFuncCount()) {
@@ -211,11 +212,12 @@ bool isImportable(std::uint32_t importer, std::string const& calleeName,
     // this correspondence globally and once; a caller that skipped it must still
     // never receive a wrong body — it must receive a crash.
     if (nameOfSymbol(*src.symbolNames, src.mir->funcSymbol(f)) != calleeName) {
+        // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
         std::fprintf(stderr,
             "dss::isImportable fatal: the index places '%s' at module #%u "
             "function #%u, but that function is named '%s' — this fetch would "
             "have imported the WRONG BODY. Call `summariesDescribeModules` "
-            "before using an index (D-OPT11-LAZY-IMPORT-EDGE).\n",
+            "before using an index.\n",
             calleeName.c_str(), site->moduleIndex, site->functionIndex,
             nameOfSymbol(*src.symbolNames, src.mir->funcSymbol(f)).c_str());
         std::abort();
@@ -474,8 +476,8 @@ void declareUndefinedReferences(
             std::fprintf(stderr,
                 "dss::lazyImportOptimize fatal: merged symbol v=%u is "
                 "referenced, undefined and unnamed — the satisfiability rule "
-                "in `isImportable` admitted a body it should have refused "
-                "(D-OPT11-LAZY-IMPORT-EDGE).\n", v);
+                "in `isImportable` admitted a body it should have refused.\n", v);
+            // Anchored: D-OPT11-LAZY-IMPORT-EDGE (unreachable: the abort below).
             std::abort();
         }
         std::string const& name = it->second;
@@ -511,8 +513,9 @@ void declareUndefinedReferences(
                     "dss::lazyImportOptimize fatal: merged symbol '%s' is "
                     "referenced and undefined, and no summary declares it as "
                     "an import — the satisfiability rule admitted a body it "
-                    "should have refused (D-OPT11-LAZY-IMPORT-EDGE).\n",
+                    "should have refused.\n",
                     name.c_str());
+                // Anchored: D-OPT11-LAZY-IMPORT-EDGE (unreachable: the abort below).
                 std::abort();
             }
         }
@@ -633,9 +636,9 @@ lazyImportOptimize(std::uint32_t importer,
                 d.severity = DiagnosticSeverity::Error;
                 d.actual   = std::format(
                     "lazyImportOptimize: the on-demand body import for module "
-                    "#{} failed to clone {} function(s) "
-                    "(D-OPT11-LAZY-IMPORT-EDGE).",
+                    "#{} failed to clone {} function(s).",
                     importer, batch.total);
+                // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
                 reporter.report(std::move(d));
                 return out;
             }
@@ -729,8 +732,9 @@ lazyImportOptimize(std::uint32_t importer,
                 "lazyImportOptimize: module #{} still had {} importable "
                 "callee(s) after {} optimize round(s) — the import fixpoint hit "
                 "its bound. The module is CORRECT; some cross-CU inlining was "
-                "left for the whole-program stage (D-OPT11-LAZY-IMPORT-EDGE).",
+                "left for the whole-program stage.",
                 importer, fresh.size(), round + 1);
+            // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
             reporter.report(std::move(d));
             break;
         }

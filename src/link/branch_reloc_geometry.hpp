@@ -51,6 +51,10 @@ branchRelocGeometry(RelocFormulaKind k) noexcept {
         //                         all (which is exactly why it cannot be an
         //                         escape for a branch either);
         //   * the lo12 / GOT    — an addressing-mode half, never a transfer.
+        //   * the one-word ADR  — PC-relative and bounded (±1 MiB), but an
+        //                         ADDRESS, not a transfer: no veneer can stand
+        //                         nearer to a datum on its behalf;
+        //   * the scaled LDST lo12 — the low bits of an absolute address.
         case RelocFormulaKind::Linear:
         case RelocFormulaKind::Aarch64AdrPrelPgHi21:
         case RelocFormulaKind::Aarch64AddAbsLo12:
@@ -58,6 +62,8 @@ branchRelocGeometry(RelocFormulaKind k) noexcept {
         case RelocFormulaKind::Aarch64AdrGotPage:
         case RelocFormulaKind::Aarch64Ld64GotLo12:
         case RelocFormulaKind::X86_64GotPcRel:
+        case RelocFormulaKind::Aarch64AdrPrelLo21:
+        case RelocFormulaKind::Aarch64LdstAbsLo12:
             return BranchRelocGeometry{ 0, 0, 0 };
     }
     // Enum-drift backstop: a formula added without a row here answers "not a
@@ -126,6 +132,11 @@ relocFieldReach(TargetRelocationInfo const& row) noexcept {
             constexpr std::int64_t kPages = std::int64_t{1} << 20;
             return RelocReach{-kPages * kPage, (kPages - 1) * kPage - 1};
         }
+        case RelocFormulaKind::Aarch64AdrPrelLo21: {
+            // S + A - P itself, unscaled, in signed 21 bits: ±1 MiB for every P.
+            constexpr std::int64_t kHalf = std::int64_t{1} << 20;
+            return RelocReach{-kHalf, kHalf - 1};
+        }
         case RelocFormulaKind::Linear: {
             // value = S + A - P + addendBias, written in `widthBytes` bytes.
             // Absolute rows, and an 8-byte field, span the address space.
@@ -139,6 +150,7 @@ relocFieldReach(TargetRelocationInfo const& row) noexcept {
         case RelocFormulaKind::Aarch64AdrGotPage:     // addresses the GOT SLOT
         case RelocFormulaKind::Aarch64Ld64GotLo12:    // addresses the GOT SLOT
         case RelocFormulaKind::X86_64GotPcRel:        // addresses the GOT SLOT
+        case RelocFormulaKind::Aarch64LdstAbsLo12:    // the low 12 bits of S + A
             return std::nullopt;
     }
     return std::nullopt;

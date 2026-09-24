@@ -240,6 +240,38 @@
       "name": "R_AARCH64_PREL32",
       "kind": 9,
       "nativeId": 261
+    },
+    {
+      "$comment": "P68 round 9 (the aarch64 twin of D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER): the one-word `adr`, S + A - P in signed 21 bits. ELF type R_AARCH64_ADR_PREL_LO21 = 274; kind 11 = arm64's `adr_prel_lo21`. ✔MEASURED 2026-09-23: gas 2.42 and clang 18 write `adr x0, msg` with this type.",
+      "name": "R_AARCH64_ADR_PREL_LO21",
+      "kind": 11,
+      "nativeId": 274
+    },
+    {
+      "$comment": "P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): the page offset of a load or store, one type per access size — AAELF64's R_AARCH64_LDST8/16/32/64/128_ABS_LO12_NC = 278/284/285/286/299, kinds 12..16 = arm64's `ldst*_abs_lo12_nc` (the scale is the target row's `scaleLog2`). ✔MEASURED 2026-09-23: aarch64 gcc 13 -O2 writes all five for one global per size; at the round-9 base this reader refused the object ('relocation type 299 ... is not declared').",
+      "name": "R_AARCH64_LDST8_ABS_LO12_NC",
+      "kind": 12,
+      "nativeId": 278
+    },
+    {
+      "name": "R_AARCH64_LDST16_ABS_LO12_NC",
+      "kind": 13,
+      "nativeId": 284
+    },
+    {
+      "name": "R_AARCH64_LDST32_ABS_LO12_NC",
+      "kind": 14,
+      "nativeId": 285
+    },
+    {
+      "name": "R_AARCH64_LDST64_ABS_LO12_NC",
+      "kind": 15,
+      "nativeId": 286
+    },
+    {
+      "name": "R_AARCH64_LDST128_ABS_LO12_NC",
+      "kind": 16,
+      "nativeId": 299
     }
   ]
 }

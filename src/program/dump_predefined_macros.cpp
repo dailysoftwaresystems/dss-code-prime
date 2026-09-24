@@ -162,6 +162,15 @@ void appendLine(std::string&          out,
             // type unsigned — a signed pair has no such row to print, exactly as
             // `-dM` lists no `__WCHAR_UNSIGNED__` where `wchar_t` is `int`.
             return pm.value;
+        case PredefinedMacroKind::TypeName:
+        case PredefinedMacroKind::TypeLimit:
+        case PredefinedMacroKind::TypeSuffix:
+            // P68 round 9: the spelling, the spelled limit or the suffix the
+            // merge REALIZED for this (language × pair) — printed as the text
+            // the preprocessor will see (a `type-suffix` may be EMPTY, as
+            // `__INT8_C_SUFFIX__` is under every reference); the kind beside it
+            // says the value was derived from a type, not declared.
+            return pm.value;
         case PredefinedMacroKind::Date:
             // Quoted exactly as the materializer quotes it, so the dumped
             // spelling is the token the parser would see.
@@ -213,7 +222,7 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
     // order, and whether the three families collide, comes from this one call.
     MergedPredefinedMacros const merged = mergePredefinedMacros(
         req.languageMacros, req.targetMacros, req.formatMacros,
-        req.activeFormat, req.exclusiveGroups, req.typeFacts);
+        req.activeFormat, req.exclusiveGroups, req.typeFacts, req.language);
     // `conflicts` non-empty ⇒ `effective` is documented UNUSABLE. Return the
     // merge's own messages and NOTHING else — no header, no partial list.
     if (!merged.conflicts.empty()) return std::unexpected(merged.conflicts);
@@ -287,15 +296,15 @@ renderPredefinedMacroDump(PredefinedMacroDumpRequest const& req) {
         FamilySurvivors{PredefinedMacroOrigin::Language,
                         mergePredefinedMacros(req.languageMacros, {}, {},
                                               req.activeFormat, {},
-                                              req.typeFacts)},
+                                              req.typeFacts, req.language)},
         FamilySurvivors{PredefinedMacroOrigin::Target,
                         mergePredefinedMacros(req.targetMacros, {}, {},
                                               req.activeFormat, {},
-                                              req.typeFacts)},
+                                              req.typeFacts, req.language)},
         FamilySurvivors{PredefinedMacroOrigin::Format,
                         mergePredefinedMacros(req.formatMacros, {}, {},
                                               req.activeFormat, {},
-                                              req.typeFacts)}};
+                                              req.typeFacts, req.language)}};
 
     std::size_t i = 0;
     for (FamilySurvivors const& fam : families) {
@@ -566,6 +575,8 @@ int dumpPredefinedMacros(CliArgs const& args, std::ostream& out,
         PredefinedTypeFacts const typeFacts =
             predefinedTypeFactsFor(**targetR, **formatR);
         req.typeFacts      = &typeFacts;
+        // P68 round 9: the language too, for the type-derived rows (h).
+        req.language       = grammar.get();
         req.userDefines    = args.defines;
         // WHICH TREE ANSWERED — from the LANGUAGE document that actually
         // loaded, never from a fresh precedence walk. See the field's docblock.

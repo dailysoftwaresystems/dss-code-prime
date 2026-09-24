@@ -81,6 +81,11 @@ void expectConstVerdicts(std::initializer_list<Case> cases) {
                     << c.what << " — control drew " << diagnosticCodeName(d.code)
                     << ": " << d.actual << "\n" << c.src;
             }
+            // P68 round 9, the vacuity sweep: a pointer conversion a control draws is
+            // a WARNING since row 1, which the error check above cannot see.
+            EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+                << c.what << " — a control must not draw a diagnosed pointer conversion\n"
+                << c.src;
         }
     }
 }

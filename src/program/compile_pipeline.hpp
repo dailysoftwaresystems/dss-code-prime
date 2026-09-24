@@ -376,7 +376,7 @@ class CompilationUnit; // fwd-decl — `compile_pipeline.cpp` includes the full 
 // ✔MEASURED — the merged route is reachable ONLY through
 // `Program::compileUnits` with ≥2 sources, and
 // <!--census:examples:top.sources-->31 of the
-// <!--census:examples:manifests-->911 shipped corpus example manifests declare a
+// <!--census:examples:manifests-->921 shipped corpus example manifests declare a
 // multi-source `sources` array, so the corpus exercises it roughly 3% as often
 // as the single-CU route.
 // ⚠ THE RATIO IS THE ONE FIGURE HERE THAT IS **NOT** MACHINE-CHECKED — a census
@@ -917,6 +917,18 @@ struct DSS_EXPORT CuMirModule {
     // stale interner silently and the pointer's nullness is one indirection away
     // from every use site.
     bool                                           usesImportedLattice = false;
+
+    // ★ THE OBJECT FORMAT KIND — AND ONLY AS A KEY (P68 round 9, the aarch64
+    // twins). An inline-asm template's address-part operator is read under the
+    // kind its dialect row lists (`symbolParts`: `:lo12:` for ELF, `@PAGEOFF`
+    // for Mach-O — ✔MEASURED 2026-09-23, each reference refuses the other's),
+    // and the dialect is chosen in the LOWER half, so the key rides this
+    // struct. ⚠ IT IS NOT THE FORMAT IDENTITY `cSymbolDecoration` REPLACED
+    // above: nothing branches on it; it is compared against a dialect's own
+    // declared lists and nothing else. A second format fact the lower half
+    // needs is a facts object, not a second key. nullopt ⇒ no format stated,
+    // and every such operator is refused by name.
+    std::optional<ObjectFormatKind>                assemblyFormatKind;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the
@@ -1286,7 +1298,13 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // without it emits the DIRECT branch that is the
                       // whole defect, and nothing downstream can tell that
                       // branch from a legitimately module-private one.
-                      std::vector<SymbolBinding> preemptibleDefinitionBindings = {});
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings = {},
+                      // P68 round 9: the format kind, ONLY as a key into the
+                      // assembly dialect's `symbolParts` (see
+                      // `CuMirModule::assemblyFormatKind`). nullopt ⇒ an
+                      // inline-asm address-part operator is refused by name.
+                      std::optional<ObjectFormatKind> assemblyFormatKind =
+                          std::nullopt);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of
 // `compileSingleUnit`). N==1 is the v1 single-CU path; N>1 triggers the linker's

@@ -372,6 +372,65 @@ void runOneCompile(fs::path const& sandbox, std::string const& languageName,
                                   out.rep);
 }
 
+// Give the realized unit extension `ext` in the staged tree, and re-point every
+// descriptor that names it. R1 (a realization names an existing file) still
+// holds, so a refusal that follows is the LANGUAGE one and not a missing body.
+void reextensionRealizedUnit(StagedTree const& staged, RealizedUnit const& unit,
+                             std::string const& ext) {
+    fs::path const oldSource = staged.configDir / unit.source;
+    fs::path       newSource = oldSource;
+    newSource.replace_extension(ext);
+    std::error_code ec;
+    fs::rename(oldSource, newSource, ec);
+    ASSERT_FALSE(ec) << "cannot re-extension the staged runtime unit "
+                     << oldSource.generic_string() << ": " << ec.message();
+
+    std::string const declaredOld = "\"" + unit.source + "\"";
+    std::string       declaredNew = unit.source;
+    declaredNew = declaredNew.substr(0, declaredNew.rfind('.')) + ext;
+    declaredNew = "\"" + declaredNew + "\"";
+    std::size_t rewritten = 0;
+    for (fs::recursive_directory_iterator it{staged.configDir / "shippedLibs", ec},
+         end; it != end; it.increment(ec)) {
+        if (ec) break;
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        if (it->path().extension() != ".json") continue;
+        std::string text = readWhole(it->path());
+        auto const  at   = text.find(declaredOld);
+        if (at == std::string::npos) continue;
+        for (std::size_t p = at; p != std::string::npos;
+             p = text.find(declaredOld, p + declaredNew.size()))
+            text.replace(p, declaredOld.size(), declaredNew);
+        ASSERT_TRUE(writeWhole(it->path(), text))
+            << "cannot re-write staged descriptor " << it->path().generic_string();
+        ++rewritten;
+    }
+    ASSERT_GT(rewritten, 0u)
+        << "no staged descriptor names " << declaredOld
+        << ", so the re-extensioned unit would never be realized and the test "
+           "would refuse nothing";
+}
+
+// A byte copy of `claiming`'s own language document under `strayLeaf` -- the
+// shape an editor, a merge or a `cp` leaves beside the real one -- optionally
+// claiming ONE EXTRA extension (inserted at the head of its first
+// `fileExtensions` array, the key the resolver's SAX reader collects).
+[[nodiscard]] bool plantStrayCopy(StagedTree const& staged, std::string const& claiming,
+                                  std::string const& strayLeaf,
+                                  std::string const& extraExt) {
+    fs::path const sources = staged.configDir / "sources";
+    std::string    text    = readWhole(sources / (claiming + std::string{kLangSuffix}));
+    if (text.empty()) return false;
+    if (!extraExt.empty()) {
+        auto const key  = text.find("\"fileExtensions\"");
+        auto const open = key == std::string::npos ? key : text.find('[', key);
+        if (open == std::string::npos) return false;
+        text.insert(open + 1, "\"" + extraExt + "\", ");
+    }
+    return writeWhole(sources / strayLeaf, text);
+}
+
 }  // namespace
 
 // ═══ THE DENOMINATOR ═════════════════════════════════════════════════════════
@@ -522,43 +581,7 @@ TEST(ShippedSourceLanguageResolution, AnUnclaimedExtensionIsRefused) {
     auto const staged = stageConfigTree(scratch.path() / "tree");
     ASSERT_TRUE(staged.has_value());
 
-    // Re-extension the realized unit in the staged tree, and re-point every
-    // descriptor that names it. R1 (a realization names an existing file) still
-    // holds, so the refusal under test is the LANGUAGE one and not a missing
-    // body.
-    fs::path const oldSource = staged->configDir / unit->source;
-    fs::path       newSource = oldSource;
-    newSource.replace_extension(strangerExt);
-    std::error_code ec;
-    fs::rename(oldSource, newSource, ec);
-    ASSERT_FALSE(ec) << "cannot re-extension the staged runtime unit "
-                     << oldSource.generic_string() << ": " << ec.message();
-
-    std::string const declaredOld = "\"" + unit->source + "\"";
-    std::string       declaredNew = unit->source;
-    declaredNew = declaredNew.substr(0, declaredNew.rfind('.')) + strangerExt;
-    declaredNew = "\"" + declaredNew + "\"";
-    std::size_t rewritten = 0;
-    for (fs::recursive_directory_iterator it{staged->configDir / "shippedLibs", ec},
-         end; it != end; it.increment(ec)) {
-        if (ec) break;
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        if (it->path().extension() != ".json") continue;
-        std::string text = readWhole(it->path());
-        auto const  at   = text.find(declaredOld);
-        if (at == std::string::npos) continue;
-        for (std::size_t p = at; p != std::string::npos;
-             p = text.find(declaredOld, p + declaredNew.size()))
-            text.replace(p, declaredOld.size(), declaredNew);
-        ASSERT_TRUE(writeWhole(it->path(), text))
-            << "cannot re-write staged descriptor " << it->path().generic_string();
-        ++rewritten;
-    }
-    ASSERT_GT(rewritten, 0u)
-        << "no staged descriptor names " << declaredOld
-        << ", so the re-extensioned unit would never be realized and this test "
-           "would refuse nothing";
+    ASSERT_NO_FATAL_FAILURE(reextensionRealizedUnit(*staged, *unit, strangerExt));
 
     ScopedEnv      env{"DSS_CONFIG_ROOT", staged->root.string()};
     CompileOutcome outcome;
@@ -573,6 +596,127 @@ TEST(ShippedSourceLanguageResolution, AnUnclaimedExtensionIsRefused) {
         outcome.rep, "no shipped language claims the extension '" + strangerExt))
         << "the refusal must be the ZERO-CLAIMANT diagnostic, naming the extension"
         << renderErrors(outcome.rep);
+}
+
+// ═══ THE STRAYS ══════════════════════════════════════════════════════════════
+//
+// [[D-CONFIG-STRAY-FILE-NAMED-AFTER-A-LANGUAGE-LOADS-AS-A-SECOND-DOCUMENT]]: what an
+// editor, a merge or a `cp` leaves beside a language document is not a language
+// document. Until the enumeration moved to its ONE owner
+// (`shippedConfigDocuments`), this resolver matched `.lang.json` as a SUBSTRING:
+// a same-stem stray was READ (its extensions bound to the real language) and a
+// differently named one was a SECOND claimant, refused by a message naming
+// neither file. Each arm plants strays in a private copy of the shipped tree and
+// asserts the build's ANSWER.
+
+// ★★ THE SAME-STEM STRAY `<lang>.lang.json.orig` claims an extension nothing else
+// does, and the realized unit is given that extension. A resolver that READS the
+// stray binds the unit to `<lang>` and the build SUCCEEDS; the owner's answer is
+// that nothing claims it, so the build refuses with the ZERO-claimant diagnostic.
+TEST(ShippedSourceLanguageResolution, ASameStemStrayIsNotReadAsTheLanguage) {
+    ASSERT_FALSE(configRoot().empty());
+    auto const unit = firstRealizedUnit();
+    ASSERT_TRUE(unit.has_value());
+    auto const machine = firstMachineFor(unit->formatKey);
+    ASSERT_TRUE(machine.has_value());
+    std::string const unitExt =
+        lowered(fs::path{unit->source}.extension().generic_string());
+    auto const claiming = languageClaiming(unitExt);
+    ASSERT_TRUE(claiming.has_value());
+    std::string const strayExt = ".lanemigstray";
+    ASSERT_FALSE(languageClaiming(strayExt).has_value())
+        << "'" << strayExt << "' must be claimed by NO shipped language";
+
+    ScratchDir scratch{Location::Temp, "shipped-source-language-resolution"};
+    auto const staged = stageConfigTree(scratch.path() / "tree");
+    ASSERT_TRUE(staged.has_value());
+    ASSERT_TRUE(plantStrayCopy(*staged, *claiming,
+                               *claiming + std::string{kLangSuffix} + ".orig", strayExt))
+        << "cannot plant the same-stem stray";
+    ASSERT_NO_FATAL_FAILURE(reextensionRealizedUnit(*staged, *unit, strayExt));
+
+    ScopedEnv      env{"DSS_CONFIG_ROOT", staged->root.string()};
+    CompileOutcome outcome;
+    ASSERT_NO_FATAL_FAILURE(runOneCompile(scratch.path() / "work", *claiming,
+                                          machine->target + ":" + machine->archiveFormat,
+                                          outcome));
+    EXPECT_NE(outcome.rc, 0)
+        << "a stray's extension must not bind the realized unit"
+        << renderErrors(outcome.rep);
+    EXPECT_TRUE(anyErrorContains(
+        outcome.rep, "no shipped language claims the extension '" + strayExt))
+        << "the stray `" << *claiming << kLangSuffix << ".orig` was READ as the "
+           "language: its extra extension bound the realized unit"
+        << renderErrors(outcome.rep);
+}
+
+// ★ DIFFERENTLY NAMED STRAYS (byte copies of the claiming document under
+// `zz.lang.json.bak` and friends) are no second claimant: the build resolves the
+// sole claimant and succeeds.
+TEST(ShippedSourceLanguageResolution, DifferentlyNamedStraysAreNoSecondClaimant) {
+    ASSERT_FALSE(configRoot().empty());
+    auto const unit = firstRealizedUnit();
+    ASSERT_TRUE(unit.has_value());
+    auto const machine = firstMachineFor(unit->formatKey);
+    ASSERT_TRUE(machine.has_value());
+    std::string const unitExt =
+        lowered(fs::path{unit->source}.extension().generic_string());
+    auto const claiming = languageClaiming(unitExt);
+    ASSERT_TRUE(claiming.has_value());
+
+    ScratchDir scratch{Location::Temp, "shipped-source-language-resolution"};
+    auto const staged = stageConfigTree(scratch.path() / "tree");
+    ASSERT_TRUE(staged.has_value());
+    for (char const* leaf : {"zz.lang.json.bak", "zz.lang.json.rej", "zz.lang.json.tmp-1234"})
+        ASSERT_TRUE(plantStrayCopy(*staged, *claiming, leaf, "")) << "cannot plant " << leaf;
+
+    ScopedEnv      env{"DSS_CONFIG_ROOT", staged->root.string()};
+    CompileOutcome outcome;
+    ASSERT_NO_FATAL_FAILURE(runOneCompile(scratch.path() / "work", *claiming,
+                                          machine->target + ":" + machine->archiveFormat,
+                                          outcome));
+    EXPECT_EQ(outcome.rc, 0)
+        << "strays named after no language must be invisible" << renderErrors(outcome.rep);
+    EXPECT_FALSE(outcome.rep.hasErrors()) << renderErrors(outcome.rep);
+}
+
+// ★ TWO GENUINE CLAIMANTS still refuse, and the refusal NAMES EACH DOCUMENT: the
+// operator's fix is to a FILE, and the old message named neither and sent the
+// reader to the (innocent) runtime source.
+TEST(ShippedSourceLanguageResolution, TwoGenuineClaimantsAreRefusedNamingBothDocuments) {
+    ASSERT_FALSE(configRoot().empty());
+    auto const unit = firstRealizedUnit();
+    ASSERT_TRUE(unit.has_value());
+    auto const machine = firstMachineFor(unit->formatKey);
+    ASSERT_TRUE(machine.has_value());
+    std::string const unitExt =
+        lowered(fs::path{unit->source}.extension().generic_string());
+    auto const claiming = languageClaiming(unitExt);
+    ASSERT_TRUE(claiming.has_value());
+
+    ScratchDir scratch{Location::Temp, "shipped-source-language-resolution"};
+    auto const staged = stageConfigTree(scratch.path() / "tree");
+    ASSERT_TRUE(staged.has_value());
+    std::string const twin = "lanemigtwin";
+    ASSERT_TRUE(plantStrayCopy(*staged, *claiming, twin + std::string{kLangSuffix}, ""))
+        << "cannot plant the twin document";
+
+    ScopedEnv      env{"DSS_CONFIG_ROOT", staged->root.string()};
+    CompileOutcome outcome;
+    ASSERT_NO_FATAL_FAILURE(runOneCompile(scratch.path() / "work", *claiming,
+                                          machine->target + ":" + machine->archiveFormat,
+                                          outcome));
+    EXPECT_NE(outcome.rc, 0) << renderErrors(outcome.rep);
+    // Each claimant is named with its document's FILE NAME: the directory the
+    // driver resolved may be spelled through a different (but equivalent) root
+    // than this test's, so the pin is the claimant AND its file, not a prefix.
+    for (std::string const& name : {*claiming, twin}) {
+        std::string const doc = name + std::string{kLangSuffix};
+        EXPECT_TRUE(anyErrorContains(outcome.rep, "'" + name + "' from ")
+                    && anyErrorContains(outcome.rep, "/sources/" + doc))
+            << "the two-claimant refusal must name claimant '" << name
+            << "' AND its document " << doc << renderErrors(outcome.rep);
+    }
 }
 
 // ═══ THE COUNT ═══════════════════════════════════════════════════════════════

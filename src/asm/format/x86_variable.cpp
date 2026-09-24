@@ -431,6 +431,9 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         case EncodingSlotKind::Imm16Inverted:
         // P68 round 8: the AdvSIMD element `imm5` is a fixed32 bit-window.
         case EncodingSlotKind::ElementIndex:
+        // P68 round 9: the one-word ADR's block field and its addend.
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:
             // Other shapes — the fixed32 register/immediate slots plus
             // the symbol-bearing Disp32, none handled by the x86
             // register-wiring walker. slotShapeFor + validate's cross-
@@ -1123,7 +1126,34 @@ bool encode(Lir const&                  lir,
             }
             st.blockRels.push_back(EncodingState::PendingBlockRel{
                 wire.prefixOpcodeBytes, srcOp.blockSlot});
-        } else if (srcOp.kind == LirOperandKind::SymbolRef) {
+        } else if (srcOp.kind == LirOperandKind::SymbolRef
+                   || srcOp.kind == LirOperandKind::SymbolAddress) {
+            // ★ A SYMBOL PLUS A CONSTANT IN A SYMBOL POSITION (`leaq msg+4,
+            // %rax` — P68 round 9) reaches the same field as a plain symbol;
+            // its constant is the relocation's addend (the pool entry holds
+            // the pair), exactly as the fixed32 walker carries `adrp x0,
+            // msg+8`'s. A plain `SymbolRef` carries 0.
+            SymbolId     relocTarget{srcOp.symbolV};
+            std::int64_t relocAddend = 0;
+            if (srcOp.kind == LirOperandKind::SymbolAddress) {
+                auto const* addr =
+                    srcOp.litIndex < lir.literalPool().size()
+                        ? std::get_if<LirSymbolAddress>(
+                              &lir.literalValue(srcOp.litIndex).value)
+                        : nullptr;
+                if (addr == nullptr) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': symbol operand names "
+                                       "literal pool entry {}, which is not a "
+                                       "symbol address in this module's pool of "
+                                       "{}", info->mnemonic, srcOp.litIndex,
+                                       lir.literalPool().size()));
+                    return false;
+                }
+                relocTarget = addr->symbol;
+                relocAddend = addr->addend;
+            }
             // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
             // Three symbol-bearing slots today:
             //   * Disp32         — pure 4-byte rel32 placeholder (e.g.
@@ -1187,9 +1217,7 @@ bool encode(Lir const&                  lir,
                     return false;
                 }
                 st.memRelocDisp32 = PendingRelocSlot{
-                    *wire.relocationKind,
-                    SymbolId{srcOp.symbolV}
-                };
+                    *wire.relocationKind, relocTarget, 0, relocAddend};
                 continue;
             }
             if (st.disp32.has_value()) {
@@ -1202,9 +1230,7 @@ bool encode(Lir const&                  lir,
                 return false;
             }
             st.disp32 = PendingRelocSlot{
-                *wire.relocationKind,
-                SymbolId{srcOp.symbolV}
-            };
+                *wire.relocationKind, relocTarget, 0, relocAddend};
             // RipRelDisp32: force the ModR/M state to the RIP-
             // relative form. mod=00 rm=101 names "[rip + disp32]"
             // in 64-bit mode — this slot repurposes the encoding

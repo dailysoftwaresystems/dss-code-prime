@@ -918,6 +918,19 @@ if(DSS_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
                 "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-no-abort-in-tests/check-no-abort-in-tests.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ★ THE EMITTED-ANCHOR-ID RATCHET. An anchor id inside a C++ string literal
+    # under src/ is operator OUTPUT, and the row it names can close while the
+    # text keeps telling the operator "a known deferral, wait for it". The id is
+    # bookkeeping: it belongs in a comment at the emit site, and the message
+    # states the condition and the action. Per-file inventory, only ever
+    # lowered; the literals come from `check-no-abort-in-tests`' scanner and the
+    # id shape from `check-anchor-balance`, never from a copy here. Like its
+    # siblings, the no-argument form verifies the tree AND runs the self-test.
+    add_test(
+        NAME emitted_anchor_ids_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-emitted-anchor-ids/check-emitted-anchor-ids.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # ⚠ THESE TWO RAN ZERO SELF-TEST ARMS UNTIL 2026-08-24 (cycle P29,
     # independent step-10 audit), AND THE ENTRIES BELOW ARE UNCHANGED — the
     # repair was in the SCRIPTS, which is the whole lesson. Both carried a

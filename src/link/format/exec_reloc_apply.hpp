@@ -77,6 +77,11 @@
 //                            bits[20:2]→immhi[23:5].
 //   * Aarch64AddAbsLo12:     value = (S + A) & 0xFFF;
 //                            OR (value << 10) into ADD imm12 [21:10].
+//   * Aarch64LdstAbsLo12:    value = ((S + A) & 0xFFF) >> scaleLog2, the
+//                            low scaleLog2 bits required ZERO; OR
+//                            (value << 10) into LDR/STR imm12 [21:10].
+//   * Aarch64AdrPrelLo21:    value = S + A - P, signed 21 bits; ADR's
+//                            immlo [30:29] / immhi [23:5] split.
 //   * Aarch64TprelAddHi12:   value = (S + A) >> 12; UNSIGNED 12-bit
 //                            (S+A must sit in [0, 0xFFFFFF] — fail
 //                            loud outside); OR (value << 10) into ADD
@@ -485,6 +490,73 @@ planGotSlotSymbols(AssembledModule const& module,
                     auto const inst = readInst32();
                     if (rejectIfBitfieldDirty(inst, mask)) return false;
                     writeInst32(inst | bits);
+                    break;
+                }
+                case RelocFormulaKind::Aarch64LdstAbsLo12: {
+                    // P68 round 9: a LOAD's or STORE's page offset. The
+                    // unsigned-offset imm12 counts ACCESS-SIZED units, so the
+                    // byte offset is divided by the row's size — writing it
+                    // unscaled (the ADD arm above) reads 2^scaleLog2 times too
+                    // far: D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD.
+                    // A target the size does not divide cannot be addressed
+                    // by the field at all; GNU ld refuses it ("relocation
+                    // truncated to fit", ✔MEASURED 2026-09-23), and so does
+                    // this, rather than drop the low bits and load from a
+                    // neighbour.
+                    std::int64_t const SA = static_cast<std::int64_t>(S) + A;
+                    if (SA < 0) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' got S+A=" + std::to_string(SA)
+                                 + " — a page offset is taken of a "
+                                   "non-negative absolute address.");
+                        return false;
+                    }
+                    auto const lo = static_cast<std::uint32_t>(
+                        static_cast<std::uint64_t>(SA) & 0xFFFu);
+                    std::uint32_t const unit = 1u << tri->scaleLog2;
+                    if ((lo & (unit - 1u)) != 0) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' targets page offset " + std::to_string(lo)
+                                 + ", which is not a multiple of the "
+                                 + std::to_string(unit)
+                                 + "-byte access its field counts in — the "
+                                   "scaled offset cannot address it, and "
+                                   "dropping the low bits would load or store "
+                                   "a neighbouring address.");
+                        return false;
+                    }
+                    std::uint32_t const bits = (lo >> tri->scaleLog2) << 10;
+                    std::uint32_t const mask = 0xFFFu << 10;
+                    auto const inst = readInst32();
+                    if (rejectIfBitfieldDirty(inst, mask)) return false;
+                    writeInst32(inst | bits);
+                    break;
+                }
+                case RelocFormulaKind::Aarch64AdrPrelLo21: {
+                    // P68 round 9: the one-word `adr` — the address itself,
+                    // PC-relative, unscaled, in the split immlo/immhi field
+                    // ADRP also uses. ±1 MiB; past it the target cannot be
+                    // named by this instruction, and GNU ld refuses the same
+                    // way ("relocation truncated to fit").
+                    std::int64_t const value = static_cast<std::int64_t>(S) + A
+                                             - static_cast<std::int64_t>(P);
+                    if (!fitsSignedNBits(value, 21)) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' value " + std::to_string(value)
+                                 + " does not fit signed 21-bit — the ADR "
+                                   "target is outside its ±1 MiB reach.");
+                        return false;
+                    }
+                    auto const u = static_cast<std::uint32_t>(value) & 0x1FFFFFu;
+                    std::uint32_t const immlo = (u & 0x3u) << 29;
+                    std::uint32_t const immhi = ((u >> 2) & 0x7FFFFu) << 5;
+                    std::uint32_t const mask  = (0x3u << 29) | (0x7FFFFu << 5);
+                    auto const inst = readInst32();
+                    if (rejectIfBitfieldDirty(inst, mask)) return false;
+                    writeInst32(inst | immlo | immhi);
                     break;
                 }
                 case RelocFormulaKind::Aarch64TprelAddHi12: {

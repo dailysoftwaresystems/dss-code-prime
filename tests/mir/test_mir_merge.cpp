@@ -917,8 +917,8 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
             << "the diagnostic must name the FIELD and BOTH values; got: "
             << allDiagText(rep);
         EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
-                                 "D-LK11-EXTERN-IMPORT-DEDUP"))
-            << allDiagText(rep);
+                                 "declare it the same way in every compilation unit"))
+            << "and say what to DO about it: " << allDiagText(rep);
         EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
                                  "(library \"libc.so.6\")"))
             << "and identify WHICH import: " << allDiagText(rep);
@@ -2037,11 +2037,11 @@ TEST(RealizeEntryShape, ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop) {
     // accept, so a bare `EXPECT_FALSE` would repeat the original mistake in a new
     // place. It must name (i) the VERB it was asked to materialize, (ii) the arity it
     // actually found — a message that says only "unmaterializable" sends the reader
-    // looking for a config row when the two inputs simply disagree — and (iii) the
-    // anchor, so the reader lands on the recorded long-term closure.
+    // looking for a config row when the two inputs simply disagree — and (iii) what
+    // to DO: give the entry the signature its language row declares.
     expectDiagContains(rep, "argc-argv");
     expectDiagContains(rep, "declares 0 parameter(s)");
-    expectDiagContains(rep, "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE");
+    expectDiagContains(rep, "give the entry the signature its language row declares");
     // Nothing was emitted for a refused entry (carried over from the deleted 3-param
     // pin, whose tail was about the FAILURE PATH's cleanliness rather than about
     // signature classification — that part never belonged to the moved gate).

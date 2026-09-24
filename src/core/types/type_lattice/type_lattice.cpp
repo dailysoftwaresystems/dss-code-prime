@@ -29,9 +29,9 @@ namespace detail {
     std::fputs("dss::TypeInterner fatal: stale operand/scalar span read — the "
                "interner pool was mutated by a later intern since this view was "
                "created; retaining operands()/scalars()/fnParams() across an "
-               "intern is a heap-use-after-free "
-               "(D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD).\n",
+               "intern is a heap-use-after-free.\n",
                stderr);
+    // Anchored: D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD (unreachable: the abort below).
     std::abort();
 }
 }  // namespace detail
@@ -114,6 +114,7 @@ inline constexpr std::array<std::string_view, 20> kLeafTypeKindNames =
         spelling.empty()
             ? std::format("<unnamed kind #{}>", static_cast<std::uint32_t>(kind))
             : std::string{spelling};
+    // Anchored: D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND.
     latticeFatal(
         std::format(
             "TypeInterner::primitive: TypeKind {} is not a LEAF kind, so it "
@@ -122,8 +123,7 @@ inline constexpr std::array<std::string_view, 20> kLeafTypeKindNames =
             "that fails at some later consumer instead of here. Build it with "
             "the kind's own builder (structType/unionType/enumType/array/"
             "vector/matrix/complex/bitInt/pointer/…), or gate the argument on "
-            "`isPrimitiveTypeKind`. Expected one of: {}. "
-            "(D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND)",
+            "`isPrimitiveTypeKind`. Expected one of: {}.",
             shown, shown, detail::renderAllowedList(kLeafTypeKindNames))
             .c_str());
 }
@@ -1123,9 +1123,10 @@ TypeKind TypeInterner::bitIntContainerKind(TypeId id) const {
     // a scalar), so reaching here means a wide value slipped into the scalar path. FAIL
     // LOUD (a crash), never the old silent `Void` sentinel that would flow to codegen
     // as a garbage-width op. The C2 by-address diverts keep this unreachable for wide.
+    // Anchored: D-CSUBSET-BITINT-C2-WIDE.
     latticeFatal("bitIntContainerKind: _BitInt(N>64) has no native container — a wide "
                  "_BitInt is multi-limb (memory), reached by ADDRESS, never as a scalar "
-                 "value; this query is a scalar-path leak (D-CSUBSET-BITINT-C2-WIDE)");
+                 "value; this query is a scalar-path leak");
 }
 
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {

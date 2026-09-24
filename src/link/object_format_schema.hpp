@@ -226,6 +226,30 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
         }
         return nativeId;
     }
+
+    // ── ONE WIRE TYPE, SEVERAL KINDS, TOLD APART BY THE INSTRUCTION ─────────
+    // (P68 round 9, D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD) — the
+    // JSON key `decodeWhenInstruction`, a list of `{ mask, value }`.
+    //
+    // A format may use ONE relocation type for fields whose arithmetic differs
+    // by the instruction that holds them. Mach-O arm64 does: ARM64_RELOC_PAGEOFF12
+    // is an ADD's unscaled page offset AND a load's or store's offset scaled by
+    // its access size, and ld64 takes the scale from the instruction. ELF spells
+    // the same five sizes as five types (R_AARCH64_LDST8..128_ABS_LO12_NC), so
+    // the difference is real and only the WIRE hides it. Each row sharing such a
+    // type declares the 32-bit instruction words it decodes for — `(word & mask)
+    // == value`, any entry — and a reader reads the word at the site to choose.
+    // `validate()` makes it a function: every row sharing the type declares
+    // patterns, and no two rows' patterns can match one word. Empty everywhere
+    // a wire type names one kind.
+    struct InstructionPattern {
+        std::uint32_t mask  = 0;
+        std::uint32_t value = 0;
+        [[nodiscard]] bool matches(std::uint32_t word) const noexcept {
+            return (word & mask) == value;
+        }
+    };
+    std::vector<InstructionPattern> decodeWhenInstruction;
 };
 
 // ★★★ WHERE A RELOCATABLE OBJECT KEEPS A RELOCATION's ADDEND — a FORMAT fact,
@@ -311,7 +335,43 @@ DSS_CHECK_ENUM_NAME_TABLE(kInputSectionPlacementTable);
 struct DSS_EXPORT RelocationDecodeTable {
     // Wire type → the DSS kind it decodes to. A FUNCTION by construction:
     // emission aliases are excluded, and a residual collision is refused.
+    // ⚠ A wire type SHARED by several kinds is not here but in `byInstruction`,
+    // and the readers ask `decode`, which knows both.
     std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
+    // Wire type → the rows it may decode to, each with the instruction words
+    // it decodes for (`ObjectFormatRelocationInfo::decodeWhenInstruction`).
+    struct InstructionKind {
+        ObjectFormatRelocationInfo::InstructionPattern pattern;
+        RelocationKind                                 kind{};
+    };
+    std::unordered_map<std::uint32_t, std::vector<InstructionKind>> byInstruction;
+
+    // Why a wire type did not decode.
+    enum class Miss : std::uint8_t {
+        Undeclared,        // no row names this wire type
+        SiteTooShort,      // shared type, and fewer than 4 bytes at the site
+        NoInstruction,     // shared type, and no row's pattern matches the word
+    };
+    // The ONE decode every reader asks. `site` is the bytes the relocation
+    // patches (little-endian; only a SHARED wire type reads it, as a 32-bit
+    // instruction word).
+    [[nodiscard]] std::expected<RelocationKind, Miss>
+    decode(std::uint32_t nativeId, std::span<std::uint8_t const> site) const {
+        if (auto const it = nativeToKind.find(nativeId); it != nativeToKind.end()) {
+            return it->second;
+        }
+        auto const shared = byInstruction.find(nativeId);
+        if (shared == byInstruction.end()) return std::unexpected(Miss::Undeclared);
+        if (site.size() < 4) return std::unexpected(Miss::SiteTooShort);
+        std::uint32_t const word = static_cast<std::uint32_t>(site[0])
+                                 | (static_cast<std::uint32_t>(site[1]) << 8)
+                                 | (static_cast<std::uint32_t>(site[2]) << 16)
+                                 | (static_cast<std::uint32_t>(site[3]) << 24);
+        for (auto const& e : shared->second) {
+            if (e.pattern.matches(word)) return e.kind;
+        }
+        return std::unexpected(Miss::NoInstruction);
+    }
     // The wire types whose presence PROVES the extern they reach is a
     // FUNCTION: every row the format declares `"isCall": true` on, plus every
     // declared `pltNativeId` (a call-through-stub variant can only be a call).

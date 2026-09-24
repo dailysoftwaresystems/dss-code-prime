@@ -86,12 +86,16 @@ void expectRefusedOnce(std::initializer_list<Shape> shapes) {
     }
 }
 
-// Admitted: no Error, and exactly `ints` S_IntegerPointerConversion warnings.
+// Admitted: no Error, and exactly `ints` S_IntegerPointerConversion warnings — and
+// NOTHING ELSE. (The vacuity sweep: counting only this code let any other diagnosed
+// conversion — an incompatible pointer, now a warning — pass as "silent".)
 void expectAdmitted(std::initializer_list<Shape> shapes, std::size_t ints) {
     for (Shape const& sh : shapes) {
         auto model = analyzeC(tu(sh.body));
         EXPECT_FALSE(model.hasErrors()) << sh.what << "\n" << sh.body;
         EXPECT_EQ(countCode(model.diagnostics(), kInt), ints) << sh.what << "\n" << sh.body;
+        EXPECT_EQ(model.diagnostics().all().size(), ints)
+            << sh.what << " — no diagnostic but the expected ones\n" << sh.body;
     }
 }
 
@@ -205,4 +209,49 @@ TEST(PointerOperandConstraints, ARefusedOperationHasNoTypeForItsContextToJudgeAg
         {"an assignment", "int main(void) { int *p = a; long r; r = ~p; return r ? 42 : 1; }\n"},
         {"a unary operand in an initializer", "int main(void) { int *p = a; long r = -p; return r ? 42 : 1; }\n"},
     });
+}
+
+// ── an ARRAY operand of `+` / `-` decays on either side ─────────────────────
+// ★ P68 round 9 (lane `cs`; routed by the coordinator from lane mig's `int x = 1 +
+// "never";`). C 6.3.2.1p3: an array operand of pointer arithmetic is converted to a
+// pointer to its first element, so `n + arr`, `arr + n` and `arr - n` are POINTERS.
+// The typer decayed no array operand — `n + arr` typed as the INTEGER, `arr ± n` as
+// the ARRAY — while the HIR built the element pointer, so every reader of the
+// semantic type was wrong: ✔MEASURED 2026-09-23 (`.temp/probe/sl`, `sl2`, `sl3`, each
+// reference separately, every program RUN) `sizeof(a + 1)` ran 40 and `sizeof(1 + a)`
+// 4 on DSS where gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 run 8;
+// `_Generic(1 + a, int *: …)` missed; `int x = 1 + "never";` drew NO diagnostic
+// (gcc and mingw at -std=c2x and MSVC warn, clang refuses) while `char const *s = 1 +
+// "never";` drew a WRONG integer-to-pointer one.
+TEST(PointerOperandConstraints, AnArrayOperandOfPointerArithmeticDecaysOnEitherSide) {
+    expectAdmitted({
+        {"the sizes: a pointer, never the array or the integer",
+         "_Static_assert(sizeof(a + 1) == sizeof(int *), \"a + 1\");\n"
+         "_Static_assert(sizeof(1 + a) == sizeof(int *), \"1 + a\");\n"
+         "_Static_assert(sizeof(a - 0) == sizeof(int *), \"a - 0\");\n"
+         "_Static_assert(sizeof(\"never\" + 1) == sizeof(char *), \"s + 1\");\n"
+         "_Static_assert(sizeof(1 + \"never\") == sizeof(char *), \"1 + s\");\n"
+         "int main(void) { return 42; }\n"},
+        {"the types: `_Generic` selects the element pointer",
+         "_Static_assert(_Generic(1 + a, int *: 1, default: 0), \"1 + a\");\n"
+         "_Static_assert(_Generic(a + 1, int *: 1, default: 0), \"a + 1\");\n"
+         "_Static_assert(_Generic(1 + \"never\", char *: 1, default: 0), \"1 + s\");\n"
+         "int main(void) { return 42; }\n"},
+        {"a pointer initializer, both operand orders",
+         "int main(void) { char const *s = 1 + \"never\"; char const *t = \"never\" + 1;\n"
+         "  int const *q = 1 + a; int const *r = a + 1; return s == t && q == r ? 42 : 1; }\n"},
+        {"a pointer argument", "static int second(int const *p) { return p[0]; }\n"
+                               "int main(void) { return second(1 + a); }\n"},
+    }, 0u);
+    // The integer destinations: the sum is a POINTER converted to an integer — the
+    // row-1 class, one S_IntegerPointerConversion each, in both operand orders and at
+    // each site.
+    expectAdmitted({
+        {"`int x = 1 + \"never\";`", "int main(void) { int x = 1 + \"never\"; return x ? 42 : 1; }\n"},
+        {"`int x = 0 + \"never\";`", "int main(void) { int x = 0 + \"never\"; return x ? 42 : 1; }\n"},
+        {"`int x = \"never\" + 1;`", "int main(void) { int x = \"never\" + 1; return x ? 42 : 1; }\n"},
+        {"`long x = 1 + a;`", "int main(void) { long x = 1 + a; return x ? 42 : 1; }\n"},
+        {"an assignment", "int main(void) { long x; x = 2 + \"never\"; return x ? 42 : 1; }\n"},
+        {"a return", "static long f(void) { return 3 + \"never\"; }\nint main(void) { return f() ? 42 : 1; }\n"},
+    }, 1u);
 }

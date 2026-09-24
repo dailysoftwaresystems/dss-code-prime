@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -89,18 +90,29 @@ namespace {
          p = text.find(from, p + to.size())) {
         text.replace(p, from.size(), to);
     }
-    // ...except the FUNCTION-LIKE rows. The loader refuses a warn verb on one
-    // (c105 already lowers it to an ordinary prologue `#define`, so a warn
-    // claim would be unenforceable), and this A/B is not the place to argue
-    // with that rule -- it is the place to vary the OBJECT-like prologue. Their
-    // two lines are common to BOTH arms, so they are not a variable.
-    const std::string fnFrom =
-        "\"params\": [\"x\"], \"availableObjectFormats\": [\"pe\"], " + to;
-    const std::string fnTo =
-        "\"params\": [\"x\"], \"availableObjectFormats\": [\"pe\"], " + from;
-    for (std::string::size_type p = text.find(fnFrom); p != std::string::npos;
-         p = text.find(fnFrom, p + fnTo.size())) {
-        text.replace(p, fnFrom.size(), fnTo);
+    // ...except the FUNCTION-LIKE rows ('params' present) — EVERY one, found by
+    // the key rather than by one row's spelling. The loader refuses a warn verb
+    // on one (c105 already lowers it to an ordinary prologue `#define`, so a warn
+    // claim would be unenforceable), and this A/B is not the place to argue with
+    // that rule -- it is the place to vary the OBJECT-like prologue. Their lines
+    // are common to BOTH arms, so they are not a variable. (Until P68 round 9 the
+    // only function-like rows were the pe `params: ["x"]` pair and this restore
+    // matched that spelling; the `__INTN_C(c)` rows broke it.) Each predefine row
+    // of c.lang.json is ONE line, so a line holding `"params"` is one such row.
+    {
+        std::string restored;
+        std::istringstream lines{text};
+        for (std::string line; std::getline(lines, line);) {
+            if (line.find("\"params\"") != std::string::npos) {
+                for (std::string::size_type p = line.find(to); p != std::string::npos;
+                     p = line.find(to, p + from.size())) {
+                    line.replace(p, to.size(), from);
+                }
+            }
+            restored += line;
+            restored += '\n';
+        }
+        text = std::move(restored);
     }
     auto loaded = dss::GrammarSchema::loadFromText(text, "<c-empty-prologue>");
     if (!loaded.has_value()) {

@@ -185,13 +185,58 @@
       "$comment": "ADD/LDR pageoff low-12 (the `add`/`ldr` half of an address materialization). r_type = ARM64_RELOC_PAGEOFF12 (4), r_pcrel = 0, r_length = 2 → nativeId = (4<<28)|(2<<25)|(0<<24) = 0x44000000. `kind` = 3 matches arm64.target.json's `add_abs_lo12_nc`.",
       "name": "ARM64_RELOC_PAGEOFF12",
       "kind": 3,
-      "nativeId": 1140850688
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 2143289344, "value": 285212672 }
+      ]
     },
     {
       "$comment": "Absolute 64-bit data pointer. r_type = ARM64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 3 (8 bytes) → nativeId = (0<<28)|(3<<25)|(0<<24) = 0x06000000. `kind` = 4 matches arm64.target.json's `abs64`.",
       "name": "ARM64_RELOC_UNSIGNED",
       "kind": 4,
       "nativeId": 100663296
+    },
+    {
+      "$comment": "P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): ONE wire type, ARM64_RELOC_PAGEOFF12, is an ADD's unscaled page offset (the kind-3 row above) and a load's or store's offset scaled by its access size (these five) — ld64 takes the scale from the instruction, and so does the reader: each row (named `ARM64_RELOC_PAGEOFF12:<size>`, because a row name is unique while the wire type is not) decodes for the instruction words its `decodeWhenInstruction` names (the load/store unsigned-immediate class, bits 29:27 = 111 and 25:24 = 01, split by size bits 31:30 and, for the 128-bit q form, V and opc<1>). ✔MEASURED 2026-09-23: at the round-9 base a clang 18 -O2 object's `ldr w8, [x8, _g32@PAGEOFF]` linked as `ldr w8, [x8, #0x60]` for a g32 at page offset 0x18 — the ADD's arithmetic on a load.",
+      "name": "ARM64_RELOC_PAGEOFF12:ldst8",
+      "kind": 12,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4278190080, "value": 956301312 },
+        { "mask": 4286578688, "value": 1023410176 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst16",
+      "kind": 13,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4211081216, "value": 2030043136 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst32",
+      "kind": 14,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4211081216, "value": 3103784960 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst64",
+      "kind": 15,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4211081216, "value": 4177526784 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst128",
+      "kind": 16,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4286578688, "value": 1031798784 }
+      ]
     }
   ]
 }

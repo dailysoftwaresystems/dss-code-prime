@@ -382,6 +382,8 @@ TEST(RedeclarationCompat, LegalRedeclarationsStayAccepted) {
         EXPECT_FALSE(model.hasErrors())
             << "refused a redeclaration BOTH gcc and clang accept:\n"
             << src << "  first error: " << firstMessage(model);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 
@@ -499,6 +501,8 @@ TEST(RedeclarationCompat, MatchingUserDeclarationOfAShippedNameStaysAccepted) {
         EXPECT_FALSE(model.hasErrors())
             << "refused a legal declaration of a shipped name:\n"
             << src << "  first error: " << firstMessage(model);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 

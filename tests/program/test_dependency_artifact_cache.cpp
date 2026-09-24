@@ -385,14 +385,9 @@ TEST(DependencyArtifactCacheSurface, TheWithdrawnEvictionMemberRejectsWithItsRea
     EXPECT_NE(message.find("no longer accepted"), std::string::npos)
         << "the refusal must say the member was WITHDRAWN rather than report "
            "it as unknown — 'unknown member' reads as a typo: " << message;
-    // ⚠ ON ONE LINE, PAST THE COLUMN GUIDE, DELIBERATELY. An anchor id split
-    // across two string literals still compiles and still MATCHES — and it is
-    // invisible to every grep and to `check-wrapped-anchor-ids`, which is how a
-    // wrap MINTS a second, unfindable id. Width loses to greppability here.
-    static constexpr std::string_view kWithdrawnAnchor =
-        "D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT";
-    EXPECT_NE(message.find(kWithdrawnAnchor), std::string::npos)
-        << "the refusal must carry the anchor a reader goes to: " << message;
+    EXPECT_NE(message.find("a cache is reclaimed by deleting its root directory"),
+              std::string::npos)
+        << "the refusal must say what replaces the withdrawn policy: " << message;
 }
 
 // ═══ THE COLD ARM ════════════════════════════════════════════════════════════

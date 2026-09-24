@@ -129,11 +129,12 @@ bool synthesizeStdioShim(
     // the identity branch the bar forbids, and the same refusal `synthesizeThreadsShim`
     // makes on a nullopt `librarySynthesis` vehicle.)
     if (!vaLayout.has_value()) {
+        // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION.
         emitErr(reporter,
                 "synthesizeStdioShim: <stdio.h> printf-family synth recipes are present but "
-                "the active calling convention declares no `vaListLayout` "
-                "(D-FFI-PE-CRT-UCRT-MIGRATION) — there is no declared variadic model to "
-                "forward, and defaulting one would be an assumed ABI, not a read one");
+                "the active calling convention declares no `vaListLayout` — there is no "
+                "declared variadic model to forward, and defaulting one would be an assumed "
+                "ABI, not a read one: declare `vaListLayout` on the calling convention");
         return false;
     }
 
@@ -167,8 +168,8 @@ bool synthesizeStdioShim(
                             "active calling convention declares `vaListLayout.strategy = ")
                     + std::string(vaListStrategyName(vaLayout->strategy))
                     + "` — refusing to forward a va_list under an unimplemented model "
-                      "rather than emitting a wrong-ABI forward "
-                      "(D-FFI-PE-CRT-UCRT-MIGRATION)");
+                      "rather than emitting a wrong-ABI forward");
+        // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION.
         return false;
     }
 
@@ -311,8 +312,8 @@ bool synthesizeStdioShim(
             emitErr(reporter,
                     std::string{"synthesizeStdioShim: the UCRT core '"} + name
                         + "' is not imported by this module — stdio.json must declare it "
-                          "as a pe symbol row alongside the `synthesize` row that needs it "
-                          "(D-FFI-PE-CRT-UCRT-MIGRATION / D-FFI-DESCRIPTOR-EAGER-IMPORT)");
+                          "as a pe symbol row alongside the `synthesize` row that needs it");
+            // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION, D-FFI-DESCRIPTOR-EAGER-IMPORT.
             return std::nullopt;
         }
         return it->second;
@@ -560,7 +561,9 @@ bool synthesizeStdioShim(
         // so reaching here means that table and this switch have drifted apart.
         emitErr(reporter,
                 "synthesizeStdioShim: no synth arm for recipe id '" + recipe
-                    + "' (D-FFI-PE-CRT-UCRT-MIGRATION vocab/switch drift)");
+                    + "' — the loader's recipe vocabulary and this switch have drifted "
+                      "apart: add the arm, or remove the id from the vocabulary");
+        // Anchored: D-FFI-PE-CRT-UCRT-MIGRATION.
         return false;
     }
 

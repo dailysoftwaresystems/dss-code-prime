@@ -10924,3 +10924,63 @@ TEST(MirToLirAtomicRmw, AtomicPointerFetchAddScalesByTheElementSize) {
                          "operand parameter is `ptrdiff_t`, not the pointee";
     }
 }
+
+// ★★ P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the
+// lowering that chooses a slot read STAMPS it on the import row, and the merge
+// only reads it. A DATA import under `got-indirect` is read through its slot
+// (`GotIndirectExternDataGlobalAddrEmitsLeaThenDeref` pins the lea + deref);
+// the same import under a format that declares no binding (a relocatable
+// object) is read directly; a function import under `direct-plt` is not a slot
+// read. Each row must leave saying so — a row that under-states sends the slot
+// read to the object itself (the round's base: SIGSEGV on ELF, an access
+// violation on pe64), one that over-states
+// sends a direct read to a slot. The stale statement each row carries IN is the
+// opposite of the right answer, so an OR-ed stamp cannot pass.
+TEST(MirToLir, TheRowLeavesStatingWhetherItsCodeReadsThroughASlot) {
+    auto const lowerWith = [](std::optional<DataImportBinding> binding,
+                              bool isData) -> std::optional<bool> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i32      = interner.primitive(TypeKind::I32);
+        TypeId const i32Ptr   = interner.pointer(i32);
+        TypeId const params[] = {i32};
+        TypeId const fnSig    = interner.fnSig(params, i32, CallConv::CcSysV);
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        (void)mb.addArg(0, i32);
+        SymbolId const sym{200};
+        MirInstId const ga         = mb.addGlobalAddr(sym, i32Ptr);
+        MirInstId const loadArgs[] = {ga};
+        MirInstId const val        = mb.addInst(MirOpcode::Load, loadArgs, i32);
+        mb.addReturn(val);
+        Mir mir = std::move(mb).finish();
+        auto target = TargetSchema::loadShipped("x86_64");
+        if (!target.has_value()) return std::nullopt;
+        DiagnosticReporter rep;
+        std::vector<dss::ExternImport> externs;
+        dss::ExternImport ei;
+        ei.symbol          = sym;
+        ei.mangledName     = "x";
+        ei.isData          = isData;
+        ei.readThroughSlot = !(isData && binding.has_value());  // stale, opposite
+        externs.push_back(ei);
+        auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                               ExternCallDispatch::DirectPlt, binding);
+        if (!lirR.ok) return std::nullopt;
+        for (auto const& row : lirR.externImports) {
+            if (row.symbol.v == sym.v) return row.readThroughSlot;
+        }
+        return std::nullopt;
+    };
+    auto const gotData = lowerWith(DataImportBinding::GotIndirect, /*isData=*/true);
+    ASSERT_TRUE(gotData.has_value());
+    EXPECT_TRUE(*gotData) << "a got-indirect DATA import is read through its slot";
+    auto const relocatableData = lowerWith(std::nullopt, /*isData=*/true);
+    ASSERT_TRUE(relocatableData.has_value());
+    EXPECT_FALSE(*relocatableData)
+        << "with no declared binding the code reads the datum directly";
+    auto const directFn = lowerWith(DataImportBinding::GotIndirect, /*isData=*/false);
+    ASSERT_TRUE(directFn.has_value());
+    EXPECT_FALSE(*directFn) << "a direct-plt function import is not a slot read";
+}

@@ -12,6 +12,8 @@
 #include "core/types/cfi.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
+#include "core/types/object_format_kind.hpp"   // ObjectFormatKind — the key of a symbol-part spelling
+#include "core/types/symbol_address_part.hpp"  // SymbolAddressPart
 
 #include <array>
 #include <cstdint>
@@ -380,9 +382,16 @@ enum class AsmOperandRole : std::uint8_t {
     // so `sym-8` bound to it would read as the number -8 and lose the symbol.
     // The decode takes an addend off FIRST, and only the name remains.
     Addend,
+    // `:lo12:` / `@PAGEOFF` around a NAME (`add x0, x0, :lo12:msg`, `ldr x1,
+    // [x0, msg@PAGEOFF]`) → WHICH PART of the symbol's address the operand
+    // denotes (P68 round 9, the aarch64 twins; `SymbolAddressPart`). The rule's
+    // one Identifier is the operator; `AssemblyConfig::symbolParts` says what
+    // it means, per object-format kind. Like `Addend`, it is taken off the
+    // scalar before the name is read.
+    SymbolPart,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 8>
+inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 9>
     kAsmOperandRoleNames{{
         {"register", AsmOperandRole::Register},
         {"immediate", AsmOperandRole::Immediate},
@@ -392,11 +401,15 @@ inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 8>
         {"scalar", AsmOperandRole::Scalar},
         {"negNumber", AsmOperandRole::NegNumber},
         {"addend", AsmOperandRole::Addend},
+        {"symbolPart", AsmOperandRole::SymbolPart},
     }};
 inline constexpr std::size_t kAsmOperandRoleCount =
     kAsmOperandRoleNames.size();
+// A SET of operand roles, one bit per `AsmOperandRole` (see
+// `AssemblyConfig::rolesForRule`).
+using AsmRoleMask = std::uint16_t;
 static_assert(kAsmOperandRoleCount
-                  == static_cast<std::size_t>(AsmOperandRole::Addend) + 1,
+                  == static_cast<std::size_t>(AsmOperandRole::SymbolPart) + 1,
               "every AsmOperandRole enumerator needs a config spelling — a role "
               "with no name is unbindable, and the loader's REQUIRE-ALL check "
               "would silently stop covering it");
@@ -448,6 +461,42 @@ struct AsmOperandSelector {
     // a condition spelling MEANS, which is what keeps `sysreg` out of the
     // shared substrate's vocabulary.
     std::string   name;
+};
+
+// ★★ A SPELLING OF ONE PART OF A SYMBOL'S ADDRESS, AND THE OBJECT FORMATS
+// WHOSE REFERENCE ASSEMBLER READS IT (P68 round 9, the aarch64 twins) — one row
+// of `assembly.symbolParts`. ✔MEASURED 2026-09-23: gas 2.42 and clang 18 for
+// ELF write `:lo12:msg` and `:pg_hi21:msg` and REFUSE `msg@PAGEOFF` /
+// `msg@PAGE`; clang 18 for Darwin writes `msg@PAGE` / `msg@PAGEOFF` and REFUSES
+// `:lo12:` and a bare `adrp` operand. So the spelling is accepted per FORMAT
+// KIND, and the kind is only a key into this list: the lowering asks "does a
+// row with this spelling name the active kind", never "is this ELF".
+struct AsmSymbolPartSpelling {
+    // The operator EXACTLY as written, punctuation included (`:lo12:`,
+    // `@PAGEOFF`) — the text of the dialect's `symbolPart` node, compared under
+    // the dialect's `spellingCase`. The punctuation is part of the spelling
+    // because it is what separates the two families: `@lo12` is neither.
+    std::string                   spelling;
+    SymbolAddressPart             part = SymbolAddressPart::Whole;
+    // Whether the operator is written BEFORE the name (`:lo12:msg`) or AFTER it
+    // (`msg@PAGEOFF`). The grammar lets the part rule stand on either side of a
+    // name, so this is what refuses `msg:lo12:` and `@PAGEOFF msg`, which no
+    // reference writes.
+    bool                          writtenBefore = true;
+    // The object-format kinds whose reference assembler takes this spelling.
+    // Never empty (the loader refuses a spelling no format reads).
+    std::vector<ObjectFormatKind> formatKinds;
+};
+
+// ★ WHAT A BARE SYMBOL MEANS IN ONE INSTRUCTION ROW, per format kind (P68 round
+// 9) — the row key `impliedSymbolPart`. gas reads `adrp x0, msg` as the PAGE of
+// `msg` (the instruction takes nothing else); clang for Darwin REFUSES it and
+// wants `msg@PAGE` (✔MEASURED 2026-09-23). A row declaring this gives a bare
+// symbol operand that part on the listed kinds; everywhere else a bare symbol
+// is the whole address, which the page-form encoding then refuses.
+struct AsmImpliedSymbolPart {
+    SymbolAddressPart             part = SymbolAddressPart::Whole;
+    std::vector<ObjectFormatKind> formatKinds;
 };
 
 // One `assembly.instructions[]` row: an assembly SPELLING and the target
@@ -667,6 +716,10 @@ struct AsmInstructionSpelling {
 
     // OPTIONAL; EMPTY on every ordinary row. See `AsmOperandSelector`.
     std::vector<AsmOperandSelector> operandSelectors;
+
+    // OPTIONAL (P68 round 9): what a bare symbol operand of this row means on
+    // some format kinds. See `AsmImpliedSymbolPart`.
+    std::optional<AsmImpliedSymbolPart> impliedSymbolPart;
 
     // The selector declared at `index`, or nullptr.
     [[nodiscard]] AsmOperandSelector const*
@@ -1218,6 +1271,18 @@ struct DSS_EXPORT AssemblyConfig {
     std::vector<AsmInstructionSpelling> instructions;
     std::vector<AsmDirectiveSpelling>   directives;
 
+    // OPTIONAL (P68 round 9, the aarch64 twins): the spellings of a PART of a
+    // symbol's address this dialect reads, each with the object-format kinds
+    // that read it. See `AsmSymbolPartSpelling`. Empty ⇒ the dialect spells no
+    // part, and its `symbolPart` operand role must be null.
+    std::vector<AsmSymbolPartSpelling> symbolParts;
+
+    // OPTIONAL (P68 round 9): the spelling of the LOCATION COUNTER — the
+    // address of the instruction or data slot being written (`.` in GNU as:
+    // `adr x7, .`, `b .`, `.quad .`). Empty ⇒ the dialect has none, and the
+    // spelling is an ordinary name.
+    std::string locationCounter;
+
     // Label names that START A PROGRAM. ★ IT IS THE SAME FACT `c.lang.json`
     // states as `semantics.declarations[].entryFunctions`, stated at a tier that
     // has no declarations: the `encode` path runs no semantic analysis, so there
@@ -1317,25 +1382,26 @@ struct DSS_EXPORT AssemblyConfig {
     // two NON-register roles on one rule, where no lookup can separate them.
     //
     // Returns a bitmask over `AsmOperandRole` (bit i = role i).
-    [[nodiscard]] std::uint8_t rolesForRule(RuleId rule) const noexcept {
-        // One bit per role in a byte: the eighth role (`addend`) fills it, and
-        // a ninth must widen the mask rather than wrap a bit away.
-        static_assert(kAsmOperandRoleCount <= 8,
-                      "rolesForRule packs one bit per AsmOperandRole into a "
-                      "std::uint8_t — widen the mask before adding a role");
+    [[nodiscard]] AsmRoleMask rolesForRule(RuleId rule) const noexcept {
+        // One bit per role. The ninth role (`symbolPart`, P68 round 9) is what
+        // widened the mask from a byte; a seventeenth must widen it again
+        // rather than wrap a bit away.
+        static_assert(kAsmOperandRoleCount <= 8 * sizeof(AsmRoleMask),
+                      "rolesForRule packs one bit per AsmOperandRole into "
+                      "AsmRoleMask — widen the mask before adding a role");
         if (!rule.valid()) return 0;
-        std::uint8_t mask = 0;
+        AsmRoleMask mask = 0;
         for (std::size_t i = 0; i < kAsmOperandRoleCount; ++i) {
             if (operandFormRules[i].valid()
                 && operandFormRules[i].v == rule.v) {
-                mask |= static_cast<std::uint8_t>(1u << i);
+                mask |= static_cast<AsmRoleMask>(1u << i);
             }
         }
         return mask;
     }
 
     [[nodiscard]] static constexpr bool
-    maskHas(std::uint8_t mask, AsmOperandRole role) noexcept {
+    maskHas(AsmRoleMask mask, AsmOperandRole role) noexcept {
         return (mask & (1u << static_cast<std::size_t>(role))) != 0;
     }
 

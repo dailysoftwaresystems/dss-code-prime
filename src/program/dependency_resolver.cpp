@@ -262,21 +262,21 @@ Resolver::shippedFormats_() {
                         "compiler's source tree.");
         return formats_;
     }
-    std::error_code ec;
-    std::vector<std::string> names;
-    for (fs::directory_iterator it{*dir, ec}, end; !ec && it != end;
-         it.increment(ec)) {
-        std::string const file = it->path().filename().string();
-        constexpr std::string_view kSuffix = ".format.json";
-        if (file.size() <= kSuffix.size()) continue;
-        if (!std::string_view{file}.ends_with(kSuffix)) continue;
-        names.push_back(file.substr(0, file.size() - kSuffix.size()));
+    // THE ONE OWNER of which files ARE format documents: exactly
+    // `<stem>.format.json`, regular files, SORTED BY STEM (so the candidate order
+    // -- and the wording of an ambiguity report -- is identical on every host),
+    // and a listing that fails or stops part-way is REFUSED rather than read as the
+    // inventory: a partial inventory can derive a format the whole would not.
+    auto const documents = shippedConfigDocuments(*dir, ".format.json");
+    if (!documents.has_value()) {
+        emitDriverError(rep_, DiagnosticCode::D_SchemaLoadFailed,
+                        documents.error()
+                            + ", so no object format can be derived for a "
+                              "dependency.");
+        return formats_;
     }
-    // Sorted so the candidate ORDER — and therefore the wording of an
-    // ambiguity report — is identical on every host, rather than inheriting
-    // whatever order the filesystem enumerated in.
-    std::sort(names.begin(), names.end());
-    for (auto const& n : names) {
+    for (auto const& document : *documents) {
+        std::string const& n = document.stem;
         auto loaded = ObjectFormatSchema::loadShipped(n);
         // A shipped document that will not load is NOT swallowed into a
         // narrower candidate set in silence: it simply cannot serve any

@@ -222,8 +222,9 @@ public:
                         "inst v=%u from loop body but operand v=%u "
                         "is not in rewrite map — analysis-tier "
                         "eligibility check missed a chained-invariant "
-                        "operand (D-OPT6-LICM-CHAINED-INVARIANTS).\n",
+                        "operand.\n",
                         oldX.v, o.v);
+                    // Anchored: D-OPT6-LICM-CHAINED-INVARIANTS (unreachable: the abort below).
                     std::abort();
                 }
                 newOps.push_back(*mapped);
@@ -369,10 +370,11 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
             d.actual   = std::format(
                 "opt::Licm: skipped loop with header v={} — {} "
                 "non-back-edge predecessor(s); preheader insertion "
-                "+ Phi-incoming merge not yet implemented "
-                "(D-OPT6-LICM-PREHEADER-INSERTION).",
+                "+ Phi-incoming merge not yet implemented, so its "
+                "invariants stay in the loop.",
                 loop.header.v,
                 ambiguous ? ">1" : "0");
+            // Anchored: D-OPT6-LICM-PREHEADER-INSERTION.
             reporter.report(std::move(d));
             continue;
         }
@@ -484,8 +486,9 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                         "walk to loop exit v={} hit its step cap, so "
                         "guaranteed-to-execute could not be decided; "
                         "refusing to hoist is the behaviour-preserving "
-                        "answer (D-OPT6-LICM-SPECULATIVE-LOAD-HOIST).",
+                        "answer.",
                         b.v, loop.header.v, e.v);
+                    // Anchored: D-OPT6-LICM-SPECULATIVE-LOAD-HOIST.
                     reporter.report(std::move(d));
                 }
             }
@@ -535,9 +538,9 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                     "dss::opt::passes::Licm fatal: chained-invariant "
                     "fixed point exceeded %zu iterations on a single "
                     "loop (header v=%u, body inst count + 1 = %zu) — "
-                    "substrate-contract violation "
-                    "(D-OPT6-LICM-CHAINED-INVARIANTS).\n",
+                    "substrate-contract violation.\n",
                     iterCap, loop.header.v, maxIter);
+                // Anchored: D-OPT6-LICM-CHAINED-INVARIANTS (unreachable: the abort below).
                 std::abort();
             }
             changed = false;

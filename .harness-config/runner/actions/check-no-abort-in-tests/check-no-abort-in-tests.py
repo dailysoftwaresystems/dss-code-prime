@@ -211,14 +211,41 @@ def _is_digit_separator(out: list, text: str, i: int) -> bool:
     return j + 1 < len(out) and out[j + 1].isdigit()
 
 
-def strip_comments_and_strings(text: str) -> str:
-    """Blank out //, /* */, "..." and '...' so only real code remains.
+class StringLiteral(tuple):
+    """One STRING literal `scan_code` found: `line` (1-based, where it opens), `at` (the offset in the
+    STRIPPED text where it stood -- so a caller can ask which code encloses it) and `body` (a raw
+    string's payload, an ordinary one's characters between the quotes with escapes as written)."""
+    __slots__ = ()
 
-    Newlines are PRESERVED so reported line numbers stay true — a guard that
-    names the wrong line sends the reader hunting and gets distrusted.
+    def __new__(cls, line, at, body):
+        return tuple.__new__(cls, (line, at, body))
+
+    line = property(lambda self: self[0])
+    at = property(lambda self: self[1])
+    body = property(lambda self: self[2])
+
+
+def scan_code(text: str) -> tuple:
+    """-> (stripped, literals): ONE pass over C/C++ source.
+
+    `stripped` blanks out //, /* */, "..." and '...' so only real code remains, and it keeps EVERY
+    line end of the source, a literal's own included, so a line number read off it is the source's
+    line — a guard that names the wrong line sends the reader hunting and gets distrusted.
+    ✔MEASURED 2026-09-24: until then a string or character literal's OWN line ends (an escaped line
+    end, or an unterminated literal running on) were dropped, so every line after one read LOW: by 2
+    in two files under src/, by 1 to 21 in nineteen corpus files. Apart from those line ends the
+    text is byte-identical to what `strip_comments_and_strings`, which the other guards import,
+    returned before this pass also returned the literals.
+
+    `literals` is every STRING literal the same pass skipped, as `StringLiteral(line, at, body)`,
+    in source order. Character literals are not string literals and are not returned. ★ One owner
+    of "what is code, what is a comment, what is a string": a guard that needs the literals asks
+    this pass for them rather than re-parsing C++ with a second, drifting scanner.
     """
     out = []
+    literals = []
     i, n = 0, len(text)
+    line = 1
     while i < n:
         c = text[i]
         nxt = text[i + 1] if i + 1 < n else ''
@@ -228,6 +255,8 @@ def strip_comments_and_strings(text: str) -> str:
         elif c == '/' and nxt == '*':
             i += 2
             while i < n and not (text[i] == '*' and i + 1 < n and text[i + 1] == '/'):
+                if text[i] == '\n':
+                    line += 1
                 out.append('\n' if text[i] == '\n' else ' ')
                 i += 1
             i += 2
@@ -242,7 +271,7 @@ def strip_comments_and_strings(text: str) -> str:
             # ⚠ THE REPORTED DIRECTION WAS "FAILS TOWARD NOISY". IT IS BOTH.
             # The span that gets blanked is REAL CODE, so a violation sitting
             # inside it is ERASED before the scan ever sees it — this can hide a
-            # finding, not merely invent one. NINE guards share this function.
+            # finding, not merely invent one -- in every guard that imports this scanner.
             out.append(c)
             i += 1
         elif c in '"\'':
@@ -253,22 +282,47 @@ def strip_comments_and_strings(text: str) -> str:
                 m = re.match(r'"([^(]{0,16})\(', text[i:])
                 if m:
                     close = ')' + m.group(1) + '"'
-                    end = text.find(close, i + m.end())
-                    end = n if end < 0 else end + len(close)
+                    found = text.find(close, i + m.end())
+                    end = n if found < 0 else found + len(close)
+                    literals.append(StringLiteral(line, len(out),
+                                                  text[i + m.end():n if found < 0 else found]))
                     for ch in text[i:end]:
+                        if ch == '\n':
+                            line += 1
                         out.append('\n' if ch == '\n' else ' ')
                     i = end
                     continue
+            start = i
             i += 1
             while i < n and text[i] != quote:
                 if text[i] == '\\':
                     i += 1
                 i += 1
+            if quote == '"':
+                literals.append(StringLiteral(line, len(out), text[start + 1:min(i, n)]))
+            # The literal's own line ends (an escaped line end, or an unterminated literal running
+            # on) stay line ends in `stripped`, so every line after it keeps its number.
+            spanned = text.count('\n', start, min(i + 1, n))
+            line += spanned
+            out.extend('\n' * spanned)
             i += 1
         else:
+            if c == '\n':
+                line += 1
             out.append(c)
             i += 1
-    return ''.join(out)
+    return ''.join(out), literals
+
+
+def strip_comments_and_strings(text: str) -> str:
+    """`scan_code`'s stripped text: //, /* */, "..." and '...' blanked so only real code remains,
+    every line end of the source kept. The name the other guards import."""
+    return scan_code(text)[0]
+
+
+def string_literals(text: str) -> list:
+    """`scan_code`'s string literals: [StringLiteral(line, at, body)] in source order."""
+    return scan_code(text)[1]
 
 
 def main() -> int:
@@ -379,6 +433,57 @@ def main() -> int:
     return 0
 
 
+# (label, source, the EXACT stripped text, the EXACT [(line, at, body)] string literals). The stripped
+# column was frozen from `strip_comments_and_strings` as it stood BEFORE `scan_code` existed, except
+# where a literal spans a line end: that line end is now KEPT, where the old text dropped it.
+_EXACT_ARMS = (
+    ('line comment to end of line, newline kept',
+     'a = 1; // "not a string" here\nb = 2;',
+     'a = 1; \nb = 2;',
+     []),
+    ('block comment across lines',
+     'x /* one\n"two"\nthree */ y',
+     'x     \n     \n       y',
+     []),
+    ('escaped quote and escaped backslash',
+     's = "a\\"b\\\\"; t = "c";',
+     's = ; t = ;',
+     [(1, 4, 'a\\"b\\\\'), (1, 10, 'c')]),
+    ('an escaped line end inside a literal',
+     'p = "one\\\ntwo"; q;',
+     'p = \n; q;',
+     [(1, 4, 'one\\\ntwo')]),
+    ('a literal after one that spans an escaped line end is on its own line',
+     'p = "one\\\ntwo";\nq = "three";',
+     'p = \n;\nq = ;',
+     [(1, 4, 'one\\\ntwo'), (3, 11, 'three')]),
+    ('raw string with a delimiter holding a quote and a paren',
+     'r = R"xy(a ")" b)xy"; z;',
+     'r = R               ; z;',
+     [(1, 5, 'a ")" b')]),
+    ('prefixed literals',
+     'a = u8"u8s"; b = L"ls"; c = u"us"; d = U"Us"; e = LR"(lr)"; f = u8R"q(u8r)q";',
+     'a = u8; b = L; c = u; d = U; e = LR      ; f = u8R         ;',
+     [(1, 6, 'u8s'), (1, 13, 'ls'), (1, 20, 'us'), (1, 27, 'Us'), (1, 35, 'lr'), (1, 50, 'u8r')]),
+    ('char literals, quotes inside them',
+     'c = \'"\'; d = \'\\\'\'; e = "after";',
+     'c = ; d = ; e = ;',
+     [(1, 16, 'after')]),
+    ('digit separators around a literal',
+     'n = 1\'000; s = "x"; m = 0x1\'F;',
+     "n = 1'000; s = ; m = 0x1'F;",
+     [(1, 15, 'x')]),
+    ('an unterminated literal at end of text',
+     'k = "open\nnext',
+     'k = \n',
+     [(1, 4, 'open\nnext')]),
+    ('adjacent literals concatenated',
+     'm = "one" "two"\n  "three";',
+     'm =  \n  ;',
+     [(1, 4, 'one'), (1, 5, 'two'), (2, 8, 'three')]),
+)
+
+
 # U+2502 BOX DRAWINGS LIGHT VERTICAL — absent from cp1252, which is the entire
 # reason it is the fixture. Built with `chr()` rather than written as the glyph or
 # as a backslash escape: the line that carries the fixture stays pure ASCII, so no
@@ -473,7 +578,7 @@ def _selftest() -> int:
         # that runs to the quote before `3` and BLANKS `'001, '` -- real code.
         # The second arm is the direction the original report missed: the blanked
         # span can CONTAIN the violation, so this fails toward clean as well as
-        # toward noisy. Nine guards share this stripper.
+        # toward noisy, in every guard that imports this stripper.
         ("std::string s(20'001, '3'); abort();",              True,  'digit sep + real call'),
         # ⚠ ONE separator, deliberately, and the count is the whole arm. With an
         # EVEN number (`1'000'000`) the mis-paired quotes re-pair and the call
@@ -507,6 +612,24 @@ def _selftest() -> int:
         bad += 1
     else:
         print('  [ok ] line numbers preserved across a multiline block comment')
+    # ★★ EXACT OUTPUT OF THE ONE PASS: the stripped text AND the string literals. The other guards
+    # import the stripped text, and `check-emitted-anchor-ids` reads the literals, so the refactor that
+    # made one pass return both left the stripped text BYTE-IDENTICAL -- each expected STRIPPED column
+    # was frozen from `strip_comments_and_strings` BEFORE the refactor, which was measured identical
+    # over every C/C++ file of src/, tests/, integrated_tests/ and examples/ -- with ONE deliberate
+    # change after it: a literal's own line ends are kept. So every arm also asserts that its stripped
+    # text holds exactly the source's line ends, whatever the shape.
+    for label, src, want_stripped, want_literals in _EXACT_ARMS:
+        got_stripped, got_literals = scan_code(src)
+        got_literals = [tuple(lit) for lit in got_literals]
+        ok = (got_stripped == want_stripped and got_literals == want_literals
+              and got_stripped.count('\n') == src.count('\n'))
+        if not ok:
+            bad += 1
+        print(f'  [{"ok " if ok else "FAIL"}] exact: {label}')
+        if not ok:
+            print(f'         stripped want {want_stripped!r}\n                  got  {got_stripped!r}')
+            print(f'         literals want {want_literals!r}\n                  got  {got_literals!r}')
     if not _pipe_arm():
         bad += 1
     print(f'selftest: {"FAIL" if bad else "OK"} ({bad} failure(s))')

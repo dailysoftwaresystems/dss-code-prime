@@ -590,10 +590,10 @@ def step34(run):
         run.clone_lock = P.CloneLock(run.sqlite_dir_posix)
         run.clone_lock.write("build_and_test.py (fetch/pull + configure + stage)", log)
         scfg = S.StageConfig.from_run(run)
-        run.stage = S.stage(scfg, log=log, lock=run.clone_lock)
+        run.stage = S.stage_and_persist(scfg, log=log, lock=run.clone_lock)
         return
     log.step("3+4/9  Derive full-source testfixture recipe + stage sources/headers (WSL)")
-    run.stage_dir = os.path.join(run.out_dir, "stage")
+    run.stage_dir = S.stage_dir_of(run.out_dir)
     os.makedirs(run.stage_dir, exist_ok=True)
     fd, sb_path = tempfile.mkstemp(prefix="stage-build-", suffix=".json", dir=run.out_dir)
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
@@ -619,7 +619,7 @@ def step34(run):
                                  % run.sqlite_dir_posix)
     if rc != 0:
         C.die("the WSL derive FAILED (rc=%d) — see its output above." % rc)
-    result = os.path.join(run.stage_dir, "derive-result.json")
+    result = os.path.join(run.stage_dir, S.RESULT_FILE)
     try:
         with open(result, "r", encoding="utf-8") as fh:
             run.stage = S.StageResult.from_json(fh.read())

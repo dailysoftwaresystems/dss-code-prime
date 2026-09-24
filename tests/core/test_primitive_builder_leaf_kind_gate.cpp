@@ -190,9 +190,6 @@ TEST(PrimitiveBuilderLeafKindGateDeathTest, MessageNamesTheKindAndTheAcceptedSet
     EXPECT_DEATH({ trigger(); }, "'NullptrT'");
     // It points at the fix, not just at the failure.
     EXPECT_DEATH({ trigger(); }, "isPrimitiveTypeKind");
-    // And it cites the anchor, un-wrapped.
-    EXPECT_DEATH({ trigger(); },
-                 "D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND");
 }
 
 // ── A KIND WITH NO SPELLING SAYS SO WITH ITS ORDINAL ────────────────────────

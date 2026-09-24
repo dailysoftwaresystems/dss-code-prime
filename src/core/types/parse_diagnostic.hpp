@@ -4694,8 +4694,9 @@ enum class DiagnosticCode : std::uint16_t {
     K_CrossCuImageEmitDeferred     = 0x8012,
     // K_AbsolutePointerRelocMissing: the cross-CU merge (LK11b) needs an
     //   ABSOLUTE 64-bit pointer relocation kind to mint a GOT-like thunk
-    //   slot (so an INDIRECT cross-CU call — `call qword ptr [slot]` — reads
-    //   a slot containing the sibling definition's address). The merge finds
+    //   slot (so an INDIRECT cross-CU call — `call qword ptr [slot]` — or a
+    //   DATA read through a got-indirect slot reads a slot containing the
+    //   sibling definition's address). The merge finds
     //   that kind AGNOSTICALLY by formula (`widthBytes == 8 && !pcRelative`)
     //   on the active `TargetSchema` — never by a hardcoded "abs64" name /
     //   kind constant. This fires when NO relocation row on the target schema
@@ -4704,11 +4705,14 @@ enum class DiagnosticCode : std::uint16_t {
     //   Fail loud rather than emit an image whose cross-CU calls dereference
     //   a null slot. (A target that genuinely has no abs64 reloc must add the
     //   row to its `*.target.json` before it can host cross-CU indirect calls.)
-    //   c154: SCOPED to formats whose declared `externCallDispatch` is
-    //   `indirect-slot` — the only dispatch whose call sites dereference a
-    //   slot. A `direct-plt`/undeclared format binds the reference directly
-    //   to the sibling definition (no slot, no abs64 needed), so this never
-    //   fires there (pinned by Abs64GateFiresOnlyOnTheIndirectSlotArm).
+    //   SCOPED to a reference its code reads THROUGH A SLOT — the referencing
+    //   import row's `ExternImport::readThroughSlot`, MIR→LIR's own answer
+    //   (P68 round 9, D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT; c154
+    //   scoped it to an `indirect-slot` dispatch, which answers for FUNCTION
+    //   calls only, and a DATA import read through a got-indirect slot was
+    //   bound to the object itself). A reference its code reaches directly
+    //   binds to the sibling definition (no slot, no abs64 needed), so this
+    //   never fires for one (pinned by Abs64GateFiresOnlyOnTheIndirectSlotArm).
     K_AbsolutePointerRelocMissing  = 0x8013,
     // K_ImageExecBitFailed: setting the POSIX execute bit on a just-written
     //   EXECUTABLE-flavor output (writer.cpp `--output` path) failed —

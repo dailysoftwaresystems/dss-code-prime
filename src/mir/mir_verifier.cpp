@@ -1249,9 +1249,9 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                         reportInst(reporter, DiagnosticCode::I_ArgPositionDuplicate, id,
                             std::format("two Args share flat call-operand "
                                         "position {} in func #{} — a payload "
-                                        "wipe at a rebuild/merge site "
-                                        "(D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP)",
+                                        "wipe at a rebuild/merge site",
                                 pos, f.v));
+                        // Anchored: D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
                     }
                 } else if (op == MirOpcode::CondBr) {
                     auto condOps = mir_.instOperands(id);

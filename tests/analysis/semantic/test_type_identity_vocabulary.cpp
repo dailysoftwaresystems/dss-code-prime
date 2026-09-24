@@ -860,6 +860,8 @@ TEST(TypeIdentityVocabulary, InterlockedCompareExchangeTakesALongPointer) {
     EXPECT_FALSE(m.hasErrors())
         << "`&v` on a `long` IS the intrinsic's `LONG volatile*` parameter";
     EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(m.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // "No error" alone would pass PRE-CHANGE too — back then `long*` and `int*`
     // were literally the same TypeId, so ANY 32-bit integer pointer was accepted.
@@ -1524,4 +1526,82 @@ TEST(TypeIdentityVocabulary, FloatLiteralSuffixSelectsLongDouble) {
             << "`1.0L` IS `long double`, `1.0` IS the anonymous `double`, "
                "`1.0f` IS `float` — on EVERY long-double axis";
     }
+}
+
+// ── P68 round 10 (lane `cs`, D-LANG-UAC-UNSIGNED-COUNTERPART-OF-SIGNED): C 6.3.1.8's
+// FIFTH CONVERSION ─────────────────────────────────────────────────────────────────
+// When the signed operand ranks higher (C 6.3.1.1, by NAME) but has the SAME width as
+// the unsigned one, it cannot represent every unsigned value, and both convert to the
+// UNSIGNED COUNTERPART of the signed type: LP64 `long long + unsigned long` is `unsigned
+// long long`, LLP64 `long + unsigned int` is `unsigned long`. The same VALUE and width
+// as the unsigned operand's own type — only `_Generic` / `typeof` can tell, which is
+// why this was a NAME-only divergence. ✔MEASURED 2026-09-24 (the lane's
+// `.temp/probe/uac`, each case one translation unit, every build RUN): gcc 13.3.0 and
+// clang 18.1.3 at `-std=c17 -pedantic-errors` and `-std=c2x` (LP64), mingw-w64 13.2.0
+// and MSVC 19.51 at both of their modes (LLP64) select exactly the arms below; DSS
+// selected the unsigned operand's own type. The widths that DIFFER are the controls:
+// a wider signed type represents every value (the fourth conversion).
+TEST(TypeIdentityVocabulary, ASameWidthMixedSignednessPairTakesTheSignedTypesUnsignedCounterpart) {
+    std::string const src =
+        "int f(long long a, unsigned long b, long c, unsigned int d, int k){\n"
+        "  return _Generic(a + b, unsigned long long: 11, unsigned long: 12, long long: 13, default: 14)\n"
+        "       + _Generic(b + a, unsigned long long: 21, unsigned long: 22, long long: 23, default: 24)\n"
+        "       + _Generic(c + d, unsigned long: 31, unsigned int: 32, long: 33, default: 34)\n"
+        "       + _Generic(d + c, unsigned long: 41, unsigned int: 42, long: 43, default: 44)\n"
+        "       + _Generic(k ? a : b, unsigned long long: 51, unsigned long: 52, long long: 53, default: 54);\n"
+        "}\n";
+    {
+        SCOPED_TRACE("LP64: long long / unsigned long are both 64-bit, long / unsigned int are not");
+        auto m = analyzeC(src, DataModel::Lp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"11", "21", "33", "43", "51"}));
+    }
+    {
+        SCOPED_TRACE("LLP64: long / unsigned int are both 32-bit, long long / unsigned long are not");
+        auto m = analyzeC(src, DataModel::Llp64);
+        expectGenericClean(m);
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"13", "23", "31", "41", "53"}));
+    }
+}
+
+// The loader's half: under `rank-prefer-unsigned` every NAMED signed entry must have
+// ONE unsigned counterpart — a named entry of the same `rank` whose core is the
+// unsigned twin — under every data model. Both perturbations below keep every row
+// loadable on its own (no name disappears — `synthesizedTypes` still resolves), so
+// the refusal is this check's and no other; the message is read, not just the fact.
+namespace {
+[[nodiscard]] std::string typeSpecifiersLoadErrors(std::function<void(nlohmann::json&)> mutate) {
+    nlohmann::json doc = loadShippedCJson();
+    mutate(doc["semantics"]["typeSpecifiers"]);
+    auto const loaded = GrammarSchema::loadFromText(doc.dump(), "<vocab-perturbed>");
+    if (loaded.has_value()) return {};
+    std::string all;
+    for (auto const& d : loaded.error()) all += d.message + "\n";
+    return all.empty() ? std::string{"<refused with no message>"} : all;
+}
+}  // namespace
+
+TEST(TypeIdentityVocabularyLoader, ASignedEntryWithoutAnUnsignedCounterpartIsRefused) {
+    // `unsigned long long` re-ranked 5: no rank-4 unsigned entry is left for `long long`
+    // (and `unsigned __int128`, U128 at rank 5, is no twin of an I64). THE CONTROL is
+    // ArbitraryOpaqueNameAccepted above: it names the 16-bit `short` with no named
+    // unsigned twin, and must still LOAD — `short` is promoted to `int` before any
+    // conversion decision, so only an entry that survives promotion needs a counterpart.
+    std::string const errors = typeSpecifiersLoadErrors([](nlohmann::json& rows) {
+        for (auto& r : rows)
+            if (r.value("name", std::string{}) == "unsigned long long") r["rank"] = 5;
+    });
+    EXPECT_NE(errors.find("'long long' has no unsigned counterpart"), std::string::npos)
+        << "refused for its OWN reason:\n" << errors;
+}
+
+TEST(TypeIdentityVocabularyLoader, ASignedEntryWithTwoUnsignedCounterpartsIsRefused) {
+    // One spelling of `unsigned long long` renamed: a SECOND rank-4 U64 entry, so
+    // `long long` has two candidate counterparts and "the" counterpart is no one type.
+    std::string const errors = typeSpecifiersLoadErrors([](nlohmann::json& rows) {
+        rows[rowIndexFor(rows, {"UnsignedKeyword", "LongKeyword", "LongKeyword", "IntKeyword"})]["name"] =
+            "unsigned long long int";
+    });
+    EXPECT_NE(errors.find("'long long' has more than one unsigned counterpart"), std::string::npos)
+        << "refused for its OWN reason:\n" << errors;
 }

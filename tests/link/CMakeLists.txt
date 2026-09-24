@@ -29,6 +29,15 @@ dss_add_test(NAME link/test_crosscu_link_formats SOURCES test_crosscu_link_forma
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
 dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)
+# P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT, routed from lane
+# lm) — the DATA twin of the cross-CU pair above: a sibling module's datum read
+# through a slot by the code that imports it. The merge reads the row's
+# `readThroughSlot` (never infers it) and retargets by ROLE — the reading code to
+# a minted slot (on arm64 both the page and the page offset), a data initializer
+# to the object; a pulled member's direct read is never sent to a slot. Linked
+# images read back byte for byte.
+dss_add_test(NAME link/test_sibling_data_import_slot
+             SOURCES test_sibling_data_import_slot.cpp)
 
 # D-LK-MACHO-STB-LOCAL-LD64-RUNTIME-WITNESS — the ld64 half of
 # D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION. Two DSS-emitted
@@ -743,3 +752,15 @@ target_link_libraries(dss_link_test_input_section_units
 # the example's own source with its reference-built archives (run on Windows).
 dss_add_test(NAME link/test_import_kind_from_definition
              SOURCES test_import_kind_from_definition.cpp)
+
+# P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): an arm64 page
+# offset is an ADD's (bytes) or a load's or store's (access-sized units). The
+# reference-built objects read with the kind each load needs (Mach-O by the
+# instruction under its one PAGEOFF12 type, ELF by its five LDST types), the
+# shared decode table word by word, and the loader's refusals of a family that
+# could decode one word two ways — the shipped document mutated, hence the json
+# link.
+dss_add_test(NAME link/test_page_offset_relocations
+             SOURCES test_page_offset_relocations.cpp)
+target_link_libraries(dss_link_test_page_offset_relocations
+                      PRIVATE nlohmann_json::nlohmann_json)

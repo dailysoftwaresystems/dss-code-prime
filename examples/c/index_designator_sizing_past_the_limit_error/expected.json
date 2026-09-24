@@ -1,0 +1,9 @@
+{
+  "$comment": "P68 round 9 (lane `cs`) — an array of UNKNOWN size an index designator would size past this implementation's limit is REFUSED, not sized wrong (negative / diagnostic). C 6.7.9p22 sizes `a` by its largest initialized index plus one: 4294967297 elements. DSS narrowed the index to 32 bits, sized the array ONE element and built it SILENTLY. MEASURED 2026-09-23, each reference separately: gcc 13.3.0 (-std=c17 -pedantic-errors and -std=c2x) builds it and the run faults on its 16 GiB stack array; clang 18.1.3 builds it with -Wframe-larger-than and the run returns 42 (this file) — the one reference whose program works; mingw-w64 13.2.0 builds the same shape and the run overflows the stack (0xC00000FD); MSVC 19.51's compile of the same shape ran about eight minutes at /std:c17 and failed, and at /std:clatest grew past a 4 GB working set before it was stopped (the lane's `.temp/probe/dx` d05). DSS places an initializer through a 32-bit index and its lowering builds one slot per element — MEASURED about 195 bytes each (`.temp/probe/la`), so four billion elements cannot be built here — so the index is refused as the IMPLEMENTATION LIMIT it is, naming the index and the limit (4294967295 elements), rather than compiled into a different program. RED-ON-DISABLE: the cursor's unknown-size limit check off -> the index is narrowed again, the array is sized one element and the build succeeds.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [
+    { "code": "S_ArrayLengthOutOfRange", "line": 15, "col": 17 }
+  ]
+}

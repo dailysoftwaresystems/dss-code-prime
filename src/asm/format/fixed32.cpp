@@ -66,6 +66,9 @@ blockRelKindForSlot(EncodingSlotKind k) noexcept {
         return walker_util::BlockRelPatchKind::Arm64Imm26;
     if (k == EncodingSlotKind::Imm14)
         return walker_util::BlockRelPatchKind::Arm64Imm14;
+    // P68 round 9: the one-word ADR naming a block of its own function.
+    if (k == EncodingSlotKind::AdrImm21)
+        return walker_util::BlockRelPatchKind::Arm64Adr21;
     return std::nullopt;
 }
 
@@ -276,6 +279,13 @@ windowFor(EncodingSlotKind s) noexcept {
         // 16..20 — the whole field; the wire arm computes its content (the
         // element's size bit and index) from the paired element field.
         case EncodingSlotKind::ElementIndex:  return SlotBitWindow{ 16, 5 };
+        // AdrImm21 (P68 round 9): the one-word ADR's immhi at bits 5..23; its
+        // immlo [30:29] is written by the block-relative patch with it
+        // (`blockRelFieldGeometry(Arm64Adr21)`). The walker writes no bits.
+        case EncodingSlotKind::AdrImm21:      return SlotBitWindow{ 5, 19 };
+        // BlockAddend (P68 round 9): a width-0 marker, like MemBaseNoScale —
+        // its operand rides the block patch, not a field.
+        case EncodingSlotKind::BlockAddend:   return SlotBitWindow{ 0, 0 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -879,6 +889,19 @@ bool encode(Lir const&                  lir,
         walker_util::BranchIslandBody     island;
     };
     std::vector<PendingBlockPatch> pendingBlockPatches;
+    // P68 round 9: a constant added to a block's ADDRESS (`adr x7, .+8`), from
+    // a `block.addend` wire; it rides this instruction's block patch.
+    std::int32_t blockAddend = 0;
+    // P68 round 9: a block-relative field aimed at THIS instruction (the
+    // location counter, `adr x7, .+8`). It becomes a self-relative patch the
+    // resolver writes (`BlockRelPatch::selfRelative`): the resolver is the one
+    // place that knows the laid-out function, and so the one place that can
+    // tell whether `. + addend` lands where the reference assembler's would.
+    struct PendingSelfField {
+        walker_util::BlockRelPatchKind kind;
+        std::uint8_t                   wordIndex;
+    };
+    std::vector<PendingSelfField> pendingSelfFields;
     for (auto const& wire : selected->wires) {
         if (wire.index >= instOps.size()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -900,7 +923,43 @@ bool encode(Lir const&                  lir,
                                           reporter);
             if (!hw.has_value()) return false;
             if (!orInto(wire.slotKind, *hw, wire.wordIndex)) return false;
-        } else if (srcOp.kind == LirOperandKind::SymbolRef) {
+        } else if (srcOp.kind == LirOperandKind::SymbolRef
+                   || srcOp.kind == LirOperandKind::SymbolAddress
+                   || (srcOp.kind == LirOperandKind::MemSymbolOffset
+                       && isSymbolBearingSlot(wire.slotKind))) {
+            // ★ THE SYMBOL AND THE PROGRAM'S CONSTANT (P68 round 9): a plain
+            // `SymbolRef` names the symbol alone; `adrp x0, msg+8` (a
+            // `SymbolAddress`) and `ldr x1, [x0, :lo12:msg+8]` (a
+            // `MemSymbolOffset` whose field the variant wires as a relocation)
+            // carry theirs in the pool. Which PART of the address the field
+            // takes was settled by election (`guard.symbolPart`), so the wire's
+            // relocation is already the right one.
+            SymbolId      relocTarget{srcOp.symbolV};
+            std::int64_t  relocAddend = 0;
+            if (srcOp.kind != LirOperandKind::SymbolRef) {
+                if (srcOp.litIndex >= lir.literalPool().size()) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': symbol operand names literal "
+                                       "pool entry {} of {} — the index outlived "
+                                       "the pool it names",
+                                       info->mnemonic, srcOp.litIndex,
+                                       lir.literalPool().size()));
+                    return false;
+                }
+                auto const* addr = std::get_if<LirSymbolAddress>(
+                    &lir.literalValue(srcOp.litIndex).value);
+                if (addr == nullptr) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': symbol operand names literal "
+                                       "pool entry {}, which is not a symbol "
+                                       "address", info->mnemonic, srcOp.litIndex));
+                    return false;
+                }
+                relocTarget = addr->symbol;
+                relocAddend = addr->addend;
+            }
             // D-AS4-3: a SymbolRef may be wired to ANY symbol-bearing
             // slot (Imm26 for BL, or the generic SymbolPatchMarker for
             // ADRP/ADD-lo12). The walker emits a Relocation + writes no
@@ -970,8 +1029,9 @@ bool encode(Lir const&                  lir,
             wroteSlot[wire.wordIndex][slotIdx] = true;
             pendingRelocs.push_back(PendingRelocSlot{
                 *wire.relocationKind,
-                SymbolId{srcOp.symbolV},
-                wire.wordIndex
+                relocTarget,
+                wire.wordIndex,
+                relocAddend
             });
         } else if (srcOp.kind == LirOperandKind::BlockRef) {
             // D-AS3-BLOCK-REL-IMM19-26 (ARM64 intra-function branch):
@@ -1086,6 +1146,44 @@ bool encode(Lir const&                  lir,
                 /*relaxable=*/isNarrowWire && escape.has_value(),
                 /*widerFieldDeclared=*/widerDeclaredThan(patchKind),
                 /*island=*/islandBodyFor(patchKind)});
+        } else if (srcOp.kind == LirOperandKind::LocationCounter) {
+            // P68 round 9: the location counter — the address of this very
+            // instruction (`adr x7, .`, `adr x7, .+8`). A location of this
+            // function, as a block is, so only a block-relative field takes it,
+            // and the resolver writes it (`pendingSelfFields`).
+            auto const patchKindOpt = blockRelKindForSlot(wire.slotKind);
+            if (!patchKindOpt.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': the location counter is wired "
+                                   "to slot '{}', which declares no "
+                                   "block-relative field",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            auto const slotIdx = static_cast<std::size_t>(wire.slotKind);
+            if (wire.wordIndex >= words.size() || slotIdx >= kEncodingSlotKindCount
+                || wroteSlot[wire.wordIndex][slotIdx]) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': the location counter's wire "
+                                   "(slot '{}', word {}) is out of the "
+                                   "template or already written",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind),
+                                   wire.wordIndex));
+                return false;
+            }
+            wroteSlot[wire.wordIndex][slotIdx] = true;
+            pendingSelfFields.push_back(
+                PendingSelfField{*patchKindOpt, wire.wordIndex});
+        } else if (srcOp.kind == LirOperandKind::ImmInt
+                   && wire.slotKind == EncodingSlotKind::BlockAddend) {
+            // P68 round 9: the constant added to a block's address. No bits:
+            // the value rides the instruction's block-relative patch.
+            blockAddend = srcOp.immInt32;
+            if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
             // P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS):
             // an ELEMENT's index. The field is the whole AdvSIMD `imm5`, and
@@ -1797,7 +1895,27 @@ bool encode(Lir const&                  lir,
     // DERIVED from the emit cursor, never a separately computed
     // `base + i*4`. Single-word opcodes (words.size()==1, all relocs at
     // wordIndex 0) behave exactly as the prior single-trailing-slot model.
+    // The location counter's address: where this instruction's first word
+    // lands (P68 round 9, `pendingSelfFields`).
+    auto const instructionStart = static_cast<std::uint32_t>(out.size());
     for (std::size_t i = 0; i < words.size(); ++i) {
+        // A field aimed at this instruction, `. + addend`: a self-relative
+        // patch at the start of its word, resolved with every other one.
+        for (auto const& sf : pendingSelfFields) {
+            if (sf.wordIndex != i) continue;
+            walker_util::BlockRelPatch self{
+                static_cast<std::uint32_t>(out.size()),
+                /*targetBlock=*/0,  // the owning block, stamped by asm.cpp
+                sf.kind,
+                /*relaxable=*/false,
+                /*widerFieldDeclared=*/false,
+                /*instV=*/0,        // stamped centrally by asm.cpp
+                /*island=*/{},
+                blockAddend};
+            self.selfRelative = true;
+            self.instStart    = instructionStart;
+            blockPatches.push_back(self);
+        }
         for (auto const& pr : pendingRelocs) {
             if (pr.wordIndex == i) {
                 walker_util::appendPendingReloc(relocs, out, pr);
@@ -1819,7 +1937,8 @@ bool encode(Lir const&                  lir,
                     bp.relaxable,
                     bp.widerFieldDeclared,
                     /*instV=*/0,  // stamped centrally by asm.cpp
-                    bp.island});
+                    bp.island,
+                    blockAddend});
             }
         }
         asm_byte_emit::appendU32LE(out, words[i]);

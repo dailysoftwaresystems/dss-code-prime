@@ -603,7 +603,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: " + decode.error());
     }
-    auto const& nativeToKind        = decode->nativeToKind;
     auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
     // -- (5) Decode every nlist_64; assign SymbolId = symtab index ---
@@ -1297,16 +1296,39 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + std::to_string(rSymNum) + " past the symbol table ("
                     + std::to_string(nsyms) + ").");
             }
-            auto const kindIt = nativeToKind.find(nativeId);
-            if (kindIt == nativeToKind.end()) {
+            // The ONE decode: a wire type several kinds share (ARM64_RELOC_
+            // PAGEOFF12 — an ADD's page offset or a load's, scaled by its
+            // size) is told apart by the instruction word it patches, as ld64
+            // does (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD).
+            std::span<std::uint8_t const> site{};
+            if (!rangeExceedsBuffer(rAddress, 4, sec.size)
+                && !rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) {
+                site = std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(sec.offset + rAddress), 4};
+            }
+            auto const decoded = decode->decode(nativeId, site);
+            if (!decoded.has_value()) {
+                using Miss = RelocationDecodeTable::Miss;
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "macho::readRelocatableObject: relocation nativeId "
                     + std::to_string(nativeId) + " in section '" + sec.segName
-                    + "," + sec.sectName + "' is not declared by Mach-O format '"
-                    + std::string{objectFormatSchema.name()}
-                    + "' -- cannot map it back to a universal RelocationKind.");
+                    + "," + sec.sectName + "' "
+                    + (decoded.error() == Miss::Undeclared
+                           ? "is not declared by Mach-O format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' -- cannot map it back to a universal "
+                                   "RelocationKind."
+                           : decoded.error() == Miss::SiteTooShort
+                               ? "is decoded by the instruction it patches, and "
+                                 "the section holds no 4-byte word at offset "
+                                 + std::to_string(rAddress) + "."
+                               : "patches an instruction word no row of Mach-O "
+                                 "format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' decodes this wire type for -- its "
+                                   "arithmetic (and so its field) is unknown."));
             }
-            RelocationKind const kind = kindIt->second;
+            RelocationKind const kind = *decoded;
             auto const* tri = targetSchema.relocationInfo(kind);
             if (tri == nullptr) {
                 return fail(DiagnosticCode::F_CorruptedBinary,

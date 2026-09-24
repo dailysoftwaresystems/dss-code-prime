@@ -82,10 +82,11 @@ void rejectUnknownKeys(substrate::DiagnosticCollector& coll,
                        std::initializer_list<std::string_view> allowed) {
     detail::rejectUnknownKeys(obj, allowed, objectLabel,
         [&](std::string_view, std::string message) {
-            // The anchor id stays in the text: it is how this rule is found
-            // from a failing document, and the shared sentence cannot carry
-            // a per-loader anchor.
-            message += " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)";
+            // Anchored: D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD. The id lives HERE,
+            // beside the emit site, not in the operator's text: the shared
+            // sentence already states the condition (the unknown key) and the
+            // action (the allowed keys), and a row id in a message turns false
+            // the day the row closes.
             emitMalformed(coll, objPath, std::move(message));
         });
 }

@@ -22,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -144,6 +145,9 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     // D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS: the x86_64
     // GOT-slot-relative reference a real glibc archive member carries.
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::X86_64GotPcRel),       "x86_64_gotpcrel");
+    // P68 round 9: the one-word `adr` and the scaled load/store page offset.
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AdrPrelLo21),   "aarch64_adr_prel_lo21");
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64LdstAbsLo12),   "aarch64_ldst_abs_lo12");
 
     EXPECT_EQ(parseRelocFormulaKind("linear"),                   RelocFormulaKind::Linear);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_call26"),           RelocFormulaKind::Aarch64Call26);
@@ -153,6 +157,8 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_got_page"),     RelocFormulaKind::Aarch64AdrGotPage);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_ld64_got_lo12"),    RelocFormulaKind::Aarch64Ld64GotLo12);
     EXPECT_EQ(parseRelocFormulaKind("x86_64_gotpcrel"),          RelocFormulaKind::X86_64GotPcRel);
+    EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_prel_lo21"),    RelocFormulaKind::Aarch64AdrPrelLo21);
+    EXPECT_EQ(parseRelocFormulaKind("aarch64_ldst_abs_lo12"),    RelocFormulaKind::Aarch64LdstAbsLo12);
     EXPECT_EQ(parseRelocFormulaKind("nonsense"),                 std::nullopt);
     EXPECT_EQ(parseRelocFormulaKind(""),                         std::nullopt);
 }
@@ -546,6 +552,153 @@ TEST(Aarch64AddAbsLo12, IgnoresHighBitsOfPositiveSplusA) {
     EXPECT_EQ(readInst(p.text, 0), 0x91000000u | (0xABCu << 10));
 }
 
+// ── Aarch64LdstAbsLo12 (P68 round 9) ────────────────────────
+//
+// A load's or store's page offset counts ACCESS-SIZED units, so the byte offset
+// is divided by the row's size. D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD
+// was the ADD arm above applied to a load: the unscaled offset in a scaled field.
+
+namespace {
+
+std::shared_ptr<TargetSchema const> loadScaledTarget(int scaleLog2) {
+    std::string const json = std::string{R"({
+      "dssTargetVersion": 1,
+      "target": {"name":"aarch64_test"},
+      "relocations":[
+        { "name": "test_kind", "kind": 1, "formula": "aarch64_ldst_abs_lo12",
+          "scaleLog2": )"} + std::to_string(scaleLog2) + R"( }
+      ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ]
+    })";
+    auto r = TargetSchema::loadFromText(json);
+    if (!r.has_value()) {
+        std::string msg;
+        for (auto const& d : r.error()) msg += d.message + "\n";
+        ADD_FAILURE() << "target load failed: " << msg;
+        return nullptr;
+    }
+    return *r;
+}
+
+// The load/store (unsigned immediate) words each size's field sits in, with
+// the offset field zero — `ldrb w0`, `ldrh w0`, `ldr w0`, `ldr x0`, `ldr q0`,
+// each `[x1]` (✔ gas 2.42).
+constexpr std::array<std::uint32_t, 5> kLoadWordByScale{
+    0x39400020u, 0x79400020u, 0xB9400020u, 0xF9400020u, 0x3DC00020u};
+
+}  // namespace
+
+TEST(Aarch64LdstAbsLo12, DividesThePageOffsetByTheAccessSize) {
+    // Page offset 0x120 (288) is a multiple of every size up to 16 bytes, so
+    // each scale writes 0x120 >> scale into imm12 [21:10].
+    for (int scale = 0; scale <= 4; ++scale) {
+        auto tgt = loadScaledTarget(scale);
+        ASSERT_NE(tgt, nullptr);
+        auto const base = kLoadWordByScale[static_cast<std::size_t>(scale)];
+        auto p = applyOneReloc(tgt, base, /*symbolVa*/ 0x40120, /*addend*/ 0,
+                               /*patchSectionVa*/ 0, /*funcOffset*/ 0);
+        ASSERT_TRUE(p.ok) << "scale " << scale;
+        EXPECT_EQ(readInst(p.text, 0), base | ((0x120u >> scale) << 10))
+            << "scale " << scale;
+    }
+}
+
+TEST(Aarch64LdstAbsLo12, MatchesTheReferenceWordForAnEightByteLoad) {
+    // ✔MEASURED 2026-09-23 (llvm-objdump of the fixed Mach-O image): `ldr d1,
+    // [x12, gd@PAGEOFF]` with `gd` at page offset 0x60 is 0xFD403181.
+    auto tgt = loadScaledTarget(3);
+    ASSERT_NE(tgt, nullptr);
+    auto p = applyOneReloc(tgt, 0xFD400181u, 0x10000C060, 0, 0, 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0xFD403181u);
+}
+
+TEST(Aarch64LdstAbsLo12, TheAddendIsPartOfTheOffset) {
+    auto tgt = loadScaledTarget(3);
+    ASSERT_NE(tgt, nullptr);
+    // S = page + 0x10, A = +8 → offset 0x18 → imm12 3.
+    auto p = applyOneReloc(tgt, 0xF9400020u, 0x7000010, 8, 0, 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0xF9400020u | (3u << 10));
+}
+
+TEST(Aarch64LdstAbsLo12, AnOffsetTheSizeDoesNotDivideIsRefused) {
+    // An 8-byte load of page offset 0x124: the scaled field cannot name it, and
+    // writing 0x124 >> 3 would load from 0x120. GNU ld 2.42 refuses the same
+    // ("relocation truncated to fit").
+    auto tgt = loadScaledTarget(3);
+    ASSERT_NE(tgt, nullptr);
+    auto p = applyOneReloc(tgt, 0xF9400020u, 0x40124, 0, 0, 0);
+    EXPECT_FALSE(p.ok);
+    EXPECT_TRUE(p.anySays("not a multiple of the 8-byte access"));
+    // The byte-sized row takes the same offset.
+    auto tgt0 = loadScaledTarget(0);
+    ASSERT_NE(tgt0, nullptr);
+    auto p0 = applyOneReloc(tgt0, 0x39400020u, 0x40125, 0, 0, 0);
+    ASSERT_TRUE(p0.ok);
+    EXPECT_EQ(readInst(p0.text, 0), 0x39400020u | (0x125u << 10));
+}
+
+TEST(Aarch64LdstAbsLo12, TheRowMustStateItsScale) {
+    auto missing = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1, "target": {"name":"aarch64_test"},
+      "relocations":[ { "name": "k", "kind": 1, "formula": "aarch64_ldst_abs_lo12" } ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ] })");
+    EXPECT_FALSE(missing.has_value()) << "a scaled row without its scale reads as bytes";
+    auto tooWide = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1, "target": {"name":"aarch64_test"},
+      "relocations":[ { "name": "k", "kind": 1, "formula": "aarch64_ldst_abs_lo12",
+                        "scaleLog2": 5 } ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ] })");
+    EXPECT_FALSE(tooWide.has_value()) << "no access is 32 bytes";
+    auto unread = TargetSchema::loadFromText(R"({
+      "dssTargetVersion": 1, "target": {"name":"aarch64_test"},
+      "relocations":[ { "name": "k", "kind": 1, "formula": "aarch64_add_abs_lo12",
+                        "scaleLog2": 3 } ],
+      "opcodes":[ {"mnemonic":"invalid","result":"none"} ] })");
+    EXPECT_FALSE(unread.has_value()) << "a scale no formula reads is refused";
+}
+
+// ── Aarch64AdrPrelLo21 (P68 round 9) ────────────────────────
+//
+// The one-word `adr`: S + A - P unscaled, signed 21 bits, split immlo [30:29] /
+// immhi [23:5].
+
+TEST(Aarch64AdrPrelLo21, MatchesTheReferenceWord) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_lo21");
+    ASSERT_NE(tgt, nullptr);
+    // ✔MEASURED 2026-09-23: gas 2.42 writes `adr x7, .+8` as 0x10000047.
+    auto p = applyOneReloc(tgt, 0x10000007u, /*symbolVa*/ 0x400108, 0,
+                           /*patchSectionVa*/ 0x400100, /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x10000047u);
+}
+
+TEST(Aarch64AdrPrelLo21, SplitsTheLowTwoBitsIntoImmlo) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_lo21");
+    ASSERT_NE(tgt, nullptr);
+    // delta 0x1235: immlo = 1, immhi = 0x48D.
+    auto p = applyOneReloc(tgt, 0x10000000u, 0x401335, 0, 0x400100, 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x10000000u | (1u << 29) | (0x48Du << 5));
+    // delta -4: the field holds 0x1FFFFC.
+    auto n = applyOneReloc(tgt, 0x10000000u, 0x4000FC, 0, 0x400100, 0);
+    ASSERT_TRUE(n.ok);
+    EXPECT_EQ(readInst(n.text, 0), 0x10000000u | (0x7FFFFu << 5));
+}
+
+TEST(Aarch64AdrPrelLo21, ReachesExactlyOneMebibyteEachWay) {
+    auto tgt = loadOneRelocTarget("aarch64_adr_prel_lo21");
+    ASSERT_NE(tgt, nullptr);
+    std::uint64_t const P = 0x800000;
+    EXPECT_TRUE(applyOneReloc(tgt, 0x10000000u, P + (1u << 20) - 1, 0, P, 0).ok);
+    EXPECT_TRUE(applyOneReloc(tgt, 0x10000000u, P - (1u << 20), 0, P, 0).ok);
+    auto far = applyOneReloc(tgt, 0x10000000u, P + (1u << 20), 0, P, 0);
+    EXPECT_FALSE(far.ok);
+    EXPECT_TRUE(far.anySays("outside its ±1 MiB reach"));
+    EXPECT_FALSE(applyOneReloc(tgt, 0x10000000u, P - (1u << 20) - 1, 0, P, 0).ok);
+}
+
 // ── Post-fold #1: additional coverage ────────────────────────
 
 // pr-test-analyzer Rating 8: Call26 boundary tests
@@ -833,7 +986,8 @@ TEST(RelocFormulaKind, AcceptedListIsCommaSpaceQuotedExactly) {
               "'linear', 'aarch64_call26', "
               "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12', "
               "'aarch64_tprel_add_hi12', 'aarch64_adr_got_page', "
-              "'aarch64_ld64_got_lo12', 'x86_64_gotpcrel'");
+              "'aarch64_ld64_got_lo12', 'x86_64_gotpcrel', "
+              "'aarch64_adr_prel_lo21', 'aarch64_ldst_abs_lo12'");
 }
 
 // pr-test-analyzer Rating 7: whitespace tolerance pinned as reject

@@ -246,6 +246,11 @@ struct DSS_EXPORT AsmDecodedOperand {
     // `symbol` must read this too, or refuse a non-zero one — dropping it would
     // address the wrong byte with a clean build log.
     std::int64_t   symbolAddend = 0;
+    // ★★ WHICH PART OF THE SYMBOL'S ADDRESS THE OPERAND NAMES (P68 round 9, the
+    // aarch64 twins): `:lo12:msg` / `msg@PAGEOFF` → the page offset, `msg@PAGE`
+    // or a bare `adrp` operand on ELF → the page, anything else the whole
+    // address. Read with `symbol`; meaningless without one.
+    SymbolAddressPart symbolPart = SymbolAddressPart::Whole;
     // `*%rax` — the dialect's indirect marker. Carried, never dropped: `jmp foo`
     // and `jmp *%rax` are different instructions and losing the star is a
     // miscompile with no diagnostic.
@@ -265,6 +270,9 @@ struct DSS_EXPORT AsmDecodedOperand {
     // symbol when the operand is lowered, because only the host has a label
     // model; the operand reaches LIR as a `MemSymbolOffset`.
     std::string    dispSymbol;
+    // The PART of `dispSymbol`'s address the displacement field takes (`[x0,
+    // :lo12:msg]` — P68 round 9); `Whole` for x86's `msg(%rip)`.
+    SymbolAddressPart dispSymbolPart = SymbolAddressPart::Whole;
 };
 
 // What a register-role operand SPELLING denotes, as the host resolved it.
@@ -620,6 +628,39 @@ public:
     [[nodiscard]] virtual std::vector<LirBlockId>
     addressTakenSuccessors() const = 0;
 
+    // ── the object format being assembled for (P68 round 9, the aarch64
+    // twins) ─────────────────────────────────────────────────────────────────
+    // ONLY a key into the dialect's `symbolParts`: an operator naming a part of
+    // an address (`:lo12:`, `@PAGEOFF`) is read only on the format kinds whose
+    // reference assembler reads it, and a row's `impliedSymbolPart` applies only
+    // on the kinds it lists. nullopt ⇒ the caller states no format, and every
+    // such spelling is refused by name rather than read under a guessed one.
+    [[nodiscard]] virtual std::optional<ObjectFormatKind> objectFormatKind() const = 0;
+
+    // ── the address of a block of THIS function (P68 round 9) ───────────────
+    // For an instruction that takes a BLOCK where it could take a symbol —
+    // `adr x1, 1f` — the block `symbol` names when it is a label of the OPEN
+    // function, resolved at assemble time as gas and clang resolve it (no
+    // relocation, so it needs none on a format that has no relocation for it).
+    // nullopt with NO diagnostic ⇒ the name is not a block of this function,
+    // and the engine lowers it as a symbol, as it always did. The location
+    // counter is never asked here: it is the instruction's own address, which
+    // the engine hands the encoder directly.
+    [[nodiscard]] virtual std::optional<LirBlockId>
+    resolveLocalBlock(std::string const& symbol, NodeId at) = 0;
+
+    // ── is this name a location in THIS unit's CODE? (P68 round 9) ──────────
+    // A function entry or a label inside a function the unit defines — as
+    // opposed to a data label, or a name defined elsewhere. Asked of an address
+    // that ADDS A CONSTANT to the name (`leaq L+2(%rip)`, `adr x0, main+4`,
+    // `.quad 1f+4`): the byte N past a code label is a distance in the
+    // REFERENCE assembler's code layout, which this build does not reproduce
+    // (a jump it synthesizes at a block's end; x86's long branch and immediate
+    // forms), so the engine refuses it rather than name another byte. false
+    // with no diagnostic for every other name.
+    [[nodiscard]] virtual bool namesCodeHere(std::string const& symbol,
+                                             NodeId at) const = 0;
+
     // ── emit bookkeeping ──────────────────────────────────────────────────
     virtual void onInstructionEmitted() = 0;
     virtual void onTerminatorEmitted() = 0;
@@ -668,6 +709,13 @@ public:
                                                NodeId operandSeq);
 
     [[nodiscard]] bool decodeOperandInto(NodeId node, AsmDecodedOperand& out);
+
+    // Does any operand of `operandSeq` spell this dialect's LOCATION COUNTER
+    // (`.` in GNU as — `adr x7, .`, `b .`, `adr x7, .+8`; P68 round 9)? The
+    // name an operand spells is read as the decode reads it — every token
+    // outside its address-part operator and its addend — so `.L3` is not it.
+    // False on a dialect that declares no location counter.
+    [[nodiscard]] bool spellsLocationCounter(NodeId operandSeq) const;
 
 private:
     struct Impl;
@@ -789,6 +837,14 @@ lowerAsmTemplateToLirRun(Tree const&                        templateTree,
                          // the template did not write — its block is appended
                          // here, for the caller to mark as synthetic. Null ⇒ the
                          // caller keeps no such record.
-                         std::vector<LirBlockId>*           syntheticFallthroughs = nullptr);
+                         std::vector<LirBlockId>*           syntheticFallthroughs = nullptr,
+                         // ★ THE OBJECT FORMAT KIND THE PROGRAM IS BUILT FOR (P68
+                         // round 9) — only a key into the dialect's
+                         // `symbolParts`: an address-part operator (`:lo12:`,
+                         // `@PAGEOFF`) is read only on the kinds its row lists.
+                         // nullopt ⇒ the caller states no format, and every such
+                         // operator is refused by name rather than read under a
+                         // guessed one.
+                         std::optional<ObjectFormatKind>    formatKind = std::nullopt);
 
 } // namespace dss

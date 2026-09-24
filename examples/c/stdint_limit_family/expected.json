@@ -1,0 +1,42 @@
+{
+  "$comment": "<stdint.h>'s limit and width macros — the whole C23 7.22.2 / 7.22.3 family, 84 names, plus __STDC_VERSION_STDINT_H__ (P68 round 9, lane lm, D-FFI-STDINT-LIMIT-MACROS). Eight groups set eight bits (main.c lists them); the exit is 42 only when all hold. DSS's <stdint.h> defined TWO of the 84 before this change (INT64_MIN/INT64_MAX): INT32_MAX, UINT64_MAX, SIZE_MAX and the rest were undeclared identifiers, and read as 0 in #if. Every check is a relation — a limit against its typedef's own size and signedness, its type against the typedef's PROMOTED type (C 7.22.5), its #if value and sign against the run-time ones — so the file is one on every platform; the platforms' absolute answers are tests/analysis/preprocess/test_stdint_limit_macros.cpp. ✔MEASURED 2026-09-24 on this file: gcc 13.3.0 `-std=c2x` and clang 18.1.3 `-std=c23`, `-pedantic -Wall`, on x86_64 Linux and on aarch64 Linux (cross, qemu), -O0 and -O2, all exit 42 with no warning; Apple clang 21.0.0 `-std=c23 -pedantic -Wall` on arm64 and under `-arch x86_64`, -O0 and -O2, exits 42 with no warning (the coordinator's Mac, 2026-09-24); mingw-w64 gcc 13.2.0 at -O0 and -O2 and MSVC 14.51 `/std:clatest` at its default and /O2 exit 42 with their documented deviations behind their own guards (each guard is load-bearing, MEASURED: mingw-w64 without its guard exits 239 — bit 16 (group 5) off, its wchar_t/wint_t limits typed unsigned int; MSVC without its guard exits 216 — bits 1, 2, 4 and 32 (groups 1, 2, 3 and 6) off, its i8/i16-suffixed limits and their #if values). Under DSS every check runs. The `release` arm runs the shipped optimizer pipeline over the same checks.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

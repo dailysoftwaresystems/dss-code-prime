@@ -76,6 +76,11 @@ windowFor(EncodingSlotKind s) noexcept {
         // ElementIndex (P68 round 8): the AdvSIMD `imm5` at bits 16..20; the
         // wire loop below recovers the INDEX from the size bit it carries.
         case EncodingSlotKind::ElementIndex:   return SlotBitWindow{ 16, 5 };
+        // AdrImm21 / BlockAddend (P68 round 9): block-relative, resolved at
+        // assemble time — nothing a round-trip decoder reads back as a
+        // register or an immediate.
+        case EncodingSlotKind::AdrImm21:
+        case EncodingSlotKind::BlockAddend:    return std::nullopt;
         // Every remaining slot decodes to nullopt. This is an
         // intentionally PARTIAL mirror of `fixed32::windowFor`: the
         // round-trip decoder only needs the register/immediate windows

@@ -303,11 +303,22 @@ constexpr std::uint32_t kLdurQ_m256 = 0x3CD00020u;  // ldur q0,[x1,#-256]
 // a REMOVE-direction one throws when the thing it aimed at is already gone.
 
 // Delete every `width`-guarded variant of the four memory opcodes, refusing
-// loudly if the count is not what this file was written against.
+// loudly unless EVERY opcode lost at least one arm of EVERY width named.
+//
+// ⓘ PER (OPCODE, WIDTH), NOT A TOTAL (P68 round 9): the scaled opcodes gained a
+// second arm per width — the symbolic page offset, `[xN, :lo12:sym]`
+// (`guard.symbolPart: pageOffset`) — so a width now names one arm on the
+// unscaled pair and two on the scaled pair. What makes the pin below non-vacuous
+// is that no (opcode, width) kept its arms, and that is what is checked.
 [[nodiscard]] std::function<void(nlohmann::json&)>
 removeWidthArms(std::vector<int> widths) {
     return [widths](nlohmann::json& doc) {
-        std::size_t removed = 0;
+        std::vector<std::string> missed;
+        for (auto const& want : kMemoryOpcodes) {
+            for (int const w : widths) {
+                missed.push_back(std::string{want} + "/" + std::to_string(w));
+            }
+        }
         for (auto& op : doc.at("opcodes")) {
             auto const mn = op.value("mnemonic", std::string{});
             bool subject = false;
@@ -317,19 +328,19 @@ removeWidthArms(std::vector<int> widths) {
             for (auto it = vars.begin(); it != vars.end();) {
                 int const w = it->at("guard").value("width", 0);
                 if (std::find(widths.begin(), widths.end(), w) != widths.end()) {
+                    std::erase(missed, mn + "/" + std::to_string(w));
                     it = vars.erase(it);
-                    ++removed;
                 } else {
                     ++it;
                 }
             }
         }
-        auto const expect = widths.size() * std::size(kMemoryOpcodes);
-        if (removed != expect) {
+        if (!missed.empty()) {
+            std::string list;
+            for (auto const& m : missed) list += " " + m;
             throw std::runtime_error{
-                "expected to strip " + std::to_string(expect)
-                + " width arm(s) from the four SIMD&FP memory opcodes, stripped "
-                + std::to_string(removed)
+                "expected every SIMD&FP memory opcode to lose an arm of every "
+                "width named, and these kept theirs:" + list
                 + " — the pin below would be vacuous"};
         }
     };

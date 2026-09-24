@@ -4,7 +4,7 @@
 #include "core/substrate/path_identity.hpp"        // genericSpelling / normalizeKeepingRoot — the lossless spellings
 #include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
-#include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver
+#include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver; resolveSystemDirs (a header named by a config row)
 #include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"        // EnumNameTable/allNames (the descriptor-local closed sets)
@@ -15,6 +15,7 @@
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (constant integer-scalar gate)
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner::kind (constant type gate)
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (the private lattice readShippedLibConstants owns)
+#include "core/types/type_lattice/type_layout.hpp"   // scalarByteSize — a pointer's width, the `type-limit` width of `pointerTo`
 #include "core/types/number_decode.hpp"          // decodeFloat (the ONE float-literal decoder)
 #include "analysis/semantic/type_rules.hpp"     // resolveArithmeticRules + promoteIntegerKind — the ONE integer-promotion rule a derived constant is typed by. HEADER-ONLY use (both inline): no link dependency on analysis_semantic, and type_rules.hpp includes only core headers, so no include cycle
 #include "core/types/grammar_schema.hpp"        // GrammarSchema::semantics() — a derived row's language
@@ -1986,8 +1987,9 @@ decodeConstantValueAndType(json const& obj, std::string const& at,
 // `__SIZEOF_WCHAR_T__` reads), so `<stddef.h>` can no longer restate per FORMAT a
 // fact that is per processor × platform. With no such fact on the pair the entry
 // is simply not injected (a use then fails loud as an undefined type); `type` and
-// `abiTypedef` together are two owners of one type and are refused.
-constexpr std::string_view kAbiTypedefKey = "abiTypedef";
+// `abiTypedef` together are two owners of one type and are refused. The key is the
+// shared type-reference notation (`kTypeRefAbiTypedefKey`, preprocess_config.hpp).
+constexpr std::string_view kAbiTypedefKey = kTypeRefAbiTypedefKey;
 
 [[nodiscard]] bool
 decodeShippedTypedefs(json const& doc, std::string const& pathStr,
@@ -2216,6 +2218,21 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
 //     typedef the descriptor declares (`int64_t`), else a name in the consuming
 //     language's vocabulary (`long`), resolved by the language's ONE resolver
 //     (`resolveLanguageTypeName`) and selected for the pair's data model;
+//   * OR `of` is ONE type REFERENCE, in the notation the `type-limit` predefined
+//     macros use for the same types (P68 round 9, D-FFI-STDINT-LIMIT-MACROS):
+//     `{ "shippedTypedef": "size_t", "header": "stddef.h" }` — a typedef ANOTHER
+//     shipped header declares, read for the pair by `readShippedHeaderTypedefs`,
+//     the one reader `__SIZE_MAX__` also asks — or `{ "abiTypedef": "wint_t" }`,
+//     the target's platform ABI typedef (`ShippedPairFacts::abiTypedefs`). C 7.22.3
+//     gives `<stdint.h>` the limits of `ptrdiff_t`, `size_t`, `wchar_t`, `wint_t`
+//     and `sig_atomic_t`, which `<stddef.h>`, `<signal.h>` and the platform ABI
+//     declare, and `<stdint.h>` includes none of them. Where that header is not
+//     shipped for the format (`<signal.h>` on pe) or the typedef is not selected
+//     on the pair, the row is NOT realized — so the macro is undefined exactly
+//     where its type is (C 7.22.3p2: "only the macros corresponding to those
+//     typedef names it actually provides"). A header no directory holds, or one
+//     that declares no such typedef on any pair, is REFUSED: a typo cannot pass
+//     for an absence;
 //   * `max`/`min` is that type's range on the pair (plain `char` by the pair's
 //     signedness), typed as the language's INTEGER PROMOTION of the type
 //     (`promoteIntegerKind`, the owner of the rule) — `USHRT_MAX` is an `int`,
@@ -2232,21 +2249,161 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
 // data model the row is evaluated under EVERY model and must come out the same.
 // ★ REFUSED, LOUDLY, in the `model-limit` style: an unknown `limit`, a `value`/
 // `type`/`variants` beside `of` (the second copy of what the lattice states), a
-// `limit` with no `of`, an `of` that names nothing, and a row whose value cannot
-// be formed (a non-integer type, a range the 64-bit carrier cannot hold).
+// `limit` with no `of`, an `of` that names nothing, a malformed `of` reference
+// (an unknown key, a `shippedTypedef` with no `header`, a `header` beside
+// anything else, two sources at once, a reference to this descriptor's OWN header
+// — its typedefs have the bare-name notation), and a row whose value cannot be
+// formed (a non-integer type, a range the 64-bit carrier cannot hold).
 
-// The closed `limit` vocabulary. One owner of the spellings.
-enum class DerivedLimit : std::uint8_t { Max, Min, Width };
-constexpr EnumNameTable<DerivedLimit, 3> kDerivedLimitTable{{{
-    { DerivedLimit::Max,   "max"   },
-    { DerivedLimit::Min,   "min"   },
-    { DerivedLimit::Width, "width" },
-}}};
-DSS_CHECK_ENUM_NAME_TABLE(kDerivedLimitTable);
+// The closed `limit` vocabulary is `IntegerTypeLimit` / `kIntegerTypeLimitTable`
+// (core/types/preprocess_config.hpp) — ONE table, shared with the `type-limit`
+// predefined macros, which state the same fact about the same type (P68 round 9;
+// until then this file owned a private copy of the three spellings).
 
 // The constant-entry key spellings a derived row adds. One owner each.
 constexpr std::string_view kDerivedOfKey    = "of";
 constexpr std::string_view kDerivedLimitKey = "limit";
+// The keys of an `of` REFERENCE (P68 round 9, D-FFI-STDINT-LIMIT-MACROS) — the
+// shared type-reference notation (`kTypeRef…Key`, preprocess_config.hpp) the
+// predefined-macro `type` arm reads too, so one notation names a shipped or an ABI
+// typedef wherever config names one. `abiTypedef` is `kAbiTypedefKey` above.
+constexpr std::string_view kDerivedOfShippedTypedefKey = kTypeRefShippedTypedefKey;
+constexpr std::string_view kDerivedOfHeaderKey         = kTypeRefHeaderKey;
+
+// What a derived row's `of` names.
+struct DerivedOf {
+    enum class Kind : std::uint8_t {
+        Name,             // a type name as this descriptor's text sees it
+        ShippedTypedef,   // a typedef ANOTHER shipped header declares
+        AbiTypedef,       // the target's platform ABI typedef for the format
+    };
+    Kind        kind = Kind::Name;
+    std::string name;     // the type name, the typedef's, or the ABI typedef's
+    std::string header;   // ShippedTypedef: the header that declares it
+
+    // How a sentence names it — `'long'`, `typedef 'size_t' of <stddef.h>`.
+    [[nodiscard]] std::string describe() const {
+        switch (kind) {
+            case Kind::Name:           return "'" + name + "'";
+            case Kind::ShippedTypedef: return "typedef '" + name + "' of <" + header + ">";
+            case Kind::AbiTypedef:     return "ABI typedef '" + name + "'";
+        }
+        return "'" + name + "'";   // unreachable: every enumerator has an arm above
+    }
+};
+
+// The shapes an `of` may take, as a refusal lists them — rendered FROM the key
+// constants, so the sentence cannot name a spelling the parse does not read.
+[[nodiscard]] std::string derivedOfShapes() {
+    return "a type name (\"long\", or a typedef this descriptor declares), { \""
+         + std::string{kDerivedOfShippedTypedefKey} + "\": <name>, \""
+         + std::string{kDerivedOfHeaderKey} + "\": <the shipped header declaring it> }, or { \""
+         + std::string{kAbiTypedefKey} + "\": <a platform ABI typedef the target declares> }";
+}
+
+// Parse a row's `of`. The SHAPE is judged here, on every read, pair or no pair;
+// what it NAMES is judged when the row is realized. `ownHeader` is this
+// descriptor's `header` (empty if it states none).
+[[nodiscard]] std::optional<DerivedOf>
+parseDerivedOf(json const& node, std::string_view ownHeader, std::string const& at,
+               std::string const& cname, DiagnosticReporter& reporter) {
+    std::string const who = "shipped-lib descriptor " + at + ": constant '" + cname + "'";
+    std::string const of{kDerivedOfKey};
+    std::string const shippedKey{kDerivedOfShippedTypedefKey};
+    std::string const headerKey{kDerivedOfHeaderKey};
+    std::string const abiKey{kAbiTypedefKey};
+    if (node.is_string()) {
+        std::string name = node.get<std::string>();
+        if (name.empty()) {
+            emitMalformed(reporter, who + ": '" + of + "' must be a non-empty type name");
+            return std::nullopt;
+        }
+        return DerivedOf{DerivedOf::Kind::Name, std::move(name), {}};
+    }
+    if (!node.is_object()) {
+        emitMalformed(reporter, who + ": '" + of + "' must be one of " + derivedOfShapes());
+        return std::nullopt;
+    }
+    if (!rejectUnknownKeys(reporter, node, at + " '" + cname + "'." + of,
+                           {kDerivedOfShippedTypedefKey, kDerivedOfHeaderKey,
+                            kAbiTypedefKey})) {
+        return std::nullopt;
+    }
+    auto const text = [&](std::string_view key) -> std::optional<std::string> {
+        if (!node.contains(key)) return std::nullopt;
+        json const& v = node.at(key);
+        if (!v.is_string() || v.get<std::string>().empty()) return std::string{};
+        return v.get<std::string>();
+    };
+    std::optional<std::string> const shipped = text(kDerivedOfShippedTypedefKey);
+    std::optional<std::string> const header  = text(kDerivedOfHeaderKey);
+    std::optional<std::string> const abi     = text(kAbiTypedefKey);
+    if (shipped.has_value() == abi.has_value()) {
+        emitMalformed(reporter, who + ": an '" + of + "' reference names its type by EXACTLY "
+                                      "one of '" + shippedKey + "' or '" + abiKey + "' — "
+                                    + derivedOfShapes());
+        return std::nullopt;
+    }
+    for (auto const& [key, value] : {std::pair{kDerivedOfShippedTypedefKey, shipped},
+                                     std::pair{kDerivedOfHeaderKey, header},
+                                     std::pair{kAbiTypedefKey, abi}}) {
+        if (value.has_value() && value->empty()) {
+            emitMalformed(reporter, who + ": '" + of + "'." + std::string{key}
+                                        + " must be a non-empty string");
+            return std::nullopt;
+        }
+    }
+    if (abi.has_value()) {
+        if (header.has_value()) {
+            emitMalformed(reporter, who + ": '" + of + "'." + headerKey + " is the companion "
+                                          "of '" + shippedKey + "' alone — an ABI typedef is "
+                                          "the target's, and no header declares it");
+            return std::nullopt;
+        }
+        return DerivedOf{DerivedOf::Kind::AbiTypedef, *abi, {}};
+    }
+    if (!header.has_value()) {
+        emitMalformed(reporter, who + ": '" + of + "'." + shippedKey + " requires '" + headerKey
+                                    + "' — the shipped header that declares '" + *shipped + "'");
+        return std::nullopt;
+    }
+    if (!ownHeader.empty() && *header == ownHeader) {
+        emitMalformed(reporter, who + ": '" + of + "' names a typedef of this very descriptor (<"
+                                    + *header + ">) by header — name it bare, \"" + of + "\": \""
+                                    + *shipped + "\", the one notation for a descriptor's "
+                                      "own typedefs");
+        return std::nullopt;
+    }
+    return DerivedOf{DerivedOf::Kind::ShippedTypedef, *shipped, *header};
+}
+
+// The typedefs of the OTHER headers a descriptor's rows name, read once per
+// decode: a header three rows name is searched and read once.
+class ForeignHeaderTypedefs {
+public:
+    ForeignHeaderTypedefs(std::optional<std::string_view> activeTarget,
+                          std::optional<ObjectFormatKind> activeFormat,
+                          ShippedPairFacts const*         pair)
+        : activeTarget_(activeTarget), activeFormat_(activeFormat), pair_(pair) {}
+
+    // nullptr ⇒ no pair: nothing can be searched, so nothing is realized.
+    [[nodiscard]] ShippedHeaderTypedefs const* of(std::string const& header) {
+        if (pair_ == nullptr) return nullptr;
+        auto it = read_.find(header);
+        if (it == read_.end()) {
+            it = read_.emplace(header, readShippedHeaderTypedefs(header, activeTarget_,
+                                                                 activeFormat_, *pair_))
+                     .first;
+        }
+        return &it->second;
+    }
+
+private:
+    std::optional<std::string_view>                        activeTarget_;
+    std::optional<ObjectFormatKind>                        activeFormat_;
+    ShippedPairFacts const*                                pair_;
+    std::unordered_map<std::string, ShippedHeaderTypedefs> read_;
+};
 
 // The data models a pair-dependent fact is evaluated under: the pair's own, or —
 // with no pair — every model in the closed table, whose answers must then AGREE.
@@ -2324,135 +2481,103 @@ integerRangeOnPair(TypeKind core, bool charIsUnsigned) {
     return std::nullopt;
 }
 
-enum class DerivedOutcome { Realized, Unrealized, Refused };
+}  // namespace — closed for the one EXPORTED step of the lattice, then reopened
 
-// Realize ONE derived row on the pair — its value and its type — or say why not.
-// `declaredTypedefs` is every typedef NAME the descriptor declares (on any
-// target); `namedTypes` the typedefs SELECTED for this pair plus the caller's
-// bindings. Refusals are reported here; `Unrealized` is silent by design (the
-// row simply does not exist on this pair — see the banner).
-[[nodiscard]] DerivedOutcome
-realizeDerivedConstant(std::string const& at, std::string const& cname,
-                       std::string const& ofText, DerivedLimit limit,
-                       std::span<NamedTypeBinding const> namedTypes,
-                       std::unordered_set<std::string> const& declaredTypedefs,
-                       ShippedPairFacts const* pair, TypeInterner& interner,
-                       DiagnosticReporter& reporter,
-                       std::int64_t& outValue, TypeId& outType) {
-    std::string const row = "shipped-lib descriptor " + at + ": constant '" + cname
-        + "' (derived: of '" + ofText + "', limit '"
-        + std::string{kDerivedLimitTable.name(limit)} + "')";
+// Declared in `ffi/shipped_lib_descriptor.hpp` (P68 round 9). Steps (2)–(4) of a
+// derived row — the range, the value's type, the value — lifted out of
+// `realizeDerivedConstant` VERBATIM when the `type-limit` predefined macros needed
+// the same answer for the same type: one computation, two readers, so
+// `LONG_MAX` and `__LONG_MAX__` cannot disagree on a pair.
+DerivedIntegerLimitResult
+deriveIntegerLimitOnPair(TypeKind core, std::string_view vocabularyName,
+                         IntegerTypeLimit limit, ShippedPairFacts const* pair) {
+    DerivedIntegerLimitResult out;
+    auto const refuse = [&](DerivedIntegerLimitRefusal why) {
+        out.outcome = DerivedIntegerLimitOutcome::Refused;
+        out.refusal = why;
+        return out;
+    };
+    PairIntegerType const ofType{core, std::string{vocabularyName}};
     std::optional<DataModel> const dm =
         pair != nullptr ? pair->dataModel : std::optional<DataModel>{};
     std::vector<DataModel> const models = modelsFor(dm);
 
-    // (1) WHICH TYPE `of` NAMES — this descriptor's own typedef first (C scoping:
-    // a header's typedef is in scope for its own macros), else the language's
-    // vocabulary. Its identity on the pair: core + vocabulary tag.
-    PairIntegerType ofType;
-    bool            haveOf = false;
-    for (auto const& b : namedTypes) {
-        if (b.name != ofText) continue;
-        ofType.core           = interner.kind(b.type);
-        ofType.vocabularyName = std::string{interner.vocabularyName(b.type)};
-        haveOf = true;
-        break;
-    }
-    if (!haveOf && declaredTypedefs.contains(ofText)) {
-        // The descriptor declares it, but no variant is selected for this pair
-        // (or its type needs a binding this reader lacks): not on this pair.
-        return DerivedOutcome::Unrealized;
-    }
-    if (!haveOf) {
-        if (pair == nullptr || pair->language == nullptr) {
-            return DerivedOutcome::Unrealized;   // no vocabulary to resolve it in
-        }
-        auto const ref = resolveLanguageTypeName(*pair->language, ofText);
-        if (!ref.has_value()) {
-            emitMalformed(reporter, row + " names a type that is neither a typedef this "
-                                          "descriptor declares nor one the consuming "
-                                          "language resolves: " + ref.error());
-            return DerivedOutcome::Refused;
-        }
-        std::optional<TypeKind> chosen;
-        for (DataModel const m : models) {
-            TypeKind const k = ref->resolveCore(m);
-            if (chosen.has_value() && *chosen != k) {
-                return DerivedOutcome::Unrealized;   // the width is the pair's to say
-            }
-            chosen = k;
-        }
-        ofType.core           = *chosen;
-        ofType.vocabularyName = ref->vocabularyName;
-    }
-
-    // (2) ITS RANGE ON THE PAIR.
+    // (2) ITS RANGE ON THE PAIR. A POINTER has none, but it has a WIDTH — its
+    // bits under the data model — and that one limit is answered (below).
+    bool const pointerWidth =
+        (ofType.core == TypeKind::Ptr && limit == IntegerTypeLimit::Width);
     if (ofType.core == TypeKind::Char
         && (pair == nullptr || !pair->charIsUnsigned.has_value())) {
-        return DerivedOutcome::Unrealized;   // plain char's signedness is the pair's
+        return out;   // Unrealized: plain char's signedness is the pair's
     }
     bool const charUnsigned =
         pair != nullptr && pair->charIsUnsigned.value_or(false);
-    std::optional<PairIntegerRange> const range =
-        integerRangeOnPair(ofType.core, charUnsigned);
-    if (!range.has_value()) {
-        emitMalformed(reporter, row + " cannot be formed: '" + ofText
-                                    + "' is not an integer type ("
-                                    + std::string{typeKindNameOrEmpty(ofType.core)} + ")");
-        return DerivedOutcome::Refused;
+    std::optional<PairIntegerRange> range;
+    if (pointerWidth) {
+        std::optional<unsigned> bits;
+        for (DataModel const m : models) {
+            auto const bytes = scalarByteSize(TypeKind::Ptr, m);
+            if (!bytes.has_value()) return refuse(DerivedIntegerLimitRefusal::NotAnIntegerType);
+            unsigned const b = static_cast<unsigned>(*bytes * 8u);
+            if (bits.has_value() && *bits != b) return out;   // Unrealized: the model's to say
+            bits = b;
+        }
+        range = PairIntegerRange{};
+        range->width = *bits;
+    } else {
+        range = integerRangeOnPair(ofType.core, charUnsigned);
     }
+    if (!range.has_value()) return refuse(DerivedIntegerLimitRefusal::NotAnIntegerType);
 
     // (3) THE ROW'S TYPE — the promotion rule and the promotion floor are the
     // LANGUAGE's, evaluated for the pair (every model with none, which must agree).
     if (pair == nullptr || pair->language == nullptr) {
-        return DerivedOutcome::Unrealized;
+        return out;   // Unrealized: no language
     }
     std::optional<ArithmeticConversions> const& acOpt =
         pair->language->semantics().arithmeticConversions;
     if (!acOpt.has_value() || !isIntegerScalarKind(acOpt->minRankType.core)) {
-        emitMalformed(reporter, row + " cannot be formed: the consuming language declares "
-                                      "no integer promotion ('semantics."
-                                      "arithmeticConversions.integerPromotion'), which "
-                                      "is what types a derived limit");
-        return DerivedOutcome::Refused;
+        return refuse(DerivedIntegerLimitRefusal::NoIntegerPromotion);
     }
     ArithmeticConversions const& ac = *acOpt;
     std::optional<PairIntegerType> rowType;
     for (DataModel const m : models) {
         PairIntegerType t;
-        if (limit == DerivedLimit::Width) {
+        if (limit == IntegerTypeLimit::Width) {
             t.core           = ac.minRankType.resolveCore(m);
             t.vocabularyName = ac.minRankType.vocabularyName;
         } else {
-            ::dss::ResolvedArithmeticRules const rules = ::dss::resolveArithmeticRules(ac, m);
+            // ONE resolver for every tier: the rules come from the whole semantics config (the
+            // counterpart map and the `_BitInt` flag ride with it), never from its arithmetic
+            // block alone.
+            std::optional<::dss::ResolvedArithmeticRules> const rules =
+                ::dss::resolveArithmeticRules(pair->language->semantics(), m);
+            if (!rules.has_value()) return refuse(DerivedIntegerLimitRefusal::NoIntegerPromotion);
             TypeKind const p =
-                ::dss::detail::type_rules::promoteIntegerKind(ofType.core, rules);
+                ::dss::detail::type_rules::promoteIntegerKind(ofType.core, *rules);
             // `integerPromotedType`'s rule: a type the promotion leaves alone keeps
             // its identity; one it changes becomes the anonymous promoted kind.
             t = (p == ofType.core) ? ofType : PairIntegerType{p, {}};
         }
-        if (rowType.has_value() && !(*rowType == t)) return DerivedOutcome::Unrealized;
+        if (rowType.has_value() && !(*rowType == t)) return out;   // Unrealized
         rowType = t;
     }
+    out.core           = rowType->core;
+    out.vocabularyName = rowType->vocabularyName;
     if (!isIntegerScalarKind(rowType->core)) {
-        emitMalformed(reporter, row + " cannot be formed: its type would be "
-                                    + std::string{typeKindNameOrEmpty(rowType->core)}
-                                    + ", not an integer scalar");
-        return DerivedOutcome::Refused;
+        return refuse(DerivedIntegerLimitRefusal::PromotedNotInteger);
     }
+    out.isUnsigned = isUnsignedIntegerKind(rowType->core);
+    out.width      = integerScalarWidthBits(rowType->core).value_or(0u);
 
     // (4) THE VALUE, in the row's type.
     std::optional<std::int64_t> bits;
     switch (limit) {
-        case DerivedLimit::Max:   bits = range->max; break;
-        case DerivedLimit::Min:   bits = range->min; break;
-        case DerivedLimit::Width: bits = static_cast<std::int64_t>(range->width); break;
+        case IntegerTypeLimit::Max:   bits = range->max; break;
+        case IntegerTypeLimit::Min:   bits = range->min; break;
+        case IntegerTypeLimit::Width: bits = static_cast<std::int64_t>(range->width); break;
     }
-    if (!bits.has_value()) {
-        emitMalformed(reporter, row + " cannot be formed: the value does not fit the "
-                                      "descriptor's 64-bit constant carrier");
-        return DerivedOutcome::Refused;
-    }
+    if (!bits.has_value()) return refuse(DerivedIntegerLimitRefusal::CarrierOverflow);
     // It must be representable in the row's type — the check a flat row's
     // `value` gets against its `type` (`decodeConstantValue`), asked of the
     // derived number, so a promotion that could not hold its own maximum (a
@@ -2462,15 +2587,177 @@ realizeDerivedConstant(std::string const& at, std::string const& cname,
                                 ? json(static_cast<std::uint64_t>(*bits))
                                 : json(*bits);
         if (!decodeConstantValue(asJson, rowType->core).has_value()) {
-            emitMalformed(reporter, row + " cannot be formed: its value does not fit "
-                                          "its promoted type "
-                                          + std::string{typeKindNameOrEmpty(rowType->core)});
+            return refuse(DerivedIntegerLimitRefusal::NotRepresentable);
+        }
+    }
+    out.outcome = DerivedIntegerLimitOutcome::Realized;
+    out.value   = *bits;
+    return out;
+}
+
+namespace {
+
+enum class DerivedOutcome { Realized, Unrealized, Refused };
+
+// Realize ONE derived row on the pair — its value and its type — or say why not.
+// `declaredTypedefs` is every typedef NAME the descriptor declares (on any
+// target); `namedTypes` the typedefs SELECTED for this pair plus the caller's
+// bindings; `foreign` the typedefs of the other headers the rows name. Refusals
+// are reported here; `Unrealized` is silent by design (the row simply does not
+// exist on this pair — see the banner).
+[[nodiscard]] DerivedOutcome
+realizeDerivedConstant(std::string const& at, std::string const& cname,
+                       DerivedOf const& of, IntegerTypeLimit limit,
+                       std::span<NamedTypeBinding const> namedTypes,
+                       std::unordered_set<std::string> const& declaredTypedefs,
+                       ForeignHeaderTypedefs& foreign,
+                       ShippedPairFacts const* pair, TypeInterner& interner,
+                       DiagnosticReporter& reporter,
+                       std::int64_t& outValue, TypeId& outType) {
+    std::string const row = "shipped-lib descriptor " + at + ": constant '" + cname
+        + "' (derived: of " + of.describe() + ", limit '"
+        + std::string{kIntegerTypeLimitTable.name(limit)} + "')";
+    std::optional<DataModel> const dm =
+        pair != nullptr ? pair->dataModel : std::optional<DataModel>{};
+    std::vector<DataModel> const models = modelsFor(dm);
+
+    // (1) WHICH TYPE `of` NAMES, and its identity on the pair: core + vocabulary tag.
+    PairIntegerType ofType;
+    switch (of.kind) {
+        case DerivedOf::Kind::Name: {
+            // This descriptor's own typedef first (C scoping: a header's typedef is
+            // in scope for its own macros), else the language's vocabulary.
+            bool haveOf = false;
+            for (auto const& b : namedTypes) {
+                if (b.name != of.name) continue;
+                ofType.core           = interner.kind(b.type);
+                ofType.vocabularyName = std::string{interner.vocabularyName(b.type)};
+                haveOf = true;
+                break;
+            }
+            if (!haveOf && declaredTypedefs.contains(of.name)) {
+                // The descriptor declares it, but no variant is selected for this
+                // pair (or its type needs a binding this reader lacks): not on this
+                // pair.
+                return DerivedOutcome::Unrealized;
+            }
+            if (!haveOf) {
+                if (pair == nullptr || pair->language == nullptr) {
+                    return DerivedOutcome::Unrealized;   // no vocabulary to resolve it in
+                }
+                auto const ref = resolveLanguageTypeName(*pair->language, of.name);
+                if (!ref.has_value()) {
+                    emitMalformed(reporter, row + " names a type that is neither a typedef "
+                                                  "this descriptor declares nor one the "
+                                                  "consuming language resolves: "
+                                                + ref.error());
+                    return DerivedOutcome::Refused;
+                }
+                std::optional<TypeKind> chosen;
+                for (DataModel const m : models) {
+                    TypeKind const k = ref->resolveCore(m);
+                    if (chosen.has_value() && *chosen != k) {
+                        return DerivedOutcome::Unrealized;   // the width is the pair's to say
+                    }
+                    chosen = k;
+                }
+                ofType.core           = *chosen;
+                ofType.vocabularyName = ref->vocabularyName;
+            }
+            break;
+        }
+        case DerivedOf::Kind::AbiTypedef: {
+            // The target's platform ABI typedef for this format — the table
+            // `__SIZEOF_WINT_T__` and `__WINT_MAX__` read. None on the pair ⇒ not
+            // on this pair, exactly as a `typedefs` entry naming one is not injected.
+            if (pair == nullptr) return DerivedOutcome::Unrealized;
+            bool found = false;
+            for (auto const& [name, core] : pair->abiTypedefs) {
+                if (name != of.name) continue;
+                ofType.core = core;   // the ABI table states a core; no vocabulary tag
+                found       = true;
+                break;
+            }
+            if (!found) return DerivedOutcome::Unrealized;
+            break;
+        }
+        case DerivedOf::Kind::ShippedTypedef: {
+            ShippedHeaderTypedefs const* const h = foreign.of(of.header);
+            if (h == nullptr) return DerivedOutcome::Unrealized;   // no pair to search for
+            switch (h->status) {
+                case ShippedHeaderTypedefsStatus::NoLanguage:
+                case ShippedHeaderTypedefsStatus::NotThisFormat:
+                    return DerivedOutcome::Unrealized;   // not a header of this pair
+                case ShippedHeaderTypedefsStatus::NotShipped:
+                    emitMalformed(reporter, row + ": no shipped descriptor for <" + of.header
+                                                + "> is found in the consuming language's "
+                                                  "system directories — name a header DSS "
+                                                  "ships");
+                    return DerivedOutcome::Refused;
+                case ShippedHeaderTypedefsStatus::Unreadable:
+                    emitMalformed(reporter, row + ": the descriptor of <" + of.header
+                                                + "> cannot be read: " + h->error);
+                    return DerivedOutcome::Refused;
+                case ShippedHeaderTypedefsStatus::Read:
+                    break;
+            }
+            if (ShippedPpTypedef const* const t = h->selected(of.name)) {
+                ofType.core           = t->core;
+                ofType.vocabularyName = t->vocabularyName;
+                break;
+            }
+            if (h->declares(of.name)) {
+                return DerivedOutcome::Unrealized;   // declared; no variant on this pair
+            }
+            emitMalformed(reporter, row + ": <" + of.header + "> declares no typedef '"
+                                        + of.name + "' on any pair");
             return DerivedOutcome::Refused;
         }
     }
-    outValue = *bits;
-    outType  = interner.primitive(rowType->core, rowType->vocabularyName);
-    return DerivedOutcome::Realized;
+
+    // (2)–(4) THE RANGE, THE ROW'S TYPE, THE VALUE — the one lattice computation
+    // (`deriveIntegerLimitOnPair`), shared with the `type-limit` predefined
+    // macros. Its refusals are reported HERE, in this row's words.
+    // ⓘ A `pointerTo`-shaped `of` cannot reach it: `of` resolves to a typedef or
+    // a vocabulary name, so a pointer's width is the predefine path's alone.
+    DerivedIntegerLimitResult const lim =
+        deriveIntegerLimitOnPair(ofType.core, ofType.vocabularyName, limit, pair);
+    switch (lim.outcome) {
+        case DerivedIntegerLimitOutcome::Unrealized:
+            return DerivedOutcome::Unrealized;
+        case DerivedIntegerLimitOutcome::Realized:
+            outValue = lim.value;
+            outType  = interner.primitive(lim.core, lim.vocabularyName);
+            return DerivedOutcome::Realized;
+        case DerivedIntegerLimitOutcome::Refused:
+            break;
+    }
+    std::string why;
+    switch (lim.refusal) {
+        case DerivedIntegerLimitRefusal::None:
+        case DerivedIntegerLimitRefusal::NotAnIntegerType:
+            why = of.describe() + " is not an integer type ("
+                + std::string{typeKindNameOrEmpty(ofType.core)} + ")";
+            break;
+        case DerivedIntegerLimitRefusal::NoIntegerPromotion:
+            why = "the consuming language declares no integer promotion ('semantics."
+                  "arithmeticConversions.integerPromotion'), which is what types a "
+                  "derived limit";
+            break;
+        case DerivedIntegerLimitRefusal::PromotedNotInteger:
+            why = "its type would be " + std::string{typeKindNameOrEmpty(lim.core)}
+                + ", not an integer scalar";
+            break;
+        case DerivedIntegerLimitRefusal::CarrierOverflow:
+            why = "the value does not fit the descriptor's 64-bit constant carrier";
+            break;
+        case DerivedIntegerLimitRefusal::NotRepresentable:
+            why = "its value does not fit its promoted type "
+                + std::string{typeKindNameOrEmpty(lim.core)};
+            break;
+    }
+    emitMalformed(reporter, row + " cannot be formed: " + why);
+    return DerivedOutcome::Refused;
 }
 
 // Every typedef NAME a descriptor declares, on any target — what lets a derived
@@ -2544,6 +2831,14 @@ if (doc.contains("constants")) {
     json const& constants = doc.at("constants");
     out.reserve(constants.size());
     std::unordered_set<std::string> const declaredTypedefs = declaredTypedefNames(doc);
+    // The header this descriptor IS — an `of` reference may not name it (its own
+    // typedefs have the bare-name notation) — and the other headers' typedefs,
+    // read on first use (P68 round 9, D-FFI-STDINT-LIMIT-MACROS).
+    std::string const ownHeader =
+        (doc.contains("header") && doc.at("header").is_string())
+            ? doc.at("header").get<std::string>()
+            : std::string{};
+    ForeignHeaderTypedefs foreign{activeTarget, activeFormat, pairFacts};
     std::size_t cidx = 0;
     for (auto const& c : constants) {
         std::string const at = std::string{"'"} + pathStr
@@ -2592,7 +2887,7 @@ if (doc.contains("constants")) {
         bool const cHasLimit = c.contains(kDerivedLimitKey);
         if (cHasOf || cHasLimit) {
             std::string const accepted =
-                detail::renderAllowedList(allNames(kDerivedLimitTable), " / ");
+                detail::renderAllowedList(allNames(kIntegerTypeLimitTable), " / ");
             if (!cHasOf) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
                                             + cname + "' has a 'limit' but no 'of' — a "
@@ -2600,13 +2895,9 @@ if (doc.contains("constants")) {
                                               "is");
                 continue;
             }
-            if (!c.at(kDerivedOfKey).is_string()
-                || c.at(kDerivedOfKey).get<std::string>().empty()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
-                                            + cname + "': 'of' must be a non-empty type "
-                                                      "name");
-                continue;
-            }
+            std::optional<DerivedOf> const of =
+                parseDerivedOf(c.at(kDerivedOfKey), ownHeader, at, cname, reporter);
+            if (!of.has_value()) continue;   // refused: reported
             if (!cHasLimit) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
                                             + cname + "' has an 'of' but no 'limit' — "
@@ -2614,9 +2905,9 @@ if (doc.contains("constants")) {
                                             + accepted + ")");
                 continue;
             }
-            std::optional<DerivedLimit> const limit =
+            std::optional<IntegerTypeLimit> const limit =
                 c.at(kDerivedLimitKey).is_string()
-                    ? kDerivedLimitTable.fromName(c.at(kDerivedLimitKey).get<std::string>())
+                    ? kIntegerTypeLimitTable.fromName(c.at(kDerivedLimitKey).get<std::string>())
                     : std::nullopt;
             if (!limit.has_value()) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at + ": constant '"
@@ -2643,8 +2934,8 @@ if (doc.contains("constants")) {
             std::int64_t dValue = 0;
             TypeId       dType;
             DerivedOutcome const outcome = realizeDerivedConstant(
-                at, cname, c.at(kDerivedOfKey).get<std::string>(), *limit, namedTypes,
-                declaredTypedefs, pairFacts, interner, reporter, dValue, dType);
+                at, cname, *of, *limit, namedTypes, declaredTypedefs, foreign, pairFacts,
+                interner, reporter, dValue, dType);
             if (outcome != DerivedOutcome::Realized) continue;   // refused: reported
             out.push_back(ShippedConstant{std::move(cname), dValue, dType, cPpVisible});
             continue;
@@ -4263,6 +4554,92 @@ readShippedLibConstants(std::filesystem::path const&    path,
             std::string{lattice.interner().vocabularyName(c.type)}});
     }
     return out;   // empty ⇒ no constants, or none preprocessor-visible
+}
+
+std::expected<std::vector<ShippedPpTypedef>, std::string>
+readShippedTypedefIdentities(std::filesystem::path const&    path,
+                             std::optional<std::string_view> activeTarget,
+                             std::optional<ObjectFormatKind> activeFormat,
+                             ShippedPairFacts const*         pairFacts) {
+    // P68 round 9. The `readShippedLibConstants` pattern exactly: the cached parse,
+    // a FUNCTION-LOCAL lattice whose TypeIds never escape (only each typedef's
+    // identity — core + vocabulary tag — crosses), and the ONE `typedefs` decode,
+    // variant-selected for the pair's data model, into a SCRATCH reporter so a
+    // typedef needing a binding only the semantic tier holds cannot take the
+    // others down (the lesson that function's own history records).
+    DiagnosticReporter readScratch;
+    json const* const docPtr = cachedDescriptorJson(path, readScratch);
+    if (!docPtr) {
+        for (auto const& d : readScratch.all()) {
+            if (!d.actual.empty()) return std::unexpected(d.actual);
+        }
+        return std::unexpected(std::string{"shipped-lib descriptor '"}
+                               + core::genericSpelling(path) + "' could not be read");
+    }
+
+    TypeLattice lattice{CompilationUnitId{1}};   // valid tag; see readShippedLibConstants
+    std::optional<DataModel> const pairModel =
+        pairFacts != nullptr ? pairFacts->dataModel : std::optional<DataModel>{};
+    std::string const activeModelName =
+        pairModel.has_value() ? std::string{dataModelName(*pairModel)} : std::string{};
+    std::deque<std::string>       typedefNameStore;
+    std::vector<NamedTypeBinding> typedefBindings;
+    std::vector<ShippedTypedef>   decoded;
+    {
+        DiagnosticReporter typedefScratch;
+        (void)decodeShippedTypedefs(*docPtr, core::genericSpelling(path),
+                                    lattice.interner(), lattice.registry(),
+                                    typedefScratch, decoded, activeTarget,
+                                    activeFormat, activeModelName, typedefNameStore,
+                                    typedefBindings, pairFacts);
+    }
+    std::vector<ShippedPpTypedef> out;
+    out.reserve(decoded.size());
+    for (ShippedTypedef const& t : decoded) {
+        out.push_back(ShippedPpTypedef{
+            t.name, lattice.interner().kind(t.type),
+            std::string{lattice.interner().vocabularyName(t.type)}});
+    }
+    return out;
+}
+
+ShippedHeaderTypedefs
+readShippedHeaderTypedefs(std::string_view                header,
+                          std::optional<std::string_view> activeTarget,
+                          std::optional<ObjectFormatKind> activeFormat,
+                          ShippedPairFacts const&         pair) {
+    // P68 round 9 (D-FFI-STDINT-LIMIT-MACROS). The search an `#include <…>` makes —
+    // the consuming language's system directories — with the name matched exactly
+    // (see the declaration), then the availability gate, then the ONE typedef read.
+    ShippedHeaderTypedefs out;
+    if (pair.language == nullptr) return out;   // NoLanguage
+    std::vector<std::filesystem::path> const dirs = resolveSystemDirs(*pair.language);
+    HeaderSearchCache cache;
+    HeaderSearchResult const desc =
+        resolveSystemDescriptor(header, dirs, kDefaultHeaderNameMatching, cache);
+    if (desc.status != HeaderSearchStatus::Found) {
+        out.status = ShippedHeaderTypedefsStatus::NotShipped;
+        return out;
+    }
+    if (activeFormat.has_value() && !shippedHeaderAvailableForFormat(desc.path, *activeFormat)) {
+        out.status = ShippedHeaderTypedefsStatus::NotThisFormat;
+        return out;
+    }
+    auto ids = readShippedTypedefIdentities(desc.path, activeTarget, activeFormat, &pair);
+    if (!ids.has_value()) {
+        out.status = ShippedHeaderTypedefsStatus::Unreadable;
+        out.error  = std::move(ids).error();
+        return out;
+    }
+    // Every NAME it declares, on any pair — what tells "declared, not selected on
+    // this pair" (not realized) from "declared nowhere" (a config defect). The same
+    // cached parse the identities came from, so it cannot fail where they did not.
+    DiagnosticReporter namesScratch;
+    out.declared = readShippedLibTypedefNames(desc.path, namesScratch)
+                       .value_or(std::vector<std::string>{});
+    out.typedefs = std::move(*ids);
+    out.status   = ShippedHeaderTypedefsStatus::Read;
+    return out;
 }
 
 std::optional<std::vector<std::string>>

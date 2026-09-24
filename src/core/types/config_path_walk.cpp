@@ -4,7 +4,9 @@
 #include "core/substrate/phase_timers.hpp"        // the `locate-config` pipeline phase
 #include "core/types/predefined_macro_json.hpp"   // kBuildVersionText — the binary's own version
 
+#include <algorithm>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -661,6 +663,46 @@ std::optional<std::string> configRootProvenanceNote() {
     // than this sentence could say.
     if (!resolved.has_value()) return std::nullopt;
     return configRootProvenanceNoteFor(*resolved, fs::path{buildSourceDir()});
+}
+
+// THE DOCUMENTS OF ONE KIND -- see the header for the measured disagreement this ends.
+std::expected<std::vector<ShippedConfigDocument>, std::string>
+shippedConfigDocuments(std::filesystem::path const& directory, std::string_view suffix) {
+    std::vector<ShippedConfigDocument> out;
+    std::error_code                    ec;
+    fs::directory_iterator             it{directory, ec};
+    if (ec) {
+        return std::unexpected(std::format(
+            "the config directory '{}' could not be listed ({}), so which "
+            "'*{}' documents it holds cannot be told",
+            directory.generic_string(), ec.message(), suffix));
+    }
+    for (fs::directory_iterator const end; it != end; it.increment(ec)) {
+        if (ec) break;
+        // A dedicated error code: `ec` carries the ITERATION's status, and a probe
+        // failure written into it would masquerade as a listing failure.
+        std::error_code typeEc;
+        if (!it->is_regular_file(typeEc) || typeEc) continue;
+        std::string const leaf = it->path().filename().generic_string();
+        // EXACT: the name ENDS with the suffix and something precedes it. A name that
+        // merely CONTAINS it (`c.lang.json.orig`) is not a document of the kind, and
+        // neither is the bare suffix.
+        if (leaf.size() <= suffix.size() || !std::string_view{leaf}.ends_with(suffix)) continue;
+        out.push_back(ShippedConfigDocument{leaf.substr(0, leaf.size() - suffix.size()),
+                                            it->path()});
+    }
+    if (ec) {
+        return std::unexpected(std::format(
+            "the listing of config directory '{}' was interrupted after {} "
+            "'*{}' document(s) ({}); a partial listing cannot prove which "
+            "documents exist, so it is refused",
+            directory.generic_string(), out.size(), suffix, ec.message()));
+    }
+    std::sort(out.begin(), out.end(),
+              [](ShippedConfigDocument const& a, ShippedConfigDocument const& b) {
+                  return a.stem < b.stem;
+              });
+    return out;
 }
 
 } // namespace dss

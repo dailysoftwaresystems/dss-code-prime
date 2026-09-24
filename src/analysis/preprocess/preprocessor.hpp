@@ -375,13 +375,25 @@ struct DSS_EXPORT MergedPredefinedMacros {
 //      plain `char` by `typeFacts->charIsUnsigned`), and DROPPED where the type
 //      is signed, is not realized, or `typeFacts` is null — (f)'s rule, with
 //      the type's signedness in place of its size.
+//  (h) P68 round 9: every `type-name` / `type-limit` / `type-suffix` entry is
+//      REALIZED with the LANGUAGE in hand (`language`, the document the
+//      `languageMacros` came from): its type's identity on the pair
+//      (`predefinedTypeIdentity` — a `shippedTypedef` from the pair's own
+//      descriptor, decoded here once per call), then its spelling
+//      (`typeNameSpellings`), its lattice limit (`ffi::deriveIntegerLimitOnPair`)
+//      spelled by the typed splice, or its promoted type's literal suffix (`c ##
+//      sfx` when function-like). DROPPED — (f)'s rule — where the pair does not
+//      realize the type or `typeFacts` / `language` is null; a type the pair
+//      DOES realize but the language cannot spell, limit or suffix is a
+//      CONFIGURATION defect and lands in `conflicts` (loud, never a guess).
 [[nodiscard]] DSS_EXPORT MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> languageMacros,
     std::span<PredefinedMacroDef const> targetMacros,
     std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat,
     std::span<PredefinedMacroExclusionGroup const> exclusiveGroups = {},
-    PredefinedTypeFacts const*          typeFacts = nullptr);
+    PredefinedTypeFacts const*          typeFacts = nullptr,
+    GrammarSchema const*                language  = nullptr);
 
 // ── c105 (D-PP-USER-DEFINE): the ONE owner of `--define NAME[=VALUE]` ─────
 //

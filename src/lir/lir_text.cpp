@@ -200,6 +200,11 @@ renderLiteralValue(LirLiteralValue const& v) {
 //   * `MemOffset`     — `+<offset>` or `-<offset>` for signed
 //   * `LiteralIndex`  — `lit#<index>`
 //   * `MemSymbolOffset` — `memsym#<index>` (a pool `symaddr` entry)
+//   * `SymbolAddress` — `symaddr#<index>` (the same pool entry, in a symbol
+//                       position). A symbolic operand naming a PART of the
+//                       address carries it as a suffix: `@5:page`,
+//                       `memsym#2:pageOffset` (`SymbolAddressPart`).
+//   * `LocationCounter` — `^.` (the address of the instruction itself)
 //   * `None`          — `_`
 // The (reserved) enum slot 3 (formerly `ImmFloat`) is unreachable; the
 // switch is `[[nodiscard]]`-exhaustive over the live variants.
@@ -210,6 +215,14 @@ renderLiteralValue(LirLiteralValue const& v) {
 // the inst-operand block ref would carry the module-wide id while the
 // successor list carries the within-function slot, breaking round-
 // trip (parser keys its `blockMap_` by within-function slot).
+// A symbolic operand's PART of the address (P68 round 9), as the `:<part>`
+// suffix the parser reads back; nothing for the whole address.
+[[nodiscard]] std::string renderPartSuffix(LirOperand const& op) {
+    auto const part = op.symbolAddressPart();
+    if (part == SymbolAddressPart::Whole) return {};
+    return std::format(":{}", symbolAddressPartName(part));
+}
+
 [[nodiscard]] std::string
 renderOperand(LirOperand const& op, TargetSchema const& schema,
               std::uint32_t fnEntryV, DiagnosticReporter& reporter) {
@@ -223,7 +236,7 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
         case LirOperandKind::BlockRef:
             return std::format("^b{}", op.blockSlot - fnEntryV);
         case LirOperandKind::SymbolRef:
-            return std::format("@{}", op.symbolV);
+            return std::format("@{}", op.symbolV) + renderPartSuffix(op);
         case LirOperandKind::MemBase:
             return std::format("*{}", op.scale);
         case LirOperandKind::MemOffset:
@@ -248,7 +261,11 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
             // class is not re-parsed, mirroring the ByValueStackAgg exhaust byte).
             return std::format("spill#{}", op.spillSlotV);
         case LirOperandKind::MemSymbolOffset:
-            return std::format("memsym#{}", op.litIndex);
+            return std::format("memsym#{}", op.litIndex) + renderPartSuffix(op);
+        case LirOperandKind::SymbolAddress:
+            return std::format("symaddr#{}", op.litIndex) + renderPartSuffix(op);
+        case LirOperandKind::LocationCounter:
+            return "^.";
     }
     // Fall-through is a substrate-corruption signal — the discriminator
     // landed on the reserved slot 3 (formerly ImmFloat) or on an out-of-
@@ -1794,6 +1811,12 @@ private:
 
     [[nodiscard]] std::uint32_t parseCaretBlockSlot() {
         if (!expect(TokKind::Caret)) return 0;
+        return parseBlockSlotName();
+    }
+
+    // The `b<int>` after a `^`, already consumed (`parseOperand` reads the
+    // caret itself to tell a block from the location counter `^.`).
+    [[nodiscard]] std::uint32_t parseBlockSlotName() {
         Tok t = lex_.take();
         // `^b<digits>` arrives as identifier whose first char is `b`.
         if (t.kind != TokKind::Ident || t.text.empty() || t.text[0] != 'b') {
@@ -2040,6 +2063,19 @@ private:
     }
 
     // Parse one operand based on its leading sigil.
+    // The optional `:<part>` suffix of a symbolic operand (P68 round 9) —
+    // `renderPartSuffix`'s inverse. Absent ⇒ the whole address; a name the
+    // vocabulary does not know is malformed text, never silently the whole.
+    [[nodiscard]] SymbolAddressPart parsePartSuffix() {
+        if (lex_.peek().kind != TokKind::Colon) return SymbolAddressPart::Whole;
+        lex_.take();
+        Tok const n = lex_.take();
+        if (auto const part = symbolAddressPartFromName(n.text)) return *part;
+        emit(DiagnosticCode::I_TextMalformed,
+             std::format("'{}' is not a part of a symbol's address", n.text));
+        return SymbolAddressPart::Whole;
+    }
+
     [[nodiscard]] LirOperand parseOperand() {
         Tok pk = lex_.peek();
         switch (pk.kind) {
@@ -2056,7 +2092,14 @@ private:
                 return LirOperand::makeImmInt32(v);
             }
             case TokKind::Caret: {
-                std::uint32_t const slot = parseCaretBlockSlot();
+                lex_.take();
+                // `^.` — the location counter (P68 round 9): the address of
+                // the instruction that carries it, which is no block.
+                if (lex_.peek().kind == TokKind::Dot) {
+                    lex_.take();
+                    return LirOperand::makeLocationCounter();
+                }
+                std::uint32_t const slot = parseBlockSlotName();
                 auto it = blockMap_.find(slot);
                 if (it == blockMap_.end()) {
                     // Forward-or-cross-function ref to a block
@@ -2080,7 +2123,7 @@ private:
                 lex_.take();
                 Tok n = lex_.take();
                 std::uint32_t const v = parseNumber<std::uint32_t>(n.text, "SymbolRef id");
-                return LirOperand::makeSymbolRef(v);
+                return LirOperand::makeSymbolRef(v, parsePartSuffix());
             }
             case TokKind::Star: {
                 lex_.take();
@@ -2117,8 +2160,17 @@ private:
                     lex_.take();
                     (void)expect(TokKind::Hash);
                     Tok n = lex_.take();
-                    return LirOperand::makeMemSymbolOffset(
-                        parseNumber<std::uint32_t>(n.text, "MemSymbolOffset"));
+                    auto const idx =
+                        parseNumber<std::uint32_t>(n.text, "MemSymbolOffset");
+                    return LirOperand::makeMemSymbolOffset(idx, parsePartSuffix());
+                }
+                if (pk.text == "symaddr") {
+                    lex_.take();
+                    (void)expect(TokKind::Hash);
+                    Tok n = lex_.take();
+                    auto const idx =
+                        parseNumber<std::uint32_t>(n.text, "SymbolAddress");
+                    return LirOperand::makeSymbolAddress(idx, parsePartSuffix());
                 }
                 return LirOperand::makeReg(parseRegOperand());
             }

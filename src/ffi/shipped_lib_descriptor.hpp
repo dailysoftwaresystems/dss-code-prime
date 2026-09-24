@@ -14,6 +14,7 @@
 
 #include <cstddef>     // std::size_t (ShippedDescriptorCacheStats)
 #include <cstdint>
+#include <expected>    // std::expected (readShippedTypedefIdentities)
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -1229,6 +1230,121 @@ readShippedLibConstants(std::filesystem::path const&    path,
                         std::optional<std::string_view> activeTarget = std::nullopt,
                         std::optional<ObjectFormatKind> activeFormat = std::nullopt,
                         ShippedPairFacts const*         pairFacts    = nullptr);
+
+// ══ THE LATTICE, ASKED OF ONE TYPE ════════════════════════════════════════════
+// (P68 round 9) A C integer type's LIMIT on a pair — its maximum, minimum or
+// width — as a value AND the type that value has: the promoted type for `max` /
+// `min` (C 5.2.5.3.2, 7.22.2p1: `USHRT_MAX` is an `int`, `ULONG_MAX` an `unsigned
+// long`), the promotion floor for `width`. The ONE computation both readers of the
+// fact run: a descriptor's lattice-derived `constants` row (`LONG_MAX`, after it
+// has resolved its `of`) and a `type-limit` predefined macro (`__LONG_MAX__`,
+// `__INT_FAST16_MAX__`). A POINTER's width (its bits under the pair's data model)
+// is the one limit of a non-integer type it answers (`__POINTER_WIDTH__`).
+//
+// REALIZED or NOT, never guessed: `Unrealized` when the answer depends on a fact
+// the pair does not supply (plain `char` with no signedness, no language, a data
+// model that decides it with none given); `Refused` when the question has no
+// answer (not an integer type, a language with no integer promotion, a value the
+// 64-bit carrier or the promoted type cannot hold) — `refusal` names which.
+enum class DerivedIntegerLimitOutcome : std::uint8_t { Realized, Unrealized, Refused };
+enum class DerivedIntegerLimitRefusal : std::uint8_t {
+    None,
+    NotAnIntegerType,    // the type has no range
+    NoIntegerPromotion,  // the language declares no `arithmeticConversions`
+    PromotedNotInteger,  // the promoted type is not an integer scalar
+    CarrierOverflow,     // the value does not fit the 64-bit carrier
+    NotRepresentable,    // the value does not fit its own (promoted) type
+};
+struct DSS_EXPORT DerivedIntegerLimitResult {
+    DerivedIntegerLimitOutcome outcome = DerivedIntegerLimitOutcome::Unrealized;
+    DerivedIntegerLimitRefusal refusal = DerivedIntegerLimitRefusal::None;
+    std::int64_t value = 0;            // bit pattern, exactly as a flat row's `value`
+    TypeKind     core  = TypeKind::Void;   // the VALUE's type: core …
+    std::string  vocabularyName;           // … and vocabulary tag (empty = anonymous)
+    // … and that type's signedness and width in bits, from the one integer-kind
+    // truth table this file owns — so a reader spelling the value (the typed
+    // splice's `ShippedPpConstant`) never keeps a second copy of it.
+    bool         isUnsigned = false;
+    unsigned     width      = 0;
+};
+[[nodiscard]] DSS_EXPORT DerivedIntegerLimitResult
+deriveIntegerLimitOnPair(TypeKind core, std::string_view vocabularyName,
+                         IntegerTypeLimit limit, ShippedPairFacts const* pair);
+
+// One typedef of a shipped descriptor, PROJECTED for the preprocessor — its name
+// and its IDENTITY on the pair (core + vocabulary tag), the interner-free view
+// `readShippedTypedefIdentities` returns (P68 round 9). A `type-name` /
+// `type-limit` / `type-suffix` predefined macro naming a `shippedTypedef` reads
+// it: GCC documents `__INT_FAST16_TYPE__` as "the correct underlying type" of
+// `int_fast16_t`, and the pair's descriptor is where DSS states that type.
+struct DSS_EXPORT ShippedPpTypedef {
+    std::string name;
+    TypeKind    core = TypeKind::Void;
+    std::string vocabularyName;
+};
+
+// Read the TYPEDEFS of the descriptor at `path` for one pair, WITHOUT an interner:
+// the `readShippedLibConstants` sibling, through the SAME `decodeShippedTypedefs`
+// the semantic tier injects them by — so the macro that names a typedef and the
+// typedef the program declares cannot select different variants. The variants are
+// selected by (`activeTarget`, `activeFormat`, the pair's data model); a typedef
+// whose type needs a cross-descriptor binding only the semantic tier holds
+// (`va_list`) is decoded into a SCRATCH reporter and simply absent here, exactly
+// as it is for a derived constant's `of`.
+// ⓘ NO REPORTER PARAMETER, deliberately: the one caller is the predefined-macro
+// merge, which reports through its own `conflicts` and holds no budget — a
+// reporter argument would force a throwaway into a budget-threaded file. An
+// unreadable document is the error, as its first diagnostic's text.
+[[nodiscard]] DSS_EXPORT std::expected<std::vector<ShippedPpTypedef>, std::string>
+readShippedTypedefIdentities(std::filesystem::path const&    path,
+                             std::optional<std::string_view> activeTarget,
+                             std::optional<ObjectFormatKind> activeFormat,
+                             ShippedPairFacts const*         pairFacts);
+
+// ══ A TYPEDEF OF A SHIPPED HEADER, NAMED BY THAT HEADER ═══════════════════════
+// (P68 round 9, D-FFI-STDINT-LIMIT-MACROS) Two kinds of config row name a typedef
+// that ANOTHER shipped header declares, by that header —
+// `{ "shippedTypedef": "size_t", "header": "stddef.h" }`: a `type-name` /
+// `type-limit` / `type-suffix` predefined macro (`__SIZE_MAX__`), and a lattice-
+// derived descriptor constant (`<stdint.h>`'s `SIZE_MAX`, whose type C 7.22.3
+// takes from `<stddef.h>`). BOTH ask this one function, so one reference can never
+// resolve to two typedefs: the header's descriptor is found in the consuming
+// language's own system directories (`resolveSystemDirs` — where `#include <…>`
+// looks), and read for the pair by `readShippedTypedefIdentities`.
+// ★ THE HEADER IS MATCHED EXACTLY AS SPELLED. A config cross-reference names
+// another descriptor's `header`; it is not a program's `#include` and takes no
+// per-format case folding — so the answer cannot depend on which format asked.
+enum class ShippedHeaderTypedefsStatus : std::uint8_t {
+    Read,           // `typedefs` / `declared` hold the header's answer on the pair
+    NoLanguage,     // no consuming language, so no directory to search: not realized
+    NotShipped,     // no descriptor for the header in the language's system directories
+    NotThisFormat,  // the descriptor exists and excludes the active object format
+    Unreadable,     // the descriptor could not be read; `error` says why
+};
+struct DSS_EXPORT ShippedHeaderTypedefs {
+    ShippedHeaderTypedefsStatus   status = ShippedHeaderTypedefsStatus::NoLanguage;
+    std::vector<ShippedPpTypedef> typedefs;   // Read: the typedefs SELECTED on this pair
+    std::vector<std::string>      declared;   // Read: every typedef NAME it declares, on any pair
+    std::string                   error;      // Unreadable: the first diagnostic's text
+
+    [[nodiscard]] ShippedPpTypedef const* selected(std::string_view name) const noexcept {
+        for (ShippedPpTypedef const& t : typedefs) {
+            if (t.name == name) return &t;
+        }
+        return nullptr;
+    }
+    [[nodiscard]] bool declares(std::string_view name) const noexcept {
+        for (std::string const& n : declared) {
+            if (n == name) return true;
+        }
+        return false;
+    }
+};
+[[nodiscard]] DSS_EXPORT ShippedHeaderTypedefs
+readShippedHeaderTypedefs(std::string_view                header,
+                          std::optional<std::string_view> activeTarget,
+                          std::optional<ObjectFormatKind> activeFormat,
+                          ShippedPairFacts const&         pair);
 
 // Read ONLY the `availableObjectFormats` set from the descriptor at `path`,
 // WITHOUT a TypeInterner — the FRONT-END per-target availability gate (the

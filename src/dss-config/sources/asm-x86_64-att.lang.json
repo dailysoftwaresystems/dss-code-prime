@@ -245,7 +245,8 @@
       "indirect":  "attIndirect",
       "scalar":    "attScalar",
       "negNumber": "attNegNumber",
-      "addend":    "attAddend"
+      "addend":    "attAddend",
+      "symbolPart": null
     },
 
     "entryLabels": ["main"],

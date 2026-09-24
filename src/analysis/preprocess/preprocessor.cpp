@@ -5,6 +5,7 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "analysis/preprocess/pp_if_eval.hpp"
+#include "core/types/config_path_walk.hpp"   // resolveSystemDirs — a `shippedTypedef` predefine's descriptor search (P68 round 9)
 #include "core/types/header_case_diagnostic.hpp"   // reportHeaderCaseAmbiguity (the ONE fold-collision emit)
 #include "core/types/include_path_resolve.hpp"
 #include "core/types/integer_literal_ladder.hpp"  // preprocessorLiteralSignedness (the ONE phase-4 signedness rule the shipped-constant spelling is verified against)
@@ -469,6 +470,333 @@ PreprocessResult::makeDiagnosticRemap() const {
 }
 
 namespace {
+
+// ══ THE TYPED SPLICE — AN INTEGER CONSTANT AS A LITERAL OF ITS OWN TYPE ═══════
+// (D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR; P68 round 9 made it
+// require the literal's PHASE-7 type as well as its phase-4 signedness — the long
+// note at its first caller, the SynthBuilder's constants splice, says why.)
+// LIFTED out of that splice, where it was a lambda, when the `type-limit`
+// predefined macros needed the same spelling for the same kind of value
+// (P68 round 9): `__LONG_MAX__` and `<limits.h>`'s `LONG_MAX` are one fact,
+// spelled by one rule, and a second copy of the rule is the drift it would be.
+enum class SpellOutcome { Spelled, Unrealized, Unspellable };
+struct IntegerConstantSpelling {
+    SpellOutcome outcome = SpellOutcome::Unspellable;
+    std::string  text;
+};
+
+// The data models a spelling is verified under: the pair's own, or — with no pair
+// — every model in the closed table, whose answers must then all agree.
+[[nodiscard]] std::vector<DataModel> spellingModels(std::optional<DataModel> dm) {
+    std::vector<DataModel> out;
+    if (dm.has_value()) {
+        out.push_back(*dm);
+        return out;
+    }
+    for (auto const& [m, mName] : kDataModelTable.rows) {
+        (void)mName;
+        out.push_back(m);
+    }
+    return out;
+}
+
+// The first suffix spelling of the language's `integerLiteralTyping` ladder, in
+// CONFIG ORDER — so the least-decorated spelling that works wins — whose literal
+// of `magnitude` has PHASE-4 signedness `!isUnsigned` (`preprocessorLiteralSignedness`,
+// the one rule the `#if` evaluator reads) AND PHASE-7 type exactly (`core`,
+// `vocabularyName`) under every model in `models` (`typeIntegerLiteral`, the
+// ladder both typing tiers run). There is no "unsigned means `u`" map anywhere:
+// the candidates are the config's own `suffixes`, verified. nullopt ⇒ no literal
+// of this language has that type.
+[[nodiscard]] std::optional<std::string>
+verifiedLiteralSuffix(GrammarSchema const& schema, std::uint64_t magnitude,
+                      bool isUnsigned, TypeKind core, std::string_view vocabularyName,
+                      std::span<DataModel const> models) {
+    auto const& rules = schema.semantics().integerLiteralTyping;
+    NumberStyle const* const ns = schema.numberStyle();
+    for (auto const& r : rules) {
+        // The unsuffixed rule is spelled by the EMPTY string; every other rule
+        // contributes each of its own spellings.
+        std::vector<std::string> spellings;
+        if (r.suffixes.empty()) spellings.emplace_back();
+        else for (auto const& s : r.suffixes) spellings.push_back(s);
+        for (auto const& s : spellings) {
+            std::string const text = std::to_string(magnitude) + s;
+            auto const sgn = preprocessorLiteralSignedness(text, ns, rules, magnitude);
+            if (!sgn.has_value() || *sgn == isUnsigned) continue;   // true = signed
+            bool typed = true;
+            for (DataModel const m : models) {
+                IntegerLadderResult const t =
+                    typeIntegerLiteral(text, ns, rules, m, magnitude);
+                if (t.status != IntegerLadderStatus::Typed || t.kind != core
+                    || t.vocabularyName != vocabularyName) {
+                    typed = false;
+                    break;
+                }
+            }
+            if (typed) return s;
+        }
+    }
+    return std::nullopt;
+}
+
+// One integer constant — a shipped descriptor's, or a `type-limit` predefine's —
+// as the literal whose phase-4 signedness AND phase-7 type are its own, under the
+// pair's data model `dm` (every model when none). TWO FORMS, the second for one
+// reason: `<digits><suffix>`, and `(-<digits-1><sfx> - 1)` for the MOST NEGATIVE
+// value of the declared width (`-2147483648` is unary minus on a literal no `int`
+// holds, so the naive spelling types `INT_MIN` as `long`; both references'
+// headers compensate the same way, gcc `(-0x7fffffff - 1)`); a negative value is
+// parenthesized so `a-EOF` cannot re-parse. Nothing verified: `Unspellable` when
+// the pair was known (a config defect — no literal of this language HAS the
+// type), `Unrealized` when it was not (the model decides it; there is none).
+[[nodiscard]] IntegerConstantSpelling
+spellIntegerConstant(GrammarSchema const& schema, ffi::ShippedPpConstant const& k,
+                     std::optional<DataModel> dm) {
+    if (schema.semantics().integerLiteralTyping.empty()) return {};
+    std::vector<DataModel> const models = spellingModels(dm);
+    auto const suffixFor = [&](std::uint64_t magnitude) {
+        return verifiedLiteralSuffix(schema, magnitude, k.isUnsigned, k.core,
+                                     k.vocabularyName, models);
+    };
+    auto const missing = [&]() -> IntegerConstantSpelling {
+        return IntegerConstantSpelling{
+            dm.has_value() ? SpellOutcome::Unspellable : SpellOutcome::Unrealized, {}};
+    };
+
+    if (k.isUnsigned) {
+        std::uint64_t const mag =
+            (k.width >= 64)
+                ? static_cast<std::uint64_t>(k.value)
+                : (static_cast<std::uint64_t>(k.value)
+                   & ((std::uint64_t{1} << k.width) - 1));
+        auto const sfx = suffixFor(mag);
+        if (!sfx.has_value()) return missing();
+        return {SpellOutcome::Spelled, std::to_string(mag) + *sfx};
+    }
+
+    std::int64_t const v = k.value;   // already sign-correct in the carrier
+    if (v >= 0) {
+        auto const sfx = suffixFor(static_cast<std::uint64_t>(v));
+        if (!sfx.has_value()) return missing();
+        return {SpellOutcome::Spelled, std::to_string(v) + *sfx};
+    }
+    // Negative. `-v` as a MAGNITUDE, computed in uint64 so the most negative value
+    // does not overflow on its way to being spelled. The verified literal is the
+    // MAGNITUDE's; unary minus keeps its type, and the compensating `- 1` (an
+    // `int`) converts to it — every type this form is reached for ranks at or
+    // above `int`.
+    std::uint64_t const mag = ~static_cast<std::uint64_t>(v) + 1u;   // two's-complement negate
+    bool const mostNegative =
+        (k.width <= 64) && (mag == (std::uint64_t{1} << (k.width - 1)));
+    std::uint64_t const spelled = mostNegative ? (mag - 1u) : mag;
+    auto const sfx = suffixFor(spelled);
+    if (!sfx.has_value()) return missing();
+    std::string body = "-" + std::to_string(spelled) + *sfx;
+    if (mostNegative) body += " - 1";
+    return {SpellOutcome::Spelled, "(" + body + ")"};
+}
+
+// ══ THE TYPE-DERIVED PREDEFINED MACROS — (LANGUAGE × PAIR) REALIZATION ═════════
+// (P68 round 9) `type-name`, `type-limit` and `type-suffix` rows are realized by
+// `mergePredefinedMacros` from the pair's facts AND the language: what follows is
+// the whole of that, so the merge arm stays one call.
+
+// The SHIPPED typedefs the rows' `shippedTypedef` types name, decoded for the pair
+// ONCE per merge, each distinct header by `ffi::readShippedHeaderTypedefs` — the
+// ONE reader of "a typedef of <h>", which `<stdint.h>`'s `SIZE_MAX` asks too
+// (D-FFI-STDINT-LIMIT-MACROS), so `__SIZE_MAX__` and `SIZE_MAX` cannot resolve one
+// reference to two typedefs. It searches the LANGUAGE's own system directories
+// (where `#include <stdint.h>` looks) and reads through the ONE typedef decode the
+// semantic tier injects the same typedefs by. A header with NO descriptor, or one
+// that declares the named typedef on NO pair, is a configuration defect (a row
+// names what DSS does not ship — a typo must not pass for an absence) and lands in
+// `conflicts`; a descriptor the active format does not have, or a typedef no
+// variant selects on this pair, is not this pair's, so the rows naming it drop.
+[[nodiscard]] std::vector<PredefinedShippedTypedef>
+shippedTypedefsForPredefines(std::span<PredefinedMacroDef const> rows,
+                             GrammarSchema const&               language,
+                             PredefinedTypeFacts const&         facts,
+                             std::optional<ObjectFormatKind>    activeFormat,
+                             std::vector<std::string>&          conflicts) {
+    std::vector<std::string> headers;   // distinct, in row order
+    for (PredefinedMacroDef const& pm : rows) {
+        if (pm.sizedType.source != PredefinedTypeSource::ShippedTypedef) continue;
+        if (std::ranges::find(headers, pm.sizedType.header) == headers.end()) {
+            headers.push_back(pm.sizedType.header);
+        }
+    }
+    std::vector<PredefinedShippedTypedef> out;
+    if (headers.empty()) return out;
+    ffi::ShippedPairFacts const pair{&language, facts.dataModel, facts.charIsUnsigned,
+                                     facts.abiTypedefs};
+    std::optional<std::string_view> const target =
+        facts.targetName.empty() ? std::nullopt
+                                 : std::optional<std::string_view>{facts.targetName};
+    for (std::string const& h : headers) {
+        ffi::ShippedHeaderTypedefs const read =
+            ffi::readShippedHeaderTypedefs(h, target, activeFormat, pair);
+        switch (read.status) {
+            case ffi::ShippedHeaderTypedefsStatus::NoLanguage:
+            case ffi::ShippedHeaderTypedefsStatus::NotThisFormat:
+                continue;   // not a header of this pair: its typedefs are not this pair's
+            case ffi::ShippedHeaderTypedefsStatus::NotShipped:
+                conflicts.push_back(std::format(
+                    "a predefined macro names a 'shippedTypedef' of <{}>, but no shipped "
+                    "descriptor for <{}> is found in the language's system directories — "
+                    "such a row must name a header DSS ships",
+                    h, h));
+                continue;
+            case ffi::ShippedHeaderTypedefsStatus::Unreadable:
+                conflicts.push_back(std::format(
+                    "a predefined macro names a 'shippedTypedef' of <{}>, whose shipped "
+                    "descriptor cannot be read: {}",
+                    h, read.error));
+                continue;
+            case ffi::ShippedHeaderTypedefsStatus::Read:
+                break;
+        }
+        for (PredefinedMacroDef const& pm : rows) {
+            if (pm.sizedType.source != PredefinedTypeSource::ShippedTypedef
+                || pm.sizedType.header != h || read.declares(pm.sizedType.spelled)) {
+                continue;
+            }
+            conflicts.push_back(std::format(
+                "predefined macro '{}' names 'shippedTypedef' '{}' of <{}>, which <{}> "
+                "declares on no pair — name a typedef the header ships",
+                pm.name, pm.sizedType.spelled, h, h));
+        }
+        for (ffi::ShippedPpTypedef const& t : read.typedefs) {
+            out.push_back(PredefinedShippedTypedef{
+                h, t.name, PredefinedTypeIdentity{t.core, t.vocabularyName}});
+        }
+    }
+    return out;
+}
+
+// A type identity as a sentence names it: its core, and its vocabulary tag if any.
+[[nodiscard]] std::string describeTypeIdentity(TypeKind core, std::string_view tag) {
+    std::string s{typeKindNameOrEmpty(core)};
+    if (!tag.empty()) s += " \"" + std::string{tag} + "\"";
+    return s;
+}
+
+// What the lattice's refusal means, in a sentence fragment.
+[[nodiscard]] std::string_view
+derivedLimitRefusalText(ffi::DerivedIntegerLimitRefusal r) noexcept {
+    switch (r) {
+        case ffi::DerivedIntegerLimitRefusal::None:
+        case ffi::DerivedIntegerLimitRefusal::NotAnIntegerType:
+            return "it is not an integer type";
+        case ffi::DerivedIntegerLimitRefusal::NoIntegerPromotion:
+            return "the language declares no integer promotion "
+                   "('semantics.arithmeticConversions.integerPromotion')";
+        case ffi::DerivedIntegerLimitRefusal::PromotedNotInteger:
+            return "its promoted type is not an integer scalar";
+        case ffi::DerivedIntegerLimitRefusal::CarrierOverflow:
+            return "the value does not fit the 64-bit constant carrier";
+        case ffi::DerivedIntegerLimitRefusal::NotRepresentable:
+            return "the value does not fit its own promoted type";
+    }
+    return "it has no value";   // unreachable: every enumerator has an arm above
+}
+
+struct TypeDerivedRealization {
+    enum class Outcome : std::uint8_t { Realized, Dropped, Refused };
+    Outcome     outcome = Outcome::Dropped;
+    std::string text;   // Realized: the macro's value. Refused: the conflict sentence.
+};
+
+// ONE type-derived row on the pair. `Dropped` where the pair does not realize the
+// type — the documented outcome, as gcc leaves a macro undefined for a type a
+// target lacks; `Refused` where it DOES and the language still cannot answer (no
+// listed spelling, no literal of the type, no promotion) — a configuration defect.
+[[nodiscard]] TypeDerivedRealization
+realizeTypeDerivedPredefine(PredefinedMacroDef const&                 pm,
+                            PredefinedTypeFacts const&                 facts,
+                            GrammarSchema const&                       language,
+                            std::span<PredefinedShippedTypedef const>  shipped) {
+    using Outcome = TypeDerivedRealization::Outcome;
+    std::optional<PredefinedTypeIdentity> const id =
+        predefinedTypeIdentity(pm.sizedType, facts, shipped);
+    if (!id.has_value()) return {};   // the pair does not realize the type
+    std::string_view const dmName = dataModelName(facts.dataModel);
+    auto const refused = [&](std::string const& why) {
+        return TypeDerivedRealization{
+            Outcome::Refused,
+            std::format("predefined macro '{}' ({} of '{}'): its type on this pair "
+                        "is {} under data model {}, and {}",
+                        pm.name, predefinedMacroKindName(pm.kind),
+                        pm.sizedType.spelled,
+                        describeTypeIdentity(id->core, id->vocabularyName), dmName,
+                        why)};
+    };
+    switch (pm.kind) {
+        case PredefinedMacroKind::TypeName: {
+            auto const sp = spellPredefinedType(language.preprocess().typeNameSpellings,
+                                                *id, facts.dataModel);
+            if (!sp.has_value()) {
+                return refused("'preprocess.typeNameSpellings' lists no name for that "
+                               "type — add its canonical spelling");
+            }
+            return {Outcome::Realized, std::string{*sp}};
+        }
+        case PredefinedMacroKind::TypeLimit:
+        case PredefinedMacroKind::TypeSuffix: {
+            // A `type-suffix` row's type is the PROMOTED type — the type the lattice
+            // gives the maximum (C 7.22.2p1: each limit macro has the promoted type;
+            // 7.22.4.1: `INTN_C(v)` expands to a constant of `int_leastN_t`'s
+            // promoted type) — so both kinds ask the one computation.
+            ffi::ShippedPairFacts const pair{&language, facts.dataModel,
+                                             facts.charIsUnsigned, facts.abiTypedefs};
+            IntegerTypeLimit const limit = (pm.kind == PredefinedMacroKind::TypeLimit)
+                                               ? pm.typeLimit
+                                               : IntegerTypeLimit::Max;
+            ffi::DerivedIntegerLimitResult const lim = ffi::deriveIntegerLimitOnPair(
+                id->core, id->vocabularyName, limit, &pair);
+            if (lim.outcome == ffi::DerivedIntegerLimitOutcome::Unrealized) return {};
+            if (lim.outcome == ffi::DerivedIntegerLimitOutcome::Refused) {
+                return refused(std::format("its {} has no value here: {}",
+                                           kIntegerTypeLimitTable.name(limit),
+                                           derivedLimitRefusalText(lim.refusal)));
+            }
+            std::string const valueType =
+                describeTypeIdentity(lim.core, lim.vocabularyName);
+            if (pm.kind == PredefinedMacroKind::TypeLimit) {
+                // The lattice refuses a non-integer value type, so a realized
+                // result always carries its type's signedness and width.
+                ffi::ShippedPpConstant const k{pm.name, lim.value, lim.isUnsigned,
+                                               lim.width, lim.core, lim.vocabularyName};
+                IntegerConstantSpelling const sp =
+                    spellIntegerConstant(language, k, facts.dataModel);
+                if (sp.outcome == SpellOutcome::Spelled) {
+                    return {Outcome::Realized, sp.text};
+                }
+                if (sp.outcome == SpellOutcome::Unrealized) return {};
+                return refused(std::format("its {} has type {}, which no literal of "
+                                           "this language's 'integerLiteralTyping' "
+                                           "ladder has",
+                                           kIntegerTypeLimitTable.name(limit),
+                                           valueType));
+            }
+            std::vector<DataModel> const models{facts.dataModel};
+            auto const sfx = verifiedLiteralSuffix(
+                language, 1, lim.isUnsigned, lim.core, lim.vocabularyName, models);
+            if (!sfx.has_value()) {
+                return refused(std::format("its promoted type {} is the type of no "
+                                           "suffix of this language's "
+                                           "'integerLiteralTyping' ladder",
+                                           valueType));
+            }
+            if (!pm.isFunctionLike) return {Outcome::Realized, *sfx};
+            // `name(c)` → `c ## sfx` (C 7.22.4.1's `INTN_C`); with no suffix, `c`.
+            std::string const& param = pm.params.front();
+            return {Outcome::Realized, sfx->empty() ? param : param + " ## " + *sfx};
+        }
+        default:
+            return {};   // not a type-derived kind: nothing to realize here
+    }
+}
 
 // FC14 / c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING): the condition stack frame
 // (C 6.10.1). LIFTED to the anonymous namespace (was nested in `MacroExpander`)
@@ -1635,100 +1963,13 @@ struct SynthBuilder {
         // the model decides is not spliced at all (`Unrealized`, silent — the
         // semantic tier, which has the pair, owns any loud answer); one it cannot
         // decide (`int`) still is.
-        enum class SpellOutcome { Spelled, Unrealized, Unspellable };
-        struct Spelling {
-            SpellOutcome outcome = SpellOutcome::Unspellable;
-            std::string  text;
-        };
-        std::vector<DataModel> spellModels;
-        if (pairFacts.dataModel.has_value()) {
-            spellModels.push_back(*pairFacts.dataModel);
-        } else {
-            for (auto const& [m, mName] : kDataModelTable.rows) {
-                (void)mName;
-                spellModels.push_back(m);
-            }
-        }
-        auto const spellConstant =
-            [this, &spellModels](ffi::ShippedPpConstant const& k) -> Spelling {
-            auto const rules = schema->semantics().integerLiteralTyping;
-            if (rules.empty()) return {};
-            NumberStyle const* const ns = schema->numberStyle();
-
-            // The first suffix spelling whose PHASE-4 signedness AND PHASE-7 type
-            // both match, for a literal of this magnitude. Iterates the rules in
-            // CONFIG ORDER, so the least-decorated spelling that works wins.
-            auto const suffixFor =
-                [&](std::uint64_t magnitude) -> std::optional<std::string> {
-                for (auto const& r : rules) {
-                    // The unsuffixed rule is spelled by the EMPTY string; every
-                    // other rule contributes each of its own spellings.
-                    std::vector<std::string> spellings;
-                    if (r.suffixes.empty()) spellings.emplace_back();
-                    else for (auto const& s : r.suffixes) spellings.push_back(s);
-                    for (auto const& s : spellings) {
-                        std::string const text = std::to_string(magnitude) + s;
-                        auto const sgn = preprocessorLiteralSignedness(
-                            text, ns, rules, magnitude);
-                        if (!sgn.has_value() || *sgn == k.isUnsigned) continue;
-                        bool typed = true;
-                        for (DataModel const m : spellModels) {
-                            IntegerLadderResult const t =
-                                typeIntegerLiteral(text, ns, rules, m, magnitude);
-                            if (t.status != IntegerLadderStatus::Typed
-                                || t.kind != k.core
-                                || t.vocabularyName != k.vocabularyName) {
-                                typed = false;
-                                break;
-                            }
-                        }
-                        if (typed) return s;
-                    }
-                }
-                return std::nullopt;
-            };
-            // Nothing verified: loud when the pair was known (a config defect —
-            // no literal of this language HAS the declared type), silent when
-            // it was not (the model decides it; there is no model).
-            auto const missing = [&]() -> Spelling {
-                return Spelling{pairFacts.dataModel.has_value()
-                                    ? SpellOutcome::Unspellable
-                                    : SpellOutcome::Unrealized,
-                                {}};
-            };
-
-            if (k.isUnsigned) {
-                std::uint64_t const mag =
-                    (k.width >= 64)
-                        ? static_cast<std::uint64_t>(k.value)
-                        : (static_cast<std::uint64_t>(k.value)
-                           & ((std::uint64_t{1} << k.width) - 1));
-                auto const sfx = suffixFor(mag);
-                if (!sfx.has_value()) return missing();
-                return {SpellOutcome::Spelled, std::to_string(mag) + *sfx};
-            }
-
-            std::int64_t const v = k.value;   // already sign-correct in the carrier
-            if (v >= 0) {
-                auto const sfx = suffixFor(static_cast<std::uint64_t>(v));
-                if (!sfx.has_value()) return missing();
-                return {SpellOutcome::Spelled, std::to_string(v) + *sfx};
-            }
-            // Negative. `-v` as a MAGNITUDE, computed in uint64 so the most
-            // negative value does not overflow on its way to being spelled.
-            // The verified literal is the MAGNITUDE's; unary minus keeps its type,
-            // and the compensating `- 1` (an `int`) converts to it — every type
-            // this form is reached for ranks at or above `int`.
-            std::uint64_t const mag =
-                ~static_cast<std::uint64_t>(v) + 1u;   // two's-complement negate
-            bool const mostNegative =
-                (k.width <= 64) && (mag == (std::uint64_t{1} << (k.width - 1)));
-            std::uint64_t const spelled = mostNegative ? (mag - 1u) : mag;
-            auto const sfx = suffixFor(spelled);
-            if (!sfx.has_value()) return missing();
-            std::string body = "-" + std::to_string(spelled) + *sfx;
-            if (mostNegative) body += " - 1";
-            return {SpellOutcome::Spelled, "(" + body + ")"};
+        // The typed splice is `spellIntegerConstant` (file scope, above): lifted out
+        // of this chokepoint in P68 round 9 so the `type-limit` predefined macros
+        // spell by the SAME rule. The pair's data model is `pairFacts.dataModel`
+        // (none ⇒ every model must agree — see there).
+        using Spelling = IntegerConstantSpelling;
+        auto const spellConstant = [&](ffi::ShippedPpConstant const& k) -> Spelling {
+            return spellIntegerConstant(*schema, k, pairFacts.dataModel);
         };
 
         auto const spliceMacro = [&out](ffi::ShippedMacro const& macro) {
@@ -8426,6 +8667,22 @@ private:
                         "mergePredefinedMacros may produce the effective list");
             }
             return materializeSignificant(def.value);
+        case PredefinedMacroKind::TypeName:
+        case PredefinedMacroKind::TypeLimit:
+            // P68 round 9: a spelling or a spelled limit, written by
+            // `mergePredefinedMacros` — never empty when realized, so an empty
+            // one bypassed the merge: the same fatal as above.
+            if (def.value.empty()) {
+                ppFatal("materializePredefined: a 'type-name' or 'type-limit' "
+                        "predefined macro reached expansion unrealized — only "
+                        "mergePredefinedMacros may produce the effective list");
+            }
+            return materializeSignificant(def.value);
+        case PredefinedMacroKind::TypeSuffix:
+            // P68 round 9: an integer-literal suffix, which is legitimately EMPTY
+            // where the promoted type is `int` (`__INT8_C_SUFFIX__`), so emptiness
+            // proves nothing here; the merge is still the only producer.
+            return materializeSignificant(def.value);
         case PredefinedMacroKind::Date:
             return materializeSignificant(quoteCString(dateString_));
         case PredefinedMacroKind::Time:
@@ -9484,7 +9741,8 @@ MergedPredefinedMacros mergePredefinedMacros(
     std::span<PredefinedMacroDef const> formatMacros,
     std::optional<ObjectFormatKind>     activeFormat,
     std::span<PredefinedMacroExclusionGroup const> exclusiveGroups,
-    PredefinedTypeFacts const*          typeFacts) {
+    PredefinedTypeFacts const*          typeFacts,
+    GrammarSchema const*                language) {
     MergedPredefinedMacros out;
 
     // The per-format availability predicate, in its ONE surviving location.
@@ -9542,6 +9800,16 @@ MergedPredefinedMacros mergePredefinedMacros(
     // partially-merged state a caller could mistake for usable.
     if (!out.conflicts.empty()) return out;
 
+    // (h) P68 round 9: the shipped typedefs the language's type-derived rows name,
+    // decoded ONCE for this (language × pair) — only the LANGUAGE family may
+    // declare a type-naming row (the entry parser refuses one elsewhere), so the
+    // language's rows are the whole question.
+    std::vector<PredefinedShippedTypedef> shippedTypedefs;
+    if (typeFacts != nullptr && language != nullptr) {
+        shippedTypedefs = shippedTypedefsForPredefines(languageMacros, *language, *typeFacts,
+                                                       activeFormat, out.conflicts);
+    }
+
     // (b)+(c) FILTER ONCE, stable order: language, then target, then format.
     out.effective.reserve(languageMacros.size() + targetMacros.size()
                           + formatMacros.size());
@@ -9576,6 +9844,27 @@ MergedPredefinedMacros mergePredefinedMacros(
                 if (!isUnsigned.value_or(false)) continue;
                 PredefinedMacroDef realized = pm;
                 realized.value = "1";
+                out.effective.push_back(std::move(realized));
+                continue;
+            }
+            // (h) P68 round 9: a `type-name` / `type-limit` / `type-suffix` row is
+            // REALIZED here with the LANGUAGE in hand (`realizeTypeDerivedPredefine`
+            // — the whole computation), DROPPED where the pair does not realize its
+            // type or no pair / language was given (the LSP, the direct-API and
+            // test callers — (f)'s rule), and REFUSED into `conflicts` where the
+            // pair realizes a type the language cannot answer for: a configuration
+            // defect the caller must abort on, never a guessed value.
+            if (predefinedMacroKindNeedsLanguage(pm.kind)) {
+                if (typeFacts == nullptr || language == nullptr) continue;
+                TypeDerivedRealization r =
+                    realizeTypeDerivedPredefine(pm, *typeFacts, *language, shippedTypedefs);
+                if (r.outcome == TypeDerivedRealization::Outcome::Dropped) continue;
+                if (r.outcome == TypeDerivedRealization::Outcome::Refused) {
+                    out.conflicts.push_back(std::move(r.text));
+                    continue;
+                }
+                PredefinedMacroDef realized = pm;
+                realized.value = std::move(r.text);
                 out.effective.push_back(std::move(realized));
                 continue;
             }
@@ -9778,7 +10067,9 @@ PreprocessResult preprocessRun(
         formatPredefinedMacros, activeFormat,
         schema->preprocess().mutuallyExclusivePredefinedMacros,
         // P68 round 8: the pair's facts, so the `type-size` rows realize here.
-        typeFacts);
+        typeFacts,
+        // P68 round 9: and the language, for the type-derived rows (h).
+        schema.get());
     if (!merged.conflicts.empty()) {
         // EITHER a name owned by more than one config, OR
         // (D-LANG-PE64-DEFINES-BOTH-MSC-VER-AND-GNUC)

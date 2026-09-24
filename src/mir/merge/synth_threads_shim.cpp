@@ -874,8 +874,10 @@ bool synthesizeThreadsShim(
                 // A recipe id present in the descriptor vocabulary but with NO win32 arm — a
                 // vocab/switch drift. Fail loud (never a silently-undefined shim). The loader
                 // closed-vocab guard makes this unreachable in practice; this is the backstop.
+                // Anchored: D-CSUBSET-C11-THREADS-HEADER.
                 emitErr(reporter, "synthesizeThreadsShim: no win32 synth arm for recipe id '"
-                                      + recipe + "' (D-CSUBSET-C11-THREADS-HEADER vocab/switch drift)");
+                                      + recipe + "' — the recipe vocabulary and this switch have "
+                                        "drifted apart: add the arm, or remove the id from the vocabulary");
                 return false;
             }
         } else {  // LibrarySynthVehicle::Pthread
@@ -1246,8 +1248,10 @@ bool synthesizeThreadsShim(
                 // A recipe id present in the descriptor vocabulary but with NO pthread arm — a
                 // vocab/switch drift. Fail loud (never a silently-undefined shim). The loader
                 // closed-vocab guard makes this unreachable in practice; this is the backstop.
+                // Anchored: D-CSUBSET-C11-THREADS-MACHO.
                 emitErr(reporter, "synthesizeThreadsShim: no pthread synth arm for recipe id '"
-                                      + recipe + "' (D-CSUBSET-C11-THREADS-MACHO vocab/switch drift)");
+                                      + recipe + "' — the recipe vocabulary and this switch have "
+                                        "drifted apart: add the arm, or remove the id from the vocabulary");
                 return false;
             }
         }

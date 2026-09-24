@@ -271,6 +271,10 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - `--self-test` covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
     decimal vs hex), the commented-out-enumerator false positive, the comment-strip property, and the
     collapse guards. Run it if you touch the script.
+  - ★ **Before you ALLOCATE, run it with `--cross-branch`:** the plain form's "next free" is only this
+    tree's answer, while `--cross-branch` also reads every other worktree's working header and every ref
+    not merged into HEAD, fails on an ordinal two of them allocated differently, and prints the next free
+    slot per band over all of them — the number an allocator actually needs.
 
 **Any red the cycle cannot self-repair → STOP and report the blocker. Do not push broken.**
 Better to wake the user to "stopped at step N, here is the blocker" than to push something

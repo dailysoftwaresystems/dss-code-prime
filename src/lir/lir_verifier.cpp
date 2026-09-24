@@ -68,6 +68,8 @@ void report(LirVerdict& verdict, std::string actual,
         case LirOperandKind::ByValueStackAgg: return "ByValueStackAgg";
         case LirOperandKind::SpillSlotRef:    return "SpillSlotRef";
         case LirOperandKind::MemSymbolOffset: return "MemSymbolOffset";
+        case LirOperandKind::SymbolAddress:   return "SymbolAddress";
+        case LirOperandKind::LocationCounter: return "LocationCounter";
     }
     return "<unknown>";
 }
@@ -162,7 +164,10 @@ classifyMemAddressForm(std::span<LirOperand const> ops) {
     bool hasSymbol = false;
     bool hasBaseOrOffset = false;
     for (auto const& o : ops) {
-        if (o.kind == LirOperandKind::SymbolRef) hasSymbol = true;
+        if (o.kind == LirOperandKind::SymbolRef
+            || o.kind == LirOperandKind::SymbolAddress) {
+            hasSymbol = true;
+        }
         if (o.kind == LirOperandKind::MemBase || isMemDisplacement(o.kind)) {
             hasBaseOrOffset = true;
         }
@@ -536,7 +541,8 @@ void checkSideStructureIntegrity(Lir const& lir, LirVerdict& verdict) {
                 }
                 for (auto const& o : lir.instOperands(inst)) {
                     if (o.kind != LirOperandKind::LiteralIndex
-                        && o.kind != LirOperandKind::MemSymbolOffset) {
+                        && o.kind != LirOperandKind::MemSymbolOffset
+                        && o.kind != LirOperandKind::SymbolAddress) {
                         continue;
                     }
                     if (o.litIndex >= lir.literalPool().size()) {
@@ -556,12 +562,13 @@ void checkSideStructureIntegrity(Lir const& lir, LirVerdict& verdict) {
                     bool const isSymbolAddress = std::holds_alternative<
                         LirSymbolAddress>(lir.literalValue(o.litIndex).value);
                     if (isSymbolAddress
-                        != (o.kind == LirOperandKind::MemSymbolOffset)) {
+                        != (o.kind == LirOperandKind::MemSymbolOffset
+                            || o.kind == LirOperandKind::SymbolAddress)) {
                         report(verdict, std::format(
                             "LirVerifier: inst {} operand {} names literal pool "
                             "entry lit#{}, which {} a symbol address — a "
-                            "MemSymbolOffset must name one and a LiteralIndex "
-                            "must not",
+                            "MemSymbolOffset or SymbolAddress must name one and "
+                            "a LiteralIndex must not",
                             inst.v, lirOperandKindName(o.kind), o.litIndex,
                             isSymbolAddress ? "is" : "is not"),
                             DiagnosticCode::L_MemOperandMalformed);
@@ -702,7 +709,8 @@ struct SideStructureCensus {
                 LirInstId const inst = lir.blockInstAt(bb, i);
                 for (auto const& o : lir.instOperands(inst)) {
                     if (o.kind == LirOperandKind::LiteralIndex
-                        || o.kind == LirOperandKind::MemSymbolOffset) {
+                        || o.kind == LirOperandKind::MemSymbolOffset
+                        || o.kind == LirOperandKind::SymbolAddress) {
                         ++c.literalRefs;
                     }
                 }

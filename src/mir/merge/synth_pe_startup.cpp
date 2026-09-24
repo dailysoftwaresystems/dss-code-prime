@@ -196,14 +196,15 @@ bool realizeEntryShape(Mir&                              mir,
         // "no mechanism" is spelled, so a `None` reaching here is a hand-built
         // schema. Refuse rather than silently skip the setup a matched verb asked
         // for — a skipped setup calls the entry on uninitialized registers.
+        // Anchored: D-RUNTIME-MAIN-ARGC-ARGV.
         emitErr(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                 std::format(
                     "realizeEntryShape: format '{}' declares a `processArgs` "
                     "block whose mechanism is the invalid `none` sentinel while "
                     "the resolved program entry needs the '{}' materialization "
                     "verb — argument setup would be silently skipped, calling "
-                    "the entry on UNINITIALIZED registers. "
-                    "(D-RUNTIME-MAIN-ARGC-ARGV.)",
+                    "the entry on UNINITIALIZED registers. Declare the format's "
+                    "argument mechanism.",
                     formatName, entryMaterializationName(verb)));
         return false;
     }
@@ -251,6 +252,7 @@ bool realizeEntryShape(Mir&                              mir,
     // WITNESS and is NOT implemented (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE).
     auto const params = interner.fnParams(entrySig);
     if (params.size() < 2) {
+        // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
         emitErr(reporter, DiagnosticCode::K_EntryVerbUnmaterializable,
                 std::format(
                     "realizeEntryShape: the resolved program entry needs the "
@@ -262,8 +264,8 @@ bool realizeEntryShape(Mir&                              mir,
                     "impossible — the semantic tier matched the definition "
                     "against the very language row this verb came from — so this "
                     "signature did not pass through it (a hand-built module, or "
-                    "an entry from a pre-built object). "
-                    "(D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.)",
+                    "an entry from a pre-built object): give the entry the "
+                    "signature its language row declares.",
                     entryMaterializationName(verb), params.size()));
         return false;
     }

@@ -6352,8 +6352,14 @@ def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
     attempted = oracle_status in ORACLE_STATUSES_ATTEMPTED
     n_sources = len({normalise_tu_path(s) for s in (manifest_sources or [])})
     sources = manifest_tu_paths(manifest_sources)
-    dss_rows = [r for r in dss_build_diagnostics(dss_log_text)
-                if r["severity"] == "error"]
+    all_dss = dss_build_diagnostics(dss_log_text)
+    # ★ A STREAM THAT WAS NOT WHOLE CLEARS NOTHING. A TU whose only errors fell past a cap is absent
+    # from the rows below, i.e. neither charged nor excused -- the attribution would read CLEANER than
+    # the build was. The driver asks for the whole stream (`sqlite_base.DIAGNOSTIC_CAP`); a gap that
+    # shows anyway is named, and the verdict is not `upstream`.
+    stream_gaps = dss_stream_gaps(all_dss)
+    dss_rows = [r for r in all_dss
+                if r["severity"] == "error" and r["code"] not in (DSS_CAP_MARKER, DSS_ELISION_MARKER)]
     ref_rows = reference_build_diagnostics(reference_log_text)
 
     # ★ A LOG THAT PARSED TO NOTHING IS A FINDING, NOT AN ANSWER. The reference
@@ -6468,8 +6474,8 @@ def attribute_build_failure(dss_log_text, reference_log_text, oracle_status,
         "dssErrors": len(dss_rows),
         "dssErrorsWithNoLocation": len([r for r in dss_rows if not r["file"]]),
         "referenceErrors": len([r for r in ref_rows if r["severity"] == "error"]),
-        "tus": tus, "chargedToDss": charged,
-        "verdictClass": "dss" if (charged or parser_gap) else "upstream",
+        "tus": tus, "chargedToDss": charged, "dssStreamGaps": stream_gaps,
+        "verdictClass": "dss" if (charged or parser_gap or stream_gaps) else "upstream",
     }
 
 
@@ -6483,7 +6489,10 @@ def build_attribution_report_lines(report):
     and "the build failed and here is why it is not ours" is a claim that has to
     be readable, not merely acted on. Silence is the failure mode."""
     label = report.get("leg", "<unlabelled>")
-    lines = []
+    # FIRST, and even when no TU is left to list: a stream that was not whole is the one fact that
+    # can make every line below read cleaner than the build was.
+    lines = ["[%s] build attribution: INCOMPLETE — %s" % (label, gap)
+             for gap in report.get("dssStreamGaps") or []]
     if not report.get("tus"):
         lines.append("[%s] build attribution: NO dss error carries a source "
                      "location — nothing to attribute" % label)
@@ -6571,6 +6580,28 @@ RECOMPILE_DSS_BUILDS = ("built", "errors", "failed")
 DSS_CAP_MARKER = "P_TooManyDiagnostics"
 DSS_ELISION_MARKER = "P_DiagnosticsElided"
 _DSS_COALESCED = re.compile(r"\b(\d+) coalesced past the per-code cap\b")
+
+
+def dss_stream_gaps(dss_rows):
+    """Every reason dsscp's diagnostic stream `dss_rows` (`dss_build_diagnostics`) is NOT whole -> [str],
+    [] = whole. The ONE reader of the two elision markers, for the recompile census and the build
+    attribution alike: a reader counting per TU off an elided stream fails toward CLEAN (a TU whose only
+    errors were dropped shows none). The per-code marker's DEDUP-ONLY form (0 coalesced) drops exact
+    repeats at one span and is routine on a clean build, so only a coalescing one is a gap."""
+    gaps = []
+    for r in dss_rows:
+        if r["code"] == DSS_CAP_MARKER:
+            gaps.append("dsscp's diagnostic stream hit its GLOBAL cap (%s): every diagnostic past it is "
+                        "hidden, so a TU that shows none may still be refused" % DSS_CAP_MARKER)
+        elif r["code"] == DSS_ELISION_MARKER:
+            m = _DSS_COALESCED.search(r["subject"])
+            if m is None:
+                gaps.append("a %s marker whose count this reader cannot read (%r): whether it hid a TU's "
+                            "errors is unknown" % (DSS_ELISION_MARKER, r["subject"]))
+            elif int(m.group(1)):
+                gaps.append("dsscp COALESCED %s diagnostic(s) past its per-code cap (%s): a TU whose only "
+                            "errors were coalesced shows none" % (m.group(1), r["subject"]))
+    return gaps
 # gcc's include chain: `In file included from <file>:<line>[:<col>],` then zero or
 # more `                 from <file>:<line>[:<col>],` lines, the LAST one (the TU)
 # ending in `:`. The path is taken NON-greedily up to the trailing number(s), so a
@@ -6707,21 +6738,10 @@ def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_
     # ── dsscp ────────────────────────────────────────────────────────────────
     dss, unplaced_dss = tally(), []
     dss_errors = 0
-    for r in dss_build_diagnostics(dss_log_text):
-        if r["code"] == DSS_CAP_MARKER:
-            incomplete.append("dsscp's diagnostic stream hit its GLOBAL cap (%s): every diagnostic "
-                              "past it is hidden, so a TU that shows none may still be refused"
-                              % DSS_CAP_MARKER)
-            continue
-        if r["code"] == DSS_ELISION_MARKER:
-            m = _DSS_COALESCED.search(r["subject"])
-            if m is None:
-                incomplete.append("a %s marker whose count this reader cannot read (%r): whether it "
-                                  "hid a TU's errors is unknown" % (DSS_ELISION_MARKER, r["subject"]))
-            elif int(m.group(1)):
-                incomplete.append("dsscp COALESCED %s diagnostic(s) past its per-code cap (%s): a TU "
-                                  "whose only errors were coalesced shows none"
-                                  % (m.group(1), r["subject"]))
+    dss_rows = dss_build_diagnostics(dss_log_text)
+    incomplete.extend(dss_stream_gaps(dss_rows))
+    for r in dss_rows:
+        if r["code"] in (DSS_CAP_MARKER, DSS_ELISION_MARKER):
             continue
         if r["severity"] not in ("error", "warning"):
             continue
@@ -14104,6 +14124,30 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           and _a_gap["verdictClass"] == "dss"
           and any("HARNESS GAP" in l
                   for l in build_attribution_report_lines(_a_gap)))
+    # ★ A DSS STREAM THAT WAS NOT WHOLE CLEARS NOTHING (`dss_stream_gaps`, the one reader the recompile
+    # census shares). The dss log below is ONLY the marker, so no TU is left to list and nothing else
+    # could make the verdict `dss`: the gap alone must, and it must be the FIRST line of the account.
+    for _gm, _gwhy in (
+            ("error[P_TooManyDiagnostics]: too many diagnostics (1000); 12 more not shown\n",
+             "GLOBAL cap"),
+            ("info[P_DiagnosticsElided]: P0B01 (S_TypeMismatch) diagnostics were ELIDED and NOT "
+             "shown: 7 coalesced past the per-code cap of 50, 0 dropped as recent duplicates.\n",
+             "COALESCED 7")):
+        _g = attribute_build_failure(_gm, _ref_log, "build-failed", _sources, _decs, "L")
+        _gl = build_attribution_report_lines(_g)
+        check("attribution: a dss stream that was not whole (%s) clears NOTHING -- named first in the "
+              "account, the verdict `dss`, though no TU is left to list" % _gwhy,
+              _g["verdictClass"] == "dss" and any(_gwhy in w for w in _g["dssStreamGaps"])
+              and not _g["tus"] and not _g["parserGap"] and _gl and "INCOMPLETE" in _gl[0]
+              and _gwhy in _gl[0], "%r / %r" % (_g, _gl))
+    _g0 = attribute_build_failure(
+        "info[P_DiagnosticsElided]: P000D (P_SchemaCursorDesync) diagnostics were ELIDED and NOT "
+        "shown: 0 coalesced past the per-code cap of 50, 45 dropped as recent duplicates.\n",
+        _ref_log, "build-failed", _sources, _decs, "L")
+    check("attribution: the DEDUP-only elision (0 coalesced) is routine -- no gap, and with no TU "
+          "rejected the verdict stays `upstream` (the control)",
+          _g0["dssStreamGaps"] == [] and _g0["verdictClass"] == "upstream",
+          "%r" % (_g0,))
     # An unanchored TU pattern silently attributes every longer sibling path.
     check("the lint REFUSES a `build-tu` pattern that is not anchored at '$'",
           any("not anchored" in f for f in build_tu_row_findings("L", 

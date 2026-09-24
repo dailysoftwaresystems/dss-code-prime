@@ -477,3 +477,17 @@ target_link_libraries(dss_asm_test_asm_undefined_symbol_reference
     PRIVATE nlohmann_json::nlohmann_json)
 target_include_directories(dss_asm_test_asm_undefined_symbol_reference
     PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
+
+# P68 round 9 (the aarch64 twins): the PAGE and PAGE OFFSET of a symbol —
+# `adrp`, `:lo12:` / `@PAGEOFF` on `add` and every unsigned-offset load/store,
+# each spelling read only on the object format its dialect row lists — a
+# constant after a name, the one-word `adr`, a block of the function addressed
+# in a field and the location counter; the words and relocations are the
+# references' (gas 2.42 = clang 18 for ELF; clang 18 for Darwin). Reads the
+# shipped documents, so it must run through ctest.
+dss_add_test(NAME asm/test_asm_arm64_address_forms
+             SOURCES test_asm_arm64_address_forms.cpp)
+target_link_libraries(dss_asm_test_asm_arm64_address_forms
+    PRIVATE nlohmann_json::nlohmann_json)
+target_include_directories(dss_asm_test_asm_arm64_address_forms
+    PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)

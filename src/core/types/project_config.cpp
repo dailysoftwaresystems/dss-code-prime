@@ -59,6 +59,8 @@ struct WithdrawnCacheMember {
     std::string_view name;
     std::string_view why;
 };
+// Anchored: D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT
+// (the `eviction` member's withdrawal).
 constexpr std::array<WithdrawnCacheMember, 1> kWithdrawnCacheMembers = {
     WithdrawnCacheMember{
         "eviction",
@@ -69,9 +71,7 @@ constexpr std::array<WithdrawnCacheMember, 1> kWithdrawnCacheMembers = {
         "cache, pruning also reclaimed ZERO bytes — the compiler's build "
         "stamp is a directory component, so a superseded generation lands in "
         "a different root and was never reachable to delete. Remove the "
-        "member; a cache is reclaimed by deleting its root directory. "
-        "Anchored: "
-        "D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT"},
+        "member; a cache is reclaimed by deleting its root directory."},
 };
 
 // Comma-join a closed-key table for a diagnostic. ONE joiner for every table

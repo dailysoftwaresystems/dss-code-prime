@@ -223,6 +223,15 @@ dss_add_test(NAME analysis/preprocess/test_platform_header_surface
 dss_add_test(NAME analysis/preprocess/test_prefixed_char_constant
              SOURCES test_prefixed_char_constant.cpp)
 
+# P68 round 9 (lane `lm`): the GNU integer-type predefined-macro families —
+# `__*_TYPE__` (`type-name`), `__*_MAX__`/`__*_MIN__`/`__*_WIDTH__` (`type-limit`),
+# `__*_C(c)`/`__*_C_SUFFIX__` (`type-suffix`) — against every reference's answer on
+# every real pair, the one-fact rule (each `__X_TYPE__` IS the shipped typedef),
+# the merge's inputs, and the loader's refusals. Reads the shipped config, so it
+# runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_type_derived_predefines
+             SOURCES test_type_derived_predefines.cpp)
+
 # P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX, the preprocessor face): the
 # `type-unsigned` predefine kind — `__CHAR_UNSIGNED__`, `__WCHAR_UNSIGNED__` and
 # `__WINT_UNSIGNED__` are defined on exactly the real pairs where gcc/clang `-dM`
@@ -231,3 +240,16 @@ dss_add_test(NAME analysis/preprocess/test_prefixed_char_constant
 # the shipped config, so it runs through ctest (the config snapshot).
 dss_add_test(NAME analysis/preprocess/test_type_unsigned_predefines
              SOURCES test_type_unsigned_predefines.cpp)
+
+# P68 round 9 (D-FFI-STDINT-LIMIT-MACROS): `<stdint.h>`'s whole C23 7.22.2 / 7.22.3
+# limit-and-width family — every `_MIN`/`_MAX`/`_WIDTH` with the TYPE and VALUE the
+# references give it on each platform (the promoted type of the platform's own
+# typedef), its `#if` value and sign, the `SIG_ATOMIC_*` rows present exactly where
+# `<signal.h>` is, `__STDC_VERSION_STDINT_H__`, and each macro equal to its GNU
+# predefined twin (`SIZE_MAX == __SIZE_MAX__`) — COMPILED FOR EVERY REAL PAIR through
+# the driver's two halves. Reads the shipped config, so it runs through ctest (the
+# config snapshot).
+dss_add_test(NAME analysis/preprocess/test_stdint_limit_macros
+             SOURCES test_stdint_limit_macros.cpp)
+target_include_directories(dss_analysis_preprocess_test_stdint_limit_macros
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

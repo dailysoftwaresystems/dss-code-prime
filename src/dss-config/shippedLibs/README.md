@@ -312,6 +312,8 @@ row may name a TYPE and a LIMIT instead of stating a number:
 { "name": "CHAR_MIN",   "of": "char",    "limit": "min"   }   // per pair: -128, or 0 on aarch64 Linux
 { "name": "LONG_WIDTH", "of": "long",    "limit": "width" }
 { "name": "INT64_MAX",  "of": "int64_t", "limit": "max"   }   // the typedef's identity: `long` on elf, `long long` on macho/pe
+{ "name": "SIZE_MAX",   "of": { "shippedTypedef": "size_t", "header": "stddef.h" }, "limit": "max" }   // another header's typedef
+{ "name": "WINT_MAX",   "of": { "abiTypedef": "wint_t" }, "limit": "max" }   // the target's platform ABI typedef
 ```
 
 C 5.2.5.3.2 gives every `<limits.h>` `_MIN`/`_MAX` its type's PROMOTED type AND
@@ -323,27 +325,38 @@ from the same `applyTargetFormatPair` inputs):
 
 | key | meaning |
 |---|---|
-| `of` | the type, named the way this descriptor's own text would see it: a typedef the SAME descriptor declares (`int64_t`), else a name in the consuming language's vocabulary (`long`, `unsigned short`, `char`, `bool`), resolved by the language's one type-name resolver (`resolveLanguageTypeName`, `core/types/type_name_resolve.hpp` — the grammar loader's own) and selected for the pair's data model |
+| `of` | the type, named the way this descriptor's own text would see it: a typedef the SAME descriptor declares (`int64_t`), else a name in the consuming language's vocabulary (`long`, `unsigned short`, `char`, `bool`), resolved by the language's one type-name resolver (`resolveLanguageTypeName`, `core/types/type_name_resolve.hpp` — the grammar loader's own) and selected for the pair's data model. OR one type REFERENCE, in the notation the `type-limit` predefined macros use for the same types (P68 round 9, D-FFI-STDINT-LIMIT-MACROS): `{ "shippedTypedef": <name>, "header": <h> }` — a typedef ANOTHER shipped header declares (C 7.22.3 gives `<stdint.h>` the limits of `<stddef.h>`'s and `<signal.h>`'s types, and includes neither), read for the pair by `ffi::readShippedHeaderTypedefs`, the one reader `__SIZE_MAX__` asks too; the header is searched in the consuming language's system directories and matched exactly as spelled — or `{ "abiTypedef": <name> }`, the target's platform ABI typedef for the format (`abiTypedefs` in `<arch>.target.json`) |
 | `limit` | `max` / `min` — the type's range on the pair (plain `char` by `TargetSchema::charIsUnsigned`), typed as the language's INTEGER PROMOTION of the type (`promoteIntegerKind`): `USHRT_MAX` is an `int`, `ULONG_MAX` an `unsigned long`. `width` — the C 6.2.6.2 width (`bool` is 1), typed as the promotion floor (`int`), the type gcc, clang and mingw give every `*_WIDTH` macro |
 
 **Realized or not, never guessed.** A row whose type depends on a fact the pair
 does not supply — `long` with no data model, `char` with no signedness, any row
 with no language — is NOT realized: it injects nothing, exactly like a `variants`
 row no target selects. A fact the missing input cannot change (`int` is 32 bits
-under every model) is realized without it.
+under every model) is realized without it. A referenced header the format does
+not ship (`<signal.h>` on pe), a typedef no variant selects on the pair, and an ABI
+typedef the target does not declare for the format are not realized either — so a
+macro is undefined exactly where its type is (C 7.22.3p2).
 
 **Refused, loudly, on every read** (the `model-limit` predefined kind's style): an
 unknown `limit`; a `value`, `type` or `variants` beside `of` (the second copy of
-what the lattice states); a `limit` with no `of` or an `of` with no `limit`; an
-`of` that names nothing (once a vocabulary can judge it); a type that is not an
-integer; a range the 64-bit value carrier cannot hold (`unsigned __int128`).
+what the lattice states); a `limit` with no `of` or an `of` with no `limit`; a
+malformed `of` reference (an unknown key, a `shippedTypedef` with no `header`, a
+`header` beside `abiTypedef`, both sources at once, or a reference to the
+descriptor's OWN header — its typedefs have the bare-name notation); an `of` that
+names nothing (once a vocabulary can judge it: a name no vocabulary resolves, a
+header no system directory holds, a typedef the header declares on no pair); a
+type that is not an integer; a range the 64-bit value carrier cannot hold
+(`unsigned __int128`).
 
-`<limits.h>` is the one descriptor built this way (31 derived rows, `MB_LEN_MAX`
-declared per format because it is the C RUNTIME's contract, not the lattice's);
-`<stdint.h>`'s `INT64_MIN`/`INT64_MAX` derive from its own `int64_t`. Pins:
-`tests/ffi/test_shipped_derived_constants.cpp` (the reader, both seams),
-`tests/analysis/preprocess/test_limits_h_lattice.cpp` (every name against the
-references on every real pair), `examples/c/limits_h_lattice` (run time).
+Two descriptors are built this way: `<limits.h>` (31 derived rows, `MB_LEN_MAX`
+declared per format because it is the C RUNTIME's contract, not the lattice's)
+and `<stdint.h>` (all 84 C23 7.22.2 / 7.22.3 limit and width macros — its own
+typedefs by bare name, `ptrdiff_t`/`size_t`/`wchar_t`/`sig_atomic_t` by header,
+`wint_t` by ABI typedef). Pins: `tests/ffi/test_shipped_derived_constants.cpp`
+(the reader, both seams), `tests/analysis/preprocess/test_limits_h_lattice.cpp` and
+`tests/analysis/preprocess/test_stdint_limit_macros.cpp` (every name against the
+references on every real pair), `examples/c/limits_h_lattice` and
+`examples/c/stdint_limit_family` (run time).
 
 ---
 

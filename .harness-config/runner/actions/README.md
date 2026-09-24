@@ -63,6 +63,7 @@ python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py
 | **`check-anchor-registry`** | `check-anchor-registry.py` | refuse a `D-*` anchor cited in a scanned root that resolves to no registry row, and refuse a markdown table row whose unescaped pipes would silently drop cells. |
 | **`check-diagnostic-codes`** | `check-diagnostic-codes.py` | refuse a duplicate, implicitly-numbered, or newly-uncovered `DiagnosticCode` ordinal. |
 | **`check-doc-census`** | `check-doc-census.py`, `source-census.py` | refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place. |
+| **`check-emitted-anchor-ids`** | `check-emitted-anchor-ids.py` | refuse a new anchor id inside a C++ string literal under src/: operator output states the condition and the action, never the bookkeeping. |
 | **`check-enum-name-table-guards`** | `check-enum-name-table-guards.py` | refuse an `EnumNameTable` vocabulary declared in `src/` without a `DSS_CHECK_ENUM_NAME_TABLE` well-formedness assert. |
 | **`check-export-macro-placement`** | `check-export-macro-placement.py` | refuse DSS_EXPORT on a member of an already-exported class, which is MSVC error C2487. |
 | **`check-guard-output-encoding`** | `check-guard-output-encoding.py` | refuse a Python script whose report cannot carry a non-cp1252 character through a pipe. |

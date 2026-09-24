@@ -924,6 +924,8 @@ TEST(SemanticAnalyzerC, CharStarToVoidStarArgImplicit) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "char* → void* must be implicit in c "
            "(implicitToVoidPtr: true)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -967,6 +969,8 @@ TEST(SemanticAnalyzerC, MultiParamCallAddressOfArgsNoStaleParamSpan) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArgCountMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-LANG-POINTER-VOID-CONVERT: the reverse direction (`void*` →
@@ -989,6 +993,8 @@ TEST(SemanticAnalyzerC, VoidStarToCharStarArgImplicit) {
            "(implicitFromVoidPtr: true). When C++ frontend lands, "
            "it would declare implicitFromVoidPtr: false and this "
            "direction would require an explicit cast.";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -1046,6 +1052,8 @@ TEST(SemanticAnalyzerC, VoidStarReturnFromTypedPtrImplicit) {
                         DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "int* → void* via return must be implicit in c "
            "(implicitToVoidPtr: true)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 TEST(SemanticAnalyzerC, TypedPtrReturnFromVoidStarImplicit) {
@@ -1060,6 +1068,8 @@ TEST(SemanticAnalyzerC, TypedPtrReturnFromVoidStarImplicit) {
                         DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "void* → int* via return must be implicit in c "
            "(implicitFromVoidPtr: true). C++ would forbid.";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // P68 round 9 (lane `cs`): the return site DIAGNOSES the pair (a Warning, as every
@@ -1104,6 +1114,8 @@ TEST(SemanticAnalyzerC, PointerMinusArrayTypesAsPointerDifferenceInt) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "ptr-array and array-ptr subtraction must type as the ptrdiff int (the array "
            "decays first), not a pointer → S_TypeMismatch, in an uncast int context";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
@@ -1183,6 +1195,8 @@ TEST(SemanticAnalyzerC, ValidAssignStmtsRemainClean) {
            "ptr<-null, ptr<-&lvalue) must stay accepted — the new check admits "
            "exactly what the init/call-arg/return sites admit";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (c2) Valid assignment statements to NON-trivial LVALUES — a DEREF store
@@ -1211,6 +1225,8 @@ TEST(SemanticAnalyzerC, ValidLvalueStoreAssignStmtsRemainClean) {
            "store (s.m=v) of a compatible value must each stay clean — subtreeType "
            "returns the lvalue's value type for the assignability check";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (d) A COMPOUND assignment is NOT routed through the plain-assignment check:
@@ -1404,6 +1420,8 @@ TEST(SemanticAnalyzerC, PtrInitFromAddressOfLegalFormsStayClean) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "void*<-&obj, and same-pointee &-inits (char/long/int) must ALL stay "
            "accepted — the fix must not over-tighten a legal object-pointer init";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (d) A string-literal initializer of a char* (`char *p = "hi";`) is a legal
@@ -1420,6 +1438,8 @@ TEST(SemanticAnalyzerC, PtrInitFromStringLiteralStaysClean) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "`char *p = \"hi\";` is a legal string-literal pointer init — the "
            "address-of-initializer tightening must not touch it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (e) PARITY: the address-of INITIALIZER form and the pointer-VARIABLE
@@ -1445,6 +1465,13 @@ TEST(SemanticAnalyzerC, PtrInitAddressOfAndPointerVarRejectIdentically) {
         << "the address-of initializer AND the pointer-variable initializer must "
            "each diagnose the char* <- long-pointee pair — two reports, not one";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    // The vacuity sweep: the legal `long *lp = &a;` must draw NO diagnosed conversion
+    // under ANY of the three codes — counting S_IncompatiblePointerConversion alone
+    // could not see it turn into the same-representation one.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+        << "`long *lp = &a;` is compatible: no diagnosed conversion of any kind";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IntegerPointerConversion), 0u);
 }
 
 // 2nd-order audit pin (code-reviewer Critical, step 13.3a): the
@@ -5230,6 +5257,8 @@ TEST(SemanticAnalyzerC, DefinitionParamsRemainBodyVisible) {
     EXPECT_FALSE(model.hasErrors())
         << "definition params must reach the body (cb/cb2 visible) while the "
            "fn-ptr params' inner `e`s stay isolated";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
@@ -5874,6 +5903,8 @@ TEST(SemanticAnalyzerC, ExplicitPointerCastAcceptedWhereImplicitRejected) {
         << (castModel.diagnostics().all().empty()
                 ? ""
                 : castModel.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(castModel.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(castModel.diagnostics(),
                         DiagnosticCode::S_InvalidCast), 0u);
 }
@@ -6186,6 +6217,8 @@ TEST(SemanticAnalyzerC, PointerPlusIntIsCleanPointerTyped) {
         "int main(void){ return 0; }\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 // The key commutative case: `n + p` must type as a pointer, not the integer.
 TEST(SemanticAnalyzerC, IntPlusPointerIsCleanPointerTyped) {
@@ -6194,6 +6227,8 @@ TEST(SemanticAnalyzerC, IntPlusPointerIsCleanPointerTyped) {
         "int main(void){ return 0; }\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 TEST(SemanticAnalyzerC, PointerMinusIntIsCleanPointerTyped) {
     auto model = analyzeShipped("c", {
@@ -6201,6 +6236,8 @@ TEST(SemanticAnalyzerC, PointerMinusIntIsCleanPointerTyped) {
         "int main(void){ return 0; }\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 // GUARD: `int + int` is NOT pointer arithmetic (the Ptr guard is not over-broad).
 TEST(SemanticAnalyzerC, IntPlusIntUnaffectedByPtrArith) {
@@ -6387,6 +6424,8 @@ TEST(SemanticAnalyzerC, PostStarConstCastStripsToPlainPointer) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // `(u32 * volatile)p` — a POST-star volatile is STRIPPED: the cast types as a
@@ -6837,6 +6876,8 @@ TEST(SemanticAnalyzerC, PointerCastsAccepted) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // Float↔pointer stays ILLEGAL (a C constraint mapCast mirrors: no
@@ -6865,6 +6906,8 @@ TEST(SemanticAnalyzerC, CastOfStringLiteralDecaysAndIsAccepted) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
         << "(char*)\"abc\" and (long)\"xy\" must decay-then-cast, "
            "never S_InvalidCast";
@@ -6893,6 +6936,8 @@ TEST(SemanticAnalyzerC, VoidDiscardCastAcceptsAllOperandTypes) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
         << "(void)x must admit every operand type (C 6.5.4p2)";
 }
@@ -7242,6 +7287,8 @@ TEST(SemanticAnalyzerC, BareFnPtrCallTypesAndChecks) {
     EXPECT_FALSE(clean.hasErrors())
         << "a well-typed indirect call must be CLEAN (the c1 wall is "
            "retired)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(clean.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // Arity: fp(1, 2) against int(*)(int) -> exactly 1 S_ArgCountMismatch.
     auto arity = analyzeShipped("c", {
@@ -7294,6 +7341,8 @@ TEST(SemanticAnalyzerC, BareFunctionNameDecaysToPointerInEveryPosition) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a bare function name assigned to a matching function pointer "
            "(`fp = add`) must decay to its address, not fail S_TypeMismatch";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(assign.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // (b) bare INITIALIZER (no `&`).
     auto init = analyzeShipped("c", {
@@ -7303,6 +7352,8 @@ TEST(SemanticAnalyzerC, BareFunctionNameDecaysToPointerInEveryPosition) {
     EXPECT_EQ(countCode(init.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a bare function name in an initializer must decay";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(init.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // (c) bare CALL-ARGUMENT (the callback position — `fn_fnptr_callback`).
     auto callback = analyzeShipped("c", {
@@ -7313,6 +7364,8 @@ TEST(SemanticAnalyzerC, BareFunctionNameDecaysToPointerInEveryPosition) {
     EXPECT_EQ(countCode(callback.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a bare function name as a call argument must decay";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(callback.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // NEGATIVE: an INCOMPATIBLE-signature decay is NOT a clean decay — the decay is
     // pinned to the SAME interned FnSig, so a different parameter list interns a
@@ -7340,6 +7393,8 @@ TEST(SemanticAnalyzerC, CastFnPtrCalleeTypesAndChecks) {
         "int main() { int (*fp)(int) = &helper; return ((H)fp)(3); }\n",
     });
     EXPECT_FALSE(clean.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(clean.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     auto arity = analyzeShipped("c", {
         "int helper(int v) { return v; }\n"
@@ -7412,6 +7467,8 @@ TEST(SemanticAnalyzerC, DerefFnPtrCalleeTypesAndChecks) {
     });
     EXPECT_FALSE(clean.hasErrors())
         << "(*fp)(3) is a well-typed indirect call — must be clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(clean.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     auto arity = analyzeShipped("c", {
         "int helper(int v) { return v; }\n"
@@ -8727,6 +8784,8 @@ TEST(SemanticAnalyzerC, AttributeDeclKindLinkageVocabularyWarnsOnATypedef) {
         SCOPED_TRACE(src);
         auto m = analyzeShipped("c", {src});
         EXPECT_FALSE(m.hasErrors());
+        EXPECT_FALSE(hasDiagnosedPointerConversion(m.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         EXPECT_EQ(ignoredForKindWarnings(m), 0u)
             << "the inert row must NOT fire where the linkage tier really does "
                "consume the name — that would be a false positive on the shape "
@@ -11118,6 +11177,8 @@ TEST(SemanticAnalyzerC, NullptrTernaryTypesAsPointer) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A bare function designator / array name DECAYS to a pointer, so `nullptr == func`
@@ -11963,6 +12024,8 @@ TEST(SemanticAnalyzerC, FuncNameOutsideFunctionIsTheEmptyStringWithAWarning) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_PredefinedIdentifierOutsideFunction), 1u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): standard-attribute
@@ -13062,6 +13125,8 @@ TEST(SemanticAnalyzerC, AutoStringLiteralDecaysToCharPointer) {
         "int main(void) { auto s = \"str\"; return s[0] == 's' ? 0 : 1; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* s = findSymbolNamed(model, "s");
     ASSERT_NE(s, nullptr);
     ASSERT_TRUE(s->type.valid());
@@ -13081,6 +13146,8 @@ TEST(SemanticAnalyzerC, AutoArrayVariableDecaysToElementPointer) {
         "}\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* p = findSymbolNamed(model, "p");
     ASSERT_NE(p, nullptr);
     ASSERT_TRUE(p->type.valid());
@@ -13097,6 +13164,8 @@ TEST(SemanticAnalyzerC, AutoFunctionNameDecaysToFunctionPointer) {
         "int main(void) { auto f = twice; return f(21); }\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* f = findSymbolNamed(model, "f");
     ASSERT_NE(f, nullptr);
     ASSERT_TRUE(f->type.valid());
@@ -13769,6 +13838,8 @@ TEST(SemanticAnalyzerC, PtrToVlaFixedPointeeFromVlaObjectAccepts) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "`int (*p)[5] = b;` where b is `int[2][n]` is VALID C (6.7.6.2p6 — only two ICE "
            "bounds must agree) and both references compile and run it silently";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work
@@ -13793,6 +13864,8 @@ TEST(SemanticAnalyzerC, LocalAggregateBraceInitStaysCleanNoFalseTypeMismatch) {
            "S_TypeMismatch";
     EXPECT_FALSE(model.hasErrors())
         << "the brace-init control program must compile clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4b (D-CSUBSET-VLA): `typedef int R[n]; R a;` — a VLA TYPEDEF object — ACCEPTS at
@@ -13928,6 +14001,8 @@ TEST(SemanticAnalyzerC, ParamPtrToVlaAcceptsAndVlaArgDecays) {
     EXPECT_FALSE(model.hasErrors())
         << "the parameter pointer-to-VLA program analyzes clean at the semantic tier (the "
            "non-leaf VLA-object caller is a separate MIR-tier deferral, not a semantic error)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param FIX-5(a) (D-CSUBSET-VLA): a param pointer to a FIXED-length array
@@ -13948,6 +14023,8 @@ TEST(SemanticAnalyzerC, ParamPtrToFixedArrayStillAccepts) {
         << "a fixed-pointee `int (*p)[5]` param accepts a fixed `int b[2][5]` arg";
     EXPECT_FALSE(model.hasErrors())
         << "the fixed-pointee ptr param program must analyze clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param FIX-5(b) (D-CSUBSET-VLA): the ADJUSTED form `int a[][n]` — the outer `[]`
@@ -13968,6 +14045,8 @@ TEST(SemanticAnalyzerC, ParamAdjustedArrayOfVlaAccepts) {
         << "`int a[][n]` (the adjusted form) must accept a VLA-object arg";
     EXPECT_FALSE(model.hasErrors())
         << "the int a[][n] program must analyze clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param (D-CSUBSET-VLA) regression control: a PLAIN `int a[n]` param must STILL
@@ -13984,6 +14063,8 @@ TEST(SemanticAnalyzerC, PlainVlaArrayParamStillDecaysToPointer) {
     EXPECT_FALSE(model.hasErrors())
         << "a plain `int a[n]` param must DECAY to `int*` (a POINTER is reassignable); the "
            "paramDecay path must strip the outermost VLA, never leave a VLA-array object";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param THE KEY OPTION-B GUARD (D-CSUBSET-VLA): a struct field `int a[n]` (variable
@@ -14028,6 +14109,8 @@ TEST(SemanticAnalyzerC, ParamPtrToVlaFixedArgAccepts) {
            "COMPATIBLE with the param's `int (*)[n]` (the VLA bound is not an ICE)";
     EXPECT_FALSE(model.hasErrors())
         << "the fixed-array-argument program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — THE OTHER TWO SHAPES, which the row named none
@@ -14055,6 +14138,8 @@ TEST(SemanticAnalyzerC, PtrToVlaRowAndFixedRowAssignInBothDirections) {
            "VLA row and a constant row differ in no ICE bound";
     EXPECT_FALSE(model.hasErrors())
         << "the two-direction ptr-row assignment program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — THE BOUNDARY, and it is what keeps the fix a
@@ -14121,6 +14206,8 @@ TEST(SemanticAnalyzerC, ArrayParamStaticDecaysToPointer) {
     EXPECT_FALSE(model.hasErrors())
         << "`int a[static 3]` is a legal parameter decoration (C 6.7.6.3p7) — accept + decay "
            "to `int*` (a reassignable pointer)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "a PARAMETER `[static 3]` is legal — the non-parameter gate must NOT fire";
@@ -14144,6 +14231,8 @@ TEST(SemanticAnalyzerC, ArrayParamDecorationsAllDecayClean) {
     EXPECT_FALSE(model.hasErrors())
         << "every array-parameter decoration (static / const / volatile / restrict and "
            "combos) is legal in a parameter and decays to `int*`";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "no decoration on a PARAMETER may trip the non-parameter gate";
@@ -14171,6 +14260,8 @@ TEST(SemanticAnalyzerC, ArrayParamStarFormDecaysCleanNonParamFailsLoud) {
     });
     EXPECT_FALSE(param.hasErrors())
         << "a PARAMETER `int a[*]` must decay to a bare pointer + compile clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(param.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(param.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "a `[*]` on a PARAMETER must NOT trip the non-parameter gate";
@@ -14258,6 +14349,8 @@ TEST(SemanticAnalyzerC, ArrayParamStarInAPrototypeStaysLegal) {
            "beside it spells the real bound and must not be blamed for the prototype";
     EXPECT_FALSE(model.hasErrors())
         << "the prototype-plus-definition program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ★★ D-CSUBSET-VLA-PARAM-STAR ✅ — THE BOUNDARY, AND IT IS THE HALF A SUBTREE SCAN GETS
@@ -14284,6 +14377,8 @@ TEST(SemanticAnalyzerC, AbstractStarInNestedPrototypeInsideDefinitionStaysLegal)
            "inside a definition — both references compile AND run it";
     EXPECT_FALSE(model.hasErrors())
         << "the nested-prototype program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-PARAM-STAR-ABSTRACT ✅ CLOSED: the UNNAMED ABSTRACT `[*]` — `int f(int,
@@ -14318,6 +14413,8 @@ TEST(SemanticAnalyzerC, AbstractUnnamedStarArrayParamParsesAndDecays) {
            "directDeclarator's BASE alt, which now lists arrayStarSuffix";
     EXPECT_FALSE(abstractForm.hasErrors())
         << "the abstract `[*]` prototype + its bound-spelling definition analyze clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(abstractForm.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // The NAMED form in the SAME position is the control: it reached the suffix REPEAT and
     // worked before this change, so a red here would mean the repeat regressed instead.
@@ -14328,6 +14425,8 @@ TEST(SemanticAnalyzerC, AbstractUnnamedStarArrayParamParsesAndDecays) {
     });
     EXPECT_FALSE(namedForm.hasErrors())
         << "the NAMED `[*]` control must stay clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(namedForm.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-PARAM-STAR-ABSTRACT ✅ — THE ROLLBACK the new base-alt candidate must not
@@ -14349,6 +14448,8 @@ TEST(SemanticAnalyzerC, AbstractArrayParamBoundsStillRollBackPastTheStarSuffix) 
            "arrayDeclSuffix";
     EXPECT_FALSE(constantBound.hasErrors())
         << "the abstract constant-bound prototype analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(constantBound.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // `int a[*p]` — the bound is the EXPRESSION `*p`, which begins with the same `*` the
     // star-modifier does and is exactly where a greedy `[ * ]` probe would mis-commit.
@@ -14362,6 +14463,8 @@ TEST(SemanticAnalyzerC, AbstractArrayParamBoundsStillRollBackPastTheStarSuffix) 
            "— the star-modifier rule is a fixed 3-token `[ * ]` and must not swallow it";
     EXPECT_FALSE(derefBound.hasErrors())
         << "the deref-sized-bound program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(derefBound.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A `[static N]` on a NON-parameter (a LOCAL) is a constraint violation — these decorations
@@ -14440,6 +14543,8 @@ TEST(SemanticAnalyzerC, DerefSizedVlaStillCompiles) {
     EXPECT_FALSE(model.hasErrors())
         << "`int a[*p]` (a deref-sized VLA) must STILL compile — the `[*]`-vs-`[*expr]` "
            "speculation must parse `*p` as the bound, not the `*` decoration";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "a deref bound `*p` is an expression, NOT the `[*]` decoration — no 0xE054";
@@ -14551,6 +14656,8 @@ TEST(SemanticAnalyzerC, PtrToVlaInitFormIsAcceptedAndKeepsItsVlaPointee) {
     EXPECT_FALSE(model.hasErrors())
         << "the pointer-to-VLA INIT form `int (*p)[n] = b` is the natural spelling and "
            "both references accept it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* p = findSymbolNamed(model, "p");
     ASSERT_NE(p, nullptr);
     ASSERT_TRUE(p->type.valid());
@@ -17240,6 +17347,8 @@ TEST(SemanticAnalyzerC, FunctionTypedefParamPrototypeAndDefinitionAgree) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // FORM (4) — an ABSTRACT (type-only) parameter, `int apply(Fn, int);`. C
@@ -17263,6 +17372,8 @@ TEST(SemanticAnalyzerC, AbstractFunctionTypedefParamAdjustsAndMergesWithNamedDef
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     // And the harvested FnSig itself carries the ADJUSTED parameter type.
     auto const* apply = findSym(model, "apply");
     ASSERT_NE(apply, nullptr);
@@ -17296,6 +17407,8 @@ TEST(SemanticAnalyzerC, NestedFnPtrDeclaratorFunctionTypedefParamAdjusts) {
         << "`ep = enumerate` type-checks ONLY if the fn-pointer's harvested "
            "params and the function's own params adjusted identically";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     // Structural pin on the fn-POINTER's pointee signature (the harvest path).
     auto const* ep = findSym(model, "ep");
     ASSERT_NE(ep, nullptr);
@@ -17334,6 +17447,8 @@ TEST(SemanticAnalyzerC, CallAndAddressOfAdjustedFunctionTypeParamAreWellTyped) {
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
     EXPECT_FALSE(model.hasErrors())
         << "the call THROUGH the adjusted parameter must dispatch cleanly";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ★ THE ANTI-VACUITY CONTROL. p8 is a PARAMETER rule and nothing else. A
@@ -17370,6 +17485,8 @@ TEST(SemanticAnalyzerC, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
         "int main(void) { return apply(twice, 21); }\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     EXPECT_FALSE(g->isProtoDeclaration)
@@ -17400,6 +17517,8 @@ TEST(SemanticAnalyzerC, SameNamedInlineFunctionTypedParamsDoNotCollide) {
         << "two functions' parameters merely SHARE a name — a parameter has no "
            "linkage (C 6.2.1p4) and must never merge across functions";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     // TWO symbols named `g`, in DIFFERENT scopes, with DIFFERENT pointees. A
     // re-homed pair collapses to one symbol, which fails the count first.
     std::vector<SymbolRecord const*> gs;
@@ -18054,6 +18173,8 @@ TEST(SemanticAnalyzerC, SourceTagUnifiesWithDescriptorMember) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // The IDENTITY itself, asserted directly and in BOTH directions so a green
     // result cannot come from a weakened assignment check.
@@ -18097,6 +18218,8 @@ TEST(SemanticAnalyzerC, DescriptorOnlyTimespecIsAlreadyOneType) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
     SymbolRecord const* tag    = findInjectedSym(model, "timespec");
@@ -18487,6 +18610,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
                                   DataModel::Llp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr)
         << "goal-2 suppressed the descriptor's printf — the row must be recorded";
@@ -18511,6 +18636,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedRowSignatureMatchesTheUserPrototype) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
                                   DataModel::Llp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr);
     ASSERT_TRUE(sup->signature.valid())
@@ -18539,6 +18666,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Elf,
                                   DataModel::Lp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr);
     EXPECT_TRUE(sup->recipeId.empty())
@@ -18617,6 +18746,8 @@ TEST(SemanticAnalyzerC, TFC121SuppressedDarwinRowCarriesItsPerTargetLinkName) {
         EXPECT_FALSE(model.hasErrors())
             << (model.diagnostics().all().empty()
                     ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         auto const* sup = model.suppressedShippedSymbolFor("fstat");
         if (sup == nullptr) {
             ADD_FAILURE()
@@ -20012,6 +20143,8 @@ TEST(SemanticAnalyzerC, TypeofLiteralOperandResolvesInEverySpecifierPosition) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "the pointer position with an initializer used to fail S0003 — it "
            "resolved the head to nothing and compared the initializer against it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     for (char const* name : {"tGlobal", "TTypedef", "tMember", "tParam",
                              "tLocal"}) {
         SymbolRecord const* s = findSym(model, name);
@@ -20617,6 +20750,8 @@ TEST(SemanticAnalyzerC, TheDiscardingContextsForAVoidExpressionStillCompile) {
         << "a void expression is admissible wherever its value is DISCARDED — "
            "comma, the (void) cast, a bare statement, and sizeof";
     EXPECT_FALSE(model.diagnostics().hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
@@ -20880,6 +21015,8 @@ TEST(SemanticAnalyzerC, WritesToNonConstFieldsDrawNoConstViolation) {
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A const-declared member READ, and INITIALIZED through the aggregate
@@ -21114,6 +21251,8 @@ TEST(SemanticAnalyzerC, ConditionalWithArrayArmAndVoidPointerIsAccepted) {
                         DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // The pointer form of the same pairing, both arm orders.
@@ -21126,6 +21265,8 @@ TEST(SemanticAnalyzerC, ConditionalWithObjectPointerAndVoidPointerIsAccepted) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── P50: D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH ──────────────────────
@@ -22988,6 +23129,8 @@ TEST(SemanticAnalyzerC, AnArrayInTheGenericAccessorBindingPositionDecays) {
                             DiagnosticCode::S_TypeMismatch), 0u)
             << a.expr << ": the binding must SPECIALIZE, not fall back to the "
                          "i32 exemplar and mismatch against it";
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 
@@ -23024,6 +23167,8 @@ TEST(SemanticAnalyzerC, AnAtomicPointerRmwOperandIsPtrdiffNotThePointee) {
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_TypeMismatch), 0u)
             << a.call << ": " << a.why;
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 
@@ -23179,6 +23324,8 @@ TEST(SemanticAnalyzerCParamListTag, EveryAcceptedShapeIsCleanAndWarnsOncePerTag)
         auto const p = analyseParamListShape(a.src);
         EXPECT_EQ(p.frontEndErrors(), 0u) << a.why << "\n" << a.src;
         EXPECT_FALSE(p.model.hasErrors()) << a.why << "\n" << a.src;
+        EXPECT_FALSE(hasDiagnosedPointerConversion(p.model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), a.tagWarnings)
             << a.why << "\n" << a.src;
     }

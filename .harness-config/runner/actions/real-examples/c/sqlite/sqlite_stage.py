@@ -62,6 +62,11 @@ DEFAULT_SQLITE_REPO_URL = "https://github.com/sqlite/sqlite.git"
 DEFAULT_TIER = "veryquick"
 RESULT_SCHEMA = "dss-sqlite-stage-result/1"
 RESULT_FILE = "derive-result.json"
+# ★ WHERE A RUN'S STAGE LIVES, ON EVERY HOST: `<output tree>/stage/` holds the derive's lists and logs and
+# its persisted result (RESULT_FILE) -- and, only when the stage is derived through WSL for a Windows host,
+# the staged COPY of the sources (a POSIX host's build reads its clone in place). One rule, read by the
+# driver's Steps 3-4 (`StageConfig.from_run`; the WSL derive's --out) and by the round-close recompile.
+STAGE_SUBDIR = "stage"
 # Written into every stage this module creates; its presence is what lets a later derive WIPE the
 # directory (a CLI that takes --out must never `rm -rf` a directory it cannot identify as its own).
 STAGE_MARKER = ".dss-sqlite-stage"
@@ -90,6 +95,12 @@ BREW_CANDIDATES = ("brew", "/opt/homebrew/bin/brew", "/usr/local/bin/brew")
 TESTDIR_SIBLINGS = ("rtree", "fts5/test", "session")
 
 _j = posixpath.join
+
+
+def stage_dir_of(out_root):
+    """`<out_root>/stage`: where the stage of the run whose output tree is `out_root` lives, on every host
+    (`STAGE_SUBDIR`). The HOST's own join: the driver calls it with a host path."""
+    return os.path.join(out_root, STAGE_SUBDIR)
 
 
 def _abs(p):
@@ -702,13 +713,14 @@ class StageConfig:
     def from_run(cls, run, **overrides):
         """The POSIX host's driver: its validated `Config` (`run.cfg`: sqlite_repo_url, jobs,
         tcl_version, tier, test_file), the clone's POSIX path it resolved (`run.sqlite_dir_posix`),
-        its output tree (`run.out_dir`), the resolver's `--stage-build` answer (`run.stage_build`) and
+        its output tree (`run.out_dir`; the stage is written under its `stage/`, `stage_dir_of`), the
+        resolver's `--stage-build` answer (`run.stage_build`) and
         the host (`run.host`). Nothing is defaulted silently: a missing one is refused by name."""
         c = run.cfg
         for name in ("sqlite_dir_posix", "out_dir", "stage_build", "host"):
             if not getattr(run, name, None):
                 C.die("INTERNAL: StageConfig.from_run needs run.%s, which is not set yet." % name)
-        kw = dict(sqlite_dir=run.sqlite_dir_posix, out_dir=run.out_dir, stage_build=run.stage_build,
+        kw = dict(sqlite_dir=run.sqlite_dir_posix, out_dir=stage_dir_of(run.out_dir), stage_build=run.stage_build,
                   tier=c.tier, test_file=c.test_file, jobs=c.jobs, tcl_version=c.tcl_version,
                   sqlite_repo_url=c.sqlite_repo_url, host_os=run.host, environ=dict(os.environ),
                   lock_what="build_and_test.py staging/build — tier %s" % c.tier)
@@ -1631,6 +1643,18 @@ def stage(cfg, log=None, lock=None):
             lock.release()
 
 
+def stage_and_persist(cfg, log=None, lock=None, stage_fn=None):
+    """`stage()` with its result PERSISTED: the ONE writer of `<cfg.out_dir>/derive-result.json`, for the WSL
+    derive (a Windows host) and a POSIX host's driver alike, so a later mode that REUSES the stage (the
+    round-close recompile) finds it on every host. A result an earlier run left is removed FIRST: a stage
+    that fails part-way must leave none to be read as this one's. `stage_fn` is the self-test's stand-in."""
+    path = _j(cfg.out_dir, RESULT_FILE)
+    _rm_f(path)
+    result = (stage_fn or stage)(cfg, log, lock=lock)
+    write_text_atomic(path, result.to_json())
+    return result
+
+
 def _stage_locked(cfg, log, lock):
     ctx = _Ctx(cfg, log)
     clone, out = cfg.sqlite_dir, cfg.out_dir
@@ -2112,17 +2136,17 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
                           environ=env, pkg_install=refuse_install,
                           lock_what="sqlite_stage.py derive for a Windows host (fetch/pull + configure + "
                                     "stage copy) — tier %s" % a.tier)
-        # A result from an earlier run must never be read as this one's, whatever happens next.
+        # A result from an earlier run must never be read as this one's, whatever happens next -- so it is
+        # removed before the clone lock is even asked for (`stage_and_persist` owns the write).
         _rm_f(_j(cfg.out_dir, RESULT_FILE))
         lock = (lock_factory or _default_lock_factory)(cfg.sqlite_dir)
         lock.write(cfg.lock_what, log)
         log.info("clone lock: WRITE on %s (held for the derive, released when it ends)" % cfg.sqlite_dir)
         try:
-            result = (stage_fn or stage)(cfg, log, lock=lock)
+            result = stage_and_persist(cfg, log, lock=lock, stage_fn=stage_fn)
         finally:
             lock.release()
         path = _j(cfg.out_dir, RESULT_FILE)
-        write_text_atomic(path, result.to_json())
     except C.HarnessDie as exc:
         _report(err, exc)
         return getattr(exc, "exit_code", 1)
@@ -2529,13 +2553,36 @@ def _st_pure(t):
         run = types.SimpleNamespace(cfg=rc_, sqlite_dir_posix=_j(tmp, "s"), out_dir=_j(tmp, "o"),
                                     stage_build=dict(_GOOD_SB), host="linux")
         c = StageConfig.from_run(run)
-        t.check("from_run takes the driver's validated Config and resolved paths",
+        t.check("from_run takes the driver's validated Config and resolved paths -- the stage under the "
+                "output tree's `stage/`, as on every host",
                 (c.sqlite_dir, c.out_dir, c.jobs, c.tier, c.tcl_version, c.sqlite_repo_url, c.copy_to_stage)
-                == (_abs(_j(tmp, "s")), _abs(_j(tmp, "o")), 4, "quick", "8.6", "https://x/s.git", False))
+                == (_abs(_j(tmp, "s")), _abs(_j(tmp, "o", STAGE_SUBDIR)), 4, "quick", "8.6", "https://x/s.git",
+                    False))
         run.sqlite_dir_posix = ""
         died, msg, _ = _dies(StageConfig.from_run, run)
         t.check("from_run refuses an unset clone path by name (never a silent default)",
                 died and "run.sqlite_dir_posix" in msg, msg)
+        # stage_and_persist: the ONE writer of the result, for a POSIX host's driver as for the WSL derive.
+        pcfg = _cfg(tmp)
+        _w(_j(pcfg.out_dir, RESULT_FILE), '{"stale": true}\n')
+
+        def dying_stage(cfg_, log_, lock=None):
+            C.die("the stage died part-way (the self-test)")
+        died, msg, _ = _dies(stage_and_persist, pcfg, C.Log(io.StringIO()), None, dying_stage)
+        t.check("stage_and_persist removes an earlier run's result BEFORE staging: a stage that dies "
+                "part-way leaves none behind", died and not os.path.exists(_j(pcfg.out_dir, RESULT_FILE)), msg)
+
+        def fine_stage(cfg_, log_, lock=None):
+            os.makedirs(cfg_.out_dir, exist_ok=True)
+            return _canned_result("/p")
+        res = stage_and_persist(pcfg, C.Log(io.StringIO()), None, fine_stage)
+        rpath = _j(pcfg.out_dir, RESULT_FILE)
+        back = None
+        if os.path.isfile(rpath):
+            with open(rpath, encoding="utf-8") as fh:
+                back = StageResult.from_json(fh.read()).to_dict()
+        t.check("stage_and_persist writes the result it returns, where the recompile reads it",
+                back == res.to_dict(), "no result was written at %s" % rpath if back is None else back)
         got = []
         ctx = _Ctx(_cfg(tmp, pkg_install=lambda a, b=None: got.append((a, b))), C.Log(io.StringIO()))
         ctx.which("no-such-tool-p4s2")

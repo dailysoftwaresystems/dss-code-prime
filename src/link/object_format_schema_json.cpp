@@ -3698,6 +3698,57 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             static_cast<std::uint32_t>(v)});
                 }
             }
+            // P68 round 9: the instruction words a SHARED wire type decodes to
+            // this row for (Mach-O arm64 ARM64_RELOC_PAGEOFF12) — see
+            // `ObjectFormatRelocationInfo::decodeWhenInstruction`. What the
+            // family must BE is `validate()`'s; this reads the shape.
+            if (r.contains("decodeWhenInstruction")) {
+                auto const& arr = r.at("decodeWhenInstruction");
+                auto const base =
+                    std::format("/relocations/{}/decodeWhenInstruction", i);
+                if (!arr.is_array() || arr.empty()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, base,
+                           "'decodeWhenInstruction' must be a non-empty array "
+                           "of { mask, value }");
+                    return false;
+                }
+                for (std::size_t j = 0; j < arr.size(); ++j) {
+                    auto const& e = arr[j];
+                    auto const path = std::format("{}/{}", base, j);
+                    static constexpr std::array<std::string_view, 2>
+                        kPatternKeys{"mask", "value"};
+                    DSS_CHECK_KEY_VOCABULARY(kPatternKeys);
+                    if (!e.is_object()
+                        || !e.contains("mask") || !e.at("mask").is_number_integer()
+                        || !e.contains("value") || !e.at("value").is_number_integer()) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               "each entry is { \"mask\": <u32>, \"value\": <u32> }");
+                        return false;
+                    }
+                    bool entryClean = true;
+                    detail::rejectUnknownKeys(e, kPatternKeys,
+                        "a decodeWhenInstruction entry",
+                        [&](std::string_view key, std::string message) {
+                            c.emit(DiagnosticCode::C_MalformedJson,
+                                   std::format("{}/{}", path, key),
+                                   std::move(message));
+                            entryClean = false;
+                        });
+                    if (!entryClean) return false;
+                    std::int64_t const m = e.at("mask").get<std::int64_t>();
+                    std::int64_t const v = e.at("value").get<std::int64_t>();
+                    if (m < 0 || m > 0xFFFFFFFFLL || v < 0 || v > 0xFFFFFFFFLL) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               std::format("mask ({}) and value ({}) must each "
+                                           "be in [0, 2^32)", m, v));
+                        return false;
+                    }
+                    info.decodeWhenInstruction.push_back(
+                        ObjectFormatRelocationInfo::InstructionPattern{
+                            static_cast<std::uint32_t>(m),
+                            static_cast<std::uint32_t>(v)});
+                }
+            }
             // ── TYPO DISCRIMINATOR FOR THE RELOCATION ROW ────────────────
             //
             // Every field above is read with `r.contains(...)`, so an
@@ -3728,9 +3779,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // (`opt/optimizer_json.cpp`, `ffi/shipped_lib_descriptor.cpp`)
             // missing the `$`-prose carve-out outright. The TABLE stays here,
             // with the fields it describes — only the loop moved.
-            static constexpr std::array<std::string_view, 7> kRelocationRowKeys{
+            static constexpr std::array<std::string_view, 8> kRelocationRowKeys{
                 "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly",
-                "nativeIdByBytesAfterField"};
+                "nativeIdByBytesAfterField", "decodeWhenInstruction"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationRowKeys);
             bool rowClean = true;
             detail::rejectUnknownKeys(r, kRelocationRowKeys, "a relocation row",
