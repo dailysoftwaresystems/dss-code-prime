@@ -1,0 +1,16 @@
+{
+  "$comment": "★★ THE UNSIGNED 64-BIT TO `float` CONVERSION AT ITS HARD VALUES (P68 round 12). 22 conversions by a plain C cast from a `volatile unsigned long long`, each float's BIT PATTERN compared with the correctly rounded value computed in exact arithmetic (round to nearest, ties to even, ONE rounding): 0, 1, 2^24+1, 2^24+3, 2^53+1, 2^63-1, 2^63, 2^64-1 and the ties on both sides of the top bit. Baseline x86_64 converts only SIGNED integers, so DSS halves a value with the top bit set, folding the dropped bit 0 into the kept bits, converts, and doubles; checks 12, 16 and 18 are the values a halving WITHOUT that fold rounds the wrong way, and checks 7, 12, 13, 16, 18 and 20 are the values a detour through `double` rounds twice. ✔MEASURED 2026-09-24: gcc 13.3.0 and clang 18.1.3 (-O0/-O2), aarch64-linux-gnu-gcc 13.3.0 under qemu (-O0/-O2), mingw-w64 gcc 13.2.0 (-O0/-O2) and MSVC 19.51 (/Od, /O2) all run it to 42. The `release` arm pins the same file through the shipped release pipeline.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

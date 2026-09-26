@@ -19,7 +19,7 @@
 //
 // Discriminators baked into the arithmetic:
 //   * `(0 - 64) >> 4` MUST be -4 (arithmetic/sign-fill). HONEST REACH
-//     (audit-residue sweep c2, D-AUDIT-WITNESS-STRENGTHENING): a
+//     (audit-residue sweep c2, which added the branch arm below): a
 //     logical-shift misroute yields 0x0FFFFFFC — huge positive, but
 //     its ADDITIVE delta vs -4 is exactly 2^28 ≡ 0 mod 256, so the
 //     SUM-routed exit aliases back to 42 under POSIX WEXITSTATUS;
@@ -79,8 +79,8 @@ int pressured(int x, int n) {               // called as pressured(5, 3)
              + a9 - 111;                    // 40+5+3+105-111 = 42
 }
 
-// BRANCH-observed SAR witness (audit-residue sweep c2,
-// D-AUDIT-WITNESS-STRENGTHENING): collapses the SAR-vs-SHR divergence
+// BRANCH-observed SAR witness (audit-residue sweep c2, which found
+// the sum term blind on POSIX): collapses the SAR-vs-SHR divergence
 // into a SIGN TEST instead of an additive delta, so it discriminates
 // on EVERY leg (the shifty() sum-term aliases mod 256 — above).
 // x = -64 and n = 3 arrive as runtime args (fold-resistant):

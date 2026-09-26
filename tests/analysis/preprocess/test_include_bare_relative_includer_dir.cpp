@@ -72,10 +72,9 @@ constexpr std::string_view kHeaderName  = "h28.h";
 constexpr std::string_view kNestedName  = "h29.h";
 
 // Shared schema fixture. Returns a REFERENCE to a function-local static for the
-// reason `test_preprocessor.cpp` spells out at length under
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: `GrammarSchema`'s accessors hand
-// back references INTO the schema, so a by-value return makes
-// `helper()->accessor()` a heap-use-after-free.
+// reason `test_preprocessor.cpp` spells out at length at its own `cSubset()`:
+// `GrammarSchema`'s accessors hand back references INTO the schema, so a
+// by-value return makes `helper()->accessor()` a heap-use-after-free.
 //
 // ⚠ CALL THIS BEFORE `useAsCwd()`, always. Schema discovery reads
 // `$DSS_CONFIG_ROOT` first — which `dss_add_test` sets, so under `ctest` the

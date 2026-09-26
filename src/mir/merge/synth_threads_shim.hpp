@@ -59,6 +59,12 @@ class DiagnosticReporter;
 // symbols but declaring no vehicle (never silently assume one); or (b) a recipe id with no
 // switch arm for the active vehicle (the closed-vocab loader guard makes this unreachable
 // in practice, but the arm is the anti-silent-gap backstop).
+//
+// ★★ LINKAGE: every function this pass defines (each shim and the once-adapter) is WEAK +
+// HIDDEN — the synthesis-once rule shared with `synthesizeStdioShim`: a synthesized library
+// body exists once per linked image however many separately compiled units carry a copy
+// (the linker's all-weak arm keeps one), and stays internal to that image (never exported,
+// never preemptible). tests/mir/test_synth_shim_collapse_linkage.cpp pins it.
 [[nodiscard]] DSS_EXPORT bool
 synthesizeThreadsShim(Mir&                                                  mir,
                       TypeInterner&                                         interner,

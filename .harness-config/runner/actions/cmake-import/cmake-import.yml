@@ -1,0 +1,14 @@
+# PURPOSE: convert a CMake project into a DSS `.dss-project.json` manifest.
+name: cmake-import
+description: >-
+  The action converts the CMake project it ships (`example/`) into a DSS manifest; on success the program prints a summary line (`cmake-import: <n> sources, <n> includes, <n> defines -> <file>`), which the step's success pattern witnesses, and the runner checks the declared output exists. The manifest lands in the step's build directory, outside the project, so every path in it is absolute (paths are relative only under the manifest's own directory) and it builds the same files from any working directory -- ctest's `harness/cmake_import_any_cwd` proves that with a real compiler.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+steps:
+  - name: convert-the-bundled-example
+    workingDirectoryRoot: action
+    run: |
+      python3 ./cmake-import.py ./example {stepBuild}/example.dss-project.json
+    successPattern: 'cmake-import: [0-9]+ sources'
+    outputs: ['example.dss-project.json']
+    requireInputsUnmoved: true

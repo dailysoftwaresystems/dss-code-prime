@@ -218,6 +218,52 @@ runXmm(std::string_view templateText, std::uint32_t widthBits) {
                  {"%0", "%1"}, {"xmm0", "xmm1"}, widthBits);
 }
 
+// ONE conversion with its two ends in DIFFERENT register files: `%0` -> xmm0 (fpr,
+// `dstWidth`) and `%1` -> the named GPR (`srcWidth`). `runOn` binds every operand
+// in one class, which is right for the arithmetic rows and wrong here.
+[[nodiscard]] std::unique_ptr<Run>
+runGprToXmm(std::string_view templateText, std::string const& gpr,
+            std::uint32_t srcWidth, std::uint32_t dstWidth) {
+    auto run     = std::make_unique<Run>();
+    run->dialect = loadDialect();
+    run->target  = shippedTarget();
+    auto tree = parseAsmTemplateText(std::string{templateText}, "<template>",
+                                     run->dialect, AsmTemplateSurface::Extended,
+                                     DiagnosticBudget::libraryDefault(),
+                                     run->reporter);
+    run->parsed = tree.has_value();
+    if (!run->parsed) return run;
+    LirBuilder builder{*run->target};
+    builder.addFunction(SymbolId{1});
+    LirBlockId const entry = builder.createBlock();
+    builder.beginBlock(entry);
+    std::vector<AsmOperandBinding> bindings;
+    auto bind = [&](char const* spelling, std::string const& reg, LirRegClass cls,
+                    std::uint32_t width) {
+        AsmOperandBinding b;
+        b.spelling  = spelling;
+        b.regClass  = cls;
+        b.widthBits = width;
+        auto const ord = run->target->registerByName(reg);
+        if (!ord.has_value()) throw std::runtime_error{"target declares no register " + reg};
+        b.reg = makePhysicalReg(*ord, cls);
+        bindings.push_back(std::move(b));
+    };
+    bind("%0", "xmm0", LirRegClass::FPR, dstWidth);
+    bind("%1", gpr, LirRegClass::GPR, srcWidth);
+    run->ok = lowerAsmTemplateToLirRun(*tree, *run->dialect, *run->target,
+                                       bindings, builder, run->reporter);
+    auto const retOp = run->target->opcodeByMnemonic("ret");
+    if (!retOp.has_value()) throw std::runtime_error{"target has no `ret`"};
+    builder.addReturn(*retOp, {});
+    Lir lir = std::move(builder).finish();
+    DiagnosticReporter     asmRep;
+    std::vector<MirInstId> lirToMir(lir.instCount());
+    auto const mod = assemble(lir, *run->target, lirToMir, asmRep);
+    if (mod.functions.size() == 1) run->bytes = mod.functions[0].bytes;
+    return run;
+}
+
 }  // namespace
 
 // ══ THE SUBJECT: THE WIDTH-KEYED PREFIX ═══════════════════════════════════
@@ -352,6 +398,23 @@ TEST(AsmX86SseDialectRows, MovsdAndMovapsDoNotEncodeTheSame) {
            "silently gone: " << hex(sd->bytes);
 }
 
+// ★★ THE SAME COMPARISON FOR THE PACKED PAIR: `movapd` (66 0F 28 /r) and
+// `movaps` (0F 28 /r) move the same 128 bits and differ ONLY in the 0x66
+// prefix, which is exactly the byte a neighbour binding would drop. Measured
+// against GNU as 2.42: `movapd %xmm0, %xmm1` is 66 0F 28 C8.
+TEST(AsmX86SseDialectRows, MovapdAndMovapsDoNotEncodeTheSame) {
+    auto const pd = runXmm("movapd %0, %1\n", 64);
+    auto const ps = runXmm("movaps %0, %1\n", 64);
+    ASSERT_TRUE(pd->ok) << messages(*pd);
+    ASSERT_TRUE(ps->ok) << messages(*ps);
+    EXPECT_NE(pd->bytes, ps->bytes)
+        << "`movapd` and `movaps` encoded identically — the 0x66 prefix that "
+           "makes the move packed-DOUBLE is gone: " << hex(pd->bytes);
+    ASSERT_FALSE(pd->bytes.empty());
+    EXPECT_EQ(pd->bytes.front(), 0x66)
+        << "`movapd` must carry its 0x66 prefix: " << hex(pd->bytes);
+}
+
 // ⚠ THE MEMORY FORMS MUST SURVIVE THE NEW REGISTER FORM. `movsd` now names
 // THREE opcodes and the target's guards choose between them by operand-list
 // length; if the [reg] guard ever shadowed the memory shapes, a load would
@@ -376,17 +439,23 @@ TEST(AsmX86SseDialectRows, TheRegisterFormDoesNotShadowTheMemoryForms) {
 
 // ══ THE NEAR-MISS RULE ════════════════════════════════════════════════════
 //
-// ★★★ GNU as ACCEPTS ALL SEVEN OF THESE AND THE TARGET DECLARES NO TEMPLATE
+// ★★★ GNU as ACCEPTS ALL SIX OF THESE AND THE TARGET DECLARES NO TEMPLATE
 // THAT EMITS THEIR BYTES, so they are deliberately UNDECLARED. Binding any of
 // them to the nearest existing opcode would emit different bytes under the same
-// source text — `movapd` on `movaps` drops the 0x66 and silently becomes a
-// packed-SINGLE move. That is the silent wrong instruction this table exists to
-// prevent, so the refusal is the correct behaviour and is pinned as such.
+// source text — `xorpd` on `xorps` would drop the 0x66 and silently become a
+// packed-SINGLE operation. That is the silent wrong instruction this table
+// exists to prevent, so the refusal is the correct behaviour and is pinned as
+// such.
 //
-// ⚠ THE LIST IS THE FULL SEVEN, not a sample. A partial list would let a future
+// ⚠ THE LIST IS THE FULL SIX, not a sample. A partial list would let a future
 // edit quietly bind one of the unlisted ones to a neighbour.
+// ⓘ IT WAS SEVEN: `movapd` left the list when the target gained its OWN
+// encoding (66 0F 28 /r, P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS)
+// — the way this rule says a near miss is meant to leave it, never by binding
+// to `movaps`. `MovapdAndMovapsDoNotEncodeTheSame` below pins that the two
+// spellings stay two instructions.
 TEST(AsmX86SseDialectRows, NearMissSpellingsRefuseRatherThanBindToTheNeighbour) {
-    for (auto const* spelling : {"movapd", "movups", "comisd", "comiss",
+    for (auto const* spelling : {"movups", "comisd", "comiss",
                                  "cvtsi2ss", "xorpd", "xorps"}) {
         auto const r = runXmm(std::string{spelling} + " %0, %1\n", 64);
         EXPECT_FALSE(r->ok)
@@ -459,7 +528,9 @@ TEST(AsmX86SseDialectRows, TheShippedDialectActuallyDeclaresTheSseBlock) {
                                   "ucomisd", "ucomiss",   "movaps", "movsd",
                                   "movss",   "cvtsd2ss",  "cvtss2sd",
                                   "cvttsd2si", "cvttss2si",
-                                  "cvtsi2sdq", "cvtsi2sdl"};
+                                  "cvtsi2sdq", "cvtsi2sdl",
+                                  "cvtsi2ssq", "cvtsi2ssl",
+                                  "cvtsi2ss",  "cvtsi2sd"};
     for (auto const& w : want) {
         bool found = false;
         for (auto const& row : rows) {
@@ -468,8 +539,8 @@ TEST(AsmX86SseDialectRows, TheShippedDialectActuallyDeclaresTheSseBlock) {
         EXPECT_TRUE(found)
             << "the shipped AT&T dialect no longer declares `" << w
             << "` — the `x` constraint has lost part of the vocabulary that "
-               "made it usable (D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-"
-               "INSTRUCTION-CAN-NAME)";
+               "made it usable "
+               "(D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME)";
     }
 }
 
@@ -483,8 +554,9 @@ TEST(AsmX86SseDialectRows, WidthChangingConversionsDeclareDestWidth) {
     auto const doc = nlohmann::json::parse(dialectText());
     auto const& rows = doc.at("assembly").at("instructions");
     std::vector<std::string> const changing{"cvtsd2ss", "cvtss2sd",
-                                            "cvttss2si", "cvtsi2sdl"};
-    std::vector<std::string> const same{"cvttsd2si", "cvtsi2sdq"};
+                                            "cvttss2si", "cvtsi2sdl",
+                                            "cvtsi2ssq"};
+    std::vector<std::string> const same{"cvttsd2si", "cvtsi2sdq", "cvtsi2ssl"};
     for (auto const& row : rows) {
         auto const sp = row.value("spelling", std::string{});
         for (auto const& c : changing) {
@@ -500,5 +572,35 @@ TEST(AsmX86SseDialectRows, WidthChangingConversionsDeclareDestWidth) {
                 << s << " has the SAME width on both sides — a `destWidth` "
                         "here would state a difference that does not exist";
         }
+    }
+}
+
+// ══ P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): CVTSI2SS, EVERY SPELLING ══
+//
+// ★ THE MANDATORY PREFIX IS THE CLAIM AGAIN, and REX.W the second one. CVTSI2SS
+// (F3) and CVTSI2SD (F2) share 0F 2A; a 64-bit source adds REX.W. ✔MEASURED, GNU as
+// 2.42 and clang 18.1.3 agreeing: `cvtsi2ss %eax,%xmm0` = F3 0F 2A C0 and
+// `cvtsi2ssq %rax,%xmm0` = F3 48 0F 2A C0. The unsuffixed spelling reads its
+// operation width from the SOURCE register, so `%eax` and `%rax` must reach the two
+// different encodings — and `cvtsi2sd` with the same source must keep F2.
+TEST(AsmX86SseDialectRows, Cvtsi2ssEncodesTheScalarSingleConvertAtTheSourceWidth) {
+    struct Case { char const* tmpl; char const* gpr; std::uint32_t src, dst;
+                  std::vector<std::uint8_t> want; };
+    std::vector<Case> const cases{
+        {"cvtsi2ssl %1, %0\n", "rax", 32, 32, {0xF3, 0x0F, 0x2A, 0xC0}},
+        {"cvtsi2ssq %1, %0\n", "rax", 64, 32, {0xF3, 0x48, 0x0F, 0x2A, 0xC0}},
+        {"cvtsi2ss %1, %0\n",  "rax", 32, 32, {0xF3, 0x0F, 0x2A, 0xC0}},
+        {"cvtsi2ss %1, %0\n",  "rax", 64, 32, {0xF3, 0x48, 0x0F, 0x2A, 0xC0}},
+        {"cvtsi2sd %1, %0\n",  "rax", 32, 64, {0xF2, 0x0F, 0x2A, 0xC0}},
+        {"cvtsi2sd %1, %0\n",  "rax", 64, 64, {0xF2, 0x48, 0x0F, 0x2A, 0xC0}},
+    };
+    for (auto const& c : cases) {
+        auto const r = runGprToXmm(c.tmpl, c.gpr, c.src, c.dst);
+        ASSERT_TRUE(r->parsed) << c.tmpl << messages(*r);
+        ASSERT_TRUE(r->ok) << c.tmpl << "(source " << c.src << " bits): " << messages(*r);
+        ASSERT_GE(r->bytes.size(), c.want.size()) << c.tmpl << hex(r->bytes);
+        std::vector<std::uint8_t> const got(r->bytes.begin(),
+                                            r->bytes.begin() + static_cast<std::ptrdiff_t>(c.want.size()));
+        EXPECT_EQ(got, c.want) << c.tmpl << "(source " << c.src << " bits): " << hex(r->bytes);
     }
 }

@@ -242,27 +242,18 @@ ObjectFormatSchema::assembleFlavourRuntimeLibraries() const {
             "cannot be assembled",
             member.name()));
     }
-    std::error_code ec;
-    std::vector<std::filesystem::path> documents;
-    for (std::filesystem::directory_iterator it{*dir, ec}, end; it != end;
-         it.increment(ec)) {
-        if (ec) break;
-        std::error_code typeEc;
-        if (!it->is_regular_file(typeEc) || typeEc) continue;
-        if (!it->path().filename().string().ends_with(".format.json")) continue;
-        documents.push_back(it->path());
-    }
-    if (ec) {
+    // THE ONE OWNER of which files ARE format documents (exactly `<stem>.format.json`,
+    // regular files, sorted by stem); a listing that fails or stops part-way is
+    // refused, because a partial scan cannot prove the family agrees.
+    auto const listed = shippedConfigDocuments(*dir, ".format.json");
+    if (!listed.has_value()) {
         return std::unexpected(std::format(
-            "the scan of object-format directory '{}' was interrupted after "
-            "PARTIAL enumeration ({}); a partial scan cannot prove the flavour "
-            "family of '{}' agrees, so it is refused",
-            dir->generic_string(), ec.message(), member.name()));
+            "{}; a partial or failed scan cannot prove the flavour family of "
+            "'{}' agrees, so it is refused",
+            listed.error(), member.name()));
     }
-    std::sort(documents.begin(), documents.end(),
-              [](std::filesystem::path const& a, std::filesystem::path const& b) {
-                  return a.filename().string() < b.filename().string();
-              });
+    std::vector<std::filesystem::path> documents;
+    for (auto const& document : *listed) documents.push_back(document.path);
 
     RuntimeLibraryTable      merged;
     std::vector<std::string> declaredBy;   // parallel to `merged.bindings`
@@ -359,6 +350,31 @@ ObjectFormatSchema::relocationDecodeTable() const {
         // guarantees the aliased row is present, so skipping never leaves the
         // wire id unmapped.
         if (r.emitOnly) continue;
+        // A wire type SEVERAL rows share, told apart by the instruction at the
+        // site (`decodeWhenInstruction`): `decode` reads the word. `validate()`
+        // guarantees every row sharing the type is patterned and that no two
+        // patterns can match one word, so the order kept here decides nothing.
+        if (!r.decodeWhenInstruction.empty()) {
+            if (table.nativeToKind.contains(r.nativeId)) {
+                return std::unexpected(
+                    "object format schema '" + std::string{name()}
+                    + "' decodes native reloc id " + std::to_string(r.nativeId)
+                    + " both by instruction and without one -- ambiguous "
+                      "reverse map.");
+            }
+            auto& rows = table.byInstruction[r.nativeId];
+            for (auto const& p : r.decodeWhenInstruction) {
+                rows.push_back(RelocationDecodeTable::InstructionKind{p, r.kind});
+            }
+            continue;
+        }
+        if (table.byInstruction.contains(r.nativeId)) {
+            return std::unexpected(
+                "object format schema '" + std::string{name()}
+                + "' decodes native reloc id " + std::to_string(r.nativeId)
+                + " both by instruction and without one -- ambiguous reverse "
+                  "map.");
+        }
         if (auto e = mapNative(r.nativeId, r.kind)) {
             return std::unexpected(std::move(*e));
         }
@@ -373,6 +389,15 @@ ObjectFormatSchema::relocationDecodeTable() const {
                 return std::unexpected(std::move(*e));
             }
             table.callSignalNativeIds.insert(r.pltNativeId);
+        }
+        // The wire types a format spells by the bytes after the field
+        // (X86_64_RELOC_SIGNED_1/_2/_4) decode to the row's own kind: they
+        // differ from `nativeId` in the type alone, never in the addend.
+        for (auto const& e : r.nativeIdByBytesAfterField) {
+            if (auto err = mapNative(e.nativeId, r.kind)) {
+                return std::unexpected(std::move(*err));
+            }
+            if (r.isCall) table.callSignalNativeIds.insert(e.nativeId);
         }
         if (r.isCall) table.callSignalNativeIds.insert(r.nativeId);
     }
@@ -684,8 +709,8 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                          "weak definition ({}). Omit the block entirely to "
                          "leave the question unanswered; an engaged block with "
                          "the invalid sentinel is neither an answer nor an "
-                         "omission. D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-"
-                         "DECLARED.",
+                         "omission. "
+                         "D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED.",
                          detail::renderAllowedList(
                              allNames(kWeakDefinitionDialectTable), " or ")));
     }
@@ -809,6 +834,88 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         }
     }
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a runpath declaration must be
+    //    one some walker records, on an image some loader reads ─────────────
+    //
+    // The VALUES are judged by the one rule set the writers also run
+    // (`runpathDeclarationProblems`, link/runpath.hpp). The two rules only
+    // THIS tier can state need the backend, which is why they are here and not
+    // in that shared set:
+    //   * the resolved backend's walker must record the declared carrier —
+    //     "does anyone write this, and is it you?", the `weakDefinition` and
+    //     `stackReserveControl` shape — or the request would be accepted at the
+    //     gate and dropped by the walker it was handed to;
+    //   * the format must be an IMAGE flavor. A relocatable object or an archive
+    //     member is never loaded by the loader that reads a runpath, so the key
+    //     there would load clean and never act.
+    if (runpath.has_value()) {
+        for (auto& p : runpathDeclarationProblems(*runpath)) {
+            fail(std::string{"/runpath/"} + std::string{p.key},
+                 std::move(p.message) + ". D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.");
+        }
+        if (runpath->carrier != RunpathCarrier::Unspecified) {
+            auto const writes = [&](link::ObjectFormatBackend const* b) {
+                if (b == nullptr) return false;
+                for (RunpathCarrier c : b->runpathCarriers()) {
+                    if (c == runpath->carrier) return true;
+                }
+                return false;
+            };
+            if (!writes(backend)) {
+                link::ObjectFormatBackend const* writer = nullptr;
+                for (auto const* candidate : link::objectFormatBackendTable()) {
+                    if (writes(candidate)) { writer = candidate; break; }
+                }
+                fail("/runpath/carrier",
+                     std::format(
+                         "runpath carrier '{}' is recorded by {}, but this "
+                         "document resolves to the '{}' backend, whose walker "
+                         "would accept the request at the gate and then drop "
+                         "it. Fix the carrier or the format.kind. "
+                         "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.",
+                         runpathCarrierName(runpath->carrier),
+                         writer != nullptr
+                             ? std::format("the '{}' walker",
+                                           writer->configName())
+                             : std::string{"NO walker in this build"},
+                         backend != nullptr
+                             ? std::string{backend->configName()}
+                             : std::string{"<unresolved>"}));
+            }
+        }
+        if (backend == nullptr || !backend->isImageFlavor(*this)) {
+            fail("/runpath",
+                 "a runpath is declared on a format that is not an IMAGE "
+                 "flavor: a relocatable object or an archive member is never "
+                 "loaded by the loader that reads a runpath, so the declaration "
+                 "could never act. Declare it on the executable / shared-library "
+                 "formats, where the final link records it. "
+                 "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.");
+        }
+    }
+    // The remedy axis: a document cannot both record a runpath and explain why
+    // it records none, and a relocatable/archive format needs no explanation —
+    // the warning derives its answer from `isImageFlavor()` — so one declared
+    // there would sit inert.
+    if (runpathUnsupportedReason.has_value()) {
+        if (runpath.has_value()) {
+            problems.push_back(ConfigDiagnostic{
+                DiagnosticCode::C_ConflictingField, DiagnosticSeverity::Error,
+                "/runpathUnsupportedReason",
+                "a format must not declare BOTH 'runpath' (it RECORDS a "
+                "runpath) and 'runpathUnsupportedReason' (why it records "
+                "none) — delete whichever no longer applies. "
+                "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH."});
+        } else if (backend == nullptr || !backend->isImageFlavor(*this)) {
+            fail("/runpathUnsupportedReason",
+                 "'runpathUnsupportedReason' is declared on a format that is "
+                 "not an IMAGE flavor: nothing loads a relocatable object or an "
+                 "archive, and the warning already says so for every such "
+                 "format, so the declaration would never be read. "
+                 "D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.");
+        }
+    }
+
     // Cross-row reloc uniqueness + non-empty-name + non-zero-kind:
     // shared substrate with TargetSchema so the two sides of plan
     // 13 §2.6's reloc-taxonomy unifier are validated identically.
@@ -835,6 +942,9 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         std::unordered_map<std::uint32_t, std::size_t> primaryOf;
         for (std::size_t i = 0; i < relocations.size(); ++i) {
             if (relocations[i].emitOnly) continue;
+            // A row decoded BY INSTRUCTION shares its wire type on purpose; the
+            // block below states what such a family must be.
+            if (!relocations[i].decodeWhenInstruction.empty()) continue;
             auto const ins = primaryOf.emplace(relocations[i].nativeId, i);
             if (!ins.second) {
                 fail(std::format("/relocations/{}/nativeId", i),
@@ -889,6 +999,158 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                              "R_X86_64_PC32 = 2)",
                              relocations[i].name));
         }
+    }
+
+    // ── nativeIdByBytesAfterField (P68 round 9) ──────────────────────────
+    // Each entry is a WIRE TYPE of its own and decodes to its row's kind, so it
+    // obeys the rules a `nativeId` does: non-zero, claimed by no other row or
+    // entry, and on a row that DECODES (an emission alias is excluded from the
+    // reverse map, so an entry on one could never be read back). A byte count
+    // of 0 would shadow the row's own `nativeId`, and two entries for one count
+    // would make the emitter's choice a declaration-order coin flip.
+    {
+        std::unordered_map<std::uint32_t, std::string> claimed;
+        for (auto const& r : relocations) {
+            if (!r.emitOnly) claimed.emplace(r.nativeId, r.name);
+            if (r.pltNativeId != 0u) claimed.emplace(r.pltNativeId, r.name);
+        }
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            auto const& r = relocations[i];
+            if (!r.nativeIdByBytesAfterField.empty() && r.emitOnly) {
+                fail(std::format("/relocations/{}/nativeIdByBytesAfterField", i),
+                     std::format("relocation '{}' is an emission alias "
+                                 "(emitOnly), so its bytes-after-field wire "
+                                 "types could never be decoded", r.name));
+            }
+            for (std::size_t j = 0; j < r.nativeIdByBytesAfterField.size(); ++j) {
+                auto const& e = r.nativeIdByBytesAfterField[j];
+                auto const path = std::format(
+                    "/relocations/{}/nativeIdByBytesAfterField/{}", i, j);
+                if (e.bytesAfterField == 0 || e.nativeId == 0) {
+                    fail(path,
+                         std::format("relocation '{}': a bytes-after-field "
+                                     "entry needs a non-zero byte count (0 is "
+                                     "the row's own 'nativeId') and a non-zero "
+                                     "wire type", r.name));
+                }
+                for (std::size_t k = 0; k < j; ++k) {
+                    if (r.nativeIdByBytesAfterField[k].bytesAfterField
+                        == e.bytesAfterField) {
+                        fail(path,
+                             std::format("relocation '{}' lists {} byte(s) "
+                                         "after the field twice", r.name,
+                                         e.bytesAfterField));
+                    }
+                }
+                auto const ins = claimed.emplace(e.nativeId, r.name);
+                if (!ins.second) {
+                    fail(path,
+                         std::format("relocation '{}': wire type {} is already "
+                                     "claimed by '{}' — a native wire id maps "
+                                     "back to exactly ONE RelocationKind",
+                                     r.name, e.nativeId, ins.first->second));
+                }
+            }
+        }
+    }
+
+    // ── decodeWhenInstruction (P68 round 9) ──────────────────────────────
+    // A wire type decoded BY INSTRUCTION is still a FUNCTION of the site: every
+    // row sharing the type must be patterned (a plain row beside them would
+    // claim every word no pattern names, and the reader could not tell which
+    // was meant), and no word may match two rows. A pattern is a real test —
+    // a zero mask matches every word, and a value with bits outside its mask
+    // matches none. The row's other decode-side declarations have no meaning
+    // for a shared type, so a patterned row may not carry them.
+    {
+        std::unordered_map<std::uint32_t, std::vector<std::size_t>> patterned;
+        for (std::size_t i = 0; i < relocations.size(); ++i) {
+            auto const& r = relocations[i];
+            if (r.decodeWhenInstruction.empty()) continue;
+            auto const path =
+                std::format("/relocations/{}/decodeWhenInstruction", i);
+            if (r.emitOnly || r.isCall || r.pltNativeId != 0u
+                || !r.nativeIdByBytesAfterField.empty()) {
+                fail(path,
+                     std::format("relocation '{}' is decoded by instruction, "
+                                 "so it cannot also be an emission alias, a "
+                                 "call signal, a PLT variant or a "
+                                 "bytes-after-field family",
+                                 r.name));
+            }
+            for (std::size_t j = 0; j < r.decodeWhenInstruction.size(); ++j) {
+                auto const& p = r.decodeWhenInstruction[j];
+                if (p.mask == 0u || (p.value & ~p.mask) != 0u) {
+                    fail(std::format("{}/{}", path, j),
+                         std::format("relocation '{}': a pattern needs a "
+                                     "non-zero mask and a value inside it "
+                                     "(mask {:#010x}, value {:#010x})",
+                                     r.name, p.mask, p.value));
+                }
+            }
+            patterned[r.nativeId].push_back(i);
+        }
+        for (auto const& [nid, rows] : patterned) {
+            for (std::size_t i = 0; i < relocations.size(); ++i) {
+                auto const& r = relocations[i];
+                if (r.nativeId == nid && !r.emitOnly
+                    && r.decodeWhenInstruction.empty()) {
+                    fail(std::format("/relocations/{}/nativeId", i),
+                         std::format("relocation '{}' shares wire type {} with "
+                                     "rows decoded by instruction but declares "
+                                     "no pattern of its own",
+                                     r.name, nid));
+                }
+            }
+            for (std::size_t a = 0; a < rows.size(); ++a) {
+                for (std::size_t b = a + 1; b < rows.size(); ++b) {
+                    auto const& ra = relocations[rows[a]];
+                    auto const& rb = relocations[rows[b]];
+                    for (auto const& pa : ra.decodeWhenInstruction) {
+                        for (auto const& pb : rb.decodeWhenInstruction) {
+                            // Two patterns share a word iff they agree on
+                            // every bit both of them test.
+                            if (((pa.value ^ pb.value) & (pa.mask & pb.mask)) == 0u) {
+                                fail(std::format(
+                                         "/relocations/{}/decodeWhenInstruction",
+                                         rows[b]),
+                                     std::format(
+                                         "relocations '{}' and '{}' share wire "
+                                         "type {} and both decode the word "
+                                         "(mask {:#010x}, value {:#010x}) / "
+                                         "(mask {:#010x}, value {:#010x}) can "
+                                         "match — one word must decode to one "
+                                         "kind",
+                                         ra.name, rb.name, nid, pa.mask,
+                                         pa.value, pb.mask, pb.value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── relocationAddends (P68 round 9): where an addend lives is a FORMAT
+    // fact, and a format that writes relocations must state it — both
+    // answers produce a well-formed object, and only one is the format.
+    if (!relocations.empty() && !relocationAddendStorage.has_value()) {
+        fail("/relocationAddends",
+             "a format that declares relocations must declare where their "
+             "addend lives ('relocationAddends': 'explicit' — the record has an "
+             "addend column — or 'inPlace' — the patched field holds it)");
+    }
+
+    // ── inputSectionPlacement (P68 round 9): whether the link may split a
+    // relocatable object's input section into independently placed atoms. A
+    // format whose objects carry relocations must say it, because both answers
+    // link and only one of them keeps the producer's code correct.
+    if (!relocations.empty() && !inputSectionPlacement.has_value()) {
+        fail("/inputSectionPlacement",
+             "a format that declares relocations must declare whether its "
+             "input sections may be split into independently placed atoms "
+             "('inputSectionPlacement': 'unit' — never — or "
+             "'subsectionsWhenDeclared' — only when the object declares it)");
     }
 
     // Sections: (kind, encoding) unique cross-row + name non-empty. The format
@@ -1450,6 +1712,118 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "names would never be emitted. Declare the argc/argv verb(s) "
                  "this format realizes, or drop the mechanism. "
                  "(D-FFI-PE-CRT-UCRT-MIGRATION.)");
+        }
+    }
+
+    // ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: every declared verb must be REALIZABLE
+    //    by the declared mechanism, and every environment key must be CONSUMED ──
+    //
+    // The rule above stops at "the CRT names are not dead". A verb the mechanism
+    // CANNOT produce is the worse half: it survives candidate selection (the verb
+    // is in this set), so the entry is called — and the values the mechanism never
+    // produced are read from whatever the argument registers hold, which is the
+    // MEASURED fault the entry-verb set exists to refuse (an envp observed as
+    // `0x4`). What a mechanism can hand an entry is a property of the MECHANISM,
+    // stated here once and asked of every declared verb:
+    //   * `stack-vector` — the entry-stack vector: argc and NARROW strings, and the
+    //     environment vector only where this format DECLARES its position
+    //     (`envpFollowsArgvTerminator` + `vectorSlotBytes`). That layout holds no
+    //     wide vector.
+    //   * `crt-argv-accessors` — argc and argv in both widths (the loader requires
+    //     all five accessor names), and each width's environment only where this
+    //     format declares that width's initialize/accessor PAIR.
+    //   * both end at the environment: neither layout has a fourth value, so a
+    //     four-value verb (Darwin's `apple`) is realizable only where the LOADER
+    //     delivers the arguments itself — no `processArgs` block at all, where the
+    //     listed verbs ARE the declaration of what the loader hands over and there
+    //     is no model here to second-guess it with.
+    // And the converse: an environment position or pair that no listed verb
+    // consumes is dead config — nothing would ever read it — refused like the
+    // dead accessor names above.
+    if (processArgs.has_value()) {
+        ProcessArgs const& pa = *processArgs;
+        constexpr std::size_t kMechanismValuesMax = 3;   // (argc, argv, envp)
+        bool const stackVector = pa.mechanism == ArgsMechanism::StackVector;
+        bool const crt         = pa.mechanism == ArgsMechanism::CrtArgvAccessors;
+        bool const stackEnvDeclared =
+            pa.envpFollowsArgvTerminator && pa.vectorSlotBytes != 0;
+        bool const narrowPairDeclared = !pa.initializeNarrowEnvironmentFn.empty()
+                                     && !pa.narrowEnvironmentAccessorFn.empty();
+        bool const widePairDeclared = !pa.initializeWideEnvironmentFn.empty()
+                                   && !pa.wideEnvironmentAccessorFn.empty();
+        bool narrowEnvConsumed = false;
+        bool wideEnvConsumed   = false;
+        for (auto const v : entryVerbs) {
+            auto const params = entryVerbParams(v);
+            if (params.empty()) continue;   // `none` — nothing to materialize
+            bool const wide = entryVerbIsWide(v);
+            bool const env  = entryVerbPassesEnvironment(v);
+            if (env && wide) wideEnvConsumed = true;
+            if (env && !wide) narrowEnvConsumed = true;
+            std::string why;
+            if (params.size() > kMechanismValuesMax) {
+                why = std::format(
+                    "it hands the entry {} values and this mechanism produces at "
+                    "most {} (argc, argv, envp); only a format whose LOADER "
+                    "delivers the arguments itself — no `processArgs` block — "
+                    "can realize more",
+                    params.size(), kMechanismValuesMax);
+            } else if (stackVector && wide) {
+                why = "the entry-stack vector holds NARROW strings only — no wide "
+                      "argument vector exists in that layout";
+            } else if (stackVector && env && !stackEnvDeclared) {
+                why = "`processArgs` does not declare where the environment "
+                      "vector sits (`envpFollowsArgvTerminator` + "
+                      "`vectorSlotBytes`)";
+            } else if (crt && env && !(wide ? widePairDeclared : narrowPairDeclared)) {
+                why = wide
+                    ? "`processArgs` does not declare the wide environment's "
+                      "`initializeWideEnvironmentFn` + `wideEnvironmentAccessorFn` "
+                      "pair"
+                    : "`processArgs` does not declare the narrow environment's "
+                      "`initializeNarrowEnvironmentFn` + "
+                      "`narrowEnvironmentAccessorFn` pair";
+            }
+            if (!why.empty()) {
+                // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+                fail("/entryVerbs",
+                     std::format(
+                         "declares the `{}` verb, which the `{}` mechanism cannot "
+                         "realize: {}. The verb would survive candidate selection "
+                         "and the entry would read the values nothing produced "
+                         "from uninitialized argument registers — the MEASURED "
+                         "fault this set exists to refuse (an envp observed as "
+                         "0x4). Declare what the mechanism needs, or drop the "
+                         "verb.",
+                         entryMaterializationName(v),
+                         argsMechanismName(pa.mechanism), why));
+            }
+        }
+        if (stackVector && pa.envpFollowsArgvTerminator && !narrowEnvConsumed) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            fail("/processArgs/envpFollowsArgvTerminator",
+                 "declares the environment vector's position but `entryVerbs` "
+                 "names no environment verb that reads it — dead config the "
+                 "synthesized init would never consult. Declare `argc-argv-envp`, "
+                 "or drop the position.");
+        }
+        if (crt && (!pa.initializeNarrowEnvironmentFn.empty()
+                    || !pa.narrowEnvironmentAccessorFn.empty())
+            && !narrowEnvConsumed) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            fail("/processArgs/initializeNarrowEnvironmentFn",
+                 "declares the narrow environment's CRT exports but `entryVerbs` "
+                 "names no narrow environment verb — the names would never be "
+                 "imported. Declare `argc-argv-envp`, or drop the pair.");
+        }
+        if (crt && (!pa.initializeWideEnvironmentFn.empty()
+                    || !pa.wideEnvironmentAccessorFn.empty())
+            && !wideEnvConsumed) {
+            // Anchored: D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE.
+            fail("/processArgs/initializeWideEnvironmentFn",
+                 "declares the wide environment's CRT exports but `entryVerbs` "
+                 "names no wide environment verb — the names would never be "
+                 "imported. Declare `argc-wargv-wenvp`, or drop the pair.");
         }
     }
 

@@ -109,6 +109,8 @@ TEST(StmtExprValueType, DeclarationInsideTheBodyDoesNotTypeTheConstruct) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "the body yields `int *`; the `int **` declared inside it is not the "
            "operand of the dereference";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // The two bisect CONTROLS, which passed before the fix and must still pass: a
@@ -124,6 +126,8 @@ TEST(StmtExprValueType, TheTwoShapesThatAlreadyWorkedStillWork) {
     ASSERT_EQ(parseErrorsFor(src), 0u);
     auto model = analyzeC(src);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A body whose declarations share NOTHING with what it yields — the walk that

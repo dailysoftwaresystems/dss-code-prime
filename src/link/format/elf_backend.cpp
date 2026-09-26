@@ -59,6 +59,14 @@ constexpr WeakDefinitionDialect kElfWeakDialects[] = {
     WeakDefinitionDialect::SymbolBinding,
 };
 
+// D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH. The runpath carrier THIS backend's
+// walker records: `elf.cpp`'s dynamic-image writer appends the joined list to
+// `.dynstr` and writes one `.dynamic` entry pointing at it. One row, so a
+// document declaring `macho-load-command` is refused at LOAD.
+constexpr RunpathCarrier kElfRunpathCarriers[] = {
+    RunpathCarrier::ElfDynamicEntry,
+};
+
 // ── The three ELF header vocabularies that have no `EnumNameTable` ────────
 // D-CONFIG-ENUM-KEYED-MAP-DIAGNOSTICS-RETYPE-THEIR-CLOSED-SET.
 //
@@ -207,6 +215,10 @@ public:
         // other two. The row is
         // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.
         return kElfWeakDialects;
+    }
+    [[nodiscard]] std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept override {
+        return kElfRunpathCarriers;
     }
 
     [[nodiscard]] bool
@@ -813,13 +825,24 @@ public:
            ObjectFormatSchema const& objectFormatSchema,
            DiagnosticReporter&       reporter,
            ImageRequest const&       request) const override {
-        // `request` is unused here BY CONSTRUCTION, not by omission:
-        // `stackReserveVehicles()` above is empty, so the load-time coherence
-        // rule rejects any ELF schema declaring a vehicle and the linker's
-        // pre-walker gate refuses any request against a format that declares
-        // no capability. An ELF walker can only ever be handed an empty one.
-        (void)request;
-        return elf::encode(module, targetSchema, objectFormatSchema, reporter);
+        // `request` reaches the walker for its RUNPATHS
+        // (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH), which the dynamic-image
+        // writer records under the format's declared `runpath`. Its stack
+        // reserve can never arrive: `stackReserveVehicles()` above is empty, so
+        // the load-time rule rejects an ELF schema declaring a vehicle and the
+        // gate refuses a reserve request against a format declaring none.
+        return elf::encode(module, targetSchema, objectFormatSchema, reporter,
+                           request);
+    }
+
+    // [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]:
+    // where `encode` above puts each import's `.plt` stub — answered by the
+    // writer's own TU, beside the layout it describes.
+    [[nodiscard]] link::ImportCallStubLayout
+    importCallStubLayout(AssembledModule const&    module,
+                         TargetSchema const&       /*targetSchema*/,
+                         ObjectFormatSchema const& objectFormatSchema) const override {
+        return elf::importCallStubLayout(module, objectFormatSchema);
     }
 
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of

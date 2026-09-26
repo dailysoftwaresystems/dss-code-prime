@@ -35,9 +35,9 @@
 //
 // ⚠ WHAT THE CORPUS EXAMPLE CANNOT REACH, WHICH IS WHY THIS FILE EXISTS.
 // `examples/c/shipped_dirent_typed_surface` proves the POSITIVE half by
-// execution. The half that closes the row is a REFUSAL, and an example that
-// must be refused is not a runnable example — so the refusals live here, each
-// beside its nearest ACCEPTING twin, because a type check fails in two opposite
+// execution. The half that closes the row is a DIAGNOSTIC (a refusal until P68
+// round 9, the warning every reference gives since) — so the diagnosed cases live
+// here, each beside its nearest ACCEPTING twin, because a type check fails in two opposite
 // directions and only the pair separates a fix that landed from one that
 // over-reached.
 
@@ -267,7 +267,7 @@ TEST(ShippedDirentTypedSurface, AReadThatSelectsNoVariantTypesDirentIncomplete) 
     }
 }
 
-// ══ 2. THE SEMANTIC TIER — the refusals the row exists for, each with a twin ══
+// ══ 2. THE SEMANTIC TIER — the diagnostics the row exists for, each with a twin ══
 
 namespace {
 
@@ -285,7 +285,7 @@ namespace {
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dm, std::nullopt,
-                   std::nullopt, fmt, arch);
+                   std::nullopt, SelectableObjectFormatKind::of(fmt), arch);
 }
 
 [[nodiscard]] SemanticModel analyzeDirentElf(std::string src) {
@@ -301,6 +301,16 @@ constexpr char const* kPrologue =
     return std::string{kPrologue} + body + "\n closedir(d); return 0; }\n";
 }
 
+// ★ P68 round 9 — A GOOD SIDE IS PROVEN BY THE ABSENCE OF THE CONVERSION CODES.
+// An incompatible pointer conversion now BUILDS with its diagnostic (the warning
+// every reference gives), so `!hasErrors()` and `!S_TypeMismatch` can no longer
+// see a descriptor that lost its pointer type. This can.
+[[nodiscard]] bool diagnosesAPointerConversion(DiagnosticReporter const& r) {
+    return hasCode(r, DiagnosticCode::S_IncompatiblePointerConversion)
+        || hasCode(r, DiagnosticCode::S_IncompatiblePointerIntegerPointee)
+        || hasCode(r, DiagnosticCode::S_IntegerPointerConversion);
+}
+
 }  // namespace
 
 // ★★★ THE CLOSING TEST THE ROW NAMES. `int *x = readdir(d);` must be
@@ -313,17 +323,18 @@ constexpr char const* kPrologue =
 //   probed SEPARATELY on this exact program: gcc 13.3.0 (WSL, -std=c17 AND
 //   -std=c2x), clang 18.1.3 (both), and mingw-w64 gcc 13.2.0 (both) ALL emit
 //   `-Wincompatible-pointer-types` and ALL exit 0 — they DIAGNOSE it and COMPILE
-//   it. DSS today answers `error[S_TypeMismatch]` and rc=1, which is stricter
-//   than the union of the references. THAT STRICTNESS IS NOT THIS ROW'S AND IS
-//   NOT NEW: ✔MEASURED against the UNMODIFIED tree, the matched control
-//   `FILE *f; int *x; x = f;` — a header typed over a struct pointer since long
-//   before P56 — is refused with the SAME code and the SAME rc there. So pinning
-//   Error severity here would pin a divergence this lane did not introduce and
-//   would red the day it is correctly relaxed. What the row claims, and what all
-//   four toolchains agree on, is that the program must not pass in SILENCE.
+//   it. DSS answered `error[S_TypeMismatch]` and rc=1 when this was written,
+//   stricter than the union of the references, and that strictness was not this
+//   row's (the matched control `FILE *f; int *x; x = f;` was refused the same
+//   way). P68 round 9 made the correction this comment anticipated: DSS builds
+//   an incompatible pointer conversion with S_IncompatiblePointerConversion, as
+//   the references do, and the pins moved with it rather than going silent. What
+//   the row claims, and what all four toolchains agree on, is that the program
+//   must not pass in SILENCE — and a good side is proven by the ABSENCE of the
+//   conversion codes (`diagnosesAPointerConversion`), never by `!hasErrors()`.
 TEST(ShippedDirentTypedSurface, ReaddirsResultNoLongerAssignsToAnyPointer) {
     auto const bad = analyzeDirentElf(program(" int *x = readdir(d); (void)x;"));
-    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "`int *x = readdir(d);` is a constraint violation every reference "
            "diagnoses; a void-typed row could not see it at all";
 
@@ -332,6 +343,8 @@ TEST(ShippedDirentTypedSurface, ReaddirsResultNoLongerAssignsToAnyPointer) {
     EXPECT_FALSE(hasCode(good.diagnostics(), DiagnosticCode::S_TypeMismatch))
         << "the ordinary shape every directory walk is written in must stay "
            "accepted";
+    EXPECT_FALSE(diagnosesAPointerConversion(good.diagnostics()))
+        << "`struct dirent *` IS readdir's result type: nothing to diagnose";
     EXPECT_FALSE(good.diagnostics().hasErrors());
 }
 
@@ -346,7 +359,7 @@ TEST(ShippedDirentTypedSurface, TheFileControlDiagnosesTheSameShape) {
         "#include <stdio.h>\n"
         "int main(void){ FILE *f = fopen(\"x\", \"r\"); int *p;\n"
         " if (f == 0) return 1; p = f; (void)p; fclose(f); return 0; }\n");
-    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "the control must diagnose, or it is not a control";
 }
 
@@ -355,29 +368,34 @@ TEST(ShippedDirentTypedSurface, TheFileControlDiagnosesTheSameShape) {
 // from an `int *`, so the classic transposition is caught at the declaration.
 TEST(ShippedDirentTypedSurface, TheDirHandleIsNoLongerAnyPointer) {
     auto const bad = analyzeDirentElf(program(" int *h = opendir(\".\"); (void)h;"));
-    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_TypeMismatch))
+    EXPECT_TRUE(hasCode(bad.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion))
         << "opendir's product is a DIR *, not any pointer at all";
 
     auto const good = analyzeDirentElf(program(" DIR *h = opendir(\".\"); (void)h;"));
     EXPECT_FALSE(hasCode(good.diagnostics(), DiagnosticCode::S_TypeMismatch));
+    EXPECT_FALSE(diagnosesAPointerConversion(good.diagnostics()))
+        << "`DIR *` IS opendir's result type: nothing to diagnose";
     EXPECT_FALSE(good.diagnostics().hasErrors());
 }
 
 // ⚠ THE OVER-REACH DETECTOR. Typing the surface must NOT break the two shapes
 // real code is written in: `void *` still converts to and from these pointers
-// in both directions (C 6.3.2.3p1), which is what keeps sqlite's shell.c and
-// `examples/c/pe_direct_dirent_superset` — which stages readdir's result
-// through a `void *` — compiling. A fix that refused these would have replaced
-// a laxness defect with a strictness one.
+// in both directions (C 6.3.2.3p1), which is what keeps sqlite's shell.c, and
+// any code that stages readdir's result through a `void *`, compiling. A fix
+// that refused these would have replaced a laxness defect with a strictness one.
 TEST(ShippedDirentTypedSurface, VoidPointerInteroperabilityIsUnchanged) {
     auto const viaVoid =
         analyzeDirentElf(program(" void *e = readdir(d); (void)e;"));
     EXPECT_FALSE(viaVoid.diagnostics().hasErrors())
+        << "T * -> void * is a standard implicit conversion and must stay one";
+    EXPECT_FALSE(diagnosesAPointerConversion(viaVoid.diagnostics()))
         << "T * -> void * is a standard implicit conversion and must stay one";
 
     auto const backOut =
         analyzeDirentElf(program(" void *p = d; struct dirent *e = readdir(p);"
                                  " (void)e;"));
     EXPECT_FALSE(backOut.diagnostics().hasErrors())
+        << "void * -> T * is the other direction of the same conversion";
+    EXPECT_FALSE(diagnosesAPointerConversion(backOut.diagnostics()))
         << "void * -> T * is the other direction of the same conversion";
 }

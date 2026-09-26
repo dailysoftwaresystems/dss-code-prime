@@ -1,0 +1,15 @@
+{
+  "$comment": "P68 round 12 (lane `cs`, D-C-A-QUALIFIED-USE-OF-A-VLA-TYPEDEF-FOUND-NO-FROZEN-SIZE): a VARIABLE-LENGTH-array typedef reached through a QUALIFIED use — `volatile V v`, `volatile V *p` (subscripted, and `sizeof *p` — the pointee's size, the stride the pointer froze), `volatile V arr[3]` (the object's own dimension above the alias's) and a 2-D alias. C 6.7.3p10 puts the qualifier on the ELEMENT, so every level of the object's type is a different type from the ones the typedef froze its size under; the size is still the one the typedef froze when its declaration was reached (C17 6.7.8p3), which the first helper checks by changing `n` after the typedef. MEASURED 2026-09-24, this file compiled and RUN on each reference separately: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x and mingw-w64 13.2.0 in both modes exit 42 with no diagnostic; MSVC 19.51 has no variable-length arrays (C2057) and abstains. Before this round DSS refused every qualified use (H_UnsupportedLoweringForKind: the typedef's origin \"froze no whole-object size slot\"). exit 42 = every use holds C's answer; 1-4 name the first that did not.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true }
+  ]
+}

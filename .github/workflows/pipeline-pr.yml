@@ -123,8 +123,7 @@ jobs:
         # ★ A BUDGET IS A CAP, NOT A RESERVATION. A leg that finishes early costs
         # nothing, so the only thing a larger cap buys is a longer wait when something
         # genuinely hangs — and the thing it prevents is a `timeout-minutes` kill,
-        # which is a SIGNAL kill that uploads no test log at all
-        # (D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG).
+        # which is a SIGNAL kill that uploads no test log at all.
         #
         # ✔ `windows-msvc-release`'s ctest budget WAS the one number here not measured
         # on its own leg. It is now: run 32585879580, the first Windows run ever to
@@ -132,11 +131,11 @@ jobs:
         # budget is 50/60 like the other release legs — 4.5x headroom, in family with
         # theirs. Its BUILD budget stays 120: that run had a 98.72%-hit ccache and
         # built in 1m48s, while the COLD build is the one that was killed at 45 min.
-        # (D-CI-WINDOWS-CTEST-COST-IS-UNMEASURED, closed.)
+        # (The Windows ctest cost was unmeasured; it is measured now, and that gap is closed.)
         #
         # ⚠ AND THE ASAN BUDGET IS A CEILING THE CORPUS IS WALKING TOWARDS: 62% of
         # those 11,314 CPU-seconds is the 1,231-entry example + integrated corpus, which
-        # grows every cycle (D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS).
+        # grows every cycle.
         run: |
           legs='[]'
           if [ "${{ true }}" = "true" ]; then
@@ -198,6 +197,40 @@ jobs:
         with:
           python-version: '3.x'
 
+      # DECLARED, NOT INHERITED, and here it is not even inherited by accident:
+      # no runner image ships DssHarness. `DSS_BUILD_TESTS=ON` registers
+      # `anchor_citations_guard` and `root_litter_guard` against the DssHarness
+      # that `find_program` resolves at CONFIGURE time (`dss_add_harness_guard`
+      # in the top-level CMakeLists.txt), and a host without it registers each
+      # of them as a REFUSAL — on purpose, because a guard that silently did not
+      # run would publish a figure about the host rather than the tree. So
+      # without these two steps every test leg fails on exactly those two
+      # entries. The tool is a .NET global tool built for net10.0, so its SDK is
+      # declared too rather than trusted to the image.
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install DssHarness
+        # PINNED to the version this tree's gate ran, and bumped WITH the tree:
+        # a floating install would let a tool release change a gate verdict on a
+        # commit that changed nothing. The version the tool REPORTS is compared,
+        # not only the exit code, so an install that resolved anything else
+        # fails here by name instead of as a puzzling guard failure later. The
+        # tool is called by the path `dotnet tool install --global` gives it,
+        # because that directory is not on PATH until a later step.
+        env:
+          DSS_HARNESS_VERSION: '0.5.8'
+        run: |
+          set -euo pipefail
+          dotnet tool install --global DssHarness --version "$DSS_HARNESS_VERSION"
+          reported="$("$HOME/.dotnet/tools/dssharness" --version)"
+          if [ "$reported" != "$DSS_HARNESS_VERSION" ]; then
+            echo "::error::DssHarness reports '$reported', but this tree pins '$DSS_HARNESS_VERSION'."
+            exit 1
+          fi
+        timeout-minutes: 5
+
       - name: Configure Git for private dependencies
         run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "git@github.com:"
 
@@ -217,6 +250,16 @@ jobs:
         # clang-tools-19 carries clang-scan-deps-19 which CMake needs for
         # C++20 modules dependency scanning; libclang-rt-19-dev carries
         # the ASan/UBSan runtime libs for clang-19.
+        #
+        # llvm-19 (added 2026-09-25, synced from DSS.DevOps a0d4abf): clang-19's
+        # sanitizer runtime probes /usr/bin/llvm-symbolizer-19 DIRECTLY, without
+        # consulting PATH, and that binary ships only in the llvm-19 package. The
+        # unversioned `llvm` below is llvm-18 on noble (1:18.0), and none of
+        # clang-19, clang-tools-19 or libclang-rt-19-dev depends on llvm-19, so
+        # the symbolizer was ABSENT and a sanitizer report printed bare addresses
+        # under "WARNING: invalid path to external symbolizer!"
+        # (D-CI-ASAN-LEG-SYMBOLIZER-PACKAGE-MISMATCH). Installing llvm-${VER}
+        # puts it where the runtime probes, inside the clang-* case only.
         # This keeps the ASan leg on libstdc++-13 — same stdlib as the
         # GCC release leg, so tests exercise the production stdlib rather
         # than libc++ (which has its own LLVM-18 alloc-dealloc ABI bug).
@@ -238,7 +281,7 @@ jobs:
           case "${{ matrix.cc }}" in
             clang-*)
               VER="${{ matrix.cc }}"; VER="${VER#clang-}"
-              PKGS+=("clang-tools-${VER}" "libclang-rt-${VER}-dev")
+              PKGS+=("clang-tools-${VER}" "libclang-rt-${VER}-dev" "llvm-${VER}")
               ;;
           esac
           sudo apt-get update -y
@@ -419,7 +462,6 @@ jobs:
         # The repair was NOT a bigger budget: the shuffle arms were 44% of the leg
         # while being the weaker instrument on it, and now scale per-leg at the
         # dss_add_shuffle_arm chokepoint in tests/CMakeLists.txt. Projected ~20.2 min.
-        # See D-TEST-SHUFFLE-ARM-REPEAT-BUDGET-IS-PER-LEG.
         #
         # ★ 2026-08-10 — IT HAPPENED AGAIN, AND THIS TIME THE BUDGET *IS* THE ANSWER.
         # ✔MEASURED, run 31278675175 job 93156338162 (linux-clang-asan, PR #48): Test
@@ -438,7 +480,7 @@ jobs:
         #   Re-measure the arms FIRST — that is still where the cost hides.
         #
         # ★★ AND ctest NOW GETS ITS OWN BUDGET, STRICTLY INSIDE THE STEP'S.
-        # [D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG.] A `timeout-minutes` kill is a hard
+        # A `timeout-minutes` kill is a hard
         # signal-kill: ctest writes Testing/Temporary/LastTest.log on COMPLETION, so
         # killed it writes nothing, the upload step finds nothing, and the run above
         # had to be diagnosed by scraping 2,892 raw job-log lines to learn it died at
@@ -472,7 +514,7 @@ jobs:
               || date -v+${BUDGET_MIN}M "+%H:%M:%S" 2>/dev/null || true)
           if [ -z "$NOW" ] || [ -z "$STOP" ]; then
             echo "::error::Cannot compute a ctest stop time: neither GNU (date -d) nor BSD (date -v) relative-date syntax works on this runner."
-            echo "Refusing to run ctest without its own budget. Without it a step that runs long is killed by timeout-minutes and writes NO test log at all, which is the exact blind spot this guard closes (D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG)."
+            echo "Refusing to run ctest without its own budget. Without it a step that runs long is killed by timeout-minutes and writes NO test log at all, which is the exact blind spot this guard closes."
             exit 1
           fi
           # ★★ ASSERT THE OFFSET ACTUALLY APPLIED, AND THIS CHECK IS THE LOAD-BEARING ONE.
@@ -487,12 +529,12 @@ jobs:
           DELTA=$(( ( $(_secs "$STOP") - $(_secs "$NOW") + 86400 ) % 86400 ))
           if [ "$DELTA" -lt $(( BUDGET_MIN * 60 - 120 )) ] || [ "$DELTA" -gt $(( BUDGET_MIN * 60 + 120 )) ]; then
             echo "::error::The computed ctest stop time is ${DELTA}s away, not the ~$(( BUDGET_MIN * 60 ))s asked for (now=$NOW stop=$STOP)."
-            echo "This runner's \`date\` accepted a relative-offset flag and did not apply it. Refusing to run: ctest treats an already-passed stop time as TOMORROW, so the budget would silently be ~24h and the step would be killed by timeout-minutes with no test log — the defect this guard exists to close (D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG)."
+            echo "This runner's \`date\` accepted a relative-offset flag and did not apply it. Refusing to run: ctest treats an already-passed stop time as TOMORROW, so the budget would silently be ~24h and the step would be killed by timeout-minutes with no test log — the defect this guard exists to close."
             exit 1
           fi
           echo "ctest stop-time: $STOP (LOCAL, ${DELTA}s out) — ${BUDGET_MIN} min, inside this step's timeout-minutes"
           # ★★ REPORT HOW MUCH OF THE BUDGET THE LEG ACTUALLY USED, AND WARN BEFORE IT
-          # RUNS OUT (D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS). A cap discovers a
+          # RUNS OUT. A cap discovers a
           # breach only by FAILING: ✔the asan leg reached 2999.79s of a 3000s budget on
           # 2026-08-21 with nothing having said it was close, and 62% of its cost is the
           # example + integrated corpus, which grows every cycle. A leg above 80% is a
@@ -511,7 +553,7 @@ jobs:
           _cap=$(( BUDGET_MIN * 60 ))
           echo "ctest wall clock: ${_used}s of a ${_cap}s budget ($(( _used * 100 / _cap ))%)"
           if [ "$_used" -gt $(( _cap * 8 / 10 )) ]; then
-            echo "::warning::This leg used ${_used}s of its ${_cap}s ctest budget (>80%). Re-derive matrix.ctest_budget_min for '${{ matrix.name }}' from this figure before it becomes a red (D-CI-ASAN-LEG-WALL-CLOCK-GROWS-WITH-THE-CORPUS)."
+            echo "::warning::This leg used ${_used}s of its ${_cap}s ctest budget (>80%). Re-derive matrix.ctest_budget_min for '${{ matrix.name }}' from this figure before it becomes a red: this leg's wall clock grows with the corpus."
           fi
           exit $_rc
         # Ten minutes above ctest's own budget: --stop-time stops ctest STARTING new
@@ -524,7 +566,7 @@ jobs:
         # ${{ matrix.t }}` is ACCEPTED and produces no run, while `timeout-minutes:
         # ${{ matrix.t + 10 }}` is REJECTED: the workflow is refused as a whole, with a
         # zero-job run whose name is the FILE PATH. That is how this file shipped broken
-        # for one commit (D-CI-STEP-TIMEOUT-MINUTES-REJECTS-AN-ARITHMETIC-EXPRESSION).
+        # for one commit.
         # ★ A plain field reference is the only expression form to use here; arithmetic
         # belongs in the shell that builds the matrix, where it is ordinary code.
         timeout-minutes: ${{ matrix.ctest_step_timeout_min }}
@@ -537,8 +579,8 @@ jobs:
           path: |
             ${{ '.' }}/${{ 'build' }}/Testing/Temporary/LastTest.log
             ${{ '.' }}/${{ 'build' }}/Testing/Temporary/LastTestsFailed.log
-          # `warn`, NOT `ignore` — the second half of
-          # D-CI-STEP-TIMEOUT-YIELDS-NO-TEST-LOG. This step only runs on failure,
+          # `warn`, NOT `ignore` — the second half of the fix for a killed step that
+          # leaves no test log. This step only runs on failure,
           # so "the logs a failing leg was supposed to leave are not there" is
           # always worth saying out loud; `ignore` made that absence silent, and
           # the absence is itself the diagnosis (the step was killed rather than
@@ -610,6 +652,6 @@ jobs:
         with:
           python-version: "3.x"
       - name: Run unit tests
-        run: python scripts/refresh_landing_log/test_refresh_landing_log.py
+        run: python .harness-config/runner/actions/refresh_landing_log/test_refresh_landing_log.py
       - name: Check landing-log hash anchors
-        run: python scripts/refresh_landing_log/refresh_landing_log.py --check
+        run: python .harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py --check

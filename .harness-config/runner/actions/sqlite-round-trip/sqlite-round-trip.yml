@@ -1,0 +1,19 @@
+# PURPOSE: carry a sqlite leg's DSS-built artefacts to a machine that runs their target and prove they EXECUTE there (the round trip).
+name: sqlite-round-trip
+description: >-
+  The action executes a carried sqlite payload on a host that runs its target -- the round trip.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+inputs:
+  payload:
+    description: 'a payload `sqlite-round-trip.py pack` produced on the build leg'
+    required: true
+steps:
+  - name: run-the-carried-payload
+    workingDirectoryRoot: action
+    run: |
+      python3 ./sqlite-round-trip.py run --payload {payload} --workdir {stepBuild} --ran-on {host} --json {stepBuild}/round-trip.json
+    successPattern: 'result json: '
+    outputs: ['round-trip.json']
+    persist: true
+    requireInputsUnmoved: true

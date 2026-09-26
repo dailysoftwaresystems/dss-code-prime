@@ -117,6 +117,42 @@ struct MirAsmOperand {
     // template will use for both halves.
     std::optional<std::uint32_t> tiedOutput;
 
+    // ★★ TRUE ⇔ THIS TIE WAS WRITTEN BY THE SOURCE AS A GNU **MATCHING
+    // CONSTRAINT** (`"0"`) rather than synthesized from a `"+"` output (P68,
+    // D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER). The two share
+    // ONE location either way (GNU's own `"+r"` IS `"=r"` plus `"0"`), and they
+    // differ in exactly one fact: a `"+"` operand's two halves are ONE C lvalue,
+    // so their widths must agree, while a matching input is a SEPARATE
+    // expression whose width is its own. ✔MEASURED 2026-09-19, gcc 13.3.0 and
+    // clang 18.1.3 on both shipped targets: an `int` input matched to a `long`
+    // output is materialized at ITS width (a -5 reads back as 4294967291), and a
+    // `long` input matched to an `int` output reads back its low half. It also
+    // keeps its own `spellings` — the source wrote it, so its `%N` names it.
+    bool matchesOutput = false;
+
+    // ★★ TRUE ⇔ `fixedRegister` WAS SET BY A GNU LOCAL REGISTER VARIABLE
+    // (`register long v asm("x4")`) rather than by a pinning LETTER (x86
+    // `"a"`), P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). The
+    // two pin ONE register identically and differ on a value wider than it:
+    // ✔MEASURED 2026-09-19, a LETTER-pinned `__int128` is refused by gcc 13.3.0
+    // and clang 18.1.3 alike, while a VARIABLE-bound one CONTINUES in the next
+    // register of the target's order (aarch64 x4→x5 on both references, x7→x8
+    // on clang; x86-64 rax→rdx, rdx→rcx, r8→r9 on gcc) — the register the
+    // target declares as `continuesIn`.
+    bool pinnedByVariable = false;
+
+    // ★★ TRUE ⇔ THIS INPUT READS ITS BOUND REGISTER AS IT STANDS: the variable
+    // it names is never written anywhere — no initializer, and every use of it
+    // is the bare value of an asm INPUT operand — so no value exists to copy in
+    // (P68 round 8, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). C 6.3.2.1p2
+    // makes reading such an object undefined, and gcc gives it the meaning this
+    // carries: the variable IS its register, so the template sees the register's
+    // content. ✔MEASURED 2026-09-19: `register unsigned long sp asm("sp")` read
+    // on `"r"` returns the stack pointer on gcc 13.3.0 at -O0/-O2 on both
+    // targets; clang 18.1.3 copies the indeterminate value IN (SIGSEGV on
+    // x86-64 at -O0). Only ever set on a pinned input.
+    bool registerAsItStands = false;
+
     // ★★★ EVERY SPELLING THIS OPERAND ANSWERS TO, AS THE TEMPLATE WRITES IT —
     // MINTED BY THE FRONT END, ONLY EVER *COMPARED* HERE AND BELOW. The
     // positional form always, plus the symbolic form when the source named the
@@ -147,6 +183,41 @@ struct MirAsmOperand {
     // No consumer may rebuild a spelling from a sigil literal — doing so would
     // give the convention a second owner, which is the defect this field closes.
     std::vector<std::string> spellings;
+
+    // ★★★ NON-ZERO ⇔ THE MIR OPERAND BOUND TO THIS ENTRY IS THE **ADDRESS** OF
+    // A `carriedBytes`-BYTE VALUE, AND THE REGISTER BINDING CARRIES THE VALUE
+    // ITSELF (D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS).
+    //
+    // A by-address kind (`isMemoryResidentType`: a struct/union, a `_Complex`, a
+    // wide integer) has no SSA rvalue at this tier — its value lives in memory
+    // and every consumer reaches it through an address. A REGISTER-form operand
+    // of such a type used to receive exactly that address (`_Complex`, wide
+    // integers) or an 8-byte scalar load of it (structs), ✔MEASURED rc=0 and the
+    // wrong bits on both shipped targets, while gcc 13.3.0 carries the VALUE —
+    // in one register when it fits one, in a register PAIR when it is twice a
+    // register (`__int128` on `"r"`).
+    //
+    // ★ SO THE FACT TRAVELS HERE AND THE REGISTERS ARE CHOSEN WHERE THEY ARE
+    // KNOWN. `hir_to_mir` files such an operand BY ADDRESS in `inputs` — an
+    // OUTPUT too, exactly as a memory-form output is, because it produces no
+    // result piece: the value is STORED through this address after the template
+    // (`carriedOut`) — and marks whether the template READS it (`carriedIn`: an
+    // input, or the read half of a `+`). `mir_to_lir` then loads the value into
+    // the bound register(s) before the template and stores it back after, at
+    // the widths the target's register file dictates, and refuses by name a
+    // size no register arrangement carries. One entry serves both halves of a
+    // `+`, so no tied read half is synthesized for it.
+    // ⚠ ZERO on every other entry — a register-form scalar, a memory form, an
+    // immediate — and on those the fields below mean nothing.
+    // ★ `carriedTypeKind` is the value's `TypeKind` (raw, for the reason
+    // `operandKind` is raw above): whether a register class may carry a kind at
+    // all differs by PROCESSOR (✔MEASURED: an aarch64 Q register carries a
+    // `_Complex double`, no x86-64 reference puts one in an XMM register), so
+    // the LIR tier asks the target's `asmValueCarriage` facet by kind.
+    std::uint32_t carriedBytes    = 0;
+    bool          carriedIn       = false;
+    bool          carriedOut      = false;
+    std::uint8_t  carriedTypeKind = 0;
 };
 
 struct DSS_EXPORT MirAsmDescriptor {
@@ -231,10 +302,12 @@ struct DSS_EXPORT MirAsmDescriptor {
     // `InlineAsm` is `{0,N}` and not `Call`'s `{1,N}`).
     //
     // ⚠⚠ THE ORDERING BELOW IS NOT EXHAUSTIVE ON ITS OWN — READ THIS FIRST. The
-    // full order is [MEMORY-FORM OUTPUTS][source-written inputs][tied read
-    // halves]. A memory-form operand written in the OUTPUT section is filed
-    // here, at the FRONT, because source order puts the output section before
-    // the input section. Nothing in the sentence below became false — `outputs`
+    // full order is [ADDRESSED OUTPUTS][source-written inputs][tied read
+    // halves], where an ADDRESSED output is a memory-form one (`"=m"`) or a
+    // memory-CARRIED register one (`carriedOut` above: a by-address value on
+    // `"=r"`), in source order. Such an operand written in the OUTPUT section
+    // is filed here, at the FRONT, because source order puts the output
+    // section before the input section. Nothing in the sentence below became false — `outputs`
     // is still exactly the result-piece list, this list is still 1:1 with the
     // instruction's operands, and the tied halves are still last — but a reader
     // who takes the two-part enumeration as complete will mis-read entry 0 of a

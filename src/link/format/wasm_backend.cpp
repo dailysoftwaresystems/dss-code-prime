@@ -161,6 +161,13 @@ public:
         // D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.
         return {};
     }
+    [[nodiscard]] std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept override {
+        // A WASM module has no native loader that searches directories for
+        // the libraries it needs, and this walker records no runpath.
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH.
+        return {};
+    }
 
     // Not a native image, not a program the OS starts, and not an `ar`
     // member — WASM has no such shapes. `allowsUndefinedImports` is

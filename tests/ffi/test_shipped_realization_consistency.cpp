@@ -220,11 +220,18 @@ using dss::ffi_test::FixtureRoleResolver;
     ShippedTypeConsistency checker{interner, std::span<VocabularyCore const>{},
                                    ax.format};
     FixtureRoleResolver const roles{ax.format};
+    // The axis's long-double format reaches the reads, as in the type-consistency
+    // sweep (P68 round 12, S2a-2a): the two sweeps read one corpus the same way.
+    ShippedPairFacts const pairFacts{
+        nullptr, ax.dm, std::nullopt, {},
+        ax.ldf == LongDoubleFormat::None ? std::optional<LongDoubleFormat>{}
+                                         : std::optional<LongDoubleFormat>{ax.ldf}};
     SweepResult out;
     for (auto const& path : descriptors) {
         DiagnosticReporter readRep;   // read health is a different invariant
         auto desc = readShippedLibDescriptor(path, interner, typeReg, readRep,
-                                             ax.dm, arch, ax.format, named, &roles);
+                                             ax.dm, arch, ax.format, named, &roles,
+                                             &pairFacts);
         if (!desc.has_value()) continue;
         if (!objectFormatInAvailabilitySet(desc->availableObjectFormats, ax.format))
             continue;   // the header does not exist here — it declares nothing here

@@ -637,6 +637,8 @@ TEST(ElfDynWriter, SonameEmittedWhenConfigured) {
         {"kind":"strtab","name":".strtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0},
         {"kind":"shstrtab","name":".shstrtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_TRUE(fmt.has_value());

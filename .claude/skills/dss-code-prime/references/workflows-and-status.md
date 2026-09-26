@@ -1,5 +1,12 @@
 # Workflow recipes, the .plans system, and honest status
 
+## Contents
+- 10. Common workflow patterns: 10.1 a new public type · 10.2 a typed view · 10.3 a `.lang.json`
+  grammar · 10.4 a diagnostic code · 10.5 driving `TreeBuilder` from tests
+- 8. The `.plans/` system
+- 11. Status — where to get it, never what it is
+- 13. Contribution checklist
+
 ## 10. Common Workflow Patterns
 
 ### 10.1 Adding a new public type / class
@@ -80,7 +87,7 @@ DATE-STAMP.** A previous pass did try annotating the rotting number instead of r
 numbers where before there was one, and the caveat lent the second one credibility. A caveat beside
 a stale figure is just a second stale figure. ⇒ the repo's own standing rule is the only stable
 form: *"never re-quote a gate figure — RE-MEASURE at the commit that carries it."*
-Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
+Species: a skill reference asserting a status nobody re-checked.
 
 ### Where status actually comes from
 
@@ -88,9 +95,9 @@ Species: [[D-PLANS-SKILL-REFERENCE-ASSERTS-UNRECHECKED-STATUS]].
 |---|---|---|
 | % complete, empirical C coverage, plan-23 arc %, SQLite-readiness, the cross-target emit/run matrix, an ETA | the **`dss-state`** skill — it runs a 104-probe C-feature battery through the REAL CLI and re-derives every axis at the commit you are standing on | any figure written in a document |
 | What the last cycle did, what it owes the next one, the live operator queue | `.plans/_handoff.md` — **READ FIRST**, rewritten every cycle | a plan's §0 summary, which lags |
-| Whether one specific defect is open | that row's own `Status` cell — `bash scripts/anchors/read-anchor.sh <ANCHOR>` prints it, and finds the row in whichever of the three registries holds it | any list, queue or summary that names the row |
+| Whether one specific defect is open | that row's own `Status` cell — `dssharness read-anchor <ANCHOR>` prints it, and finds the row in whichever registry holds it (two since 2026-09-16: production and the archive) | any list, queue or summary that names the row |
 | Whether it is OPEN vs GATED, and its priority | the same row's `Status` and `Priority` columns, explicit since 2026-09-01 | the glyph leading its `Trigger` prose, which is a second copy the gate cross-checks but does not read |
-| Anchor open/closed counts | `python scripts/check-anchor-balance/check-anchor-balance.py` | a count quoted in prose |
+| Anchor open/closed counts | `dssharness check-anchor-balance` | a count quoted in prose |
 | Suite size, pass count, timings | run the gate | this file |
 
 ### What this file may state, because a reader re-derives it in one command
@@ -111,7 +118,8 @@ status carries an explicit re-measure obligation naming the instrument that sett
 
 Before declaring a phase done:
 
-1. **Run the full ctest suite.** `ctest --test-dir build --output-on-failure` — must be 100%.
+1. **Run the full test suite.** `dssharness test --legs windows-x86_64-debug --json --time` — must be
+   100%; the round gate is `dssharness test --legs gate`.
 2. **Every new test must use STRICT asserts** per §7. No `EXPECT_GE` on known counts. No
    substring `find` where full equality would work.
 3. **Update `.plans/`** — flip the row status, update test counts in §0, add the new file to

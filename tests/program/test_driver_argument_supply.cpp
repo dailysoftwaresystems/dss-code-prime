@@ -1,5 +1,5 @@
-// ★★★ THE DRIVER'S SUPPLYING IS THE SUBJECT — NOT THE CALLEE'S BEHAVIOUR
-// (D-TEST-STATIC-LINK-UNIT-SUITE-CANNOT-WITNESS-A-DRIVER-THREADING-GAP).
+// ★★★ THE DRIVER'S SUPPLYING IS THE SUBJECT — NOT THE CALLEE'S BEHAVIOUR.
+// A UNIT SUITE CANNOT WITNESS A DRIVER THREADING GAP.
 //
 // ── WHAT THIS FILE IS FOR ───────────────────────────────────────────────────
 // `src/program/compile_pipeline.hpp` exports the pipeline kernel. Several of
@@ -824,7 +824,8 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheFormatsDataModel) {
 
 // ════════════════════════════════════════════════════════════════════════════
 // `callingConventionIndex` on the MERGED route — the ordinal `dss::ffi::
-// resolveAbi` produced, turned into an index by pointer distance (D-FF3-3).
+// resolveAbi` produced, turned into an index by pointer distance
+// (D-FF3-3-RESOLVED-CC-INDEX-THREADED).
 // ════════════════════════════════════════════════════════════════════════════
 //
 // ★★ THE SINGLE-CU ROUTE IS PINNED BY `program/test_entry_argv_run`
@@ -879,7 +880,7 @@ TEST(DriverArgumentSupply, MergedMultiCuRouteSuppliesTheCallingConventionIndex) 
            "for THIS format. Supplied ordinal 0 (`sysv_amd64`) the frames lose "
            "the 32-byte shadow space and `main` reads its arguments from the "
            "wrong registers — the build still succeeds with no diagnostic and "
-           "the image dies at run time (D-FF3-3)";
+           "the image dies at run time (D-FF3-3-RESOLVED-CC-INDEX-THREADED)";
 #else
     GTEST_SKIP() << "a pe64 image only RUNS on Windows; the merged route's "
                     "calling-convention ordinal has no host-independent "

@@ -389,6 +389,8 @@ loadChainedFixupsWeakExecFormat() {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -1761,10 +1763,9 @@ TEST(MachoImageSymbolNames,
         // which would turn this cell into a test of that refusal and delete
         // every assertion it was written to make. The shared fixture is the
         // shipped document minus the signature and NOTHING else -- in
-        // particular the arm64 one KEEPS `image.buildVersion`, so the
-        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
-        // that port exactly as it did before, and this file remains the only
-        // place that boundary is pinned by EXECUTION.
+        // particular both KEEP `image.buildVersion`, which the static walker
+        // now EMITS (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION, closed), so the
+        // static cells reach their own assertions on BOTH ports.
         using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
         auto fmt = (arm == ImageArm::StaticExec)
             ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
@@ -1825,54 +1826,41 @@ TEST(MachoImageSymbolNames,
         // injected.
         if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
 
-        // ★ THE STATIC ARM IS NOT REACHABLE ON EVERY SHIPPED EXEC FORMAT, and
-        // this cell ASSERTS that boundary rather than skipping past it. The
-        // arm64 exec schema declares `image.buildVersion` (modern dyld rejects
-        // an Apple Silicon main executable without LC_BUILD_VERSION), and
-        // `encodeExec` REFUSES such a schema loud
-        // (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION) because only the dynamic
-        // arm emits that load command. The x86_64 exec schema deliberately
-        // OMITS the key for exactly this reason -- its own
-        // `$remainingDeliberateOmissionsComment` says so -- which is what
-        // keeps the static walker reachable from a test at all.
-        // So: on a format that declares it, this cell pins the LOUD REFUSAL
-        // (silently emitting an unloadable image is the failure that gate
-        // exists to prevent); on one that does not, it pins the NAMES. Either
-        // way the cell asserts something that can go red, and the naming fix
-        // is still witnessed on BOTH ports by the dynamic exec + dylib cells
-        // -- which is where every shipped build actually lands.
-        bool const staticArmRefusedByBuildVersion =
-            arm == ImageArm::StaticExec
-            && (*fmt)->machoImage().buildVersion.has_value();
-
+        // ★ THE STATIC ARM IS REACHABLE ON BOTH SHIPPED EXEC FORMATS. Both
+        // declare `image.buildVersion` (dyld4 reads a main executable's
+        // platform from LC_BUILD_VERSION: the arm64 image is rejected without
+        // it, and ✔MEASURED 2026-09-24 an x86_64 image without it runs under
+        // Rosetta with no `executable_path=` in its `apple` vector), and
+        // `encodeExec` EMITS the command since
+        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION closed -- this cell used to
+        // pin that arm's LOUD REFUSAL on the arm64 port. So on every port it
+        // pins the NAMES, and on the static arm it also pins the command's
+        // bytes against the document's declaration.
         DiagnosticReporter rep;
         auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
                              dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
-        if (staticArmRefusedByBuildVersion) {
-            EXPECT_TRUE(bytes.empty())
-                << label
-                << ": a schema declaring image.buildVersion must NOT encode "
-                   "down the static arm -- that arm emits no LC_BUILD_VERSION, "
-                   "so the image would be silently unloadable";
-            bool sawAnchor = false;
-            for (auto const& d : rep.all()) {
-                if (d.actual.find("D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION")
-                    != std::string::npos) {
-                    sawAnchor = true;
-                }
-            }
-            EXPECT_TRUE(sawAnchor)
-                << label
-                << ": the refusal must NAME its anchor so the boundary stays "
-                   "findable\n" << diags;
-            return;
-        }
-
         ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
         ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
+
+        // The static image CARRIES the platform command its document declares,
+        // written through the one `appendBuildVersionCommand` chokepoint.
+        // RED-ON-DISABLE: put the static arm's refusal back and this cell
+        // fails at the errorCount assertion above, by name, on both ports.
+        if (arm == ImageArm::StaticExec) {
+            auto const& bv = (*fmt)->machoImage().buildVersion;
+            ASSERT_TRUE(bv.has_value()) << label;
+            auto const at = dss::macho::test::findLoadCommand(
+                std::span<std::uint8_t const>{bytes}, 0x32u);
+            ASSERT_TRUE(at.has_value())
+                << label << ": the static exec image carries no LC_BUILD_VERSION";
+            EXPECT_EQ(readU32LE(bytes, *at + 8),
+                      static_cast<std::uint32_t>(bv->platform)) << label;
+            EXPECT_EQ(readU32LE(bytes, *at + 12), bv->minOs) << label;
+            EXPECT_EQ(readU32LE(bytes, *at + 16), bv->sdk) << label;
+        }
 
         // Each cell must really reach the arm it NAMES -- otherwise cells could
         // silently share one builder and most of the matrix would assert
@@ -2311,10 +2299,9 @@ TEST(MachoImageSymbolNames,
         // which would turn this cell into a test of that refusal and delete
         // every assertion it was written to make. The shared fixture is the
         // shipped document minus the signature and NOTHING else -- in
-        // particular the arm64 one KEEPS `image.buildVersion`, so the
-        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
-        // that port exactly as it did before, and this file remains the only
-        // place that boundary is pinned by EXECUTION.
+        // particular both KEEP `image.buildVersion`, which the static walker
+        // now EMITS (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION, closed), so the
+        // static cells reach their own assertions on BOTH ports.
         using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
         auto fmt = (arm == ImageArm::StaticExec)
             ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
@@ -2360,25 +2347,11 @@ TEST(MachoImageSymbolNames,
         }
         if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
 
-        // The arm64 exec schema declares `image.buildVersion`, and the static
-        // walker emits no LC_BUILD_VERSION, so it REFUSES such a schema loud
-        // (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION). That boundary is already
-        // pinned by the sibling naming test; here the cell simply has nothing
-        // to say, so it asserts the refusal and stops.
-        bool const staticArmRefusedByBuildVersion =
-            arm == ImageArm::StaticExec
-            && (*fmt)->machoImage().buildVersion.has_value();
-
         DiagnosticReporter rep;
         auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
                              dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
-
-        if (staticArmRefusedByBuildVersion) {
-            EXPECT_TRUE(bytes.empty()) << label << "\n" << diags;
-            return;
-        }
 
         ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
         ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
@@ -2678,10 +2651,9 @@ TEST(MachoImageWeakAlias, EveryImageArmPublishesAWeakAliasAsAWeakDefinition) {
         // which would turn this cell into a test of that refusal and delete
         // every assertion it was written to make. The shared fixture is the
         // shipped document minus the signature and NOTHING else -- in
-        // particular the arm64 one KEEPS `image.buildVersion`, so the
-        // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION branch below still fires on
-        // that port exactly as it did before, and this file remains the only
-        // place that boundary is pinned by EXECUTION.
+        // particular both KEEP `image.buildVersion`, which the static walker
+        // now EMITS (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION, closed), so the
+        // static cells reach their own assertions on BOTH ports.
         using FmtLoad = LoadResult<std::shared_ptr<ObjectFormatSchema>>;
         auto fmt = (arm == ImageArm::StaticExec)
             ? FmtLoad{dss::macho::test::loadUnsignedExec(port.execFormat)}
@@ -2710,14 +2682,6 @@ TEST(MachoImageWeakAlias, EveryImageArmPublishesAWeakAliasAsAWeakDefinition) {
             mod.externImports.push_back(std::move(imp));
         }
         if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
-
-        // The arm64 static exec schema declares image.buildVersion, which that
-        // walker refuses outright — a boundary its sibling test already pins,
-        // and one that would mask this cell's own verdict.
-        if (arm == ImageArm::StaticExec
-            && (*fmt)->machoImage().buildVersion.has_value()) {
-            return;
-        }
 
         DiagnosticReporter rep;
         auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,

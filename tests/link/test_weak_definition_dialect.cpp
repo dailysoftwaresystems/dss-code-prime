@@ -230,11 +230,13 @@ struct ShippedFormatDoc {
 // returned a `std::vector<std::string>`. The vector wins — it keeps ORDER and
 // MULTIPLICITY, and a set is derivable from it while the reverse is not — so
 // this file now uses the one owner,
-// `tests/test_support/vocabulary_message_probe.hpp`. See
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+// `tests/test_support/vocabulary_message_probe.hpp`. It lives there and not in
+// `tests/core/vocabulary_projection_probe.hpp` because that header also LOCATES
+// a shipped config document and so drags in `nlohmann/json.hpp`, and because
+// `dss_add_test` puts only `src` and `tests/test_support` on every test
+// target's include path — `tests/core` is on no other suite's.
 //
-// ⚠ THE NARROWING HAD ALREADY BLURRED SIX ASSERTIONS —
-// D-TEST-WEAK-DEFINITION-QUOTED-TOKEN-COUNT-IS-UNFALSIFIABLE-OVER-A-SET —
+// ⚠ THE NARROWING HAD ALREADY BLURRED SIX ASSERTIONS,
 // which is why the call sites below now say which of the two things they mean.
 // All six were written
 // as `quoted.count(x) == 1`, and on a `std::set` `count` is 0-or-1 — so the
@@ -422,9 +424,9 @@ TEST(WeakDefinitionDialect, EachBackendDeclaresTheDialectsItsWalkerSpells) {
         ASSERT_TRUE(d.has_value());
         // `.contains`, not `count(...) == 1`: on a `std::set` `count` is 0-or-1
         // by definition, so the `== 1` an author reads as "exactly once" is
-        // unfalsifiable — D-TEST-WEAK-DEFINITION-QUOTED-TOKEN-COUNT-IS-UNFALSIFIABLE-OVER-A-SET,
-        // which this same file documents and which the step-10 audit found
-        // re-created here. Membership is the whole claim; say only that.
+        // unfalsifiable — the same blurring this file documents above, which the
+        // step-10 audit found re-created here. Membership is the whole claim;
+        // say only that.
         EXPECT_TRUE(spelledByAnyone.contains(*d))
             << "dialect '" << name
             << "' is in the vocabulary but no backend's walker writes it";

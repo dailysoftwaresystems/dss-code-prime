@@ -47,11 +47,13 @@ using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
 // RAII temp directory (same facade as test_import_resolver.cpp): include
-// targets must share the includer's directory. The facade — and the reason its
-// unique-path scheme is NOT reimplemented locally, defect
-// D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
-// identical here and in test_import_resolver.cpp. The GROUP below is this
-// suite's own, so its scratch tree stays separate from that sibling's.
+// targets must share the includer's directory. The facade lives in
+// `toy_cu_fixture.hpp` — it was identical here and in test_import_resolver.cpp
+// — and its unique-path scheme is NOT reimplemented locally because a
+// reimplemented one is exactly what collided: a fixed scratch path let
+// concurrent processes of this binary delete each other's fixtures.
+// The GROUP below is this suite's own, so its scratch tree stays separate from
+// that sibling's.
 constexpr char kScratchGroup[] = "fc2-type-name-oracle";
 using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
@@ -60,7 +62,7 @@ using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 // Two subtrees built under the SAME schema compare equal iff they have identical
 // shape + spelling — used to prove a cast resolved by the FIRST-PARSE SEED is
 // structurally IDENTICAL to the SAME cast resolved by the finish() oracle
-// reparse (D-PERF-2 Opt-4 one-directional parity).
+// reparse (D-PERF-2-TYPEDEF-SEED-DISAMBIGUATION, Opt-4 one-directional parity).
 void subtreeSig(Tree const& t, NodeId n, std::string& out) {
     if (isEmptySpace(t.flags(n))) return;
     if (t.kind(n) == NodeKind::Token) {

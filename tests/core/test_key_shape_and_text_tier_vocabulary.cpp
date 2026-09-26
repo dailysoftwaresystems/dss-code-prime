@@ -62,6 +62,7 @@
 #include "hir/hir_text.hpp"
 #include "mir/mir_text.hpp"
 
+#include "probe_config_root.hpp"
 #include "vocabulary_message_probe.hpp"
 
 #include <gtest/gtest.h>
@@ -156,11 +157,11 @@ public:
 
 // ★ `quotedTokens` used to be a file-local copy here, byte-identical to the one
 // `tests/core/vocabulary_projection_probe.hpp` already owned — and therefore
-// invisible to the mutant that closed
-// D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE. It has ONE
+// invisible to the mutant that ended the per-file copying of these probe
+// helpers. It has ONE
 // owner now, `tests/test_support/vocabulary_message_probe.hpp`, which is
-// json-free and on every test target's include path; see
-// D-TEST-VOCABULARY-PROBE-MESSAGE-HALF-IS-UNREACHABLE-AND-JSON-COUPLED.
+// json-free and on every test target's include path — the split that made the
+// probe's MESSAGE half reachable without dragging `nlohmann/json.hpp` in.
 using ::dss::test_support::quotedTokens;
 
 template <typename Diags>
@@ -465,7 +466,7 @@ struct HirAttrVocabulary {
 // Everything else is the minimum a module needs, so a diagnostic can only be
 // about the hole.
 [[nodiscard]] std::string mirGlobalModule(std::string_view globalTail) {
-    return std::string{"dssir 1\n"
+    return std::string{"dssir 3\n"
                        "symbols { %1 \"f\" %2 \"g\" }\n"
                        "module {\n"
                        "  global %2 : "} + std::string{globalTail} + "\n"
@@ -509,7 +510,7 @@ TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
         "c", "/semantics/builtinFunctions/0/lowering",
-        "unknown builtin lowering", 37, "semantics.builtinFunctions[0].lowering");
+        "unknown builtin lowering", 38, "semantics.builtinFunctions[0].lowering");
 }
 
 // ★★ THE `.dsshir` ATTRIBUTE VOCABULARIES. Six sets that each used to exist
@@ -519,22 +520,22 @@ TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
 TEST(TextTierVocabulary, EveryHirAttributeRefusalAdvertisesExactlyWhatItAccepts) {
     constexpr HirAttrVocabulary kVocabularies[] = {
         {"ffi linkage",
-         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi linkage", 3},
         {"ffi visibility",
-         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi visibility", 3},
         {"shader stage",
-         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader stage", 7},
         {"shader builtin",
-         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader builtin", 12},
         {"transpile idiom",
-         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
          ")\n  extern_global %1 : i32\n}\n", "unknown transpile idiom", 6},
         {"diag recovery",
-         "dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
          ")\n  extern_global %1 : i32\n}\n", "unknown diag recovery", 4},
     };
 
@@ -589,7 +590,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
     // in the test. Found only because a sibling pin added a POSITIVE control and
     // the control reddened; the negative arm alone can never see this.
     auto const module = [](std::string_view marker) {
-        return std::string{"dssir 1\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -675,7 +676,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
 // anchored for later.
 TEST(TextTierVocabulary, UnknownMirCallingConventionIsRefusedAndNamesTheAcceptedSet) {
     auto const module = [](std::string_view cc) {
-        return std::string{"dssir 1\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void cc "} +
@@ -931,11 +932,15 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
     ASSERT_FALSE(msg.empty()) << "the refusal did not name the core vocabulary.";
     auto advertised = quotedTokens(msg);
     std::erase(advertised, std::string{kBadSpelling});
-    // 19 primitive spellings + the 6 STRUCTURAL cores a literal may carry
-    // (struct/union/array/ptr/ref/enum). The two sets live in two tables because
-    // the structural kinds must NOT be reachable as bare TYPE keywords; the
-    // message projects both, so this count notices either one shrinking.
-    EXPECT_EQ(advertised.size(), 25u)
+    // 19 primitive spellings + the 8 STRUCTURAL cores a literal may carry
+    // (struct/union/array/ptr/ref/enum; `bitint` — the core of every `_BitInt`
+    // value, which had no spelling until P68 round 8, lane `ht`, part 1c-b, so the
+    // writer refused every `_BitInt` constant; and `complex` — a `_Complex`
+    // constant's core, the same gap, closed in part 1d). The two sets live in
+    // two tables because the structural kinds must NOT be reachable as bare TYPE
+    // keywords; the message projects both, so this count notices either one
+    // shrinking.
+    EXPECT_EQ(advertised.size(), 27u)
         << "the advertised literal-core set changed size — a SHRINK means a core "
            "spelling the reader takes stopped being advertised.\nmessage:\n  "
         << msg;
@@ -973,7 +978,7 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
 // is this file's own rule, written beside the inline-asm arm.
 TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
     auto const module = [](char const* arms, char const* extraBlock) {
-        return std::string{"dssir 1\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1012,7 +1017,7 @@ TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
 // SILENT. `%b`, `%vx`, `%b3x` all fell out of the prefix-stripping loop as 0.
 TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 1\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1055,7 +1060,7 @@ TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
 // crash is not a guard.
 TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 1\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1088,7 +1093,7 @@ TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
 // the two arms pinned above were being converted in the same file.
 TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility) {
     auto const module = [](std::string_view attr) {
-        return std::string{"dssir 1\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void ["} + std::string{attr} + "] {\n"
@@ -1144,7 +1149,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 
         dss::MirTextContext ctx;
         ctx.interner    = &res->interner;
-        ctx.symbolNames = &res->symbolNames;
+        ctx.symbolNameMap = &res->symbolNames;
         DiagnosticReporter wr;
         std::string const  emitted = dss::emitMir(res->mir, ctx, wr);
         EXPECT_NE(emitted.find(row.value), std::string::npos)
@@ -1161,7 +1166,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
                                   "succeed:" << mirDiagnostics(emitted);
         dss::MirTextContext ctx2;
         ctx2.interner    = &again->interner;
-        ctx2.symbolNames = &again->symbolNames;
+        ctx2.symbolNameMap = &again->symbolNames;
         DiagnosticReporter wr2;
         EXPECT_EQ(dss::emitMir(again->mir, ctx2, wr2), emitted)
             << "emitMir(parseMir(emitMir(m))) must equal emitMir(m).";
@@ -1175,7 +1180,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 // constant in the reader's translation unit, so the two ends cannot drift.
 TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
     auto const text =
-        std::string{"dsshir 4\nproducer \"\"\n"
+        std::string{"dsshir 6\nproducer \"\"\n"
                     "symbols { %1 \"g\" }\n"
                     "module [] \"probe\" {\n"
                     "  global %1 : i32 = lit unspelled_aggregate : i32\n"
@@ -1219,9 +1224,9 @@ namespace {
 
 // A `.dsshir` module whose single function body is `bodyLine`.
 [[nodiscard]] std::string hirBody(std::string_view bodyLine) {
-    return std::string{"dsshir 4\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      "}
-         + std::string{bodyLine} + "\n      return\n    }\n  }\n}\n";
+         + std::string{bodyLine} + "\n      return void\n    }\n  }\n}\n";
 }
 
 }  // namespace
@@ -1279,7 +1284,11 @@ TEST(TextTierVocabulary, EveryAdvertisedAggregateFieldCoreIsAcceptedByTheReader)
            "would give every element of a folded aggregate the wrong core while "
            "the re-emitted text still matched byte for byte.";
     auto const advertised = advertisedIn(msg);
-    EXPECT_EQ(advertised.size(), 26u)
+    // 20 primitive spellings + the 8 structural cores, `bitint` among them since
+    // P68 round 8 (lane `ht`, part 1c-b) — an aggregate holding a `_BitInt` field
+    // was refused by its own writer before it — and `complex` since part 1d, the
+    // same gap for a `_Complex` field.
+    EXPECT_EQ(advertised.size(), 28u)
         << "the advertised field-core set changed size.\nmessage:\n  " << msg;
     for (auto const& core : advertised) {
         SCOPED_TRACE(core);
@@ -1305,9 +1314,22 @@ TEST(TextTierVocabulary, EveryAdvertisedAggregateFieldCoreIsAcceptedByTheReader)
 // legitimately malformed for reasons that have nothing to do with the
 // vocabulary. What must NOT happen is the reader failing to RECOGNIZE it.
 TEST(TextTierVocabulary, EveryAdvertisedNodeKeywordIsRecognizedByTheReader) {
-    auto const msg = hirRefusal(hirBody(kBadSpelling), "unknown node keyword");
+    // ★ ONE SPELLING OF THE REFUSAL, FOR THE CONTROL AND THE LOOP ALIKE. The loop
+    // must match the refusal that names the keyword UNDER TEST, not any refusal:
+    // each keyword is fed BARE, and the reader's recovery from that deliberately
+    // malformed line runs on into the fixture's own tail — v5's `return void` —
+    // whose stray `void` is then reported as an unknown node keyword of its own.
+    // A bare-prefix match counted that as the tested keyword being unrecognized
+    // (✔MEASURED on the v5 tree: 31 of 54 reddened, each keyword recognized). The
+    // control below asserts this EXACT form for its own spelling, so a drift in
+    // the reader's quoting reds the control instead of silently greening the loop.
+    auto const refusalNaming = [](std::string_view kw) {
+        return std::string{"unknown node keyword '"} + std::string{kw} + "'";
+    };
+    auto const msg = hirRefusal(hirBody(kBadSpelling), refusalNaming(kBadSpelling));
     ASSERT_FALSE(msg.empty())
-        << "an unrecognized node keyword must be refused BY NAME.";
+        << "an unrecognized node keyword must be refused BY NAME, as `"
+        << refusalNaming(kBadSpelling) << "`.";
     auto const advertised = advertisedIn(msg);
     // 28 statement keywords + 26 expression keywords.
     // ⓘ 23 → 25 on 2026-08-23 (cycle P28, lane Z): `builtincall` and `labeladdr`
@@ -1326,7 +1348,7 @@ TEST(TextTierVocabulary, EveryAdvertisedNodeKeywordIsRecognizedByTheReader) {
            "stopped being routed.\nmessage:\n  " << msg;
     for (auto const& kw : advertised) {
         SCOPED_TRACE(kw);
-        EXPECT_TRUE(hirRefusal(hirBody(kw), "unknown node keyword").empty())
+        EXPECT_TRUE(hirRefusal(hirBody(kw), refusalNaming(kw)).empty())
             << "the refusal advertises '" << kw
             << "' and the reader then does not recognize it as a node keyword.";
     }
@@ -1387,8 +1409,10 @@ TEST(TextTierVocabulary, EveryAdvertisedMirTypeKeywordIsRecognizedByTheReader) {
     auto const msg = refusalFor(kBadSpelling);
     ASSERT_FALSE(msg.empty()) << "the type arm must refuse an unknown keyword BY NAME";
     auto const advertised = advertisedIn(msg);
-    // 19 primitive spellings + 16 structural keywords.
-    EXPECT_EQ(advertised.size(), 35u)
+    // 19 primitive spellings + 17 structural keywords — P68 round 8 (lane `ht`,
+    // part 1d): 16 -> 17, the new one being `type`, `.dssir` v2's composite
+    // reference into the `types` table.
+    EXPECT_EQ(advertised.size(), 36u)
         << "the advertised type-keyword set changed size.\nmessage:\n  " << msg;
     for (auto const& kw : advertised) {
         SCOPED_TRACE(kw);
@@ -1414,59 +1438,16 @@ TEST(TextTierVocabulary, EveryAdvertisedMirTypeKeywordIsRecognizedByTheReader) {
 // a paragraph in the loader explaining exactly why, and was named by that
 // sentence as forbidden. `asm.lang.json` declares four of them.
 //
-// ⚠ THE PROBE MOVES THE CWD, IT DOES NOT WRITE THE ENVIRONMENT. A referenced
-// document is resolved off the FILESYSTEM by logical name — there is no text
-// entry point for the referenced side — and `findShippedConfig` consults
-// `$DSS_CONFIG_ROOT` first, falling through to a cwd walk. Entering a scratch
-// root therefore ADDS `probe` without REMOVING anything, so the shipped
-// documents the rest of this file mutates still resolve. Restored in the
-// destructor, before `remove_all`, because Windows refuses to delete the current
-// directory. (The mechanism is `test_language_references.cpp`'s
-// `ProbeConfigRoot`; it lives in that file's anonymous namespace, so this is a
-// second instance of it rather than a second design.)
+// The probe is a real referenced document in a scratch config root the process
+// enters as its cwd: `dss::test_support::ProbeConfigRoot`, which says why it
+// moves the cwd rather than the environment (so the shipped documents the rest
+// of this file mutates still resolve) and why its root is claimed per process.
+// It was a second copy of `test_language_references.cpp`'s fixture until both
+// were hoisted into one.
 
 namespace {
 
-class ProbeConfigRoot {
-public:
-    explicit ProbeConfigRoot(nlohmann::json const& referencedDoc) {
-        namespace fs = std::filesystem;
-        static int      counter = 0;
-        std::error_code ec;
-        root_ = fs::temp_directory_path()
-              / ("dss-keyshape-refdoc-" + std::to_string(++counter));
-        fs::remove_all(root_, ec);
-        fs::path const sources = root_ / "src" / "dss-config" / "sources";
-        fs::create_directories(sources, ec);
-        if (ec) {
-            ADD_FAILURE() << "could not create the probe config root: "
-                          << ec.message();
-            return;
-        }
-        {
-            std::ofstream out(sources / "probe.lang.json", std::ios::binary);
-            out << referencedDoc.dump(2);
-        }
-        previous_ = fs::current_path(ec);
-        fs::current_path(root_, ec);
-        if (ec) {
-            ADD_FAILURE() << "could not enter the probe config root: "
-                          << ec.message();
-        }
-    }
-    ~ProbeConfigRoot() {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        if (!previous_.empty()) fs::current_path(previous_, ec);
-        fs::remove_all(root_, ec);
-    }
-    ProbeConfigRoot(ProbeConfigRoot const&)            = delete;
-    ProbeConfigRoot& operator=(ProbeConfigRoot const&) = delete;
-
-private:
-    std::filesystem::path root_;
-    std::filesystem::path previous_;
-};
+using dss::test_support::ProbeConfigRoot;
 
 // The synthetic REFERENCED document: two holes, one shape, nothing else. Every
 // arm below is this document plus ONE key, so a diagnostic can only be about the
@@ -1557,9 +1538,12 @@ TEST(ReferencedDocumentSurface, TheRefusalNamesEveryBlockTheLoopLetsThrough) {
     // ⚠ THE COUNT IS STATED AND IT IS THE SHRINK GUARD. Everything else walks
     // whatever the message says; only this notices a list that got shorter —
     // which is the exact direction this site was measured wrong in (7 of 15).
-    EXPECT_EQ(advertised.size(), 15u)
-        << "the advertised referenced-document surface changed size. 15 = the 7 "
-           "keys the merge folds in or reads itself, plus the 8 standalone "
+    // 15 → 16 (P68 round 8): `endOfInputImplies` joined the standalone blocks
+    // — a referenced document's implied end-of-input lexeme belongs to its own
+    // standalone reading and is never merged into a host.
+    EXPECT_EQ(advertised.size(), 16u)
+        << "the advertised referenced-document surface changed size. 16 = the 7 "
+           "keys the merge folds in or reads itself, plus the 9 standalone "
            "blocks the merge deliberately leaves alone. A SHRINK means a block "
            "the loop lets through stopped being advertised.\nmessage:\n  "
         << msg;

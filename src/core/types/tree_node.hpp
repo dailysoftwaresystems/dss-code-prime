@@ -29,7 +29,17 @@ enum class NodeFlags : std::uint8_t {
     Missing    = 1u << 1,    // schema required this node but source didn't have it
     HasError   = 1u << 2,    // this node or some descendant is/contains an Error
     Synthetic  = 1u << 3,    // inserted by builder, not derived from source tokens
-    // bits 4-7 reserved
+    // ★ SET BY THE TOKENIZER, AND ONLY ON ONE EMISSION (P68 round 8,
+    // D-ASM-LAST-LINE-WITHOUT-A-NEWLINE-REFUSED): this token stands for the
+    // schema's `endOfInputImplies` lexeme, which the source does NOT contain —
+    // it is zero-width at the end of the buffer. The builder spells it by that
+    // lexeme (a flagged token under a schema declaring none is a fatal drift),
+    // and every other consumer can tell it from a real one by this bit instead
+    // of re-deriving a guess from its position. ⚠ Not `Synthetic`: that one is
+    // the builder's "inserted by recovery", a different fact from a different
+    // tier.
+    Implied    = 1u << 4,
+    // bits 5-7 reserved
 };
 
 // Inline constexpr free operators — header-only, zero cost. Not DSS_EXPORT

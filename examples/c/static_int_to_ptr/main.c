@@ -25,9 +25,11 @@
 //   * q        — a BLOCK-SCOPE static int->ptr: a static-duration local lowers to
 //                a module global, so it reaches the SAME classifyGlobals path.
 //
-// RED-ON-DISABLE: remove either wiring of tryClassifyIntToPtrConst and each
-// int->ptr initializer above falls to runtimeInit -> the aggregate fail-loud ->
-// this TU no longer COMPILES (never reaches exit 18).
+// RED-ON-DISABLE: remove the constant evaluator's integer-to-pointer arm (P68
+// round 13 deleted tryClassifyIntToPtrConst; the evaluator folds this shape for the
+// scalar, the member and the array alike) and each int->ptr initializer above falls
+// to runtimeInit -> the aggregate fail-loud -> this TU no longer COMPILES (never
+// reaches exit 18).
 
 struct Two { char* a; void* b; };
 

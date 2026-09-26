@@ -19,11 +19,14 @@
 #include "core/types/enum_name_table.hpp"       // namesWhere — the `core` subset is a FILTERED PROJECTION, not a third list
 #include "core/types/type_lattice/core_type.hpp" // kTypeKindNameTable / isPrimitiveTypeKind — the TypeKind spellings' ONE owner
 #include "core/types/entry_shape.hpp"          // kDeclarableEntryParamShapeNames / kEntryMaterializationTable (entryFunctions rows)
+#include "core/types/integer_literal_ladder.hpp"  // int_ladder::integerWidth — which named signed entries survive integer promotion (the UAC counterpart check)
 #include "core/types/predefined_macro_json.hpp" // parsePredefinedMacroArray (TF-C74: shared with the target loader)
 #include "core/types/object_format_kind.hpp"  // objectFormatKindFromName
 #include "core/types/section_kind.hpp"         // dataSectionKindFromName — the ONE data-section taxonomy (`assembly.directives[].section`)
 #include "core/types/target_schema.hpp"        // targetRegClassFromName / kOperableTargetRegClassNames — `assembly.templateModifiers[].registerClass` names a row of the ONE register-class envelope
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
+#include "core/types/variant_when_json.hpp"   // decodeWhen — a builtin signature arm's `when` (S2a-1)
+#include "core/types/type_name_resolve.hpp"    // resolveLanguageTypeName — the ONE type-name resolver (shared with the shipped-descriptor reader, P68 round 9)
 
 #include <nlohmann/json.hpp>
 
@@ -220,9 +223,8 @@ using Collector = substrate::DiagnosticCollector;
 //
 // `extra`, when non-empty, is appended to the shared sentence. It exists for the
 // handful of blocks whose refusal carries a REASON the generic message cannot
-// state (`identifierClass` deliberately has no start-character key; a
-// sibling-arm key names the arm it belongs to). Routing must never cost a
-// diagnostic that was saying something real.
+// state (a sibling-arm key names the arm it belongs to). Routing must never cost
+// a diagnostic that was saying something real.
 bool checkKeysAgainst(json const& obj, std::span<std::string_view const> known,
                       std::string_view pathPrefix, std::string_view objectLabel,
                       DiagnosticCode code, Collector& coll,
@@ -2755,7 +2757,7 @@ constexpr std::uint32_t kMaxSchemaVersion = 4;
 // ENTIRE phase. Every name here is a key the loader genuinely reads.
 // Shared with the referenced-document check so a fragment gets the same
 // typo discrimination its host does.
-constexpr std::array<std::string_view, 25> kDocumentKeys{
+constexpr std::array<std::string_view, 26> kDocumentKeys{
     // identity + loader gates
     "dssSchemaVersion", "language", "reservedWordPolicy", "parser",
     // ⚠ `isa` MUST be in this table, and its reason is the sharpest one here.
@@ -2794,6 +2796,12 @@ constexpr std::array<std::string_view, 25> kDocumentKeys{
     // (Whether it BELONGS at top level is the same open question as `isa`'s —
     // see that key's note.)
     "identifierClass",
+    // ⚠ `endOfInputImplies` has the same reason again: it is OPTIONAL and its
+    // absence means "the end of input implies nothing", so a typo'd
+    // `endOfInputImplied` would load clean and put a gas dialect back to
+    // refusing every `.s` whose last line has no newline — a refusal GNU as
+    // and clang do not make, reported as a parse error the config never names.
+    "endOfInputImplies",
     // type-extension + artifact declarations (SP2 / schema v3)
     "typeExtensions", "artifactProfiles",
     // grammar surface
@@ -2900,7 +2908,7 @@ DSS_CHECK_KEY_VOCABULARY(kReferencedDocumentKeys);
 // does mean "silently does nothing". Adding a key here is a claim that the
 // referenced document itself consumes it — do not add one to quiet a
 // diagnostic.
-constexpr std::array<std::string_view, 8> kStandaloneOnlyDocumentKeys{
+constexpr std::array<std::string_view, 9> kStandaloneOnlyDocumentKeys{
     "tokens", "numberStyle", "keywords", "syncTokens", "artifactProfiles",
     // `identifierClass` widens the class of THIS document's own identifier
     // runs. Merging it into a host would change how the HOST tokenizes its own
@@ -2916,7 +2924,14 @@ constexpr std::array<std::string_view, 8> kStandaloneOnlyDocumentKeys{
     // `assembly` names the document's OWN rules and its own spellings; merging
     // it would hand a host an instruction vocabulary for a language the host
     // does not read. It is consumed by the standalone `.s` lowering only.
-    "assembly"};
+    "assembly",
+    // `endOfInputImplies` states what the end of THIS document's own input
+    // means — a line end, for a line-oriented dialect. A host reads its own
+    // file with its own tokenizer, whose end of input means whatever the HOST
+    // declares; merging the key would make C's end of file imply a newline
+    // because a gas dialect's does. It is the token table's, so it stays with
+    // the token table.
+    "endOfInputImplies"};
 DSS_CHECK_KEY_VOCABULARY(kStandaloneOnlyDocumentKeys);
 
 // ⓘ DELIBERATELY NOT ROUTED THROUGH `checkKeysAgainst`, and recorded here so a
@@ -2944,10 +2959,13 @@ void checkReferencedDocumentBlocks(json const& refDoc,
         }
         // ★★ THE SENTENCE IS A PROJECTION OF THE TWO TABLES THIS LOOP WALKS,
         // and it was ✔MEASURED DRIFTED before it became one: it said a
-        // referenced document "may declare only" the SEVEN
-        // `kReferencedDocumentKeys` — while this very loop `continue`s over the
-        // EIGHT `kStandaloneOnlyDocumentKeys` as well, plus
-        // `languageReferences`. So a document author whose `asm.lang.json`
+        // referenced document "may declare only" the
+        // `kReferencedDocumentKeys` — while this very loop `continue`s over
+        // every `kStandaloneOnlyDocumentKeys` entry as well, plus
+        // `languageReferences`. (This note names no count on purpose: it used
+        // to say "SEVEN" and "EIGHT", and a count here is one more copy of the
+        // two arrays' sizes that drifts the day either grows, which is the
+        // defect it describes.) So a document author whose `asm.lang.json`
         // declared `tokens`, `lexerModes` or `assembly` — every one of them
         // deliberately legal here, with a paragraph above explaining WHY — was
         // told by name that the loader would refuse it. That is the class
@@ -3020,7 +3038,7 @@ struct DeclaredHoles {
     // RENDERS IT. The sentence used to spell `{ rules: [...], tokens: [...] }`
     // as a literal below the table — invisible to a quoted-token census, because
     // the keys are UNQUOTED there, which is one of the four blind spots
-    // `scripts/check-retyped-closed-sets` prints with its own count.
+    // `.harness-config/runner/actions/check-retyped-closed-sets` prints with its own count.
     static constexpr std::array<std::string_view, 2> kRequiresKeys{
         "rules", "tokens"};
     DSS_CHECK_KEY_VOCABULARY(kRequiresKeys);
@@ -4325,8 +4343,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                           "unresolvable shape reference. Declare the role with a "
                           "lexeme, or drop the binding and the grammar that "
                           "spells it "
-                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
-                          "CONFIG-OWNER)",
+                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER)",
                           origin, key, hostLabel, modeName, bound->second,
                           bound->second));
             continue;
@@ -4500,8 +4517,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                       "table: it synthesizes one row per template role from "
                       "'{}'s 'semantics.{}'. Declare the mode with no 'tokens' "
                       "of its own "
-                      "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
-                      "CONFIG-OWNER)",
+                      "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER)",
                       hostLabel, modeName, origin,
                       kInlineAsmTemplateLexemesKey));
         return;
@@ -4554,8 +4570,7 @@ void synthesizeInlineAsmTemplateLexemeRows(
                           "row; declare only the capability ('templateLexerMode' "
                           "+ 'templateOperandRule') and the kind binding in "
                           "'bindTokens' "
-                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-"
-                          "CONFIG-OWNER)",
+                          "(D-SEMANTIC-ASM-TEMPLATE-SIGILS-HARDCODED-BESIDE-A-CONFIG-OWNER)",
                           hostLabel, modeName, why, clash,
                           kInlineAsmTemplateLexemesKey, origin));
         }
@@ -5178,6 +5193,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             if (modeIt == data.lexerModeIds.end()) continue;   // unreachable
             const LexerModeId modeId = modeIt->second;
 
+            // CLOSED KEY VOCABULARY for a mode object (the
+            // D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD class). Every knob here is
+            // OPTIONAL with a meaningful default, which is exactly the shape in
+            // which a typo loads clean and silently does nothing: a misspelled
+            // `atEndOfInput` would leave a C `//` comment refused at the end of
+            // a file, and a misspelled `popAtNewline` would let a directive's
+            // lexing leak into the next line. `$`-prefixed keys are the
+            // documentation convention and exempt, as everywhere.
+            {
+                static constexpr std::array<std::string_view, 5> kLexerModeKeys{
+                    "tokens", "defaultToken", "unterminatedAs", "popAtNewline",
+                    "atEndOfInput"};
+                DSS_CHECK_KEY_VOCABULARY(kLexerModeKeys);
+                (void)checkKeysAgainst(modeObj, kLexerModeKeys, modePath,
+                                       "a lexer mode object",
+                                       DiagnosticCode::C_ConflictingField, coll);
+            }
+
             // Parse defaultToken into a local; the mode entry is then
             // rebuilt via the factory rather than mutated in place.
             std::optional<DefaultTokenSpec> defaultToken;
@@ -5370,8 +5403,59 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
+            // Optional `atEndOfInput` — what the end of input does to a frame of
+            // this mode still open there (`EndOfInputPolicy`, lexer_mode.hpp:
+            // `unterminated` (the default), `closes`, `closesWithWarning`).
+            //
+            // ★ TWO REFUSALS, EACH ONE WAY OF SAYING ONE THING TWICE.
+            //   • On a `popAtNewline` mode: its frame ends with its line and the
+            //     end of input ends the last line, so its verdict is `closes` BY
+            //     CONSTRUCTION (`LexerMode::make` derives it). Declaring it is a
+            //     second spelling of the same fact; declaring anything else
+            //     contradicts the line scope.
+            //   • On `main`: the bottom frame is never swept — the end of input
+            //     is what a whole file's `main` scan is FOR — so a policy there
+            //     would be a knob that does nothing.
+            EndOfInputPolicy atEndOfInput = EndOfInputPolicy::Unterminated;
+            if (modeObj.contains("atEndOfInput")) {
+                json const& ae = modeObj.at("atEndOfInput");
+                std::optional<EndOfInputPolicy> parsed;
+                if (ae.is_string()) {
+                    parsed = endOfInputPolicyFromName(ae.get<std::string>());
+                }
+                if (!parsed.has_value()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/atEndOfInput", modePath),
+                              std::format("'atEndOfInput' must be one of {}",
+                                          renderAllowedList(
+                                              allNames(kEndOfInputPolicyTable))));
+                } else if (popAtNewline) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/atEndOfInput", modePath),
+                              std::format("'atEndOfInput' is not declarable on a "
+                                          "'popAtNewline' mode: its frame ends "
+                                          "with its line and the end of input "
+                                          "ends the last line, so its verdict is "
+                                          "'{}' by construction — declaring it "
+                                          "says one thing twice, and declaring "
+                                          "anything else contradicts the line "
+                                          "scope",
+                                          endOfInputPolicyName(
+                                              EndOfInputPolicy::Closes)));
+                } else if (modeName == "main") {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/atEndOfInput", modePath),
+                              "'atEndOfInput' is not declarable on 'main': the "
+                              "bottom frame of a whole-file scan is never open "
+                              "'at' the end of input — reaching it is what the "
+                              "scan is for — so the policy would do nothing");
+                } else {
+                    atEndOfInput = *parsed;
+                }
+            }
             data.lexerModes[modeId.v] =
-                LexerMode::make(modeName, modeId, defaultToken, flavor, popAtNewline);
+                LexerMode::make(modeName, modeId, defaultToken, flavor, popAtNewline,
+                                atEndOfInput);
 
             // tokens field: "default" inherits top-level lexemeTable;
             // an inline object IS the per-mode override table. While the
@@ -5947,6 +6031,97 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
             data.syncTokens = std::move(collected);
+        }
+    }
+
+    // endOfInputImplies ──
+    // Optional: the lexeme the END of this language's input implies — a line
+    // end, for a line-oriented dialect (GNU as inserts the missing final
+    // newline; ✔MEASURED 2026-09-23 on GNU as 2.42, and clang 18.1.3 accepts the
+    // same file silently). The tokenizer reads a non-empty text that does not
+    // end with it AS IF it did; see `GrammarSchema::endOfInputImplies()`.
+    //
+    // ★ THE LEXEME MUST BE ONE THE GLOBAL `tokens` TABLE DECLARES. An implied
+    // byte sequence the language cannot lex would put an `Error` token (or a
+    // multi-token run nobody wrote) at the end of every file that lacks it, so
+    // an undeclared lexeme is a CONFIG defect, refused here rather than
+    // discovered as an illegal character past the end of a user's text.
+    // An EMPTY string is refused too: "implies nothing" is spelled by omitting
+    // the key, and a second spelling of the default is one a reader has to
+    // learn is the same.
+    if (doc.contains("endOfInputImplies")) {
+        json const& ev = doc.at("endOfInputImplies");
+        if (!ev.is_string() || ev.get<std::string>().empty()) {
+            coll.emit(DiagnosticCode::C_MissingField, "/endOfInputImplies",
+                      "'endOfInputImplies' must be a non-empty string: the "
+                      "lexeme the end of this language's input implies "
+                      "(omit the key when it implies nothing)");
+        } else {
+            std::string const lexeme = ev.get<std::string>();
+            bool const declared = doc.contains("tokens")
+                               && doc.at("tokens").is_object()
+                               && doc.at("tokens").contains(lexeme);
+            // ★ THE IMPLIED TAIL MUST LEX AS ITS OWN TOKEN(S), NEVER AS THE END
+            // OF A LONGER ONE. A declared lexeme that ENDS with a prefix of the
+            // implied one — `\r\n` against an implied `\n` — would be matched
+            // ACROSS the end of the buffer (`\r` written, `\n` implied), and that
+            // token would be half real and half not: no single flag could say
+            // which of its bytes the source holds. Refused here, in every table
+            // the tail can be read with (the global one and each mode's inline
+            // override), so the invariant holds by construction.
+            std::string straddler;
+            auto const scanTable = [&](json const& table) {
+                if (!table.is_object()) return;
+                for (auto const& [other, unused] : table.items()) {
+                    (void)unused;
+                    if (!straddler.empty() || other == lexeme) continue;
+                    for (std::size_t cut = 1; cut < other.size(); ++cut) {
+                        std::string_view const head{other.data(), cut};
+                        std::string_view const tail{other.data() + cut,
+                                                    other.size() - cut};
+                        // A buffer ending in `head` gets the tail only when it
+                        // does not already end with the lexeme — so a head that
+                        // does (`\n` of `\n\n`) can never meet the implied bytes.
+                        if (head.ends_with(lexeme)) continue;
+                        if (tail.size() <= lexeme.size()
+                            && std::string_view{lexeme}.starts_with(tail)) {
+                            straddler = other;
+                            break;
+                        }
+                    }
+                }
+            };
+            if (doc.contains("tokens")) scanTable(doc.at("tokens"));
+            if (doc.contains("lexerModes") && doc.at("lexerModes").is_object()) {
+                for (auto const& [modeName, modeObj] : doc.at("lexerModes").items()) {
+                    if (isDocumentationKey(modeName) || !modeObj.is_object()) continue;
+                    if (modeObj.contains("tokens")) scanTable(modeObj.at("tokens"));
+                }
+            }
+            if (declared && !straddler.empty()) {
+                coll.emit(DiagnosticCode::C_ConflictingField, "/endOfInputImplies",
+                          std::format("'endOfInputImplies' names the lexeme {}, "
+                                      "and the declared lexeme {} ends with it (or "
+                                      "with a prefix of it) — a text ending in the "
+                                      "rest of {} would be lexed across the end of "
+                                      "the buffer into ONE token that is part "
+                                      "written and part implied",
+                                      json(lexeme).dump(), json(straddler).dump(),
+                                      json(straddler).dump()));
+            } else if (!declared) {
+                coll.emit(DiagnosticCode::C_UnknownToken, "/endOfInputImplies",
+                          // The lexeme is shown as its JSON spelling, so a
+                          // newline reads `"\n"` rather than breaking the line.
+                          std::format("'endOfInputImplies' names the lexeme "
+                                      "{}, which this document's global "
+                                      "'tokens' table does not declare — the "
+                                      "tokenizer would read an implied tail "
+                                      "the language cannot lex at the end of "
+                                      "every text that lacks it",
+                                      json(lexeme).dump()));
+            } else {
+                data.endOfInputImplies = lexeme;
+            }
         }
     }
 
@@ -7019,44 +7194,122 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             if (!ic.is_object()) {
                 coll.emit(DiagnosticCode::C_MalformedJson, "/identifierClass",
                           "'identifierClass' must be an object with an "
-                          "'extraContinue' character-class string");
+                          "'extraContinue' and/or 'extraStart' "
+                          "character-class string");
             } else {
-                static constexpr std::array<std::string_view, 1>
-                    kIdentifierClassKeys{"extraContinue"};
+                static constexpr std::array<std::string_view, 2>
+                    kIdentifierClassKeys{"extraContinue", "extraStart"};
                 DSS_CHECK_KEY_VOCABULARY(kIdentifierClassKeys);
-                // ⚠ `extraStart` IS THE KEY A READER WILL REACH FOR, AND IT IS
-                // REFUSED ON PURPOSE RATHER THAN UNIMPLEMENTED — so the reason
-                // rides along as the `extra` sentence. "unknown key" alone
-                // reads as an oversight and would send the next implementer to
-                // add it; routing the loop must not cost that.
                 bool const clean = checkKeysAgainst(
                     ic, kIdentifierClassKeys, "/identifierClass",
                     "the 'identifierClass' block",
-                    DiagnosticCode::C_MalformedJson, coll,
-                    "There is deliberately NO start-character key: an extra "
-                    "character may CONTINUE an identifier and may never START "
-                    "one, because a leading character that also introduces a "
-                    "directive or an operator is owned by that TOKEN, and two "
-                    "mechanisms for one byte cannot agree about which construct "
-                    "it opens");
-                if (clean) {
-                    if (!ic.contains("extraContinue")
-                        || !ic.at("extraContinue").is_string()
-                        || ic.at("extraContinue").get<std::string>().empty()) {
-                        // A block declaring nothing is a block that silently
-                        // does nothing — the absence of the block is the way to
-                        // say "the universal rule".
+                    DiagnosticCode::C_MalformedJson, coll);
+                // A key that is present must be a non-empty class string; a
+                // block declaring NEITHER is a block that silently does
+                // nothing — the absence of the block is the way to say "the
+                // universal rule".
+                auto classOf = [&](std::string_view key) -> std::optional<std::string> {
+                    if (!ic.contains(std::string{key})) return std::nullopt;
+                    json const& v = ic.at(std::string{key});
+                    if (!v.is_string() || v.get<std::string>().empty()) {
                         coll.emit(DiagnosticCode::C_MissingField,
-                                  "/identifierClass/extraContinue",
-                                  "'extraContinue' is required and must be a "
-                                  "non-empty character-class string (the same "
-                                  "syntax as numberStyle's 'digits' — literal "
-                                  "characters and 'a-z' ranges). Omit the whole "
-                                  "'identifierClass' block to mean 'the "
-                                  "universal identifier rule'");
-                    } else {
-                        auto const cls =
-                            ic.at("extraContinue").get<std::string>();
+                                  std::format("/identifierClass/{}", key),
+                                  std::format(
+                                      "'{}' must be a non-empty character-class "
+                                      "string (the same syntax as numberStyle's "
+                                      "'digits' — literal characters and 'a-z' "
+                                      "ranges). Omit the whole 'identifierClass' "
+                                      "block to mean 'the universal identifier "
+                                      "rule'", key));
+                        return std::nullopt;
+                    }
+                    return v.get<std::string>();
+                };
+                if (clean && !ic.contains("extraContinue")
+                    && !ic.contains("extraStart")) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/identifierClass/extraContinue",
+                              "'extraContinue' or 'extraStart' is required (a "
+                              "non-empty character-class string); omit the "
+                              "whole 'identifierClass' block to mean 'the "
+                              "universal identifier rule'");
+                }
+                // ── extraStart ── [[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]] ────────
+                //
+                // ★★ ADMITTED EXACTLY WHERE NO TOKEN OWNS THE BYTE. This key was
+                // refused outright, with the reason "a leading character that
+                // also introduces a directive or an operator is owned by that
+                // TOKEN, and two mechanisms for one byte cannot agree about
+                // which construct it opens" — and that reason is kept, as a
+                // CHECK rather than a blanket refusal: a byte that begins any
+                // lexeme this document declares (the global `tokens` and every
+                // mode's inline table) is refused, naming the lexeme; a byte no
+                // token begins cannot be fought over. The class is matched byte
+                // by byte through the same `digitClassMatches` the tokenizer
+                // runs, so a range is judged exactly as it will be used.
+                if (clean) {
+                    if (auto const cls = classOf("extraStart")) {
+                        bool bad = false;
+                        for (unsigned b = 0; b <= 0xFF; ++b) {
+                            char const c = static_cast<char>(b);
+                            if (!digitClassMatches(*cls, c)) continue;
+                            std::string_view why;
+                            std::string owner;
+                            if (IdentifierClass::universalStart(c)) {
+                                why = "already starts an identifier under the "
+                                      "universal rule (ASCII letters, '_', and "
+                                      "the UTF-8 lead bytes), so declaring it "
+                                      "here changes nothing";
+                            } else if (b >= '0' && b <= '9') {
+                                why = "is a digit: a digit starts a NUMBER, and "
+                                      "a name that could begin with one would "
+                                      "take `1abc` from the numeric scanner";
+                            } else if (b <= 0x20) {
+                                why = "is whitespace or a control character; a "
+                                      "name that may begin with one swallows "
+                                      "the gap before it — a wrong parse rather "
+                                      "than a parse error";
+                            } else {
+                                auto const begins = [&](auto const& table) {
+                                    for (auto const& [lex, meanings] : table) {
+                                        (void)meanings;
+                                        if (!lex.empty() && lex.front() == c) {
+                                            owner = lex;
+                                            return true;
+                                        }
+                                    }
+                                    return false;
+                                };
+                                bool owned = begins(data.lexemeTable);
+                                for (auto const& [modeId, table] : data.lexerModeTokens) {
+                                    (void)modeId;
+                                    if (owned) break;
+                                    owned = begins(table);
+                                }
+                                if (owned) {
+                                    why = "begins a lexeme this document "
+                                          "declares, and a leading character "
+                                          "that introduces a token is owned by "
+                                          "that TOKEN — two mechanisms for one "
+                                          "byte cannot agree about which "
+                                          "construct it opens";
+                                }
+                            }
+                            if (why.empty()) continue;
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/identifierClass/extraStart",
+                                      owner.empty()
+                                          ? std::format("byte 0x{:02x} {}", b, why)
+                                          : std::format("'{}' {} ('{}')",
+                                                        c, why, owner));
+                            bad = true;
+                        }
+                        if (!bad) data.identifierClass.extraStart = *cls;
+                    }
+                }
+                if (clean && ic.contains("extraContinue")) {
+                    if (auto const cont = classOf("extraContinue")) {
+                        std::string const& cls = *cont;
                         bool bad = false;
                         for (char const c : cls) {
                             if (c == '-') continue;   // range syntax, not a char
@@ -7523,10 +7776,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // the two families can never drift on the closed `kind`
                     // verb set, the Constant⇒`value` rule, the function-like
                     // `params` checks, or `availableObjectFormats` validation.
+                    // `true`: the LANGUAGE family may declare `type-size`
+                    // rows; their `type` is resolved below, once
+                    // `semantics`' type tables are read.
                     detail::parsePredefinedMacroArray(
                         pms, "/preprocess/predefinedMacros",
                         DiagnosticCode::C_InvalidPreprocess, coll,
-                        cfg.predefinedMacros);
+                        cfg.predefinedMacros, /*typeVocabularyInScope=*/true);
+                }
+            }
+            // P68 round 9: `typeNameSpellings` — the language's canonical TYPE
+            // NAMES a `type-name` predefined macro's value is chosen from (see
+            // `PredefinedTypeSpelling`). Shape only here; each name is RESOLVED
+            // below, with the `type-size` rows, once `semantics`' type tables exist.
+            if (pp.contains("typeNameSpellings")) {
+                json const& tns = pp.at("typeNameSpellings");
+                constexpr char const* kPath = "/preprocess/typeNameSpellings";
+                if (!tns.is_array()) {
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess, kPath,
+                              "'preprocess.typeNameSpellings' must be an array of "
+                              "type-name strings");
+                } else {
+                    for (std::size_t si = 0; si < tns.size(); ++si) {
+                        if (!tns[si].is_string() || tns[si].get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      std::format("{}/{}", kPath, si),
+                                      "each 'typeNameSpellings' entry must be a "
+                                      "non-empty type name");
+                            continue;
+                        }
+                        PredefinedTypeSpelling s;
+                        s.spelled = tns[si].get<std::string>();
+                        cfg.typeNameSpellings.push_back(std::move(s));
+                    }
                 }
             }
 
@@ -8542,6 +8824,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // P68 round 8: set once the `semantics` block has resolved the `type-size`
+    // predefined macros' types (see there). A language with such rows and no
+    // type tables to resolve them against is refused just after the block.
+    bool typeSizeRowsReachedSemantics = false;
+
     // semantics ── per-language semantic config (plan 08.6; schema v4).
     // Optional; absent ⇒ analyzer performs no semantic analysis. Parsed
     // LATE, after `shapes`/`tokens` populated the interners, so referenced
@@ -8586,14 +8873,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // of pointer arithmetic. A sibling of `pointerAliasing` (a per-language
             // fact read at two tiers), NOT of `sizeof`/`alignof` (which name
             // GRAMMAR RULES, while this names a size).
-            static constexpr std::array<std::string_view, 61> kSemanticsKeys{
+            // ⓘ 63 → 64 (P68 round 12, lane `cs`): `enumerationCompatibleTypes` — the
+            // ladders an enumeration's compatible type is chosen from (C23
+            // 6.7.3.3p13); a sibling of `integerLiteralTyping`, whose shape it has.
+            // ⓘ 64 → 65 (P68 round 13, lane `cs`): `staticInitializers` — C 6.7.9p4's
+            // constraint and the 6.6p10 constant forms (`StaticInitializerRule`); a sibling
+            // of `compoundLiterals`.
+            static constexpr std::array<std::string_view, 65> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
                 // the type surface
                 "builtinTypes", "typeShapes", "literalTypes", "typeSpecifiers",
                 "integerLiteralTyping", "floatLiteralTyping", "parameters",
-                "arithmeticConversions", "synthesizedTypes",
+                "arithmeticConversions", "synthesizedTypes", "enumerationCompatibleTypes",
                 // SE4-SE7 expression facets
                 "assignments", "callRules", "casts",
                 // type-query operators + declaration specifiers
@@ -8605,14 +8898,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // remaining expression / declaration facets
                 "variadic", "staticAssertRule", "inlineAsm",
                 "inlineAsmTemplateLexemes", "generic",
-                "compoundLiterals", "builtinFunctions",
+                "compoundLiterals", "staticInitializers", "builtinFunctions",
                 // P31: the compile-time OPERATORS (not functions — see above)
                 "builtinOffsetof", "builtinTypesCompatible", "builtinChooseExpr",
                 // statement surface
                 "returnRules", "loopRules", "loopControls",
                 // single-token roles
                 "identifierToken", "bracketIdentifierToken", "pointerToken",
-                "volatileMarker", "atomicMarker",
+                // the language's qualifier vocabulary — ONE owner for all four
+                "constMarker", "restrictMarker", "volatileMarker", "atomicMarker",
                 // link / FFI surface. ⛔ `externLibraryByFormat` is DELIBERATELY
                 // ABSENT (UCRT-P4, Decision 1): a per-LANGUAGE "which image owns a
                 // symbol" default was a guess standing in for the shipped-descriptor
@@ -8896,7 +9190,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 23>
+                    static constexpr std::array<std::string_view, 24>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -8913,6 +9207,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // VLA C4c (D-CSUBSET-VLA): the OPTIONAL array-parameter
                             // decoration token-kind set (static / cv-qualifiers / `*`).
                             "arraySuffixModifierTokens",
+                            // P68 round 10: the OPTIONAL subset C 6.7.6.2p1 allows only on a
+                            // parameter's OUTERMOST array derivation.
+                            "arraySuffixOutermostOnlyTokens",
                             // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL
                             // struct/union member-declarator + member-list roles.
                             "memberDeclaratorRule", "memberListRule",
@@ -9247,6 +9544,55 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
                     }
+                    // P68 round 10 (lane `cs`): the OPTIONAL decorations C 6.7.6.2p1 allows
+                    // only on a parameter's OUTERMOST array derivation. Known token-kind
+                    // names, and each ALSO an `arraySuffixModifierTokens` entry — a
+                    // decoration the bound locator did not skip would be read as the bound.
+                    if (dj.contains("arraySuffixOutermostOnlyTokens")) {
+                        json const& ot = dj.at("arraySuffixOutermostOnlyTokens");
+                        std::string const oPath = dPath + "/arraySuffixOutermostOnlyTokens";
+                        if (!ot.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, oPath,
+                                      "'declarators.arraySuffixOutermostOnlyTokens' must be "
+                                      "an array of token-kind name strings");
+                            dOk = false;
+                        } else {
+                            for (auto const& el : ot) {
+                                if (!el.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, oPath,
+                                              "each 'arraySuffixOutermostOnlyTokens' entry "
+                                              "must be a token-kind name string");
+                                    dOk = false;
+                                    continue;
+                                }
+                                auto const nm = el.get<std::string>();
+                                if (!data.schemaTokens->contains(nm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken, oPath,
+                                              std::format("'declarators."
+                                                          "arraySuffixOutermostOnlyTokens' "
+                                                          "references unknown token kind "
+                                                          "'{}'", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                if (std::find(dc.arraySuffixModifierTokenNames.begin(),
+                                              dc.arraySuffixModifierTokenNames.end(), nm)
+                                    == dc.arraySuffixModifierTokenNames.end()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, oPath,
+                                              std::format("'declarators."
+                                                          "arraySuffixOutermostOnlyTokens' names "
+                                                          "'{}', which 'arraySuffixModifierTokens' "
+                                                          "does not — the bound locator would read "
+                                                          "that decoration as the bound", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                dc.arraySuffixOutermostOnlyTokens.push_back(
+                                    data.schemaTokens->find(nm));
+                                dc.arraySuffixOutermostOnlyTokenNames.push_back(nm);
+                            }
+                        }
+                    }
                     if (dOk) cfg.declarators = std::move(dc);
                 }
             }
@@ -9291,7 +9637,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 "fieldChildren", "bitfieldSuffix",
                                 "arraySuffix", "allowFlexibleArray",
                                 "enumUnderlyingType",
-                                // specifier + marker roles
+                                // specifier + marker roles. The three
+                                // QUALIFIER markers are RETIRED here (P68
+                                // round 9): still listed so the refusal below
+                                // can name where each one moved, never read.
                                 "specifierPrefix", "requiredSpecifierToken",
                                 "constMarker", "volatileMarker",
                                 "restrictMarker",
@@ -9413,80 +9762,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 data.schemaTokens->find(rs);
                         }
 
-                        // SE4: optional const-marker token. A bad token
-                        // name is C_UnknownToken; the symbol is still
-                        // minted (just never marked const).
-                        if (entry.contains("constMarker")) {
-                            if (!entry.at("constMarker").is_string()) {
-                                coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/constMarker",
-                                          "'constMarker' must be a string");
-                            } else {
-                                auto const cm = entry.at("constMarker").get<std::string>();
-                                if (!data.schemaTokens->contains(cm)) {
-                                    coll.emit(DiagnosticCode::C_UnknownToken,
-                                              path + "/constMarker",
-                                              std::format("'declarations[{}].constMarker' "
-                                                          "references unknown token kind '{}'",
-                                                          i, cm));
-                                } else {
-                                    rule.constMarker = data.schemaTokens->find(cm);
-                                }
-                            }
+                        // ── RETIRED (P68 round 9, lane `cs`): A ROW NO LONGER
+                        //    DECLARES THE LANGUAGE'S QUALIFIER TOKENS ─────────
+                        // `const`, `restrict` and `volatile` used to be written
+                        // on every declarator-mode row (c: thirteen copies of
+                        // `ConstKeyword`, thirteen of `RestrictKeyword`, ten of
+                        // `VolatileKeyword`, while the type-position resolver
+                        // read a FOURTH, semantics-level `volatileMarker`) — one
+                        // fact with fourteen owners, and the drift was real: the
+                        // three C23 `auto` rows carried `const` and `restrict`
+                        // but not `volatile`. A type NAME (a cast, an `_Generic`
+                        // association) has no row at all, so it could not read
+                        // the `const` token anywhere. The vocabulary now lives
+                        // ONCE, in `semantics.{const,restrict,volatile,atomic}
+                        // Marker`, and every declarator-mode row takes it by
+                        // derivation (see "THE QUALIFIER MARKERS OF A
+                        // DECLARATOR-MODE ROW ARE DERIVED" below). A row still
+                        // spelling one is refused BY NAME, pointing at its home.
+                        for (char const* retired :
+                             {"constMarker", "restrictMarker", "volatileMarker"}) {
+                            if (!entry.contains(retired)) continue;
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path + "/" + retired,
+                                      std::format("'declarations[{}].{}' is retired: the "
+                                                  "language's qualifier tokens are declared "
+                                                  "ONCE, as 'semantics.{}', and every "
+                                                  "declarator-mode row takes them from there",
+                                                  i, retired, retired));
                         }
 
-                        // P44 (D-C23-REDECL-QUALIFIER-AXIS-HAS-THREE-UNCLAIMED-SOURCES
-                        // part (b)): optional restrict-marker token. Same shape
-                        // as `constMarker` above — a bad token name is
-                        // C_UnknownToken and the declaration stays usable, it
-                        // simply makes no restrict claim. Source-language
-                        // agnostic: each language declares its own marker.
-                        if (entry.contains("restrictMarker")) {
-                            if (!entry.at("restrictMarker").is_string()) {
-                                coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/restrictMarker",
-                                          "'restrictMarker' must be a string");
-                            } else {
-                                auto const rm =
-                                    entry.at("restrictMarker").get<std::string>();
-                                if (!data.schemaTokens->contains(rm)) {
-                                    coll.emit(DiagnosticCode::C_UnknownToken,
-                                              path + "/restrictMarker",
-                                              std::format("'declarations[{}].restrictMarker' "
-                                                          "references unknown token kind '{}'",
-                                                          i, rm));
-                                } else {
-                                    rule.restrictMarker = data.schemaTokens->find(rm);
-                                }
-                            }
-                        }
-
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): optional
-                        // volatile-marker token. Same shape as `constMarker`
-                        // above: a bad token name is C_UnknownToken; the symbol
-                        // is still minted (just never marked volatile). Source-
-                        // language agnostic — each language declares its own
-                        // marker token.
-                        if (entry.contains("volatileMarker")) {
-                            if (!entry.at("volatileMarker").is_string()) {
-                                coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                          path + "/volatileMarker",
-                                          "'volatileMarker' must be a string");
-                            } else {
-                                auto const vm = entry.at("volatileMarker").get<std::string>();
-                                if (!data.schemaTokens->contains(vm)) {
-                                    coll.emit(DiagnosticCode::C_UnknownToken,
-                                              path + "/volatileMarker",
-                                              std::format("'declarations[{}].volatileMarker' "
-                                                          "references unknown token kind '{}'",
-                                                          i, vm));
-                                } else {
-                                    rule.volatileMarker = data.schemaTokens->find(vm);
-                                }
-                            }
-                        }
-
-                        // D-LANG-VARIADIC (step 13.4, 2026-06-02): optional
+                        // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): optional
                         // C-style variadic-marker token. Same shape as
                         // `constMarker` above: a bad token name is
                         // C_UnknownToken; the declaration is still usable
@@ -9603,13 +9908,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     // missing keys are BOOLEANS, so the "string
                                     // fields" half was wrong for them as well
                                     // (D-CONFIG-GRAMMAR-LOADER-KEY-SHAPE-SENTENCES-RETYPE-THEIR-VOCABULARIES).
-                                    static constexpr std::array<std::string_view, 7>
+                                    static constexpr std::array<std::string_view, 9>
                                         kLinkageEffectKeys{"binding", "visibility",
                                                            "staticStorage",
                                                            "threadStorage",
                                                            "nonDefining",
                                                            "exclusiveGroup",
-                                                           "compatibleWith"};
+                                                           "compatibleWith",
+                                                           "asmLabelNamesRegister",
+                                                           "addressNotTakeable"};
                                     DSS_CHECK_KEY_VOCABULARY(kLinkageEffectKeys);
                                     if (!eff.is_object()) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -9808,6 +10115,39 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             continue;
                                         }
                                         any = true;
+                                    }
+                                    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED):
+                                    // the two `register` facts — an asm label
+                                    // naming a MACHINE REGISTER (GNU local
+                                    // register variables) and C 6.5.3.2p1's
+                                    // "not the operand of `&`". Optional bools,
+                                    // the staticStorage mirror; `false` states
+                                    // nothing and so counts toward nothing.
+                                    if (eff.contains("asmLabelNamesRegister")) {
+                                        if (!eff.at("asmLabelNamesRegister")
+                                                 .is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'asmLabelNamesRegister' "
+                                                      "must be a boolean");
+                                            continue;
+                                        }
+                                        effect.asmLabelNamesRegister =
+                                            eff.at("asmLabelNamesRegister")
+                                                .get<bool>();
+                                        if (effect.asmLabelNamesRegister) any = true;
+                                    }
+                                    if (eff.contains("addressNotTakeable")) {
+                                        if (!eff.at("addressNotTakeable").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'addressNotTakeable' must be "
+                                                      "a boolean");
+                                            continue;
+                                        }
+                                        effect.addressNotTakeable =
+                                            eff.at("addressNotTakeable").get<bool>();
+                                        if (effect.addressNotTakeable) any = true;
                                     }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
@@ -10803,11 +11143,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             continue;
                                         }
                                         row.verb = *vb;
-                                        // ★★ VERB ⟺ SIGNATURE COHERENCE. Stated as a
-                                        // table of the (verb → the param shapes that
-                                        // verb's emitter actually materializes) pairs,
-                                        // so a NEW verb has to add a row here instead
-                                        // of inheriting a permissive default.
+                                        // ★★ VERB ⟺ SIGNATURE COHERENCE, read off the
+                                        // ONE (verb → the param shapes that verb's
+                                        // emitter actually materializes) table,
+                                        // `entryVerbParams` in entry_shape.hpp — the
+                                        // table the synthesized inits and the entry
+                                        // trampoline read too, so a NEW verb adds its
+                                        // row there (its switch has no `default:`)
+                                        // instead of inheriting a permissive default.
                                         //
                                         // ⓘ THIS RULE MIGRATED HERE FROM THE FORMAT
                                         // LOADER, where it could not survive: the
@@ -10826,18 +11169,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         // UNINITIALIZED registers — the measured
                                         // `argc=846361312` class. Neither is the
                                         // "harmless" one.
-                                        std::vector<EntryParamShape> want;
-                                        switch (row.verb) {
-                                        case EntryMaterialization::None:      break;
-                                        case EntryMaterialization::ArgcArgv:
-                                            want = {EntryParamShape::I32,
-                                                    EntryParamShape::PtrPtrChar};
-                                            break;
-                                        case EntryMaterialization::ArgcWargv:
-                                            want = {EntryParamShape::I32,
-                                                    EntryParamShape::PtrPtrU16};
-                                            break;
-                                        }
+                                        auto const wantShapes = entryVerbParams(row.verb);
+                                        std::vector<EntryParamShape> const want(
+                                            wantShapes.begin(), wantShapes.end());
                                         if (row.params != want) {
                                             std::string wantText;
                                             for (auto const w : want) {
@@ -12033,90 +12367,33 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // falls back to a `builtinTypes` text match (toy-style
             // languages with no specifier table). Unresolvable → reject
             // (C_InvalidSemantics) so a typo can never silently no-op.
+            //
+            // ★ THE RESOLUTION ITSELF IS `resolveLanguageTypeName`
+            // (`core/types/type_name_resolve.hpp`), the ONE resolver a
+            // shipped-library descriptor's lattice-derived constant also uses
+            // at USE time (P68 round 9). This lambda only binds it to the
+            // tables being built and emits its message at the JSON path.
             auto const resolveTypeName =
                 [&](std::string const& name, std::string const& path,
                     DataModelTypeRef& out) -> bool {
-                out.name = name;
-                // Split on single spaces (the JSON spelling convention).
-                std::vector<std::string> words;
-                {
-                    std::size_t pos = 0;
-                    while (pos < name.size()) {
-                        std::size_t const sp = name.find(' ', pos);
-                        if (sp == std::string::npos) {
-                            words.push_back(name.substr(pos));
-                            break;
-                        }
-                        if (sp > pos) words.push_back(name.substr(pos, sp - pos));
-                        pos = sp + 1;
+                TypeNameWordKind const wordKind =
+                    [&](std::string_view w) -> std::optional<SchemaTokenId> {
+                    auto const it = data.lexemeTable.find(w);
+                    if (it == data.lexemeTable.end() || it->second.size() != 1) {
+                        return std::nullopt;
                     }
-                }
-                if (words.empty()) {
+                    return it->second.front().id;
+                };
+                auto resolved = resolveLanguageTypeName(
+                    name, wordKind, cfg.typeSpecifiers, cfg.builtinTypes);
+                if (!resolved.has_value()) {
+                    out.name = name;   // as the lambda always left it on a miss
                     coll.emit(DiagnosticCode::C_InvalidSemantics, path,
-                              "type name must be non-empty");
+                              resolved.error());
                     return false;
                 }
-                // Try the typeSpecifiers multiset (each word must be a
-                // declared keyword lexeme with exactly one meaning).
-                if (!cfg.typeSpecifiers.empty()) {
-                    std::vector<SchemaTokenId> kinds;
-                    bool allWordsKnown = true;
-                    for (auto const& w : words) {
-                        auto const it = data.lexemeTable.find(w);
-                        if (it == data.lexemeTable.end()
-                            || it->second.size() != 1) {
-                            allWordsKnown = false;
-                            break;
-                        }
-                        kinds.push_back(it->second.front().id);
-                    }
-                    if (allWordsKnown) {
-                        std::sort(kinds.begin(), kinds.end(),
-                                  [](SchemaTokenId a, SchemaTokenId b) {
-                                      return a.v < b.v;
-                                  });
-                        for (auto const& row : cfg.typeSpecifiers) {
-                            if (row.tokens.size() != kinds.size()) continue;
-                            bool same = true;
-                            for (std::size_t n = 0; n < kinds.size(); ++n) {
-                                if (row.tokens[n].v != kinds[n].v) {
-                                    same = false;
-                                    break;
-                                }
-                            }
-                            if (same) {
-                                out.core            = row.core;
-                                out.coreByDataModel = row.coreByDataModel;
-                                // FC17.9(e): copy the long-double axis map —
-                                // dropping it here would silently type the
-                                // "long double" LITERAL rule at the base core.
-                                out.coreByLongDoubleFormat =
-                                    row.coreByLongDoubleFormat;
-                                // D-LANG-TYPE-IDENTITY-VOCABULARY: and the
-                                // identity tag, for the same reason one tier up.
-                                out.vocabularyName = row.name;
-                                return true;
-                            }
-                        }
-                    }
-                }
-                // Single-word fallback: builtinTypes text match (core
-                // rows only — extension types have no width semantics).
-                if (words.size() == 1) {
-                    for (auto const& bt : cfg.builtinTypes) {
-                        if (bt.name == words.front() && !bt.extension.has_value()) {
-                            out.core            = bt.core;
-                            out.coreByDataModel = bt.coreByDataModel;
-                            out.vocabularyName  = bt.vocabularyName;
-                            return true;
-                        }
-                    }
-                }
-                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
-                          std::format("type name '{}' resolves to no "
-                                      "'typeSpecifiers' multiset and no "
-                                      "'builtinTypes' entry", name));
-                return false;
+                out = std::move(*resolved);
+                return true;
             };
 
             // Is the resolved ref an INTEGER kind under EVERY data model
@@ -12163,11 +12440,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // required; `decimal`/`nondecimal` are the candidate
                         // ladders an ordinary row carries; `bitPrecise` selects
                         // the magnitude-derived `_BitInt` row and `signed`
-                        // picks `wb` vs `uwb` within it.
-                        static constexpr std::array<std::string_view, 5>
+                        // picks `wb` vs `uwb` within it; `type` + `outOfRange`
+                        // make the FIXED-TYPE row (MSVC's sized suffixes).
+                        static constexpr std::array<std::string_view, 7>
                             kIntegerLiteralRowKeys{"suffixes", "decimal",
                                                    "nondecimal", "bitPrecise",
-                                                   "signed"};
+                                                   "signed", "type",
+                                                   "outOfRange"};
                         DSS_CHECK_KEY_VOCABULARY(kIntegerLiteralRowKeys);
                         if (!checkKeysAgainst(
                                 entry, kIntegerLiteralRowKeys, path,
@@ -12198,6 +12477,104 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             rule.suffixes.push_back(s.get<std::string>());
                         }
                         if (!entryOk) { rowsOk = false; continue; }
+                        // P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): a
+                        // FIXED-TYPE rule — `type` names the literal's ONE type and
+                        // `outOfRange` what a magnitude past its range does. Its type
+                        // does not depend on the magnitude, so it carries no candidate
+                        // ladder and is not bit-precise; a row that mixes shapes is
+                        // refused rather than read one way.
+                        if (entry.contains("type") || entry.contains("outOfRange")) {
+                            if (!entry.contains("type")) {
+                                coll.emit(DiagnosticCode::C_MissingField, path + "/type",
+                                          "'outOfRange' belongs to a fixed-type rule, "
+                                          "which must name its 'type'");
+                                rowsOk = false; continue;
+                            }
+                            auto const verbs = [] {
+                                return renderAllowedList(
+                                    allNames(kIntegerLiteralOutOfRangeTable), " or ");
+                            };
+                            if (!entry.contains("outOfRange")) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/outOfRange",
+                                          std::format("a fixed-type rule must say what a "
+                                                      "magnitude its type cannot hold "
+                                                      "does: 'outOfRange' is required — "
+                                                      "expected {}", verbs()));
+                                rowsOk = false; continue;
+                            }
+                            if (entry.contains("decimal") || entry.contains("nondecimal")
+                                || entry.contains("bitPrecise") || entry.contains("signed")) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                          "a fixed-type rule ('type') types every "
+                                          "literal it covers as that one type, so it "
+                                          "must NOT declare 'decimal'/'nondecimal' "
+                                          "candidates or 'bitPrecise'/'signed'");
+                                rowsOk = false; continue;
+                            }
+                            if (!entry.at("outOfRange").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/outOfRange",
+                                          std::format("'outOfRange' must be a string "
+                                                      "(closed verb) — expected {}",
+                                                      verbs()));
+                                rowsOk = false; continue;
+                            }
+                            auto const verb = entry.at("outOfRange").get<std::string>();
+                            auto const parsedVerb = integerLiteralOutOfRangeFromName(verb);
+                            if (!parsedVerb.has_value()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/outOfRange",
+                                          std::format("unknown 'outOfRange' verb '{}' — "
+                                                      "expected {}", verb, verbs()));
+                                rowsOk = false; continue;
+                            }
+                            if (!entry.at("type").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/type",
+                                          "'type' must be a type-name string");
+                                rowsOk = false; continue;
+                            }
+                            DataModelTypeRef ref;
+                            if (!resolveTypeName(entry.at("type").get<std::string>(),
+                                                 path + "/type", ref)) {
+                                rowsOk = false; continue;
+                            }
+                            // An integer core of at most 64 bits, or plain `char`: the
+                            // reduction is modulo 2^width of a 64-bit magnitude. And the
+                            // SAME core under every data model, because phase 4 (`#if`)
+                            // reduces with no data model in scope — a width the model
+                            // decided would make the preprocessor's answer a guess.
+                            auto const fixedKind = [](TypeKind k) noexcept {
+                                return k == TypeKind::I8 || k == TypeKind::U8
+                                    || k == TypeKind::I16 || k == TypeKind::U16
+                                    || k == TypeKind::I32 || k == TypeKind::U32
+                                    || k == TypeKind::I64 || k == TypeKind::U64
+                                    || k == TypeKind::Char;
+                            };
+                            bool const invariant = std::ranges::all_of(
+                                ref.coreByDataModel,
+                                [&](auto const& row) { return row.second == ref.core; });
+                            if (!fixedKind(ref.core) || !invariant) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/type",
+                                          std::format("fixed type '{}' must resolve to an "
+                                                      "integer kind of at most 64 bits, or "
+                                                      "plain char, and to the same kind "
+                                                      "under every data model", ref.name));
+                                rowsOk = false; continue;
+                            }
+                            if (rule.suffixes.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                          "a fixed-type rule must declare its "
+                                          "'suffixes' (the unsuffixed rule is a ladder)");
+                                rowsOk = false; continue;
+                            }
+                            rule.fixedType  = std::move(ref);
+                            rule.outOfRange = *parsedVerb;
+                            cfg.integerLiteralTyping.push_back(std::move(rule));
+                            continue;
+                        }
                         // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a
                         // `wb`/`uwb` bit-precise rule. Its type is magnitude-derived
                         // (`_BitInt(N)`), so it carries NO `decimal`/`nondecimal`
@@ -12522,8 +12899,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // ── FC4 c1: parameters (parameter-list conventions) ────────
             // `soleVoidMeansEmpty` (C 6.7.6.3p10): a `(void)` list means
-            // zero params at the engine's param-harvest chokepoint. Closed
-            // keys; non-bool value fails loud.
+            // zero params at the engine's param-harvest chokepoint.
+            // `unqualifiedParameterTypes` (C 6.7.6.3p15, P68 round 10): a
+            // function type takes each parameter's unqualified type. Closed
+            // keys; a non-bool value fails loud.
             if (sem.contains("parameters")) {
                 json const& pj = sem.at("parameters");
                 if (!pj.is_object()) {
@@ -12531,25 +12910,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "/semantics/parameters",
                               "'parameters' must be an object");
                 } else {
-                    // DERIVED FROM THE PARSE ARM below: the block reads exactly
-                    // one key today.
-                    static constexpr std::array<std::string_view, 1>
-                        kParametersKeys{"soleVoidMeansEmpty"};
+                    // DERIVED FROM THE PARSE ARMS below: the block reads exactly
+                    // these two keys.
+                    static constexpr std::array<std::string_view, 2>
+                        kParametersKeys{"soleVoidMeansEmpty", "unqualifiedParameterTypes"};
                     DSS_CHECK_KEY_VOCABULARY(kParametersKeys);
                     (void)checkKeysAgainst(
                         pj, kParametersKeys, "/semantics/parameters",
                         "the 'parameters' block",
                         DiagnosticCode::C_InvalidSemantics, coll);
-                    if (pj.contains("soleVoidMeansEmpty")) {
-                        if (!pj.at("soleVoidMeansEmpty").is_boolean()) {
+                    auto const readBool = [&](std::string_view key, bool& out) {
+                        std::string const k{key};
+                        if (!pj.contains(k)) return;
+                        if (!pj.at(k).is_boolean()) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      "/semantics/parameters/soleVoidMeansEmpty",
-                                      "'soleVoidMeansEmpty' must be a boolean");
-                        } else {
-                            cfg.parameters.soleVoidMeansEmpty =
-                                pj.at("soleVoidMeansEmpty").get<bool>();
+                                      "/semantics/parameters/" + k,
+                                      "'" + k + "' must be a boolean");
+                            return;
                         }
-                    }
+                        out = pj.at(k).get<bool>();
+                    };
+                    readBool("soleVoidMeansEmpty", cfg.parameters.soleVoidMeansEmpty);
+                    readBool("unqualifiedParameterTypes",
+                             cfg.parameters.unqualifiedParameterTypes);
                 }
             }
 
@@ -12753,6 +13136,62 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── C 6.3.1.8's FIFTH CONVERSION NEEDS EACH SIGNED ENTRY'S COUNTERPART ──
+            //
+            // P68 round 10 (lane `cs`, D-LANG-UAC-UNSIGNED-COUNTERPART-OF-SIGNED):
+            // under `rank-prefer-unsigned`, two operands of the SAME width whose
+            // signed one ranks higher convert to the UNSIGNED COUNTERPART of the
+            // signed type — the named entry of equal `rank` whose core is the
+            // unsigned twin of the signed entry's (`deriveUnsignedCounterparts`,
+            // semantic_config.hpp: the one derivation the conversions consult). A
+            // named signed entry with no such entry, or with two, under ANY data
+            // model, would leave that conversion no type to name: refused here, at
+            // load, never guessed at a use. Only an entry that SURVIVES integer
+            // promotion can meet an unsigned operand of its own width as ITSELF: one
+            // narrower than the promotion floor, or listed in `alsoPromote`, is the
+            // anonymous promoted type by then (the config's documented promotion —
+            // the rule `promoteIntegerKind` applies in the conversions), so it needs
+            // no counterpart and a language may name it freely.
+            if (cfg.arithmeticConversions.has_value()
+                && cfg.arithmeticConversions->mixedSignedness
+                       == MixedSignednessRule::RankPreferUnsigned) {
+                ArithmeticConversions const& uac = *cfg.arithmeticConversions;
+                for (auto const& [dm, dmName] : kDataModelTable.rows) {
+                    TypeKind const floorCore = uac.minRankType.resolveCore(dm);
+                    auto const promotes = [&](TypeKind k) {
+                        for (auto const& p : uac.alsoPromote)
+                            if (p.resolveCore(dm) == k) return true;
+                        return detail::int_ladder::integerWidth(k)
+                             < detail::int_ladder::integerWidth(floorCore);
+                    };
+                    UnsignedCounterparts const cps =
+                        deriveUnsignedCounterparts(cfg.typeSpecifiers, dm);
+                    for (auto const& e : cps.missing) {
+                        if (promotes(e.core)) continue;
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/typeSpecifiers",
+                                  std::format("the signed vocabulary entry '{}' has no "
+                                              "unsigned counterpart under the {} data "
+                                              "model: no named entry of the same 'rank' "
+                                              "whose core is the unsigned twin of its "
+                                              "own. C 6.3.1.8 converts a same-width pair "
+                                              "whose signed operand ranks higher to that "
+                                              "counterpart", e.name, dmName));
+                    }
+                    for (auto const& e : cps.ambiguous) {
+                        if (promotes(e.core)) continue;
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  "/semantics/typeSpecifiers",
+                                  std::format("the signed vocabulary entry '{}' has more "
+                                              "than one unsigned counterpart under the {} "
+                                              "data model: two named entries of its "
+                                              "'rank' share the unsigned twin of its "
+                                              "core, so C 6.3.1.8's conversion to 'the' "
+                                              "counterpart has no one type", e.name, dmName));
+                    }
+                }
+            }
+
             // ── D-LANG-TYPE-IDENTITY-VOCABULARY: synthesizedTypes ──────
             //
             // WHICH VOCABULARY ENTRY each ENGINE-SYNTHESIZED standard type
@@ -12778,6 +13217,46 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // the anonymous core on exactly that one model — the silent
             // wrong-arm defect this block exists to remove, re-introduced
             // per-target.
+            // ── THE TABLE IS THE DISPATCH KEY ──────────────────────────────
+            //
+            // ★★ THE COMMENT THIS REPLACED CLAIMED the name array and the
+            // `if (key == …)` cascade below "cannot drift apart silently … both
+            // are visible here". That is a statement about PROXIMITY, and
+            // proximity guarantees nothing: a fourth role added to the array
+            // and not to the cascade would have been ACCEPTED by
+            // `checkKeysAgainst` and then silently DROPPED — a declared role
+            // that loads clean, ends up unset, and leaves every consumer on the
+            // anonymous core this block exists to replace. Two owners of one
+            // fact, where one of them is a router
+            // (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN).
+            //
+            // Pairing each role name with the MEMBER it fills makes the ONE
+            // table both the vocabulary and the dispatch: a row cannot be added
+            // without naming its slot, and the key set is PROJECTED from it by
+            // `keysOf` rather than retyped.
+            // ★ Declared OUTSIDE the `synthesizedTypes` block (P68 round 8) so
+            // the `type-size` predefined-macro resolution below reads a role by
+            // the SAME table — a second role list there would be a second owner.
+            using RoleSlot = SynthesizedTypeRule SemanticConfig::*;
+            // 3 -> 5 (P31): `offsetof` (C 7.19 -- size_t, given its own role
+            // rather than sharing sizeof's slot so this block answers the
+            // question without a cross-reference) and `typesCompatible` (gcc
+            // yields `int`).
+            // 5 -> 6 (P68 round 12, lane `cs`): `enumerationConstant` — the type
+            // of an enumeration constant (C17 6.4.4.3p2, C23 6.7.3.3: `int`).
+            static constexpr std::array<std::pair<std::string_view, RoleSlot>, 6>
+                kSynthesizedTypeRoleRows{{
+                    {"sizeof",              &SemanticConfig::sizeofResultType},
+                    {"alignof",             &SemanticConfig::alignofResultType},
+                    {"pointerDifference",   &SemanticConfig::pointerDifferenceType},
+                    {"offsetof",            &SemanticConfig::offsetofResultType},
+                    {"typesCompatible",     &SemanticConfig::typesCompatibleResultType},
+                    {"enumerationConstant", &SemanticConfig::enumerationConstantType},
+                }};
+            static constexpr auto kSynthesizedTypeRoles =
+                keysOf(kSynthesizedTypeRoleRows,
+                       [](auto const& r) { return r.first; });
+            DSS_CHECK_KEY_VOCABULARY(kSynthesizedTypeRoles);
             if (sem.contains("synthesizedTypes")) {
                 json const& obj = sem.at("synthesizedTypes");
                 if (!obj.is_object()) {
@@ -12861,41 +13340,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         if (roleOk) out = std::move(rule);
                     };
-                    // ── THE TABLE IS THE DISPATCH KEY ──────────────────────
-                    //
-                    // ★★ THE COMMENT THIS REPLACED CLAIMED the name array and
-                    // the `if (key == …)` cascade below "cannot drift apart
-                    // silently … both are visible here". That is a statement
-                    // about PROXIMITY, and proximity guarantees nothing: a
-                    // fourth role added to the array and not to the cascade
-                    // would have been ACCEPTED by `checkKeysAgainst` and then
-                    // silently DROPPED — a declared role that loads clean, ends
-                    // up unset, and leaves every consumer on the anonymous core
-                    // this block exists to replace. Two owners of one fact,
-                    // where one of them is a router
-                    // (D-CONFIG-GRAMMAR-LOADER-INLINE-CHAIN-VOCABULARIES-REMAIN).
-                    //
-                    // Pairing each role name with the MEMBER it fills makes the
-                    // ONE table both the vocabulary and the dispatch: a row
-                    // cannot be added without naming its slot, and the key set
-                    // is PROJECTED from it by `keysOf` rather than retyped.
-                    using RoleSlot = SynthesizedTypeRule SemanticConfig::*;
-                    // 3 -> 5 (P31): `offsetof` (C 7.19 -- size_t, given its own
-                    // role rather than sharing sizeof's slot so this block answers
-                    // the question without a cross-reference) and
-                    // `typesCompatible` (gcc yields `int`).
-                    static constexpr std::array<std::pair<std::string_view, RoleSlot>, 5>
-                        kSynthesizedTypeRoleRows{{
-                            {"sizeof",            &SemanticConfig::sizeofResultType},
-                            {"alignof",           &SemanticConfig::alignofResultType},
-                            {"pointerDifference", &SemanticConfig::pointerDifferenceType},
-                            {"offsetof",          &SemanticConfig::offsetofResultType},
-                            {"typesCompatible",   &SemanticConfig::typesCompatibleResultType},
-                        }};
-                    static constexpr auto kSynthesizedTypeRoles =
-                        keysOf(kSynthesizedTypeRoleRows,
-                               [](auto const& r) { return r.first; });
-                    DSS_CHECK_KEY_VOCABULARY(kSynthesizedTypeRoles);
+                    // The role table (`kSynthesizedTypeRoleRows`, declared just
+                    // above this block) is the vocabulary AND the dispatch.
                     (void)checkKeysAgainst(
                         obj, kSynthesizedTypeRoles,
                         "/semantics/synthesizedTypes",
@@ -12909,6 +13355,469 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             readRole(key, cfg.*slot);
                             break;
                         }
+                    }
+                }
+            }
+
+            // ── P68 round 13 (lane `cs`): `staticInitializers` (C 6.7.9p4, 6.6p7-p10) ──
+            // An object whose one optional key, `otherConstantForms`, lists the constant
+            // forms beyond C 6.6's own list the language admits in a static initializer
+            // (6.6p10), each a name of the closed `ConstantForm` vocabulary, each at most
+            // once. The block's presence IS the constraint. Refused loud: a non-object, an
+            // unknown key, a non-array list, a non-string or unknown name, a duplicate — a
+            // dropped name would silently turn a form every reference builds into a refusal.
+            if (sem.contains("staticInitializers")) {
+                json const& obj = sem.at("staticInitializers");
+                std::string const base = "/semantics/staticInitializers";
+                static constexpr std::array<std::string_view, 1> kStaticInitializerKeys{
+                    "otherConstantForms"};
+                DSS_CHECK_KEY_VOCABULARY(kStaticInitializerKeys);
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                              "'staticInitializers' must be an object");
+                } else if (checkKeysAgainst(obj, kStaticInitializerKeys, base,
+                                            "the 'staticInitializers' block",
+                                            DiagnosticCode::C_InvalidSemantics, coll,
+                                            "each key names one part of the rule")) {
+                    StaticInitializerRule rule;
+                    bool ok = true;
+                    if (obj.contains("otherConstantForms")) {
+                        std::string const path = base + "/otherConstantForms";
+                        json const& forms = obj.at("otherConstantForms");
+                        if (!forms.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      std::format("'otherConstantForms' must be an array of "
+                                                  "constant-form names ({})",
+                                                  renderAllowedList(allNames(kConstantFormTable))));
+                            ok = false;
+                        } else {
+                            for (auto const& f : forms) {
+                                auto const form = f.is_string()
+                                    ? constantFormFromName(f.get<std::string>())
+                                    : std::nullopt;
+                                if (!form.has_value()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("unknown constant form '{}' (expected "
+                                                          "one of {})",
+                                                          f.is_string() ? f.get<std::string>()
+                                                                        : f.dump(),
+                                                          renderAllowedList(
+                                                              allNames(kConstantFormTable))));
+                                    ok = false;
+                                    continue;
+                                }
+                                if (rule.otherConstantForms.admits(*form)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("constant form '{}' is listed twice",
+                                                          constantFormName(*form)));
+                                    ok = false;
+                                    continue;
+                                }
+                                rule.otherConstantForms.admit(*form);
+                            }
+                        }
+                    }
+                    if (ok) cfg.staticInitializers = rule;
+                }
+            }
+
+            // ── P68 round 12 (lane `cs`): `enumerationCompatibleTypes` (C23 6.7.3.3p13)
+            //
+            // `{ "<rule>": { "unsigned": [type names…], "signed": [type names…] }, … }`
+            // — per format convention (`EnumCompatibleTypeRule`: "msvc", "gnu"), the
+            // two ORDERED ladders the type an enumeration without a fixed underlying
+            // type is compatible with is chosen from (see `EnumerationCompatibleTypes`).
+            // Each rung resolves through the SAME `resolveTypeName` the literal ladder
+            // uses, so its representation follows the data model. Fails loud on: a
+            // non-object block or rule entry, a key that is no rule spelling, a rule
+            // left uncovered (a format declaring it would silently find no ladders), a
+            // key outside `unsigned` / `signed`, a missing or empty ladder, a rung that
+            // is not an integer type under every data model, an UNSIGNED rung on the
+            // `signed` ladder (it could never hold a negative value), and a block
+            // declared without the `enumerationConstant` role it sits beside.
+            if (sem.contains("enumerationCompatibleTypes")) {
+                json const& obj = sem.at("enumerationCompatibleTypes");
+                std::string const base = "/semantics/enumerationCompatibleTypes";
+                static constexpr std::array<std::string_view, 2> kEnumerationLadderKeys{
+                    "unsigned", "signed"};
+                DSS_CHECK_KEY_VOCABULARY(kEnumerationLadderKeys);
+                auto const isUnsignedKind = [](TypeKind k) noexcept {
+                    return k == TypeKind::U8 || k == TypeKind::U16 || k == TypeKind::U32
+                        || k == TypeKind::U64 || k == TypeKind::U128;
+                };
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                              std::format("'enumerationCompatibleTypes' must be an object "
+                                          "keyed by format convention ({})",
+                                          renderAllowedList(allNames(
+                                              kEnumCompatibleTypeRuleTable))));
+                } else {
+                    bool widenOk = true;
+                    EnumerationCompatibleTypes block;
+                    for (auto const& [key, entry] : obj.items()) {
+                        if (isDocumentationKey(key)) continue;
+                        std::string const rulePath = base + "/" + key;
+                        auto const rule = enumCompatibleTypeRuleFromName(key);
+                        if (!rule.has_value()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, rulePath,
+                                      std::format("unknown format convention '{}' "
+                                                  "(expected one of {})", key,
+                                                  renderAllowedList(allNames(
+                                                      kEnumCompatibleTypeRuleTable))));
+                            widenOk = false;
+                            continue;
+                        }
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, rulePath,
+                                      "each convention's entry must be an object with an "
+                                      "'unsigned' and a 'signed' ladder of type names");
+                            widenOk = false;
+                            continue;
+                        }
+                        widenOk = checkKeysAgainst(
+                                      entry, kEnumerationLadderKeys, rulePath,
+                                      "an 'enumerationCompatibleTypes' convention",
+                                      DiagnosticCode::C_InvalidSemantics, coll,
+                                      "each key names the ladder for one sign of the values")
+                                  && widenOk;
+                        auto const readLadder = [&](char const* ladderKey, bool signedOnly,
+                                                    std::vector<DataModelTypeRef>& out) {
+                            std::string const path = rulePath + "/" + ladderKey;
+                            if (!entry.contains(ladderKey) || !entry.at(ladderKey).is_array()
+                                || entry.at(ladderKey).empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField, path,
+                                          std::format("'{}' is required and must be a "
+                                                      "non-empty array of type names",
+                                                      ladderKey));
+                                return false;
+                            }
+                            for (auto const& nm : entry.at(ladderKey)) {
+                                if (!nm.is_string() || nm.get<std::string>().empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              "each rung must be a non-empty type-name "
+                                              "string");
+                                    return false;
+                                }
+                                DataModelTypeRef ref;
+                                if (!resolveTypeName(nm.get<std::string>(), path, ref))
+                                    return false;   // resolveTypeName already reported
+                                if (!isIntegerKindName(ref)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("rung '{}' must resolve to an "
+                                                          "integer kind under every data "
+                                                          "model", nm.get<std::string>()));
+                                    return false;
+                                }
+                                bool anyUnsigned = isUnsignedKind(ref.core);
+                                for (auto const& [_, k] : ref.coreByDataModel)
+                                    anyUnsigned = anyUnsigned || isUnsignedKind(k);
+                                if (signedOnly && anyUnsigned) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("rung '{}' is unsigned under some "
+                                                          "data model — the 'signed' ladder "
+                                                          "holds a NEGATIVE value, which an "
+                                                          "unsigned rung never can",
+                                                          nm.get<std::string>()));
+                                    return false;
+                                }
+                                out.push_back(std::move(ref));
+                            }
+                            return true;
+                        };
+                        EnumerationLadders ladders;
+                        widenOk = readLadder("unsigned", false, ladders.unsignedLadder)
+                                  && widenOk;
+                        widenOk = readLadder("signed", true, ladders.signedLadder)
+                                  && widenOk;
+                        block.byRule.emplace(*rule, std::move(ladders));
+                    }
+                    // Full coverage of the closed rule vocabulary: a format declaring an
+                    // uncovered convention would silently find no ladders.
+                    for (auto const& [rule, ruleName] : kEnumCompatibleTypeRuleTable.rows) {
+                        if (block.byRule.contains(rule)) continue;
+                        coll.emit(DiagnosticCode::C_MissingField, base,
+                                  std::format("'enumerationCompatibleTypes' declares no "
+                                              "ladders for the '{}' convention — a declared "
+                                              "block must cover EVERY convention a format "
+                                              "can name", ruleName));
+                        widenOk = false;
+                    }
+                    if (widenOk && !cfg.enumerationConstantType.declared()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                                  "'enumerationCompatibleTypes' chooses an enumeration's "
+                                  "compatible type beside its constants' type, so "
+                                  "'synthesizedTypes.enumerationConstant' must be "
+                                  "declared too");
+                        widenOk = false;
+                    }
+                    if (widenOk) cfg.enumerationCompatibleTypes = std::move(block);
+                }
+            }
+
+            // ── P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the
+            // `type-size` PREDEFINED MACROS' TYPES, resolved through THIS
+            // language's own vocabulary ────────────────────────────────────
+            //
+            // The `preprocess` block was read first (it is above), so its
+            // `type-size` rows carry their `type` only as written. They are
+            // resolved HERE, where the type tables exist, by the SAME
+            // `resolveTypeName` the literal ladder and `synthesizedTypes` use —
+            // a macro that says `__SIZEOF_LONG__` measures exactly the type the
+            // source spelling `long` denotes, and a typo fails the load.
+            //   * a TYPE NAME        → its (core, per-data-model, per-long-double)
+            //                          triple, which must be SIZED on every axis
+            //                          (`void` names a type with no size);
+            //   * `synthesized`      → the role's type per data model, through
+            //                          `kSynthesizedTypeRoleRows` (one table);
+            //   * `pointerTo`        → the pointee must resolve; the core is a
+            //                          pointer, sized by the data model;
+            //   * `abiTypedef`       → nothing here: the TARGET declares it, per
+            //                          object format, so it resolves per PAIR.
+            //
+            // P68 round 9: `type-unsigned` rows name a type the SAME way and are
+            // resolved by the same arms, with one more requirement — every core
+            // the type can take must be an INTEGER type (it has a signedness).
+            // A `float` there would realize to nothing on every pair: a declared
+            // macro that is silently never defined. The same round's `type-name`,
+            // `type-limit` and `type-suffix` rows require it too (a spelling from
+            // an integer-only list, a lattice limit, a literal suffix) — except a
+            // POINTER's width, the one limit a pointer has (`__POINTER_WIDTH__`;
+            // the entry parser admits `pointerTo` there alone). Each row also
+            // keeps its type's VOCABULARY TAG, so `long` is spelled and typed as
+            // `long` where the data model makes it the width of `int`.
+            typeSizeRowsReachedSemantics = true;
+            auto const hasSignedness = [](TypeKind k) {
+                switch (k) {
+                    case TypeKind::Bool: case TypeKind::Char:
+                    case TypeKind::I8: case TypeKind::I16: case TypeKind::I32:
+                    case TypeKind::I64: case TypeKind::I128:
+                    case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
+                    case TypeKind::U64: case TypeKind::U128:
+                        return true;
+                    default:
+                        return false;
+                }
+            };
+            // P68 round 9: `typeNameSpellings`, RESOLVED — each listed name to its
+            // identity under every data model, through the one resolver, so a
+            // `type-name` macro can only ever say a name the parser reads back as
+            // the realized type. INTEGER names only (the list serves the integer
+            // families), and ONE name per identity on every data model: two
+            // would make the spelling a matter of list order.
+            {
+                auto& spellings = data.preprocess.typeNameSpellings;
+                for (std::size_t si = 0; si < spellings.size(); ++si) {
+                    PredefinedTypeSpelling& s = spellings[si];
+                    std::string const spPath =
+                        std::format("/preprocess/typeNameSpellings/{}", si);
+                    DataModelTypeRef ref;
+                    if (!resolveTypeName(s.spelled, spPath, ref)) continue;
+                    bool integral = ref.coreByLongDoubleFormat.empty()
+                                    && hasSignedness(ref.core);
+                    for (auto const& [dm, k] : ref.coreByDataModel) {
+                        if (!hasSignedness(k)) integral = false;
+                    }
+                    if (!integral) {
+                        coll.emit(DiagnosticCode::C_InvalidPreprocess, spPath,
+                                  std::format("'typeNameSpellings' lists '{}', which "
+                                              "is not an integer type on every data "
+                                              "model — the list spells the integer "
+                                              "types a 'type-name' macro can realize",
+                                              s.spelled));
+                        continue;
+                    }
+                    s.core            = ref.core;
+                    s.coreByDataModel = ref.coreByDataModel;
+                    s.vocabularyName  = ref.vocabularyName;
+                    s.resolved        = true;
+                }
+                for (auto const& [dm, dmName] : kDataModelTable.rows) {
+                    for (std::size_t i = 0; i < spellings.size(); ++i) {
+                        if (!spellings[i].resolved) continue;
+                        for (std::size_t j = i + 1; j < spellings.size(); ++j) {
+                            if (!spellings[j].resolved) continue;
+                            if (!(spellings[i].identityUnder(dm)
+                                  == spellings[j].identityUnder(dm))) {
+                                continue;
+                            }
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      std::format("/preprocess/typeNameSpellings/{}", j),
+                                      std::format("'typeNameSpellings' lists '{}' and "
+                                                  "'{}', which name ONE type under data "
+                                                  "model {} — a type has one canonical "
+                                                  "spelling; remove one",
+                                                  spellings[i].spelled,
+                                                  spellings[j].spelled, dmName));
+                        }
+                    }
+                }
+            }
+            // A `type-name` row whose type the load already knows (a type name, a
+            // synthesized role) must be SPELLABLE on every data model it can take
+            // — refused here, once, rather than on the first pair that meets it.
+            auto const spellableEverywhere =
+                [&](PredefinedMacroDef const& pm,
+                    std::function<PredefinedTypeIdentity(DataModel)> const& idOn) {
+                if (pm.kind != PredefinedMacroKind::TypeName) return true;
+                for (auto const& [dm, dmName] : kDataModelTable.rows) {
+                    PredefinedTypeIdentity const id = idOn(dm);
+                    if (spellPredefinedType(data.preprocess.typeNameSpellings, id, dm)
+                            .has_value()) {
+                        continue;
+                    }
+                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                              pm.declaredAt + "/type",
+                              std::format("predefined macro '{}' spells type '{}', "
+                                          "which under data model {} is {}{} — a type "
+                                          "'preprocess.typeNameSpellings' lists no "
+                                          "name for",
+                                          pm.name, pm.sizedType.spelled, dmName,
+                                          typeKindNameOrEmpty(id.core),
+                                          id.vocabularyName.empty()
+                                              ? std::string{}
+                                              : " \"" + id.vocabularyName + "\""));
+                    return false;
+                }
+                return true;
+            };
+            for (PredefinedMacroDef& pm : data.preprocess.predefinedMacros) {
+                if (!predefinedMacroKindNamesAType(pm.kind)) continue;
+                // Every type-naming kind but `type-size` needs an INTEGER type
+                // (a pointer's width is admitted by the `pointerTo` arm alone).
+                bool const asksSignedness = (pm.kind != PredefinedMacroKind::TypeSize);
+                PredefinedSizedType& st = pm.sizedType;
+                std::string const typePath = pm.declaredAt + "/type";
+                switch (st.source) {
+                    case PredefinedTypeSource::None:
+                    case PredefinedTypeSource::AbiTypedef:
+                    case PredefinedTypeSource::ShippedTypedef:
+                        // Per PAIR (the target's ABI typedefs) or per (language ×
+                        // pair) (the shipped descriptor's decode): nothing here.
+                        break;
+                    case PredefinedTypeSource::Vocabulary: {
+                        DataModelTypeRef ref;
+                        if (!resolveTypeName(st.spelled, typePath, ref)) break;
+                        // Every core the name can take must have a size, or the
+                        // macro would silently vanish on the axis that lacks one.
+                        std::vector<TypeKind> cores{ref.core};
+                        for (auto const& [dm, k] : ref.coreByDataModel) cores.push_back(k);
+                        for (auto const& [f, k] : ref.coreByLongDoubleFormat) cores.push_back(k);
+                        bool sized = true;
+                        bool integral = true;
+                        for (TypeKind const k : cores) {
+                            if (!scalarByteSize(k, DataModel::Lp64).has_value()) sized = false;
+                            if (!hasSignedness(k)) integral = false;
+                        }
+                        if (!sized) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, typePath,
+                                      std::format("predefined macro '{}' sizes type "
+                                                  "'{}', which has no scalar size — a "
+                                                  "'{}' row must name a sized type",
+                                                  pm.name, st.spelled,
+                                                  predefinedMacroKindName(pm.kind)));
+                            break;
+                        }
+                        if (asksSignedness && !integral) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess, typePath,
+                                      std::format("predefined macro '{}' names type "
+                                                  "'{}', which is not an integer type — "
+                                                  "a '{}' row must name an integer type",
+                                                  pm.name, st.spelled,
+                                                  predefinedMacroKindName(pm.kind)));
+                            break;
+                        }
+                        if (!spellableEverywhere(pm, [&](DataModel dm) {
+                                return PredefinedTypeIdentity{ref.resolveCore(dm),
+                                                              ref.vocabularyName};
+                            })) {
+                            break;
+                        }
+                        st.core                   = ref.core;
+                        st.coreByDataModel        = ref.coreByDataModel;
+                        st.coreByLongDoubleFormat = ref.coreByLongDoubleFormat;
+                        st.vocabularyName         = ref.vocabularyName;
+                        st.resolved               = true;
+                        break;
+                    }
+                    case PredefinedTypeSource::PointerTo: {
+                        DataModelTypeRef pointee;
+                        if (!resolveTypeName(st.spelled, typePath + "/pointerTo",
+                                             pointee)) {
+                            break;
+                        }
+                        st.core     = TypeKind::Ptr;
+                        st.resolved = true;
+                        break;
+                    }
+                    case PredefinedTypeSource::Synthesized: {
+                        RoleSlot slot = nullptr;
+                        for (auto const& [roleName, s] : kSynthesizedTypeRoleRows) {
+                            if (roleName == st.spelled) {
+                                slot = s;
+                                break;
+                            }
+                        }
+                        if (slot == nullptr) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      typePath + "/synthesized",
+                                      std::format("predefined macro '{}' names "
+                                                  "synthesized role '{}', which is "
+                                                  "not a role (expected one of {})",
+                                                  pm.name, st.spelled,
+                                                  renderAllowedList(
+                                                      kSynthesizedTypeRoles)));
+                            break;
+                        }
+                        SynthesizedTypeRule const& rule = cfg.*slot;
+                        if (!rule.declared()) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      typePath + "/synthesized",
+                                      std::format("predefined macro '{}' sizes the "
+                                                  "type of synthesized role '{}', "
+                                                  "which this language does not "
+                                                  "declare in "
+                                                  "'semantics.synthesizedTypes'",
+                                                  pm.name, st.spelled));
+                            break;
+                        }
+                        // A declared role covers every data model (the block
+                        // above refuses one that does not), so `core` is never
+                        // the answer; it stays Void, which has no size.
+                        bool integral = true;
+                        for (auto const& [dm, ref] : rule.byDataModel) {
+                            st.coreByDataModel[dm] = ref.resolveCore(dm);
+                            st.vocabularyNameByDataModel[dm] = ref.vocabularyName;
+                            if (!hasSignedness(st.coreByDataModel[dm])) integral = false;
+                        }
+                        if (asksSignedness && !integral) {
+                            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                      typePath + "/synthesized",
+                                      std::format("predefined macro '{}' names "
+                                                  "synthesized role '{}', whose type "
+                                                  "is not an integer type on every "
+                                                  "data model — a '{}' row must name "
+                                                  "an integer type",
+                                                  pm.name, st.spelled,
+                                                  predefinedMacroKindName(pm.kind)));
+                            st.coreByDataModel.clear();
+                            st.vocabularyNameByDataModel.clear();
+                            break;
+                        }
+                        if (!spellableEverywhere(pm, [&](DataModel dm) {
+                                auto const it = rule.byDataModel.find(dm);
+                                return it == rule.byDataModel.end()
+                                           ? PredefinedTypeIdentity{}
+                                           : PredefinedTypeIdentity{
+                                                 it->second.resolveCore(dm),
+                                                 it->second.vocabularyName};
+                            })) {
+                            st.coreByDataModel.clear();
+                            st.vocabularyNameByDataModel.clear();
+                            break;
+                        }
+                        st.core     = TypeKind::Void;
+                        st.resolved = true;
+                        break;
                     }
                 }
             }
@@ -15142,9 +16051,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // 'name'; 'signature' and 'params'/'result' are mutually
                         // exclusive). `$`-prefixed keys are the codebase-wide
                         // documentation convention, never a role.
-                        static constexpr std::array<std::string_view, 8>
-                            kBuiltinFnKeys{"name", "signature",
-                                           "signatureByDataModel", "params",
+                        static constexpr std::array<std::string_view, 7>
+                            kBuiltinFnKeys{"name", "signature", "params",
                                            "result", "variadic", "lowering",
                                            // D-CSUBSET-ATOMIC-MONOMORPH-I32
                                            "genericPointee"};
@@ -15163,10 +16071,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // two forms must be used (both = an ambiguous declaration;
                         // fail loud rather than pick).
                         if (entry.contains("signature")) {
-                            if (!entry.at("signature").is_string()) {
+                            json const& sigNode = entry.at("signature");
+                            if (!sigNode.is_string() && !sigNode.is_object()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/signature",
-                                          "'signature' must be a string");
+                                          "'signature' must be a type-text string or a "
+                                          "per-pair object with 'variants'");
                                 continue;
                             }
                             if (entry.contains("params") || entry.contains("result")) {
@@ -15177,51 +16087,83 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 continue;
                             }
                             BuiltinFunctionMapping m;
-                            m.name          = entry.at("name").get<std::string>();
-                            m.signatureText = entry.at("signature").get<std::string>();
-                            // D-LANG-TYPE-IDENTITY-VOCABULARY: the OPTIONAL
-                            // per-data-model signature override (same key name +
-                            // shape as the shipped-lib reader's). Keys are the
-                            // closed data-model vocabulary; an unknown key fails
-                            // loud rather than silently never applying.
-                            if (entry.contains("signatureByDataModel")) {
-                                json const& byDm = entry.at("signatureByDataModel");
-                                if (!byDm.is_object()) {
+                            m.name = entry.at("name").get<std::string>();
+                            if (sigNode.is_string()) {
+                                m.signatureText = sigNode.get<std::string>();
+                            } else {
+                                // P68 round 12 (S2a-1): the per-pair form — decoded
+                                // HERE, at load, by the ONE `when` decoder the
+                                // shipped-descriptor reader uses, and selected at
+                                // injection by the ONE matcher.
+                                std::string const sigPath = path + "/signature";
+                                bool armsOk = true;
+                                auto const bad = [&](std::string const& at, std::string msg) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, at, std::move(msg));
+                                    armsOk = false;
+                                };
+                                detail::rejectUnknownKeys(
+                                    sigNode, std::array<std::string_view, 1>{"variants"},
+                                    "a per-pair 'signature'",
+                                    [&](std::string_view, std::string message) { bad(sigPath, std::move(message)); });
+                                if (!sigNode.contains("variants") || !sigNode.at("variants").is_array()
+                                    || sigNode.at("variants").empty()) {
+                                    bad(sigPath, "a per-pair 'signature' must carry a non-empty 'variants' array "
+                                                 "(or be a flat type-text string)");
+                                }
+                                bool haveDefault = false;
+                                if (armsOk) {
+                                    std::size_t vi = 0;
+                                    for (json const& arm : sigNode.at("variants")) {
+                                        std::string const at = sigPath + "/variants/" + std::to_string(vi++);
+                                        if (!arm.is_object()) { bad(at, "each arm must be an object"); continue; }
+                                        bool const isDefault = arm.contains("default");
+                                        auto const knownArmKeys = isDefault
+                                            ? std::array<std::string_view, 2>{"default", "value"}
+                                            : std::array<std::string_view, 2>{"when", "value"};
+                                        detail::rejectUnknownKeys(
+                                            arm, knownArmKeys, "a 'signature' arm",
+                                            [&](std::string_view, std::string message) { bad(at, std::move(message)); });
+                                        if (!arm.contains("value") || !arm.at("value").is_string()
+                                            || arm.at("value").get<std::string>().empty()) {
+                                            bad(at, "each arm must carry a non-empty string 'value'");
+                                            continue;
+                                        }
+                                        std::string text = arm.at("value").get<std::string>();
+                                        if (isDefault) {
+                                            if (!arm.at("default").is_boolean() || !arm.at("default").get<bool>()) {
+                                                bad(at, "'default' must be the literal true (a default arm has "
+                                                        "no 'when')");
+                                                continue;
+                                            }
+                                            if (haveDefault) {
+                                                bad(at, "at most one 'default' arm — it serves every pair no "
+                                                        "other arm selects");
+                                                continue;
+                                            }
+                                            haveDefault     = true;
+                                            m.signatureText = std::move(text);
+                                            continue;
+                                        }
+                                        if (!arm.contains("when")) { bad(at, "each arm needs a 'when'"); continue; }
+                                        auto spec = decodeWhen(
+                                            arm.at("when"), WhenAxes::FullTarget, at + "/when",
+                                            [&](std::string body) { bad(at + "/when", std::move(body)); },
+                                            [&](std::string sentence) { bad(at + "/when", std::move(sentence)); });
+                                        if (!spec.has_value()) continue;
+                                        m.signatureArms.push_back(
+                                            BuiltinFunctionMapping::SignatureArm{std::move(*spec), std::move(text)});
+                                    }
+                                }
+                                if (!armsOk) continue;
+                                m.signatureIsPerPair = true;
+                                if (entry.contains("genericPointee")) {
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                              path + "/signatureByDataModel",
-                                              "'signatureByDataModel' must be an "
-                                              "object keyed by data-model name");
+                                              path + "/genericPointee",
+                                              "'genericPointee' needs ONE exemplar signature; "
+                                              "a per-pair 'signature' has several — declare "
+                                              "the flat form");
                                     continue;
                                 }
-                                bool dmOk = true;
-                                for (auto const& [key, val] : byDm.items()) {
-                                    if (isDocumentationKey(key)) continue;
-                                    auto const dm = dataModelFromName(key);
-                                    if (!dm.has_value()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/signatureByDataModel/" + key,
-                                                  std::format("unknown data-model key "
-                                                              "'{}' (expected one "
-                                                              "of {})", key,
-                                                              renderAllowedList(
-                                                                  allNames(
-                                                                      kDataModelTable))));
-                                        dmOk = false;
-                                        continue;
-                                    }
-                                    if (!val.is_string()
-                                        || val.get<std::string>().empty()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/signatureByDataModel/" + key,
-                                                  "each override must be a non-empty "
-                                                  "signature string");
-                                        dmOk = false;
-                                        continue;
-                                    }
-                                    m.signatureTextByDataModel.emplace(
-                                        *dm, val.get<std::string>());
-                                }
-                                if (!dmOk) continue;
                             }
                             if (entry.contains("variadic")) {
                                 if (!entry.at("variadic").is_boolean()) {
@@ -15410,9 +16352,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // D-CSUBSET-ATOMIC-MONOMORPH-I32: `genericPointee` binds
                         // `T` from a POINTER parameter's pointee, and the scalar
                         // `params`/`result` axis cannot declare a pointer at all —
-                        // so on this branch it could never bind. Same fail-loud as
-                        // `signatureByDataModel` below, for the same reason: a knob
-                        // that loads clean and does nothing is the failure mode.
+                        // so on this branch it could never bind. A knob that loads
+                        // clean and does nothing is the failure mode.
                         if (entry.contains("genericPointee")) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       path + "/genericPointee",
@@ -15420,22 +16361,6 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "mutually exclusive — it binds a POINTER "
                                       "parameter's pointee, which the scalar "
                                       "params/result axis cannot declare");
-                            continue;
-                        }
-                        // D-LANG-TYPE-IDENTITY-VOCABULARY: `signatureByDataModel`
-                        // is an override OF `signature` — the scalar
-                        // `params`/`result` form has nothing for it to override,
-                        // and this branch never reads it. Declaring both loaded
-                        // CLEAN and SILENTLY DID NOTHING, which is exactly the
-                        // knob-that-lies the `signature`-vs-`params` rejection
-                        // above exists to prevent. Same fail-loud, same wording.
-                        if (entry.contains("signatureByDataModel")) {
-                            coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      path + "/signatureByDataModel",
-                                      "'signatureByDataModel' and 'params'/'result' "
-                                      "are mutually exclusive — it overrides the "
-                                      "'signature' form, which this entry does not "
-                                      "declare");
                             continue;
                         }
                         if (!entry.contains("result") || !entry.at("result").is_string()) {
@@ -15764,6 +16689,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── constMarker / restrictMarker (P68 round 9, lane `cs`) ──
+            // OPTIONAL tokens: the language's `const`- and `restrict`-class
+            // qualifiers. Neither is interned (a TypeId carries no trace of
+            // either), so they ride the QUALIFIER SPINE beside the TypeId — of a
+            // declaration (the declarator walk) and, since this round, of a type
+            // NAME and an expression (`_Generic` association matching). Same
+            // validation shape as `volatileMarker` above.
+            for (auto const& [key, slot] :
+                 {std::pair<char const*, std::optional<SchemaTokenId>*>{
+                      "constMarker", &cfg.constMarker},
+                  std::pair<char const*, std::optional<SchemaTokenId>*>{
+                      "restrictMarker", &cfg.restrictMarker}}) {
+                if (!sem.contains(key)) continue;
+                json const& tok = sem.at(key);
+                std::string const where = std::string{"/semantics/"} + key;
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, where,
+                              std::format("'{}' must be a string", key));
+                    continue;
+                }
+                auto const name = tok.get<std::string>();
+                if (!data.schemaTokens->contains(name)) {
+                    coll.emit(DiagnosticCode::C_UnknownToken, where,
+                              std::format("'{}' references unknown token kind '{}'",
+                                          key, name));
+                    continue;
+                }
+                *slot = data.schemaTokens->find(name);
+            }
+
+            // ── THE QUALIFIER MARKERS OF A TYPED ROW ARE DERIVED, NOT WRITTEN
+            //    (P68 round 9, lane `cs`) ──────────────────────────────────────
+            // A row that declares a TYPED entity — it folds a C-style declarator
+            // (`head` / `declarator` / `declaratorList`) or it names a `type`
+            // child — declares an object, a function or a type whose qualifiers
+            // are the language's: no row's `const` is a different token from the
+            // language's `const`. So such a row takes the two semantics-level
+            // markers the declaration walks read, and nothing else can set them
+            // (the per-row keys are refused above). A row with NEITHER declares no
+            // type a qualifier could qualify — a tag specifier, an enumerator —
+            // and never scans. ✔CHECKED against the config this replaced: the
+            // thirteen c rows that spelled `constMarker` were exactly the thirteen
+            // typed rows, every one naming `ConstKeyword` / `RestrictKeyword`, and
+            // the four rows without were exactly the four untyped ones.
+            // ⚠ The per-row `volatileMarker` the rows used to spell is NOT
+            // derived: ✔READ, no code read it — a declaration's volatility has
+            // been read off its TYPE (the resolver's `VolatileQual`, driven by
+            // `semantics.volatileMarker`) since c27 — so the field is gone.
+            for (DeclarationRule& d : cfg.declarations) {
+                if (!d.isDeclaratorMode() && !d.typeChild.has_value()) continue;
+                d.constMarker    = cfg.constMarker;
+                d.restrictMarker = cfg.restrictMarker;
+            }
+
             // ── RETIRED: `externLibraryByFormat` (UCRT-P4, Decision 1) ──────
             // A per-LANGUAGE map "object-format kind -> runtime library" used to
             // supply the import library for every source-declared extern that
@@ -15848,8 +16827,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "`implicitFromVoidPtr`, "
                               "`nullPointerConstantFromIntegerZero`, "
                               "`nullPointerConstantFromNullptrT`, "
-                              "`allowVoidPtrFnConvert`, and "
-                              "`directCallIntPointeeCompat` boolean fields");
+                              "`allowVoidPtrFnConvert`, "
+                              "`incompatiblePointerConvertsDiagnosed`, and "
+                              "`integerPointerConvertsDiagnosed` boolean fields");
                 } else {
                     auto readBool = [&](char const* field, bool& out) {
                         if (!obj.contains(field)) return;
@@ -15881,12 +16861,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // idiom). Default false = ISO-strict; c opts in.
                     readBool("allowVoidPtrFnConvert",
                              cfg.pointerConversions.allowVoidPtrFnConvert);
-                    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: at a shipped-FFI-
-                    // descriptor call-arg boundary, admit a real C integer pointer
-                    // into a same-representation descriptor `ptr<i64>`-style param.
-                    // Default false = ISO-strict; c opts in.
-                    readBool("directCallIntPointeeCompat",
-                             cfg.pointerConversions.directCallIntPointeeCompat);
+                    // P68 round 9 (lane `cs`): the two classes of pointer conversion
+                    // C makes constraint violations and every pinned reference
+                    // builds WITH A DIAGNOSTIC — see `PointerConversionRules`.
+                    // Default false = the pair stays refused; c opts in. The
+                    // retired `directCallIntPointeeCompat` (one instance of the first
+                    // class, at one site) is NOT read: the closed allowlist below
+                    // refuses it, so a stale config fails loud instead of silently
+                    // meaning nothing.
+                    readBool("incompatiblePointerConvertsDiagnosed",
+                             cfg.pointerConversions.incompatiblePointerConvertsDiagnosed);
+                    readBool("integerPointerConvertsDiagnosed",
+                             cfg.pointerConversions.integerPointerConvertsDiagnosed);
                     // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
                     // constant at the HIR tier (Fix 1(a)), so its HIR realization
                     // (coerce→Ptr / ternary / condition) REUSES the integer-0
@@ -15921,13 +16907,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     // them DEFAULTS TO FALSE — which is why a typo cannot be
                     // tolerated: `implictToVoidPtr` would silently leave the
                     // language in strict mode and flip its semantics.
-                    static constexpr std::array<std::string_view, 6>
+                    static constexpr std::array<std::string_view, 7>
                         kPointerConversionKeys{
                             "implicitToVoidPtr", "implicitFromVoidPtr",
                             "nullPointerConstantFromIntegerZero",
                             "nullPointerConstantFromNullptrT",
                             "allowVoidPtrFnConvert",
-                            "directCallIntPointeeCompat"};
+                            "incompatiblePointerConvertsDiagnosed",
+                            "integerPointerConvertsDiagnosed"};
                     DSS_CHECK_KEY_VOCABULARY(kPointerConversionKeys);
                     (void)checkKeysAgainst(
                         obj, kPointerConversionKeys,
@@ -16529,6 +17516,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
         }
     }
 
+    // A `type-size` predefined macro names a TYPE, and a language with no
+    // `semantics` block has no type tables to name it in. Refused rather than
+    // left unresolved: an unresolved row would realize to nothing on every
+    // target, i.e. a declared macro that is silently never defined. (A row the
+    // block DID reach and could not resolve was reported there, once.) An
+    // `abiTypedef` row needs no language table, so it is not refused here.
+    if (!typeSizeRowsReachedSemantics) {
+        for (PredefinedMacroDef const& pm : data.preprocess.predefinedMacros) {
+            if (!predefinedMacroKindNamesAType(pm.kind)) continue;
+            // P68 round 9: a kind that SPELLS or TYPES by its type needs the
+            // language's tables even when the target names the type.
+            if (pm.sizedType.source == PredefinedTypeSource::AbiTypedef
+                && !predefinedMacroKindNeedsLanguage(pm.kind)) {
+                continue;
+            }
+            coll.emit(DiagnosticCode::C_InvalidPreprocess, pm.declaredAt + "/type",
+                      std::format("predefined macro '{}' names type '{}', but "
+                                  "this language declares no 'semantics' block, "
+                                  "so it has no type vocabulary to resolve it in",
+                                  pm.name, pm.sizedType.spelled));
+        }
+        if (!data.preprocess.typeNameSpellings.empty()) {
+            coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                      "/preprocess/typeNameSpellings",
+                      "'preprocess.typeNameSpellings' names types, but this language "
+                      "declares no 'semantics' block, so it has no type vocabulary "
+                      "to resolve them in");
+        }
+    }
+
     // hirLowering ── per-language CST→HIR lowering config (plan 09 HR8; schema
     // v4). Optional; absent ⇒ no lowering. Parsed LATE (after shapes/tokens
     // interned) so rule/token references resolve here. HIR kind/op NAMES are
@@ -16985,14 +18002,26 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             // C11/C23 6.4.5 (strings) + 6.4.4.4 (chars): the literal-opener →
             // element-core table(s). Optional array `[{startToken, elementCore,
-            // elementCoreByFormat?}]`. Each row validates: the token resolves to a
-            // declared kind, `elementCore` (and every per-format override) is a known
-            // TypeKind name, and no startToken is duplicated across rows. Row 0 is
+            // abiTypedef?}]`, a CLOSED key set. Each row validates: the token
+            // resolves to a declared kind, `elementCore` is a known TypeKind name,
+            // and no startToken is duplicated across rows. Row 0 is
             // AUTO-SEEDED from the narrow opener when absent — so a schema declaring
             // no explicit prefixes is byte-identical. The STRING and CHAR forms share
             // this ONE validator (identical row/format-map shape; only the field
             // name, target vector, and the narrow opener's auto-seed core differ) so
             // the two can never drift.
+            //
+            // ★ P68 round 9: `elementCoreByFormat` is REFUSED BY NAME. It keyed an
+            // element type on the object format alone, and its only use —
+            // `wchar_t` — is a (processor × platform) fact it could not hold (`elf`
+            // is x86_64's `int` and aarch64's `unsigned int`); `abiTypedef` names
+            // the target's per-pair table instead. And the row's keys are now a
+            // CLOSED set: a misspelled `abiTypedef` would otherwise load clean and
+            // leave the row on its base core — a silent wrong type on every pair
+            // whose typedef differs from it.
+            static constexpr std::array<std::string_view, 3> kLiteralPrefixKeys{
+                "startToken", "elementCore", "abiTypedef"};
+            DSS_CHECK_KEY_VOCABULARY(kLiteralPrefixKeys);
             auto parseLiteralPrefixTable =
                 [&](char const* field, std::vector<LiteralPrefixEntry>& target,
                     SchemaTokenId narrowTok, std::string const& narrowTokName,
@@ -17013,6 +18042,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             auto const path = std::format(
                                 "/hirLowering/{}/{}", field, i);
                             json const& entry = arr[i];
+                            if (entry.is_object()) {
+                                bool keysOk = true;
+                                rejectUnknownKeys(
+                                    entry, kLiteralPrefixKeys,
+                                    std::format("a '{}' entry", field),
+                                    [&](std::string_view key, std::string message) {
+                                        // The RETIRED key gets its own sentence,
+                                        // appended to the shared refusal (the
+                                        // `opcode` -> `opcodes` precedent): its author
+                                        // made no typo — they wrote a mechanism that
+                                        // no longer exists.
+                                        if (key == "elementCoreByFormat") {
+                                            message +=
+                                                ". 'elementCoreByFormat' was removed: an "
+                                                "element type that differs by platform is a "
+                                                "platform ABI typedef the TARGET declares per "
+                                                "(processor, format) in its 'abiTypedefs' "
+                                                "table. Name it with 'abiTypedef' (e.g. "
+                                                "\"abiTypedef\": \"wchar_t\"); a "
+                                                "format-keyed map cannot state it (elf is "
+                                                "x86_64's int and aarch64's unsigned int)";
+                                        }
+                                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                  std::format("{}/{}", path, key),
+                                                  std::move(message));
+                                        keysOk = false;
+                                    });
+                                if (!keysOk) continue;
+                            }
                             if (!entry.is_object()
                                 || !entry.contains("startToken")
                                 || !entry.at("startToken").is_string()
@@ -17046,88 +18104,24 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 continue;
                             }
                             row.elementCore = *core;
-                            // Optional per-format element-core override
-                            // (`elementCoreByFormat`), mirroring builtinTypes'
-                            // `coreByDataModel`: this is how `L"…"`/`L'…'` (wchar_t)
-                            // declares its FORMAT-keyed width AS CONFIG DATA
-                            // (elf/macho→I32, pe→U16) — no engine tier hardcodes a
-                            // `format == …` branch. Closed keys: every key must resolve
-                            // to a known ObjectFormatKind (the EXISTING object-format-
-                            // name resolver) and every value to a known TypeKind — a
-                            // typo'd format name would otherwise silently never override.
-                            bool formatMapOk = true;
-                            if (entry.contains("elementCoreByFormat")) {
-                                auto const& fmtObj = entry.at("elementCoreByFormat");
-                                if (!fmtObj.is_object()) {
+                            // P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): the
+                            // element type as a platform ABI typedef the TARGET
+                            // declares per object format (`abiTypedefs`) — see
+                            // `LiteralPrefixEntry::abiTypedef`. A non-empty NAME; it
+                            // replaced the deleted `elementCoreByFormat` (a
+                            // format-keyed map cannot state a per-processor fact).
+                            if (entry.contains("abiTypedef")) {
+                                auto const& tv = entry.at("abiTypedef");
+                                if (!tv.is_string() || tv.get<std::string>().empty()) {
                                     coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                              path + "/elementCoreByFormat",
-                                              "'elementCoreByFormat' must be an object "
-                                              "mapping object-format names to TypeKinds");
-                                    formatMapOk = false;
-                                } else {
-                                    for (auto const& [fkey, fval] : fmtObj.items()) {
-                                        if (isDocumentationKey(fkey)) continue;
-                                        auto const fmt = objectFormatKindFromName(fkey);
-                                        if (!fmt) {
-                                            // ⚠ THE LIST IS PROJECTED, AND IT USED TO
-                                            // SAY "e.g.". That hedge was honest about
-                                            // being incomplete and still answered the
-                                            // author's question wrongly: `wasm` and
-                                            // `spirv` are accepted here too, and the
-                                            // three named formats were whichever ones
-                                            // existed the day the sentence was typed.
-                                            // `kSelectableObjectFormatKindNames` is the
-                                            // whole accepted set, sentinel excluded,
-                                            // and it cannot fall behind the check.
-                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                                      path + "/elementCoreByFormat/" + fkey,
-                                                      std::format("unknown object format "
-                                                                  "'{}' (expected one "
-                                                                  "of {})", fkey,
-                                                                  renderAllowedList(
-                                                                      kSelectableObjectFormatKindNames)));
-                                            formatMapOk = false;
-                                            continue;
-                                        }
-                                        // The `unknown` sentinel spells correctly and this
-                                        // map is ALREADY keyed on ObjectFormatKind, so it
-                                        // would store a live `Unknown` row. That is worse
-                                        // than a dead entry: `resolveElementCore` takes an
-                                        // `optional<ObjectFormatKind>`, so a caller holding
-                                        // a default-constructed kind (== Unknown, not
-                                        // nullopt) would MATCH the row and silently take a
-                                        // wchar_t width nothing intended.
-                                        if (!isSelectableObjectFormatKind(*fmt)) {
-                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                                      path + "/elementCoreByFormat/" + fkey,
-                                                      std::string{
-                                                          kObjectFormatKindSentinelRejection});
-                                            formatMapOk = false;
-                                            continue;
-                                        }
-                                        if (!fval.is_string()) {
-                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                                      path + "/elementCoreByFormat/" + fkey,
-                                                      "per-format element core must be a "
-                                                      "TypeKind name string");
-                                            formatMapOk = false;
-                                            continue;
-                                        }
-                                        auto const fcore =
-                                            coreTypeFromName(fval.get<std::string>());
-                                        if (!fcore) {
-                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                                      path + "/elementCoreByFormat/" + fkey,
-                                                      std::format("unknown TypeKind '{}'",
-                                                                  fval.get<std::string>()));
-                                            formatMapOk = false;
-                                            continue;
-                                        }
-                                        row.elementCoreByFormat[*fmt] = *fcore;
-                                    }
+                                              path + "/abiTypedef",
+                                              "'abiTypedef' must be a non-empty name of a "
+                                              "platform ABI typedef a target declares in "
+                                              "its 'abiTypedefs' table");
+                                    continue;
                                 }
+                                row.abiTypedef = tv.get<std::string>();
                             }
-                            if (!formatMapOk) continue;
                             target.push_back(std::move(row));
                         }
                     }
@@ -17434,7 +18428,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // two keys the loader reads two hundred lines further down. One
             // owner per fact: the OPTIONALITY is a comment, the MEMBERSHIP is
             // the table.
-            static constexpr std::array<std::string_view, 19> kAssemblyKeys{
+            static constexpr std::array<std::string_view, 26> kAssemblyKeys{
                 // required whenever the block is present
                 "unitRule",      "lineRule",      "elementRule",
                 "directiveRule", "statementRule", "labelTailRule",
@@ -17443,16 +18437,30 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 "templateLexerMode", "templateOperandRule",
                 "templateLabelRule", "templateModifierRule",
                 "templateModifiers",
+                // OPTIONAL AS A PAIR (P68 round 8): GNU as's numeric local
+                // labels — the definition rule and the two reference suffixes.
+                "numericLabelRule", "localLabelSuffixes",
+                // OPTIONAL (P68 round 8): the template TEXT forms this dialect's
+                // template surface expands before its lexer runs.
+                "templateTextForms",
                 // OPTIONAL, and NOT part of the template capability census
                 // below: a lane arrangement is written in a standalone `.s`
                 // exactly as it is in a template, so a dialect may declare it
                 // with or without a template surface.
                 // D-ASM-DIALECTS-DECLARE-A-REGISTER-CLASS-NO-INSTRUCTION-CAN-NAME.
                 "registerArrangements",
+                // OPTIONAL AS A PAIR (P68 round 8): the element sizes and the
+                // rule that carries an element's index — see the block that
+                // reads them, below the directive table.
+                "elementIndexRule", "registerElements",
                 // OPTIONAL, and validated separately below: a dialect with no
                 // directive vocabulary refuses every directive by name, which
                 // is a coherent state.
-                "directives", "entryLabels"};
+                "directives", "entryLabels",
+                // OPTIONAL (P68 round 9, the aarch64 twins): the spellings of a
+                // PART of a symbol's address, per object-format kind, and the
+                // location counter's spelling.
+                "symbolParts", "locationCounter"};
             DSS_CHECK_KEY_VOCABULARY(kAssemblyKeys);
             (void)checkKeysAgainst(
                 as, kAssemblyKeys, "/assembly", "the 'assembly' block",
@@ -17462,6 +18470,65 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
 
             AssemblyConfig cfg;
             bool assemblyClean = true;
+
+            // P68 round 9: a list of OBJECT-FORMAT KINDS, the key a symbol-part
+            // spelling is accepted under (`symbolParts[].formatKinds`, a row's
+            // `impliedSymbolPart.formatKinds`). Non-empty, each a real kind —
+            // the `unknown` sentinel resolves by name and matches no build, so
+            // it is refused as every format-name surface refuses it — and no
+            // kind twice.
+            auto const readFormatKinds =
+                [&](json const& arr, std::string const& path)
+                -> std::optional<std::vector<ObjectFormatKind>> {
+                if (!arr.is_array() || arr.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                              "'formatKinds' must be a non-empty array of "
+                              "object-format kind names");
+                    return std::nullopt;
+                }
+                std::vector<ObjectFormatKind> out;
+                for (std::size_t k = 0; k < arr.size(); ++k) {
+                    auto const kPath = std::format("{}/{}", path, k);
+                    auto const kind = arr[k].is_string()
+                        ? objectFormatKindFromName(arr[k].get<std::string>())
+                        : std::nullopt;
+                    if (!kind.has_value() || !isSelectableObjectFormatKind(*kind)) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, kPath,
+                                  std::format("'{}' is not an object-format kind "
+                                              "a build can have",
+                                              arr[k].is_string()
+                                                  ? arr[k].get<std::string>()
+                                                  : arr[k].dump()));
+                        return std::nullopt;
+                    }
+                    if (std::find(out.begin(), out.end(), *kind) != out.end()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering, kPath,
+                                  std::format("object-format kind '{}' is listed "
+                                              "twice", objectFormatKindName(*kind)));
+                        return std::nullopt;
+                    }
+                    out.push_back(*kind);
+                }
+                return out;
+            };
+            // A PART of a symbol's address, by name — never `whole`, which is
+            // what a bare symbol already is and so states nothing.
+            auto const readSymbolPart =
+                [&](json const& v, std::string const& path)
+                -> std::optional<SymbolAddressPart> {
+                auto const part = v.is_string()
+                    ? symbolAddressPartFromName(v.get<std::string>())
+                    : std::nullopt;
+                if (!part.has_value() || *part == SymbolAddressPart::Whole) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                              std::format("'part' must be '{}' or '{}'",
+                                          symbolAddressPartName(SymbolAddressPart::Page),
+                                          symbolAddressPartName(
+                                              SymbolAddressPart::PageOffset)));
+                    return std::nullopt;
+                }
+                return part;
+            };
 
             // One landmark: required, must be a string, must name a rule that
             // exists. A landmark naming nothing is the "capability claim with no
@@ -17496,6 +18563,347 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readRule("statementRule",  cfg.statementRule);
             readRule("labelTailRule",  cfg.labelTailRule);
             readRule("operandSeqRule", cfg.operandSeqRule);
+
+            // ── GNU as's NUMERIC LOCAL LABELS: `numericLabelRule` +
+            //    `localLabelSuffixes` (P68 round 8,
+            //    D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED)
+            //
+            // ★ OPTIONAL AS A PAIR, REQUIRED OF EACH OTHER: a definition rule with
+            // no reference spelling defines labels nothing can name, and suffixes
+            // with no definition rule name labels nothing can define — both a
+            // silent half-capability. ★ AND EACH SUFFIX MUST BE ONE THE NUMBER
+            // GRAMMAR ALREADY LEXES AS AN INTEGER SUFFIX (`numberStyle.
+            // integerSuffixes`): that is what makes `1b` ONE token. A suffix the
+            // number grammar does not know would lex `1b` as `1` + `b` — a
+            // reference the parser refuses on every line that writes one.
+            {
+                bool const hasRule     = as.contains("numericLabelRule");
+                bool const hasSuffixes = as.contains("localLabelSuffixes");
+                if (hasRule != hasSuffixes) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              hasRule ? "/assembly/localLabelSuffixes"
+                                      : "/assembly/numericLabelRule",
+                              "'numericLabelRule' and 'localLabelSuffixes' are "
+                              "declared together or not at all — one without the "
+                              "other is a local label that can be defined but "
+                              "never named, or named but never defined");
+                    assemblyClean = false;
+                } else if (hasRule) {
+                    readRule("numericLabelRule", cfg.numericLabelRule);
+                    json const& sx = as.at("localLabelSuffixes");
+                    auto const suffix = [&](char const* key, std::string& out) {
+                        auto const path =
+                            std::format("/assembly/localLabelSuffixes/{}", key);
+                        if (!sx.is_object() || !sx.contains(key)
+                            || !sx.at(key).is_string()
+                            || sx.at(key).get<std::string>().empty()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'localLabelSuffixes.{}' is "
+                                                  "required: the non-empty suffix "
+                                                  "a {} local-label reference "
+                                                  "ends with",
+                                                  key, key));
+                            assemblyClean = false;
+                            return;
+                        }
+                        out = sx.at(key).get<std::string>();
+                        bool const lexed =
+                            data.numberStyle.has_value()
+                            && std::ranges::find(data.numberStyle->integerSuffixes,
+                                                 out)
+                                   != data.numberStyle->integerSuffixes.end();
+                        if (!lexed) {
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      std::format("'localLabelSuffixes.{}' is '{}', "
+                                                  "which 'numberStyle."
+                                                  "integerSuffixes' does not "
+                                                  "declare — `1{}` would lex as "
+                                                  "`1` + `{}`, two tokens no "
+                                                  "operand rule accepts",
+                                                  key, out, out, out));
+                            assemblyClean = false;
+                        }
+                    };
+                    if (sx.is_object()) {
+                        static constexpr std::array<std::string_view, 2>
+                            kSuffixKeys{"backward", "forward"};
+                        DSS_CHECK_KEY_VOCABULARY(kSuffixKeys);
+                        (void)checkKeysAgainst(sx, kSuffixKeys,
+                                               "/assembly/localLabelSuffixes",
+                                               "the 'localLabelSuffixes' object",
+                                               DiagnosticCode::C_ConflictingField,
+                                               coll);
+                    }
+                    suffix("backward", cfg.localLabelBackwardSuffix);
+                    suffix("forward", cfg.localLabelForwardSuffix);
+                    if (!cfg.localLabelBackwardSuffix.empty()
+                        && cfg.localLabelBackwardSuffix
+                               == cfg.localLabelForwardSuffix) {
+                        coll.emit(DiagnosticCode::C_ConflictingField,
+                                  "/assembly/localLabelSuffixes",
+                                  std::format("both local-label suffixes are "
+                                              "'{}' — a reference could then "
+                                              "never say which way it points",
+                                              cfg.localLabelBackwardSuffix));
+                        assemblyClean = false;
+                    }
+                }
+            }
+
+            // ── the TEMPLATE TEXT FORMS (`templateTextForms`, P68 round 8,
+            //    D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED)
+            //
+            // What this dialect's EXTENDED templates expand before its lexer
+            // runs; `core/types/asm_template_text_forms.hpp` holds the measured
+            // table and the one expansion.
+            // ★★ A FORM IS DECLARED AS ITS CODE — the bytes AFTER the sigil —
+            // AND COMPOSED WITH THE LANGUAGE'S SIGIL HERE, ONCE, exactly as a
+            // width-view letter is (`templateModifiers`, below): the sigil has
+            // ONE owner (`semantics.inlineAsmTemplateLexemes`), and a dialect
+            // that spelled `%=` whole would stop agreeing with a language that
+            // re-declares its sigil — every form would then name a byte no
+            // template writes.
+            // ★ EACH CODE OPENS WITH ASCII PUNCTUATION that does not open a
+            // symbolic name, the composed form never begins with the escape, and
+            // each is declared once. Each clause closes a way a form could
+            // silently do nothing or the wrong thing: the expansion reads the
+            // escape FIRST (a form starting with it is unreachable); a letter,
+            // digit or `[` after the sigil is an OPERAND REFERENCE the dialect's
+            // lexer owns (`%l0`, `%w1`, `%[x]` — a form spelled so would shadow
+            // every reference it prefixes); and two declarations of one spelling
+            // are two meanings for one text. The semantic scan passes exactly
+            // this class (sigil + ASCII punctuation) through to the lowering, so
+            // the two tiers agree on what a form is.
+            if (as.contains("templateTextForms")) {
+                json const& tf = as.at("templateTextForms");
+                std::string const& sigil =
+                    data.semantics.inlineAsmTemplateLexemes.placeholder;
+                std::string const& escape =
+                    data.semantics.inlineAsmTemplateLexemes.escape;
+                std::string const& nameOpen =
+                    data.semantics.inlineAsmTemplateLexemes.symbolicNameOpen;
+                std::vector<std::string> seen;
+                auto composeForm = [&](std::string const& code,
+                                       std::string const& path,
+                                       std::string& out) {
+                    std::string const form = sigil + code;
+                    bool ok = !sigil.empty() && !code.empty()
+                           && (escape.empty() || !form.starts_with(escape))
+                           && std::ranges::find(seen, form) == seen.end();
+                    if (ok) {
+                        char const c = code.front();
+                        bool const punct = c > ' ' && c <= '~'
+                            && !(c >= '0' && c <= '9')
+                            && !(c >= 'a' && c <= 'z')
+                            && !(c >= 'A' && c <= 'Z');
+                        ok = punct
+                          && (nameOpen.empty() || !code.starts_with(nameOpen));
+                    }
+                    if (!ok) {
+                        coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                  std::format("template text form code '{}' "
+                                              "(the form '{}') must open with "
+                                              "ASCII punctuation that does not "
+                                              "open a symbolic name ('{}'), its "
+                                              "form must not begin with the "
+                                              "escape ('{}'), and each form is "
+                                              "declared once — a letter or digit "
+                                              "after the sigil ('{}') is an "
+                                              "operand reference the dialect's "
+                                              "lexer reads",
+                                              code, form, nameOpen, escape,
+                                              sigil));
+                        assemblyClean = false;
+                        return false;
+                    }
+                    seen.push_back(form);
+                    out = form;
+                    return true;
+                };
+                auto readString = [&](json const& obj, char const* key,
+                                      std::string const& path, bool allowEmpty,
+                                      std::string& out) {
+                    if (!obj.is_object() || !obj.contains(key)
+                        || !obj.at(key).is_string()
+                        || (!allowEmpty && obj.at(key).get<std::string>().empty())) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  std::format("{}/{}", path, key),
+                                  std::format("'{}' is required and must be a{} "
+                                              "string", key,
+                                              allowEmpty ? "" : " non-empty"));
+                        assemblyClean = false;
+                        return false;
+                    }
+                    out = obj.at(key).get<std::string>();
+                    return true;
+                };
+                if (!as.contains("templateLexerMode")) {
+                    // A form is expanded only where a TEMPLATE is lowered, and a
+                    // dialect with no template surface lowers none — the
+                    // declaration would be a capability claim with no subject.
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              "/assembly/templateTextForms",
+                              "'templateTextForms' is declared, but this dialect "
+                              "declares no template surface ('templateLexerMode' "
+                              "and its four partners) — no template is ever "
+                              "lowered with it, so no form could ever be expanded");
+                    assemblyClean = false;
+                } else if (!tf.is_object()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              "/assembly/templateTextForms",
+                              "'templateTextForms' must be an object");
+                    assemblyClean = false;
+                } else {
+                    static constexpr std::array<std::string_view, 4> kFormKeys{
+                        "instanceNumber", "fixed", "featureSelected",
+                        "alternatives"};
+                    DSS_CHECK_KEY_VOCABULARY(kFormKeys);
+                    (void)checkKeysAgainst(tf, kFormKeys,
+                                           "/assembly/templateTextForms",
+                                           "the 'templateTextForms' object",
+                                           DiagnosticCode::C_ConflictingField, coll);
+                    AsmTemplateTextForms forms;
+                    if (tf.contains("instanceNumber")) {
+                        std::string code;
+                        if (readString(tf, "instanceNumber",
+                                       "/assembly/templateTextForms", false, code)) {
+                            (void)composeForm(code,
+                                              "/assembly/templateTextForms/"
+                                              "instanceNumber",
+                                              forms.instanceNumber);
+                        }
+                    }
+                    if (tf.contains("fixed")) {
+                        json const& rows = tf.at("fixed");
+                        for (std::size_t k = 0; rows.is_array() && k < rows.size();
+                             ++k) {
+                            auto const path = std::format(
+                                "/assembly/templateTextForms/fixed/{}", k);
+                            if (rows[k].is_object()) {
+                                static constexpr std::array<std::string_view, 2>
+                                    kFixedKeys{"code", "text"};
+                                DSS_CHECK_KEY_VOCABULARY(kFixedKeys);
+                                (void)checkKeysAgainst(rows[k], kFixedKeys, path,
+                                                       "a fixed template form",
+                                                       DiagnosticCode::C_ConflictingField,
+                                                       coll);
+                            }
+                            AsmTemplateFixedForm row;
+                            std::string code;
+                            if (!readString(rows[k], "code", path, false, code)
+                                || !readString(rows[k], "text", path, true,
+                                               row.text)) {
+                                continue;
+                            }
+                            if (composeForm(code, path + "/code", row.form)) {
+                                forms.fixed.push_back(std::move(row));
+                            }
+                        }
+                        if (!rows.is_array()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateTextForms/fixed",
+                                      "'fixed' must be an array of {code, text}");
+                            assemblyClean = false;
+                        }
+                    }
+                    if (tf.contains("featureSelected")) {
+                        json const& rows = tf.at("featureSelected");
+                        for (std::size_t k = 0; rows.is_array() && k < rows.size();
+                             ++k) {
+                            auto const path = std::format(
+                                "/assembly/templateTextForms/featureSelected/{}", k);
+                            if (rows[k].is_object()) {
+                                static constexpr std::array<std::string_view, 4>
+                                    kFeatureKeys{"code", "feature", "present",
+                                                 "absent"};
+                                DSS_CHECK_KEY_VOCABULARY(kFeatureKeys);
+                                (void)checkKeysAgainst(rows[k], kFeatureKeys, path,
+                                                       "a feature-selected "
+                                                       "template form",
+                                                       DiagnosticCode::C_ConflictingField,
+                                                       coll);
+                            }
+                            AsmTemplateFeatureForm row;
+                            std::string code;
+                            if (!readString(rows[k], "code", path, false, code)
+                                || !readString(rows[k], "feature", path, false,
+                                               row.feature)
+                                || !readString(rows[k], "present", path, true,
+                                               row.present)
+                                || !readString(rows[k], "absent", path, true,
+                                               row.absent)) {
+                                continue;
+                            }
+                            if (composeForm(code, path + "/code", row.form)) {
+                                forms.featureSelected.push_back(std::move(row));
+                            }
+                        }
+                        if (!rows.is_array()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      "/assembly/templateTextForms/featureSelected",
+                                      "'featureSelected' must be an array of "
+                                      "{code, feature, present, absent}");
+                            assemblyClean = false;
+                        }
+                    }
+                    if (tf.contains("alternatives")) {
+                        json const& alt = tf.at("alternatives");
+                        auto const path =
+                            std::string{"/assembly/templateTextForms/alternatives"};
+                        AsmTemplateAlternatives a;
+                        if (alt.is_object()) {
+                            static constexpr std::array<std::string_view, 4>
+                                kAlternativeKeys{"open", "separator", "close",
+                                                 "select"};
+                            DSS_CHECK_KEY_VOCABULARY(kAlternativeKeys);
+                            (void)checkKeysAgainst(alt, kAlternativeKeys, path,
+                                                   "the 'alternatives' object",
+                                                   DiagnosticCode::C_ConflictingField,
+                                                   coll);
+                        }
+                        if (readString(alt, "open", path, false, a.open)
+                            && readString(alt, "separator", path, false,
+                                          a.separator)
+                            && readString(alt, "close", path, false, a.close)) {
+                            if (!alt.contains("select")
+                                || !alt.at("select").is_number_unsigned()
+                                || alt.at("select").get<std::uint64_t>()
+                                       > std::numeric_limits<std::uint32_t>::max()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/select",
+                                          "'select' is required: WHICH "
+                                          "alternative (0-based, a 32-bit "
+                                          "unsigned number) this dialect is");
+                                assemblyClean = false;
+                            } else if (a.open == a.separator || a.open == a.close
+                                       || a.separator == a.close) {
+                                coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                          "the three alternative delimiters must "
+                                          "differ — one byte with two meanings "
+                                          "cannot be split");
+                                assemblyClean = false;
+                            } else if (!sigil.empty()
+                                       && (a.open.starts_with(sigil)
+                                           || a.separator.starts_with(sigil)
+                                           || a.close.starts_with(sigil))) {
+                                coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                          std::format("an alternative delimiter "
+                                                      "begins with the placeholder "
+                                                      "sigil ('{}'), which the "
+                                                      "expansion reads first — the "
+                                                      "delimiter could never be "
+                                                      "seen", sigil));
+                                assemblyClean = false;
+                            } else {
+                                a.select = alt.at("select").get<std::uint32_t>();
+                                a.declared = true;
+                                forms.alternatives = std::move(a);
+                            }
+                        }
+                    }
+                    cfg.templateTextForms = std::move(forms);
+                }
+            }
 
             // ── the TEMPLATE SURFACE: `templateLexerMode` +
             //    `templateOperandRule` + `templateLabelRule`
@@ -17661,9 +19069,9 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                   "nothing can ever mint");
                         assemblyClean = false;
                     } else {
-                        static constexpr std::array<std::string_view, 3>
+                        static constexpr std::array<std::string_view, 4>
                             kModifierKeys{"letter", "widthBits",
-                                          "registerClass"};
+                                          "registerClass", "selects"};
                         DSS_CHECK_KEY_VOCABULARY(kModifierKeys);
                         // ⚠ THE WIDTHS ARE THE ONES `lirInstWidthBits` CAN
                         // STATE, and the check is not pedantry: a width
@@ -17841,6 +19249,43 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else if (!firstUnscoped.has_value()) {
                                 firstUnscoped = index - 1;
                             }
+                            // ── the optional REGISTER SELECTOR ──────────────
+                            //
+                            // ★ A CLOSED SET OF ONE: `"pairSecond"` — the
+                            // letter names the SECOND register of a
+                            // two-register operand (see `AsmTemplateModifier::
+                            // selectsPairSecond`). Any other spelling is
+                            // refused: a selector the engine does not know
+                            // would load as a plain view of the FIRST
+                            // register, the silent wrong register this key
+                            // exists to name. It is INDEPENDENT of the class
+                            // scope: a pair lives in the one file its operand
+                            // is bound in, and the template engine refuses the
+                            // letter on any operand the target did not carry
+                            // as a pair — so a width-only (all-unscoped)
+                            // document may declare it like any other letter,
+                            // and a scoped one scopes it like any other.
+                            bool selectsPairSecond = false;
+                            if (m.contains("selects")) {
+                                if (!m.at("selects").is_string()
+                                    || m.at("selects").get<std::string>()
+                                           != "pairSecond") {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidHirLowering,
+                                        path + "/selects",
+                                        std::format(
+                                            "template modifier '{}' declares "
+                                            "'selects' as something other than "
+                                            "\"pairSecond\" — the one register "
+                                            "selector this pipeline realizes "
+                                            "(the second register of a "
+                                            "two-register operand)",
+                                            letter));
+                                    assemblyClean = false;
+                                    continue;
+                                }
+                                selectsPairSecond = true;
+                            }
                             std::string lexeme =
                                 cfg.templatePlaceholderLexeme + letter;
                             bool duplicate = false;
@@ -17864,7 +19309,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             cfg.templateModifiers.push_back(
                                 AssemblyConfig::AsmTemplateModifier{
                                     letter, std::move(lexeme), width,
-                                    std::move(regClass)});
+                                    std::move(regClass), selectsPairSecond});
                         }
                         // ★★★ THE PER-DIALECT ALL-OR-NOTHING RULE. A document
                         // either scopes EVERY letter (aarch64: the wrong-class
@@ -18622,7 +20067,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // hundred lines earlier would have compared against an empty table
             // and passed on every document.
             if (cfg.templateOperandRule.valid()) {
-                std::uint8_t const mask =
+                AsmRoleMask const mask =
                     cfg.rolesForRule(cfg.templateOperandRule);
                 if (mask != 0) {
                     std::string roles;
@@ -18690,12 +20135,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         assemblyClean = false;
                         continue;
                     }
-                    static constexpr std::array<std::string_view, 8>
+                    static constexpr std::array<std::string_view, 11>
                         kInstRowKeys{"spelling", "opcodes", "width",
+                                     "unstatedWidth", "unstatedWidthWarns",
                                      "destWidth", "destWidthFromOperands",
                                      "cond",
                                      "opcodesAreRankedEncodings",
-                                     "operandSelectors"};
+                                     "operandSelectors", "impliedSymbolPart"};
                     DSS_CHECK_KEY_VOCABULARY(kInstRowKeys);
                     // ★ NAME THE RENAME. `opcode` (a single string) was this
                     // key's shape until one mnemonic had to denote a SET of
@@ -18947,6 +20393,72 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             continue;
                         }
                     }
+                    // ── unstatedWidth ── OPTIONAL; the width a spelling that
+                    // DERIVES its width operates at when nothing written states
+                    // one (P68 round 8,
+                    // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS; the
+                    // field states the measurement). Refused beside any key
+                    // that STATES a width — it could never be reached there.
+                    if (row.contains("unstatedWidth")) {
+                        json const& uw = row.at("unstatedWidth");
+                        // The vocabulary a LIR instruction's width can state
+                        // (`lirInstWidthBits`): 128 is a packed move's own
+                        // width (`movaps`).
+                        if (!uw.is_number_unsigned()
+                            || (uw.get<std::uint32_t>() != 8
+                                && uw.get<std::uint32_t>() != 16
+                                && uw.get<std::uint32_t>() != 32
+                                && uw.get<std::uint32_t>() != 64
+                                && uw.get<std::uint32_t>() != 128)) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/unstatedWidth",
+                                      "'unstatedWidth' must be an operand width "
+                                      "in BITS (8, 16, 32, 64 or 128) — the width "
+                                      "this spelling operates at when neither "
+                                      "its mnemonic nor any operand states one");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        if (ins.width.has_value() || ins.destWidth.has_value()
+                            || ins.destWidthFromOperands) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/unstatedWidth",
+                                      "'unstatedWidth' is the width used when "
+                                      "NOTHING states one, so it cannot appear "
+                                      "beside 'width', 'destWidth' or "
+                                      "'destWidthFromOperands', which state "
+                                      "one — it could never be reached, and a "
+                                      "key that is never read reads as though "
+                                      "it were");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.unstatedWidth = uw.get<std::uint32_t>();
+                    }
+                    if (row.contains("unstatedWidthWarns")) {
+                        if (!row.at("unstatedWidthWarns").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                      path + "/unstatedWidthWarns",
+                                      "'unstatedWidthWarns' must be a boolean — "
+                                      "whether the reference warns when it falls "
+                                      "back to 'unstatedWidth'");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.unstatedWidthWarns =
+                            row.at("unstatedWidthWarns").get<bool>();
+                        if (ins.unstatedWidthWarns && !ins.unstatedWidth.has_value()) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/unstatedWidthWarns",
+                                      "'unstatedWidthWarns' says the reference "
+                                      "warns when it falls back to "
+                                      "'unstatedWidth', but this row declares no "
+                                      "'unstatedWidth' — there is no fallback "
+                                      "for it to warn about");
+                            assemblyClean = false;
+                            continue;
+                        }
+                    }
                     // ── operandSelectors ── OPTIONAL; the written operands that
                     // are part of the MNEMONIC rather than operands of it.
                     // ⚠ THE NAME IS TEXT AND IS NEVER INTERPRETED HERE: whether
@@ -19119,6 +20631,38 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         if (ambiguous) { assemblyClean = false; continue; }
                     }
+                    // ── impliedSymbolPart ── OPTIONAL (P68 round 9): what a BARE
+                    // symbol operand of this row means, on the listed format
+                    // kinds (gas reads `adrp x0, msg` as the page; clang for
+                    // Darwin refuses it — ✔MEASURED 2026-09-23).
+                    if (row.contains("impliedSymbolPart")) {
+                        json const& isp = row.at("impliedSymbolPart");
+                        auto const ispPath = path + "/impliedSymbolPart";
+                        static constexpr std::array<std::string_view, 2>
+                            kImpliedKeys{"part", "formatKinds"};
+                        DSS_CHECK_KEY_VOCABULARY(kImpliedKeys);
+                        if (!isp.is_object()
+                            || !checkKeysAgainst(isp, kImpliedKeys, ispPath,
+                                                 "an 'impliedSymbolPart' object",
+                                                 DiagnosticCode::C_InvalidHirLowering,
+                                                 coll)
+                            || !isp.contains("part")
+                            || !isp.contains("formatKinds")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, ispPath,
+                                      "'impliedSymbolPart' must be an object "
+                                      "{ part, formatKinds }");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        auto const part  = readSymbolPart(isp.at("part"), ispPath + "/part");
+                        auto const kinds = readFormatKinds(isp.at("formatKinds"),
+                                                           ispPath + "/formatKinds");
+                        if (!part.has_value() || !kinds.has_value()) {
+                            assemblyClean = false;
+                            continue;
+                        }
+                        ins.impliedSymbolPart = AsmImpliedSymbolPart{*part, *kinds};
+                    }
                     rowJsonIndex.push_back(i);
                     cfg.instructions.push_back(std::move(ins));
                 }
@@ -19145,6 +20689,111 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         cfg.entryLabels.push_back(arr[i].get<std::string>());
                     }
+                }
+            }
+
+            // ── symbolParts ── OPTIONAL (P68 round 9, the aarch64 twins): the
+            // spellings of a PART of a symbol's address, each with the format
+            // kinds whose reference assembler reads it. The operator is the one
+            // Identifier of the `symbolPart` role's rule, so the role and this
+            // list come together: one without the other is a spelling nothing
+            // parses, or a parse nothing gives a meaning to.
+            if (as.contains("symbolParts")) {
+                json const& arr = as.at("symbolParts");
+                if (!arr.is_array() || arr.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/symbolParts",
+                              "'symbolParts' must be a non-empty array of "
+                              "{ spelling, part, position, formatKinds } rows");
+                    assemblyClean = false;
+                } else {
+                    for (std::size_t i = 0; i < arr.size(); ++i) {
+                        auto const path = std::format("/assembly/symbolParts/{}", i);
+                        json const& row = arr[i];
+                        static constexpr std::array<std::string_view, 4>
+                            kPartKeys{"spelling", "part", "position",
+                                      "formatKinds"};
+                        DSS_CHECK_KEY_VOCABULARY(kPartKeys);
+                        if (!row.is_object()
+                            || !checkKeysAgainst(row, kPartKeys, path,
+                                                 "a 'symbolParts' row",
+                                                 DiagnosticCode::C_InvalidHirLowering,
+                                                 coll)
+                            || !row.contains("spelling")
+                            || !row.at("spelling").is_string()
+                            || row.at("spelling").get<std::string>().empty()
+                            || !row.contains("part")
+                            || !row.contains("position")
+                            || !row.at("position").is_string()
+                            || (row.at("position").get<std::string>() != "before"
+                                && row.at("position").get<std::string>() != "after")
+                            || !row.contains("formatKinds")) {
+                            coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                      "each 'symbolParts' row is { spelling: "
+                                      "<operator as written>, part, position: "
+                                      "'before' | 'after' the name, formatKinds }");
+                            assemblyClean = false;
+                            continue;
+                        }
+                        auto const part  = readSymbolPart(row.at("part"), path + "/part");
+                        auto const kinds = readFormatKinds(row.at("formatKinds"),
+                                                           path + "/formatKinds");
+                        if (!part.has_value() || !kinds.has_value()) {
+                            assemblyClean = false;
+                            continue;
+                        }
+                        AsmSymbolPartSpelling sp;
+                        sp.spelling    = row.at("spelling").get<std::string>();
+                        sp.part          = *part;
+                        sp.writtenBefore = row.at("position").get<std::string>() == "before";
+                        sp.formatKinds   = *kinds;
+                        bool dup = false;
+                        for (auto const& prior : cfg.symbolParts) {
+                            if (cfg.spellingMatches(prior.spelling, sp.spelling)) {
+                                dup = true;
+                            }
+                        }
+                        if (dup) {
+                            coll.emit(DiagnosticCode::C_ConflictingField,
+                                      path + "/spelling",
+                                      std::format("symbol-part spelling '{}' is "
+                                                  "declared twice", sp.spelling));
+                            assemblyClean = false;
+                            continue;
+                        }
+                        cfg.symbolParts.push_back(std::move(sp));
+                    }
+                }
+            }
+            {
+                bool const roleBound =
+                    cfg.operandFormRules[static_cast<std::size_t>(
+                        AsmOperandRole::SymbolPart)].valid();
+                if (roleBound != !cfg.symbolParts.empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              roleBound ? "/assembly/symbolParts"
+                                        : "/assembly/operandForms/symbolPart",
+                              roleBound
+                                  ? "the 'symbolPart' operand role is bound to "
+                                    "a rule, but 'symbolParts' declares no "
+                                    "spelling for it to mean"
+                                  : "'symbolParts' declares spellings, but the "
+                                    "'symbolPart' operand role binds no rule to "
+                                    "parse them");
+                    assemblyClean = false;
+                }
+            }
+            // ── locationCounter ── OPTIONAL (P68 round 9): the spelling of the
+            // address being written (`.` in GNU as).
+            if (as.contains("locationCounter")) {
+                json const& lc = as.at("locationCounter");
+                if (!lc.is_string() || lc.get<std::string>().empty()) {
+                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                              "/assembly/locationCounter",
+                              "'locationCounter' must be a non-empty spelling");
+                    assemblyClean = false;
+                } else {
+                    cfg.locationCounter = lc.get<std::string>();
                 }
             }
 
@@ -19625,6 +21274,149 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     hasStart ? "frameStart" : "frameEnd",
                                     hasStart ? "frameEnd" : "frameStart"));
                             assemblyClean = false;
+                        }
+                    }
+                }
+            }
+
+            // ── the ELEMENT surface: `elementIndexRule` + `registerElements` ──
+            // OPTIONAL AS A PAIR (P68 round 8,
+            // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). `v1.d[1]` names
+            // ONE element: a size suffix (this table) and an index (the rule).
+            // Either half alone is a silent no-op — a rule with no sizes parses
+            // `[i]` with no width to read it at, sizes with no rule name a
+            // spelling no shape produces — so each is refused without the other.
+            // Read AFTER the arrangement table, because an element suffix equal
+            // to an arrangement suffix would give one spelling two readings.
+            {
+                bool const hasRule = as.contains("elementIndexRule");
+                bool const hasRows = as.contains("registerElements");
+                if (hasRule != hasRows) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              hasRule ? "/assembly/registerElements"
+                                      : "/assembly/elementIndexRule",
+                              std::format(
+                                  "'elementIndexRule' and 'registerElements' "
+                                  "are declared together or not at all; this "
+                                  "dialect declares only '{}' — {}",
+                                  hasRule ? "elementIndexRule"
+                                          : "registerElements",
+                                  hasRule ? "an index rule with no element "
+                                            "sizes parses `[i]` and has no "
+                                            "width to read it at"
+                                          : "element sizes with no index rule "
+                                            "name a spelling no shape "
+                                            "produces"));
+                    assemblyClean = false;
+                } else if (hasRule) {
+                    readRule("elementIndexRule", cfg.elementIndexRule);
+                    json const& rows = as.at("registerElements");
+                    if (!rows.is_array() || rows.empty()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  "/assembly/registerElements",
+                                  "'registerElements' must be a non-empty "
+                                  "array of {suffix, laneBits, registerClass} "
+                                  "rows");
+                        assemblyClean = false;
+                    } else {
+                        static constexpr std::array<std::string_view, 3>
+                            kElementKeys{"suffix", "laneBits", "registerClass"};
+                        DSS_CHECK_KEY_VOCABULARY(kElementKeys);
+                        for (std::size_t ei = 0; ei < rows.size(); ++ei) {
+                            auto const path = std::format(
+                                "/assembly/registerElements/{}", ei);
+                            json const& e = rows[ei];
+                            if (!e.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path,
+                                          "each 'registerElements' entry must "
+                                          "be an object");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            if (!checkKeysAgainst(
+                                    e, kElementKeys, path,
+                                    "a 'registerElements' row",
+                                    DiagnosticCode::C_InvalidHirLowering, coll,
+                                    "")) {
+                                assemblyClean = false;
+                            }
+                            if (!e.contains("suffix")
+                                || !e.at("suffix").is_string()
+                                || e.at("suffix").get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/suffix",
+                                          "'suffix' is required and must be "
+                                          "the element size AS WRITTEN, "
+                                          "INCLUDING its separator (\".d\")");
+                                assemblyClean = false;
+                                continue;
+                            }
+                            auto suffix = e.at("suffix").get<std::string>();
+                            std::uint32_t laneBits = 0;
+                            if (e.contains("laneBits")
+                                && e.at("laneBits").is_number_unsigned()) {
+                                laneBits = e.at("laneBits").get<std::uint32_t>();
+                            }
+                            if (laneBits != 8 && laneBits != 16
+                                && laneBits != 32 && laneBits != 64) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/laneBits",
+                                          std::format(
+                                              "element size '{}' must declare "
+                                              "'laneBits' 8, 16, 32 or 64 — the "
+                                              "width of the ONE element it "
+                                              "names, which the target's "
+                                              "element field reads its size "
+                                              "from",
+                                              suffix));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            std::string regClass;
+                            if (e.contains("registerClass")
+                                && e.at("registerClass").is_string()) {
+                                regClass =
+                                    e.at("registerClass").get<std::string>();
+                            }
+                            auto const cls = targetRegClassFromName(regClass);
+                            if (!cls.has_value()
+                                || !isOperableTargetRegClass(*cls)) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/registerClass",
+                                          std::format(
+                                              "element size '{}' must name the "
+                                              "operable register class whose "
+                                              "registers hold elements (got "
+                                              "'{}')",
+                                              suffix, regClass));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            bool clash = false;
+                            for (auto const& prev : cfg.registerElements) {
+                                if (prev.suffix == suffix) clash = true;
+                            }
+                            for (auto const& a : cfg.registerArrangements) {
+                                if (a.suffix == suffix) clash = true;
+                            }
+                            if (clash) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path + "/suffix",
+                                          std::format(
+                                              "element size '{}' is declared "
+                                              "twice, or is also a lane "
+                                              "arrangement — one spelling "
+                                              "cannot name both one element "
+                                              "and a whole register's lanes",
+                                              suffix));
+                                assemblyClean = false;
+                                continue;
+                            }
+                            cfg.registerElements.push_back(
+                                AssemblyConfig::AsmRegisterElement{
+                                    std::move(suffix), laneBits,
+                                    std::move(regClass)});
                         }
                     }
                 }

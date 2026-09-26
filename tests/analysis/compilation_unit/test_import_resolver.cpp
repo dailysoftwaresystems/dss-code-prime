@@ -34,11 +34,13 @@ using dss::cu_test::hasCode;
 using dss::cu_test::loadShippedSchema;
 
 // RAII temp directory for the c include tests: files must share a
-// directory so same-directory `#include` resolution finds them. The facade —
-// and the reason its unique-path scheme is NOT reimplemented locally, defect
-// D-TEST-FIXED-SCRATCH-PATH-POPULATION — lives in `toy_cu_fixture.hpp`; it was
-// identical here and in test_type_name_oracle.cpp. The GROUP below is this
-// suite's own, so its scratch tree stays separate from that sibling's.
+// directory so same-directory `#include` resolution finds them. The facade
+// lives in `toy_cu_fixture.hpp` — it was identical here and in
+// test_type_name_oracle.cpp — and its unique-path scheme is NOT reimplemented
+// locally because a reimplemented one is exactly what collided: a fixed scratch
+// path let concurrent processes of this binary delete each other's fixtures.
+// The GROUP below is this suite's own, so its scratch tree stays separate from
+// that sibling's.
 constexpr char kScratchGroup[] = "cu4-import-resolver";
 using TempDir = dss::cu_test::ScratchSourceDir<kScratchGroup>;
 
@@ -1092,4 +1094,86 @@ TEST(ImportResolver, AngleDescriptorFoldCollisionFailsLoudAndNamesCandidates) {
     EXPECT_NE(msg.find("Kolide.json"), std::string::npos) << msg;
     EXPECT_TRUE(cu.shippedLibDescriptors().empty())
         << "and nothing may be resolved: any pick would be host-dependent";
+}
+
+// ── [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]] ───────────
+//
+// ONE LISTING PER DIRECTORY PER COMPILE, ACROSS EVERY TIER THAT SEARCHES. A compile
+// (`UnitBuilder`) owns one `HeaderSearchCache` and hands it to every search it makes: the
+// preprocessor's splice, pre-scan, `__has_include` and descriptor closures, the import
+// resolver's descriptor lookups and closure walk, and the shipped-surface check. Before
+// it, each of them re-listed on every resolution (✔MEASURED on the sqlite build: 11,204
+// listings of 13 directories, ~109 per compile where ≤ 13 were needed). COUNTED from a
+// tally that sees listings made through ANY cache — so a tier that searched through a
+// cache of its own, instead of the compile's, lists a directory a second time and reds
+// here. The fixture reaches every searching tier: a quote include in the includer's
+// directory, one only on `-I` (after missing the includer's directory), a nested quote
+// include, a descriptor `<api.h>` (splice + import resolver + closure), an angle source
+// header reached through the `-I` fallback, both `__has_include` forms, and a
+// `windows.json` the `_WIN32` surface claim looks up on pe from every build. Both policies.
+TEST(ImportResolver, ACompileListsEachSearchedDirectoryOnceAcrossEveryTier) {
+    for (auto m : {HeaderNameMatching::CaseSensitive, HeaderNameMatching::CaseInsensitive}) {
+        SCOPED_TRACE(headerNameMatchingName(m));
+        TempDir srcDir;
+        TempDir incDir;
+        TempDir sysDir;
+        auto main = srcDir.write("main.c",
+            "#include \"local.h\"\n"
+            "#include \"shared.h\"\n"
+            "#include <api.h>\n"
+            "#include <real.h>\n"
+            "#if __has_include(\"shared.h\") && __has_include(<api.h>)\n"
+            "int both_found = 1;\n"
+            "#endif\n"
+            "int main() { return local_fn() + shared_fn() + real_fn(); }\n");
+        srcDir.write("local.h", "#include \"shared.h\"\nint local_fn(void) { return 0; }\n");
+        incDir.write("shared.h",
+            "#ifndef SHARED_H\n#define SHARED_H\nint shared_fn(void) { return 0; }\n#endif\n");
+        incDir.write("real.h", "int real_fn(void) { return 0; }\n");
+        sysDir.write("api.json",
+            R"({ "library": { "pe": "lib.dll" },
+                 "symbols": [ { "name": "use", "signature": "fn() -> i32" } ] })");
+        sysDir.write("windows.json",
+            R"({ "library": { "pe": "kernel32.dll" },
+                 "symbols": [ { "name": "GetLastError", "signature": "fn() -> u32" } ] })");
+
+        HeaderSearchTally const tally;
+        {
+            UnitBuilder builder{loadShippedSchema("c"), DiagnosticBudget::libraryDefault()};
+            builder.addIncludeDir(incDir.path());
+            builder.addSystemDir(sysDir.path());
+            builder.setHeaderNameMatching(m);
+            builder.addFile(main);
+            auto cu = std::move(builder).finish();
+            ASSERT_EQ(cu.trees().size(), 1u);
+            EXPECT_FALSE(cu.trees()[0].diagnostics().hasErrors())
+                << "every include of the fixture must resolve, or the count below "
+                   "would be about a compile that stopped searching early";
+            EXPECT_FALSE(hasCode(cu.driverDiagnostics(),
+                                 DiagnosticCode::F_ShippedHeaderNotFound));
+        }
+
+        auto const listed = tally.listingsPerDirectory();
+        auto countOf = [&](std::filesystem::path const& dir) -> std::size_t {
+            std::filesystem::path key = dir;
+            key.make_preferred();
+            for (auto const& [d, n] : listed)
+                if (d == key) return n;
+            return 0;
+        };
+        EXPECT_EQ(countOf(srcDir.path()), 1u) << "the includer's directory";
+        EXPECT_EQ(countOf(incDir.path()), 1u) << "the -I directory";
+        EXPECT_EQ(countOf(sysDir.path()), 1u)
+            << "the system descriptor directory, searched by the preprocessor, the "
+               "import resolver, the descriptor closures and the surface check";
+        for (auto const& [dir, n] : listed) {
+            EXPECT_EQ(n, 1u) << "`" << dir.string() << "` was listed " << n
+                             << " times in ONE compile — some tier searched it through a "
+                                "cache that is not the compile's";
+        }
+        for (auto const& [candidate, n] : tally.probesPerCandidate()) {
+            EXPECT_EQ(n, 1u) << "`" << candidate.string() << "` was probed " << n
+                             << " times in ONE compile";
+        }
+    }
 }

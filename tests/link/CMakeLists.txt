@@ -29,6 +29,15 @@ dss_add_test(NAME link/test_crosscu_link_formats SOURCES test_crosscu_link_forma
 dss_add_test(NAME link/test_elf_writer           SOURCES test_elf_writer.cpp)
 dss_add_test(NAME link/test_pe_writer            SOURCES test_pe_writer.cpp)
 dss_add_test(NAME link/test_macho_writer         SOURCES test_macho_writer.cpp)
+# P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT, routed from lane
+# lm) — the DATA twin of the cross-CU pair above: a sibling module's datum read
+# through a slot by the code that imports it. The merge reads the row's
+# `readThroughSlot` (never infers it) and retargets by ROLE — the reading code to
+# a minted slot (on arm64 both the page and the page offset), a data initializer
+# to the object; a pulled member's direct read is never sent to a slot. Linked
+# images read back byte for byte.
+dss_add_test(NAME link/test_sibling_data_import_slot
+             SOURCES test_sibling_data_import_slot.cpp)
 
 # D-LK-MACHO-STB-LOCAL-LD64-RUNTIME-WITNESS — the ld64 half of
 # D-LK-INTERNAL-LINKAGE-FN-EMITTED-GLOBAL-FOREIGN-COLLISION. Two DSS-emitted
@@ -94,6 +103,37 @@ dss_add_test(NAME link/test_macho_dylib_writer   SOURCES test_macho_dylib_writer
 
 # D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
 dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
+# [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] (parent:
+# [[D-LK-AARCH64-CALL26-BEYOND-RANGE-HAS-NO-VENEER]]): the branch-veneer pass.
+# The PLANNER is pinned at the REAL +/-128 MiB reach through its size-only model
+# (no filler bytes at all); the full-path arms share one 144 MiB zero-filled
+# filler, because only they must see the assembled body's real bytes.
+dss_add_test(NAME link/test_branch_veneers SOURCES test_branch_veneers.cpp)
+# ... its COMPLEXITY pin: the placement's own counted work, doubled input,
+# never a clock (lane `cr`'s pattern).
+dss_add_test(NAME link/test_branch_veneers_complexity SOURCES test_branch_veneers_complexity.cpp)
+# ... and the two declarations it reads, each against its owner: the target's
+# `linkVeneers` vocabulary (loader, shape rules, assembled body) and every
+# writer's `importCallStubLayout` (against the image that writer emits).
+dss_add_test(NAME link/test_link_veneer_vocabulary SOURCES test_link_veneer_vocabulary.cpp)
+# The vocabulary arms mutate the shipped arm64 JSON in memory
+# (`mutate_target_schema.hpp`, an nlohmann consumer).
+target_link_libraries(dss_link_test_link_veneer_vocabulary
+    PRIVATE nlohmann_json::nlohmann_json)
+# ... and its REAL-SCALE end-to-end: the subject row's own shape at 144 MiB
+# through the real linker (entry trampoline, stub layout, veneer pass, writer)
+# for ELF exec, PIE and Mach-O, and RUN where an arm64 runner exists. OPT-IN,
+# because each arm holds ~600 MB and hashes the image for its build-id; the
+# default gate pins the same decisions through the planner's size-only model.
+# Enable with -DDSS_REAL_SCALE_TESTS=ON; the entry carries the `real-scale`
+# label so a gate that does enable it can still select or exclude it by name.
+option(DSS_REAL_SCALE_TESTS "Register the opt-in real-scale link tests" OFF)
+if(DSS_REAL_SCALE_TESTS)
+    dss_add_test(NAME link/test_branch_veneers_real_scale
+                 SOURCES test_branch_veneers_real_scale.cpp)
+    set_tests_properties(link/test_branch_veneers_real_scale
+                         PROPERTIES LABELS real-scale)
+endif()
 
 # Plan 14 LK7 — codesign-placeholder reservation tests.
 dss_add_test(NAME link/test_codesign_placeholder SOURCES test_codesign_placeholder.cpp)
@@ -168,6 +208,16 @@ dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c
 # per-format RUNNER axis (including the `imageLoader` arm no shipped document
 # selects, which nothing else exercises), and the shipped-document sweep.
 dss_add_test(NAME link/test_static_init_schedule SOURCES test_static_init_schedule.cpp)
+
+# D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the format half of the environment entry forms —
+# the shipped verb sets and environment declarations per exec format, and the load
+# rules holding a format's verbs and its `processArgs` mechanism together. Its
+# fixtures are the shipped documents changed in ONE place, hence the json link (the
+# `test_c_symbol_decoration` precedent).
+dss_add_test(NAME link/test_entry_environment_verbs
+             SOURCES test_entry_environment_verbs.cpp)
+target_link_libraries(dss_link_test_entry_environment_verbs
+                      PRIVATE nlohmann_json::nlohmann_json)
 
 # c163 (D-LK-STATIC-ARCHIVE-WRITER, writer half of D-FF1-AR-WRITER-STATIC-LINK)
 # — the GNU/System V `ar` static-archive WRITER: byte-exact framing + armap
@@ -617,6 +667,22 @@ target_link_libraries(dss_link_test_glibc_relocation_vocabulary
 # vacuous without anyone noticing.
 dss_add_test(NAME link/test_glibc_gotpcrel_resolution
              SOURCES test_glibc_gotpcrel_resolution.cpp)
+# P68 round 11 (D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS,
+# D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS): the link's GOT-slot lowering —
+# where each formula's addend goes, the direct twin it becomes, a relocatable
+# format left alone, a weak symbol resolved to nothing — and the REAL gcc members
+# (every x86 GOT type, the aarch64 pair) linked through `linker::link` into an
+# exec, a PIE and a shared object, each slot filled as its image kind requires.
+dss_add_test(NAME link/test_got_slot_lowering
+             SOURCES test_got_slot_lowering.cpp)
+
+# P68 round 11 (D-LK-MACHO-GOT-RELOCATIONS-REFUSED-AT-READ): clang's Mach-O
+# GOT_LOAD / GOT relocations — x86_64's in-place remainder read as the addend,
+# and the REAL members (`macho_got_member_objects.inc`) linked through
+# `linker::link` into a Mach-O exec on both ISAs, each slot rebased or bound as
+# its target requires.
+dss_add_test(NAME link/test_macho_got_relocations
+             SOURCES test_macho_got_relocations.cpp)
 
 # D-LK-ELF-EMITS-NO-BUILD-ID-NOTE: the ELF image's `.note.gnu.build-id` -- its
 # wire record, the fixed-point content derivation, reproducibility, distinctness,
@@ -667,4 +733,60 @@ target_link_libraries(dss_link_test_macho_image_overaligned_section_placement
 dss_add_test(NAME link/test_elf_static_va_chain_document_boundaries
              SOURCES test_elf_static_va_chain_document_boundaries.cpp)
 target_link_libraries(dss_link_test_elf_static_va_chain_document_boundaries
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# D-LINK-WRITER-RENAME-OVER-FAILS-WHILE-ANOTHER-PROCESS-HOLDS-THE-FILE: the
+# commit that renames a staged artifact over its target, with ONE MORE OPEN
+# HANDLE on the file — the holder the round-7 gate met (a real-time scan of the
+# previous artifact, measured sharing delete) must never refuse it; a holder
+# that lets go is waited out; a holder that never lets go is refused loudly, by
+# name. Every holder is released by the TEST (an explicit call, or the commit's
+# own patience callback as a handshake), never by a timer, and the one duration
+# involved is READ from `linker::detail::kCommitHolderWait`. Runs on every leg:
+# on POSIX, `rename(2)` never consults an open descriptor, and the pins assert
+# exactly that instead of skipping.
+dss_add_test(NAME link/test_link_writer_commit_holder
+             SOURCES test_link_writer_commit_holder.cpp)
+
+# D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the runpath vocabulary (the gate, portable
+# and translation rules), the format declarations and the loader's refusals over
+# them — each refusal spliced into the SHIPPED document, hence the json link —
+# and the request gate's refuse/warn split. The bytes each writer records are
+# pinned through the real driver in tests/program/test_image_runpath_build.cpp.
+dss_add_test(NAME link/test_image_runpath SOURCES test_image_runpath.cpp)
+target_link_libraries(dss_link_test_image_runpath
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 9: an ELF or PE/COFF INPUT SECTION is the unit of placement
+# (`inputSectionPlacement`, `InputSectionSlice`). Reference-built objects read
+# by the readers and laid out by the writers' own `buildExecDataSection`; each
+# pin checks the address the producer's instruction reaches, because the
+# measured defect was a green link that ran to 33. The native witnesses build
+# their objects with a mingw-w64 gcc on PATH (Windows) and RUN them.
+dss_add_test(NAME link/test_input_section_units
+             SOURCES test_input_section_units.cpp)
+# Loads each shipped `.format.json` minus one key, so the fixture cannot drift from the file.
+target_link_libraries(dss_link_test_input_section_units
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 9 (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL): a `.s`
+# reference that states no code-vs-data kind takes it from the DEFINITION. The
+# link gate on hand-built modules (a library stating no kind or DATUM refused by
+# name, a library FUNCTION and a sibling definition not, a relocatable object
+# keeping the name, the merge adopting a statement), then the same cases
+# through the driver: a golden NOTYPE shared object, the shipped `stdout`, and
+# the example's own source with its reference-built archives (run on Windows).
+dss_add_test(NAME link/test_import_kind_from_definition
+             SOURCES test_import_kind_from_definition.cpp)
+
+# P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): an arm64 page
+# offset is an ADD's (bytes) or a load's or store's (access-sized units). The
+# reference-built objects read with the kind each load needs (Mach-O by the
+# instruction under its one PAGEOFF12 type, ELF by its five LDST types), the
+# shared decode table word by word, and the loader's refusals of a family that
+# could decode one word two ways — the shipped document mutated, hence the json
+# link.
+dss_add_test(NAME link/test_page_offset_relocations
+             SOURCES test_page_offset_relocations.cpp)
+target_link_libraries(dss_link_test_page_offset_relocations
                       PRIVATE nlohmann_json::nlohmann_json)

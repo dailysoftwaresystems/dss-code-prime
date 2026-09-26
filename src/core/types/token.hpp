@@ -59,11 +59,16 @@ enum class CoreTokenKind : std::uint16_t {
 //                lexeme via the full candidate-filter path.
 // - span       : byte range in the source buffer. The lexeme text is recovered
 //                via SourceBuffer::slice(span); never stored on the token itself.
-// Tokenizer-supplied flags. Today this is just `EmptySpace` flagged by
-// the tokenizer on body-mode emissions when the mode declares
-// `defaultToken.flags`. The builder OR-merges these with the
-// resolved meaning's `flagsApplied` at pushToken time so both sources
-// of flag intent propagate to the resulting Node.
+// Tokenizer-supplied flags. Two, each set by the tokenizer only:
+//   • `EmptySpace` on body-mode emissions when the mode declares
+//     `defaultToken.flags`;
+//   • `Implied` on the ONE emission that reads the schema's
+//     `endOfInputImplies` lexeme from the implied tail — a token with no bytes
+//     in the buffer (zero-width at its end), which the builder spells by that
+//     lexeme rather than by slicing its span.
+// The builder OR-merges these with the resolved meaning's `flagsApplied` at
+// pushToken time so both sources of flag intent propagate to the resulting
+// Node.
 //
 // (`Missing`/`Synthetic`/`HasError` are set by the builder, never the
 // tokenizer — but the field is the same type to keep the merge

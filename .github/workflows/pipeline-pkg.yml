@@ -22,7 +22,7 @@ name: Package
 # the .deb/.rpm step in publish-packages.yml already chmod'd bin/dsscp, so no Debian
 # or RPM package could be produced at all -- and nothing saw it, because that step
 # runs only on a v* tag and no tag had been pushed. A half-migration behind a green
-# suite (D-PKG-PUBLISH-PATH-NAMES-THE-POST-RENAME-BINARY).
+# suite.
 #
 # Flow (immutable-release-safe): create a DRAFT release, build the shippable
 # artifact on each platform leg in parallel, PERSIST it as a run artifact and
@@ -46,9 +46,9 @@ name: Package
 # ⛔ THE MODE IS THREE `if:` CONDITIONS, NEVER A SECOND COPY OF ANYTHING. Adding a
 # mode to a workflow is cheapest by forking the packaging steps into a second job,
 # and a forked copy is two owners of one shape — the drift this repository already
-# carries an open row about for the sibling pipeline
-# (D-CI-PR-PIPELINE-IS-VENDORED-AND-ITS-SYNC-IS-UNCHECKED). `pkg_pipeline_modes_guard`
-# (`scripts/check-pkg-pipeline/`) refuses a tree where that stops being true, and
+# filed once for the sibling pipeline (a vendored copy whose sync nothing checks).
+# `pkg_pipeline_modes_guard`
+# (`.harness-config/runner/actions/check-pkg-pipeline/`) refuses a tree where that stops being true, and
 # pins the release path's job and step sequence besides.
 #
 # ── THE RELEASE PATH: WHAT WAS FROZEN, AND WHAT WAS THEN AUTHORISED ─────────
@@ -420,7 +420,7 @@ jobs:
         timeout-minutes: 90
 
       # ── Stage the INSTALL SET, and tar THAT ───────────────────────────────
-      # D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE. This step used to be
+      # This step used to be
       # absent and the packaging step below tarred `bin` straight out of the
       # build directory — so every release shipped a bare executable with NO
       # `src/dss-config/`, and a packaged compiler could not resolve a single
@@ -465,7 +465,12 @@ jobs:
         env:
           ARTIFACT_NAME: ${{ needs.resolve-version.outputs.artifact-name }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
-          PLATFORM: ${{ matrix.platform }}
+          # ⚠ NOT `PLATFORM`. On the Windows leg the Visual Studio developer environment
+          # already defines `Platform`, Windows environment names are case-INSENSITIVE so
+          # Actions' injection updates that slot while keeping its casing, and `bash` is
+          # case-SENSITIVE — so `${PLATFORM}` expanded to NOTHING and release v0.5.0 shipped
+          # `dsscp-0.5.0-.tar.gz` while the other three legs were named correctly.
+          DSS_PLATFORM: ${{ matrix.platform }}
           # The staged PREFIX TREE (bin/, lib/, share/), not the build dir. The
           # exe finds its config by a path relative to itself, so the tarball
           # must preserve that relative layout — which is exactly what a prefix
@@ -476,7 +481,20 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          archive="$(pwd)/dist/${ARTIFACT_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+
+          # ★ EVERY COMPONENT OF THE NAME IS REQUIRED, AND AN EMPTY ONE IS A HARD FAILURE.
+          # An asset whose name is missing a component is indistinguishable from a correct one
+          # to anything that globs `*.tar.gz` — including this workflow's own upload step — while
+          # `publish-packages.yml` fetches by NAME and simply cannot find it. That is how a
+          # nameless Windows package reached a published release without one job going red.
+          for _part in ARTIFACT_NAME VERSION DSS_PLATFORM; do
+            if [ -z "${!_part}" ]; then
+              echo "::error::\$$_part is empty, so the archive name would be missing a component. Refusing to package."
+              exit 1
+            fi
+          done
+
+          archive="$(pwd)/dist/${ARTIFACT_NAME}-${VERSION}-${DSS_PLATFORM}.tar.gz"
 
           if [ -n "$PACKAGE_COMMAND" ]; then
             # Escape hatch: the consumer's command must write the finished

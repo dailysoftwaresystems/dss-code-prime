@@ -13,6 +13,7 @@
 #include "core/types/symbol_attrs.hpp"        // SymbolBinding / SymbolVisibility (lifted to core/types for MIR-tier producers)
 #include "core/types/target_schema.hpp"       // EnumNameTable<E,N>
 #include "link/object_format_backend.hpp"     // D-LINK-…-KIND-IDENTITY-BRANCHES: the format-identity SEAM
+#include "link/runpath.hpp"                   // RunpathDeclaration (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH)
 
 #include <array>
 #include <cstdint>
@@ -197,7 +198,113 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     //   the reader's runtime discovery into a LOAD-TIME invariant (at most
     //   one non-alias row per nativeId).
     bool           emitOnly = false;
+    // ── THE WIRE TYPE BY THE BYTES THAT FOLLOW THE FIELD ────────────────────
+    // (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER) — the JSON
+    // key `nativeIdByBytesAfterField`, a list of `{ bytesAfterField, nativeId }`.
+    //
+    // A format may spell, in the relocation TYPE, how many bytes of the
+    // instruction follow the patched field. Mach-O x86_64 does:
+    // X86_64_RELOC_SIGNED when the field ends the instruction, SIGNED_1/_2/_4
+    // when 1, 2 or 4 bytes follow it (✔MEASURED 2026-09-23, clang 18.1.3:
+    // `movl $5, counter(%rip)` is SIGNED_4, `addl $1, counter(%rip)` SIGNED_1).
+    // The emitter writes the entry matching `Relocation::bytesAfterField`, and
+    // `nativeId` when none does; a reader decodes every entry back to this
+    // row's kind. The ADDEND is the same in every case (the x86 walker has
+    // already lowered it by those bytes), so the entries differ in the type
+    // alone — the same shape `pltNativeId` has. Empty on every other row.
+    struct BytesAfterFieldNativeId {
+        std::uint8_t  bytesAfterField = 0;
+        std::uint32_t nativeId        = 0;
+    };
+    std::vector<BytesAfterFieldNativeId> nativeIdByBytesAfterField;
+
+    // The wire type for a site with `bytesAfterField` bytes after its field.
+    [[nodiscard]] std::uint32_t
+    nativeIdFor(std::uint8_t bytesAfterField) const noexcept {
+        for (auto const& e : nativeIdByBytesAfterField) {
+            if (e.bytesAfterField == bytesAfterField) return e.nativeId;
+        }
+        return nativeId;
+    }
+
+    // ── ONE WIRE TYPE, SEVERAL KINDS, TOLD APART BY THE INSTRUCTION ─────────
+    // (P68 round 9, D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD) — the
+    // JSON key `decodeWhenInstruction`, a list of `{ mask, value }`.
+    //
+    // A format may use ONE relocation type for fields whose arithmetic differs
+    // by the instruction that holds them. Mach-O arm64 does: ARM64_RELOC_PAGEOFF12
+    // is an ADD's unscaled page offset AND a load's or store's offset scaled by
+    // its access size, and ld64 takes the scale from the instruction. ELF spells
+    // the same five sizes as five types (R_AARCH64_LDST8..128_ABS_LO12_NC), so
+    // the difference is real and only the WIRE hides it. Each row sharing such a
+    // type declares the 32-bit instruction words it decodes for — `(word & mask)
+    // == value`, any entry — and a reader reads the word at the site to choose.
+    // `validate()` makes it a function: every row sharing the type declares
+    // patterns, and no two rows' patterns can match one word. Empty everywhere
+    // a wire type names one kind.
+    struct InstructionPattern {
+        std::uint32_t mask  = 0;
+        std::uint32_t value = 0;
+        [[nodiscard]] bool matches(std::uint32_t word) const noexcept {
+            return (word & mask) == value;
+        }
+    };
+    std::vector<InstructionPattern> decodeWhenInstruction;
 };
+
+// ★★★ WHERE A RELOCATABLE OBJECT KEEPS A RELOCATION's ADDEND — a FORMAT fact,
+// the root key `relocationAddends` (P68 round 9).
+//   * `explicit` — the relocation RECORD has an addend column (ELF RELA's
+//     `r_addend`), which carries the psABI's full implicit addend: DSS's addend
+//     plus the target kind's `addendBias`;
+//   * `inPlace` — the record has none (COFF IMAGE_RELOCATION, Mach-O
+//     relocation_info), and the PATCHED FIELD holds the addend: DSS's addend,
+//     because the format's own formula carries the bias the target declares
+//     (IMAGE_REL_AMD64_REL32 is S + field - (P + 4)).
+// ⚠ ONE OWNER: `link/format/relocation_addend.hpp` is the only code that
+// writes or reads an addend by this rule, so a writer and a reader cannot
+// disagree about it — the defect this closed was a reader that assumed "the
+// writer rejects a non-zero `.text` addend" and dropped every foreign one.
+enum class RelocationAddendStorage : std::uint8_t {
+    Explicit,
+    InPlace,
+};
+
+inline constexpr EnumNameTable<RelocationAddendStorage, 2>
+    kRelocationAddendStorageTable{{{
+        { RelocationAddendStorage::Explicit, "explicit" },
+        { RelocationAddendStorage::InPlace,  "inPlace"  },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kRelocationAddendStorageTable);
+
+// ★★★ WHETHER AN INPUT SECTION MAY BE CUT APART — a FORMAT fact, the root key
+// `inputSectionPlacement` (P68 round 9). A relocatable-object reader slices each
+// section into symbol-bounded atoms. This key says whether the link may then place
+// those atoms independently, or must keep every one at its offset from the others.
+//   * `unit` — never split: the input section is the unit of placement, as it
+//     is for every ELF and PE/COFF linker. Code in the object can depend on the
+//     section's layout with nothing a reader can see: a reference gas reduced
+//     to "section symbol + offset", a `sym+off` that runs into the next object,
+//     an array of objects walked between two labels.
+//   * `subsectionsWhenDeclared` — split at symbols ONLY when the object itself
+//     declares its sections divisible, which is ld64's rule for Mach-O's
+//     MH_SUBSECTIONS_VIA_SYMBOLS. How an object declares it is a wire fact, so
+//     the format's reader owns it. An object that does not declare it gets the
+//     `unit` treatment, and a format with no such declaration never splits.
+// Where a section is a unit, its atoms carry `InputSectionSlice`, and the link
+// keeps or drops the section WHOLE. A member that dedup or weak resolution
+// discards keeps its bytes, so nothing after it moves.
+enum class InputSectionPlacement : std::uint8_t {
+    Unit,
+    SubsectionsWhenDeclared,
+};
+
+inline constexpr EnumNameTable<InputSectionPlacement, 2>
+    kInputSectionPlacementTable{{{
+        { InputSectionPlacement::Unit,                    "unit"                    },
+        { InputSectionPlacement::SubsectionsWhenDeclared, "subsectionsWhenDeclared" },
+    }}};
+DSS_CHECK_ENUM_NAME_TABLE(kInputSectionPlacementTable);
 
 // ── THE DECODE SIDE OF `relocations[]`, BUILT ONCE ────────────────
 //
@@ -228,7 +335,43 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
 struct DSS_EXPORT RelocationDecodeTable {
     // Wire type → the DSS kind it decodes to. A FUNCTION by construction:
     // emission aliases are excluded, and a residual collision is refused.
+    // ⚠ A wire type SHARED by several kinds is not here but in `byInstruction`,
+    // and the readers ask `decode`, which knows both.
     std::unordered_map<std::uint32_t, RelocationKind> nativeToKind;
+    // Wire type → the rows it may decode to, each with the instruction words
+    // it decodes for (`ObjectFormatRelocationInfo::decodeWhenInstruction`).
+    struct InstructionKind {
+        ObjectFormatRelocationInfo::InstructionPattern pattern;
+        RelocationKind                                 kind{};
+    };
+    std::unordered_map<std::uint32_t, std::vector<InstructionKind>> byInstruction;
+
+    // Why a wire type did not decode.
+    enum class Miss : std::uint8_t {
+        Undeclared,        // no row names this wire type
+        SiteTooShort,      // shared type, and fewer than 4 bytes at the site
+        NoInstruction,     // shared type, and no row's pattern matches the word
+    };
+    // The ONE decode every reader asks. `site` is the bytes the relocation
+    // patches (little-endian; only a SHARED wire type reads it, as a 32-bit
+    // instruction word).
+    [[nodiscard]] std::expected<RelocationKind, Miss>
+    decode(std::uint32_t nativeId, std::span<std::uint8_t const> site) const {
+        if (auto const it = nativeToKind.find(nativeId); it != nativeToKind.end()) {
+            return it->second;
+        }
+        auto const shared = byInstruction.find(nativeId);
+        if (shared == byInstruction.end()) return std::unexpected(Miss::Undeclared);
+        if (site.size() < 4) return std::unexpected(Miss::SiteTooShort);
+        std::uint32_t const word = static_cast<std::uint32_t>(site[0])
+                                 | (static_cast<std::uint32_t>(site[1]) << 8)
+                                 | (static_cast<std::uint32_t>(site[2]) << 16)
+                                 | (static_cast<std::uint32_t>(site[3]) << 24);
+        for (auto const& e : shared->second) {
+            if (e.pattern.matches(word)) return e.kind;
+        }
+        return std::unexpected(Miss::NoInstruction);
+    }
     // The wire types whose presence PROVES the extern they reach is a
     // FUNCTION: every row the format declares `"isCall": true` on, plus every
     // declared `pltNativeId` (a call-through-stub variant can only be a call).
@@ -1223,7 +1366,7 @@ struct DSS_EXPORT ObjectFormatData {
     // target), so the width contract does too. Consumed by the driver
     // (`buildCuMir` threads it into `analyze()`) — the per-language
     // `coreByDataModel` overrides, the integer-literal ladder, and the
-    // shipped-lib descriptor `signatureByDataModel` all resolve
+    // shipped-lib descriptor's `when: {dataModel}` signature variants all resolve
     // against it. The zero default is the INVALID sentinel: a
     // hand-built ObjectFormatData that never set it is rejected by
     // validate() (the loader path always sets it or fails).
@@ -1421,6 +1564,20 @@ struct DSS_EXPORT ObjectFormatData {
     // NO target-side fallback field — the axis is format-only.
     LongDoubleFormat     longDoubleFormat = LongDoubleFormat::None;
 
+    // ── P68 round 12 (lane `cs`): the per-format ENUMERATION COMPATIBLE-TYPE RULE ──
+    //
+    // OPTIONAL top-level `"enumCompatibleTypeRule"` ("msvc" / "gnu"; closed enum,
+    // loader fails loud on an unknown spelling — the longDoubleFormat discipline):
+    // which integer type an enumeration WITHOUT a fixed underlying type is
+    // compatible with is the PLATFORM ABI's choice (C 6.7.2.2p4) — `int` on the
+    // Microsoft x64 ABI, `unsigned int` when no value is negative on the SysV /
+    // AAPCS / Darwin ones — observable in an enum bit-field's signedness, the
+    // enumeration's arithmetic, `_Generic` and redeclarations. The format names the
+    // convention; the language's `enumerationCompatibleTypes` says which of its types
+    // each one chooses. Absent ⇒ `None`: an enumeration without a fixed type is then
+    // S_EnumCompatibleTypeRuleUndeclared (wasm / spirv skeletons omit it). FORMAT-ONLY.
+    EnumCompatibleTypeRule enumCompatibleTypeRule = EnumCompatibleTypeRule::None;
+
     // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the format's own
     //    predefined macros ─────────────────────────────────────────────
     //
@@ -1477,6 +1634,16 @@ struct DSS_EXPORT ObjectFormatData {
     std::vector<ObjectFormatRelocationInfo> relocations;
     substrate::TransparentStringMap<std::uint16_t> relocationNameIndex;
     std::unordered_map<RelocationKind, std::uint16_t> relocationKindIndex;
+    // Where this format's relocatable objects keep an addend (the
+    // `relocationAddends` root key — see `RelocationAddendStorage`). REQUIRED
+    // whenever `relocations` is non-empty (`validate()`), because both answers
+    // produce a well-formed object and only one of them is the format.
+    std::optional<RelocationAddendStorage> relocationAddendStorage;
+    // Whether a relocatable object's input sections may be split into
+    // independently placed atoms (the `inputSectionPlacement` root key — see
+    // `InputSectionPlacement`). REQUIRED whenever `relocations` is non-empty
+    // (`validate()`): a format whose objects the link reads must say it.
+    std::optional<InputSectionPlacement> inputSectionPlacement;
 
     // Sections row (D-LK4-2). The walker reads sections by
     // SectionKind; `name`/`type`/`flags`/`addrAlign`/`entrySize`
@@ -1995,6 +2162,33 @@ struct DSS_EXPORT ObjectFormatData {
     // why each of the four verbs exists and what it tells the user to do.
     std::optional<StackReserveUnsupportedReason> stackReserveUnsupportedReason;
 
+    // ── D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: where an image of this format
+    //    records the directories its loader searches for its libraries ──────
+    //
+    // `"runpath"` in the JSON: the closed CARRIER verb naming the structure
+    // (`elf-dynamic-entry`, `macho-load-command`), its parameters, and this
+    // format's spelling of the image's own directory. See `link/runpath.hpp`
+    // for the measured reference behaviour each part of it transcribes.
+    //
+    // `std::nullopt` = an image of this format records no runpath, and that is
+    // NOT a refusal: both PE references ACCEPT an rpath request and emit
+    // nothing (the Windows loader searches the application's directory), so a
+    // request against such a format is accepted, recorded nowhere, and reported
+    // by a WARNING (`K_FormatLacksRunpath`) rather than dropped in silence.
+    // Declared by the six ELF exec/pie/dyn documents and the four Mach-O
+    // exec/dylib documents; `validate()` refuses it on a format that is not an
+    // image flavor (nothing would ever read it) or whose backend's walker does
+    // not write the declared carrier.
+    std::optional<RunpathDeclaration> runpath;
+
+    // The REMEDY axis of the same row (`"runpathUnsupportedReason"`): WHERE the
+    // loader of an image format that records no runpath finds a library
+    // instead, as a closed verb the warning turns into a sentence. Mutually
+    // exclusive with `runpath`; refused on a non-image flavor, whose answer is
+    // derived (nothing loads it). OPTIONAL. Declared by the two PE image
+    // documents. See `RunpathUnsupportedReason` (link/runpath.hpp).
+    std::optional<RunpathUnsupportedReason> runpathUnsupportedReason;
+
     // ── D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the weak-DEFINITION
     //    spelling this format uses (`"weakDefinition"` in the JSON) ────────
     //
@@ -2278,6 +2472,12 @@ public:
     [[nodiscard]] LongDoubleFormat     longDoubleFormat() const noexcept {
         return d_.longDoubleFormat;
     }
+    // P68 round 12 (lane `cs`): the format's declared enumeration compatible-type
+    // rule, or `None` if it declared none. Read by the driver via
+    // `effectiveEnumCompatibleTypeRule(format)`.
+    [[nodiscard]] EnumCompatibleTypeRule enumCompatibleTypeRule() const noexcept {
+        return d_.enumCompatibleTypeRule;
+    }
 
     // ── Format-owned predefined macros (TF-C97) ───────────────────
     // The format's `predefinedMacros` rows, in declaration order and
@@ -2305,6 +2505,22 @@ public:
         auto it = d_.relocationKindIndex.find(kind);
         if (it == d_.relocationKindIndex.end()) return nullptr;
         return &d_.relocations[it->second];
+    }
+
+    // Where this format keeps a relocation's addend (`relocationAddends`), or
+    // nullopt for a document that declares no relocations. Read ONLY through
+    // `link/format/relocation_addend.hpp`.
+    [[nodiscard]] std::optional<RelocationAddendStorage>
+    relocationAddendStorage() const noexcept {
+        return d_.relocationAddendStorage;
+    }
+
+    // Whether this format's input sections may be split into independently
+    // placed atoms (`inputSectionPlacement`), or nullopt for a document that
+    // declares no relocations. Read by the relocatable-object readers.
+    [[nodiscard]] std::optional<InputSectionPlacement>
+    inputSectionPlacement() const noexcept {
+        return d_.inputSectionPlacement;
     }
 
     [[nodiscard]] ObjectFormatRelocationInfo const*
@@ -2820,6 +3036,24 @@ public:
     [[nodiscard]] std::optional<StackReserveUnsupportedReason>
     stackReserveUnsupportedReason() const noexcept {
         return d_.stackReserveUnsupportedReason;
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: how an image of this format records
+    // a runpath, or `std::nullopt` if it records none. Presence is the
+    // capability — the question the gate and both writers ask, never a format
+    // identity. Returned by reference: the declaration carries strings.
+    [[nodiscard]] std::optional<RunpathDeclaration> const&
+    runpath() const noexcept {
+        return d_.runpath;
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: WHERE this image format's loader
+    // finds a library instead, when it records no runpath; `std::nullopt` ⇒
+    // not declared (the warning then says so). Never has a value when
+    // `runpath()` does — exclusive by load-time validation.
+    [[nodiscard]] std::optional<RunpathUnsupportedReason>
+    runpathUnsupportedReason() const noexcept {
+        return d_.runpathUnsupportedReason;
     }
 
     // D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED: the dialect this format

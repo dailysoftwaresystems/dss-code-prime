@@ -1,0 +1,13 @@
+{
+  "$comment": "D-MIR-ASM-BY-ADDRESS-OPERAND-BOUND-TO-A-REGISTER-RECEIVES-ITS-ADDRESS and D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED, x86_64. A struct, a `_Complex`, an `__int128` or an x87 `long double` bound to an inline-asm REGISTER constraint must reach the template as its VALUE — loaded into its register(s) before the template, stored back after it — where the template used to receive the value's ADDRESS (`__int128` and `_Complex float` on `\"r\"`: rc=0, the wrong bits, debug and release). A 16-byte value on `\"r\"` rides a register PAIR whose second register AT&T gives the template no name for, so a `+` operand's high half must survive untouched; an XMM operand is moved by the SSE instruction the template names (a 16-byte one by `movaps`, whose width-128 encoding the x86_64 target now declares). Twelve shapes, each its own exit code 11..22: a pair read and read-modify-written; a 16-byte struct pair beside a register clobber (the constrained range must hold only its own instructions — a frame address materialized inside it used to be refused at `callconv`, L_SideStructureReferenceLost); a `_Complex double` pair; structs of 1, 2, 4 and 8 bytes in one general register, each direction; a `_Complex float` in one register; an `__int128` in one XMM register; structs of 8, 4 and 2 bytes in XMM registers (the 2-byte one staged through a general register, gcc's own `movzwl` + `movd`); a struct on the PINNED letter `\"+a\"`; an `asm goto` struct-pair output read on both edges; a call's struct RESULT as the operand; and, ELF only, an x87 `long double` on a general-register pair (64 + 16 bits). gcc 13.3.0 runs the file to 42 at -O0 and -O2 (clang 18.1.3 refuses the 16-byte struct and complex inputs). Every check is BITWISE over the value's own bytes. RED-ON-DISABLE: undo the front end's carriage (hand the operand's address to the register) and the first check fails. Under the Windows x64 ABI a `long double` IS a `double`, so the x87 shape is compiled out there (`_WIN64`).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

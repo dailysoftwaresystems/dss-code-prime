@@ -90,7 +90,7 @@ struct ThrowingStreamBuf : std::streambuf {
 // marker that is merely PRESENT can always be tripped by writing about it, so
 // comments and string literals are blanked first and only what the compiler
 // would actually compile is matched. (Same reasoning, same shape, as
-// `scripts/check-no-abort-in-tests/check-no-abort-in-tests.py`.)
+// `.harness-config/runner/actions/check-no-abort-in-tests/check-no-abort-in-tests.py`.)
 [[nodiscard]] std::string stripCommentsAndStrings(std::string const& text) {
     std::string out;
     out.reserve(text.size());

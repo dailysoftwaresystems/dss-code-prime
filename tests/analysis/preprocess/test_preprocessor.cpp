@@ -10,6 +10,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/char_decode.hpp"
+#include "core/types/data_model.hpp"         // kDataModelTable: CHAR_BIT realized under every data model
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"   // c105: per-format prologue tests
@@ -17,6 +18,7 @@
 #include "core/types/source_buffer.hpp"
 #include "core/types/target_schema.hpp"   // TF-C74: per-arch target predefines
 #include "core/types/unsuppressable_codes.hpp"  // TF-C86: the refusal's closed-table pin
+#include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibConstants: the lattice-derived CHAR_BIT (P68 round 9)
 #include "link/object_format_schema.hpp"  // TF-C97: per-format data-model predefines
 #include "tokenizer/tokenizer.hpp"
 #include "test_support/golden_file.hpp"   // TF-C85: findCorpusRoot / readFile
@@ -50,7 +52,7 @@ using namespace dss;
 // Nothing below may name `temp_directory_path()` directly — that is the whole
 // point of routing 39 sites through one function.
 //
-// WHY THE ROOT MUST BE PER-RUN (D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES).
+// WHY THE ROOT MUST BE PER-RUN.
 // `tests/CMakeLists.txt` registers a SECOND ctest entry that runs THIS
 // binary again under `--gtest_shuffle --gtest_repeat=20`, deliberately without
 // serialization. So on any ordinary `ctest -j` two live processes of this
@@ -93,7 +95,7 @@ using namespace dss;
 // REFERENCE to the cached owner. Same shape as `x86Schema()` in
 // tests/lir/test_lir.cpp.
 //
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — WHY THIS RETURNS A REFERENCE.
+// WHY THIS RETURNS A REFERENCE.
 // While this returned `std::shared_ptr<GrammarSchema const>` BY VALUE, every
 // call built a fresh schema owned solely by the returned temporary, so the
 // one-liner `auto const& x = cSubset()->accessor();` bound a reference into an
@@ -128,9 +130,9 @@ using namespace dss;
     return schema;
 }
 
-// D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE — the DURABLE guard, and the only
-// kind available here. Once `cSubset()` hands back a reference to a static the
-// dangling read becomes IMPOSSIBLE, which retires the crash test that proved it:
+// The DURABLE guard against that dangling read, and the only kind available
+// here. Once `cSubset()` hands back a reference to a static the dangling read
+// becomes IMPOSSIBLE, which retires the crash test that proved it:
 // a runtime red-on-disable cannot survive its own fix. So the property is pinned
 // at COMPILE time instead. Restoring the by-value return re-admits the entire
 // defect class at all 36 call sites, so that regression must not be silent.
@@ -138,7 +140,7 @@ using namespace dss;
 // `std::shared_ptr<GrammarSchema const>` and this fails to compile.
 static_assert(std::is_reference_v<decltype(cSubset())>,
               "cSubset() must return a REFERENCE to a cached owner. A by-value "
-              "return re-admits D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: "
+              "return re-admits the dangling-reference defect: "
               "`helper()->accessor()` would again bind a reference into a schema "
               "owned only by the temporary, which dies at the end of the "
               "full-expression (heap-use-after-free).");
@@ -4059,11 +4061,36 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     // identical to C11's `memory_order_*`, so the two spellings share ONE
     // numbering rather than needing a translation.
     // 26 un-gated, 13 pe-gated, 3 macho-gated = 42.
-    EXPECT_EQ(pms.size(), 42u)
-        << "c declares 26 un-gated + 13 pe-gated + 3 macho-gated predefined macros";
+    // P68 round 8 part 4 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): +13
+    // UN-GATED rows, the `__SIZEOF_*__` family (`type-size` rows naming a TYPE,
+    // realized per pair; `tests/analysis/preprocess/test_sizeof_macro_family.cpp`
+    // pins the family itself). Un-gated because whether each is defined is the
+    // PAIR's question — answered by whether the pair realizes the type — not a
+    // format filter's. 39 un-gated, 13 pe-gated, 3 macho-gated = 55.
+    // P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): +3 UN-GATED rows, the
+    // `type-unsigned` family — `__CHAR_UNSIGNED__` (moved here from
+    // arm64.target.json, where it was a hand-gated `["elf"]` constant),
+    // `__WCHAR_UNSIGNED__`, `__WINT_UNSIGNED__`; each names a TYPE and is defined
+    // where the PAIR makes it unsigned (test_type_unsigned_predefines pins the
+    // family). 42 un-gated, 13 pe-gated, 3 macho-gated = 58.
+    // P68 round 9 (D-C-GNU-INTEGER-TYPE-PREDEFINES-MISSING): +122 UN-GATED rows,
+    // the GNU integer-type families — 36 `type-name` (`__*_TYPE__`), 66
+    // `type-limit` (`__*_MAX__`/`__*_MIN__`/`__*_WIDTH__`), 20 `type-suffix`
+    // (`__*_C(c)`/`__*_C_SUFFIX__`); each names a TYPE and is realized per (language
+    // × pair) — un-gated for the `type-size` rows' reason: whether one is defined
+    // is the pair's question (test_type_derived_predefines pins the family).
+    // 164 un-gated, 13 pe-gated, 3 macho-gated = 180.
+    // P68 (lane lm, #2): +6 ELF-GATED rows, the Linux identity every Linux reference
+    // predefines in its ISO modes — `__linux__`, `__linux`, `__gnu_linux__`, `__unix__`,
+    // `__unix`, `__ELF__` (✔MEASURED gcc 13.3.0 + clang 18.1.3, x86_64 and aarch64);
+    // each carries the `impliedSurface` it backs (test_os_identity_predefines pins them
+    // on every real pair). 164 un-gated, 13 pe-gated, 3 macho-gated, 6 elf-gated = 186.
+    EXPECT_EQ(pms.size(), 186u)
+        << "c declares 164 un-gated + 13 pe-gated + 3 macho-gated + 6 elf-gated predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     std::vector<std::string> machoGatedNames;
+    std::vector<std::string> elfGatedNames;
     for (auto const& pm : pms) {
         if (pm.availableObjectFormats.empty()) {
             ++ungated;
@@ -4075,11 +4102,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
             auto const& fmt = pm.availableObjectFormats.front();
             if (fmt == "macho") {
                 machoGatedNames.push_back(pm.name);
+            } else if (fmt == "elf") {
+                elfGatedNames.push_back(pm.name);
             } else {
                 ++peGated;
                 EXPECT_EQ(fmt, "pe")
-                    << pm.name << " should be pe-gated (Windows selection) or macho-gated "
-                                  "(Darwin selection) — no other format gate is declared";
+                    << pm.name << " should be pe-gated (Windows selection), macho-gated "
+                                  "(Darwin selection) or elf-gated (Linux selection) — no "
+                                  "other format gate is declared";
             }
         }
     }
@@ -4097,8 +4127,25 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
            "dropping either of the first two makes every `#ifdef __APPLE__` in portable C "
            "take the wrong branch, and dropping __APPLE_CC__ re-closes the "
            "TargetConditionals.h conjunction that gates the whole Darwin ladder";
-    EXPECT_EQ(ungated, 26u)
-        << "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
+    // The Linux identity (P68, lane lm, #2). EXACT SET, as for Darwin: every portable C
+    // program branches on `__linux__`, and without it DSS silently compiled the non-Linux
+    // arms of sqlite's os_unix.c on the ELF pairs (no pread/pwrite, no mmap I/O, no
+    // mremap) — a different program than every reference builds.
+    std::sort(elfGatedNames.begin(), elfGatedNames.end());
+    EXPECT_EQ(elfGatedNames,
+              (std::vector<std::string>{"__ELF__", "__gnu_linux__", "__linux", "__linux__",
+                                        "__unix", "__unix__"}))
+        << "elf targets must predefine exactly the six names gcc and clang define for a "
+           "linux triple in their ISO modes (`linux`/`unix` are GNU-mode only and belong "
+           "to the program)";
+    EXPECT_EQ(ungated, 164u)
+        << "the 122 GNU integer-type rows (`type-name`/`type-limit`/`type-suffix`, P68 "
+           "round 9, realized per pair) + "
+           "the 3 `type-unsigned` rows (__CHAR_UNSIGNED__/__WCHAR_UNSIGNED__/"
+           "__WINT_UNSIGNED__, P68 round 9, realized per pair) + "
+           "the 13 `__SIZEOF_*__` type-size rows "
+           "(D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING, realized per pair) + "
+           "__COUNTER__ (D-CSUBSET-COUNTER-MACRO-NOT-EXPANDED, the one `counter` "
            "kind) + the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
            "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) + the 5 TF-C83 "
            "un-gated identity rows (__DSSCP__, __GNUC__, __GNUC_MINOR__, "
@@ -4175,7 +4222,17 @@ TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
 //   __GNUC__ 4 / __GNUC_MINOR__ 2 / __GNUC_PATCHLEVEL__ 1 / __APPLE_CC__ 6000 /
 //   __clang__ 1.
 // `__DSSCP__` is the one row with no clang counterpart — it is DSS's own
-// identity, packed from VERSION (0.0.2 -> 0*1000000 + 0*1000 + 2 == 2).
+// identity, packed from the repo-root VERSION file (0.0.2 -> 0*1000000 + 0*1000
+// + 2 == 2; 0.5.0 -> 5000).
+//
+// ⚠ ITS EXPECTED VALUE IS READ FROM `VERSION`, NEVER RESTATED HERE. The five
+// clang rows are literals because they are MEASURED against clang and a bump of
+// this project changes none of them; `__DSSCP__` is the opposite — it follows
+// this repository's own version, so a literal here is a pin that goes stale at
+// the next release and reds the whole corpus while blaming the config.
+// ✔MEASURED 2026-09-16: it did. The merge that bumped VERSION 0.0.2 -> 0.5.0
+// left this expectation at "2", and this test plus its shuffled twin were the
+// only two failures on an otherwise green 2207-test gate.
 //
 // WHY VALUES AND NOT JUST PRESENCE: `__GNUC__` alone would satisfy a
 // presence-only test while yielding GCC_VERSION 4000000 instead of the truthful
@@ -4191,14 +4248,35 @@ TEST(Preprocessor, TFC83IdentityPredefineValuesMatchClang) {
             got[pm.name] = pm.value;
         }
     }
+    // The repository's own version, read where the loader reads it, packed the way
+    // the loader packs it. `packVersionComponents` is exercised on its own against
+    // fixed strings by TFC83VersionPackingIsOrderPreserving below, so this is not a
+    // tautology: that test owns the transform, this one owns the wiring.
+    auto const versionFile = dss::test::repoRoot() / "VERSION";
+    std::ifstream versionIn(versionFile);
+    ASSERT_TRUE(versionIn) << "cannot read " << versionFile.string();
+    std::string versionText;
+    std::getline(versionIn, versionText);
+    // Trailing whitespace only -- a CRLF checkout of this one-line file leaves a
+    // carriage return that `packVersionComponents` would refuse.
+    while (!versionText.empty() && versionText.back() <= ' ') {
+        versionText.pop_back();
+    }
+    const std::vector<long long> versionWeights{1000000, 1000, 1};
+    auto const packed = dss::packVersionComponents(versionText, versionWeights);
+    ASSERT_TRUE(packed.has_value())
+        << versionFile.string() << " holds " << versionText << ": "
+        << (packed ? std::string{} : packed.error());
+
     const std::map<std::string, std::string> want{
-        {"__APPLE_CC__", "6000"},     {"__DSSCP__", "2"},
+        {"__APPLE_CC__", "6000"},     {"__DSSCP__", std::to_string(*packed)},
         {"__GNUC_MINOR__", "2"},      {"__GNUC_PATCHLEVEL__", "1"},
         {"__GNUC__", "4"},            {"__clang__", "1"},
     };
     EXPECT_EQ(got, want)
         << "the TF-C83 identity predefines must carry their clang-MEASURED "
-           "values; __DSSCP__ must be VERSION (0.0.2) packed to 2";
+           "values; __DSSCP__ must be VERSION (" << versionText << ") packed to "
+        << *packed;
     // The GCC_VERSION arithmetic sqliteInt.h actually performs.
     EXPECT_EQ(std::stoll(got.at("__GNUC__")) * 1000000
                   + std::stoll(got.at("__GNUC_MINOR__")) * 1000
@@ -5832,12 +5910,20 @@ TEST(Preprocessor, FC15ObjectLikeDanglingPasteFailsLoud) {
 // global tokenize. Two symptoms, both closed:
 //   P0016 -- a quote-`#include` inside `#if 0`/`#if SQLITE_OS_WIN` is no longer
 //            resolved (a missing dead-branch header no longer errors);
-//   P000E -- a `P_IllegalChar` (`$ @ ``) inside a DEAD branch is suppressed,
-//            while an ACTIVE one (a live body, a `#define`/`#if` line, a
-//            `#`-stringized arg, an uninvoked live macro body) STILL reports
-//            (the FIX-1 dead-region oracle keys on the source BYTE's liveness).
+//   P000E -- a `P_IllegalChar` (`@ ``) inside a DEAD branch is suppressed,
+//            while one that is CONVERTED (a live body, an evaluated `#if`
+//            operand, the use of a macro whose body holds it) STILL reports.
+//            ⚠ This header used to add "a `#define` line, a `#`-stringized
+//            arg, an uninvoked live macro body" to the reporting list — the
+//            byte-liveness oracle. ✔REFUTED 2026-09-22 by all four references;
+//            see (4b)–(4d) and
+//            [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]].
 // Every assertion is RED-ON-DISABLE. The completeness pins (tests 2/4/4b/6)
 // prove the fix did not over-suppress.
+// ⓘ `$` left every stray-character witness below when it became an identifier
+// character ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]): a LIVE `$` is a name now and
+// reports nothing, so a pin that expected it to report would red for the wrong
+// reason, and a DEAD one would prove nothing.
 // ============================================================================
 
 // (1) P0016 core: a quote-`#include` of a NONEXISTENT header inside `#if 0` is
@@ -5868,12 +5954,12 @@ TEST(Preprocessor, LiveBranchQuoteIncludeStillErrorsLoud) {
         << "a LIVE-branch missing quote-#include must STILL fail loud";
 }
 
-// (3) P000E core: illegal characters (`$ @ ``) inside `#if 0` are suppressed.
+// (3) P000E core: illegal characters (`@ ``) inside `#if 0` are suppressed.
 // RED-ON-DISABLE: dropping the dead-region promotion (forwarding every
-// provisional P_IllegalChar unconditionally) re-errors the dead `$`/`@`.
+// provisional P_IllegalChar unconditionally) re-errors the dead `@`/`` ` ``.
 TEST(Preprocessor, DeadBranchIllegalCharDoesNotError) {
     PreprocessResult r;
-    auto lexs = ppLexemes("#if 0\n$ @ `\n#endif\nint x;\n", r);
+    auto lexs = ppLexemes("#if 0\n@ `\n#endif\nint x;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "illegal chars inside #if 0 must be elided (no P_IllegalChar)";
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
@@ -5887,64 +5973,84 @@ TEST(Preprocessor, DeadBranchIllegalCharDoesNotError) {
 // bytes) would silence this.
 TEST(Preprocessor, ActiveIllegalCharStillErrorsLoud) {
     PreprocessResult r;
-    (void)ppLexemes("#if 1\n$\n#endif\nint x;\n", r);
+    (void)ppLexemes("#if 1\n@\n#endif\nint x;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "a LIVE-branch illegal char must STILL fail loud";
 }
 
-// (4b) ★ FIX-1 PROOF (the dead-region oracle, NOT the survival oracle): an
-// illegal char on an ACTIVE `#define` LINE still errors. The `$` is consumed by
-// the directive line (it never survives into the final token stream), so the
-// REJECTED "Error token survived" oracle would WRONGLY drop it. The dead-region
-// oracle reports it because its source byte is in a LIVE region.
-// RED-ON-DISABLE: switching the promotion to the survival oracle drops this.
-TEST(Preprocessor, ActiveIllegalCharOnDefineLineStillErrors) {
-    PreprocessResult r;
-    (void)ppLexemes("#define A 1 $\nint x;\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char on an ACTIVE #define line must STILL error (it is "
-           "consumed by the directive, so only the BYTE-liveness oracle catches "
-           "it -- the survival oracle would wrongly drop it)";
+// ── (4b)–(4d): A TOKEN NOBODY CONVERTS IS NOT JUDGED, WHEREVER IT SITS ──────
+//
+// [[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]]. These three
+// pins used to assert the OPPOSITE, as "an explicit, asserted choice": a stray
+// character on a live `#define` line, in a stringized argument or in an
+// uninvoked macro body errored, because the gate keyed on the byte's LIVENESS
+// and rejected the "did the token reach the parser" oracle as one that would
+// "wrongly drop" them. ✔MEASURED 2026-09-22, one TU per shape, gcc 13.3.0 and
+// clang 18.1.3 (WSL, `-std=c2x -fsyntax-only`), MinGW gcc (`-std=c2x -c`), MSVC
+// VS 18 (`cl /std:clatest /c`):
+//
+//   | shape                                        | gcc | clang | MinGW | MSVC |
+//   |----------------------------------------------|-----|-------|-------|------|
+//   | `#define X @` never used                     | rc0 | rc0   | rc0   | rc0  |
+//   | `#define S(x) #x` + `S(@)`                   | rc0 | rc0   | rc0   | rc0  |
+//   | `#warning an @ sign`                         | rc0 | rc0   | rc0   | rc0  |
+//   | `#define X @` + `X;` (the token IS converted) | rc1 | rc1   | rc1   | rc2  |
+//   | (the three pins' own `$` shapes)             | rc0 | rc0   | rc0   | rc0  |
+//
+// EVERY reference accepts what these pins refused, and refuses exactly the one
+// shape whose token reaches phase 7. So the gate delivers a conversion
+// diagnostic only for a token that was CONVERTED — one that reached the parser
+// (as itself or as a macro-expansion copy) or sat in an evaluated `#if`/`#elif`
+// operand. ⓘ The witnesses use `@`, not the pins' old `$`: in the same change `$`
+// became an identifier character (C23 6.4.2.1 implementation-defined; all four
+// references accept it), so it is no longer a stray character at all.
+// (4b) and (4d) carry their own CONVERTED twin, and (4c) the product it must
+// still contain, so a gate that stopped judging anything cannot pass them.
+// RED-ON-DISABLE: put the byte-liveness gate back and each accept arm reds.
+
+// (4b) a live `#define` LINE: its replacement list is converted only where the
+// macro is expanded.
+TEST(Preprocessor, IllegalCharOnALiveDefineLineIsJudgedOnlyWhereExpanded) {
+    PreprocessResult unused;
+    (void)ppLexemes("#define A 1 @\nint x;\n", unused);
+    EXPECT_FALSE(hasPPCode(unused, DiagnosticCode::P_IllegalChar))
+        << "a replacement list nobody expands is never converted";
+    EXPECT_FALSE(unused.diagnostics->hasErrors());
+
+    PreprocessResult used;
+    (void)ppLexemes("#define A 1 @\nint x = A;\n", used);
+    EXPECT_TRUE(hasPPCode(used, DiagnosticCode::P_IllegalChar))
+        << "expanded, the `@` reaches the parser and IS converted";
 }
 
-// (4c) FIX-1 (the `#`-stringize variant): an illegal char in a STRINGIZED macro
-// argument still errors. c declares `#` (HashOp), so `#define S(x) #x` +
-// `S($)` consumes the `$` into a `#`-product string -- the original `$` token
-// does NOT survive, so again only the dead-region (byte-liveness) oracle catches
-// it. RED-ON-DISABLE: the survival oracle drops it. (If `#` were out of c
-// scope this case would be covered generically by the same byte-liveness
-// predicate and could be skipped.)
-TEST(Preprocessor, ActiveIllegalCharInStringizedArgStillErrors) {
+// (4c) a STRINGIZED argument: the `#` product is a string literal; the argument
+// token itself never reaches phase 7.
+TEST(Preprocessor, IllegalCharInAStringizedArgumentIsNotJudged) {
     PreprocessResult r;
-    auto lexs = ppLexemes("#define S(x) #x\nint y = S($);\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char in a (live) #-stringized argument must STILL error";
-    // DISCRIMINATOR vs the survival oracle: the `$` was CONSUMED into the
-    // `#`-stringize product (a `"$"` string literal), so it does NOT survive as a
-    // standalone Error token -- yet P_IllegalChar still fired. That co-occurrence
-    // is what only the byte-liveness oracle (not the survival oracle) achieves.
-    bool stringizedDollarPresent = false;
+    auto lexs = ppLexemes("#define S(x) #x\nchar const *y = S(@);\n", r);
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
+        << "a stringized argument is spelled into a string, never converted";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool stringizedAtPresent = false;
     for (auto const& s : lexs) {
-        if (s.find('$') != std::string::npos) stringizedDollarPresent = true;
+        if (s.find('@') != std::string::npos) stringizedAtPresent = true;
     }
-    EXPECT_TRUE(stringizedDollarPresent)
-        << "the `$` must appear inside the #-stringized product (proving it was "
-           "consumed, not surviving as a token) -- so the survival oracle would "
-           "have seen nothing while the byte-liveness oracle still reports it";
+    EXPECT_TRUE(stringizedAtPresent)
+        << "the `@` must survive INSIDE the stringized product — proving the "
+           "argument was consumed, and that nothing was lost to make this pass";
 }
 
-// (4d) FIX-1 (the uninvoked-live-macro-body variant; an EXPLICIT pinned choice):
-// an illegal char in the replacement of a LIVE-region `#define` that is NEVER
-// invoked STILL errors. The `$` byte is in a live region (the `#define` line),
-// so the byte-liveness oracle reports it -- matching today's behavior (the
-// tokenizer sees every byte of the synth buffer). RED-ON-DISABLE: the survival
-// oracle would drop it (an uninvoked macro body never reaches finalTokens).
-TEST(Preprocessor, ActiveUninvokedMacroBodyIllegalCharStillErrors) {
-    PreprocessResult r;
-    (void)ppLexemes("#define M $\nint x;\n", r);
-    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char in an uninvoked LIVE macro body still errors (its "
-           "byte is in a live region) -- an explicit, asserted choice";
+// (4d) an UNINVOKED macro body, and its invoked twin.
+TEST(Preprocessor, IllegalCharInAnUninvokedMacroBodyIsNotJudged) {
+    PreprocessResult unused;
+    (void)ppLexemes("#define M @\nint x;\n", unused);
+    EXPECT_FALSE(hasPPCode(unused, DiagnosticCode::P_IllegalChar))
+        << "an uninvoked macro body is never converted";
+
+    PreprocessResult used;
+    (void)ppLexemes("#define M @\nint x = M;\n", used);
+    EXPECT_TRUE(hasPPCode(used, DiagnosticCode::P_IllegalChar))
+        << "invoked, the body's `@` is converted where it lands";
 }
 
 // (5) P0016 via `#ifdef`: a quote-`#include` guarded by `#ifdef SQLITE_OS_WIN`
@@ -6294,8 +6400,8 @@ TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
     auto out = preprocess(buf, schema, includeDirs, dss::kDefaultHeaderNameMatching, DiagnosticBudget::libraryDefault(), {}, std::nullopt, defines);
     EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
         << "the command-line define seed must thread into the child builder so "
-           "outer.h's own #ifdef GATE-gated include is LIVE (D-PP-PRESCAN-"
-           "DEFINEDNESS-PARITY child-threading)";
+           "outer.h's own #ifdef GATE-gated include is LIVE ("
+           "D-PP-PRESCAN-DEFINEDNESS-PARITY child-threading)";
     fs::remove_all(dir, ec);
 }
 
@@ -6574,8 +6680,8 @@ TEST(Preprocessor, AngleShippedMacroSplicesUnderQuoteIncludeGatedIf) {
     }
     EXPECT_TRUE(has777)
         << "the shipped object-macro must inject+expand under a quote-include-gated "
-           "#if the pre-scan is blind to (D-PP-PRESCAN-ANGLE-MACRO-SPLICE-"
-           "AUTHORITATIVE-LIVENESS)";
+           "#if the pre-scan is blind to ("
+           "D-PP-PRESCAN-ANGLE-MACRO-SPLICE-AUTHORITATIVE-LIVENESS)";
     EXPECT_FALSE(hasBareMac) << "SHIPPED_MAC must not survive the parser boundary "
                                "unexpanded";
     fs::remove_all(sysdir, ec);
@@ -6797,13 +6903,13 @@ TEST(Preprocessor, DeadBranchIncludeSkipIsConfigDrivenNotHardcoded) {
 }
 
 // A `#if 0` block combining ALL c17 symptoms (the corpus pattern in unit form):
-// illegal chars `$ @ ``, a quote-`#include` of a missing header, AND a nested
+// illegal chars `@ ``, a quote-`#include` of a missing header, AND a nested
 // `#ifdef SQLITE_OS_WIN #include` -- the whole group elides cleanly.
 TEST(Preprocessor, DeadBranchCombinedGarbageAndIncludeElides) {
     PreprocessResult r;
     auto lexs = ppLexemes(
         "#if 0\n"
-        "$ @ `\n"
+        "@ `\n"
         "#include \"does_not_exist.h\"\n"
         "#ifdef SQLITE_OS_WIN\n"
         "#include \"os_win.h\"\n"
@@ -6824,11 +6930,11 @@ TEST(Preprocessor, DeadBranchCombinedGarbageAndIncludeElides) {
 // that is ENCLOSED by a dead `#if 0` must still be suppressed (the inner branch
 // is dead because its enclosing context is dead). RED-ON-DISABLE: a per-frame
 // (rather than whole-stack) dead test would wrongly treat the inner #else as
-// live and re-error the `$`.
+// live and re-error the `@`.
 TEST(Preprocessor, NestedDeadBranchIllegalCharSuppressed) {
     PreprocessResult r;
     auto lexs = ppLexemes(
-        "#if 0\n#if 1\n$\n#else\n@\n#endif\n#endif\nint x;\n", r);
+        "#if 0\n#if 1\n@\n#else\n`\n#endif\n#endif\nint x;\n", r);
     EXPECT_FALSE(r.diagnostics->hasErrors())
         << "illegal chars in a dead-enclosed nested conditional must be elided";
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar));
@@ -6838,22 +6944,22 @@ TEST(Preprocessor, NestedDeadBranchIllegalCharSuppressed) {
 
 // The LIVE arm of a conditional keeps its illegal char an ERROR while the DEAD
 // arm's is suppressed -- the two arms are treated independently by byte. `#if 1`
-// -> `$` in the then-arm errors; the `#else` `@` is dead + suppressed.
+// -> `@` in the then-arm errors; the `#else` `` ` `` is dead + suppressed.
 TEST(Preprocessor, LiveArmErrorsDeadArmSuppressedInSameGroup) {
     PreprocessResult r;
-    (void)ppLexemes("#if 1\n$\n#else\n@\n#endif\nint x;\n", r);
-    // Exactly the live `$` reports; the dead `@` does not. We assert at least
+    (void)ppLexemes("#if 1\n@\n#else\n`\n#endif\nint x;\n", r);
+    // Exactly the live `@` reports; the dead `` ` `` does not. We assert at least
     // the live one fires AND that suppression did not silence it.
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "the LIVE arm's illegal char must report";
-    // Count: there must be exactly ONE illegal-char diagnostic (the live `$`),
-    // proving the dead `@` was suppressed (not 2).
+    // Count: there must be exactly ONE illegal-char diagnostic (the live `@`),
+    // proving the dead `` ` `` was suppressed (not 2).
     int illegalCount = 0;
     for (auto const& d : r.diagnostics->all()) {
         if (d.code == DiagnosticCode::P_IllegalChar) ++illegalCount;
     }
     EXPECT_EQ(illegalCount, 1)
-        << "exactly the LIVE `$` reports; the DEAD `@` is suppressed";
+        << "exactly the LIVE `@` reports; the DEAD `` ` `` is suppressed";
 }
 
 // ============================================================================
@@ -6867,23 +6973,26 @@ TEST(Preprocessor, LiveArmErrorsDeadArmSuppressedInSameGroup) {
 // ★ THE PROVEN c17 SILENT MISCOMPILE, now fixed. `#if __STDC__` is a PREDEFINED-
 // macro guard: the SynthBuilder pre-scan never sees predefined macros, so it
 // folds `__STDC__` -> 0 and calls the branch DEAD -- but the real macro pass
-// materializes `__STDC__` = 1, so the branch is LIVE. A `$` on the live `#define`
-// line is CONSUMED by the directive (it reaches no token stream), so ONLY a
-// byte-liveness oracle keyed on the AUTHORITATIVE pass can catch it. Before
-// Option 1 (the pre-scan dead-region oracle) this compiled SILENTLY. RED-ON-
-// DISABLE: revert the oracle to the pre-scan's `deadRegions` and this `$` is
-// silently dropped again (verified: the pre-scan records the whole `#if __STDC__`
-// body as dead).
+// materializes `__STDC__` = 1, so the branch is LIVE, and a stray character in it
+// must be judged. RED-ON-DISABLE: key the gate on the pre-scan's liveness and
+// this `@` is silently dropped again (verified: the pre-scan records the whole
+// `#if __STDC__` body as dead).
+// ⚠ THE WITNESS MOVED, THE PIN DID NOT. It used to be a `$` on an UNUSED
+// `#define` line inside the branch — a token no phase converts, which every
+// reference accepts ([[D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED]];
+// and `$` is an identifier character since the same change). The live branch's
+// `@` below reaches the parser, so only a gate that knows the branch is LIVE —
+// the authoritative pass, whose output stream the gate reads — reports it.
 TEST(Preprocessor, PredefinedMacroGuardedLiveIllegalCharStillErrors) {
     PreprocessResult r;
     auto lexs = ppLexemes(
-        "#if __STDC__\n#define UNUSED_MACRO $\nint live_in_stdc_branch;\n"
+        "#if __STDC__\n#define USED_MACRO @\nint live_in_stdc_branch = USED_MACRO;\n"
         "#endif\nint x;\n",
         r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "an illegal char in a PREDEFINED-macro-guarded LIVE branch (consumed "
-           "by a #define line) must STILL fail loud -- the AUTHORITATIVE oracle "
-           "catches it where the pre-scan oracle silently dropped it";
+        << "an illegal char in a PREDEFINED-macro-guarded LIVE branch must STILL "
+           "fail loud -- the AUTHORITATIVE pass passes it to the parser, where "
+           "the pre-scan oracle silently dropped it";
     // GUARD AGAINST FALSE GREEN: prove `#if __STDC__` is genuinely LIVE here, so
     // the assertion above can't pass for the WRONG reason (the branch going dead).
     // The live-branch declaration must survive into the token stream.
@@ -6899,11 +7008,11 @@ TEST(Preprocessor, PredefinedMacroGuardedLiveIllegalCharStillErrors) {
 
 // An UNTERMINATED dead `#if 0` (no `#endif`): the dead illegal chars up to EOF
 // are suppressed (no double-report), but the missing-`#endif` STILL fails loud.
-// RED-ON-DISABLE: dropping the EOF dead-span close re-errors the dead `$`/`@`/`` ` ``;
+// RED-ON-DISABLE: dropping the EOF dead-span close re-errors the dead `@`/`` ` ``;
 // dropping the unterminated-conditional check silences the structural error.
 TEST(Preprocessor, UnterminatedDeadBranchSuppressesCharsButErrorsUnterminated) {
     PreprocessResult r;
-    (void)ppLexemes("#if 0\n$ @ `\n", r);
+    (void)ppLexemes("#if 0\n@ `\n", r);
     EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
         << "illegal chars in an unterminated dead `#if 0` must be suppressed (the "
            "EOF dead-span close covers them)";
@@ -6911,21 +7020,21 @@ TEST(Preprocessor, UnterminatedDeadBranchSuppressesCharsButErrorsUnterminated) {
         << "the unterminated conditional (missing #endif) must STILL fail loud";
 }
 
-// A LIVE-outer / DEAD-inner nest: `#if 1 { $ } #if 0 { @ }`. The authoritative
+// A LIVE-outer / DEAD-inner nest: `#if 1 { @ } #if 0 { ` }`. The authoritative
 // recorder must open a dead range ONLY for the inner dead group -- the live-outer
-// `$` is in NO dead range and must report. RED-ON-DISABLE: a per-frame (not
-// whole-stack) or sloppy boundary recorder swallows the live `$`.
+// `@` is in NO dead range and must report. RED-ON-DISABLE: a per-frame (not
+// whole-stack) or sloppy boundary recorder swallows the live `@`.
 TEST(Preprocessor, LiveOuterDeadInnerNestReportsLiveSuppressesInner) {
     PreprocessResult r;
-    (void)ppLexemes("#if 1\n$\n#if 0\n@\n#endif\n#endif\nint x;\n", r);
+    (void)ppLexemes("#if 1\n@\n#if 0\n`\n#endif\n#endif\nint x;\n", r);
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "the LIVE-outer `$` must report";
+        << "the LIVE-outer `@` must report";
     int illegalCount = 0;
     for (auto const& d : r.diagnostics->all()) {
         if (d.code == DiagnosticCode::P_IllegalChar) ++illegalCount;
     }
     EXPECT_EQ(illegalCount, 1)
-        << "exactly the live-outer `$` reports; the dead-inner `@` is suppressed";
+        << "exactly the live-outer `@` reports; the dead-inner `` ` `` is suppressed";
 }
 
 // (FIX-3, the nullopt arm) a guard the pre-scan cannot evaluate as an ICE (an
@@ -6943,9 +7052,9 @@ TEST(Preprocessor, UnevaluableGuardSkipsIncludeConservatively) {
 
 // AGNOSTICISM (RED-ON-DISABLE), the `#endif` word: the dead-region CLOSE boundary
 // reads `endifDirective` from config, not a hard-coded "endif". Rebind it to
-// "endwhile": after `#endwhile` the `#if 0` reactivates, so a following `$` is
+// "endwhile": after `#endwhile` the `#if 0` reactivates, so a following `@` is
 // LIVE and must report. RED-ON-DISABLE: hard-coding "endif" leaves `#endwhile`
-// unrecognized -> the `#if 0` stays open -> the live `$` is wrongly suppressed.
+// unrecognized -> the `#if 0` stays open -> the live `@` is wrongly suppressed.
 TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
     namespace fs = std::filesystem;
     std::vector<fs::path> noDirs;
@@ -6956,10 +7065,10 @@ TEST(Preprocessor, DeadRegionCloseUsesConfigEndifWordNotHardcoded) {
     ASSERT_EQ(schema->preprocess().endifDirective, "endwhile");
 
     auto buf = SourceBuffer::fromString(
-        std::string{"#if 0\n#endwhile\n$\nint x;\n"}, "main.c");
+        std::string{"#if 0\n#endwhile\n@\nint x;\n"}, "main.c");
     PreprocessResult r = preprocess(buf, schema, noDirs, dss::kDefaultHeaderNameMatching, DiagnosticBudget::libraryDefault());
     EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_IllegalChar))
-        << "the dead-region close must use the CONFIG `#endwhile`, so the `$` "
+        << "the dead-region close must use the CONFIG `#endwhile`, so the `@` "
            "AFTER it is LIVE and reports -- not a hard-coded `#endif`";
 }
 
@@ -8656,9 +8765,17 @@ TEST(Preprocessor, EmbedParametersLoaderRefusesMalformedBlocks) {
 }
 
 // C23 6.10.4.1p6: the embed element width is CHAR_BIT. `CHAR_BIT` has exactly
-// ONE owner in this tree (`shippedLibs/limits.json`) and the width is an engine
-// constant rather than a second declaration of it -- this pin is the coupling
-// made visible: it goes red the day either side moves.
+// ONE owner in this tree and the width is an engine constant rather than a
+// second declaration of it -- this pin is the coupling made visible: it goes red
+// the day either side moves.
+//
+// ★ P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): THAT OWNER IS
+// NOW THE LATTICE. `limits.json`'s CHAR_BIT no longer states `8`; it is the row
+// `{ "of": "char", "limit": "width" }`, realized per pair from the language's
+// `char`. So this pin no longer reads a `value` out of the JSON text (there is
+// none to read) — it asks the REAL descriptor reader to realize CHAR_BIT under
+// every data model and both plain-`char` signednesses, which is every pair the
+// lattice can describe, and requires each answer to be the embed width.
 //
 // ⚠ SAY WHAT `kEmbedElementWidthBits` IS: a TRIPWIRE ANCHOR, not a width
 // parameter. ✔MEASURED -- no engine site reads its VALUE to decide anything; the
@@ -8666,40 +8783,37 @@ TEST(Preprocessor, EmbedParametersLoaderRefusesMalformedBlocks) {
 // in `handleEmbed`'s splice loop (which spells one byte per element), and a
 // `static_assert` at that loop refuses to compile if the constant ever moves off
 // 8. So this pin is the OTHER half of the tripwire — the half that watches
-// `limits.json` — and neither half claims the constant is a knob.
+// CHAR_BIT's owner — and neither half claims the constant is a knob.
 TEST(Preprocessor, EmbedElementWidthIsTheOneCharBitOwner) {
     auto const root = dss::test::findConfigRoot();
     ASSERT_TRUE(root.has_value()) << dss::test::configRootDiagnostic();
-    std::ifstream in(*root / "shippedLibs" / "limits.json", std::ios::binary);
-    ASSERT_TRUE(in.is_open());
-    std::string const text{std::istreambuf_iterator<char>(in),
-                           std::istreambuf_iterator<char>()};
-    // ⚠ THE SEARCH IS BOUNDED TO CHAR_BIT'S OWN OBJECT, AND THAT IS THE WHOLE
-    // POINT OF THIS BLOCK. An unbounded `find("\"value\":", name)` reads the
-    // NEXT constant's value the day CHAR_BIT's row loses or renames the field --
-    // and SCHAR_MIN's -128 or SCHAR_MAX's 127 is not 8, so it would go red...
-    // unless the next row happened to hold an 8, in which case the pin passes
-    // while measuring the wrong macro. An instrument that can fail toward CLEAN
-    // is not an instrument: every step below refuses instead of guessing.
-    auto const constants = text.find("\"constants\"");
-    ASSERT_NE(constants, std::string::npos)
-        << "limits.json no longer has a `constants` array";
-    auto const name = text.find("\"CHAR_BIT\"", constants);
-    ASSERT_NE(name, std::string::npos) << "limits.json no longer declares CHAR_BIT";
-    auto const rowEnd = text.find('}', name);
-    ASSERT_NE(rowEnd, std::string::npos) << "CHAR_BIT's row is unterminated";
-    auto const value = text.find("\"value\":", name);
-    ASSERT_NE(value, std::string::npos);
-    ASSERT_LT(value, rowEnd)
-        << "CHAR_BIT's OWN row no longer carries a `value` field -- this pin "
-           "would otherwise have read the next constant's";
-    char const* const digits = text.c_str() + value + std::string{"\"value\":"}.size();
-    char*             parsed = nullptr;
-    std::uint64_t const charBit = std::strtoull(digits, &parsed, 10);
-    ASSERT_NE(parsed, digits) << "CHAR_BIT's `value` is not a decimal number";
-    EXPECT_EQ(charBit, kEmbedElementWidthBits)
-        << "the resource reader yields octets; a target with another CHAR_BIT "
-           "needs another reader, not a config knob";
+    auto const limits = *root / "shippedLibs" / "limits.json";
+    std::size_t pairs = 0;
+    for (auto const& [model, modelName] : kDataModelTable.rows) {
+        for (bool const charIsUnsigned : {false, true}) {
+            SCOPED_TRACE(std::string{modelName}
+                         + (charIsUnsigned ? " / unsigned char" : " / signed char"));
+            ffi::ShippedPairFacts const pair{cSubset().get(), model, charIsUnsigned};
+            DiagnosticReporter rep;
+            auto const consts = ffi::readShippedLibConstants(
+                limits, rep, std::nullopt, std::nullopt, &pair);
+            ASSERT_TRUE(consts.has_value())
+                << "limits.json no longer reads: "
+                << (rep.all().empty() ? std::string{"<no diagnostic>"}
+                                      : rep.all().front().actual);
+            std::size_t seen = 0;
+            for (auto const& k : *consts) {
+                if (k.name != "CHAR_BIT") continue;
+                ++seen;
+                EXPECT_EQ(static_cast<std::uint64_t>(k.value), kEmbedElementWidthBits)
+                    << "the resource reader yields octets; a target with another "
+                       "CHAR_BIT needs another reader, not a config knob";
+            }
+            EXPECT_EQ(seen, 1u) << "limits.json must realize CHAR_BIT exactly once";
+            ++pairs;
+        }
+    }
+    EXPECT_EQ(pairs, 2u * kDataModelTable.rows.size());
     EXPECT_EQ(embedResourceWidthBytes(8, std::nullopt), 8u);
     EXPECT_EQ(embedResourceWidthBytes(8, 3), 3u);
     EXPECT_EQ(embedResourceWidthBytes(8, 100), 8u);
@@ -9012,7 +9126,7 @@ TEST(Preprocessor, FC179HasEmbedPreScanParityGatesQuoteInclude) {
     std::error_code ec; fsemb::remove_all(dir, ec);
 }
 
-// D-PERF-1 (macro-pass O(n^2) -> O(n)) EFFECTIVENESS PIN. The macro expander
+// D-PERF-1-PREPROCESSOR (macro-pass O(n^2) -> O(n)) EFFECTIVENESS PIN. The macro expander
 // consumes its stream from a FRONT-CONSUMED deque and splices only at the front,
 // so the TOTAL splice-work (`PreprocessResult::macroTokenMoves`, summing
 // `consumed + produced` over every `spliceOver`) is LINEAR in the invocation
@@ -9046,10 +9160,11 @@ TEST(Preprocessor, DPerf1MacroPassTokenMovesStayLinear) {
     // The load-bearing assertion: EXACTLY 2 front-splice token-moves per object-
     // like expansion (pop the name `A`, push its replacement `1`) -> 2*N total,
     // LINEAR in N. The exact count is the strongest provable property here.
-    // RED-ON-DISABLE: `tokenMoves_` is intrinsic to the D-PERF-1 deque splice;
-    // reverting `spliceOver` to the pre-D-PERF-1 `std::vector` erase+insert removes
-    // it (the counter lives inside the deque splice), so macroTokenMoves -> 0 and
-    // this EQ fails (0 != 2*N). A logical op-counter
+    // RED-ON-DISABLE: `tokenMoves_` is intrinsic to the deque splice
+    // (D-PERF-1-PREPROCESSOR); reverting `spliceOver` to the `std::vector`
+    // erase+insert it replaced removes it (the counter lives inside the deque
+    // splice), so macroTokenMoves -> 0 and this EQ fails (0 != 2*N). A logical
+    // op-counter
     // cannot by itself distinguish the deque's O(n) front-splice from a
     // same-formula vector mid-splice; the PHYSICAL O(n^2)->O(n) tail-shift win is
     // proven separately by the sqlite `preprocess-expand` phase re-measure
@@ -10938,18 +11053,14 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
                "are UNGATED, so they appear on macho alongside the Apple-only "
                "identity pair; `__BIG_ENDIAN__` must appear on NO leg";
     }
-    // arm64 on ELF: the Apple-only pair is GONE, and `__CHAR_UNSIGNED__`
-    // APPEARS — the two gates point in OPPOSITE directions on the same target,
-    // which is the whole reason the gate is per-entry.
+    // arm64 on ELF: the Apple-only pair is GONE.
     //
-    // ★ `__CHAR_UNSIGNED__` is not an identity spelling: it is the
-    // PREPROCESSOR-VISIBLE face of the target's `charIsUnsigned` key
-    // (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM), whose `default` is `true` and
-    // whose macho/pe overrides are `false`. So it must be defined on exactly
-    // the leg where the default is the effective answer. MEASURED 2026-07-28
-    // with `/usr/bin/clang -dM -E -x c /dev/null -target <triple>` (Apple clang
-    // 21.0.0): DEFINED for aarch64-linux-gnu; NOT defined for
-    // arm64-apple-darwin, x86_64-unknown-linux-gnu or x86_64-pc-windows-msvc.
+    // ★ P68 round 9: `__CHAR_UNSIGNED__` is no longer in the TARGET half. It
+    // was a target row gated `["elf"]` by hand — the preprocessor face of the
+    // target's `charIsUnsigned` in a second notation — and is now the
+    // LANGUAGE's `type-unsigned` row naming `char`, realized per pair from that
+    // key (defined on arm64 × elf alone; pinned per pair by
+    // test_type_unsigned_predefines, against gcc/clang `-dM`).
     {
         auto m = mergePredefinedMacros((*c)->preprocess().predefinedMacros,
                                        (*arm)->predefinedMacros(), {},
@@ -10958,16 +11069,13 @@ TEST(Preprocessor, TFC74EffectiveArchPredefinesForShippedTargets) {
         EXPECT_EQ(namesOfTargetHalf(m, langSurviving(ObjectFormatKind::Elf)),
                   (std::vector<std::string>{"__ARM_ARCH_ISA_A64",
                                             "__BYTE_ORDER__",
-                                            "__CHAR_UNSIGNED__",
                                             "__LITTLE_ENDIAN__",
                                             "__aarch64__"}))
             << "`__arm64__`/`__arm64` are Apple-only and must NOT leak onto "
-               "ELF, while `__CHAR_UNSIGNED__` is ELF-only and MUST appear "
-               "there — it is the preprocessor face of the target's "
-               "`charIsUnsigned` default, which macho/pe override to signed. "
-               "TF-C115: the two endianness rows are UNGATED and therefore "
-               "appear on BOTH legs — the negative that matters is "
-               "`__BIG_ENDIAN__`, which appears on none";
+               "ELF; `__CHAR_UNSIGNED__` is the language's type-unsigned row "
+               "now, not the target's. TF-C115: the two endianness rows are "
+               "UNGATED and therefore appear on BOTH legs — the negative that "
+               "matters is `__BIG_ENDIAN__`, which appears on none";
     }
     // x86_64: the same four spellings on every format.
     for (ObjectFormatKind fmt : {ObjectFormatKind::Elf, ObjectFormatKind::MachO,
@@ -11073,10 +11181,10 @@ TEST(Preprocessor, TFC115EndiannessPredefinesCrossLayerCoherence) {
 // engine's own notion of the set.
 namespace {
 [[nodiscard]] std::vector<std::string> tfc86DeclaredOperators() {
-    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: NAME the owning handle. The
-    // one-liner `auto const& pp = cSubset()->preprocess();` binds a reference
-    // INTO a schema owned only by a temporary `shared_ptr`, which dies at the
-    // end of that full-expression -> `pp` dangles for every read below.
+    // NAME the owning handle. The one-liner
+    // `auto const& pp = cSubset()->preprocess();` binds a reference INTO a
+    // schema owned only by a temporary `shared_ptr`, which dies at the end of
+    // that full-expression -> `pp` dangles for every read below.
     auto schema = cSubset();
     auto const& pp = schema->preprocess();
     std::vector<std::string> names;
@@ -11177,8 +11285,8 @@ TEST(Preprocessor, TFC86ConditionalInclusionOperatorsAreDefinedInElifdefForms) {
 // reds. Without this test an over-broad predicate would pass every assertion
 // above while quietly changing what `#ifdef defined` means.
 TEST(Preprocessor, TFC86DefinedOperatorItselfIsNotADefinedName) {
-    // D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE: see the note in
-    // `tfc86DeclaredOperators` — the owning handle must outlive `pp`.
+    // See the note in `tfc86DeclaredOperators` — the owning handle must
+    // outlive `pp`.
     auto schema = cSubset();
     auto const& pp = schema->preprocess();
     ASSERT_FALSE(pp.definedOperator.empty());
@@ -15136,6 +15244,163 @@ TEST(PreprocessorIfIntmax, TheImplicitlyUnsignedWarningIsAbsentWhereBothReferenc
         EXPECT_EQ(ppTakenArm("42 > 0", r), "taken_if");
         EXPECT_FALSE(hasPPCode(
             r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+}
+
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): A SIZED LITERAL IN
+//    #if IS REDUCED TO ITS TYPE FIRST, THEN READ AT INTMAX WIDTH ─────────────────
+//
+// MSVC's sized suffixes fix the literal's type; in phase 4 the literal is reduced
+// to that type and only then widened with the type's own signedness. ✔MEASURED
+// 2026-09-25, MSVC 19.51.36260 (`dssharness run probe-reference-cc --legs
+// windows-x86_64-release`, run 20260925-092749-73db8424), IDENTICALLY under its
+// conforming preprocessor (`/std:c17`), its traditional one (`/std:c17
+// /Zc:preprocessor-`), the default mode and `/std:clatest` — every arm below is
+// MSVC's. gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc refuse the spellings, so MSVC
+// is the only witness. Each case writes both arms and asserts WHICH survived.
+namespace {
+
+// The arm `cond` selects when the preprocessor is told plain `char`'s signedness
+// (`charIsUnsigned`; nullopt = no target), plus whether the run REFUSED.
+struct SizedIfArm { std::string arm; bool refused; };
+[[nodiscard]] SizedIfArm sizedIfArm(std::string const& cond,
+                                    std::optional<bool> charIsUnsigned) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        "#if " + cond + "\nint taken_if;\n#else\nint taken_else;\n#endif\n", "main.c");
+    PreprocessResult r = preprocess(
+        buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+        DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+        charIsUnsigned);
+    bool sawIf = false, sawElse = false;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        std::string_view const lex = r.synthBuffer->slice(t.span);
+        sawIf   = sawIf   || lex == "taken_if";
+        sawElse = sawElse || lex == "taken_else";
+    }
+    std::string arm = sawIf && sawElse ? "BOTH" : sawIf ? "taken_if"
+                    : sawElse ? "taken_else" : "NEITHER";
+    return {std::move(arm), hasPPCode(r, DiagnosticCode::P_PreprocessorDirective)};
+}
+
+}  // namespace
+
+TEST(PreprocessorIfSizedSuffix, TheValueIsReducedToTheFixedTypeFirst) {
+    struct Row { char const* cond; char const* arm; };
+    static constexpr Row kRows[] = {
+        {"5i64 == 5",                          "taken_if"},
+        {"300i8 == 44",                        "taken_if"},
+        {"300i8 == 300",                       "taken_else"},
+        {"128i8 < 0",                          "taken_if"},
+        {"0xFFi8 == -1",                       "taken_if"},
+        {"256ui8 == 0",                        "taken_if"},
+        {"4294967296i32 == 0",                 "taken_if"},
+        {"2147483648i32 < 0",                  "taken_if"},
+        {"0xFFFFFFFFi32 == -1",                "taken_if"},
+        {"0x80i8 == -128",                     "taken_if"},
+        {"65536i16 == 0",                      "taken_if"},
+        {"0xFFFFFFFFFFFFFFFFi64 < 0",          "taken_if"},
+        {"(1i64 << 40) == 1099511627776",      "taken_if"},
+    };
+    for (auto const& row : kRows) {
+        // x86_64 and every Windows pair: plain `char` is SIGNED, as it is for MSVC.
+        auto const got = sizedIfArm(row.cond, /*charIsUnsigned=*/false);
+        EXPECT_FALSE(got.refused) << row.cond;
+        EXPECT_EQ(got.arm, row.arm) << row.cond;
+    }
+}
+
+TEST(PreprocessorIfSizedSuffix, TheUnsignedFormsReadAsUintmax) {
+    // `5ui8 - 6` is UINTMAX_MAX, not -1: the `ui` types are unsigned, and phase 4
+    // keeps the sign of the literal's TYPE. The signed forms beside them are the
+    // control that the sign is read, not assumed.
+    struct Row { char const* cond; char const* arm; };
+    static constexpr Row kRows[] = {
+        {"5ui8 - 6 < 0",           "taken_else"},
+        {"5ui16 - 6 < 0",          "taken_else"},
+        {"5ui32 - 6 < 0",          "taken_else"},
+        {"5ui64 - 6 < 0",          "taken_else"},
+        {"-1 < 0ui8",              "taken_else"},
+        {"0xFFFFFFFFui32 > -1",    "taken_else"},
+        {"0xFFFFFFFFFFFFFFFFui64 > 0", "taken_if"},
+        {"5i8 - 6 < 0",            "taken_if"},
+        {"5i32 - 6 < 0",           "taken_if"},
+    };
+    for (auto const& row : kRows) {
+        auto const got = sizedIfArm(row.cond, /*charIsUnsigned=*/false);
+        EXPECT_FALSE(got.refused) << row.cond;
+        EXPECT_EQ(got.arm, row.arm) << row.cond;
+    }
+}
+
+TEST(PreprocessorIfSizedSuffix, AnI8LiteralTakesTheTargetsCharSignedness) {
+    // `i8` is plain `char`. On a signed-char pair `128i8` is -128; on the
+    // unsigned-char pair DSS ships (arm64 × ELF) it is +128 and UNSIGNED; with no
+    // pair its reading is the target's to decide, so the fold REFUSES — even for
+    // a byte whose value would not change, because the SIGN still would.
+    EXPECT_EQ(sizedIfArm("128i8 < 0", false).arm, "taken_if");
+    auto const unsignedChar = sizedIfArm("128i8 < 0", true);
+    EXPECT_FALSE(unsignedChar.refused);
+    EXPECT_EQ(unsignedChar.arm, "taken_else");
+    EXPECT_EQ(sizedIfArm("5i8 - 6 < 0", true).arm, "taken_else")
+        << "an unsigned `char` literal reads as uintmax_t in phase 4";
+    // The VALUE, not only the sign: `0xFFi8` is the char 255 where plain `char` is
+    // unsigned and -1 where it is signed. (A sign arm alone cannot tell a byte from
+    // its sign extension once phase 4 reads both as uintmax_t.)
+    EXPECT_EQ(sizedIfArm("0xFFi8 == 255", true).arm, "taken_if");
+    EXPECT_EQ(sizedIfArm("0xFFi8 == -1", false).arm, "taken_if");
+    auto const noTarget = sizedIfArm("5i8 - 6 < 0", std::nullopt);
+    EXPECT_TRUE(noTarget.refused)
+        << "the sign of a `char`-typed literal is the target's; with none, refuse";
+    // A sized literal whose type is NOT plain `char` needs no target at all.
+    auto const shortNoTarget = sizedIfArm("65536i16 == 0", std::nullopt);
+    EXPECT_FALSE(shortNoTarget.refused);
+    EXPECT_EQ(shortNoTarget.arm, "taken_if");
+}
+
+// ── P68 round 13 (D-PP-IF-BIT-PRECISE-LITERAL-READS-UNSIGNED): A BIT-PRECISE
+//    LITERAL KEEPS ITS TYPE'S SIGNEDNESS IN #if ─────────────────────────────────
+//
+// C23 counts the bit-precise types among the signed and unsigned integer types
+// phase 4 widens to intmax_t / uintmax_t, so `wb` is signed there and `uwb`
+// unsigned. ✔MEASURED 2026-09-25, clang 18.1.3 `-std=c23` and `-std=c2x
+// -pedantic-errors` (runs 20260925-095900-8cb95906 and 20260925-102338-6976cc3f);
+// gcc 13.3.0 refuses both spellings. DSS read BOTH as unsigned — the bit-precise
+// rule carries no candidate list, so the phase-4 ladder fell to its closing
+// `unsigned` — and `#if 5wb - 6 < 0` took the `#else` arm in silence.
+TEST(PreprocessorIfBitPrecise, AWbLiteralIsSignedAndAUwbLiteralIsNot) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("5wb - 6 < 0", r), "taken_if")
+        << "`wb` is a SIGNED bit-precise type; 5 - 6 is -1";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppTakenArm("5uwb - 6 < 0", r), "taken_else")
+        << "`uwb` is unsigned; 5 - 6 is UINTMAX_MAX — the control for the arm above";
+    EXPECT_EQ(ppTakenArm("-1 < 0wb", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("-1 < 0uwb", r), "taken_else");
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+TEST(PreprocessorIfBitPrecise, AWbLiteralPastIntmaxMaxReadsUnsignedAndSaysSo) {
+    // clang: `9223372036854775808wb` is 'interpreting as unsigned' with a warning,
+    // the rule an unsuffixed decimal follows; INTMAX_MAX itself stays signed and
+    // silent, and a `uwb` literal is unsigned by its type, so it is never a surprise.
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808wb > 0", r), "taken_if");
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775807wb > -1", r), "taken_if")
+            << "INTMAX_MAX fits a signed intmax_t, so -1 stays -1";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("18446744073709551615uwb > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
     }
 }
 

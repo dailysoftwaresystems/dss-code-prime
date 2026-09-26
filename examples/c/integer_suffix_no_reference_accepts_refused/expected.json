@@ -1,0 +1,17 @@
+{
+  "$comment": "★ INTEGER-SUFFIX SPELLINGS C 6.4.4.1 DOES NOT DEFINE AND NO REFERENCE ACCEPTS. The C language document lists every integer-suffix spelling some reference accepts — ISO C's 22 (`integer_suffix_mixed_case`) and MSVC's ten mixed-case `ll` forms (`integer_suffix_mixed_case_long_long_msvc`); taking a spelling outside both would be an invention above `(gcc ∪ clang ∪ MSVC) ∪ ISO C`. ✔MEASURED 2026-09-24 over every string of `u`, `U`, `l`, `L` up to four letters: gcc 13.3.0 and clang 18.1.3 (`-std=c11 -pedantic-errors` and gcc's default mode), mingw-w64 gcc and MSVC 19.51 (`/std:c17`) accept exactly 22 and 32 of them, and each rejects each spelling here — a doubled `u` (`5uu`), a tripled `l` (`5lll`), a `u` between the two `l`s (`5lul`), a case mix MSVC does not take (`5llL`) and a `u` on both sides (`5uLLu`); all four reject this file ('invalid suffix', MSVC C2059). DSS reports each as its own P_MalformedNumber at its own position. The pin was written in P68 round 11 together with the change that admitted the mixed-case spellings the references do accept, to hold the boundary that change must not cross. ★ RED-ON-DISABLE: list `llL` in the language document and its diagnostic disappears, so the set no longer matches.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "expectDiagnostics": [
+    { "code": "P_MalformedNumber", "line": 14, "col": 24 },
+    { "code": "P_MalformedNumber", "line": 15, "col": 24 },
+    { "code": "P_MalformedNumber", "line": 16, "col": 24 },
+    { "code": "P_MalformedNumber", "line": 17, "col": 24 },
+    { "code": "P_MalformedNumber", "line": 18, "col": 24 },
+    { "code": "D_LaterPhasesNotRun", "line": 0, "col": 0, "positioned": false }
+  ]
+}

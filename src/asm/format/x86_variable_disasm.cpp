@@ -411,10 +411,18 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::Imm32MovzMovk:
                 case EncodingSlotKind::SymbolPatchMarker:
                 case EncodingSlotKind::Imm19:
+                // [[D-CSUBSET-LONG-BRANCH]]: the TBZ/TBNZ imm14 is a
+                // fixed32 bit-window slot, like Imm19.
+                case EncodingSlotKind::Imm14:
                 // D-ASM-ARM64-NEGATIVE-IMMEDIATE-UNENCODABLE: the
                 // inverted-imm16 (complement-immediate) slot is fixed32,
                 // like Imm16 whose window it shares.
                 case EncodingSlotKind::Imm16Inverted:
+                // P68 round 8: the AdvSIMD element `imm5`, a fixed32 field.
+                case EncodingSlotKind::ElementIndex:
+                // P68 round 9: the one-word ADR's block field and its addend.
+                case EncodingSlotKind::AdrImm21:
+                case EncodingSlotKind::BlockAddend:
                     // fixed32 slots. Validate-time rules reject
                     // cross-shape variants, but if a future variant
                     // drift reached this arm, returning nullopt

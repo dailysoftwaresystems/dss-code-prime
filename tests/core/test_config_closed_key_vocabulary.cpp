@@ -188,9 +188,24 @@ constexpr Block kBlocks[] = {
     {"asm-arm64-gas", "/assembly",                   "the 'assembly' block"},
     {"asm-arm64-gas", "/assembly/operandForms",      "the 'operandForms' map"},
     {"asm-arm64-gas", "/assembly/instructions/0",    "an 'instructions' row"},
-    {"asm-arm64-gas", "/assembly/instructions/36/operandSelectors/0",
+    // ⚠ Re-aimed 40 → 42 (P68 round 8): the `ldaxr` / `stlxr` rows landed ahead
+    // of the first `cset` row, the first to carry `operandSelectors`; 42 → 43
+    // (P68 round 9): the `adrp` row landed ahead of it too.
+    {"asm-arm64-gas", "/assembly/instructions/43/operandSelectors/0",
                                                      "an 'operandSelectors' entry"},
+    // P68 round 9 (the aarch64 twins): a row's implied address part (`adrp`)
+    // and the address-part spellings.
+    {"asm-arm64-gas", "/assembly/instructions/24/impliedSymbolPart",
+                                                     "an 'impliedSymbolPart' object"},
+    {"asm-arm64-gas", "/assembly/symbolParts/0",     "a 'symbolParts' row"},
     {"asm-arm64-gas", "/assembly/directives/0",      "a 'directives' row"},
+    // P68 round 8: the numeric local labels' suffix pair, the template text
+    // forms, and a lexer mode's own closed vocabulary.
+    {"asm-arm64-gas", "/assembly/localLabelSuffixes", "the 'localLabelSuffixes' object"},
+    {"asm-arm64-gas", "/assembly/templateTextForms", "the 'templateTextForms' object"},
+    {"asm-arm64-gas", "/assembly/templateTextForms/fixed/0",
+                                                     "a fixed template form"},
+    {"asm-arm64-gas", "/lexerModes/line-comment",    "a lexer mode object"},
     // ── the predefined-macro loader, reached through a language document ──
     {"c", "/preprocess/predefinedMacros/0",   "a 'predefinedMacros' entry"},
 };
@@ -348,15 +363,25 @@ TEST(ClosedKeyVocabulary, DocumentationKeyStaysExemptInEveryObjectOfEveryDocumen
 // The other half of the skip list above, so the deliberate NON-carve-out is
 // pinned rather than merely commented: a `$`-led key in the `tokens` map is a
 // LEXEME, and it loads.
+// ⓘ THE VEHICLE IS `toy`, AND IT USED TO BE `c`. C now declares
+// `identifierClass.extraStart: "$"` ([[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]]), and
+// the loader refuses a start byte that a declared lexeme begins with — so a `$$`
+// lexeme injected into C is a genuine ownership conflict and is REFUSED, by
+// design (pinned in test_grammar_schema.cpp). This pin's question is only
+// whether a `$`-led tokens key is a lexeme rather than prose, which any document
+// whose identifier class does not claim `$` answers; `toy` declares none.
 TEST(ClosedKeyVocabulary, ADollarLedKeyInTheTokensMapIsALexemeNotProse) {
-    auto doc = shippedLanguageDoc("c");
+    auto doc = shippedLanguageDoc("toy");
+    ASSERT_FALSE(doc.contains("identifierClass"))
+        << "the vehicle must not claim `$` as an identifier start, or the "
+           "injected lexeme would be the ownership conflict the loader refuses";
     ASSERT_FALSE(doc["tokens"].contains("$$"))
         << "the probe lexeme must not already be declared, or this asserts "
            "nothing";
     doc["tokens"]["$$"] = nlohmann::json::parse(
         R"([{ "kind": "DollarDollarProbe" }])");
     auto const text = doc.dump();
-    auto       r    = GrammarSchema::loadFromText(text, "c");
+    auto       r    = GrammarSchema::loadFromText(text, "toy");
     EXPECT_TRUE(r.has_value())
         << "`$` is an ordinary operator character in a configured language; "
            "reserving it in the lexeme key space would DELETE a legal spelling:"

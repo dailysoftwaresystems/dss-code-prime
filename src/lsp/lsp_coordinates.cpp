@@ -47,6 +47,31 @@ DocumentCoordinates::DocumentCoordinates(dss::CompilationUnit const& unit,
     // a position answer, the name in the rendering says which buffer it was,
     // instead of impersonating the main source the way the synth buffer does.
     document_ = dss::SourceBuffer::fromString(documentText, documentUri_);
+    // The DOCUMENT's own origin buffer inside the compile: the first tree is the
+    // open document (the LSP adds it first), and for a preprocessed tree its
+    // origin is the buffer the synthesized one was spliced from.
+    auto const trees = unit_.trees();
+    if (!trees.empty()) {
+        dss::BufferId const own    = trees[0].source().id();
+        dss::BufferId const origin = unit_.mainOriginForSynth(own);
+        documentOrigin_ = origin.valid() ? origin : own;
+    }
+}
+
+std::string DocumentCoordinates::uriOf(dss::SourceBuffer const& origin) const {
+    // ★ THE DOCUMENT IS NAMED BY ITS PATH INSIDE THE COMPILE, AND BY THE CLIENT'S
+    // URI ON THE WIRE. The LSP names the in-memory buffer with the document's
+    // filesystem path, so `#include "local.h"` searches the document's own
+    // directory as the build does. Rendering that name back through
+    // `fileUriFromPath` could spell the uri differently from the one the client
+    // sent (percent-encoding, drive-letter case), and a publish under another
+    // spelling lands on no open document. So the document's own origin answers
+    // with the uri it arrived under; any other origin (a spliced header) with
+    // its path's uri.
+    if (documentOrigin_.valid() && origin.id() == documentOrigin_) {
+        return documentUri_;
+    }
+    return uriForBufferName(origin.name());
 }
 
 dss::SourceBuffer const* DocumentCoordinates::bufferFor(dss::BufferId id) const {
@@ -114,8 +139,9 @@ std::optional<Located> DocumentCoordinates::locate(dss::Tree const& tree,
     Located out;
     // The origin's NAME is its path. `fileUriFromPath` is the exact inverse of
     // the `pathFromFileUri` every request arrives through, so a location we
-    // emit can be sent back to us unchanged.
-    out.uri   = uriForBufferName(origin->name());
+    // emit can be sent back to us unchanged — and the open document itself
+    // answers with the client's own uri (`uriOf`).
+    out.uri   = uriOf(*origin);
     out.range = spanToRange(*origin, mapped);
     return out;
 }
@@ -127,7 +153,7 @@ DocumentCoordinates::locateDiagnostic(dss::BufferId buffer,
     dss::SourceBuffer const* origin = bufferFor(buffer);
 
     if (origin != nullptr && !bufferIsSynthetic(*origin)) {
-        out.uri   = uriForBufferName(origin->name());
+        out.uri   = uriOf(*origin);
         out.range = spanToRange(*origin, span);
         return out;
     }

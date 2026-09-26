@@ -8,14 +8,16 @@
 // The ONE answer to "which SymbolIds are already taken in this module", for
 // every link-tier pass that has to MINT one.
 //
-// Two such passes exist today and they are in different files:
+// Three such passes exist today and they are in different files:
 //   * `injectEntryTrampoline` (entry_trampoline.cpp) mints the synthetic
 //     `_start` body and, on the ByNameImport exit path, a synthetic extern;
 //   * `materializeObjectImportSlots` (linker.cpp) mints one carried
 //     import slot per referenced extern import — DATA
 //     (D-LK-PE-OBJECT-WEAK-DATA-EXTERN-REL32-TO-AN-ABSOLUTE-TARGET) and,
 //     under an `indirect-slot` dispatch, FUNCTION too
-//     (D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET).
+//     (D-LK-PE-OBJECT-WEAK-FUNCTION-ADDR-REL32-TO-AN-ABSOLUTE-TARGET);
+//   * `lowerGotSlotReferences` (linker.cpp, P68 round 11) mints one GOT slot
+//     per (symbol, addend) an image's GOT-slot-relative references name.
 //
 // ★ IT IS HOISTED RATHER THAN COPIED, AND THE COST OF THE COPY IS ALREADY
 // RECORDED IN THIS FUNCTION'S OWN HISTORY. The scan has been WIDENED twice
@@ -42,6 +44,14 @@ maxExistingSymbolIdV(AssembledModule const& mod) noexcept {
     }
     for (auto const& ext : mod.externImports) {
         if (ext.symbol.v > maxV) maxV = ext.symbol.v;
+        // ★ AND ITS ADDRESS-SLOT SYMBOL — the THIRD widening (P68 round 11).
+        // A preemption reference in a `.so` names the import's address through
+        // a second id of its own (D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING),
+        // and it lives only here. ✔MEASURED 2026-09-24: the GOT-slot lowering —
+        // the first minting pass that runs on a `.so` — minted id #11 for an
+        // aarch64 shared object whose address slot was already #11, and the
+        // link refused it as "declared more than once".
+        if (ext.addressSlotSymbol.v > maxV) maxV = ext.addressSlotSymbol.v;
     }
     for (auto const& d : mod.dataItems) {
         if (d.symbol.v > maxV) maxV = d.symbol.v;

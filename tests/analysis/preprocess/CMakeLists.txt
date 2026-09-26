@@ -106,6 +106,14 @@ target_include_directories(
 dss_add_test(NAME analysis/preprocess/test_skipped_group_not_otherwise_processed
              SOURCES test_skipped_group_not_otherwise_processed.cpp)
 
+# D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ + D-PP-CONVERSION-DIAGNOSTIC-FIRES-ON-A-TOKEN-NEVER-CONVERTED:
+# a character constant, string literal or header name ENDS AT ITS LINE (the
+# tokenizer honours `stringStyle.multiline`), and a conversion diagnostic is
+# delivered only for a token phase 7 converts. Tokenizer and preprocessor pins
+# in one binary because the second defect was hidden behind the first.
+dss_add_test(NAME analysis/preprocess/test_literal_ends_at_its_line
+             SOURCES test_literal_ends_at_its_line.cpp)
+
 # [[D-PP-SINGLE-PASS-INCLUDE-RESOLUTION]]: the include PRE-SCAN's macro state IS
 # the authoritative `MacroExpander`, hosted as an oracle — so the guard that
 # decides whether a quote-`#include` is spliced is evaluated by the same engine
@@ -140,3 +148,119 @@ dss_add_test(NAME analysis/preprocess/test_feature_query_operator_family
 target_include_directories(
     dss_analysis_preprocess_test_feature_query_operator_family
     PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 8 (D-C-SIZEOF-LONG-DOUBLE-NOT-PREDEFINED, then
+# D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): `__SIZEOF_LONG_DOUBLE__`, the C
+# language's `type-size` row, realized on every (target x format) pair and
+# pinned against the size `sizeof(long double)` has there — derived from the
+# grammar's own `long double` row, never a table of numbers — and absent where
+# the format refuses the type or no pair was named. A separate binary rather
+# than more cases in test_preprocessor.cpp because it is a sweep over every
+# SHIPPED document on disk, which that file's in-memory fixtures deliberately
+# do not load.
+dss_add_test(NAME analysis/preprocess/test_sizeof_long_double_macro
+             SOURCES test_sizeof_long_double_macro.cpp)
+
+# P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the whole
+# `__SIZEOF_*__` family — every member a `type-size` row of the language, the
+# targets' platform ABI typedefs behind `wchar_t`/`wint_t`, and a translation
+# unit of `_Static_assert(sizeof(T) == __SIZEOF_T__)` COMPILED FOR EVERY REAL
+# PAIR (through `applyTargetFormatPair` and `analyzeForTargetFormat`, the
+# driver's own two halves), so DSS's preprocessor and DSS's `sizeof` must give
+# one answer. Separate from the `long double` pin above because that one sweeps
+# the merge over every pair, plausible or not, while this one compiles C.
+dss_add_test(NAME analysis/preprocess/test_sizeof_macro_family
+             SOURCES test_sizeof_macro_family.cpp)
+
+# P68 round 8 (D-C-BITINT-MAXWIDTH-MACRO-RESTATES-THE-MODEL-BOUND): a predefined
+# macro whose value is a limit of DSS's own model — `__BITINT_MAXWIDTH__`, named
+# by `kind: model-limit` and written by the loader from `kBitIntMaxWidth`. Pins
+# the document (no number), the loaded value, the width check reading the same
+# number through the driver's two halves, and the loader's refusals. Reads the
+# shipped config, so it MUST run through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_model_limit_macros
+             SOURCES test_model_limit_macros.cpp)
+target_link_libraries(dss_analysis_preprocess_test_model_limit_macros
+    PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): `<limits.h>`
+# realized per (target, format) pair from the lattice — every one of the 32 names
+# with the TYPE and VALUE gcc/clang (per arch), mingw/MSVC (pe) and Darwin give it,
+# plus its `#if` arms, COMPILED FOR EVERY REAL PAIR through the driver's two halves;
+# the `<stdint.h>`/`NULL`/`clock_t` identities the typed shipped-constant splice
+# decides; `#undef` removing a shipped constant like any macro; and the splice's
+# refusal of a declared type no literal of the language has. Reads the shipped
+# config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_limits_h_lattice
+             SOURCES test_limits_h_lattice.cpp)
+target_include_directories(dss_analysis_preprocess_test_limits_h_lattice
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): `wchar_t` — the `<stddef.h>`
+# typedef and the type of `L'…'`/`L"…"` — from ONE source, the target's platform
+# ABI typedef table, on every real (target, format) pair; every shipped target
+# declares it; and a stripped custom target that does not REACHES
+# S_AbiTypedefUndeclared at the literal. Reads the shipped config, so it runs
+# through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_wchar_t_abi_typedef
+             SOURCES test_wchar_t_abi_typedef.cpp)
+
+# P68 round 9 (D-CONFIG-SYS-STAT-OVER-DECLARES-S-ISLNK-ON-PE, the coordinator's
+# ruling (a), and the <sys/stat.h> family found incomplete while measuring it): on
+# every real pair `<sys/stat.h>` defines exactly the mode names — with their values
+# — the platform's own reference defines (glibc, Darwin, mingw-w64 ∪ MSVC), and on
+# pe `<direct.h>`/`<dirent.h>` pull only what the Windows references pull. Reads the
+# shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_platform_header_surface
+             SOURCES test_platform_header_surface.cpp)
+
+# P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION +
+# D-PP-IF-NARROW-CHARACTER-CONSTANT-IGNORES-PLAIN-CHAR-SIGNEDNESS): `L'…'`, `u'…'`,
+# `U'…'` and `u8'…'` are integer constant expressions in every ICE position and in
+# `#if`, and a character constant reads in `#if` as signed iff its element type is —
+# on every real pair, through the driver's own front halves and the CST→HIR tier.
+# Reads the shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_prefixed_char_constant
+             SOURCES test_prefixed_char_constant.cpp)
+
+# P68 round 9 (lane `lm`): the GNU integer-type predefined-macro families —
+# `__*_TYPE__` (`type-name`), `__*_MAX__`/`__*_MIN__`/`__*_WIDTH__` (`type-limit`),
+# `__*_C(c)`/`__*_C_SUFFIX__` (`type-suffix`) — against every reference's answer on
+# every real pair, the one-fact rule (each `__X_TYPE__` IS the shipped typedef),
+# the merge's inputs, and the loader's refusals. Reads the shipped config, so it
+# runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_type_derived_predefines
+             SOURCES test_type_derived_predefines.cpp)
+
+# P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX, the preprocessor face): the
+# `type-unsigned` predefine kind — `__CHAR_UNSIGNED__`, `__WCHAR_UNSIGNED__` and
+# `__WINT_UNSIGNED__` are defined on exactly the real pairs where gcc/clang `-dM`
+# define them, which is exactly where the type is unsigned; the merge realizes them
+# from the pair's facts alone; and the loader refuses every malformed row. Reads
+# the shipped config, so it runs through ctest (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_type_unsigned_predefines
+             SOURCES test_type_unsigned_predefines.cpp)
+
+# P68 round 9 (D-FFI-STDINT-LIMIT-MACROS): `<stdint.h>`'s whole C23 7.22.2 / 7.22.3
+# limit-and-width family — every `_MIN`/`_MAX`/`_WIDTH` with the TYPE and VALUE the
+# references give it on each platform (the promoted type of the platform's own
+# typedef), its `#if` value and sign, the `SIG_ATOMIC_*` rows present exactly where
+# `<signal.h>` is, `__STDC_VERSION_STDINT_H__`, and each macro equal to its GNU
+# predefined twin (`SIZE_MAX == __SIZE_MAX__`) — COMPILED FOR EVERY REAL PAIR through
+# the driver's two halves. Reads the shipped config, so it runs through ctest (the
+# config snapshot).
+dss_add_test(NAME analysis/preprocess/test_stdint_limit_macros
+             SOURCES test_stdint_limit_macros.cpp)
+target_include_directories(dss_analysis_preprocess_test_stdint_limit_macros
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
+# P68 (lane lm, #2 — D-C-LINUX-IDENTITY-PREDEFINES-MISSING): the operating-system and
+# object-format identity predefines on every real pair — exactly the names the platform's
+# references predefine in their ISO modes (the Linux six on ELF, `__APPLE__`/`__MACH__` on
+# Mach-O, `_WIN32`/`_WIN64` on pe), never the GNU-mode `linux`/`unix`, and on the ELF pairs
+# the surface the Linux claims imply. Reads the shipped config, so it runs through ctest
+# (the config snapshot).
+dss_add_test(NAME analysis/preprocess/test_os_identity_predefines
+             SOURCES test_os_identity_predefines.cpp)
+target_include_directories(dss_analysis_preprocess_test_os_identity_predefines
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)

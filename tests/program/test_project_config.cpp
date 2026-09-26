@@ -33,7 +33,7 @@
                                           // note on why it lives in `core`)
 #include "link/object_format_schema.hpp"  // ObjectFormatSchema::loadShipped (AP3 format-gate integration)
 #include "program/program.hpp"          // Program, routesToMultiUnit
-#include "program/project_sources.hpp"  // AP6 M4: expandAndDedupProjectSources
+#include "core/types/project_sources.hpp"  // AP6 M4: expandAndDedupProjectSources
 #include "host_native_target.hpp"       // hostNativeTarget (build-and-spawn on EVERY leg)
 #include "run_binary.hpp"               // runBinary (behavioral exit-code proof)
 #include "scratch_dir.hpp"
@@ -361,7 +361,7 @@ TEST(ProjectConfigLoader, FlagArraysPopulatedParseExactly) {
     ASSERT_EQ(pc->resolveLibraries.size(), 2u);
     EXPECT_EQ(pc->resolveLibraries[0].path, "libfoo.so");
     EXPECT_EQ(pc->resolveLibraries[1].path, "libbar.a");
-    // D-FFI-DECLARED-IMPORT-NAME: a PLAIN string entry states NOTHING — the
+    // Declared import names: a PLAIN string entry states NOTHING — the
     // byte-for-byte pre-existing meaning every shipped manifest relies on.
     EXPECT_TRUE(pc->resolveLibraries[0].declaredImportName.empty());
     EXPECT_TRUE(pc->resolveLibraries[1].declaredImportName.empty());
@@ -441,7 +441,7 @@ TEST(ProjectConfigLoader, NonArrayResolveLibrariesFailsLoud) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::C_MalformedJson), 1u);
 }
 
-// ── D-FFI-DECLARED-IMPORT-NAME: the extended `resolveLibraries` entry ────────
+// ── Declared import names: the extended `resolveLibraries` entry ────────
 //
 // Each entry is EITHER a plain path string (nothing stated) OR an object
 // `{"path", "importName"}` that additionally STATES the runtime identity to
@@ -1405,7 +1405,9 @@ TEST(ProjectConfigLoader, UnknownKeyMessageIsDerivedFromTheRealKnownKeyTable) {
     //     Bumping this number is the intended, visible cost of adding a key.
     //     13 -> 14 on 2026-08-31: `dependencyArtifactCache`
     //     (D-DEPS-NO-ARTIFACT-SHARING-ACROSS-BUILDS-AT-ONE-CONFIGURATION (C)).
-    EXPECT_EQ(projectConfigKnownKeys().size(), 14u);
+    //     14 -> 15 on 2026-09-21: `runpaths`
+    //     (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH).
+    EXPECT_EQ(projectConfigKnownKeys().size(), 15u);
     for (std::string_view k : projectConfigKnownKeys()) {
         EXPECT_FALSE(k.empty()) << "a zero-filled table entry would whitelist "
                                    "the empty key (DSS_CHECK_KEY_VOCABULARY)";
@@ -3660,7 +3662,7 @@ TEST(CompileProjectGlob, OverlappingLiteralAndGlobDedupByNormalizedPath) {
 // and `tests/program/test_build_scripts.cpp` both do it, and the reasoning is
 // recorded at length in the latter: no external dependency (Windows has no
 // `/bin/echo`), no new build target (hence no `$<TARGET_FILE:…>` define, no
-// `add_dependencies` edge, and no row in the two `scripts/check-orphan-tests/check-orphan-tests`
+// `add_dependencies` edge, and no row in the two `.harness-config/runner/actions/check-orphan-tests/check-orphan-tests`
 // twins), and an EXACT path via `argv[0]`.
 //
 // The RELATIVE write path is not a convenience — it is half the subject. A
@@ -4263,7 +4265,7 @@ TEST(CompileProjectHooks, NoHooksDeclaredLeavesTheBuildUnchanged) {
 // half, and the dedup key
 //
 // The `sources[]` resolution moved out of `Program::compileProject` into
-// `program/project_sources.hpp` so a DEPENDENCY manifest — which declares its
+// `core/types/project_sources.hpp` so a DEPENDENCY manifest — which declares its
 // sources relative to ITS OWN directory, not to whatever cwd the consumer's
 // compiler is running in — can be resolved by the same code and the same
 // policy. The pins below are the three things that extraction had to get right.
@@ -4328,7 +4330,7 @@ TEST(ProjectSources, EmptyBaseKeepsLiteralEntriesCharacterForCharacter) {
 // other one. A resolution that consults cwd returns the decoy and this test
 // fails on the path it returns — it does not merely "find nothing".
 //
-// RED-ON-DISABLE (`src/program/project_sources.cpp`, the literal arm): make
+// RED-ON-DISABLE (`src/core/types/project_sources.cpp`, the literal arm): make
 // the literal arm push `entry` unconditionally, and the returned path is the
 // DECOY's — `EXPECT_EQ(out[0], …)` reports the wrong directory, and the
 // `decoy` guard below reports it a second time by name.
@@ -4416,7 +4418,7 @@ TEST(ProjectSources, AbsoluteLiteralEntryIsNeverRebased) {
 // is a DUPLICATE CU and a duplicate-symbol link error nothing can tie back to a
 // manifest. `weakly_canonical` is what closes it.
 //
-// RED-ON-DISABLE (`src/program/project_sources.cpp`, the dedup key): key on
+// RED-ON-DISABLE (`src/core/types/project_sources.cpp`, the dedup key): key on
 // `fs::path{s}.lexically_normal().generic_string()` instead and the relative
 // spelling never matches the absolute one, so `r->size()` is 2, not 1.
 TEST(ProjectSources, AbsoluteAndRelativeSpellingsOfOneFileDedupToOne) {
@@ -4673,7 +4675,7 @@ TEST(ProgramArtifactPaths, ARejectedSecondRunClearsThePreviousRunsPaths) {
 // lexicographically smallest wins" give DIFFERENT answers and the pin can tell
 // them apart.
 //
-// RED-ON-DISABLE (`src/program/project_sources.cpp`): sort the returned list
+// RED-ON-DISABLE (`src/core/types/project_sources.cpp`): sort the returned list
 // before returning it and the artifact becomes `alpha` — the `zeta` existence
 // assertion fails, `artifactPaths()[0]` reports the `alpha` name, and the
 // `alpha` non-existence assertion fails as well.
@@ -4793,13 +4795,15 @@ routedArtifact(std::filesystem::path const& base, std::string_view name) {
 }  // namespace
 
 // The manifest's `output` REDIRECTS the base dir when the CLI supplied none.
-// Relative, so this also witnesses the cwd-rooting rule; the absolute case is
-// covered by the override pin below, which uses one.
+// Relative, and the manifest sits in the working directory, so the two bases
+// coincide here; the pin below separates them. The absolute case is covered by
+// the override pin further down, which uses one.
 //
 // RED-ON-DISABLE: delete the `setOutputDir(manifestBase)` stamp in
-// `Program::compileProject` and the base falls back to `<cwd>/target` ⇒ the
-// declared path is ABSENT *and* the default path EXISTS ⇒ both arms go red, and
-// `artifactPaths()` — the driver's own account of what it wrote — disagrees too.
+// `Program::compileProject` and the base falls back to `<manifest dir>/target`
+// ⇒ the declared path is ABSENT *and* the default path EXISTS ⇒ both arms go
+// red, and `artifactPaths()` — the driver's own account of what it wrote —
+// disagrees too.
 TEST(CompileProjectOutputField, ManifestOutputRedirectsTheBaseDir) {
     using dss::test_support::Location;
     using dss::test_support::ScratchDir;
@@ -4809,38 +4813,35 @@ TEST(CompileProjectOutputField, ManifestOutputRedirectsTheBaseDir) {
     auto const proj = writeOutputBaseProject(dir, "app",
                                              std::optional<std::string>{"declared"},
                                              std::nullopt);
-    scratch.useAsCwd();   // `<cwd>/declared` and the `<cwd>/target` default both
-                          // land inside the scratch dir, so both are assertable.
-    // The cwd AS THE PROCESS REPORTS IT — the value the driver's own
-    // `absoluteKeepingRoot` will resolve the relative `output` against. Using
-    // `scratch.path()` here instead would compare two spellings of one directory
-    // on a host that re-spells its cwd (8.3 short form, case).
-    auto const cwd = std::filesystem::current_path();
+    scratch.useAsCwd();   // the manifest's directory and the working directory
+                          // coincide, as in a build started beside its manifest.
 
     Program prog;                  // NO setOutputDir — the manifest is the only
     DiagnosticReporter rep;        // source of a base in this build.
     ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
         << "the project must compile + emit";
 
-    auto const declared = routedArtifact(cwd / "declared", "app");
+    // The manifest's directory AS THE MANIFEST PATH SPELLS IT — the base a
+    // relative `output` resolves against. The process's own spelling of the same
+    // directory (`current_path()`) may differ on a host that re-spells its cwd
+    // (8.3 short form, case), and is no longer the base.
+    auto const declared = routedArtifact(dir / "declared", "app");
     EXPECT_TRUE(std::filesystem::exists(declared))
         << "the manifest `output` must be the routed base; expected "
         << declared.string();
     EXPECT_FALSE(std::filesystem::exists(dir / "target"))
-        << "the `<cwd>/target` default must not be used when the manifest "
-           "declares an output base";
+        << "the default `target/` must not be used when the manifest declares "
+           "an output base";
 
     auto const& paths = prog.artifactPaths();
     ASSERT_EQ(paths.size(), 1u);
     ASSERT_TRUE(paths[0].has_value());
-    // ⓘ THE DRIVER'S OWN ACCOUNT IS RELATIVE HERE, AND THAT IS THE MECHANISM,
-    // NOT A DEFECT — ✔MEASURED: it reports `declared/<formatName>/app`. The base
-    // is stored VERBATIM (the manifest half deliberately matches `cli_args.cpp`'s
-    // treatment of `--output`), so a relative `output` yields a relative artifact
-    // path, and `reportArtifactWritten` is the one place that absolutizes for the
+    // ⓘ THE DRIVER'S OWN ACCOUNT IS SPELLED FROM THE MANIFEST PATH, and is
+    // exactly as absolute as that path: the relative `output` is joined onto the
+    // manifest's directory as the manifest was named (an absolute path here),
+    // and `reportArtifactWritten` is the one place that absolutizes for the
     // operator-facing line. Resolve the same way here rather than assuming the
-    // driver did it — asserting against a bare absolute path would have been a
-    // test that pins the wrong fact and reds on correct behaviour.
+    // driver did it, so the comparison is between two resolved spellings.
     std::error_code absEc;
     auto const reported =
         dss::core::normalizeKeepingRoot(
@@ -4850,20 +4851,25 @@ TEST(CompileProjectOutputField, ManifestOutputRedirectsTheBaseDir) {
         << "and the driver's own report of what it wrote must name that path";
 }
 
-// A RELATIVE `output` resolves against the PROCESS working directory, NOT
-// against the manifest's own directory — the base this manifest's `sources[]`
-// and `preBuildScripts` already use, so a manifest composes with itself.
+// A RELATIVE `output` resolves against THE MANIFEST'S OWN DIRECTORY, NOT the
+// process working directory — the base this manifest's `sources[]` and its
+// `preBuildScripts`' working directory use, so a pre-build hook writing `dist/`
+// and an `"output": "dist"` name one place, from wherever the build starts
+// ([[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]).
+//
+// ⚠ THIS PIN USED TO ASSERT THE OPPOSITE (it was named
+// `ManifestOutputRelativeResolvesAgainstProcessCwd`), and it was right about
+// the rule it pinned: the root manifest's relative paths used to resolve
+// against the cwd. The rule changed, not the test's quality — every relative
+// path a manifest holds is now manifest-relative, the root's included.
 //
 // The manifest sits in `<cwd>/proj/`, so the two candidate bases are DIFFERENT
-// directories and the pin discriminates them. This is the whole reason the test
-// exists: the manifest-relative reading is the intuitive one, and adopting it
-// would leave a pre-build hook writing `dist/` and an `"output": "dist"` naming
-// two different places with nothing to say so.
+// directories and the pin discriminates them.
 //
-// RED-ON-DISABLE: base the stamp on `fs::path{projectFilePath}.parent_path()`
-// instead of the raw value and BOTH arms flip — the cwd-rooted path vanishes and
-// the manifest-rooted one appears.
-TEST(CompileProjectOutputField, ManifestOutputRelativeResolvesAgainstProcessCwd) {
+// RED-ON-DISABLE: stamp the raw `output` value instead of resolving it through
+// `resolveManifestPathSpelling` and BOTH arms flip — the manifest-rooted path
+// vanishes and the cwd-rooted one appears.
+TEST(CompileProjectOutputField, ManifestOutputRelativeResolvesAgainstTheManifestsDirectory) {
     using dss::test_support::Location;
     using dss::test_support::ScratchDir;
 
@@ -4881,11 +4887,12 @@ TEST(CompileProjectOutputField, ManifestOutputRelativeResolvesAgainstProcessCwd)
     ASSERT_EQ(prog.compileProject(proj.string(), rep), 0)
         << "the project must compile + emit";
 
-    EXPECT_TRUE(std::filesystem::exists(routedArtifact(cwd / "reldist", "sub")))
-        << "a relative `output` is cwd-rooted, like a relative `--output`";
-    EXPECT_FALSE(std::filesystem::exists(dir / "proj" / "reldist"))
-        << "it must NOT be rooted at the manifest's own directory — that is the "
-           "base a DEPENDENCY manifest uses, a different question";
+    EXPECT_TRUE(std::filesystem::exists(routedArtifact(dir / "proj" / "reldist", "sub")))
+        << "a relative `output` is rooted at the manifest's own directory";
+    EXPECT_FALSE(std::filesystem::exists(cwd / "reldist"))
+        << "it must NOT be rooted at the working directory the build started "
+           "in — a relative `--output` is, because the COMMAND LINE is the "
+           "invoker's; the manifest is its author's";
 }
 
 // PRECEDENCE: the CLI `--output` WINS over the manifest `output`, and the

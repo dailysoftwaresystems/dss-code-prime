@@ -41,6 +41,7 @@
 // `languageReferences` block — and cannot drift apart.
 
 #include "core/types/grammar_schema.hpp"
+#include "probe_config_root.hpp"   // the scratch config root battery B enters
 
 #include <gtest/gtest.h>
 
@@ -829,64 +830,12 @@ void expectRefusal(std::vector<ConfigDiagnostic> const& diags,
 
 // ── battery B: the REFERENCED side ───────────────────────────────────────
 //
-// ★ WHY A REAL FILE AND NOT A STRING. `mergeLanguageReferences` resolves a
-// referenced document through `findShippedConfig` — off the filesystem, by
-// logical name. There is no text entry point for the referenced side, and
-// inventing one for the test would exercise a path production never takes. The
-// referenced-document refusals (a `root` shape, a transitive
-// `languageReferences`, a block the merge does not consume, a cross-document
-// duplicate shape, a malformed `requires`) are reachable ONLY through a file
-// the resolver can actually find.
-//
-// ★★ IT MOVES THE CWD, NOT THE ENVIRONMENT, AND THAT IS A DELIBERATE CHOICE.
-// `findShippedConfig` consults `$DSS_CONFIG_ROOT` FIRST and falls THROUGH to an
-// 8-ancestor cwd walk on a miss. Entering this root therefore ADDS `probe`
-// without REMOVING anything: `asm.lang.json` still resolves through whatever
-// `$DSS_CONFIG_ROOT` ctest exported (or through the walk, in-tree), so every
-// other arm in this file is untouched by construction. Overriding the
-// environment instead would have taken `asm` away AND written the environment,
-// which `config_path_walk.cpp` documents as a READ-only lookup whose
-// race-freedom the project intends to keep. The cwd is restored in the
-// destructor — before `remove_all`, because Windows refuses to delete the
-// current directory — so it survives a gtest `ASSERT_` early return.
-class ProbeConfigRoot {
-public:
-    explicit ProbeConfigRoot(nlohmann::json const& referencedDoc) {
-        namespace fs = std::filesystem;
-        static int counter = 0;
-        std::error_code ec;
-        root_ = fs::temp_directory_path()
-              / ("dss-langref-probe-" + std::to_string(++counter));
-        fs::remove_all(root_, ec);              // a crashed earlier run
-        const fs::path sources = root_ / "src" / "dss-config" / "sources";
-        fs::create_directories(sources, ec);
-        if (ec) {
-            ADD_FAILURE() << "could not create the probe config root: "
-                          << ec.message();
-            return;
-        }
-        {
-            std::ofstream out(sources / "probe.lang.json", std::ios::binary);
-            out << referencedDoc.dump(2);
-        }
-        previous_ = fs::current_path(ec);
-        fs::current_path(root_, ec);
-        if (ec) ADD_FAILURE() << "could not enter the probe config root: "
-                              << ec.message();
-    }
-    ~ProbeConfigRoot() {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        if (!previous_.empty()) fs::current_path(previous_, ec);
-        fs::remove_all(root_, ec);
-    }
-    ProbeConfigRoot(ProbeConfigRoot const&)            = delete;
-    ProbeConfigRoot& operator=(ProbeConfigRoot const&) = delete;
-
-private:
-    std::filesystem::path root_;
-    std::filesystem::path previous_;
-};
+// Each arm writes ONE synthetic referenced document into a scratch config root
+// the process enters as its cwd: `dss::test_support::ProbeConfigRoot`, which
+// says why it must be a real file, why it moves the cwd rather than the
+// environment (so `asm.lang.json` still resolves for every other arm here), and
+// why its root is claimed per process.
+using dss::test_support::ProbeConfigRoot;
 
 // The synthetic REFERENCED document: two holes, one shape, nothing else. Kept
 // minimal on purpose — every battery-B arm is this document plus ONE key, so
@@ -1519,6 +1468,7 @@ constexpr std::string_view kLineHostDoc = R"JSON({
         "templateLabelPlaceholder": "SlotLabelMark",
         "templateModifierPlaceholder": "SlotWidthMark",
         "templateOperandIndex":     "IntLiteral",
+        "localLabelNumber":         "IntLiteral",
         "symbolicNameOpen":         "HugOpen",
         "symbolicNameClose":        "HugClose"
       }
@@ -1568,9 +1518,14 @@ constexpr std::array<std::string_view, 6> kAsmTemplateRules{
 
 // The line-structure rules the STANDALONE entry pulls in, including the alt
 // wrapper the placeholder hangs off.
-constexpr std::array<std::string_view, 8> kAsmLineRules{
+// ⚠ THE NINTH ARRIVED IN P68 ROUND 8 WITH A HOLE OF ITS OWN: `asmNumericLabel`
+// (GNU as's `1:`) spells `localLabelNumber`, so this alien host binds it — the
+// same load-breaking consequence the placeholder rules' comment above records,
+// felt here first, deliberately.
+constexpr std::array<std::string_view, 9> kAsmLineRules{
     "asmLine",       "asmElement",       "asmDirective",  "asmStatement",
     "asmStatementTail", "asmLabelTail",  "asmOperandSeq", "asmOperandItem",
+    "asmNumericLabel",
 };
 
 [[nodiscard]] nlohmann::json lineHostJson() {

@@ -1,0 +1,16 @@
+{
+  "$comment": "The register-pressure half of `deep_stmt_mir`: the same 250-level `if (a)` nest with the result `g` as a LOCAL, so Mem2Reg promotes it and every join merges it in a phi -- a phi chain as deep as the nest, which out-of-SSA copy placement and register allocation must carry through all 250 levels. The sibling keeps `g` global to stay a pure statement-flattening witness; this is the shape it used to avoid because it was once refused (x86 `L_VirtualRegInPostRegalloc` scratch exhaustion; arm64 frame stores past the unscaled imm9 slot). `t()` returns 1 and is DECLARED `__attribute__((noinline))`, and that is load-bearing: without it the shipped release pipeline inlines `t`, folds every condition and the chain disappears (MEASURED 2026-09-19, pe64: 3072 bytes against 18944 with noinline). The `full-release-like` arm runs Mem2Reg with no inliner; the `release` arm is the shipped pipeline. MEASURED 2026-09-19 with noinline: exit 42 on pe64 (native), x86_64 ELF (WSL) and arm64 ELF (qemu), debug and release. Miscompile-sensitive: `g` starts 0 and only the innermost statement sets 42, so a wrong phi input at any join, a lost copy or a mis-slotted reload returns 0, not 42.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {"spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"]},
+    {"spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"]},
+    {"spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64"},
+    {"spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": ""}
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"], "mustDifferFromBaseline": true},
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

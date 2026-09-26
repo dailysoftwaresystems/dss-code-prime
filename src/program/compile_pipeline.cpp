@@ -37,6 +37,7 @@
 #include "mir/summary/mir_summary.hpp"
 #include "mir/summary/summary_index.hpp"
 #include "lir/lir_2addr_legalize.hpp"
+#include "lir/lir_asm_region.hpp"      // expandAsmRegions — the inline-asm bundles
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_peephole.hpp"
@@ -93,49 +94,6 @@ void copyDiagnostics(DiagnosticReporter const& src,
     dst.sourceBuffers().addAll(src.sourceBuffers());
     for (auto const& d : src.all()) dst.report(d);
 }
-
-BitFieldStrategy
-effectiveBitFieldStrategy(TargetSchema const&       target,
-                          ObjectFormatSchema const& format) noexcept {
-    // FORMAT wins (the strategy is OS/format-determined); fall back to the
-    // target's declared value when the format declared none. Selects on the
-    // config-declared enum only — no target/format identity branch.
-    if (format.bitFieldStrategy() != BitFieldStrategy::None) {
-        return format.bitFieldStrategy();
-    }
-    return target.aggregateLayout().bitFieldStrategy;
-}
-
-LongDoubleFormat
-effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
-                          ObjectFormatSchema const&            format) noexcept {
-    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): FORMAT-only — no target-side field
-    // exists to fall back to (see the header docblock). `None` propagates as
-    // the honest undeclared state; the semantic bind fails loud on it.
-    return format.longDoubleFormat();
-}
-
-UnnamedBitFieldAlignment
-effectiveUnnamedBitFieldAlignment([[maybe_unused]] TargetSchema const& target,
-                                  ObjectFormatSchema const&            format) noexcept {
-    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: FORMAT-only — no target-side field
-    // exists to fall back to (see the header docblock). `None` propagates as the
-    // honest undeclared state; the layout engine fails loud on it, and only when an
-    // unnamed bit-field actually needs the rule.
-    return format.unnamedBitFieldAlignment();
-}
-
-// ── NOT HERE: `effectiveCharIsUnsigned` (D-TARGET-CHAR-SIGNEDNESS-PER-PLATFORM)
-// ──────────────────────────────────────────────────────────────
-// There is deliberately no third member of the `effective*` family for
-// bare-`char` signedness. This family exists because those axes have
-// contributions from BOTH schemas that must be RECONCILED — a genuine
-// two-sided negotiation. Char signedness has exactly ONE contributor: the
-// target declares the whole (processor × platform) fact in its single
-// `charIsUnsigned` key. An `effectiveCharIsUnsigned(target, format)` wrapper
-// would advertise a negotiation that no longer happens, and would be a second
-// place the fact is "about" — the exact duplication this reshape removed.
-// The call site asks the owner directly: `target.charIsUnsigned(format.kind())`.
 
 namespace {
 
@@ -235,8 +193,8 @@ bool optimizeModule(Mir&                  mir,
                 d.actual   = std::format(
                     "compile_pipeline: pipeline '{}' declares unitPipeline "
                     "'{}' which failed to load — a two-stage topology must "
-                    "name a shipped pipeline document (D-OPT7-CROSSCU-LTO-"
-                    "SINGLE-OPTIMIZE).",
+                    "name a shipped pipeline document ("
+                    "D-OPT7-CROSSCU-LTO-SINGLE-OPTIMIZE).",
                     *name, loadedPipeline.unitPipelineName);
                 reporter.report(std::move(d));
                 forwardConfigDiagnostics(unitLoaded.error(), reporter);
@@ -519,7 +477,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //      library comes from the ROW — the PLATFORM's
     //      shipped-descriptor realization, or a source
     //      `extern "otherlib.dll" int foo();`
-    //      (D-CSUBSET-EXTERN-LIBRARY-SYNTAX) — and a row with
+    //      (the extern library-name syntax) — and a row with
     //      neither is UNBOUND, resolved at the LINK tier per C23
     //      5.1.1.2 phase 8. The former `externLibraryByFormat` map
     //      was a per-LANGUAGE GUESS standing in for the corpus and a
@@ -584,12 +542,27 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // the format's rule instead of the canonical identifier. Already
             // resolved per (arch, format) at descriptor-read time — a plain
             // string like `version`, not a per-format map needing the fold above.
+            // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: carry the
+            // DECLARATION's thread storage duration so the binary binder can
+            // compare it against the LIBRARY's own answer for the same name.
+            // Read from the SAME `threadLocalMap` side table HIR→MIR reads to
+            // stamp `ExternImport.isThreadLocal` — one producer, so the FFI
+            // tier and the MIR tier can never disagree about what the source
+            // said. Absent entry ⇒ false: the map is SPARSE (only thread-local
+            // declarations are recorded), which is exactly the `!isThreadLocal`
+            // this check is looking for.
+            bool declaredThreadLocal = false;
+            if (auto const* tl = hir->threadLocalMap.tryGet(r.node);
+                tl != nullptr) {
+                declaredThreadLocal = tl->isThreadLocal;
+            }
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
                             r.noLibraryBinding,
                             r.version,   // D-LK-ELF-SYMBOL-VERSIONING (c156)
                             r.isEagerImport,
                             r.asmName,
-                            r.linkName});
+                            r.linkName,
+                            declaredThreadLocal});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -700,7 +673,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // LC_LOAD_DYLIB / PE import descriptor), ranked in `ingest()` and
             // documented on `ffi::BinaryLibrarySource`:
             //   1. `declaredImportName` -- what the CLI/manifest STATED for
-            //      this entry (D-FFI-DECLARED-IMPORT-NAME; empty = unstated);
+            //      this entry (its declared import name; empty = unstated);
             //   2. the binary's own embedded soname, read by FF1;
             //   3. the file BASENAME supplied here as the last-resort fallback.
             // All three are plain strings: no arm of this is language-,
@@ -846,25 +819,18 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //    policy into the lowering config (same shape as the
     //    lowered_lir_fixture used by ML6 / AS pipeline tests).
     auto const mirEntry = reporter.errorCount();
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat =
-        grammar.hirLowering().globalsConstEval.allowFloat;
-    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): thread
-    // the source-language strict-aliasing opt-in from the SemanticConfig
-    // through to the HIR→MIR lowering, which stamps it onto the Mir
-    // for CSE/LICM Load admission. Multi-language CUs will eventually
-    // AND each schema's knob; today's single-language-per-CU shape
-    // reads directly.
-    mirCfg.strictAliasingOnDistinctTypes =
-        grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
-    mirCfg.charTypesAliasAll =
-        grammar.semantics().pointerAliasing.charTypesAliasAll;
-    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the SAME shape, and threaded
-    // here for the same reason — `void`/function operand sizes are a per-LANGUAGE
-    // fact (GNU C says 1, ISO C says none) read at TWO tiers, so the schema states
-    // it once and both the semantic const-fold and HIR→MIR read that one
-    // declaration. Absent ⇒ the strict-ISO refusal, unchanged.
-    mirCfg.nonObjectTypeSizes = grammar.semantics().nonObjectTypeSizes;
+    // The LANGUAGE's part of the policy, read off its schema by the ONE assembly every
+    // schema-built test fixture starts from too (`languageMirLoweringConfig`): the globals
+    // const-eval `allowFloat` knob; the static-initializer constant forms
+    // (`semantics.staticInitializers`, the list the semantic tier's check read — P68 round
+    // 13); D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING's strict-aliasing opt-in and
+    // char-aliasing knob, which HIR→MIR stamps onto the Mir for CSE/LICM Load admission
+    // (multi-language CUs will eventually AND each schema's knob; today's
+    // single-language-per-CU shape reads directly); and
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED's `void`/function operand sizes — a
+    // per-LANGUAGE fact (GNU C says 1, ISO C says none) the semantic const-fold and HIR→MIR
+    // both read from that one declaration (absent ⇒ the strict-ISO refusal).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(grammar);
     // FC6: thread the active target's aggregate-layout params + the format's data
     // model so HIR→MIR can fold `sizeof(T)` to T's byte size via the type_layout
     // engine. The target supplies the alignment rule, the format the pointer width.
@@ -934,7 +900,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
                           &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
                           &hir->returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
-                          &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE)
+                          &hir->noInlineMap,   // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
                           &hir->alwaysInlineMap,   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
                           &hir->noOptimizeMap,   // TF-C85 (#pragma optimize region)
                           &hir->noSanitizeThreadMap,   // TF-C92 (no_sanitize_thread)
@@ -1051,6 +1017,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // "nothing declared", which that pass refuses loudly, rather than as a real layout it
     // could not tell from a genuine declaration. Consulted only if a stdio recipe appears.
     cuMir.vaListLayout = analyzeVaLayout;
+    // P68 round 9 (the aarch64 twins): the format kind, ONLY as the key an
+    // inline-asm template's address-part operators are read under — see the
+    // field.
+    cuMir.assemblyFormatKind = format.kind();
     return cuMir;
 }
 
@@ -1080,94 +1050,29 @@ static std::optional<CuHirModule> buildCuHirImpl(
     //    `copyDiagnostics` helper to eliminate the inline-drain
     //    duplicate.)
     auto const semEntry = reporter.errorCount();
-    // FC3 c1: thread the FORMAT's declared data model (its REQUIRED
-    // `dataModel` field) into the per-(CU × target) analysis — the
-    // single source for every width-dependent resolution downstream
-    // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
-    // literal ladder, descriptor `signatureByDataModel`). The HIR
-    // lowering reads the SAME value back off the SemanticModel.
-    // FC6 deferral-close: also thread the target's aggregate-layout params so a
-    // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
-    // through the same `computeLayout` engine MIR uses — `nullopt` when the
-    // target declared no block (the fold then fails loud, never a wrong size).
-    // D-CSUBSET-BITFIELD-ABI-EXACT: overlay the FORMAT-resolved bit-field strategy
-    // onto the target's params (the strategy is OS/format-determined; the target
-    // supplies only the alignment rule). A `sizeof` over a bit-field struct in an
-    // array dimension then folds with the byte-ABI-exact layout.
-    auto const effectiveBfStrategy = effectiveBitFieldStrategy(target, format);
-    // D-CSUBSET-ZERO-WIDTH-BITFIELD-ALIGNMENT: resolved beside the strategy and
-    // overlaid at the SAME three consumer sites, because the two axes are read by one
-    // packer and a site that got one without the other would lay out to a mixture of
-    // two ABIs.
-    auto const effectiveUnnamedBfAlign =
-        effectiveUnnamedBitFieldAlignment(target, format);
-    std::optional<AggregateLayoutParams> analyzeLayout;
-    if (target.aggregateLayoutLoaded()) {
-        analyzeLayout = target.aggregateLayout();
-        analyzeLayout->bitFieldStrategy = effectiveBfStrategy;
-        analyzeLayout->unnamedBitFieldAlignment = effectiveUnnamedBfAlign;
-    }
-    // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2): capture the RESOLVED CC's
-    // WHOLE `vaListLayout` block. Read from the SAME resolved CC the MirLoweringConfig
-    // reads its `vaListLayout` from (below); `nullopt` when the CC declares no
-    // variadic-callee ABI.
-    //
-    // TWO consumers, each taking the part it needs from this ONE lookup:
-    //   * the semantic `va_list`-type injection wants only `.strategy`, to size the `ap`
-    //     local per ABI (SysV __va_list_tag[1]=24B vs Win64 char*=8B). `nullopt` there ⇒
-    //     the SysV-family default, which is inert (a CC with no vaListLayout has no
-    //     variadic-callee surface at all).
-    //   * D-FFI-PE-CRT-UCRT-MIGRATION (Phase 3): `synthesizeStdioShim`, across the MIR/LIR
-    //     seam, needs the WHOLE block — `.variadicUsesOverflowBase` is what selects its
-    //     va leaf, and reading only `.strategy` there was a latent silent miscompile (see
-    //     `CuMirModule::vaListLayout`). Same resolved CC, resolved ONCE.
-    std::optional<VaListLayout> analyzeVaLayout;
-    if (auto const* cc = target.callingConvention(callingConventionIndex);
-        cc != nullptr && cc->vaListLayout.has_value()) {
-        analyzeVaLayout = *cc->vaListLayout;
-    }
-    std::optional<VaListStrategy> const analyzeVaStrategy =
-        analyzeVaLayout.has_value() ? std::optional<VaListStrategy>{analyzeVaLayout->strategy}
-                                    : std::nullopt;
     // c97: sequential per-phase scoping via optional emplace — emplace
     // destroys the prior Scope (closing its accumulation window) BEFORE
     // opening the next, and any early return closes the live one.
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Semantic);
-    // D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE: this
-    // producer BINDS imports, so it answers descriptor role entries — from the
-    // active format's own row, or its shipped flavour family's.
-    FormatRuntimeLibraryRoleResolver const roleResolver{format};
-    auto model = analyze(
-        // D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: the operator's
-        // budget, carried on `opts` from `rep` -- NOT `reporter.config()`, which
-        // is the relaxed per-target scratch.
-        std::move(borrowed), diagBudget,
-        format.dataModel(), analyzeLayout, analyzeVaStrategy,
-        format.kind(),       // c8: the active object-format → per-target availability gate
-        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
-        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
-        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
-        // spirv) leaves `long double` rows unrealized (loud on use).
-        effectiveLongDoubleFormat(target, format),
-        // ★ Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): THE ACTIVE TARGET.
-        // Without it `analyze` runs with `target == nullptr`, and its two
-        // target-dependent asm checks — `S_InlineAsmConstraintLetterUndeclared`
-        // (0xE065) and `S_InlineAsmClobberUnknown` (0xE068) — correctly decline
-        // to guess and DO NOT RUN. ✔MEASURED before this argument existed: a
-        // `"=Zq"` constraint and a `"notaregister"` clobber BOTH compiled to a
-        // clean `.o` at rc=0 through this very pipeline. A diagnostic that fires
-        // only in a unit test that passes its own schema is not a shipped
-        // diagnostic. `target` is the driver's own long-lived schema and
-        // outlives `model`, which is the lifetime the parameter requires.
-        &target,
-        // The standard deep-recursion reserve (the `0` sentinel) — spelled only
-        // because the resolver behind it is positional.
-        /*deepRecursionReserveBytes=*/0,
-        // Consulted during analysis only, never republished by the model, so a
-        // reference to a local outlives every read of it.
-        &roleResolver);
+    // ★ D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: what this pair means to
+    // `analyze()` — the data model, the aggregate layout with the format's two
+    // bit-field overlays, the `va_list` strategy of the resolved calling
+    // convention, the availability gate, the shipped-struct variant selector,
+    // `long double`, the target and the runtime-library role resolver — is
+    // derived in ONE place, `analyzeForTargetFormat`
+    // (`analysis/semantic/target_format_analysis.hpp`). This site used to derive
+    // it inline and was the only channel that did: the LSP and the FFI header
+    // parser analyzed under defaults and disagreed with this build about every
+    // header, `long double` and `sizeof` the pair decides. The budget is the
+    // operator's (D-DIAG-VOLUME-CAP-ENFORCED-AT-SIX-STAGES-NOT-ONCE: carried on
+    // `opts` from `rep`, never the relaxed per-target scratch), and `target` is
+    // the driver's own long-lived schema, which outlives the model.
+    auto analysis = analyzeForTargetFormat(
+        std::move(borrowed), diagBudget, target, format,
+        target.callingConvention(callingConventionIndex));
     phase.reset();
+    SemanticModel& model = analysis.model;
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
@@ -1183,11 +1088,11 @@ static std::optional<CuHirModule> buildCuHirImpl(
     }
 
     // Both products of the front half, plus the ONE derived fact the lower half
-    // still needs from step 1 (`analyzeVaLayout` — resolved from the same CC the
-    // MIR lowering config reads, so resolving it twice could disagree).
+    // still needs from step 1 (`analysis.vaListLayout` — resolved from the same
+    // CC the MIR lowering config reads, so resolving it twice could disagree).
     return CuHirModule{.model        = std::move(model),
                        .hir          = std::move(hir),
-                       .vaListLayout = analyzeVaLayout};
+                       .vaListLayout = analysis.vaListLayout};
 }
 
 // LOWER half body (Cycle 25, Stage C): MIR → LIR → liveness → regalloc → rewrite →
@@ -1306,7 +1211,11 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          // above; the NAMES the routing needs are built from
                          // `nameOf` right below, not threaded from the caller.
                          std::vector<SymbolBinding>                  preemptibleDefinitionBindings,
-                         DiagnosticReporter&                         reporter) {
+                         DiagnosticReporter&                         reporter,
+                         // P68 round 9: the format kind, ONLY as a key into
+                         // the assembly dialect's `symbolParts` (see
+                         // `CuMirModule::assemblyFormatKind`).
+                         std::optional<ObjectFormatKind>             assemblyFormatKind) {
     // ★★ D-MIR-DYLIB-SELF-CALL-BYPASSES-WEAK-COALESCING: the on-binary names
     // MIR→LIR needs to MINT a loader-resolved reference for a preemptible
     // definition. Built HERE because this is where names live — `nameOf` is
@@ -1382,7 +1291,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           // the format's declared preemptible-definition
                           // bindings, and the names the routing mints with.
                           std::move(preemptibleDefinitionBindings),
-                          std::move(definedSymbolNames));
+                          std::move(definedSymbolNames),
+                          // P68 round 9: the format kind, ONLY as a key into
+                          // the assembly dialect's `symbolParts`.
+                          assemblyFormatKind);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -1494,8 +1406,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     why it runs HERE and not after callconv: callconv mints ZERO
     //     additional identity class moves, and its `perFuncCfi` is keyed BY
     //     `LirInstId`,
-    //     ⚠ CORRECTED 2026-09-02 (P53,
-    //     D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    //     ⚠ CORRECTED 2026-09-02 (P53).
     //     This repeated `lir_peephole.hpp`'s evidence verbatim -- "MEASURED
     //     5575 at both stages" -- and that evidence could not support the
     //     claim. post-rewrite and post-callconv were the only two dump stages
@@ -1526,6 +1437,34 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         return std::nullopt;
     }
 
+    // 8b. P68 round 8 part 4 — THE INLINE-ASM BUNDLES BECOME THEIR BODIES.
+    //     Every inline-asm statement has been ONE instruction (`asm_region`)
+    //     through allocation, rewrite, two-address legalization and the
+    //     peephole, so nothing those passes generate can land between a
+    //     template's lines. Its body replaces it HERE: after the peephole (which
+    //     must see the statement as the opaque instruction it is) and BEFORE
+    //     callconv (whose per-function CFI is keyed by `LirInstId`, so a rebuild
+    //     after it would renumber every CFI subject — the peephole's own reason
+    //     for running where it does). A module with no statement carries an
+    //     empty region pool and skips the pass: nothing to expand, no rebuild.
+    //     ⚠ The paired check is the CONSUMING one: the pool must come out
+    //     empty and every other side structure carried as by any rebuild.
+    std::optional<LirAsmRegionExpansionResult> expanded;
+    Lir const* ccInput = &peeped.lir;
+    if (peeped.lir.asmRegionPool().size() != 0) {
+        auto const expandEntry = reporter.errorCount();
+        expanded = expandAsmRegions(peeped.lir, target, reporter);
+        if (!expanded->ok || !tierClean(reporter, expandEntry)) {
+            return std::nullopt;
+        }
+        if (!verifyLirAsmRegionExpansion(peeped.lir, expanded->lir, target,
+                                         reporter)
+            || !verifyLirPostRegalloc(expanded->lir, target, reporter)) {
+            return std::nullopt;
+        }
+        ccInput = &expanded->lir;
+    }
+
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
     //    ML7 cycle 2 gap — anchored D-LK10-2 for caller awareness).
@@ -1554,7 +1493,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
                                   a.perAllocaAlignBytes});
     }
-    auto cc = materializeCallingConvention(peeped.lir, target, alloc, reporter,
+    auto cc = materializeCallingConvention(*ccInput, target, alloc, reporter,
                                            sehFuncletParents,
                                            funcLocalAligns);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
@@ -1565,7 +1504,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // same reason: callconv materializes the frame ops and the arg/return
     // moves, so it is the pass with the most opportunities to mint a register
     // operand, and after `assemble()` there is no LIR left to check.
-    if (!verifyLirRebuild(peeped.lir, cc.lir, "callconv", reporter)
+    if (!verifyLirRebuild(*ccInput, cc.lir, "callconv", reporter)
         || !verifyLirPostRegalloc(cc.lir, target, reporter)) {
         return std::nullopt;
     }
@@ -1575,7 +1514,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     diverged from the original MIR's instruction set, so a
     //     fidelity-preserving map would require legalize + callconv
     //     to thread their own translation tables (anchored at
-    //     plan 12 D-ML3-2.1 MirSourceMap IOU). Cycle 2 acceptance
+    //     plan 12 D-PLAN12-MIRSOURCEMAP-INJECTION-SLOT-MIRVERIFIER-CYCLE-STASHES-NODE-ACTUAL MirSourceMap IOU). Cycle 2 acceptance
     //     pins SHAPE + BYTES, not source-map fidelity.
     auto const asmEntry = reporter.errorCount();
     phase.emplace(substrate::CompilePhase::Encode);
@@ -1733,8 +1672,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
                 "jump-table (SymbolId={{ {} }}) requires an absolute-64 pointer "
-                "relocation but target '{}' declares none (D-OPT-SWITCH-JUMP-"
-                "TABLE) — the dense-switch address table cannot be emitted",
+                "relocation but target '{}' declares none ("
+                "D-OPT-SWITCH-JUMP-TABLE) — the dense-switch address table cannot be emitted",
                 desc.tableSymbol.v, target.name());
             reporter.report(std::move(d));
             return std::nullopt;
@@ -1786,8 +1725,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             d.severity = DiagnosticSeverity::Error;
             d.actual   = std::format(
                 "jump-table (SymbolId={{ {} }}) references a target block with no "
-                "byte offset or symbol — malformed descriptor (D-OPT-SWITCH-JUMP-"
-                "TABLE)", desc.tableSymbol.v);
+                "byte offset or symbol — malformed descriptor ("
+                "D-OPT-SWITCH-JUMP-TABLE)", desc.tableSymbol.v);
             reporter.report(std::move(d));
             return std::nullopt;
         }
@@ -2379,7 +2318,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         cuMir.tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibraryOpt),
         atomicsRuntime, cuMir.indirectSlotBindings,
-        cuMir.preemptibleDefinitionBindings, reporter);
+        cuMir.preemptibleDefinitionBindings, reporter,
+        cuMir.assemblyFormatKind);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -2427,7 +2367,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       // the format's declared preemptible-definition
                       // bindings, pre-resolved one level up in program.cpp
                       // (same shape as `indirectSlotBindings` above).
-                      std::vector<SymbolBinding> preemptibleDefinitionBindings) {
+                      std::vector<SymbolBinding> preemptibleDefinitionBindings,
+                      std::optional<ObjectFormatKind> assemblyFormatKind) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
     // by the LK11a symbol-table populate (module-private), exactly as in the CU path.
@@ -2444,7 +2385,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         externCallDispatch, dataImportBinding, externAddrBinding, tlsAccess,
         std::move(sehScopes), std::move(wideFloatSoftcallLibrary),
         std::move(atomicsRuntime), std::move(indirectSlotBindings),
-        std::move(preemptibleDefinitionBindings), reporter);
+        std::move(preemptibleDefinitionBindings), reporter,
+        assemblyFormatKind);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -2590,6 +2532,14 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // role entries exactly as the C front half does — one resolver shape, one
     // family answer, on every path a symbol reaches the linker by.
     FormatRuntimeLibraryRoleResolver const roleResolver{format};
+    // P68 round 12 (S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): and it reads
+    // each descriptor with the PAIR's facts, as the `#include` path does — the ABI
+    // typedefs a row's signature may name (`wchar_t`) and the long-double format an
+    // arm may key on — built by the one owner of a pair's type facts. No consuming
+    // language: this oracle realizes symbol rows, never a lattice-derived constant.
+    PredefinedTypeFacts const typeFacts = predefinedTypeFactsFor(target, format);
+    ffi::ShippedPairFacts const pairFacts{nullptr, typeFacts.dataModel, typeFacts.charIsUnsigned,
+                                          typeFacts.abiTypedefs, typeFacts.longDoubleFormat};
 
     // The oracle interns each row's declared signature, so it needs a lattice.
     // Neither of this file's on-binary-name producers has a `SemanticModel` (the
@@ -2616,7 +2566,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // SAME `cc->vaListLayout->strategy`, so the descriptor read here sees the
     // identical type the `#include` path would give it on this (target, format)
     // — Win64's `char*` is 8 bytes and SysV's `__va_list_tag[1]` is 24, and a
-    // corpus row that ever gained a `signatureByDataModel` arm keyed on the
+    // corpus row that ever gained a `signature` variant keyed on the
     // difference would otherwise decode one way here and another way there.
     // Hard-coding one arm would be a platform GUESS in shared substrate; asking
     // the ABI is a fact lookup, with no `if (arch)` and no `if (format)`.
@@ -2688,7 +2638,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         auto const realized = ffi::realizeShippedExternSymbols(
             forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
-            format.kind(), namedTypes, &roleResolver);
+            format.kind(), namedTypes, &roleResolver, &pairFacts);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
         for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
             if (canonicalOf[i].empty()) continue;
@@ -2739,7 +2689,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
         everyName, lattice.interner(), lattice.registry(), reporter,
         format.dataModel(), std::optional<std::string_view>{target.name()},
-        format.kind(), namedTypes, &roleResolver);
+        format.kind(), namedTypes, &roleResolver, &pairFacts);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name
@@ -2818,6 +2768,12 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
 struct OperatorNamedImport {
     std::string library;   // the runtime identity to RECORD
     std::string version;   // ELF default version, or empty
+    // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: what the LIBRARY says this
+    // name's storage duration is, carried verbatim from the reader's row so the
+    // askers can compare it against their own row's declaration. Format-blind
+    // vocabulary (`SymbolKind::Tls` == ELF STT_TLS / PE __declspec(thread) /
+    // Mach-O S_THREAD_LOCAL_*), so no asker grows a format arm.
+    ffi::SymbolKind kind = ffi::SymbolKind::NoType;
 };
 
 [[nodiscard]] std::optional<std::unordered_map<std::string, OperatorNamedImport>>
@@ -2852,7 +2808,8 @@ resolveOperatorNamedLibraryImports(std::span<ResolveLibrarySpec const> libraries
             }
             bySymbol.try_emplace(
                 row.mangledName,
-                OperatorNamedImport{std::move(identity), std::move(version)});
+                OperatorNamedImport{std::move(identity), std::move(version),
+                                    row.kind});
         }
     }
     return bySymbol;
@@ -3044,8 +3001,8 @@ archiveMemberFormat(ArchiveMemberFormat&          cache,
             "'{}' in '{}'. The link is producing '{}', whose relocation "
             "vocabulary describes an IMAGE and was never promised to describe a "
             "relocatable member; the member's own object format {}. {} "
-            "Anchored: D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-"
-            "OBJECT-FORMAT.",
+            "Anchored: "
+            "D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT.",
             memberName, core::genericSpelling(archivePath), linkFormat.name(),
             objectFormatName.empty()
                 ? std::string{"could not be resolved"}
@@ -3428,6 +3385,17 @@ pullStaticArchiveMembers(std::span<AssembledModule const>       clientModules,
                 if (definedNames.count(ext.mangledName) != 0) continue;
                 auto const it = bySymbol->find(ext.mangledName);
                 if (it == bySymbol->end()) continue;
+                // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the pulled
+                // member's reference must agree with the library's storage
+                // duration for the same name, exactly as a C source reference
+                // must. ONE rule, one implementation (ffi/ingest.hpp) — the
+                // member arrives from an object reader rather than from HIR,
+                // and that must not decide whether the rule applies.
+                if (ffi::reportLibraryThreadStorageDisagreement(
+                        ext.mangledName, it->second.library, it->second.kind,
+                        ext.isThreadLocal, reporter)) {
+                    continue;   // left unbound behind a reported Error
+                }
                 ext.libraryPath = it->second.library;
                 ext.version     = it->second.version;
             }
@@ -3730,6 +3698,17 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
     // both toolchains, with the boundary held at Local.
     std::vector<link::format::ArMemberInput> members;
     members.reserve(modules.size());
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a runpath request against an archive
+    // is ACCEPTED and recorded nowhere (no loader loads an `ar` member), and it
+    // is reported ONCE, for the ARCHIVE, through the gate's own function. The
+    // member links below then get a request WITHOUT runpaths: `linker::link`
+    // reports once per link, and one archive of N members is still ONE artifact
+    // — N identical warnings would bury the one that matters. Everything else
+    // in the request still rides every member link, unchanged.
+    (void)reportUnrecordedRunpaths(request, format, "linkAndWriteStaticArchive",
+                                   reporter);
+    ImageRequest memberRequest = request;
+    memberRequest.runpaths.clear();
     for (std::size_t i = 0; i < modules.size(); ++i) {
         // D-SQLITE-PE64-FULL-TIER-STACK-DEPTH: `request` rides each member link
         // so the capability gate fires on the archive path too. No archive
@@ -3737,7 +3716,7 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
         // image headers), so a request here is REFUSED on the first member —
         // never silently swallowed by a build that reports success.
         auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
-                                  target, format, reporter, request);
+                                  target, format, reporter, memberRequest);
         if (!image.ok() || !tierClean(reporter, entry)) {
             return false;
         }
@@ -3850,6 +3829,35 @@ namespace {
 // format-keyed step the C path has too. Every other input is data off a
 // descriptor row or an export table.
 //
+// ★★ THE DEFINITION DECIDES WHAT THE REFERENCE LEFT OPEN
+// (D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). A `.s` address operand
+// or data slot naming a symbol the file does not define mints its import
+// `Pending`: it states no code-vs-data, and gas's relocation states none either.
+// The library this binder just matched it to is the DEFINITION, and it states
+// its own kind, so that kind is written into `isData`, as ld reads it from the
+// symbol it resolves to. A library that states none (a stripped `.so`'s
+// NOTYPE, a PE forwarder) leaves the row `Pending`, and the link refuses it by
+// name if it survives (`K_ImportReferenceUnbindable`), because a default would
+// be a guess with a wire consequence. A row the reference itself decided (a
+// CALL) is never touched: its kind is its own statement.
+void decideKindFromTheDefinition(ExternImport& e, ffi::SymbolKind definition) {
+    if (e.kindOrigin != ExternKindOrigin::Pending) return;
+    switch (definition) {
+        case ffi::SymbolKind::Function:
+            e.isData     = false;
+            e.kindOrigin = ExternKindOrigin::FromLibrary;
+            return;
+        case ffi::SymbolKind::Object:
+            e.isData     = true;
+            e.kindOrigin = ExternKindOrigin::FromLibrary;
+            return;
+        case ffi::SymbolKind::Tls:        // refused by the storage-duration rule above it
+        case ffi::SymbolKind::NoType:     // the definition states nothing
+        case ffi::SymbolKind::Forwarder:  // the kind is the forward target's, unread here
+            return;
+    }
+}
+
 // Returns false iff a diagnostic was reported and the build must stop.
 [[nodiscard]] bool bindAsmExternImports(std::vector<ExternImport>& externs,
                                         CompilationUnit const&     cu,
@@ -3885,8 +3893,23 @@ namespace {
             if (!e.libraryPath.empty()) continue;
             auto const it = bySymbol->find(e.mangledName);
             if (it == bySymbol->end()) continue;
+            // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: an assembly unit's
+            // extern is subject to the SAME agreement rule as a C one — the
+            // storage duration a definition has is a property of the DEFINITION,
+            // not of the language that wrote the reference. `.s` has no
+            // `_Thread_local` spelling to carry, so `isThreadLocal` is false on
+            // every row here and the rule reduces to "an assembly extern may not
+            // name a library thread-local" — which is the correct answer while
+            // no assembly surface can request the thread-pointer-relative access
+            // such a symbol needs.
+            if (ffi::reportLibraryThreadStorageDisagreement(
+                    e.mangledName, it->second.library, it->second.kind,
+                    e.isThreadLocal, reporter)) {
+                continue;   // left unbound behind a reported Error
+            }
             e.libraryPath = it->second.library;
             e.version     = it->second.version;
+            decideKindFromTheDefinition(e, it->second.kind);
         }
     }
 
@@ -3996,6 +4019,10 @@ namespace {
         if (lib == row->row.library.end() || lib->second.empty()) continue;
         e.libraryPath = lib->second;
         e.version     = row->row.version;
+        // The corpus row IS the platform's definition, and it states its kind
+        // (an ExternFunction or an ExternGlobal).
+        decideKindFromTheDefinition(e, row->row.isFunction ? ffi::SymbolKind::Function
+                                                           : ffi::SymbolKind::Object);
         // ⚠ `mangledName` IS NOT REWRITTEN, and a `linkName` row is REFUSED
         // rather than silently re-spelled. `ShippedSymbolRealization::linkName`
         // replaces the C identifier a C declaration would have been decorated
@@ -4104,8 +4131,11 @@ assembleAsmUnit(CompilationUnit const&     cu,
     AssembledModule merged;
     merged.cuId = cu.id();
     for (auto const& tree : cu.trees()) {
+        // P68 round 9: the format kind, ONLY as a key into the dialect's
+        // `symbolParts` / `impliedSymbolPart` (`:lo12:` on ELF, `@PAGEOFF` on
+        // Mach-O — each reference reads only its own format's spelling).
         auto lowered = lowerAsmTextToLir(tree, grammar, target, entryNames,
-                                         reporter);
+                                         reporter, format.kind());
         if (!lowered) return std::nullopt;
 
         // D-ASM-EXTERN-CALL-CANNOT-BIND-A-LIBRARY +
@@ -4187,8 +4217,7 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "function #{}, but this unit assembled {} "
                            "function(s) — the assembly lowering and the "
                            "assembler disagree about this file's function list "
-                           "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-"
-                           "OFFSET)",
+                           "(D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.funcIndex, assembled.functions.size()));
                 return std::nullopt;
             }
@@ -4204,8 +4233,8 @@ assembleAsmUnit(CompilationUnit const&     cu,
                            "a data slot takes the address of a label whose "
                            "basic block (id {}) the assembler published no byte "
                            "offset for — the relocation would name a symbol "
-                           "with no address (D-ASM-INTERIOR-LABELS-NOT-"
-                           "ADDRESSABLE-AT-AN-OFFSET)",
+                           "with no address ("
+                           "D-ASM-INTERIOR-LABELS-NOT-ADDRESSABLE-AT-AN-OFFSET)",
                            b.lirBlockV));
                 return std::nullopt;
             }

@@ -385,25 +385,17 @@ TEST(PeObjectDataImportSlotDriver, StrongFunctionImportKeepsItsDirectReference) 
 #if defined(_WIN32)
 namespace {
 
-// The vcvars64-entered link.exe environment. LOCATING it is
-// `test_support::native_probe::locateMsvcToolchain`'s job — the ONE implementation, shared
-// with the ABI conformance witnesses; this only USES what it returns.
-struct MsvcEnv {
-    fs::path vcvars;
-    fs::path work;
-    [[nodiscard]] bool run(std::string const& cmdline) const {
-        auto const bat = work / "dss_p54_rp_link.bat";
-        {
-            std::ofstream b{bat};
-            b << "@echo off\r\n"
-              << "call \"" << vcvars.string() << "\" >nul 2>&1\r\n"
-              << "cd /d \"" << work.string() << "\"\r\n"
-              << cmdline << " >nul 2>&1\r\n";
-        }
-        std::string const sys = "\"\"" + bat.string() + "\"\"";
-        return std::system(sys.c_str()) == 0;
-    }
-};
+// The link.exe / cl.exe these witnesses drive: LOCATING the installation is
+// `test_support::native_probe::locateMsvcToolchain`'s job and ENTERING its developer
+// environment is `native_probe::msvcToolsIn`'s — both in `native_c_probe.hpp`, once per
+// process, shared with the COFF reader's witnesses and the ABI probes.
+//
+// ★★ THIS FILE USED TO CARRY ITS OWN `MsvcEnv`, a batch that CALLed vcvars64.bat in a FRESH
+// cmd.exe for EVERY tool line — 10 entries per run, 1.2–2.4 s each alone and 3.9–16.2 s
+// beside a concurrent build (✔MEASURED by lane mig, 2026-09-19), which is how this entry
+// timed out at 315 s in a gate run beside another lane's build. Every `env.run(...)` below
+// is still the same command line, in the same directory, asserted the same way;
+// `MsvcDeveloperEnvironment` below pins the count.
 
 // mingw `ld` reached through the `gcc` on PATH. PRESENT is not USABLE: a shim
 // with no toolchain behind it counts as ABSENT, so the probe proves it can
@@ -433,6 +425,46 @@ struct MingwLd {
 
 }  // namespace
 
+// ── THE COST PIN: the developer environment is entered ONCE per process ──
+//
+// COUNTED, NEVER TIMED. This file's native witnesses cost the number of vcvars64.bat
+// entries they made (10 per run) times a price that load multiplies; this pins the NUMBER,
+// which no machine's speed can move. Two tool lines in two different scratch directories
+// stand in for two cases, so a helper that re-entered per LINE (the old `MsvcEnv`) or per
+// DIRECTORY is red here whichever cases ran before it and in whatever order — the tallies
+// belong to the process. vswhere is counted too: it used to start once per case.
+TEST(MsvcDeveloperEnvironment, IsEnteredOncePerProcessAndHandedToEveryTool) {
+    test_support::ScratchDir first{test_support::Location::InsideRepo, "pe-import-slot"};
+    test_support::ScratchDir second{test_support::Location::InsideRepo, "pe-import-slot"};
+    auto const msvc = test_support::native_probe::locateMsvcToolchain(first.path());
+    if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
+    ASSERT_TRUE(msvc.ok()) << msvc.describe();
+    auto const again = test_support::native_probe::locateMsvcToolchain(second.path());
+    ASSERT_TRUE(again.ok()) << again.describe();
+
+    auto const inFirst = test_support::native_probe::msvcToolsIn(msvc, first.path());
+    ASSERT_TRUE(inFirst.ready()) << inFirst.describe();
+    auto const inSecond = test_support::native_probe::msvcToolsIn(again, second.path());
+    ASSERT_TRUE(inSecond.ready()) << inSecond.describe();
+    { std::ofstream f{first.path() / "once.c"};  f << "int once_first(void) { return 1; }\n"; }
+    { std::ofstream f{second.path() / "once.c"}; f << "int once_second(void) { return 2; }\n"; }
+    ASSERT_TRUE(inFirst.run("cl /nologo /c once.c")) << "cl must compile in the FIRST directory";
+    ASSERT_TRUE(inSecond.run("cl /nologo /c once.c")) << "cl must compile in the SECOND directory";
+    // Each line ran where it was sent — the `cd /d` the old batch spelled on its own line.
+    EXPECT_TRUE(fs::exists(first.path() / "once.obj"));
+    EXPECT_TRUE(fs::exists(second.path() / "once.obj"));
+
+    EXPECT_EQ(test_support::native_probe::msvcEnvironmentEntries(), 1u)
+        << "this process entered vcvars64.bat "
+        << test_support::native_probe::msvcEnvironmentEntries()
+        << " time(s). Each entry is a fresh cmd.exe running the whole VS developer-prompt "
+           "setup, the cost that timed this suite out under load; ONE per process is the "
+           "design, and 0 would mean the tally no longer sees the entry at all.";
+    EXPECT_EQ(test_support::native_probe::msvcToolchainQueries(), 1u)
+        << "this process asked vswhere " << test_support::native_probe::msvcToolchainQueries()
+        << " time(s); an installation cannot move mid-process, so ONE is the design.";
+}
+
 TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAnUnresolvedWeakDataImport) {
     test_support::ScratchDir scratch{test_support::Location::InsideRepo,
                                      "pe-import-slot"};
@@ -440,7 +472,8 @@ TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAnUnresolvedWeakDataImport
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, "wkdata", kWeakDataImportSource, rep);
@@ -512,7 +545,8 @@ TEST(PeObjectDataImportSlotNative, TwoObjectsImportingOneNameFoldTheirSlots) {
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const a1 = buildObj(dir, "slota",
@@ -552,7 +586,8 @@ TEST(PeObjectDataImportSlotNative, ADefinitionPresentResolvesThroughTheSlot) {
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, "wkdata", kWeakDataImportSource, rep);
@@ -589,7 +624,8 @@ TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAnUnresolvedWeakFunctionIm
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, "wkfn", kWeakFunctionImportSource, rep);
@@ -654,7 +690,8 @@ TEST(PeObjectDataImportSlotNative, AFunctionDefinitionPresentResolvesThroughTheS
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, "wkfn", kWeakFunctionImportSource, rep);
@@ -695,7 +732,8 @@ TEST(PeObjectDataImportSlotNative, LinkExeLinksAndRunsAStrongFunctionImportDirec
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, "stfn", kStrongFunctionImportSource, rep);
@@ -743,7 +781,8 @@ TEST(PeObjectDataImportSlotNative, AStrongFunctionImportWithNoDefinitionIsRefuse
     auto const msvc = test_support::native_probe::locateMsvcToolchain(dir);
     if (msvc.toolAbsent()) GTEST_SKIP() << msvc.detail;
     ASSERT_TRUE(msvc.ok()) << msvc.describe();
-    MsvcEnv const env{msvc.vcvars, dir};
+    auto const env = test_support::native_probe::msvcToolsIn(msvc, dir);
+    ASSERT_TRUE(env.ready()) << env.describe();
 
     DiagnosticReporter rep;
     auto const obj = buildObj(dir, "stfn", kStrongFunctionImportSource, rep);

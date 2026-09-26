@@ -110,6 +110,8 @@ constexpr std::string_view kElfMinimal = R"({
     "kind": "elf"
   },
   "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+  "relocationAddends": "explicit",
+  "inputSectionPlacement": "unit",
   "relocations": [
     { "name": "R_X86_64_PC32",  "kind": 1, "nativeId": 2 },
     { "name": "R_X86_64_PLT32", "kind": 2, "nativeId": 4 }
@@ -218,6 +220,62 @@ TEST(ObjectFormatSchemaLoader, ShippedFormatsDeclareTheAbiTruthTable) {
     }
 }
 
+// ── P68 round 12 (lane `cs`): the optional `enumCompatibleTypeRule` axis ──
+//
+// Which integer type an enumeration without a fixed underlying type is compatible
+// with is the platform ABI's choice (C 6.7.2.2p4): `int` on the Microsoft x64 ABI
+// ("msvc"), `unsigned int` for a non-negative enumeration on SysV / AAPCS / Darwin
+// ("gnu"). RED-ON-DISABLE: drop the loader's arm and every spelling reads `None`.
+TEST(ObjectFormatSchemaLoader, EnumCompatibleTypeRuleParsesClosedSet) {
+    struct Row { char const* spelling; EnumCompatibleTypeRule expected; };
+    for (Row const row : {Row{"msvc", EnumCompatibleTypeRule::Msvc},
+                          Row{"gnu", EnumCompatibleTypeRule::Gnu}}) {
+        std::string json{kElfMinimal};
+        json.insert(json.rfind('}'),
+                    std::string{",\"enumCompatibleTypeRule\":\""} + row.spelling + "\"");
+        auto r = ObjectFormatSchema::loadFromText(json);
+        ASSERT_TRUE(r.has_value()) << row.spelling;
+        EXPECT_EQ((*r)->enumCompatibleTypeRule(), row.expected) << row.spelling;
+    }
+    // Omission = None (the honest undeclared state — wasm/spirv).
+    auto r = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->enumCompatibleTypeRule(), EnumCompatibleTypeRule::None);
+}
+
+TEST(ObjectFormatSchemaLoader, UnknownEnumCompatibleTypeRuleRejected) {
+    // A typo'd spelling is a HARD reject — silently un-declaring the rule would
+    // turn every enumeration without a fixed type on the format into a spurious
+    // S_EnumCompatibleTypeRuleUndeclared; a non-string is refused the same way.
+    for (char const* bad : {"\"gcc\"", "\"\"", "1"}) {
+        std::string json{kElfMinimal};
+        json.insert(json.rfind('}'), std::string{",\"enumCompatibleTypeRule\":"} + bad);
+        EXPECT_FALSE(ObjectFormatSchema::loadFromText(json).has_value()) << bad;
+    }
+}
+
+TEST(ObjectFormatSchemaLoader, ShippedFormatsDeclareTheEnumCompatibleTypeRule) {
+    // pe64 follows the Microsoft x64 ABI (beside its `msvc_straddle` bit-fields and
+    // `f64` long double); every ELF and Mach-O format the SysV / AAPCS / Darwin one;
+    // the wasm / spirv skeletons OMIT it, as they omit `longDoubleFormat`.
+    struct Row { char const* name; EnumCompatibleTypeRule expected; };
+    for (Row const row : {
+             Row{"pe64-x86_64-windows-exec", EnumCompatibleTypeRule::Msvc},
+             Row{"pe64-x86_64-windows", EnumCompatibleTypeRule::Msvc},
+             Row{"pe64-x86_64-windows-dll", EnumCompatibleTypeRule::Msvc},
+             Row{"pe64-x86_64-windows-staticlib", EnumCompatibleTypeRule::Msvc},
+             Row{"macho64-arm64-darwin-exec", EnumCompatibleTypeRule::Gnu},
+             Row{"macho64-x86_64-darwin", EnumCompatibleTypeRule::Gnu},
+             Row{"elf64-x86_64-linux-exec", EnumCompatibleTypeRule::Gnu},
+             Row{"elf64-aarch64-linux", EnumCompatibleTypeRule::Gnu},
+             Row{"wasm32-v1", EnumCompatibleTypeRule::None},
+             Row{"spirv-1.6", EnumCompatibleTypeRule::None}}) {
+        auto r = ObjectFormatSchema::loadShipped(row.name);
+        ASSERT_TRUE(r.has_value()) << row.name;
+        EXPECT_EQ((*r)->enumCompatibleTypeRule(), row.expected) << row.name;
+    }
+}
+
 // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 relocatable +
 // static-archive formats declare `externAddrBinding: "got"` AND the two
 // GOT-address reloc rows (R_AARCH64_ADR_GOT_PAGE kind 7 nativeId 311,
@@ -276,6 +334,8 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "got",
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[ {"name":"r","kind":1,"nativeId":1} ]
     })");
     ASSERT_TRUE(ok.has_value());
@@ -296,6 +356,8 @@ TEST(ObjectFormatSchemaLoader, ExternAddrBindingRoundTripAndRejectsUnknown) {
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 183 },
       "externAddrBinding": "plt",
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[ {"name":"r","kind":1,"nativeId":1} ]
     })");
     EXPECT_FALSE(bad.has_value())
@@ -321,6 +383,8 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_FOO","kind":1,"nativeId":1},
         {"name":"R_FOO","kind":2,"nativeId":2}
@@ -353,6 +417,8 @@ TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"$comment":"prose is always allowed",
                       "name":"R_OK","kind":1,"nativeId":1,"isCall":true}]
     })");
@@ -370,6 +436,8 @@ TEST(ObjectFormatSchemaLoader, UnknownRelocationRowKeyRejected) {
       "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_TYPO","kind":1,"nativeId":1,"iscall":true}]
     })");
     ASSERT_FALSE(r.has_value())
@@ -395,6 +463,8 @@ TEST(ObjectFormatSchemaLoader, ZeroKindRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_BAD","kind":0,"nativeId":1}]
     })");
     ASSERT_FALSE(r.has_value())
@@ -417,6 +487,8 @@ TEST(ObjectFormatSchemaLoader, DuplicateRelocationKindRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_A","kind":7,"nativeId":1},
         {"name":"R_B","kind":7,"nativeId":2}
@@ -507,6 +579,8 @@ TEST(ObjectFormatSchemaLoader, RelocationsNotArrayRejected) {
   "headerNameMatching": "case-sensitive",
       "format": {"name":"x","kind":"elf"},
       "elf": {"class":"elf64","data":"lsb","machine":62},
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": "oops"
     })");
     ASSERT_FALSE(r.has_value()) << "'relocations' as a non-array must reject";
@@ -800,6 +874,8 @@ TEST(LibrarySynthesis, UnknownVehicleRejected) {
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": [],
       "runtimeLibraries": [{"role":"cLibrary","image":"libc.so.6"}],
       "librarySynthesis": { "vehicle": "bogus", "role": "cLibrary" }
@@ -827,6 +903,8 @@ TEST(LibrarySynthesis, MissingRoleRejected) {
       "headerNameMatching": "case-sensitive",
       "format": { "name": "x", "version": "1.0", "kind": "elf" },
       "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations": [],
       "$runtimeLibrariesComment": "DELIBERATELY ABSENT. Declaring a row here would add a SECOND error -- the loader also rejects a role-table row NO block names -- and both would trace to this fixture's ONE property (the missing role), so the test would stop pinning a single defect. Absent, the only complaint is the omitted `role`, which is exactly what this test is for.",
       "librarySynthesis": { "vehicle": "pthread" }
@@ -2640,6 +2718,14 @@ TEST(FormatPredefinedMacros, EntryUnknownKeyRejectedAndNamed) {
 // RED-ON-DISABLE: delete the `predefinedMacros` key from any single LP64
 // `.format.json` (its leg reds), or add it to any pe64/wasm/spirv file (that leg
 // reds). MEASURED both ways during TF-C97.
+//
+// ⓘ P68 round 8: for part of that round each format that realizes `long
+// double` also carried a `__SIZEOF_LONG_DOUBLE__` constant, and this test
+// peeled it off before the data-model checks. That row is GONE — the size is
+// now the C language's `type-size` row, derived per pair from the type
+// (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING) — so the format documents are
+// back to carrying the data model alone, and "a pe64 file has no rows" is
+// again the LLP64 negative, checked below unchanged from TF-C97.
 TEST(FormatPredefinedMacros, ShippedPopulationFollowsDataModelNotFormatName) {
     constexpr std::string_view kAll[] = {
         "elf64-aarch64-linux-dyn",      "elf64-aarch64-linux-exec",

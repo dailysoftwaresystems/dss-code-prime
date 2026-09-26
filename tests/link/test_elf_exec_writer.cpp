@@ -1292,6 +1292,8 @@ TEST(ElfExecFormatJson, BindNowDefaultsToTrue) {
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_TRUE(r.has_value());
@@ -1331,6 +1333,8 @@ TEST(ElfExecWriter, BindNowFalseFailsLoudCitingDLK611) {
         {"kind":"strtab","name":".strtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0},
         {"kind":"shstrtab","name":".shstrtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_X86_64_PC32","kind":1,"nativeId":2},
         {"name":"R_X86_64_64","kind":2,"nativeId":1},
@@ -2291,6 +2295,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_TRUE(fmt.has_value())
@@ -2349,6 +2355,8 @@ TEST(ElfExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "entryCallingConvention": "sysv_amd64",
       "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"exec", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
       "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4198400}],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"R_X86_64_PC32","kind":1,"nativeId":2}]
     })");
     ASSERT_TRUE(declared.has_value());

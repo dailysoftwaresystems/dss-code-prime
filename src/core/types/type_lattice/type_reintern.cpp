@@ -732,10 +732,22 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
             reinternFatal(kind, "is a qualifier skin and must be re-interned via the "
                                 "strip-and-rewrap path, not the operand-DAG switch");
 
-        // ── enum: NO operands; name + scalars=[(int)underlyingTypeKind] ──
+        // ── enum: name + scalars=[(int)underlyingTypeKind]; operands=[the FIXED
+        //    underlying type as declared] for an enum that has one (C23 6.7.2.2,
+        //    `enum E : long`), else none. P68 round 12 (lane `cs`): the operand is
+        //    re-interned like any other (`ops`), so a merged module keeps the NAME
+        //    the enum's rank is decided by; rebuilding from the kind alone would
+        //    mint a second, operand-less enum TypeId beside the source's.
+        //    The enumeration P1: an enum whose compatible type was CHOSEN
+        //    (scalars=[kind, 1]) keeps that origin too — dropping it would re-intern
+        //    the chosen type as a FIXED one, a different enumeration (C23 6.2.7p1). ──
         case TypeKind::Enum:
             result = dst.enumType(src.name(srcId),
-                                  static_cast<TypeKind>(srcScalar[0]));
+                                  static_cast<TypeKind>(srcScalar[0]),
+                                  ops.empty() ? InvalidType : ops[0],
+                                  srcScalar.size() == 2 && srcScalar[1] == 1
+                                      ? TypeInterner::EnumUnderlyingOrigin::Chosen
+                                      : TypeInterner::EnumUnderlyingOrigin::Fixed);
             break;
 
         // ── fnSig: operands=[result, params...]; scalars=[(int)cc] or

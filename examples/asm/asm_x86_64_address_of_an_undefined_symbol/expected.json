@@ -1,0 +1,42 @@
+{
+  "$comment": "★★★ A `.s` MAY NAME, BY ADDRESS, A SYMBOL IT DOES NOT DEFINE (P68 round 9, D-ASM-ADDRESS-OPERAND-CANNOT-NAME-AN-UNDEFINED-SYMBOL). The import is minted with its code-vs-data kind PENDING, and the link takes the kind from the definition it resolves to, as ld does. Here that definition is a SIBLING unit: the reference-built archive below, from `int sib_data[2] = {30, 10}; int sib_fn(void) { return 2; }`. ✔MEASURED 2026-09-23: gas writes R_X86_64_PC32 for both `leaq sib_data(%rip)` and `leaq sib_fn(%rip)` and R_X86_64_64 for `.quad sib_fn`, stating no kind, and gcc -no-pie and -pie run this file with the archive to 42. At the tranche-1 fold DSS refused it ('.quad' names 'sib_fn', which this file defines no label for). Now pe64 (native) and ELF x86_64 run to 42. The `release` arm pins that naming the release pipeline does not break the assembly path; an assembly source has nothing for it to transform.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ],
+      "prebuiltLibraries": [
+        {
+          "$comment": "mingw-w64 gcc 13.2.0 `-O2 -c` + x86_64-w64-mingw32-ar `rcs`. The witness is the definition's own name.",
+          "path": "tests/link/data/libasm_sibling_definitions_x86_64_pe.a",
+          "containerWitness": "sib_data"
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13 `-O2 -c` + `ar rcs`. The witness is the definition's own name.",
+          "path": "tests/link/data/libasm_sibling_definitions_x86_64_elf.a",
+          "containerWitness": "sib_data"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

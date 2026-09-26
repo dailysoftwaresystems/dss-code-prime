@@ -3,7 +3,8 @@
 // ★★★ THE COVERAGE BOUNDARY BETWEEN THE TWO CORPUS RUNNERS — STATED, EMITTED
 // AND JUDGED IN ONE PLACE.
 //
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// The CLI-subprocess runner builds only the spec THIS host can execute, so a
+// capability one runner sees can be invisible to the other.
 //
 // ── THE BOUNDARY, AS A SENTENCE ──────────────────────────────────────────────
 //
@@ -19,7 +20,7 @@
 //
 // The rule this project holds — a capability change must reach BOTH example
 // runners, because one enforcing while its sibling shrugs is a silent harness
-// bug ([[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]]) — has a MEASURED exception
+// bug, and the two runners must AGREE — has a MEASURED exception
 // that was never written down. ✔MEASURED by the P30 asm lane and re-measured
 // here: a red-on-disable mutant that dropped arm64's width-view letter was
 // caught by one runner and not the other, because the CLI-subprocess runner

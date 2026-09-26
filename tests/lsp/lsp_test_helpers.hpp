@@ -102,12 +102,13 @@ private:
 // client messages, then calls `runUntilExit()` to await server
 // teardown and return the exit code. Move-only; one harness per
 // test.
-// The stack the harness gives the server loop. 8 MiB is the DOCUMENTED main-
-// thread default on both POSIX hosts this project gates on, and production runs
-// `server.run()` on main -- so this is not a generous number, it is the number
-// the emulated thread already had. Reserved, not committed: a shallow run
-// touches about one page of it.
-inline constexpr std::size_t kServerLoopStackBytes = 8u * 1024u * 1024u;
+// The stack the harness gives the server loop. Production runs `server.run()` on
+// main, so the emulated thread gets the main thread's stack — the ONE constant
+// the substrate states for every thread doing main-thread work (the executor's
+// workers included), 8 MiB, the DOCUMENTED main-thread default on both POSIX
+// hosts this project gates on. Reserved, not committed: a shallow run touches
+// about one page of it.
+inline constexpr std::size_t kServerLoopStackBytes = substrate::kMainThreadClassStackBytes;
 
 class LspTestHarness {
 public:
@@ -125,8 +126,8 @@ public:
         // (cycle P34): `buildSchemaFromJsonText` compiles to a **415,360-byte**
         // frame under clang -O0, so all four LSP binaries died `Bus error` on macOS
         // and passed everywhere else. The harness was emulating an 8 MiB thread
-        // with 1/16th of its stack.
-        // D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK
+        // with 1/16th of its stack: this harness ran the server loop on the
+        // HOST'S DEFAULT stack instead of the one production gives it.
         , serverThread_(kServerLoopStackBytes, [this] {
               // Nothing may escape a thread entry, and a `run()` that threw would
               // otherwise leave the promise unsatisfied -- which `runUntilExit`
@@ -199,7 +200,8 @@ public:
     // expected EXIT CODE, so a bare -1 reads as `Which is: -1` — a wrong exit
     // status, which is not what happened. The added failure names the real event;
     // the -1 return is kept so no call site has to change.
-    // D-TEST-LSP-WAIT-DEADLINE-IS-SIZED-FOR-AN-IDLE-HOST
+    // ⚠ The default comes from the shared cap, never from a local literal: a
+    // wait deadline sized for an IDLE host reds on a loaded one.
     [[nodiscard]] int runUntilExit(
         std::chrono::seconds timeout = dss::test_support::kWaitBudget) {
         if (exitFuture_.wait_for(timeout) != std::future_status::ready) {

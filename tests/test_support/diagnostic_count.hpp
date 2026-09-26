@@ -20,7 +20,7 @@
 // hoist threshold). Pure read over the reporter's span — no state,
 // no per-consumer variance.
 //
-// Anchored D-TEST-DIAG-SEVERITY-EXACT-PIN (0f7d714 audit-fold
+// Anchored PIN-TEST-DIAG-SEVERITY-EXACT-PIN (0f7d714 audit-fold
 // 2026-06-01): the `sawX bool + EXPECT_EQ severity + EXPECT_EQ
 // errorCount` pattern at
 // tests/ffi/test_binary_reader.cpp::Elf64PartialCorruptionFires...

@@ -144,7 +144,7 @@ struct DSS_EXPORT ConfigDocumentDependency {
 // recorded verbatim from the loader that already resolved it, and re-read under
 // that exact spelling — so this file has no path IDENTITY question to answer
 // and deliberately owns no `<filesystem>` of its own
-// (`scripts/check-path-identity` names the rule).
+// (`.harness-config/runner/actions/check-path-identity` names the rule).
 [[nodiscard]] DSS_EXPORT std::optional<std::string>
 digestConfigDocumentFile(std::string_view path);
 

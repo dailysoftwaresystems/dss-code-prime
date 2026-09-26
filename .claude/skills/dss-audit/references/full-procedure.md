@@ -2,7 +2,7 @@
 
 ## A. The bar it judges against — NON-NEGOTIABLE
 
-These are the same six non-negotiables `dss-cycle` builds to (§A there). The auditor's job is to
+These are the same seven non-negotiables `dss-cycle` builds to (§A there). The auditor's job is to
 **confirm each held, by evidence** — not to trust that it did.
 
 1. **Source / target / linker agnostic.** No identity branch in shared substrate — never
@@ -23,6 +23,10 @@ These are the same six non-negotiables `dss-cycle` builds to (§A there). The au
    ways this hides).
 6. **The full gate held:** build green · full ctest green · anchor-registry guard OK · agnosticism
    scan clean · review folded · **and all CI legs green, not just local** (§F).
+7. **No un-anchored issue.** Every issue the cycle came across is ANCHORED — a real registry row, committed
+   in the same cycle — AND handled: fixed, or pinned as a genuine deferral behind a named blocker or an
+   unfired trigger. A workaround that hides an issue (a masked test, a swallowed error, "green on the other
+   leg") breaks it, and so does a row for work the cycle could have done instead (the quick-fix rule).
 
 **The auditor's own meta-rule:** it holds itself to the same standard — it never reports "clean"
 on something it has not independently verified (§B).
@@ -88,9 +92,10 @@ proof, absent hardening, or a test that stays green on a silently-broken impl �
 Render the verdict in the §G shape (verified-clean vs green-but-rule-breaking vs unverified). For
 every green-but-rule-breaking or unverified item, author the implementer prompt that closes it (§H).
 
-### Pre-build variant — the plan-lock design review (`dss-cycle` Step 3.5)
+### Pre-build variant — the plan-lock design review (`dss-cycle` step 4)
 The steps above audit *committed code*; the same bar also judges a **plan before it is built** — the
-gate `dss-cycle` runs at its Step 3.5, and the mode this skill applied to the linkage P1+P2 plan
+gate `dss-cycle` runs at its step 4 (Step 3.5 in its older numbering), and the mode this skill applied
+to the linkage P1+P2 plan
 (2026-06-04). What changes:
 
 - **No battery.** Nothing is built, so §D (build/ctest) does not apply. Apply the bar (§A), the

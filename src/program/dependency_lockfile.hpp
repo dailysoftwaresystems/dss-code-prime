@@ -108,15 +108,22 @@ public:
     // leaves a window in which the path holds neither the old nor the new
     // document, so a Ctrl-C or a full disk in that window would leave the
     // project unbuildable until the operator finds and deletes a file inside a
-    // git-ignored directory they have never heard of. `rename` is
-    // replace-in-one-step on every host we build for (`MoveFileExW` with
-    // `MOVEFILE_REPLACE_EXISTING` on Windows, `::rename` on POSIX), so the path
-    // always holds ONE COMPLETE DOCUMENT — the old one or the new one.
+    // git-ignored directory they have never heard of. The commit is
+    // `linker::detail::commitReplacing` — `rename(2)` on POSIX, a
+    // POSIX-semantics replace on Windows that a real-time scan of the previous
+    // lockfile cannot refuse — so the path always holds ONE COMPLETE DOCUMENT:
+    // the old one or the new one.
     //
-    // The temp file sits beside the lockfile (same directory, so the rename is
-    // same-volume and cannot degrade into a copy) under a FIXED name: a crashed
-    // build leaves exactly one stale scratch file that the next build
-    // overwrites, rather than an accumulating pile of uniquely-named ones.
+    // The scratch file sits beside the lockfile (same directory, so the rename
+    // is same-volume and cannot degrade into a copy) under a UNIQUE name,
+    // `<lock>.tmp-<pid>-<n>`, CLAIMED with an exclusive create
+    // ([[D-DEPS-LOCKFILE-STAGES-THROUGH-ONE-FIXED-TEMP-NAME]]). It used to be one
+    // FIXED name opened truncating, chosen so a crashed build would leave exactly
+    // one stale file; two builds saving at once then wrote the SAME file, and a
+    // torn document could be committed (✔MEASURED: 3500 unparseable commits in
+    // 30 s of two concurrent writers). A claimed name is never shared and never
+    // truncated; the price is one harmless, never-adopted stale file per save a
+    // killed build interrupted.
     //
     // Failure is reported as `D_OutputDirCreateFailed`. That code is the
     // driver's own "mkdir failure", split out of `D_FileNotFound` precisely so a

@@ -27,9 +27,8 @@ namespace {
 //
 // ★★★ THE PREDICATE ITSELF LIVES IN `lir_pass_util`, AND THAT IS THE POINT.
 // It has a second consumer — `censusIdentityClassMoves`, the stage-boundary
-// instrument that attributes this population per PASS
-// (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT). A census
-// that re-implemented the rule would measure a population the rule does not
+// instrument that attributes this population per PASS. A census that
+// re-implemented the rule would measure a population the rule does not
 // act on, which is exactly the failure that left the header's callconv claim
 // unfalsifiable for a cycle. One owner; the census reports the verdict this
 // function acts on, by construction.
@@ -89,7 +88,7 @@ isRedundantCopy(Lir const& src, LirInstId inst, TargetSchema const& schema,
 // of — 37 of 37 (arm64) and 39 of 39 (x86_64) surviving identity class moves
 // are refused by the width test and by nothing else, and ZERO deletable ones
 // survive to the encoder on either target. See the header's ATTRIBUTION
-// section (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+// section.
 
 // ── RULE R2 — FALLTHROUGH-BRANCH ELISION (D-OPT-JCC-FALLTHROUGH) ────────
 //
@@ -113,24 +112,18 @@ isElidableFallthroughBranch(Lir const& src, LirBlockId blk, LirInstId inst,
                             std::optional<LirBlockId> nextBlock,
                             TargetSchema const& schema) {
     // The LAST block of a function has no next-laid-out block, so its
-    // fallthrough edge has nowhere to fall to and must stay materialized.
-    if (!nextBlock.has_value()) return false;
-    auto const* info = schema.opcodeInfo(src.instOpcode(inst));
-    if (info == nullptr || !info->isTerminator()) return false;
-
-    auto const ops   = src.instOperands(inst);
-    auto const succs = src.blockSuccessors(blk);
-    if (ops.empty() || ops.size() != succs.size()) return false;
-    for (std::size_t k = 0; k < ops.size(); ++k) {
-        if (ops[k].kind != LirOperandKind::BlockRef) return false;
-        if (ops[k].blockSlot != succs[k].v) return false;
-    }
-    if (succs.back().v != nextBlock->v) return false;
-
-    // ★★★ AND ONLY IF THE TARGET SAYS SO. One owner for that question, shared
-    // with the verifier arm that has to bless the result.
-    return lir_pass_util::declaresFallthroughBranchForm(
-        schema, src.instOpcode(inst), ops.size());
+    // fallthrough edge has nowhere to fall to and must stay materialized
+    // (`nextBlock` is nullopt there, which the shared predicate refuses).
+    //
+    // ★★★ AND ONLY IF THE TARGET SAYS SO. The whole question — the operand list
+    // agreeing with the successor list, the last successor being the next block,
+    // and the target declaring the shorter form — has ONE owner,
+    // `lir_pass_util::canElideFallthroughOperand`, shared with the verifier arm
+    // that has to bless the result and (P68 round 8 part 4) with the asm-region
+    // expansion, which lays out a template's blocks after this pass ran.
+    return lir_pass_util::canElideFallthroughOperand(
+        schema, src.instOpcode(inst), src.instOperands(inst),
+        src.blockSuccessors(blk), nextBlock);
 }
 
 // Rewrite ONE function into `b`, dropping the instructions R1 proves
@@ -259,8 +252,7 @@ runLirPeephole(Lir const&          src,
 
     result.lir     = std::move(b).finish();
     result.rebuilt = true;
-    // ★ THE STAGE BOUNDARY THIS PASS DID NOT HAVE
-    // (D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT).
+    // ★ THE STAGE BOUNDARY THIS PASS DID NOT HAVE.
     // Env-gated and zero-cost when unset, like every other stage dump. Without
     // it the nearest boundaries either side of this pass were `post-rewrite`
     // and `post-callconv`, so ANY per-pass claim about the population R1 acts

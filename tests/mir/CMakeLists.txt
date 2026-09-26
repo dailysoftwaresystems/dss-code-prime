@@ -79,10 +79,9 @@ dss_add_test(NAME mir/test_mir_text_operand_forms SOURCES test_mir_text_operand_
 # D-ASM-IMMEDIATE-CONSTRAINT-FORM-NOT-REALIZED
 # D-MIR-LVALUE-REFUSAL-RENDERS-A-RAW-ORDINAL-NOT-A-NAME
 # ⚠ Those two ids sit on their own lines because an anchor id split across a
-# line break is invisible to every grep AND to the registry guard — the exact
-# defect D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP
-# records, and this comment carried an instance of it until the step-10 audit
-# found it. Break BEFORE an id or AFTER it, never inside it.
+# line break is invisible to every grep AND to the registry guard — and this
+# comment carried an instance of exactly that until the step-10 audit found it.
+# Break BEFORE an id or AFTER it, never inside it.
 # The `"i"` IMMEDIATE constraint at the tier that owns
 # the two facts nothing below it can recover: the CONSTANT PROOF (gcc refuses a
 # non-constant with "impossible constraint in 'asm'", and so must this) and the
@@ -112,6 +111,32 @@ dss_add_test(NAME mir/test_mir_text_global_attrs
 dss_add_test(NAME mir/test_mir_text_unsealed_block
              SOURCES test_mir_text_unsealed_block.cpp)
 
+# P68 round 8 (lane `ht`, part 1b): EVERY `MirInst` field survives a `.dssir`
+# round trip — the writer printed no instruction flag and no secondary payload
+# (an alloca's alignment, an atomic access's provable alignment), and read them
+# back as the defaults with `ok == true`. A field-by-field comparison per reader
+# arm, and a `sizeof(MirInst)` assertion that refuses to compile until a NEW
+# field is covered too.
+dss_add_test(NAME mir/test_mir_text_instruction_fields
+             SOURCES test_mir_text_instruction_fields.cpp)
+
+# P68 round 8 (lane `ht`, part 1b): the `.dssir` reader RETURNS on every input.
+# The measured table of shapes that used to abort, hang or read clean; a sweep
+# of every truncation and every single-token deletion of a golden module, each
+# announced on stderr before it is parsed so an abort or a timeout names it; and
+# the cascade pin — one bad block costs its own diagnostic, later blocks are read.
+dss_add_test(NAME mir/test_mir_text_reader_never_aborts
+             SOURCES test_mir_text_reader_never_aborts.cpp)
+
+# P68 round 8 lane `ht` part 1d: the `.dssir` v2 `types` table — a composite is
+# `type <H>`, defined ONCE with every layout channel through the ONE owner both text
+# tiers share. The cycle (a linked-list node and a mutual pair round-trip), the
+# layout (every channel and the computed layout read back equal), the size (a graph
+# mentioned N times is defined once), each refusal by name, the spelling the HIR v5
+# table shares, and the `.dss.mir` body a module holding a linked list now encodes.
+dss_add_test(NAME mir/test_mir_text_types_table
+             SOURCES test_mir_text_types_table.cpp)
+
 # D-CSUBSET-C11-THREADS-MACHO-MTX-PLAIN-RECURSIVE + D-CSUBSET-C11-THREADS-MTX-PLAIN-RECURSIVE
 # (P51 lane mx): `mtx_init`'s C11 `type` argument. The macho recipe passed a NULL
 # mutexattr, so `mtx_init(&m, mtx_recursive)` yielded a NON-recursive Darwin mutex
@@ -125,6 +150,19 @@ dss_add_test(NAME mir/test_mir_text_unsealed_block
 # disagree three ways, so pe must keep NOT growing a recursion guard.
 dss_add_test(NAME mir/test_synth_threads_mtx_type
              SOURCES test_synth_threads_mtx_type.cpp)
+
+# P68 round 11 (D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the synthesis-once
+# rule: every body `synthesizeStdioShim` / `synthesizeThreadsShim` defines is Weak + Hidden, so
+# the copies separately compiled units carry collapse to one per image.
+dss_add_test(NAME mir/test_synth_shim_collapse_linkage
+             SOURCES test_synth_shim_collapse_linkage.cpp)
+
+# P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE, lane `lm`, fold S1b):
+# GNU `__builtin_unreachable()` ENDS its block with MIR's `Unreachable` terminator —
+# the C front end through MIR, and the pin a no-op lowering reds (the then-branch
+# would fall through to the join), whatever any example's exit code says.
+dss_add_test(NAME mir/test_builtin_unreachable_lowering
+             SOURCES test_builtin_unreachable_lowering.cpp)
 
 # P55 lane `rc` — "depth costs heap, not host call frames". Its OWN binary
 # because a red here is a STACK OVERFLOW, which kills the process and would take
@@ -142,3 +180,11 @@ dss_add_test(NAME mir/test_deep_nesting_costs_heap
 # nullopt arm cannot be green for a reason unrelated to the abort.
 dss_add_test(NAME mir/test_mir_try_accessors
              SOURCES test_mir_try_accessors.cpp)
+
+# P68 round 9 lane `lm` — D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED: a null
+# pointer or an integer address reaching a STATIC pointer object through a CHAIN of
+# pointer casts (`char *p = NULL;` with the references' `((void *)0)` is two) is
+# static data. Pinned at the MIR literal and at the static-data producer on every
+# real (target, format) pair, through the driver's own `buildCuMir`/`assembleUnit`.
+dss_add_test(NAME mir/test_static_pointer_cast_chain
+             SOURCES test_static_pointer_cast_chain.cpp)

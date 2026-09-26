@@ -1,4 +1,4 @@
-// FC6 (D-FF3-1): the aggregate-layout substrate witnessed end-to-end via
+// FC6 (D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS): the aggregate-layout substrate witnessed end-to-end via
 // `sizeof` — the classic alignment-padding + array-stride cases (the FAM case
 // lives in sizeof_flexible_array).
 //

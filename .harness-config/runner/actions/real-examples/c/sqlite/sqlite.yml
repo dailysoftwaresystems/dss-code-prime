@@ -1,0 +1,154 @@
+# PURPOSE: prove dsscp builds SQLite from its real sources into the Tcl testfixture and the sqlite3 CLI, and runs SQLite's own unit corpus green, for every declared target.
+name: sqlite
+description: >-
+  The real-example corpus harness: clone the repository and run ONE command to prove
+  DSS Code Prime builds SQLite from its REAL sources (no amalgamation) and runs
+  SQLite's own `.test` corpus green, for every leg `legs.json` declares, on whatever
+  host runs it. The driver documents itself in its own header (`build_and_test.py`,
+  and each step's module beside it); this file declares only how a runner starts the
+  driver and what witnesses that it ran.
+
+  ★ GROUPED, AND THE GROUP IS THE OPERATOR'S OWN SHAPE. This directory was
+  `real-examples/c/sqlite/` until 2026-09-18, when `real-examples/` and `scripts/`
+  stopped existing and every program moved under DssHarness's actions directory. The
+  action is `sqlite`; `real-examples` and `c` only group it (`dssharness help runners`:
+  directories above an action group actions and hold no file of their own name).
+
+  ★ ONE DRIVER ON EVERY HOST, SO ONE STEP ON EVERY LEG, AND NO `runOn`. Until
+  2026-09-21 this action started a POSIX shell driver and its PowerShell twin was run by
+  hand on Windows, because DssHarness then gave a step no platform selector. The
+  operator's order that no `.sh`/`.ps1` lives under the actions directory collapsed the
+  twins into one Python driver carrying the union of both drivers' checks, so the step
+  needs no selector: on a Windows host the driver runs its POSIX half (the sqlite
+  configure, the recipe derivation, the reference oracles) inside WSL through
+  `wsl.exe -e`, which is the only host switch it has.
+
+  ★ THREE MANUAL STEPS (P68 round 12: the first two 2026-09-25, the self-test 2026-09-26):
+  the round-close RECOMPILE, the speedtest1 BENCHMARK, and the action's own SELF-TEST.
+  Each is work a person used to start by hand -- a wrapper script outside the actions
+  directory for the recompile, the benchmark driver typed at a prompt, the self-tests
+  reachable only through ctest in a build tree -- and each is now a step a runner names
+  (`dssharness run sqlite-recompile`, `dssharness run speedtest1`, `dssharness run
+  sqlite-self-test`) or a run selects (`--manual-step <name>`). A plain run of this action
+  runs none of them, and says so (`unselectedSteps`).
+
+  ★ EVERY STEP'S KNOBS ARE ITS INPUTS, AND EVERY STEP'S dsscp IS THE LEG'S OWN (2026-09-25).
+  What a step's result depends on reaches the driver on its COMMAND LINE, from the step's
+  own inputs -- the corpus tier, the dsscp configuration, a single test file -- never
+  through an environment variable set outside the run (the driver still reads DSS_TIER,
+  DSS_CONFIG, DSS_TEST_FILE and DSS_BIN by hand, and refuses one that names a different
+  value from the flag). And each step names the dsscp it measures as `{product}`, the one
+  file the leg's build is declared to make (config.json's `buildOutputs`), which its
+  runner's `requireBuild` just built: never a DSS_BIN set outside the run, never "the
+  newest release under build/" searched for and rebuilt from inside a step -- a build
+  outside the harness.
+  The PR exit's four-leg corpus is
+      dssharness run sqlite --input tier=veryquick --input dssConfig=release
+  (`dssConfig`, not `config`: `{config}` is the leg's own build configuration, a name this
+  file cannot take for an input).
+
+steps:
+  - name: build-and-test
+    workingDirectoryRoot: action
+    inputs:
+      tier:
+        description: "the unit-corpus tier every leg runs: <sqlite>/test/<tier>.test (veryquick, quick, full, all)"
+        default: 'veryquick'
+      dssConfig:
+        description: "the dsscp configuration every leg's testfixture and CLI are compiled with (dsscp --config=<it>)"
+        default: 'release'
+      testFile:
+        description: "ONE .test file run alone instead of the tier, a path on the leg's own host; empty runs the tier"
+        default: ''
+    # Every option is `--name=value`: a test file is a path, and nothing a step splices in may be
+    # read as a flag of its own.
+    run: |
+      python3 ./build_and_test.py --tier="{tier}" --dss-config="{dssConfig}" --test-file="{testFile}" --dss="{product}"
+    # The driver's closing claim, printed only after every declared leg's verdict is
+    # counted from the ledger -- a run that verified nothing exits 1 before reaching it.
+    successPattern: 'declared leg\(s\) VERIFIED'
+    requireInputsUnmoved: true
+
+  # The ROUND-CLOSE RECOMPILE: one leg's testfixture manifest compiled by THIS leg's dsscp and by
+  # that leg's same-platform reference; a translation unit the reference compiles that dsscp
+  # refuses is a merge blocker. The stage it compiles from is THIS tree's own
+  # (build/real-examples/c/sqlite[/windows]), refreshed by the step itself when it is missing or
+  # no longer current -- never another tree's output. The driver documents the mode
+  # (`sqlite_recompile.py`).
+  - name: recompile
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      recompileLeg:
+        description: "the legs.json leg label whose testfixture is recompiled (the round close compiles pe64-x86_64 on the Windows leg, against the mingw reference)"
+        default: 'pe64-x86_64'
+      dssConfig:
+        description: "the dsscp configuration the manifest is compiled with (dsscp --config=<it>)"
+        default: 'release'
+    run: |
+      python3 ./build_and_test.py --recompile="{recompileLeg}" --dss="{product}" --dss-config="{dssConfig}"
+    # ONE summary line, printed LAST, naming the sqlite commit it compiled -- the pin, legs.json
+    # `stageBuild.sqliteCommit`, which a stage of any other revision is re-staged to -- and only a
+    # clean census (every TU seen, no blocker) says `blockers=0`: a census that could not see a TU
+    # prints INCOMPLETE and exits 1 first. `\b`, not `$`: the pattern is matched per line, and a
+    # Windows console line may end in a carriage return.
+    successPattern: '^recompile: \S+ sqlite=[0-9a-f]{12} tus=[0-9]+ reference_ok=[0-9]+ dss_ok=[0-9]+ blockers=0\b'
+    requireInputsUnmoved: true
+
+  # The speedtest1 BENCHMARK: DSS against the reference C compilers building and running
+  # SQLite's own test/speedtest1.c from full source (`benchmark_speedtest1.py` documents it), of
+  # the PINNED sqlite -- legs.json `stageBuild.sqliteCommit`, the revision the corpus and the
+  # recompile compile -- read from the harness's OWN checkout inside this tree
+  # (build/real-examples/c/sqlite[/windows]/speedtest1/sqlite), put on the pin under the tree's run
+  # lock, the one the corpus run and the recompile take, so two runs of one tree serialize on every
+  # host. What the benchmark writes stays in the tree: the checkout, the lock, this step's output and
+  # the measurement core's own temporaries (the vcvars script, the pre-flight probe, the timed
+  # databases), which go in `speedtest1/scratch` beside the checkout and are removed when the run
+  # ends. The compilers it times, and the POSIX build that derives the subject, write their own
+  # temporary files where their environment says -- theirs, not moved. The report is KEPT: the raw
+  # measurement and its README-ready markdown, each naming the sqlite head measured and whether it IS
+  # the pin.
+  - name: benchmark-speedtest1
+    manual: true
+    workingDirectoryRoot: action
+    inputs:
+      size:
+        description: 'speedtest1 --size'
+        default: '25'
+      buildRepeats:
+        description: 'cold builds per arm and worker count'
+        default: '3'
+      runRepeats:
+        description: 'timed runs per arm'
+        default: '5'
+      jobsArms:
+        description: 'the worker counts measured, space-separated'
+        default: '1 4'
+    run: |
+      python3 ./benchmark_speedtest1.py --dss="{product}" --out="{stepBuild}" --size="{size}" --build-repeats="{buildRepeats}" --run-repeats="{runRepeats}" --jobs-arms="{jobsArms}"
+    outputs: [benchmark-speedtest1.json, benchmark-speedtest1.md]
+    persist: true
+    # The measurement core's verdict line (speedtest1_bench.py, R9), printed LAST, after both kept
+    # files were written, and only when every REQUIRED arm -- the dss arm the plan writer marks --
+    # built at every worker count and ran. A run in which dsscp failed while a reference compiler
+    # did not exits 4 instead, its report still printed: a benchmark without its subject is not
+    # a benchmark of it. The line also names the sqlite head measured and whether it is the pin.
+    successPattern: '^speedtest1_bench: every required arm measured \('
+    requireInputsUnmoved: true
+
+  # The action's OWN CHECKS, with no build: the benchmark's self-test, then the driver's Step 0 alone
+  # (`build_and_test.py --self-test`: both suites, every module's self-test, the leg plan's self-test and
+  # lint) -- the lists the gate's `harness/sqlite_benchmark_selftest` and `harness/sqlite_driver_selftest`
+  # run, reachable on a leg with no build tree. No dsscp takes part, so the runner that names this step
+  # (`sqlite-self-test`) declares no `requireBuild`; the `sqlite` runner's would build the leg first.
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./benchmark_speedtest1.py --self-test
+      python3 ./build_and_test.py --self-test
+    # The driver's closing line, printed only when every Step-0 check held; the benchmark's line above
+    # answers with its exit code. `\(`, not `$`: the pattern is matched per line, and a Windows console
+    # line may end in a carriage return.
+    successPattern: '^build_and_test\.py --self-test: OK \('
+    requireInputsUnmoved: true

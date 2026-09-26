@@ -1,0 +1,24 @@
+{
+  "$comment": "P68 round 9 (lane `cs`) — D-C-A-WRITE-TO-AN-ELEMENT-OF-FUNC-IS-ACCEPTED-INTO-READ-ONLY-DATA and the designation walk beside it (negative / diagnostic). The operand of an assignment, a compound assignment or ++/-- must be a MODIFIABLE lvalue (C 6.5.16p2, 6.5.2.4p1, 6.5.3.1p1), and the one check that asks (`reportWriteToConstLvalue` over `constQualifiedLvalue`) must reach the object however the designation is spelled. FAMILY (1), the first six writes of `refused`: `__func__`'s ELEMENTS — C 6.4.2.2p1 declares `static const char __func__[]`, and the synthetic symbol carried only its level-0 `isConst`, so every element write compiled into an image that FAULTED on the write to read-only data. FAMILY (2), the next ten: a pointer COMPUTED on the way to a const object — `p + 1`, `1 + p`, `q + 2 - 1`, `a + 1` on a const array, `(p + 1)[0]`, `(*(p + 1))++`, `c ? p : q`, `c ? buf : p` (C 6.5.15p6: the conditional's pointee carries BOTH arms' qualifiers), `(z, p)`, `&a[0] + 1` — which the walk met as an operator it did not know, so it made no claim and the write compiled. MEASURED 2026-09-23, each shape its own translation unit, every build RUN: gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 refuse every write here ('assignment of read-only location'); MSVC 19.51.36260 refuses family (2) (C2166) and ACCEPTS family (1) into a program that does not work (it materializes `__func__` per mention, so the write does not read back: exit 1 at /Od) — no reference makes those writes work, so the union owes the refusal. The same translation unit carries the POLARITY CONTROLS in `accepted` (the same computed syntax over MUTABLE objects, a moved pointer-to-const, and a read of `__func__`), and the expectation is EXACT SET EQUALITY, so a walk that answered const for every computed designation would red this entry as surely as one that answered for none. RED-ON-DISABLE: drop the `__func__` spine minted in Pass 1 -> the six family-(1) reports vanish; drop the walk's binary / conditional / `&` arms -> the family-(2) reports vanish (and `*(__func__ + 1)` with them).",
+  "language": "c",
+  "source": "main.c",
+  "targets": [ { "spec": "x86_64:elf64-x86_64-linux-exec" } ],
+  "expectDiagnostics": [
+    { "code": "S_ConstViolation", "line": 21, "col": 5 },
+    { "code": "S_ConstViolation", "line": 22, "col": 5 },
+    { "code": "S_ConstViolation", "line": 23, "col": 5 },
+    { "code": "S_ConstViolation", "line": 24, "col": 5 },
+    { "code": "S_ConstViolation", "line": 25, "col": 7 },
+    { "code": "S_ConstViolation", "line": 26, "col": 5 },
+    { "code": "S_ConstViolation", "line": 27, "col": 5 },
+    { "code": "S_ConstViolation", "line": 28, "col": 5 },
+    { "code": "S_ConstViolation", "line": 29, "col": 5 },
+    { "code": "S_ConstViolation", "line": 30, "col": 5 },
+    { "code": "S_ConstViolation", "line": 31, "col": 5 },
+    { "code": "S_ConstViolation", "line": 32, "col": 5 },
+    { "code": "S_ConstViolation", "line": 33, "col": 5 },
+    { "code": "S_ConstViolation", "line": 34, "col": 5 },
+    { "code": "S_ConstViolation", "line": 35, "col": 5 },
+    { "code": "S_ConstViolation", "line": 36, "col": 5 }
+  ]
+}

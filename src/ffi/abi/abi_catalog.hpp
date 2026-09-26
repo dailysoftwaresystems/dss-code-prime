@@ -32,14 +32,14 @@
 // because `resolveAbi` takes an `ObjectFormatSchema const&` — it asks that
 // schema what it DECLARES, never what it IS.
 //
-// D-FF3-3 CLOSED (2026-06-01 post-fold #5): `resolveAbi` is threaded through
+// D-FF3-3-RESOLVED-CC-INDEX-THREADED CLOSED (2026-06-01 post-fold #5): `resolveAbi` is threaded through
 // `compileOneTarget` → `compileSingleUnit` → `allocateRegisters(ccIndex)`. A
 // `target=x86_64 format=pe64-x86_64-windows` pair correctly dispatches to
 // `ms_x64`, not the pre-fix hardcoded `sysv_amd64` (cc[0]). The behavioral pin
 // lives at `tests/lir/test_lir_callconv.cpp::CcIndex1DrivesDifferentArgGprThanCc0`.
 //
 // Layout-side (pointer size, integer-type sizes, struct padding, va_arg
-// handling) is anchored as D-FF3-1 — not in v1 because no shipped target.json
+// handling) is anchored as D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS — not in v1 because no shipped target.json
 // yet declares layout, and adding the fields is a cross-tier extension to
 // TargetSchema beyond FF3's scope. When it lands it belongs INSIDE the
 // `cCallingConvention` block as a sibling key, which is why that block is an
@@ -65,7 +65,7 @@ struct DSS_EXPORT AbiTuple {
     // `resolveAbi` callers read `cc` — and its only consumer was a
     // test asserting the deleted table against itself. The struct is
     // kept (rather than collapsing the return type to a bare pointer)
-    // because D-FF3-1's layout facts belong here when they land.
+    // because D-FF3-1-TARGET-AGGREGATE-LAYOUT-PARAMS's layout facts belong here when they land.
     TargetCallingConvention const* cc = nullptr;
 };
 

@@ -46,8 +46,11 @@
 //     float-capable constexpr-initializer consumer)
 //   - NARROW character constant (`'a'` — the [charStartToken, charBodyToken]
 //     shape via the SHARED `decodeCharLiteralBody`, gated on the body token
-//     being integer-cored; wide/UTF openers stay non-foldable/loud — their
-//     element core is format-keyed and semantic-stamped, not derivable here)
+//     being integer-cored)
+//   - WIDE/UTF character constant (`L'a'`/`u'a'`/`U'a'`/`u8'a'`, P68 round 9) —
+//     its element core comes from `CstEvalEnvironment::resolveWideCharCore`
+//     (the pair's, which this engine cannot derive), its value from the SHARED
+//     `decodeWideCharCodepoint` the value tier runs; no resolver ⇒ non-foldable
 
 namespace dss {
 
@@ -171,7 +174,7 @@ struct CstCastTarget {
     // the target is a float, so there is no "which float?" state to get wrong.
     std::optional<TypeKind> floatKind{};
     // Integer target width: 1 (Bool) / 8 / 16 / 32 / 64, and — since
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94) — 128 for the two STANDARD 128-bit kinds
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94) — 128 for the two STANDARD 128-bit kinds
     // (`__int128` / `unsigned __int128`, which are NOT bit-precise and so are NOT
     // carried in the `isBitPrecise` triple below). The 128 case is the ONLY width
     // that does not fold through `narrowIntToBits`: the Cast arm routes it through
@@ -286,6 +289,19 @@ using CstFoldedConstantResolver =
 // boundary is enforced by the ordinary fold rather than by a second opinion.
 using CstSelectedArmResolver = std::function<std::optional<NodeId>(NodeId)>;
 
+// P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION): the
+// ELEMENT CORE of a wide/UTF character constant — `L'…'`, `u'…'`, `U'…'`, `u8'…'`
+// (C 6.4.4.4p11: wchar_t, char16_t, char32_t, unsigned char) — on the ACTIVE pair,
+// given the constant's node. The engine cannot answer this itself: `L'…'`'s type
+// is the pair's `wchar_t` (the target's `abiTypedefs` per format), which only the
+// tier holding the pair knows, so each tier answers from the fact IT already owns
+// — the semantic tier from the per-pair opener map it built, the CST→HIR tier from
+// the core the semantic tier stamped on the body token. nullopt (or an absent
+// resolver) for a node that is not a wide/UTF character constant, or one the pair
+// cannot type (an opener naming an ABI typedef the target does not declare) ⇒ the
+// constant is NOT foldable here and the consumer's own loud refusal stands.
+using CstWideCharCoreResolver = std::function<std::optional<TypeKind>(NodeId)>;
+
 struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
     CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
@@ -295,6 +311,7 @@ struct CstEvalEnvironment {
     CstFieldOffsetResolver resolveFieldOffset{};  // c43 — &((T*)0)->M offsets
     CstFoldedConstantResolver resolveFoldedConstant{};  // P31 — offsetof / types_compatible_p
     CstSelectedArmResolver    resolveSelectedArm{};     // P31/P49 — __builtin_choose_expr / _Generic
+    CstWideCharCoreResolver   resolveWideCharCore{};    // P68 — L'…' / u'…' / U'…' / u8'…'
 };
 
 // Static recognition context. All fields are non-owning references

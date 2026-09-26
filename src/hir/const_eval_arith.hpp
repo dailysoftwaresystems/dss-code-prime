@@ -424,7 +424,7 @@ intKindInfo(TypeKind k, std::optional<bool> charIsUnsigned) noexcept {
     return v >= 0 && v <= hi;
 }
 
-// ⚠ INT64-DOMAIN HELPER (D-CSUBSET-INT128-CONSTFOLD, TF-C94). `v` is an
+// ⚠ INT64-DOMAIN HELPER (D-CSUBSET-INT128-CONSTFOLD-WIDE, TF-C94). `v` is an
 // `std::int64_t`, so this can only ever express a 64-bit result: for
 // `target.bits >= 64` it returns `v` UNCHANGED, which is right for a 64-bit
 // target and for a signed 128-bit one (every int64 is already its own 128-bit
@@ -618,7 +618,7 @@ floatToWideIntTarget(HirLiteralValue const& src, std::uint32_t width, bool isSig
 
 // True for the two 128-bit standard integer kinds — the widths that are STANDARD
 // (not bit-precise) yet still too wide for the int64/uint64 literal arms, so they
-// must stay in the `BitIntValue` bignum arm (D-CSUBSET-INT128-CONSTFOLD, TF-C94).
+// must stay in the `BitIntValue` bignum arm (D-CSUBSET-INT128-CONSTFOLD-WIDE, TF-C94).
 [[nodiscard]] inline bool isInt128Kind(TypeKind k) noexcept {
     return k == TypeKind::I128 || k == TypeKind::U128;
 }
@@ -965,7 +965,7 @@ applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
 [[nodiscard]] inline std::optional<BitIntOperandType>
 bitIntOperandType(HirLiteralValue const& v,
                   std::optional<bool> charIsUnsigned) noexcept {
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): `core` is consulted BEFORE the variant
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): `core` is consulted BEFORE the variant
     // arm, because after this cycle the two no longer determine each other. A
     // folded 128-bit STANDARD value rides the `BitIntValue` payload (nothing
     // narrower holds 128 bits) while carrying an I128/U128 core, so a
@@ -1048,7 +1048,7 @@ bitIntUac(BitIntOperandType a, BitIntOperandType b) noexcept {
         case 8:  return isSigned ? TypeKind::I8  : TypeKind::U8;
         case 16: return isSigned ? TypeKind::I16 : TypeKind::U16;
         case 32: return isSigned ? TypeKind::I32 : TypeKind::U32;
-        // D-CSUBSET-INT128-CONSTFOLD (TF-C94): 128 is a REAL standard width now
+        // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): 128 is a REAL standard width now
         // (`__int128`/`__uint128_t` bind to I128/U128 and `intKindInfo` already
         // reports {128, signed}). Before this arm it fell to the `default` and a
         // 128-bit result was mislabelled I64/U64 — the root of the silent 64-bit
@@ -1064,7 +1064,7 @@ bitIntUac(BitIntOperandType a, BitIntOperandType b) noexcept {
 // bridges + the narrow-cast paths see a plain integer, exactly as the typed side
 // produces a standard type for an int-outranked BitInt).
 //
-// D-CSUBSET-INT128-CONSTFOLD (TF-C94): a 128-bit STANDARD result is the third
+// D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a 128-bit STANDARD result is the third
 // case. It is not bit-precise (its core is I128/U128, never BitInt), but it does
 // NOT fit the int64/uint64 arms either — `asI64()`/`low64()` would silently drop
 // the high 64 bits, which is exactly the mod-2^64 wrap this cycle exists to
@@ -1104,7 +1104,7 @@ struct BitIntBinaryFold {
 [[nodiscard]] inline BitIntBinaryFold
 foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
                  std::optional<bool> charIsUnsigned) {
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): entry is by "does this fold need MORE
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): entry is by "does this fold need MORE
     // than 64 bits?", not by "is a `BitIntValue` variant present?". The old
     // variant-only predicate was the reason a PURE 128-bit fold silently wrapped
     // at 64: `__uint128_t` values whose magnitude fits in 64 bits carry a plain
@@ -1198,7 +1198,7 @@ struct BitIntUnaryFold {
 foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner,
                 std::optional<bool> charIsUnsigned) {
     BitIntUnaryFold r;
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): the binary entry's twin — enter for a
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): the binary entry's twin — enter for a
     // 128-bit STANDARD operand too, not only for a `BitIntValue` variant, or
     // `-(__int128)x` / `~(__uint128_t)x` fall to the caller's int64 path and wrap
     // at 64 bits. `bitIntOperandType` supplies the operand's true (width, signed,

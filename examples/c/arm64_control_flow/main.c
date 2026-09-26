@@ -1,4 +1,4 @@
-// D-AS3-BLOCK-REL-IMM19/26 (ARM64 conditional control-flow) runtime corpus.
+// D-AS3-BLOCK-REL-IMM19-26 (ARM64 conditional control-flow) runtime corpus.
 // The cross-target end-to-end proof that the AArch64 cmp / setcc / jcc / jmp
 // back-edge + alloca path EXECUTES — not just assembles. A count-up while loop
 // runs the loop body 42 times and returns the counter as the process exit code.

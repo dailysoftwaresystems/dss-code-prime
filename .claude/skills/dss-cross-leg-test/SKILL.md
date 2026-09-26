@@ -33,7 +33,7 @@ committed code → `dss-audit`.
 
 This skill is **client-parameterised**. The client is the real-world corpus under test.
 
-- Today the only implemented client is **`sqlite`** (`real-examples/c/sqlite/`).
+- Today the only implemented client is **`sqlite`** (`.harness-config/runner/actions/real-examples/c/sqlite/`).
 - **If the invocation does not name a client, STOP AND ASK.** Do not default to sqlite — the whole
   point of the parameter is that more clients are coming, and silently picking one produces a verdict
   labelled with the wrong subject.
@@ -64,12 +64,15 @@ means a leg vanished without a verdict, which is a harness defect.
 ## Workflow
 
 1. **Establish the client** (step 0 above). Ask if it was not named.
-2. **Per host, drive the client's own driver** — `build-and-test.sh` on Linux/WSL/macOS/VPS,
-   `build-and-test.ps1` on Windows. **Do not delegate the runs to an agent**: a delegated build agent
-   reliably yields mid-build and leaves an orphaned job. Drive them foreground-blocking, or via a
+2. **Drive the client's action through DssHarness, one invocation for every host** — for sqlite, the
+   `sqlite` runner runs the action's `build-and-test` step on each host's release leg, with that leg's
+   own dsscp (the runner builds it first); on Windows the driver's POSIX half runs inside WSL through
+   `wsl.exe -e`. The corpus tier, the dsscp configuration and a single test file are the step's
+   inputs, carried on its command line. **Do not delegate the run to an agent**: a delegated build
+   agent reliably yields mid-build and leaves an orphaned job. Drive it foreground-blocking, or via a
    harness-tracked background command that re-invokes you on exit.
    ```bash
-   DSS_TIER=veryquick DSS_CONFIG=release bash ./build-and-test.sh
+   dssharness run sqlite --input tier=veryquick --input dssConfig=release
    ```
 3. **Collect every cell** — host × leg × {BUILD, CLI run, UNITS run}, plus the round-trip rows.
 4. **Attribute every red cell** before blaming the compiler — DSS, upstream, or environment, with the

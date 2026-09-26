@@ -14,7 +14,9 @@
 //
 // Target-blind: the analysis depends only on the LIR module's CFG +
 // per-instruction operand shape (Reg-kind operand → use; result vreg
-// → def). It never inspects opcode semantics, mnemonics, or
+// → def — and on an inline-asm bundle, each operand's ROLE, read through
+// `lirForEachInstUse` / `lirForEachInstDef`). It never inspects opcode
+// semantics, mnemonics, or
 // `TargetSchema`. Source-language-blind: input is LIR; the analysis
 // never touches MIR/HIR types.
 //
@@ -39,7 +41,9 @@
 // The
 // substrate ships flat single-interval ranges per vreg today; the
 // allocator co-designs split-aware sub-intervals with this substrate
-// — see plan 12 §3.1 ML6 deferral D-ML6-1.1.
+// — see plan 12 §3.1's ML6 sub-interval deferral, which the registry now
+// carries as D-PLAN12-SUB-INTERVAL-LIRLIVERANGE-LIST-DEFERRED-FROM-ML6-CYCLE
+// (its pre-migration plan-step spelling was ML6-1.1).
 //
 // LIR has no Phi opcode: MIR Phis were resolved into parallel-copy
 // `mov`s on predecessor edges during MIR→LIR isel. Liveness therefore
@@ -127,7 +131,7 @@ struct DSS_EXPORT LirLiveRange {
 // header note above), so a value dead in a hole is still reported live across
 // it. Over-approximating liveness makes this return `true` where a
 // split-interval analysis would return `false` — a MISSED coalesce, never an
-// unsound one. When split-aware sub-intervals land (D-ML6-1.1) this predicate
+// unsound one. When split-aware sub-intervals land (D-PLAN12-SPLIT-AWARE-SUB-INTERVAL-LIRLIVERANGE-LIST-CURRENTLY-FLAT) this predicate
 // gains precision and every consumer gains it at once.
 [[nodiscard]] constexpr bool
 lirRangesInterfere(LirLiveRange const& a, LirLiveRange const& b) noexcept {
@@ -183,8 +187,9 @@ struct DSS_EXPORT LirLiveness {
 // Run liveness analysis over every function in `lir`. The caller owns
 // `lir`; the analysis returns a freshly-allocated result. No
 // `TargetSchema` parameter: def/use derivation is target-blind (def =
-// `instResult(id).valid() && !isPhysical`; use = Reg-kind operand
-// with a valid non-physical reg).
+// every non-physical register `lirForEachInstDef` names — the result, plus a
+// bundle's writing operands; use = every non-physical register
+// `lirForEachInstUse` names).
 [[nodiscard]] DSS_EXPORT LirLiveness
 analyzeLiveness(Lir const& lir);
 

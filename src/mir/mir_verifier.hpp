@@ -1,7 +1,11 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/parse_diagnostic.hpp"   // DiagnosticCode (the report members)
 #include "mir/mir.hpp"
+
+#include <cstddef>
+#include <string>
 
 namespace dss {
 
@@ -18,9 +22,9 @@ class TypeInterner;
 //     ⇒ those rules are skipped (a module built directly in a test
 //     fixture, with no semantic phase, has no interner to consult).
 //   - one public entry point: `verify(DiagnosticReporter&) → bool`
-//     returns true iff THIS run emitted no Error-severity diagnostic
-//     (delta on the reporter's error count, so a reporter carrying
-//     prior-phase errors doesn't make a clean module look dirty).
+//     returns true iff THIS run found no violation the reporter's policy
+//     makes an Error — by the verifier's OWN count (the verdict), AND the
+//     delta on the reporter's error count, AND an uncapped reporter.
 //
 // COLLECT-ALL discipline: every rule sweeps the whole module; one run
 // surfaces every violation. The `Mir`'s build-time + freeze-time
@@ -46,12 +50,32 @@ public:
     MirVerifier(Mir&&)                      = delete;
     MirVerifier(Mir&&, TypeInterner const*) = delete;
 
-    // Run every rule, reporting each violation into `reporter`. Returns
-    // true iff THIS run emitted no Error-severity diagnostic. The
-    // delta-on-errorCount discipline matches HirVerifier.
+    // Run every rule, reporting each violation into `reporter`. Returns true
+    // iff THIS run found no violation the reporter's policy makes an Error —
+    // by the verifier's OWN count of such findings (each judged by
+    // `DiagnosticReporter::effectiveSeverity`), AND the delta on the reporter's
+    // error count, AND only when the reporter has not hit its cap: the same
+    // verdict `HirVerifier` answers with. The own count is the verdict: a
+    // reporter drops a diagnostic identical to a recent one without storing it,
+    // so ✔MEASURED P68 (lane `ht`) a module this verifier refused
+    // (`I_AllocaAlignmentNotPowerOfTwo`), verified twice into ONE reporter,
+    // passed the second time. Not re-entrant on ONE verifier object.
     [[nodiscard]] bool verify(DiagnosticReporter& reporter) const;
 
 private:
+    // THE ONE WAY A RULE REPORTS — every finding is an Error, formatted with its
+    // node's "mir inst/block/func #N" prefix — and the one place the verifier
+    // counts what it found (by the policy's effective severity), so `verify()`'s
+    // verdict never depends on what the reporter chose to STORE.
+    void report(DiagnosticReporter& reporter, DiagnosticCode code,
+                std::string actual) const;
+    void reportInst(DiagnosticReporter& reporter, DiagnosticCode code,
+                    MirInstId id, std::string detail) const;
+    void reportBlock(DiagnosticReporter& reporter, DiagnosticCode code,
+                     MirBlockId id, std::string detail) const;
+    void reportFunc(DiagnosticReporter& reporter, DiagnosticCode code,
+                    MirFuncId id, std::string detail) const;
+
     // Re-run ML1's structural invariants on the frozen module so the
     // direct-`Mir`-ctor path is covered the same way as `MirBuilder`.
     // Checks: opcode-validity, operand-count in `[min,max]`, successor-
@@ -211,6 +235,10 @@ private:
 
     Mir const&          mir_;
     TypeInterner const* interner_;
+    // The findings THIS run reported that the policy makes Errors; reset by
+    // `verify()`, bumped only by `report`. `mutable` because every rule is
+    // `const` — the count is the verdict's bookkeeping, not the module's state.
+    mutable std::size_t errorsFound_ = 0;
 };
 
 } // namespace dss

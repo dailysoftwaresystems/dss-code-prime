@@ -227,9 +227,54 @@ ProcessArgs ucrtAccessorPa() {
     pa.wideArgvAccessorFn    = "__p___wargv";
     pa.argvMode              = 1;
     pa.argvUnavailableExitStatus = 127;
+    // The environment pairs (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE), ✔MEASURED 2026-09-24
+    // on ucrtbase 10.0.26100.9444: `_initialize_narrow_environment` ord 373,
+    // `_get_initial_narrow_environment` 321, `_initialize_wide_environment` 375,
+    // `_get_initial_wide_environment` 322.
+    pa.initializeNarrowEnvironmentFn = "_initialize_narrow_environment";
+    pa.narrowEnvironmentAccessorFn   = "_get_initial_narrow_environment";
+    pa.initializeWideEnvironmentFn   = "_initialize_wide_environment";
+    pa.wideEnvironmentAccessorFn     = "_get_initial_wide_environment";
     pa.role                  = RuntimeLibraryRole::CLibrary;
     pa.crtLibraryPath        = "ucrtbase.dll";
     return pa;
+}
+
+// The elf entry-stack mechanism as the shipped elf formats declare it: argc at
+// [sp+0], argv in place at sp+8, and the environment vector one 8-byte slot past
+// argv's NULL terminator.
+ProcessArgs stackVectorPa() {
+    ProcessArgs pa;
+    pa.mechanism                 = ArgsMechanism::StackVector;
+    pa.argcStackOffset           = 0;
+    pa.argvStackOffset           = 8;
+    pa.envpFollowsArgvTerminator = true;
+    pa.vectorSlotBytes           = 8;
+    return pa;
+}
+
+// An entry signature spelled from the ONE verb → parameter-shapes table, so a pin
+// hands the pass exactly the signature the language row for that verb declares.
+TypeId entrySigFor(TypeInterner& in, EntryMaterialization verb, CallConv cc) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    std::vector<TypeId> params;
+    for (auto const shape : entryVerbParams(verb)) {
+        switch (shape) {
+        case EntryParamShape::I32:
+            params.push_back(i32);
+            break;
+        case EntryParamShape::PtrPtrChar:
+            params.push_back(in.pointer(in.pointer(in.primitive(TypeKind::Char))));
+            break;
+        case EntryParamShape::PtrPtrU16:
+            params.push_back(in.pointer(in.pointer(in.primitive(TypeKind::U16))));
+            break;
+        case EntryParamShape::None:
+            ADD_FAILURE() << "the verb table holds the `none` sentinel shape";
+            break;
+        }
+    }
+    return in.fnSig(params, i32, cc);
 }
 
 // The pe64 exec format's declared program-entry VERB SET — `entryVerbs`, which is
@@ -253,6 +298,8 @@ std::vector<EntryMaterialization> peEntryVerbs() {
         EntryMaterialization::None,        // `int main(void)` — nothing to fetch
         EntryMaterialization::ArgcArgv,    // `int main(int, char**)`
         EntryMaterialization::ArgcWargv,   // `int wmain(int, wchar_t**)` — pe only
+        EntryMaterialization::ArgcArgvEnvp,    // `int main(int, char**, char**)`
+        EntryMaterialization::ArgcWargvWenvp,  // MSVC's 3-parameter `wmain`
     };
 }
 
@@ -917,8 +964,8 @@ TEST(MirMerge, ConflictingExternImportAttributesFailLoudAtTheMirTier) {
             << "the diagnostic must name the FIELD and BOTH values; got: "
             << allDiagText(rep);
         EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
-                                 "D-LK11-EXTERN-IMPORT-DEDUP"))
-            << allDiagText(rep);
+                                 "declare it the same way in every compilation unit"))
+            << "and say what to DO about it: " << allDiagText(rep);
         EXPECT_TRUE(diagContains(rep, DiagnosticCode::K_ExternImportAttributeConflict,
                                  "(library \"libc.so.6\")"))
             << "and identify WHICH import: " << allDiagText(rep);
@@ -1926,9 +1973,9 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
 //   MATERIALIZE (D-FFI-PE-CRT-UCRT-MIGRATION)
 //     * EveryDeclaredVerbHasAMaterializationArm -- the verb-SET pin, and the
 //       red-on-disable that replaces the deleted config-lever refusal: every verb
-//       the pe64 format declares must have an arm here, and FILTERING `argc-argv`
-//       out of the declared set must remove the narrow argv spine from what the
-//       format can realize (its own matcher, the `__p___argv` import name);
+//       the pe64 format declares must have an arm here, and FILTERING the narrow
+//       verbs out of the declared set must remove the narrow spine from what the
+//       format can realize (its own matchers, the narrow import names);
 //     * NarrowMainBindsUcrtNarrowAccessors -- a main(int,char**) entry appends a synth
 //       fn (entry retargeted) and imports EXACTLY the narrow triple from the
 //       role-resolved image;
@@ -1939,6 +1986,19 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
 //     * VoidMainNeedsNoSynth -- the `none` verb is a clean no-op -> NO synth;
 //     * StackVectorMechanismIsANoOp -- the ELF route materializes in the trampoline;
 //     * NoMechanismIsANoOp -- Mach-O's real answer (dyld already did it).
+//
+//   THE ENVIRONMENT VERBS (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE), below the completeness pin
+//     * CrtEnvironmentFollowsMsvcsOwnStartupOrder -- per width: configure argv,
+//       initialize the environment, read its accessor, call the entry with THREE
+//       arguments, in that order, importing nothing of the other width;
+//     * StackEnvironmentIsArgvPlusArgcPlusOneSlots -- the elf init takes (argc,
+//       argv) and passes argv + (argc + 1) * the declared slot width;
+//     * ALoaderDeliveredFormPassesThroughUntouched -- Mach-O, the four-value verb
+//       included;
+//     * AMechanismThatCannotRealizeTheVerbIsRefused -- the backstop for a hand-built
+//       `ProcessArgs` (validate() refuses the same pairings at format load);
+//     * AnEnvironmentVerbOnATwoParameterEntryHitsTheArityBackstop -- the backstop
+//       counts the verb's own parameters, not a literal two.
 
 // Assert a substring is present, with the whole message on failure -- the refusal's
 // CONTENT is the contract here, so a bare `hasErrors()` would not pin it.
@@ -1970,16 +2030,25 @@ inline void expectDiagContains(DiagnosticReporter const& rep, std::string_view n
 //
 // OWNER OF THE COVERAGE, VERIFIED PRESENT RATHER THAN ASSUMED:
 // `S_EntryShapeNotDeclared`, emitted from src/analysis/semantic/semantic_analyzer.cpp
-// and pinned END-TO-END by examples/c/entry_main_envp_refused_positioned --
-// this same 3-parameter source, expecting that code with `positioned: true` at an
-// EXACT line:col. That example asserts strictly MORE than the test deleted here
-// could: the span it demands is exactly what the MIR tier cannot supply, so if the
-// check ever regresses back to a span-less tier the example goes RED even though the
-// same diagnostic code is still emitted. Its siblings cover the other two halves of
-// the split -- entry_wmain_only_refused_elf (`K_ProgramEntryUndefined`, a wmain-only
-// ELF build: `argc-wargv` is not in any ELF format's `entryVerbs`, so `wmain` does
-// not survive candidate selection) and entry_main_and_wmain_ambiguous_pe
+// and pinned END-TO-END by examples/c/entry_main_int_third_param_refused_positioned,
+// expecting that code with `positioned: true` at an EXACT line:col. That example
+// asserts strictly MORE than the test deleted here could: the span it demands is
+// exactly what the MIR tier cannot supply, so if the check ever regresses back to a
+// span-less tier the example goes RED even though the same diagnostic code is still
+// emitted. Its siblings cover the other two halves of the split --
+// entry_wmain_only_refused_elf (`K_ProgramEntryUndefined`, a wmain-only ELF build:
+// `argc-wargv` is not in any ELF format's `entryVerbs`, so `wmain` does not survive
+// candidate selection) and entry_main_and_wmain_ambiguous_pe
 // (`K_ProgramEntryAmbiguous`).
+//
+// ★ AND THE 3-PARAMETER `main` ITSELF IS NOW SUPPORTED
+// (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): the language declares its row with the
+// `argc-argv-envp` verb, every exec format realizes it, and
+// examples/c/entry_main_envp RUNS it on every leg. The
+// positioned refusal therefore moved to `int main(int, char**, int)`, a third
+// parameter no reference gives a meaning (clang 18.1.3 refuses it, MEASURED
+// 2026-09-24). The MEASURED fault above is closed by SUPPORT now; the refusal still
+// guards every signature the language does not declare.
 
 // ── ⓧ REMOVED: RealizeEntryShape.VoidReturnMainRefusedByTheSameCheck ──────────
 //
@@ -2037,11 +2106,11 @@ TEST(RealizeEntryShape, ArgcArgvVerbOnAZeroParamEntryHitsTheArityBackstop) {
     // accept, so a bare `EXPECT_FALSE` would repeat the original mistake in a new
     // place. It must name (i) the VERB it was asked to materialize, (ii) the arity it
     // actually found — a message that says only "unmaterializable" sends the reader
-    // looking for a config row when the two inputs simply disagree — and (iii) the
-    // anchor, so the reader lands on the recorded long-term closure.
+    // looking for a config row when the two inputs simply disagree — and (iii) what
+    // to DO: give the entry the signature its language row declares.
     expectDiagContains(rep, "argc-argv");
     expectDiagContains(rep, "declares 0 parameter(s)");
-    expectDiagContains(rep, "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE");
+    expectDiagContains(rep, "give the entry the signature its language row declares");
     // Nothing was emitted for a refused entry (carried over from the deleted 3-param
     // pin, whose tail was about the FAILURE PATH's cleanliness rather than about
     // signature classification — that part never belonged to the moved gate).
@@ -2058,7 +2127,8 @@ TEST(RealizeEntryShape, EveryEntryRefusalCodeIsUnsuppressable) {
     // `--suppress` reaching any ONE of them hands back a member of the same family
     // of accepted-then-faulting binaries the whole split exists to refuse:
     //   * S_EntryShapeNotDeclared     — the definition's signature is not a declared
-    //                                   entry spelling (3-param main, `void main()`);
+    //                                   entry spelling (`int main(int, char**, int)`,
+    //                                   `void main()`);
     //   * K_ProgramEntryUndefined     — an exec-flavored format with NO realizable
     //                                   entry candidate;
     //   * K_ProgramEntryAmbiguous     — more than one realizable candidate;
@@ -2091,42 +2161,39 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
     // `entryVerbs` without an arm here is RED by construction.
     //
     // ★★ MUTANT HALF — the red-on-disable that replaces the deleted refusal pin, and
-    // it is NOT the tautology it can look like. Filtering `argc-argv` out of the
-    // declared set must remove the NARROW argv spine from what the format can
-    // realize, asserted with the pin's own matcher (the `__p___argv` import NAME),
-    // while the WIDE spine stays. What that catches is a pass that bound the narrow
-    // accessors regardless of the verb — i.e. keyed on the format instead of on the
-    // entry, which is precisely the c111 defect class this whole arc removed. Under
-    // such a regression `__p___argv` survives the mutation and this reds. The mutant
-    // is also still a WELL-FORMED verb set (non-empty, no duplicates), so the
-    // mutation cannot be passing merely by making its input invalid.
+    // it is NOT the tautology it can look like. Filtering the NARROW verbs out of the
+    // declared set must remove the narrow spine from what the format can realize,
+    // asserted with the pin's own matchers (the `__p___argv` and
+    // `_get_initial_narrow_environment` import NAMES), while the WIDE spine stays.
+    // What that catches is a pass that bound the narrow accessors regardless of the
+    // verb — i.e. keyed on the format instead of on the entry, which is precisely the
+    // c111 defect class this whole arc removed. Under such a regression the narrow
+    // names survive the mutation and this reds. The mutant is also still a
+    // WELL-FORMED verb set (non-empty, no duplicates), so the mutation cannot be
+    // passing merely by making its input invalid.
+    //
+    // ⓘ WHY EVERY NARROW VERB AND NOT `argc-argv` ALONE
+    // (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE). `argc-argv-envp` binds the narrow argv
+    // accessor too — it materializes the same argv plus the environment — so a set
+    // that keeps it still realizes `__p___argv` legitimately. The narrow/wide split is what the verb decides, so
+    // the mutation removes the whole narrow side, read off the verb table
+    // (`entryVerbIsWide`) rather than listed by hand.
     //
     // ★ DEMONSTRATED RED, not reasoned about (the file's rule for every pin below the
-    // stdio banner, applied here). Filtering the WRONG verb out — `argc-wargv` in
-    // place of `argc-argv` — was applied, built and run: it reds BOTH halves of the
-    // mutant assertion (`__p___argv` still present, `__p___wargv` now absent) and
-    // NOTHING else in this suite, so the pin distinguishes WHICH verb produced WHICH
-    // accessor rather than merely counting imports. Likewise `verbRealizedBy` was
-    // asked for `argc-wargv` against the elf set below: it reds with its own message.
-    // Both mutations were then reverted (the suite is back to 61/61).
+    // stdio banner, applied here). In the argc/argv-only form of this pin, filtering
+    // the WRONG verb out — `argc-wargv` in place of `argc-argv` — was applied, built
+    // and run: it red BOTH halves of the mutant assertion and NOTHING else in this
+    // suite, so the pin distinguishes WHICH verb produced WHICH accessor rather than
+    // merely counting imports; `verbRealizedBy` asked for `argc-wargv` against the
+    // elf set below reds with its own message.
 
-    // Materialize ONE verb against a signature that matches it, and report what the
-    // pass produced. The signature is chosen per verb because that is what entry
-    // resolution guarantees this pass — a verb never arrives against a signature the
-    // language did not match it to.
+    // Materialize ONE verb against the signature its language row declares (spelled
+    // from the verb table), and report what the pass produced — a verb never arrives
+    // against a signature the language did not match it to.
     auto const runVerb = [](EntryMaterialization verb, bool& ok,
                             std::string& diagText) {
         TypeInterner in{CompilationUnitId{1}};
-        TypeId const i32    = in.primitive(TypeKind::I32);
-        TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
-        TypeId const u16PP  = in.pointer(in.pointer(in.primitive(TypeKind::U16)));
-        TypeId const sig =
-            verb == EntryMaterialization::None
-                ? in.fnSig({}, i32, CallConv::CcMS64)
-                : in.fnSig(std::array<TypeId, 2>{
-                               i32, verb == EntryMaterialization::ArgcWargv ? u16PP
-                                                                           : charPP},
-                           i32, CallConv::CcMS64);
+        TypeId const sig = entrySigFor(in, verb, CallConv::CcMS64);
         Mir mir = buildEntryOnly(in, sig);
         std::optional<SymbolId>   entry = SymbolId{100};
         std::vector<ExternImport> ext;
@@ -2164,22 +2231,34 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
         return false;
     };
 
-    // ── THE WITNESS: the declared set realizes BOTH spines. ──
+    // ── THE WITNESS: the declared set realizes BOTH spines, environments included. ──
     auto const declared = realizableImports(peEntryVerbs());
     EXPECT_TRUE(has(declared, "__p___argv"))
         << "the declared set includes `argc-argv`, so the NARROW argv accessor must "
            "be realizable";
     EXPECT_TRUE(has(declared, "__p___wargv"))
         << "and `argc-wargv`, so the WIDE one must be too";
+    EXPECT_TRUE(has(declared, "_get_initial_narrow_environment"))
+        << "and `argc-argv-envp`, so the NARROW environment accessor";
+    EXPECT_TRUE(has(declared, "_get_initial_wide_environment"))
+        << "and `argc-wargv-wenvp`, so the WIDE one";
 
-    // ── THE MUTANT: the declared set MINUS the verb under test. Built by FILTERING
+    // ── THE MUTANT: the declared set MINUS its narrow verbs. Built by FILTERING
     // rather than by re-typing the list, so the two sets cannot drift apart. ──
     std::vector<EntryMaterialization> mutant;
+    std::size_t narrowVerbs = 0;
     for (auto const v : peEntryVerbs()) {
-        if (v != EntryMaterialization::ArgcArgv) mutant.push_back(v);
+        bool const narrow = v != EntryMaterialization::None && !entryVerbIsWide(v);
+        if (narrow) {
+            ++narrowVerbs;
+        } else {
+            mutant.push_back(v);
+        }
     }
-    ASSERT_EQ(mutant.size(), peEntryVerbs().size() - 1u)
-        << "the mutation must remove EXACTLY the verb under test";
+    ASSERT_EQ(narrowVerbs, 2u)
+        << "the pe set's narrow verbs are `argc-argv` and `argc-argv-envp`";
+    ASSERT_EQ(mutant.size(), peEntryVerbs().size() - narrowVerbs)
+        << "the mutation must remove EXACTLY the narrow verbs";
     ASSERT_FALSE(mutant.empty())
         << "the mutant must still be a WELL-FORMED (non-empty) declared set — an "
            "exec format declaring no verb at all is rejected by the schema loader, "
@@ -2192,14 +2271,349 @@ TEST(RealizeEntryShape, EveryDeclaredVerbHasAMaterializationArm) {
     }
 
     auto const mutated = realizableImports(mutant);
-    EXPECT_FALSE(has(mutated, "__p___argv"))
-        << "with `argc-argv` removed from the declared set, NOTHING the format can "
-           "realize may bind the narrow argv accessor — if it still does, the arm is "
-           "being chosen by something other than the verb";
-    EXPECT_TRUE(has(mutated, "__p___wargv"))
-        << "while the untouched `argc-wargv` verb must be unaffected — this is what "
-           "keeps the assertion above from being satisfiable by a pass that stopped "
-           "importing anything at all";
+    for (char const* narrowName : {"__p___argv", "_configure_narrow_argv",
+                                   "_initialize_narrow_environment",
+                                   "_get_initial_narrow_environment"}) {
+        EXPECT_FALSE(has(mutated, narrowName))
+            << "with the narrow verbs removed from the declared set, NOTHING the "
+               "format can realize may bind " << narrowName << " — if it still "
+               "does, the arm is being chosen by something other than the verb";
+    }
+    for (char const* wideName : {"__p___wargv", "_get_initial_wide_environment"}) {
+        EXPECT_TRUE(has(mutated, wideName))
+            << "while the untouched wide verbs must be unaffected — this is what "
+               "keeps the assertions above from being satisfiable by a pass that "
+               "stopped importing anything at all (" << wideName << ")";
+    }
+}
+
+// ── D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the environment verbs ─────────────────────
+//
+// The CRT arm in MSVC's own startup order, the entry-stack arm's pointer
+// arithmetic, pass-through on a loader that delivers the arguments itself, and the
+// mechanism backstop for a hand-built `ProcessArgs` that cannot realize a verb.
+
+namespace {
+
+// The callee symbol of every direct Call in `fn`, in block-then-instruction order,
+// with each call's ARGUMENT count beside it.
+struct OrderedCall {
+    std::uint32_t symbol = 0;
+    std::size_t   args   = 0;
+};
+[[nodiscard]] std::vector<OrderedCall> orderedCalls(Mir const& mir, MirFuncId fn) {
+    std::vector<OrderedCall> out;
+    std::uint32_t const nb = mir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const blk = mir.funcBlockAt(fn, bi);
+        std::uint32_t const ni = mir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const id = mir.blockInstAt(blk, ii);
+            if (mir.instOpcode(id) != MirOpcode::Call) continue;
+            auto const ops = mir.instOperands(id);
+            if (mir.instOpcode(ops[0]) != MirOpcode::GlobalAddr) continue;
+            out.push_back({mir.globalAddrSymbol(ops[0]).v, ops.size() - 1});
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::size_t indexOfCall(std::vector<OrderedCall> const& calls,
+                                      std::uint32_t symbol) {
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        if (calls[i].symbol == symbol) return i;
+    }
+    return calls.size();
+}
+
+}  // namespace
+
+TEST(RealizeEntryShape, CrtEnvironmentFollowsMsvcsOwnStartupOrder) {
+    // MSVC's startup (DOCUMENTED, the toolset's crt/src/vcruntime/exe_common.inl):
+    // `pre_c_initialization` configures argv, then calls
+    // `environment_policy::initialize_environment()` and ignores its result; then
+    // `invoke_main` is `main(__argc, __argv, _get_initial_narrow_environment())`. The
+    // synthesized init must make the same calls in the same order, and hand the entry
+    // the accessor's result as its THIRD argument — per width.
+    struct Case {
+        EntryMaterialization verb;
+        char const* configure;
+        char const* argvAccessor;
+        char const* init;
+        char const* accessor;
+        std::vector<char const*> forbidden;   // the other width's names
+    };
+    std::vector<Case> const cases{
+        {EntryMaterialization::ArgcArgvEnvp, "_configure_narrow_argv", "__p___argv",
+         "_initialize_narrow_environment", "_get_initial_narrow_environment",
+         {"_configure_wide_argv", "__p___wargv", "_initialize_wide_environment",
+          "_get_initial_wide_environment"}},
+        {EntryMaterialization::ArgcWargvWenvp, "_configure_wide_argv", "__p___wargv",
+         "_initialize_wide_environment", "_get_initial_wide_environment",
+         {"_configure_narrow_argv", "__p___argv", "_initialize_narrow_environment",
+          "_get_initial_narrow_environment"}},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(entryMaterializationName(c.verb));
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildEntryOnly(in, entrySigFor(in, c.verb, CallConv::CcMS64));
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext,
+                                      verbRealizedBy(peEntryVerbs(), c.verb),
+                                      ucrtAccessorPa(), CSymbolDecorationScheme::None,
+                                      "pe64-x86_64-windows-exec", rep))
+            << allDiagText(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+
+        std::unordered_map<std::string, ExternImport const*> byName;
+        for (auto const& e : ext) byName.emplace(e.mangledName, &e);
+        for (char const* want : {c.configure, "__p___argc", c.argvAccessor, c.init,
+                                 c.accessor}) {
+            ASSERT_EQ(byName.count(want), 1u) << "missing UCRT import " << want;
+            EXPECT_EQ(byName[want]->libraryPath, "ucrtbase.dll") << want;
+            EXPECT_FALSE(byName[want]->isData) << want << " is a function";
+        }
+        for (char const* forbidden : c.forbidden) {
+            EXPECT_EQ(byName.count(forbidden), 0u)
+                << forbidden << " belongs to the other width";
+        }
+
+        ASSERT_TRUE(entry.has_value());
+        auto const synthFn = findFuncBySymbol(mir, *entry);
+        ASSERT_TRUE(synthFn.has_value()) << "the entry must be retargeted to the init";
+        auto const calls = orderedCalls(mir, *synthFn);
+        auto const at = [&](char const* name) {
+            return indexOfCall(calls, byName[name]->symbol.v);
+        };
+        std::size_t const iConfigure = at(c.configure);
+        std::size_t const iInit      = at(c.init);
+        std::size_t const iAccessor  = at(c.accessor);
+        std::size_t const iEntry     = indexOfCall(calls, 100u);
+        ASSERT_LT(iEntry, calls.size()) << "the init must call the user entry";
+        EXPECT_LT(iConfigure, iInit)
+            << "argv is configured BEFORE the environment is initialized";
+        EXPECT_LT(iInit, iAccessor)
+            << "the environment is initialized BEFORE its accessor is read";
+        EXPECT_LT(iAccessor, iEntry) << "and read before the entry is called";
+        EXPECT_EQ(calls[iEntry].args, 3u)
+            << "the entry receives (argc, argv, envp)";
+
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
+    }
+}
+
+TEST(RealizeEntryShape, StackEnvironmentIsArgvPlusArgcPlusOneSlots) {
+    // The elf environment vector sits one slot past argv's NULL terminator on the
+    // entry stack, so its address is argv + (argc + 1) * slot — RUNTIME arithmetic
+    // on the (argc, argv) the trampoline materializes, which is why the entry is
+    // retargeted to an init that TAKES those two and computes the third.
+    TypeInterner in{CompilationUnitId{1}};
+    std::vector<EntryMaterialization> const elfVerbs{
+        EntryMaterialization::None, EntryMaterialization::ArgcArgv,
+        EntryMaterialization::ArgcArgvEnvp};
+    Mir mir = buildEntryOnly(
+        in, entrySigFor(in, EntryMaterialization::ArgcArgvEnvp, CallConv::CcSysV));
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(elfVerbs, EntryMaterialization::ArgcArgvEnvp), stackVectorPa(),
+        CSymbolDecorationScheme::None, "elf64-x86_64-linux-exec", rep))
+        << allDiagText(rep);
+    EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+    EXPECT_TRUE(ext.empty()) << "the entry stack needs no import";
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_NE(entry->v, 100u) << "the entry must be retargeted to the init";
+    auto const synthFn = findFuncBySymbol(mir, *entry);
+    ASSERT_TRUE(synthFn.has_value());
+
+    // The init's own parameters are the two values the trampoline hands it.
+    EXPECT_EQ(in.fnParams(mir.funcSignature(*synthFn)).size(), 2u)
+        << "the init takes (argc, argv) — the trampoline and its park are unchanged";
+
+    // Walk the body: two Args, argc widened, +1, * slot, a byte-offset Gep off argv,
+    // and one call to the entry with three arguments — the third being that Gep.
+    std::size_t args = 0;
+    std::optional<MirInstId> argcArg, argvArg, gep;
+    std::optional<std::int64_t> addend, scale;
+    std::optional<OrderedCall> entryCall;
+    MirInstId entryCallId{};
+    std::uint32_t const nb = mir.funcBlockCount(*synthFn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const blk = mir.funcBlockAt(*synthFn, bi);
+        std::uint32_t const ni = mir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const id = mir.blockInstAt(blk, ii);
+            auto const ops = mir.instOperands(id);
+            auto const constOf = [&](MirInstId v) -> std::optional<std::int64_t> {
+                auto const index = mir.tryConstLiteralIndex(v);
+                if (!index.has_value()) return std::nullopt;
+                auto const& lit = mir.literalValue(*index);
+                if (auto const* i = std::get_if<std::int64_t>(&lit.value)) return *i;
+                return std::nullopt;
+            };
+            switch (mir.instOpcode(id)) {
+            case MirOpcode::Arg:
+                if (args == 0) argcArg = id;
+                if (args == 1) argvArg = id;
+                ++args;
+                break;
+            case MirOpcode::Add:
+                for (auto const o : ops) {
+                    if (auto const k = constOf(o)) addend = *k;
+                }
+                break;
+            case MirOpcode::Mul:
+                for (auto const o : ops) {
+                    if (auto const k = constOf(o)) scale = *k;
+                }
+                break;
+            case MirOpcode::Gep:
+                gep = id;
+                ASSERT_EQ(ops.size(), 2u);
+                EXPECT_TRUE(argvArg.has_value() && ops[0].v == argvArg->v)
+                    << "the environment is addressed off ARGV";
+                break;
+            case MirOpcode::Call:
+                if (mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr
+                    && mir.globalAddrSymbol(ops[0]).v == 100u) {
+                    entryCall = OrderedCall{100u, ops.size() - 1};
+                    entryCallId = id;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    EXPECT_EQ(args, 2u);
+    EXPECT_EQ(addend, std::optional<std::int64_t>{1})
+        << "one slot past argv's NULL terminator: argc + 1, never argc";
+    EXPECT_EQ(scale, std::optional<std::int64_t>{8})
+        << "the DECLARED slot width (`vectorSlotBytes`), multiplied in because a MIR "
+           "Gep index is a BYTE offset";
+    ASSERT_TRUE(gep.has_value()) << "envp must be computed as an address off argv";
+    ASSERT_TRUE(entryCall.has_value()) << "the init must call the user entry";
+    EXPECT_EQ(entryCall->args, 3u);
+    auto const callOps = mir.instOperands(entryCallId);
+    EXPECT_TRUE(argcArg.has_value() && callOps[1].v == argcArg->v);
+    EXPECT_TRUE(argvArg.has_value() && callOps[2].v == argvArg->v);
+    EXPECT_EQ(callOps[3].v, gep->v) << "the third argument IS the computed address";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
+}
+
+TEST(RealizeEntryShape, ALoaderDeliveredFormPassesThroughUntouched) {
+    // Mach-O: dyld calls LC_MAIN with (argc, argv, envp, apple) in the argument
+    // registers, so every verb — Darwin's four-value one included — is realized with
+    // NOTHING synthesized; the trampoline's park is what keeps the registers intact.
+    TypeInterner in{CompilationUnitId{1}};
+    std::vector<EntryMaterialization> const machoVerbs{
+        EntryMaterialization::None, EntryMaterialization::ArgcArgv,
+        EntryMaterialization::ArgcArgvEnvp, EntryMaterialization::ArgcArgvEnvpApple};
+    for (auto const verb : {EntryMaterialization::ArgcArgvEnvp,
+                            EntryMaterialization::ArgcArgvEnvpApple}) {
+        SCOPED_TRACE(entryMaterializationName(verb));
+        Mir mir = buildEntryOnly(in, entrySigFor(in, verb, CallConv::CcApple));
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        ASSERT_TRUE(realizeEntryShape(mir, in, entry, ext,
+                                      verbRealizedBy(machoVerbs, verb), std::nullopt,
+                                      CSymbolDecorationScheme::LeadingUnderscore,
+                                      "macho64-arm64-darwin-exec", rep))
+            << allDiagText(rep);
+        EXPECT_EQ(rep.errorCount(), 0u) << allDiagText(rep);
+        EXPECT_EQ(mir.moduleFuncCount(), 1u) << "dyld already delivered them";
+        EXPECT_TRUE(ext.empty());
+        ASSERT_TRUE(entry.has_value());
+        EXPECT_EQ(entry->v, 100u);
+    }
+}
+
+TEST(RealizeEntryShape, AMechanismThatCannotRealizeTheVerbIsRefused) {
+    // `ObjectFormatData::validate()` refuses each of these pairings AT LOAD, so a
+    // loaded format never reaches them; a hand-built `ProcessArgs` can, and the
+    // alternative to refusing is handing the entry values nothing produced.
+    ProcessArgs noLayout = stackVectorPa();
+    noLayout.envpFollowsArgvTerminator = false;
+    noLayout.vectorSlotBytes = 0;
+    ProcessArgs noNarrowPair = ucrtAccessorPa();
+    noNarrowPair.initializeNarrowEnvironmentFn.clear();
+    noNarrowPair.narrowEnvironmentAccessorFn.clear();
+    struct Case {
+        char const* name;
+        EntryMaterialization verb;
+        ProcessArgs pa;
+        char const* why;
+    };
+    std::vector<Case> const cases{
+        {"a wide verb on the entry stack", EntryMaterialization::ArgcWargvWenvp,
+         stackVectorPa(), "narrow strings only"},
+        // Not an environment verb, so the entry stack would otherwise take its
+        // no-op arm — the backstop runs FIRST, or the trampoline's narrow argv
+        // would reach a `wchar_t**` parameter.
+        {"a wide argv on the entry stack", EntryMaterialization::ArgcWargv,
+         stackVectorPa(), "narrow strings only"},
+        {"the environment verb with no declared layout",
+         EntryMaterialization::ArgcArgvEnvp, noLayout,
+         "does not declare where the environment vector sits"},
+        {"the environment verb with no CRT pair", EntryMaterialization::ArgcArgvEnvp,
+         noNarrowPair, "environment initialize/accessor pair"},
+        {"the four-value verb through a CRT", EntryMaterialization::ArgcArgvEnvpApple,
+         ucrtAccessorPa(), "produces at most 3"},
+        {"the four-value verb on the entry stack",
+         EntryMaterialization::ArgcArgvEnvpApple, stackVectorPa(),
+         "produces at most 3"},
+    };
+    for (auto const& c : cases) {
+        SCOPED_TRACE(c.name);
+        TypeInterner in{CompilationUnitId{1}};
+        Mir mir = buildEntryOnly(in, entrySigFor(in, c.verb, CallConv::CcSysV));
+        std::optional<SymbolId>   entry = SymbolId{100};
+        std::vector<ExternImport> ext;
+        DiagnosticReporter        rep;
+        EXPECT_FALSE(realizeEntryShape(mir, in, entry, ext, c.verb, c.pa,
+                                       CSymbolDecorationScheme::None,
+                                       "<hand-built>", rep));
+        EXPECT_EQ(test_support::countCode(
+                      rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u)
+            << allDiagText(rep);
+        expectDiagContains(rep, c.why);
+        EXPECT_TRUE(ext.empty()) << "a refused entry must import nothing";
+        EXPECT_EQ(mir.moduleFuncCount(), 1u) << "and synthesize nothing";
+        ASSERT_TRUE(entry.has_value());
+        EXPECT_EQ(entry->v, 100u) << "and leave the entry symbol alone";
+    }
+}
+
+TEST(RealizeEntryShape, AnEnvironmentVerbOnATwoParameterEntryHitsTheArityBackstop) {
+    // The environment verbs materialize THREE values, so the arity backstop is the
+    // verb table's count and not a literal two: a two-parameter entry handed the
+    // `argc-argv-envp` verb has nowhere to put envp.
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildEntryOnly(
+        in, entrySigFor(in, EntryMaterialization::ArgcArgv, CallConv::CcMS64));
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    EXPECT_FALSE(realizeEntryShape(
+        mir, in, entry, ext,
+        verbRealizedBy(peEntryVerbs(), EntryMaterialization::ArgcArgvEnvp),
+        ucrtAccessorPa(), CSymbolDecorationScheme::None,
+        "pe64-x86_64-windows-exec", rep));
+    EXPECT_EQ(test_support::countCode(
+                  rep, DiagnosticCode::K_EntryVerbUnmaterializable), 1u)
+        << allDiagText(rep);
+    expectDiagContains(rep, "materializes 3 arguments");
+    expectDiagContains(rep, "declares 2 parameter(s)");
+    EXPECT_TRUE(ext.empty());
+    EXPECT_EQ(mir.moduleFuncCount(), 1u);
 }
 
 TEST(RealizeEntryShape, NarrowMainBindsUcrtNarrowAccessors) {

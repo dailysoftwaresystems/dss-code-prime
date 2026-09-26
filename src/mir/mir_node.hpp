@@ -190,13 +190,22 @@ struct MirInst {
     std::uint32_t operandStart = 0;                   // 4  — into operand pool (or phi pool if Phi)
     std::uint32_t operandCount = 0;                   // 4
     std::uint32_t payload      = 0;                   // 4  — per-opcode scalar
-    // Secondary per-opcode scalar. Currently used ONLY by `Alloca`
-    // (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): `payload` carries the aggregate
-    // byte size (frame-slot sizing), so the local's EFFECTIVE alignment
-    // (max of natural + `alignas`) rides here — MIR→LIR reads it to compute
-    // each function's max local alignment (fed to the frame layout). 0 for
-    // every other opcode + a scalar alloca that recorded no over-alignment
-    // (its natural alignment is derivable, so 0 is a safe "no info" sentinel).
+    // ★ THE ONE STATEMENT OF WHAT `payload2` CARRIES — a secondary per-opcode
+    // scalar; 0 means "no information" wherever an opcode below does not set it:
+    //   * `Alloca` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the slot's EFFECTIVE
+    //     alignment in bytes. For a fixed local, the max of natural and `alignas`
+    //     (`payload` carries the byte size); for a runtime-sized (VLA) alloca, the
+    //     ELEMENT's (the size is the operand); 8 for the 8-byte slots that hold a
+    //     VLA's frozen level size or stride. MIR→LIR reads it for each slot and
+    //     for each function's max local alignment (the frame layout). 0 = the
+    //     type's natural alignment, derivable, nothing over-aligned recorded.
+    //   * `AtomicLoad` / `AtomicStore` / `AtomicCas` (D-CSUBSET-PACKED-ATOMIC-MEMBER):
+    //     the accessed lvalue's PROVABLE alignment in bytes, which MIR→LIR compares
+    //     with the access width to choose the native form or the atomics runtime
+    //     (`atomicAccessIsUnderAligned`). 0 = unknown, treated as aligned.
+    //   * every other opcode: 0.
+    // (This note said "Currently used ONLY by `Alloca`" long after the atomics
+    // began stamping it; the `.dssir` text carried neither use until P68.)
     // Grows MirInst 24→28 bytes — the static_assert below still holds.
     std::uint32_t payload2     = 0;                   // 4  — secondary per-opcode scalar
 };
@@ -245,7 +254,7 @@ struct MirFunc {
     // Fits the existing 4-byte _pad slot — no struct-size growth.
     SymbolBinding    binding    = SymbolBinding::Global;     // 1
     SymbolVisibility visibility = SymbolVisibility::Default; // 1
-    // TF-C78 (D-CSUBSET-NOINLINE): the source declared this function
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the source declared this function
     // `__attribute__((noinline))` — the optimizer's inliner MUST NOT splice its
     // body into any caller. Reaches here as source → SymbolRecord.isNoInline →
     // HirNoInlineMap → this bit (the `binding`/`visibility` route above, whose

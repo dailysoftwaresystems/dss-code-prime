@@ -33,7 +33,7 @@
 //   * `frame_load` pseudo-ops become `load result, [SP + slotOffset]`.
 //   * `frame_store` pseudo-ops become `store value, [SP + slotOffset]`.
 //
-// **Frame layout (target-blind, D-ML7-2.2 closure 2026-06-02)**:
+// **Frame layout (target-blind, D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure 2026-06-02)**:
 //   [SP+0 .. SP+outgoingArgAreaSize)              outgoing-args area
 //                                                  — THIS fn's reserved
 //                                                  space for ITS calls.
@@ -319,6 +319,27 @@ frameSlotStrideForClasses(TargetSchema const& schema,
                                        occupants.begin(), occupants.size()});
 }
 
+// ── D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE: WHICH FORM A FRAME ACCESS TAKES ──────
+//
+// The frame chokepoint's own decision (`lir_callconv.cpp` `selectFrameMemOp`),
+// published for the reason `frameSlotStride` is: a derivation no tier can
+// observe is a derivation whose mutant reddens nothing. For a frame LOAD
+// (`isStore == false`) or STORE issued with the class op `baseOp` at `offset`,
+// at the access width `widthFlags` states: the opcode the chokepoint emits —
+// the short form, or its class's scaled long-reach twin — and whether the
+// access is FAR, i.e. beyond every form the target declares for it, and
+// therefore emitted as an address materialized in a register followed by an
+// access at offset 0. Both answers are read from the target's own encoding
+// (the variant guards and the displacement field the offset is wired to),
+// never from a literal.
+struct FrameMemAccessForm {
+    std::uint16_t op  = 0;
+    bool          far = false;
+};
+[[nodiscard]] DSS_EXPORT FrameMemAccessForm
+frameMemAccessForm(TargetSchema const& schema, std::uint16_t baseOp,
+                   bool isStore, std::int32_t offset, std::uint8_t widthFlags);
+
 // ── D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL ───────────────────────────────
 //
 // PLACING ONE LOCAL WHOSE ALIGNMENT MAY EXCEED WHAT A STATIC FRAME OFFSET CAN
@@ -527,7 +548,7 @@ argPoolsShareACursor(TargetSchema const&            schema,
 //     pool states what this target made allocatable, and is NOT a capacity
 //     overflow the stack could absorb;
 //   * the pool is EXHAUSTED — `index >= pool.size()`, which IS stack passing
-//     (D-ML7-2.2).
+//     (D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7).
 [[nodiscard]] DSS_EXPORT std::optional<LirReg>
 argPassingRegister(TargetSchema const&            schema,
                    TargetCallingConvention const& cc,
@@ -720,7 +741,23 @@ private:
         // `lir_wide_call_args::lowerOneFunc`.
         bool const natural = rule == StackArgPacking::Natural
                              && naturalBytes != 0 && naturalBytes <= slot_;
-        std::uint32_t const size  = natural ? naturalBytes : slot_;
+        // ★★ A SCALAR WIDER THAN THE SLOT OCCUPIES ITS OWN SIZE, IN WHOLE SLOTS,
+        // AND IS MOVED AT ITS OWN WIDTH (P68 round 8,
+        // D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED). The slot rule below
+        // used to give it ONE slot: a binary128 `long double` past v7 would have
+        // been placed as 8 bytes, the next stacked argument written over its
+        // high half, and the access moved at the 64-bit default. ✔MEASURED
+        // 2026-09-19, aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 agreeing: a
+        // stacked binary128 after one stacked `double` is at +16, the `double`
+        // after a stacked binary128 at +16, and each is read with one 16-byte
+        // `ldr q`. Only a width the LIR instruction model states (16 → 128 bits)
+        // qualifies; every size a producer states today is 1/2/4/8 or 16, so
+        // every previously-reachable placement is byte-for-byte unchanged.
+        bool const wide = naturalBytes > slot_
+                          && widthFlagsForBytes(naturalBytes) != 0;
+        std::uint32_t const size  = natural ? naturalBytes
+                                  : wide    ? alignUp(naturalBytes, slot_)
+                                            : slot_;
         // D-CSUBSET-LONG-DOUBLE-STACK-ARG-ALIGNMENT: a scalar's own alignment IS
         // its natural size, and the CC's scalar cap decides how much of it
         // survives above the slot. For every naturalBytes a producer states today
@@ -734,8 +771,8 @@ private:
             natural ? naturalBytes : rules_.scalarAlignment(naturalBytes, slot_);
         std::uint32_t const off   = alignUp(cursor_, align);
         cursor_ = off + size;
-        return Placement{off, natural ? widthFlagsForBytes(naturalBytes)
-                                      : std::uint8_t{0}};
+        return Placement{off, (natural || wide) ? widthFlagsForBytes(naturalBytes)
+                                                : std::uint8_t{0}};
     }
 
     [[nodiscard]] static constexpr std::uint8_t
@@ -744,6 +781,7 @@ private:
             case 1:  return kLirInstFlagWidth8;
             case 2:  return kLirInstFlagWidth16;
             case 4:  return kLirInstFlagWidth32;
+            case 16: return kLirInstFlagWidth128;   // a >slot scalar (see `place`)
             default: return 0;   // 8 (and anything else) ⇒ the 64-bit access
         }
     }
@@ -766,7 +804,7 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       outgoingArgAreaSize = 0; // bytes reserved at [SP+0..) for THIS function's outgoing stack args
     std::uint32_t       savedRegAreaSize  = 0;  // bytes occupied by callee-saved regs
     std::uint32_t       spillAreaSize     = 0;  // bytes occupied by spill slots
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): byte
+    // Local-int codegen (plan step 13.3b, 2026-06-02): byte
     // count for body-declared local allocas (one `alloca` LIR op =
     // one `slotSize`-byte slot). Allocas live ABOVE spill slots in
     // the frame layout (positive RSP offset post-prologue). The
@@ -836,7 +874,7 @@ struct DSS_EXPORT FrameLayout {
     bool                hasCalls          = false;
 
     // Derived: saved-reg area starts immediately after the outgoing-
-    // args area. Updated by D-ML7-2.2 closure (2026-06-02) — the
+    // args area. Updated by D-PLAN12-CLOSED-2026-STACK-PASSED-ARGS-CLOSED-WITH-ML7 closure (2026-06-02) — the
     // outgoing area is the new SP+0 zone for stack-arg overflow on
     // ANY cc that overflows its argGprs/argFprs pool. Zero when this
     // function makes no calls or every call fits in the register
@@ -852,7 +890,7 @@ struct DSS_EXPORT FrameLayout {
         return outgoingArgAreaSize + savedRegAreaSize;
     }
 
-    // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b): local-alloca area
+    // Local-int codegen (plan step 13.3b): local-alloca area
     // starts immediately after the spill area (above spills in the
     // stack-grows-down convention; positive offset from post-prologue
     // RSP). Each alloca i (0-indexed by scan order) sits at

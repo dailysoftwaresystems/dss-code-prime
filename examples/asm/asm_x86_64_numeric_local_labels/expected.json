@@ -1,0 +1,28 @@
+{
+  "$comment": "★★ GNU as's NUMERIC LOCAL LABELS ASSEMBLE AND RUN (P68 round 8, D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED). `1:` / `1b`, a `9f` written after one `9:` that must reach the NEXT `9:`, a `9b` loop on the nearest one, and label 0 through `0f` / `0b` beside the binary literal `0b10101`. ✔MEASURED 2026-09-23: GNU as 2.42 and clang 18.1.3 run this file to 42; DSS refused it at the parser (a line cannot begin with a number) until `asm.lang.json` gained `asmNumericLabel` and the dialect declared `numericLabelRule` + `localLabelSuffixes` (with `b`/`f` in `numberStyle.integerSuffixes`). Every reference resolves through the ONE resolver the template lowering asks too (`asm/asm_local_labels.hpp`). ★ RED-ON-DISABLE: resolve a forward reference to the nearest definition BEHIND it and `jmp 9f` loops on the first `9:` — the exit code moves; drop the grammar arm and the file is refused at `1:`. The `release` arm pins only that naming the release pipeline does not break the assembly path (an assembly source forms no HIR/MIR).",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

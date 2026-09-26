@@ -134,18 +134,18 @@ target/
 # project must never write inside this repo.
 #
 # The entry is here only because THIS repo also contains `.dss-project.json`
-# manifests of its own (examples/, real-examples/, and the runners' scratch
+# manifests of its own (examples/, the sqlite corpus action's generated ones, and the runners' scratch
 # trees), so a `dependsOn` example compiled in place would drop the cache
 # inside our working tree. It is ACQUIRED content, never source: reproducible
 # from the manifest's pins, and committing it would vendor someone else's
 # history into this repo. (See docs/project-config-spec.md §2.6.)
 .dss-deps/
 # ⓘ 2026-08-19: `!scripts/build/` stood here, because the unanchored `build/`
-# rule above matches at ANY depth and swallowed the local-build script's
-# directory. The scripts/ consolidation renamed that directory to
-# `scripts/local-build/`, which no ignore rule matches, so the negation was
-# removed rather than retargeted: a negation that negates nothing reads as
-# protection and provides none.
+# rule above matches at ANY depth and swallowed a build script's own directory.
+# The scripts/ consolidation renamed that directory, which no ignore rule
+# matches, so the negation was removed rather than retargeted: a negation that
+# negates nothing reads as protection and provides none. (The script itself is
+# retired -- `dssharness build` builds each leg in its own keyed directory.)
 
 # CTest leftover when ctest is invoked from the repo root (e.g. inside
 # a CI step that cd's wrong) — these are throwaway run artifacts.
@@ -156,7 +156,7 @@ Testing/
 # happen to land at repo-root when ctest runs without a build-dir cwd.
 test-scratch/
 
-# Python bytecode cache (e.g. scripts/refresh_landing_log/refresh_landing_log.py)
+# Python bytecode cache (e.g. .harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py)
 __pycache__/
 *.pyc
 
@@ -196,20 +196,29 @@ __pycache__/
 #
 # ⚠ THIS LINE IS WHAT KEEPS LANE CHECKOUTS OFF EVERY GATE HOST, and that is a
 # REQUIREMENT, not a nicety — operator, same day: "worktrees MUST be ignored by
-# ALL host copies to run legs". Since 2026-08-26 the carriages derive their
-# exclude list from git (`scripts/carriage-excludes/`), so this rule — and only
-# this rule — is what stops N full repo copies riding to macOS and the arm64 VPS
-# on every push. ✔MEASURED: the same accident under `.claude/worktrees/` put
+# ALL host copies to run legs". The transport derives what it carries from git —
+# a hand-typed exclude list per carriage first, `dssharness sync` since — so this
+# rule — and only this rule — is what stops N full repo copies riding to macOS and
+# the arm64 VPS on every push. ✔MEASURED: the same accident under `.claude/worktrees/` put
 # 9,638 files on the macOS host, and the examples runner globs `examples/<lang>/*`,
 # so a gate host holding one can run somebody's uncommitted corpus and report the
 # result as the cycle's. `.worktrees/` is therefore ALSO pinned in that script's
-# `MUST_NEVER_TRAVEL` floor, which re-asks git and REFUSES the carriage if this
-# line ever disappears — the rule is asserted on every leg, not trusted.
+# `MUST_NEVER_TRAVEL` floor, which re-asked git and REFUSED the carriage if this
+# line ever disappeared — the rule was asserted on every leg, not trusted.
+# ★ THAT SECOND ASSERTION SURVIVED THE MIGRATION AND STOPPED BEING PER-CARRIAGE.
+# ✔MEASURED: `.harness-config/config.json`'s `sync.neverTransfer` names
+# `.worktrees`, `.claude/worktrees`, `.secrets`, `.temp`, `build`, `scratchpad` and
+# `test-scratch`, once, for every host — so the floor no longer depends on N
+# hand-written scripts agreeing with each other. `dssharness sync --dry-run` lists
+# every path it would write, and is how to check this rather than trust it.
 #
-# ⚠ `git clean -fd` (what `scripts/leg-tree/` restore runs) does NOT delete
+# ⚠ `git clean -fd` (what a tree restore runs) does NOT delete
 # ignored paths, so a live worktree survives a leg restore. `-fdx` WOULD destroy
 # it mid-build; the dss-cycle skill forbids `-fdx` for exactly this reason.
-/.worktrees/
+# ⓘ THE RULE ITSELF, `/.worktrees/`, NOW LIVES IN THE repo-harness MANAGED BLOCK AT THE END
+# OF THIS FILE (2026-09-18): `dssharness init` derives it from `worktrees.root` in
+# `.harness-config/config.json`, so the directory and the rule cannot name two places. One
+# statement of the rule, not two -- the reasons above still apply to that line.
 
 # Agent-manager tooling and third-party dependency trees. THE SAME SHAPE AS THE
 # RULE ABOVE, and it cost the same way: `.kilo/` was covered only by
@@ -218,17 +227,21 @@ __pycache__/
 # ✔MEASURED 2026-08-26: the arm64 VPS gate host held `.kilo/` — 3,671 files, 61 MB,
 # 3,667 of them `node_modules` — because every carriage excluded `node_modules`
 # ANCHORED at the top level and `.kilo/node_modules` is not at the top level.
-# ★ Since 2026-08-26 the carriages derive their exclude list from git
-# (`scripts/carriage-excludes/`), so a rule written HERE is what keeps a tree off
-# every gate host, and a rule written only in `.git/info/exclude` protects one.
-# D-SCRIPT-CARRIAGE-EXCLUDES-ARE-A-HAND-LIST-AND-MISS-NESTED-IGNORED-TREES
+# ★ The transport derives what it carries from git, so a rule written HERE is
+# what keeps a tree off every gate host, and a rule written only in
+# `.git/info/exclude` protects one.
+# ⚠ AND A HAND LIST PATCHED AFTER THE FACT DOES NOT UNDO THE DAMAGE: rsync does
+# NOT delete an EXCLUDED path, so a name added late PROTECTS the stale copy
+# instead of removing it. ✔MEASURED 2026-08-26 — `.secrets/` was named by one of
+# the four lists and leaked anyway, leaving each gate host holding the OTHER
+# host's private key; both hosts had to be cleaned once, explicitly.
 .kilo/
 node_modules/
 .venv/
 
 #.plans/ -- Not for now, but will be used when first minimal implementation is done and we start working on the next steps.
 
-# Operator connection data for scripts/ssh-*/ — hosts, logins, key PATHS.
+# Operator connection data (first for the retired scripts/ssh-*/ carriages) — hosts, logins, key PATHS.
 # NEVER tracked: this repo is slated to go public (PR #37) and these name real machines.
 # ★ Connection data + key material for the cross-host tooling.
 #   ⚠ THE ORIGINAL RULE HERE WAS "PATHS ONLY, no private key material" — that changed
@@ -261,3 +274,59 @@ id_ed25519
 # Explicit exceptions: template/example files that carry NO secret, only field names.
 !*.env.example
 !*.env.template
+# ── DssHarness ────────────────────────────────────────────────────────────────
+# The tool's own state, its per-host connection data and its runner inputs are
+# ignored; the contract (`config.json`) and the runner ACTIONS are tracked, because
+# they describe what this repository does and must travel with a clone.
+#
+# ★★ TWO HALVES, AND THE ORDER IS LOAD-BEARING. The tool's own rules are the MANAGED
+# BLOCK at the end of this file, written and rewritten by `dssharness init` (marked
+# `>>> repo-harness managed block >>>`, derived from `.harness-config/config.json`).
+# ✔MEASURED 2026-09-18 in a throwaway repository: `init` writes exactly the lines below
+# that block's markers, and a second `init` answers `kept .gitignore (rules already
+# current)`. Until then this section was a HAND-WRITTEN copy of an older block, and it
+# had not kept up: it did not ignore `<action>/artifacts/` at all (a persisted output
+# would have ridden every sync and been committable), and `<action>/build/` was ignored
+# only by the unrelated repository-wide `build/` rule near the top of this file.
+# ⇒ what stays HERE is only what the block does not say: an ALLOWLIST that ignores
+# everything at `.harness-config/` and `.harness-config/runner/` the tool may ever
+# write, then re-includes the four places this repository tracks. It must come FIRST:
+# the block's contents rules re-include the placeholders, and git cannot re-include a
+# file whose parent directory a LATER rule excludes. No rule is stated twice.
+# ⚠ `init` (0.5.8) NOTES each `!…/` re-include below as doing "nothing there" for the
+# paths BELOW its directory. True of those paths, and still no reason to drop one: each
+# re-includes its DIRECTORY, without which the block's `!…/.gitkeep` is unreachable.
+# ✔MEASURED 2026-09-21 in a throwaway repository: without `!/.harness-config/sshItems/`,
+# `git add --all` never reaches `sshItems/.gitkeep` and `check-ignore` names line 1.
+# ⚠ THE WORKTREES ROOT is ignored WHOLE, never by the contents shape: the block names it
+# (`/.worktrees`, like `/.harness-config/runs`) -- by NAME since 0.5.8, so a root kept on
+# another disk through a link is ignored as surely as a directory. The contents shape
+# `/x/* + !/x/.gitkeep` answers NOT-IGNORED to `check-ignore x` without the slash,
+# which costs nothing on a slot holding an address and a key and, on a root holding
+# entire working trees, is the difference between a clean sync and shipping N
+# checkouts -- which this repository has already paid for once.
+/.harness-config/*
+!/.harness-config/config.json
+!/.harness-config/sshItems/
+!/.harness-config/wslDistros/
+!/.harness-config/runner/
+/.harness-config/runner/*
+!/.harness-config/runner/actions/
+!/.harness-config/runner/.env/
+!/.harness-config/runner/.secrets/
+
+# >>> repo-harness managed block >>>
+/.harness-config/lock.json
+/.harness-config/runs
+/.worktrees
+/.harness-config/sshItems/*
+!/.harness-config/sshItems/.gitkeep
+/.harness-config/wslDistros/*
+!/.harness-config/wslDistros/.gitkeep
+/.harness-config/runner/.env/*
+!/.harness-config/runner/.env/.gitkeep
+/.harness-config/runner/.secrets/*
+!/.harness-config/runner/.secrets/.gitkeep
+/.harness-config/runner/actions/**/build/
+/.harness-config/runner/actions/**/artifacts/
+# <<< repo-harness managed block <<<

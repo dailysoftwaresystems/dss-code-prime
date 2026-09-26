@@ -59,6 +59,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <optional>
 #include <set>
@@ -230,11 +231,23 @@ std::size_t checkOneTarget(fs::path const& root, GrammarSchema const& sch,
     auto const rows = vocab.rows();
     ShippedTypeConsistency checker{interner, rows, ax.format};
 
+    // The axis's long-double format reaches the reader too (P68 round 12, S2a-1):
+    // a typedef or `signature` arm keyed `when: {longDoubleFormat}` is selected
+    // by it — the axis this sweep already enumerates for the vocabulary, now
+    // carried to the descriptors it checks. No language (no derived constant is
+    // realized) and no ABI typedefs: this sweep crosses every arch with every
+    // axis, including pairs no target declares, so it keeps the reads it made.
+    ShippedPairFacts const pairFacts{
+        nullptr, ax.dm, std::nullopt, {},
+        ax.ldf == LongDoubleFormat::None ? std::optional<LongDoubleFormat>{}
+                                         : std::optional<LongDoubleFormat>{ax.ldf}};
+
     std::size_t checked = 0;
     for (auto const& path : descriptors) {
         DiagnosticReporter readRep;   // read failures are a DIFFERENT invariant
         auto desc = readShippedLibDescriptor(path, interner, typeReg, readRep,
-                                             ax.dm, arch, ax.format, named);
+                                             ax.dm, arch, ax.format, named,
+                                             nullptr, &pairFacts);
         // A descriptor that does not READ is a different invariant (pinned by
         // test_shipped_lib_descriptor) — but it MUST NOT silently shrink this
         // sweep, so it is surfaced here rather than skipped in silence.
@@ -293,6 +306,45 @@ TEST(ShippedTypeConsistency, EveryDescriptorAgreesOnEveryTagAndTypedefPerTarget)
                 << "only " << checked << " descriptors were checked on this "
                    "target — the sweep is no longer exhaustive";
         }
+    }
+}
+
+// ── P68 round 12 (S2a-2a): one owner per typedef name ───────────────────────
+//
+// ONE document defines each shipped typedef name; every other header that declares
+// it NAMES that owner. ✔MEASURED before S2a-2a: size_t was defined six times, wchar_t
+// four, intptr_t and time_t twice — held together only by the consistency sweep. A
+// second definition is where the next drift would start.
+TEST(ShippedTypeConsistency, EveryShippedTypedefNameHasOneDefiningDescriptor) {
+    fs::path const cfg = configRoot();
+    ASSERT_FALSE(cfg.empty());
+    fs::path const root = cfg / "shippedLibs";
+    std::map<std::string, std::vector<std::string>> definers;
+    std::size_t references = 0;
+    for (auto const& entry : fs::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+        std::ifstream in{entry.path(), std::ios::binary};
+        auto const doc = nlohmann::json::parse(in, nullptr, /*allow_exceptions=*/false);
+        ASSERT_FALSE(doc.is_discarded()) << entry.path().generic_string();
+        if (!doc.contains("typedefs")) continue;
+        std::string const rel = fs::relative(entry.path(), root).generic_string();
+        for (auto const& t : doc.at("typedefs")) {
+            bool isRef = t.contains("shippedTypedef");
+            if (t.contains("variants"))
+                for (auto const& v : t.at("variants")) isRef = isRef || v.contains("shippedTypedef");
+            if (isRef) { ++references; continue; }
+            definers[t.at("name").get<std::string>()].push_back(rel);
+        }
+    }
+    EXPECT_GE(definers.size(), 100u) << "the typedef enumeration collapsed (162 names at S2a-2a)";
+    EXPECT_GE(references, 10u) << "S2a-2a's references are gone";
+    for (auto const& [name, where] : definers) {
+        std::string list;
+        for (auto const& w : where) list += " " + w;
+        EXPECT_EQ(where.size(), 1u)
+            << "typedef '" << name << "' is DEFINED by" << list
+            << " — one document defines each type; every other header names it with "
+               "`shippedTypedef`";
     }
 }
 

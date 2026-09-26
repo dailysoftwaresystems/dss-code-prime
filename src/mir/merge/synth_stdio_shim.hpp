@@ -148,6 +148,13 @@ class DiagnosticReporter;
 // `vaLayout->strategy` this pass has no arm for (the SysVRegisterSave / Aapcs64DualCursor
 // cases above); or (d) `vaLayout == nullopt` — the active CC declared no `vaListLayout` at
 // all, so there is no declared variadic model to forward.
+//
+// ★★ LINKAGE: every shim this pass defines is WEAK + HIDDEN — the synthesis-once rule
+// (P68 round 11): a synthesized library body exists once per linked image however many
+// separately compiled units carry a copy (a program CU, a DSS static library's member, a
+// shipped runtime unit's archive member), because the linker's all-weak arm keeps one; and
+// it stays internal to that image, as the UCRT's own header inline does — never exported,
+// never preemptible. tests/mir/test_synth_shim_collapse_linkage.cpp pins it.
 [[nodiscard]] DSS_EXPORT bool
 synthesizeStdioShim(Mir&                                                  mir,
                     TypeInterner&                                         interner,

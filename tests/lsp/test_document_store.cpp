@@ -1,5 +1,5 @@
 // DocumentStore: open/update/close lifecycle, generation bumping,
-// stale-parse suppression (worker writes diagnostics tagged with
+// stale-parse suppression (a worker writes its analyses tagged with
 // the generation it parsed; if the doc was updated meanwhile the
 // write is silently dropped).
 
@@ -21,6 +21,7 @@ using dss::DiagnosticCode;
 using dss::DiagnosticSeverity;
 using dss::ParseDiagnostic;
 using dss::SourceSpan;
+using dss::lsp::DocumentAnalysis;
 using dss::lsp::DocumentStore;
 
 namespace {
@@ -32,6 +33,27 @@ namespace {
     d.span     = SourceSpan::of(ByteOffset{0}, ByteOffset{1});
     d.actual   = std::move(actual);
     return d;
+}
+
+// One language-only analysis carrying `diags` — the shape a document with no
+// build configuration stores.
+[[nodiscard]] std::vector<DocumentAnalysis>
+analysesOf(std::vector<ParseDiagnostic> diags) {
+    DocumentAnalysis a;
+    a.diagnostics = std::move(diags);
+    std::vector<DocumentAnalysis> out;
+    out.push_back(std::move(a));
+    return out;
+}
+
+// Every stored diagnostic of `uri`, across its analyses, in order.
+[[nodiscard]] std::vector<ParseDiagnostic>
+storedDiagnostics(DocumentStore const& s, std::string const& uri) {
+    std::vector<ParseDiagnostic> out;
+    for (auto const& a : s.analysesFor(uri)) {
+        out.insert(out.end(), a.diagnostics.begin(), a.diagnostics.end());
+    }
+    return out;
 }
 
 } // namespace
@@ -106,26 +128,26 @@ TEST(DocumentStore, UpdateOnUnknownUriReturnsNullopt) {
     EXPECT_FALSE(s.update("ghost", 1, "x").has_value());
 }
 
-TEST(DocumentStore, SetDiagnosticsAppliesWhenGenerationMatches) {
+TEST(DocumentStore, SetAnalysesAppliesWhenGenerationMatches) {
     DocumentStore s;
     s.open("u", 1, "x", nullptr);
     std::vector<ParseDiagnostic> diags;
     diags.push_back(makeDiag("foo"));
-    EXPECT_TRUE(s.setDiagnostics("u", 0u, std::move(diags)));
-    auto got = s.diagnosticsFor("u");
+    EXPECT_TRUE(s.setAnalyses("u", 0u, analysesOf(std::move(diags))));
+    auto got = storedDiagnostics(s, "u");
     ASSERT_EQ(got.size(), 1u);
     EXPECT_EQ(got[0].actual, "foo");
 }
 
-TEST(DocumentStore, SetDiagnosticsDroppedWhenStale) {
+TEST(DocumentStore, SetAnalysesDroppedWhenStale) {
     DocumentStore s;
     s.open("u", 1, "x", nullptr);
     (void)s.update("u", 2, "xy"); // bumps gen to 1
     std::vector<ParseDiagnostic> staleDiags;
     staleDiags.push_back(makeDiag("STALE"));
     // Worker started at gen 0 — must be dropped.
-    EXPECT_FALSE(s.setDiagnostics("u", 0u, std::move(staleDiags)));
-    EXPECT_TRUE(s.diagnosticsFor("u").empty());
+    EXPECT_FALSE(s.setAnalyses("u", 0u, analysesOf(std::move(staleDiags))));
+    EXPECT_TRUE(s.analysesFor("u").empty());
 }
 
 TEST(DocumentStore, CloseRemovesDocument) {
@@ -133,11 +155,11 @@ TEST(DocumentStore, CloseRemovesDocument) {
     s.open("u", 1, "x", nullptr);
     s.close("u");
     EXPECT_FALSE(s.snapshot("u").has_value());
-    EXPECT_TRUE(s.diagnosticsFor("u").empty());
+    EXPECT_TRUE(s.analysesFor("u").empty());
 }
 
 TEST(DocumentStore, ConcurrentUpdatesAndStaleWritebackPreserveLatest) {
-    // Worker thread storms `setDiagnostics(staleGen, …)` while the
+    // Worker thread storms `setAnalyses(staleGen, …)` while the
     // main thread storms `update(...)`. The mutex + generation
     // token must guarantee: (a) the stale writeback is dropped or
     // applied only against its matching generation, and (b) the
@@ -153,7 +175,7 @@ TEST(DocumentStore, ConcurrentUpdatesAndStaleWritebackPreserveLatest) {
             diags.push_back(makeDiag("worker"));
             // Always target gen 0 — every update bumps past it, so
             // these writes should be dropped after the first update.
-            (void)s.setDiagnostics("u", 0u, std::move(diags));
+            (void)s.setAnalyses("u", 0u, analysesOf(std::move(diags)));
         }
     });
 
@@ -177,7 +199,7 @@ TEST(DocumentStore, ReopenResetsState) {
     (void)s.update("u", 2, "older"); // gen 1
     std::vector<ParseDiagnostic> oldDiags;
     oldDiags.push_back(makeDiag("OLD"));
-    (void)s.setDiagnostics("u", 1u, std::move(oldDiags));
+    (void)s.setAnalyses("u", 1u, analysesOf(std::move(oldDiags)));
 
     s.open("u", 10, "new", nullptr);
     auto snap = s.snapshot("u");
@@ -185,5 +207,5 @@ TEST(DocumentStore, ReopenResetsState) {
     EXPECT_EQ(snap->parseGeneration, 0u);
     EXPECT_EQ(snap->clientVersion, 10);
     EXPECT_EQ(snap->text, "new");
-    EXPECT_TRUE(s.diagnosticsFor("u").empty());
+    EXPECT_TRUE(s.analysesFor("u").empty());
 }

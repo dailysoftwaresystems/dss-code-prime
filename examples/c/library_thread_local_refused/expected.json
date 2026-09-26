@@ -1,0 +1,36 @@
+{
+  "$comment": "D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA — the ONLY end-to-end witness of a P0 that shipped with none. ★★★ WHY THIS EXAMPLE EXISTS AND WHAT IT ADDS OVER THE UNIT ARMS. The pins that landed with the fix call `reportLibraryThreadStorageDisagreement` DIRECTLY, passing a literal name, a literal library string and a literal SymbolKind: they prove the PREDICATE and never once touch the WIRING. Nothing read an ELF file, nothing entered `ingest()`, nothing drove `Program`, nothing ran the CLI — so the chain the defect actually travelled (elf_reader classifies STT_TLS → the export row matches a C `extern` declaration → the binder consults both answers → the refusal reaches the user) had zero coverage of any kind. This entry is that chain, from C source to a rendered diagnostic, over a library a real gcc built. ★★ THE LIBRARY IS A COMMITTED FIXTURE, NOT A `dependsOn` BUILD, and that is deliberate rather than convenient: the defect is about what ANOTHER TOOLCHAIN'S export table says, so a library DSS built would be asserting against DSS's own idea of STT_TLS. `tests/ffi/data/libtls-*.so` are GNU ld 2.42 / gcc 13.3.0 output, and `tests/ffi/data/libtls.source.c` carries the exact rebuild commands. The `containerWitness` is `.tdata` — the section a `__thread` definition creates — so a fixture regenerated WITHOUT the keyword stops resolving instead of silently turning this example green. ⚠ THE HARNESS CAPABILITY THIS ENTRY NEEDED, AND IT IS REPORTED AS A FINDING RATHER THAN BURIED HERE: until this change BOTH runners PARSED `prebuiltLibraries` on an `expectDiagnostics` manifest and then compiled WITHOUT it, so every refusal that only a library can cause — storage-duration, object-format and architecture disagreements alike — was inexpressible as a corpus example. `runErrorTarget` now resolves the key through the same `resolvePrebuiltLibrary` the success arm uses and threads it into `setResolveLibraries`; `runErrorExampleViaCli` mirrors it onto the shipped CLI's `--resolve-library`. Both refuse `expectDiagnostics` beside `dependsOn` or `optimizedPipelines` by name, which the CLI runner's own comment had already called the right fix. ★ THE SECOND IMPORT IS THE NEGATIVE CONTROL, in the same source, asserted by the same set equality: `dss_lib_plain_counter` is ordinary STT_OBJECT data exported from the SAME image, and it must still bind. ✔MEASURED through the shipped CLI at this tree, both ELF targets, with the library on `--resolve-library`: exactly ONE diagnostic line, rc 1, and an EMPTY output directory. ✔MEASURED in the same run, the two arms this example cannot itself carry: the plain-only program (`extern int dss_lib_plain_counter;` alone) compiles rc 0 and writes its artifact even under `--warnings-as-errors`; and the CORRECTLY-spelled `extern _Thread_local int dss_lib_tls_counter;` reaches K_FormatLacksThreadLocalSupport instead — a different program and a different message, which is what makes this refusal a guard rather than a blanket. NO `optimizedPipelines` ARM, and the absence is structural rather than an omission: a refusal arm never builds an artifact, so there is no baseline image for an optimized arm to differ from; the parsers now REFUSE the pair instead of parsing and dropping it. Leg-by-leg results are NOT recorded here — whoever runs the legs writes them.",
+  "language": "c",
+  "source": "main.c",
+  "expectDiagnostics": [
+    {
+      "code": "K_ExternImportAttributeConflict",
+      "line": 1,
+      "col": 1,
+      "positioned": false
+    }
+  ],
+  "targets": [
+    {
+      "$comment": "The CLI runner compiles only the FIRST declared target (a front-end refusal is target-independent) and records the rest as NotSelectedByRunner; the in-process runner drives every one. Both ELF targets are declared because each carries its OWN library fixture, and the arm64 one is what proves the reader's STT_TLS classification is not an x86-only accident.",
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13.3.0 / GNU ld 2.42, `-shared -fPIC -Os`, stripped. `readelf --dyn-syms` reports `TLS GLOBAL DEFAULT` for dss_lib_tls_counter.",
+          "path": "tests/ffi/data/libtls-x86_64.so.1",
+          "containerWitness": ".tdata"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "prebuiltLibraries": [
+        {
+          "$comment": "aarch64-linux-gnu-gcc 13.3.0 / GNU ld 2.42, same flags, stripped. Same `TLS GLOBAL DEFAULT` row.",
+          "path": "tests/ffi/data/libtls-aarch64.so.1",
+          "containerWitness": ".tdata"
+        }
+      ]
+    }
+  ]
+}

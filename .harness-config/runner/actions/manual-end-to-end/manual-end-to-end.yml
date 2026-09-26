@@ -1,0 +1,86 @@
+# PURPOSE: run the manual end-to-end corpus, the entries whose cost makes them wrong to put in a gate, taken deliberately instead.
+name: manual-end-to-end
+description: >-
+  Runs the MANUAL end-to-end corpus — the entries whose cost makes them wrong to put in a gate,
+  taken deliberately instead. Today that is one entry: the AArch64 BRANCH ISLAND edge, which fires
+  only beyond ±128 MiB of emitted code, so witnessing it means compiling a single function larger
+  than 134 MB. The driver, the corpus and every supporting file live in this directory; the
+  mechanism and the numbers it prints are documented in the program itself,
+  `.harness-config/runner/actions/manual-end-to-end/manual-end-to-end.py`.
+
+  ★★★ WHY THE MANUAL CORPUS IS NOT UNDER `examples/`, AND IT IS A MEASUREMENT RATHER THAN A
+  CONVENTION. ✔MEASURED at this tree: both shipped corpus harnesses derive their ctest entries
+  from ONE glob, `${CMAKE_SOURCE_DIR}/examples/*/*/expected.json` — exactly that ROOT. An entry
+  HERE is therefore invisible to both, so the default `ctest -N` count cannot move. ⚠ IT IS THE
+  ROOT THAT PROTECTS THIS, NOT THE DEPTH: this corpus is itself `corpus/<language>/<name>/`,
+  mirroring `examples/` and `real-examples/`, and its driver discovers entries RECURSIVELY. An
+  earlier wording said "exactly two levels" as though depth were half the guarantee; it was not. That guarantee is STRUCTURAL: there is no flag for a future caller to forget and no
+  registered-but-skipped entry to perturb the cross-leg identity the gate checks. A `-LE` label
+  would have relied on every future invocation remembering it; a `DISABLED` entry still appears in
+  `ctest -N`; this appears nowhere.
+
+  ★★ THE MANIFEST STILL DECLARES ITS INTENT: `manualRun` defaults to FALSE and this driver SKIPS,
+  by name, any entry that does not declare it true. The LOCATION decides what a default run sees;
+  the FLAG decides what this runner will execute. Without the flag, this directory would be a
+  place where a test runs by accident.
+
+  ★ LAYOUT — the operator's ruling, ✔PROVEN WORKING at DssHarness 0.5.4 by the clock-step probe
+  beside it: one directory per action, named for the action, holding its `.yml` and every
+  supporting file, because a `run` line is a program and its arguments with no shell.
+
+steps:
+  - name: run-manual-corpus
+    # `python3` is the first token for the same reason the clock-step probe uses it: a run line's
+    # program must be a tool the configuration declares, and the script is then an ordinary
+    # argument, so a repository program needs no declaration of its own.
+    # ★ WORKING DIRECTORY. A step runs at the LEG'S TREE ROOT unless it says otherwise;
+    # `workingDirectoryRoot: action` puts the cwd in THIS directory, which is what lets the
+    # program be named `./manual-end-to-end.py`. The tree root is then passed EXPLICITLY rather
+    # than derived by counting `..` segments in the program — the layout rule is enforced by the
+    # tool, but a path built out of its enforcement is a second place the rule lives.
+    workingDirectoryRoot: action
+    run: |
+      python3 ./manual-end-to-end.py --tree-root ../../../.. --heartbeat 15
+    # ⚠ THE STALL BOUND, AND WHY IT IS NOT A WALL-CLOCK BUDGET. DssHarness deliberately does not
+    # apply wall-clock timeouts to phases and legs: a time budget is a guess about workload size,
+    # and an honest run that exceeds it gets killed. What it bounds instead is a STALL — no output
+    # for N seconds means hung — because output CADENCE stays stable even when total duration does
+    # not. That contract is only meaningful against a program that reports as it works, so the
+    # driver emits a heartbeat every 15 s carrying elapsed time and the compiler's output size so
+    # far. 120 s is eight heartbeats: wide enough that a paused scheduler, a slow filesystem or a
+    # thrashing host does not read as a hang, narrow enough that a genuinely wedged compile is
+    # caught in two minutes rather than after a multi-hour run.
+    # ⚠ IT IS A PROPERTY OF THE HEARTBEAT, NOT OF THE WORKLOAD, and that is the whole point: the
+    # island compile's duration is the thing being MEASURED, so bounding it would be bounding the
+    # measurement.
+    stallSeconds: 120
+    # ★★★ THE WITNESS. A zero exit code is not proof this ran: a driver that found no corpus, or
+    # skipped every entry, would exit 0 having measured nothing. The pattern below is printed ONLY
+    # on the path where at least one entry was executed — a run that skipped everything prints
+    # `manual-end-to-end executed-nothing` instead and exits 1 — so the witness cannot be
+    # satisfied by a vacuous run. The per-entry EVIDENCE lines (wall clock, peak resident memory,
+    # emitted bytes, .text span, relaxation passes, islands placed, host) are in the same output,
+    # which is what makes the `docs/` write-up able to quote a run rather than a recollection.
+    successPattern: "manual-end-to-end complete ran="
+    # ⛔⛔ `watchContention` IS DELIBERATELY ABSENT, AND THIS IS THE ONE ACTION IN THE TREE WHERE
+    # DECLARING IT WOULD BE A DEFECT RATHER THAN AN IMPROVEMENT. 📄DOCUMENTED (repo-harness, the
+    # release that adds it): `watchContention` needs a directory to watch, and that directory is
+    # THE LEG'S BUILD DIRECTORY. An action invoked with NO LEG has none, and that combination is
+    # REFUSED WHEN THE ACTION RUNS, naming the key — not at config-read time, because reading an
+    # action file cannot know how it will later be invoked.
+    # ★★★ THAT REFUSAL LANDS EXACTLY WHERE THIS RUNNER LIVES. A manual end-to-end runner is the
+    # thing a person invokes STANDALONE, outside a leg, months from now, to reproduce a number the
+    # `docs/` write-up quotes. Declaring the key would leave this file green in every check anyone
+    # can run today and refusing at the one moment it exists for. Nothing here can show the runner
+    # is only ever reachable through a leg — the opposite is its purpose — so the key stays off.
+    # ⚠ DO NOT ADD IT "for parity" with the leg-bound runners. Their invocation always carries a
+    # leg; this one's deliberately need not.
+    #
+    # ⓘ `requireInputsUnmoved` is also absent, and for a WEAKER reason that is stated separately so
+    # the two are not read as one judgement: no limit was published for it on an action run without
+    # a leg. UNSTATED IS NOT PROVEN ABSENT. Whoever wants it here MEASURES it on a legless
+    # invocation first, rather than inferring safety from the silence.
+    #
+    # ⚠ AND NEITHER KEY MAY LAND BEFORE THE RELEASE THAT ADDS THEM: an unknown key is an action
+    # parse REFUSAL at the installed version, so a file carrying one breaks the tree on the day it
+    # is committed rather than on the day it is needed.

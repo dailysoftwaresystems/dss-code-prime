@@ -1,0 +1,16 @@
+{
+  "$comment": "C23's unreachable() from <stddef.h> and the GNU __builtin_unreachable() it expands to, on every pair (P68 round 12, D-C-STDDEF-H-LACKS-UNREACHABLE, fold S1b) — both undeclared before S1b (S_UndeclaredIdentifier, measured on pe64 and ELF x86_64; the builtin table is the language's, not a pair's). unreachable() is `(__builtin_unreachable())`, gcc's own <stddef.h> spelling (clang 18's and Apple clang 21's are the same call unparenthesized); each use sits only where control cannot arrive (the tail after a switch over every enumerator — C23 7.21.1 EXAMPLE 2's own shape — a switch default the callers exclude, the tail after a branch that returned, an expression arm the operand never takes), so the trap lowering and the exit code coexist — the no-fall-through property is pinned by tests/mir/test_builtin_unreachable_lowering.cpp. Exit 42 = 7 + 11 + 24 + 2 + 1 - 3. References: gcc 13.3.0 and clang 18.1.3 on x86_64 and gcc 13.3.0 on native aarch64 (-O0 and -O2), Apple clang 21 on both Mach-O arches (-O2), all `-pedantic -Wall`: exit 42 with no diagnostic; mingw-w64 13.2.0 declares no unreachable(). RED-ON-DISABLE: drop <stddef.h>'s unreachable() row and every pair refuses the compile (S_UndeclaredIdentifier); drop the isDirectNoreturnCall arm for the builtin and every pair refuses `channel`, `pick` and `twice` (H_VerifierFailure: non-void function may fall through).",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" },
+    { "spec": "x86_64:macho64-x86_64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

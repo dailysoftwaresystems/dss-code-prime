@@ -62,8 +62,8 @@ namespace {
 // carrying no table it passed having actually inspected ONE, and reported the
 // migration's exit criterion as met. An aggregate count over a population where
 // most members are absent is the "guard that asserts nothing" shape this project
-// has anchored twice (D-TEST-PE64-CONFOUND-PIN-WEAKENED-BY-ITS-OWN-SUBJECT). The
-// fix is not a bigger number — it is a per-member verdict that must be RESTATED
+// has been bitten by twice, most memorably by a pin its own subject was free to
+// weaken. The fix is not a bigger number — it is a per-member verdict RESTATED
 // when the member changes.
 //
 // Each verdict is the answer for that flavour, and each `why` is the argument for

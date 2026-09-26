@@ -55,6 +55,8 @@
 
 namespace dss {
 
+class GrammarSchema;   // PredefinedMacroDumpRequest::language (a pointer; P68 round 9)
+
 // ── The output vocabulary ────────────────────────────────────────────────────
 //
 // LINE SHAPE (one per effective macro), `key=value` fields separated by single
@@ -183,6 +185,20 @@ struct DSS_EXPORT PredefinedMacroDumpRequest {
     // renders as `<none>` rather than being omitted — a MISSING field would be
     // read as an older build, while `<none>` is a fact.
     std::string_view configRoot;
+
+    // P68 round 8 (D-C-SIZEOF-PREDEFINED-MACRO-FAMILY-MISSING): the pair's facts
+    // for the language's `type-size` rows (`predefinedTypeFactsFor`, the same
+    // computation `applyTargetFormatPair` hands the compile), forwarded to EVERY
+    // merge this dump runs — the full one and the per-family origin calls. Null
+    // ⇒ no pair ⇒ those rows are not in the effective set, exactly as a compile
+    // with no target would see.
+    PredefinedTypeFacts const* typeFacts = nullptr;
+
+    // P68 round 9: the LANGUAGE the `languageMacros` came from, forwarded with
+    // `typeFacts` to every merge this dump runs, so the `type-name` /
+    // `type-limit` / `type-suffix` rows print the values this triple's compile
+    // would define (the merge realizes them only with the language in hand).
+    GrammarSchema const* language = nullptr;
 };
 
 // Render ONE triple's effective set.

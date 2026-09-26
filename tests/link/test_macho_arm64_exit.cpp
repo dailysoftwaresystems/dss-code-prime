@@ -444,6 +444,8 @@ TEST(MachOArm64Exit, IndirectSlotDispatchOnMachOFailsLoud) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -633,29 +635,32 @@ TEST(MachOArm64Exit, Arm64ExecEmitsBuildVersionMacOs) {
 //    THIS test, whose whole subject is the ABSENCE path. It would stay
 //    green and stop proving anything. Left absent on purpose.
 //
-//  * buildVersion: ★ the old one-liner here said "Intel/Rosetta is
-//    lenient". Do not read that as established. It is DOCUMENTED at
-//    best and nothing in this project has measured it: LC_BUILD_VERSION
-//    is how dyld4 identifies a main executable's PLATFORM, which is an
-//    OS-version property rather than a CPU one, so the leniency claim
-//    may not survive contact with a current macOS. It stays absent here
-//    for a CONCRETE reason instead: `macho::encodeExec` (the static
-//    exec arm) REJECTS a schema carrying image.buildVersion LOUD
-//    (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION), and several walker
-//    tests drive this format with zero-extern modules straight down
-//    that arm — so declaring it today turns tests red for a reason that
-//    has nothing to do with macOS. IF the first Rosetta run of a
-//    DSS-built x86_64 Mach-O fails at load with a platform /
-//    EBADMACHO-class error, this EXPECT_FALSE is the line to flip (to
-//    a buildVersion assertion mirroring Arm64ExecEmitsBuildVersionMacOs
-//    above), and that static-arm gap is what must land with it.
+//  * buildVersion: DECLARED since 2026-09-24 (macos / 10.14 / 10.14), and
+//    this used to be the EXPECT_FALSE that pinned its absence. The "Intel/
+//    Rosetta is lenient" argument it once rested on was FALSE: ✔MEASURED
+//    2026-09-24 on the macos-arm64 leg, a DSS x86_64 image WITHOUT the
+//    command loads under Rosetta but its `apple` vector carries no
+//    `executable_path=` (examples/c/entry_main_envp_apple exited 97; Apple
+//    clang's x86_64 build of the same source runs to 42). The static-arm
+//    gap that kept it absent closed with it
+//    (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION): the static exec arm EMITS
+//    the command now, pinned by StaticExecArmEmitsTheDeclaredBuildVersion
+//    below. 10.14 is the lowest macOS LC_BUILD_VERSION can name — the
+//    format's own `$buildVersionComment` argues the value.
 TEST(MachOArm64Exit, X86DarwinExecDefaultsTo4KSegmentPageSize) {
     auto fmt = loadDarwinExecByName("macho64-x86_64-darwin-exec.format.json");
     ASSERT_TRUE(fmt);
     EXPECT_EQ(fmt->machoImage().segmentPageSize, 4096u);
-    // x86 declares no buildVersion — see the block comment above; this
-    // is a live open question, not a settled platform fact.
-    EXPECT_FALSE(fmt->machoImage().buildVersion.has_value());
+    // x86 DECLARES buildVersion — see the block comment above: macOS,
+    // min-OS 10.14 and SDK 10.14 in the on-wire (major<<16)|(minor<<8)
+    // nibble form, 10.14.0 = 0x000A0E00.
+    auto const& bv = fmt->machoImage().buildVersion;
+    ASSERT_TRUE(bv.has_value())
+        << "the x86_64 darwin exec must declare image.buildVersion: dyld4 "
+           "reads a main executable's platform from LC_BUILD_VERSION";
+    EXPECT_EQ(static_cast<std::uint32_t>(bv->platform), 1u);  // PLATFORM_MACOS
+    EXPECT_EQ(bv->minOs, 0x000A0E00u);                         // 10.14.0
+    EXPECT_EQ(bv->sdk, 0x000A0E00u);                           // 10.14.0
     // ★ The load-bearing half of "4096 is right here", added with the
     // runnable-CLI key set: validate()'s Mach-O mmap-congruence rule
     // reads BOTH this page size and the __text row's virtualAddress,
@@ -674,6 +679,68 @@ TEST(MachOArm64Exit, X86DarwinExecDefaultsTo4KSegmentPageSize) {
         << fmt->machoImage().pageZeroSize << " under segmentPageSize 0x"
         << fmt->machoImage().segmentPageSize
         << " — the kernel rejects such an image at exec (EBADMACHO)";
+}
+
+// ── D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION: the STATIC arm emits it too ─
+//
+// `macho::encodeExec` — the arm `macho::encode` takes for a module with no
+// extern imports — used to REFUSE a document declaring image.buildVersion.
+// It now writes the command through the one `appendBuildVersionCommand`
+// chokepoint, after the LC_SEGMENT_64 commands as the dynamic arm does, and
+// counts it in ncmds / sizeofcmds. Both shipped darwin exec documents declare
+// it, so both are driven here, each through its UNSIGNED counterpart (the
+// static arm can host no LC_CODE_SIGNATURE: `loadUnsignedExec`).
+// RED-ON-DISABLE: put the refusal back and both rows fail by name; drop the
+// accounting and the header walk below stops at the wrong command.
+TEST(MachOArm64Exit, StaticExecArmEmitsTheDeclaredBuildVersion) {
+    struct Row { char const* target; char const* format; std::vector<std::uint8_t> ret; };
+    for (Row const& row : {Row{"arm64", "macho64-arm64-darwin-exec", {0xC0, 0x03, 0x5F, 0xD6}},
+                           Row{"x86_64", "macho64-x86_64-darwin-exec", {0xC3}}}) {
+        auto target = TargetSchema::loadShipped(row.target);
+        ASSERT_TRUE(target.has_value()) << row.format;
+        auto fmt = dss::macho::test::loadUnsignedExec(row.format);
+        ASSERT_NE(fmt, nullptr) << row.format;
+        auto const& bv = fmt->machoImage().buildVersion;
+        ASSERT_TRUE(bv.has_value()) << row.format << " must declare image.buildVersion";
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = row.ret;
+        mod.functions.push_back(std::move(fn));
+        mod.imageEntryOverride = 0u;   // no extern imports: the STATIC arm
+
+        DiagnosticReporter rep;
+        auto bytes = encodeWithArtifactName(mod, **target, *fmt, rep);
+        for (auto const& d : rep.all()) ADD_FAILURE() << row.format << ": " << d.actual;
+        ASSERT_EQ(rep.errorCount(), 0u) << row.format;
+        ASSERT_FALSE(bytes.empty()) << row.format;
+        EXPECT_FALSE(dss::macho::test::findSegment(std::span<std::uint8_t const>{bytes}, "__LINKEDIT")
+                         .has_value())
+            << row.format << ": this pin must reach the STATIC walker, which builds no __LINKEDIT";
+
+        std::span<std::uint8_t const> sp{bytes};
+        auto const at = dss::macho::test::findLoadCommand(sp, 0x32u);
+        ASSERT_TRUE(at.has_value()) << row.format << ": the static exec image carries no LC_BUILD_VERSION";
+        EXPECT_EQ(readU32LE(bytes, *at + 4), 24u) << row.format;    // cmdsize, ntools = 0
+        EXPECT_EQ(readU32LE(bytes, *at + 8), static_cast<std::uint32_t>(bv->platform)) << row.format;
+        EXPECT_EQ(readU32LE(bytes, *at + 12), bv->minOs) << row.format;
+        EXPECT_EQ(readU32LE(bytes, *at + 16), bv->sdk) << row.format;
+        EXPECT_EQ(readU32LE(bytes, *at + 20), 0u) << row.format;    // ntools
+
+        // The header COUNTS it: walking ncmds commands of sizeofcmds bytes
+        // lands exactly on the end of the command area.
+        std::uint32_t const ncmds      = readU32LE(bytes, 16);
+        std::uint32_t const sizeofcmds = readU32LE(bytes, 20);
+        std::size_t off = 32;
+        for (std::uint32_t i = 0; i < ncmds; ++i) {
+            std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+            ASSERT_NE(cmdsize, 0u) << row.format;
+            off += cmdsize;
+        }
+        EXPECT_EQ(off, 32u + sizeofcmds) << row.format << ": ncmds / sizeofcmds disagree with the commands";
+    }
 }
 
 // ── validate() fail-loud: a non-power-of-two segmentPageSize ──────────
@@ -715,6 +782,8 @@ TEST(MachOArm64Exit, SegmentPageSizeNonPowerOfTwoFailsLoud) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[{"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992}]
     })";
     auto res = ObjectFormatSchema::loadFromText(json);
@@ -786,6 +855,8 @@ TEST(MachOArm64Exit, TextVaNotCongruentTo16KPageFailsLoud) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[{"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992}]
     })";
     auto res = ObjectFormatSchema::loadFromText(json);

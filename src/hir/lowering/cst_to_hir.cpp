@@ -6,6 +6,8 @@
 // semantic tier so the gate that BINDS a declaration to a shipped shim and the
 // check that REFUSES an incompatible declaration cannot disagree about what
 // "compatible" means (D-CSUBSET-SUPPRESSED-SHIPPED-ROW-SIGNATURE-UNCHECKED).
+#include "analysis/semantic/anon_member_search.hpp"   // a designator through anonymous members
+#include "analysis/semantic/initializer_cursor.hpp"   // WHERE a brace element lands (both tiers)
 #include "analysis/semantic/redeclaration_compat.hpp"
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
@@ -237,7 +239,7 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
-    // TF-C78 (D-CSUBSET-NOINLINE): shared accumulator of (FUNCTION decl HIR node
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): shared accumulator of (FUNCTION decl HIR node
     // → NoInlineAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.isNoInline` at each Function lowering site (where the record
     // is in hand) — the exact `mutability` discipline. Applied to the result's
@@ -568,12 +570,7 @@ struct Lowerer {
     // (sourceKind, targetKind) pair. The emitted Cast is aliased to its
     // OPERAND's source-map entry so diagnostics anchored at the synthetic
     // Cast still locate to real source.
-    // `srcNode` (default InvalidNode): the CST arg-expression node, threaded ONLY by
-    // `coerceCallArg` for call-arguments (D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT).
-    // Every other caller passes InvalidNode → the node-mark-gated FFI Ptr→Ptr arm
-    // below stays inert (guarded on `srcNode.valid()`, so no UnitAttribute routing of
-    // an untagged id). It is used SOLELY to consult `model.isIntPointeeCompat`.
-    [[nodiscard]] E coerce(E child, TypeId target, NodeId srcNode = {}) {
+    [[nodiscard]] E coerce(E child, TypeId target) {
         if (!target.valid() || !child.type.valid()) return child;
         if (child.type == target) return child;
         TypeKind const ck = interner.kind(child.type);
@@ -605,8 +602,13 @@ struct Lowerer {
             // Both emit the synthetic Array→Ptr Cast that MIR re-types by the
             // target (element-agnostic), so a string-literal / array arg lands as
             // a width-correct `void*`.
+            // P68 round 10 (lane `cs`): the element up to its `volatile` skin — the
+            // SAME test `isAssignable`'s Ptr←Array arm admits with
+            // (`decayedElementReachesPointee`), so `int a[2]` reaching a
+            // `volatile int *` is realized as the decay it is admitted as.
             bool const sameElem = !arrElem.empty() && !ptrElem.empty()
-                               && arrElem[0] == ptrElem[0];
+                               && decayedElementReachesPointee(interner, ptrElem[0],
+                                                               arrElem[0]);
             // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6): the decayed element
             // is an ARRAY on both sides and the two are COMPATIBLE though not identical
             // — a fixed `int b[2][2]` (rows `int[2]`) reaching an `int (*)[n]`
@@ -763,32 +765,6 @@ struct Lowerer {
         // block — file-line citation deliberately omitted to remain
         // stable under future reformatting of the loader TU).
         if (ck == TypeKind::Ptr && tk == TypeKind::Ptr) {
-            // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: the semantic analyzer marked
-            // this call-arg node (isIntPointeeCompat) because it admitted a real C
-            // integer pointer into a shipped-descriptor abstract-width integer-pointee
-            // param (`ptr<i64>` vs `long long*` / `sqlite3_int64*` / `long*`-on-LP64)
-            // via `sameRepresentation`, at the call-arg boundary ONLY. REALIZE it as
-            // the SAME synthetic Ptr→Ptr Cast the void arms below emit — HIR→MIR maps
-            // Ptr→Ptr to a no-op Bitcast (no bits change), and the Cast RETYPES the
-            // node to `target` (== the param type) so the post-coerce HIR verifier's
-            // arg==param equality holds (the missing-cast backstop is H_VerifierFailure).
-            // The node-mark is the SINGLE authority — admit⟺realize by construction,
-            // NO re-derivation of the FFI/descriptor decision here (the
-            // `nullPointerConstant` "trust the semantic admission" discipline).
-            // `srcNode` is InvalidNode for every non-call-arg caller, so the
-            // `.valid()` guard keeps this arm inert everywhere else (and avoids
-            // routing an untagged NodeId through the UnitAttribute).
-            if (srcNode.valid() && model.isIntPointeeCompat(srcNode)) {
-                HirNodeId const cast =
-                    builder.makeCast(child.id, target, HirFlags::Synthetic);
-                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
-                    if (it->first == child.id) {
-                        spans.push_back({cast, it->second});
-                        break;
-                    }
-                }
-                return {cast, target};
-            }
             auto const fromElem = interner.operands(child.type);
             auto const toElem   = interner.operands(target);
             if (!fromElem.empty() && !toElem.empty()) {
@@ -833,6 +809,22 @@ struct Lowerer {
                 else if (vlaCompatibleArrayTypes(interner,
                                                  interner.stripVolatile(fromElem[0]),
                                                  interner.stripVolatile(toElem[0]))) {
+                    admit = true;
+                }
+                // ★ P68 round 12 (lane `cs`, the enumeration P1): two POINTERS whose
+                // pointees are compatible through an ENUMERATION — `unsigned *pu = &e;`
+                // for an `enum E` compatible with `unsigned int`, the reverse, and the
+                // same pair one or more pointer levels down (C 6.2.7p1, 6.7.6.1p2). The
+                // REALIZE half of the Ptr/Ptr admission `isAssignable` gained through
+                // the ONE relation, `sameOrEnumCompatible`: without it the store reached
+                // MIR typed for the other pointee (✔MEASURED on the P1 trial build,
+                // 2026-09-24: three `I_StoreValueTypeMismatch … Ptr<Enum 'Pos'> into …
+                // Ptr<U32>` for enum_compatible_type_gnu_rule). The same representation-
+                // free Bitcast the arms above share; volatile is stripped on both sides
+                // for the reason the VLA arm strips it.
+                else if (sameOrEnumCompatible(interner,
+                                              interner.stripVolatile(fromElem[0]),
+                                              interner.stripVolatile(toElem[0]))) {
                     admit = true;
                 }
                 if (admit) {
@@ -968,9 +960,12 @@ struct Lowerer {
         // kinds), so this arm runs BEFORE the gate below — which would
         // otherwise pass an enum-typed mismatch straight through uncoerced.
         // The semantic tier already admitted the assignment (isAssignable's
-        // enum arm); coerce only realizes it. Different-enum mismatches
-        // never reach here as a coerce target (semantic rejects them).
-        if ((ck == TypeKind::Enum && isArithmeticCore(tk))
+        // enum arm); coerce only realizes it. ★ P68 round 12 (lane `cs`, the
+        // enumeration P1): so is enum ← a DIFFERENT enum now — C 6.5.16.1p1
+        // admits arithmetic ← arithmetic, and every reference builds `e = f;`
+        // ([[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]) — and it
+        // is realized by the same width-exact Cast.
+        if ((ck == TypeKind::Enum && (isArithmeticCore(tk) || tk == TypeKind::Enum))
             || (tk == TypeKind::Enum && isArithmeticCore(ck))) {
             HirNodeId const cast =
                 builder.makeCast(child.id, target, HirFlags::Synthetic);
@@ -1031,6 +1026,54 @@ struct Lowerer {
                 builder.makeCast(child.id, target, HirFlags::Synthetic);
             for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
                 if (it->first == child.id) {
+                    spans.push_back({cast, it->second});
+                    break;
+                }
+            }
+            return {cast, target};
+        }
+        // ★★ P68 round 9 (lane `cs`) — REALIZE A CONVERSION THE LANGUAGE ADMITS WITH A
+        // DIAGNOSTIC (D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS).
+        //
+        // A pointer from a pointer to an incompatible type, a pointer from an integer
+        // that is not a null pointer constant, and an integer from a pointer are
+        // constraint violations C converts anyway once they are diagnosed, and the
+        // semantic tier (initialization, assignment, argument, return) or this tier's
+        // brace-element report now diagnoses and ADMITS each class the language
+        // declares. The value is the explicit cast's: the SAME `Cast` node an explicit
+        // `(T)e` builds, which `mapCast` already lowers for every pair here (Ptr→Ptr
+        // and FnSig→Ptr a representation-free Bitcast, Array→Ptr the element-agnostic
+        // decay re-typed by the target, integer→Ptr IntToPtr with the source's own
+        // extension, Ptr→integer PtrToInt) — no new lowering.
+        //
+        // ★ ADMIT ⟺ REALIZE BY CONSTRUCTION, TWO WAYS. The class comes from the ONE
+        // classifier the admitting sites ask (`diagnosedConversion`), so nothing is
+        // realized that no site admits, and nothing admitted is left un-realized for the
+        // post-coerce verifier to catch. And the ORDINARY rules are asked first
+        // (`isAssignableUnder`), so a pair C converts on its own and this function
+        // deliberately leaves node-less — a `volatile` pointee difference, which the
+        // Ptr/Ptr arm above passes through untouched — keeps its exact old lowering:
+        // only a pair the ordinary rules DECLINE reaches the cast. This replaces the
+        // `isIntPointeeCompat` node mark the direct-call integer-pointee admission
+        // used to hand across the tier boundary: the types are the whole decision.
+        if (DiagnosedConversion const cls =
+                diagnosedConversion(interner, target, child.type, sem.pointerConversions);
+            cls != DiagnosedConversion::None
+            && !isAssignableUnder(sem, interner, target, child.type,
+                                  /*charArrayFromStringLiteralInit=*/false)) {
+            E from = child;
+            // An integer FROM an array or a function designator converts the pointer
+            // the operand decays to (C 6.3.2.1p3-p4): decay through the ordinary arms
+            // first, exactly as the explicit cast's epilogue does, then convert.
+            if (cls == DiagnosedConversion::PointerToInteger && ck != TypeKind::Ptr) {
+                TypeId const decayed =
+                    interner.pointer(contributedPointee(interner, child.type));
+                from = coerce(child, decayed);
+                if (from.type != decayed) return child;   // decay declined: stay loud
+            }
+            HirNodeId const cast = builder.makeCast(from.id, target, HirFlags::Synthetic);
+            for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                if (it->first == from.id) {
                     spans.push_back({cast, it->second});
                     break;
                 }
@@ -1445,13 +1488,8 @@ struct Lowerer {
     // a non-arithmetic kind and passes straight through). Non-Array / valid-param
     // behavior is byte-identical to the prior inline `coerce(arg, paramType)` /
     // pass-through shapes.
-    // `argNode` (default InvalidNode): the CST arg-expression node, forwarded to
-    // `coerce` so the D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT node-mark can drive
-    // the Ptr→Ptr bitcast realize. Only the declared-param path forwards it (a
-    // variadic-tail arg with no param type is never FFI-marked — the semantic loop
-    // checks only up to the declared arity).
-    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType, NodeId argNode = {}) {
-        if (paramType.valid()) return coerce(arg, paramType, argNode);
+    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType) {
+        if (paramType.valid()) return coerce(arg, paramType);
         if (!arg.type.valid()) return arg;
         TypeKind const ak = interner.kind(arg.type);
         // Array<T,N> → Ptr<T> lvalue decay (C 6.3.2.1p3 — the c79 shape).
@@ -1536,13 +1574,11 @@ struct Lowerer {
         longDoubleFormat_ = m.longDoubleFormat();
         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: so does plain `char`'s sign.
         charIsUnsigned_ = m.charIsUnsigned();
-        if (sem.arithmeticConversions.has_value()) {
-            arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
-            // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
-            // conversions is a SEPARATE top-level flag (keeps ArithmeticConversions'
-            // JSON unchanged) — inject it into the resolved rules here.
-            arith_->bitIntConversions = sem.bitIntConversions;
-        }
+        // THE ONE RESOLVER the semantic typer asks too (`resolveArithmeticRules`,
+        // type_rules.hpp): the block for this data model, the `_BitInt` flag and the
+        // unsigned-counterpart map. P68 round 10 (lane `cs`): both tiers injected
+        // the flag by hand after resolving; the resolver owns it now.
+        arith_ = resolveArithmeticRules(sem, dataModel_);
         for (RuleId r : cfg.deferredRules) deferred_.emplace(r.v, true);
         // HR10: register every declared extension kind up front, so a rule mapped
         // to one (or a NULL literal) lowers to a HirKind::Extension carrying its id.
@@ -2893,7 +2929,7 @@ struct Lowerer {
             || attr.staticInit.any())
             linkage.push_back({node, attr});
     }
-    // TF-C78 (D-CSUBSET-NOINLINE): record the inliner opt-out for a lowered
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): record the inliner opt-out for a lowered
     // Function node from its bound symbol's `SymbolRecord.isNoInline` (sparse:
     // only annotated functions are stored; absence ⇒ freely inlinable). `sym`
     // must be the function's declared symbol. The `recordMutability` shape.
@@ -3447,8 +3483,9 @@ struct Lowerer {
     // (parenthesized/wrapper descent, the PLAIN binary operands, and the unary
     // operand). A deeply-nested chain of those forms therefore carries flat O(N)
     // host-stack cost (only the worker thread's heap-backed `work` vector grows),
-    // closing the dominant deep cases. EVERY OTHER arm (Comma/Assign in
-    // lowerBinary, ternary, postfix incl. Call/Index/Member/PostInc, cast,
+    // closing the dominant deep cases (the comma and every assignment flatten
+    // through Comma / Assign frames of their own). EVERY OTHER arm (the
+    // ternary, postfix incl. Call/Index/Member/PostInc, cast,
     // sizeof, the operand leaf/identifier terminals, classifyLvalue, lowerFlatExpr)
     // DELEGATES to its existing recursive helper UNCHANGED — those helpers call
     // `lowerExpr` for their own operands, which re-enters this driver, so a deep
@@ -3558,21 +3595,20 @@ struct Lowerer {
     };
 
     // The accumulating state for a flattened assignment sub-expression (`lhs = rhs`
-    // / `lhs OP= rhs` used as a VALUE — `lowerBinary`'s `Assign` arm). Lives in an
+    // / `lhs OP= rhs` used as a VALUE). Lives in an
     // `assignCtxs` stack LOCAL to `lowerExpr` (NOT in `ExprFrame` — the `Lvalue`
     // carries a `prep` vector, and `work` reallocs across the rhs `enter`). An
     // Assign frame holds only an INDEX (`aux`); indices are stable because a
     // right-assoc chain `a=b=c=…` finishes inner-first (LIFO push/pop the back).
     // The lhs lvalue is CLASSIFIED in the `enter` classifier BEFORE the frame is
-    // pushed (so a complex lhs's `prep` AddressOf/VarDecl emit before the rhs, as
-    // the recursive arm does); the frame then flattens ONLY the rhs through the
-    // work-stack — which is the sole deep-recursion axis of an assign chain. For a
-    // COMPOUND `OP=`, the lvalue READ (`compoundLhsRead`) is also emitted in `enter`
-    // (BEFORE the rhs) — the recursive `addParent(BinaryOp, std::array{lvRead(*lv),
-    // lowerExpr(rhsN).id}, …)` evaluates the braced-init-list LEFT-TO-RIGHT with a
-    // sequence point ([dcl.init.list]/4, NOT the unsequenced function-arg rule), so
-    // lvRead's node precedes the rhs subtree on EVERY conforming compiler. Emitting
-    // it in `enter` reproduces that arena order exactly (prep → lvRead → rhs → op).
+    // pushed (so a complex lhs's `prep` AddressOf/VarDecl emit before the rhs); the
+    // frame then flattens ONLY the rhs through the work-stack — which is the sole
+    // deep-recursion axis of an assign chain. For a COMPOUND `OP=`, the lvalue READ
+    // (`compoundLhsRead`) is also emitted in `enter` (BEFORE the rhs), so the arena
+    // order is prep → lvRead → rhs → op — the order the pre-driver recursive form
+    // produced (its braced-init-list `{lvRead(*lv), lowerExpr(rhsN).id}` evaluated
+    // LEFT-TO-RIGHT with a sequence point, [dcl.init.list]/4), which the
+    // output-identity gate pinned when the driver replaced it.
     struct AssignCtx {
         Lvalue       lv;              // the classified lhs (simple sym OR temp-ptr + prep)
         bool         compound{};      // true for `OP=` (compound assignment)
@@ -3639,7 +3675,7 @@ struct Lowerer {
                     // `lhs OP= rhs` as a value) flattens its RHS through an Assign
                     // frame so a right-assoc chain `a=b=c=…` carries flat host-stack
                     // cost (the lhs is classified inline here, before the frame —
-                    // its prep emits before the rhs, as the recursive arm does).
+                    // its prep emits before the rhs).
                     NodeId lhsN{}, rhsN{}, opTok{};
                     for (NodeId c : visible(n)) {
                         if (isToken(c)) { if (!opTok.valid()) opTok = c; continue; }
@@ -3657,11 +3693,11 @@ struct Lowerer {
                         return;
                     }
                     // ASSIGN: classify the lhs lvalue + resolve the (compound) op
-                    // EXACTLY as `lowerBinary`'s Assign arm — same order, same
-                    // diagnostics, so a complex lhs's prep AddressOf/VarDecl emit
-                    // here (before the rhs). On success push an Assign frame whose
-                    // ctx carries the lvalue; phase 0 enters the rhs. Malformed /
-                    // non-assign nodes fall through to `lowerBinary` unchanged.
+                    // HERE, so a complex lhs's prep AddressOf/VarDecl emit before
+                    // the rhs. On success push an Assign frame whose ctx carries the
+                    // lvalue; phase 0 enters the rhs. This is the ONE lowering of
+                    // an assignment used as a value. Malformed / unmapped nodes fall
+                    // through to `lowerBinary`, which reports them.
                     if (HirOperatorEntry const* ae =
                             assignBinaryEntry(n, opTok, lhsN, rhsN)) {
                         AssignCtx ctx;
@@ -3683,8 +3719,8 @@ struct Lowerer {
                             ctx.compound = true;
                             ctx.baseOp   = *op;
                             // Emit the lvalue READ HERE — BEFORE entering the rhs —
-                            // to match the recursive arm's L-to-R braced-init order
-                            // (lvRead's node precedes the rhs subtree). See AssignCtx.
+                            // so lvRead's node precedes the rhs subtree (the arena
+                            // order AssignCtx records).
                             // ⚠ NOT for an `_Atomic` lvalue: `finishAssign` lowers
                             // it to a read-modify-write, which reads the object
                             // itself — a read minted here would be an orphan, and
@@ -3699,7 +3735,7 @@ struct Lowerer {
                                         .n0 = rhsN, .aux = ctxIdx});
                         return;   // phase 0 enters the rhs
                     }
-                    result = lowerBinary(n); return;  // malformed (non-assign)
+                    result = lowerBinary(n); return;  // malformed / unmapped: reported there
                 }
                 if (r == cfg.unaryExprRule.v) {
                     NodeId opTok{}, operandN{};
@@ -4030,13 +4066,7 @@ struct Lowerer {
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
                     // c79: variadic-tail args (invalid paramType) array-decay
                     // via the shared funnel (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
-                    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: pass the in-flight
-                    // arg's CST node (fresh index access — callCtxs may have grown)
-                    // so a shipped-descriptor int-pointee admission realizes its
-                    // Ptr→Ptr bitcast.
-                    HirNodeId const a =
-                        coerceCallArg(result, paramType,
-                                      callCtxs[ctxIdx].argNodes[k]).id;
+                    HirNodeId const a = coerceCallArg(result, paramType).id;
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
@@ -4048,11 +4078,10 @@ struct Lowerer {
                 // classified in `enter` (its prep emitted before us); for a compound
                 // `OP=` the lvalue READ was ALSO emitted there (`compoundLhsRead`,
                 // before the rhs). Phase 0 enters the RHS through the work-stack (the
-                // sole deep axis of an assign chain → flat). Phase 1 runs the
-                // recursive tail: compute `stored` (plain = rhs; compound =
-                // `compoundLhsRead OP rhs`), then [prep…, lvWrite] + a fresh `lvRead`
-                // yield, all in a SeqExpr — byte-identical to `lowerBinary`'s Assign
-                // arm, including the prep→lvRead→rhs→op emission order.
+                // sole deep axis of an assign chain → flat). Phase 1 finishes it:
+                // compute `stored` (plain = rhs; compound = `compoundLhsRead OP rhs`),
+                // then [prep…, lvWrite] + a fresh `lvRead` yield, all in a SeqExpr, in
+                // the prep→lvRead→rhs→op emission order.
                 if (f.phase == 0) {
                     f.phase = 1;
                     NodeId const rhsN = f.n0;
@@ -4086,16 +4115,15 @@ struct Lowerer {
         result = callE;
     }
 
-    // Finish a flattened Assign: `result` holds the lowered RHS. Build the SeqExpr
-    // EXACTLY as `lowerBinary`'s Assign arm — for plain `=` the stored value is the
-    // rhs; for `OP=` it is `lvRead OP rhs`, where `lvRead` was ALREADY emitted in
-    // `enter` (before the rhs — `compoundLhsRead`), reproducing the recursive arm's
-    // L-to-R braced-init order (prep → lvRead → rhs → op). Then `[prep…,
-    // lvWrite(stored)]` with a fresh `lvRead` yield, SeqExpr, deliver into `result`,
-    // and pop this frame + its ctx (the LIFO top — a right-assoc chain finishes
-    // inner-first). The Assign frame is `work.back()` here (phase 1 entered nothing
-    // above it); its `.node` is the binary node — the SAME provenance as the
-    // recursive `track(makeSeqExpr(...), node)`.
+    // Finish a flattened Assign: `result` holds the lowered RHS. Build the SeqExpr —
+    // for plain `=` the stored value is the rhs; for `OP=` it is `lvRead OP rhs`,
+    // where `lvRead` was ALREADY emitted in `enter` (before the rhs —
+    // `compoundLhsRead`), keeping the prep → lvRead → rhs → op order AssignCtx
+    // records. Then `[prep…, lvWrite(stored)]` with a fresh `lvRead` yield, SeqExpr,
+    // deliver into `result`, and pop this frame + its ctx (the LIFO top — a
+    // right-assoc chain finishes inner-first). The Assign frame is `work.back()`
+    // here (phase 1 entered nothing above it); its `.node` is the binary node, the
+    // provenance the SeqExpr is tracked under.
     void finishAssign(std::vector<ExprFrame>& work, std::vector<AssignCtx>& assignCtxs,
                       std::uint32_t ctxIdx, E& result) {
         AssignCtx const& ctx = assignCtxs[ctxIdx];
@@ -4138,17 +4166,23 @@ struct Lowerer {
             // `p += n`) keeps opType==lv.type → the c41 stride-Gep, unchanged.
             E lhsE{ctx.compoundLhsRead, lv.type};
             E rhsE = result;
-            TypeId const common = commonArithType(lhsE.type, rhsE.type);
-            TypeId const opType = common.valid() ? common : lv.type;
-            if (common.valid()) {
-                lhsE = coerce(lhsE, common);
-                rhsE = coerce(rhsE, common);
+            if (compoundTakesTheBinaryCombine(ctx.baseOp, lhsE.type, rhsE.type)) {
+                // `x += p` / `p -= q`: the binary operator's own value, then the
+                // conversion to the lvalue's type (see `compoundTakesTheBinaryCombine`).
+                stored = coerce(combineCoreBinary(node, ctx.baseOp, lhsE, rhsE), lv.type).id;
+            } else {
+                TypeId const common = commonArithType(lhsE.type, rhsE.type);
+                TypeId const opType = common.valid() ? common : lv.type;
+                if (common.valid()) {
+                    lhsE = coerce(lhsE, common);
+                    rhsE = coerce(rhsE, common);
+                }
+                HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
+                    std::array{lhsE.id, rhsE.id}, opType, encodeOp(ctx.baseOp));
+                stored = (opType.v != lv.type.v)
+                    ? coerce(E{opResult, opType}, lv.type).id
+                    : opResult;
             }
-            HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
-                std::array{lhsE.id, rhsE.id}, opType, encodeOp(ctx.baseOp));
-            stored = (opType.v != lv.type.v)
-                ? coerce(E{opResult, opType}, lv.type).id
-                : opResult;
         }
         std::vector<HirNodeId> stmts = lv.prep;
         stmts.push_back(lvWrite(lv, stored));
@@ -4718,9 +4752,9 @@ struct Lowerer {
 
     // Is `tok` a NON-NARROW string opener — one that requires the UTF-8 code-unit
     // path (`u"`/`U"`/`u8"`, or `L"` whose per-format core is a wide kind)? True when
-    // ANY of the opener's possible cores (the base `elementCore` OR any
-    // `elementCoreByFormat` value) is non-narrow, so the classification is format-
-    // AGNOSTIC (no `activeFormat` needed here — the HIR tier lacks it). The narrow
+    // the opener's `elementCore` is non-narrow or it names a platform ABI typedef,
+    // so the classification is format-AGNOSTIC (no `activeFormat` needed here —
+    // the HIR tier lacks it). The narrow
     // `"` (Char base, no format map) and SQL `N'` stay false. Used to DETECT a
     // semantic type-drop: a wide opener whose node was left narrow/untyped (e.g. an
     // astral cp the format-resolved core could not hold) — HIR fails loud on that
@@ -4728,12 +4762,13 @@ struct Lowerer {
     [[nodiscard]] bool isWideStringOpenerKind(SchemaTokenId tok) const {
         for (auto const& px : cfg.stringLiteralPrefixes) {
             if (px.startToken.v != tok.v) continue;
-            if (isNonNarrowCore(px.elementCore)) return true;
-            for (auto const& [fmt, core] : px.elementCoreByFormat) {
-                (void)fmt;
-                if (isNonNarrowCore(core)) return true;
-            }
-            return false;
+            // P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): a row whose element
+            // type is a platform ABI typedef (`L"…"` → `wchar_t`) is WIDE by
+            // declaration — the typedef's core is the pair's to choose, and this
+            // format-agnostic classification must not wait for it (the semantic
+            // tier's `nonNarrowStringOpeners` states the same rule).
+            if (!px.abiTypedef.empty()) return true;
+            return isNonNarrowCore(px.elementCore);
         }
         return false;
     }
@@ -5130,9 +5165,7 @@ struct Lowerer {
                     // c79: same call-arg funnel as the other three sites
                     // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY); declared params
                     // coerce byte-identically, Array-typed tail args decay.
-                    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: `a` is the CST arg
-                    // node → realizes a shipped-descriptor int-pointee bitcast.
-                    E const coerced = coerceCallArg(arg, paramType, a);
+                    E const coerced = coerceCallArg(arg, paramType);
                     argNode = coerced.id;
                 }
                 args.push_back(argNode);
@@ -5507,6 +5540,7 @@ struct Lowerer {
             // C-2: both tiers type the literal; one implementation, two
             // call sites), refining the static `literalTypes` core by
             // magnitude / suffix-class / radix-class under the model.
+            std::uint64_t bits = *iv;
             if (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
                 && numberStyle->emitKind.integer.valid()
                 && tk == numberStyle->emitKind.integer) {
@@ -5515,6 +5549,18 @@ struct Lowerer {
                 if (r.status == IntegerLadderStatus::Typed) {
                     core = r.kind;
                     type = interner.primitive(core, r.vocabularyName);
+                    // D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED: the VALUE is the
+                    // magnitude reduced to the type — the identity for a ladder
+                    // type, MSVC's `wrap` for a fixed one (`300i8` is 44). The ONE
+                    // shared reduction; a `char`-typed literal whose byte is above
+                    // 0x7F waits on the target's char signedness, and with none
+                    // (a direct-API lowering) it stays loud below, never guessed.
+                    if (auto const reduced =
+                            reducedIntegerLiteralBits(core, *iv, charIsUnsigned_)) {
+                        bits = *reduced;
+                    } else {
+                        ok = false;
+                    }
                 } else {
                     // TooLarge / NoRule: the semantic tier already
                     // diagnosed (S_IntegerLiteralTooLarge / loader
@@ -5524,8 +5570,8 @@ struct Lowerer {
                 }
             }
             if (ok) {
-                if (isSignedCore(core)) val.value = static_cast<std::int64_t>(*iv);
-                else                    val.value = *iv;
+                if (isSignedCore(core)) val.value = static_cast<std::int64_t>(bits);
+                else                    val.value = bits;
             }
         } else {
             ok = false;             // integer overflow
@@ -5538,11 +5584,11 @@ struct Lowerer {
     }
 
     // Combine two lowered operands under an ALREADY-RESOLVED binary-operator entry
-    // `e`, anchoring provenance + diagnostics at `anchor`. Shared by the Pratt
-    // (`lowerBinary`) and flat (`lowerFlatExpr`) paths so the logical-op special
-    // cases and operator-result typing (comparison → Bool, else the left operand's
-    // type) stay identical. Does NOT handle `Assign` (an expression-position
-    // store) — that is Pratt-only and resolved by the caller before this point.
+    // `e`, anchoring provenance + diagnostics at `anchor`. Shared by the expression
+    // driver's Binary frame and the flat (`lowerFlatExpr`) path so the logical-op
+    // special cases and operator-result typing (comparison → Bool, else the left
+    // operand's type) stay identical. Does NOT handle `Assign` (an
+    // expression-position store) — the driver's Assign frame owns it.
     E combineBinary(NodeId anchor, HirOperatorEntry const& e, E lhs, E rhs) {
         // LogicalAnd/Or: operands are CONDITION positions (short-circuit
         // semantics) — each non-Bool scalar operand takes the truthiness
@@ -5568,10 +5614,20 @@ struct Lowerer {
             unsupported(anchor, std::format("binary target '{}' is not a core binary operator", e.target));
             return {errorNode(anchor), InvalidType};
         }
+        return combineCoreBinary(anchor, *op, lhs, rhs);
+    }
+
+    // P68 round 9 (lane `cs`): the core-operator half of `combineBinary`, split out
+    // UNCHANGED (a pure move: `*op` became the `op` parameter) so the compound
+    // assignments can ask the binary operator's OWN combine for the two
+    // pointer-mixed shapes the semantic tier admits (`x += p`, `p -= q`; see
+    // `compoundTakesTheBinaryCombine`). Every other caller reaches it through
+    // `combineBinary`, exactly as before.
+    E combineCoreBinary(NodeId anchor, HirOpKind const op, E lhs, E rhs) {
         // FC3 c1 shifts under the `arithmeticConversions` block: the result
         // type follows the config verb `shiftResult` via the shared
-        // `shiftResultType` chokepoint (D-UAC-SHIFT-RESULT-RULE-CONFIG) — the
-        // SAME function the semantic typer calls, so the two tiers can never
+        // `shiftResultType` chokepoint — the SAME function the semantic typer
+        // calls, so the two tiers can never
         // diverge on the verb. `promotedLeft` (C 6.5.7): the PROMOTED LEFT
         // operand only (the count's type never contributes; `i64 << u32` is
         // I64, `u32 >> 1` is U32 → LShr). `commonType`: the usual-arithmetic
@@ -5581,7 +5637,7 @@ struct Lowerer {
         // in C). A block-less language has no `arith_` and falls through to the
         // legacy both-coerce-to-common path below EXACTLY.
         if (arith_.has_value()
-            && (*op == HirOpKind::Shl || *op == HirOpKind::Shr)) {
+            && (op == HirOpKind::Shl || op == HirOpKind::Shr)) {
             TypeId const result =
                 shiftResultType(interner, lhs.type, rhs.type, *arith_);
             E lc = lhs, rc = rhs;
@@ -5591,7 +5647,7 @@ struct Lowerer {
             }
             return {track(builder.addParent(HirKind::BinaryOp,
                                             std::array{lc.id, rc.id},
-                                            result, encodeOp(*op)), anchor),
+                                            result, encodeOp(op)), anchor),
                     result};
         }
         // C99 usual arithmetic conversions: both operands coerce to their
@@ -5608,7 +5664,7 @@ struct Lowerer {
         // `promoteComparisons: false` (config) keeps comparison operands
         // at their raw types — no conversion is materialized.
         if (arith_.has_value() && !arith_->promoteComparisons
-            && isComparison(*op)) {
+            && isComparison(op)) {
             common = InvalidType;
         }
         E lc = lhs, rc = rhs;
@@ -5641,7 +5697,7 @@ struct Lowerer {
         // becomes the same two-Ptr compare `p == q` already accepts
         // (pre-existing latitude, not widened here). A shapeless Array
         // (no element operand — malformed) falls through unchanged: loud.
-        if (isComparison(*op)) {
+        if (isComparison(op)) {
             if (lc.type.valid()
                 && interner.kind(lc.type) == TypeKind::Array) {
                 auto const elems = interner.operands(lc.type);
@@ -5685,7 +5741,7 @@ struct Lowerer {
         // MirOpcode::Invalid → an addInst ABORT (a compiler crash). Covers
         // `p-arr`, `arr-p`, `arr-arr`; `arr - scalarIndex` stays the c59
         // `array - index` Ptr form (the other operand is a scalar, not Ptr/Array).
-        if (*op == HirOpKind::Sub) {
+        if (op == HirOpKind::Sub) {
             bool const lArr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Array;
             bool const rArr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Array;
             bool const lPtr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Ptr;
@@ -5744,7 +5800,7 @@ struct Lowerer {
         // EITHER side is excluded (no stride); an equal-pointee `void* - void*`
         // keeps its pre-existing fail-loud in the MIR arm, untouched.
         bool const ptrSub =
-            *op == HirOpKind::Sub && lc.type.valid() && rc.type.valid()
+            op == HirOpKind::Sub && lc.type.valid() && rc.type.valid()
             && interner.kind(lc.type) == TypeKind::Ptr
             && interner.kind(rc.type) == TypeKind::Ptr
             && (interner.operands(lc.type)[0] == interner.operands(rc.type)[0]
@@ -5778,21 +5834,21 @@ struct Lowerer {
                            && interner.kind(lc.type) != TypeKind::Ptr;
         bool const rcIdx = rc.type.valid() && interner.kind(rc.type) != TypeKind::Array
                            && interner.kind(rc.type) != TypeKind::Ptr;
-        if ((*op == HirOpKind::Add || *op == HirOpKind::Sub) && lcArr && rcIdx) {
+        if ((op == HirOpKind::Add || op == HirOpKind::Sub) && lcArr && rcIdx) {
             auto const elems = interner.operands(lc.type);
             if (!elems.empty()) lc = coerce(lc, interner.pointer(elems[0]));
         }
-        if (*op == HirOpKind::Add && rcArr && lcIdx) {
+        if (op == HirOpKind::Add && rcArr && lcIdx) {
             auto const elems = interner.operands(rc.type);
             if (!elems.empty()) rc = coerce(rc, interner.pointer(elems[0]));
         }
-        if (*op == HirOpKind::Add && lc.type.valid() && rc.type.valid()
+        if (op == HirOpKind::Add && lc.type.valid() && rc.type.valid()
             && interner.kind(lc.type) != TypeKind::Ptr
             && interner.kind(rc.type) == TypeKind::Ptr) {
             std::swap(lc, rc);   // n + p → canonicalize: Ptr always left
         }
         bool const ptrIntArith =
-            (*op == HirOpKind::Add || *op == HirOpKind::Sub)
+            (op == HirOpKind::Add || op == HirOpKind::Sub)
             && lc.type.valid() && rc.type.valid()
             && interner.kind(lc.type) == TypeKind::Ptr
             && interner.kind(rc.type) != TypeKind::Ptr;
@@ -5806,14 +5862,43 @@ struct Lowerer {
         // type is `int` (6.5.8p6 / 6.5.9p3); the SEMANTIC type-oracle
         // (subtreeType, D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE) reports `int` for
         // sizeof/auto/_Generic. Different PROPERTIES by design — like char→i32.
-        TypeId const result = isComparison(*op) ? boolType()
+        TypeId const result = isComparison(op) ? boolType()
                             : ptrSub      ? synthesizedType(sem.pointerDifferenceType,
                                                             TypeKind::I64)
                             : ptrIntArith ? lc.type   // Ptr<T> (the pointer operand)
                             : (common.valid() ? common
                                               : (lhs.type.valid() ? lhs.type : rhs.type));
         return {track(builder.addParent(HirKind::BinaryOp, std::array{lc.id, rc.id},
-                                        result, encodeOp(*op)), anchor), result};
+                                        result, encodeOp(op)), anchor), result};
+    }
+
+    // ── P68 round 9 (lane `cs`): THE TWO POINTER-MIXED COMPOUND ASSIGNMENTS ──────
+    // `x += p` (an integer `x`) and `p -= q` (two pointers to compatible types) are C
+    // constraint violations (6.5.17.3p1) that gcc 13.3.0 and mingw-w64 13.2.0 BUILD at
+    // `-std=c2x` as the literal `E1 = E1 op E2`, each with its int-conversion
+    // warning; the semantic tier admits exactly these two with the same diagnostic
+    // (`compoundPointerOperandPairing`, type_rules.hpp). gcc's value is the BINARY
+    // operator's: `x + p` is the stride-scaled pointer `p + x`, `p - q` the element
+    // difference, and only that result converts to the lvalue's type.
+    //
+    // ✔MEASURED 2026-09-23 (`.temp/probe/r7d`, every build RUN): these arms computed
+    // `lhs op rhs` at `commonArithType`-else-the-LVALUE's type, so `x += p` was an
+    // UNSCALED integer add and `p -= q` took the `p - n` stride-Gep with `q` as the
+    // index — DSS exit 1 where gcc exits 42 on all three probes, and SILENT (the
+    // front end said nothing) until this round's operand check. A silent miscompile.
+    //
+    // Only these two shapes take the binary combine; every other compound shape
+    // keeps the arms' own computation byte for byte.
+    [[nodiscard]] bool compoundTakesTheBinaryCombine(HirOpKind const op, TypeId lhsType,
+                                                     TypeId rhsType) const {
+        auto const pointerValued = [&](TypeId t) {
+            if (!t.valid()) return false;
+            TypeKind const k = interner.kind(interner.stripVolatile(t));
+            return k == TypeKind::Ptr || k == TypeKind::Array;
+        };
+        if (op == HirOpKind::Add) return !pointerValued(lhsType) && pointerValued(rhsType);
+        if (op == HirOpKind::Sub) return pointerValued(lhsType) && pointerValued(rhsType);
+        return false;
     }
 
     E lowerBinary(NodeId node) {
@@ -5833,92 +5918,32 @@ struct Lowerer {
                                           tree().text(opTok)));
             return {errorNode(node), InvalidType};
         }
-        HirOperatorEntry const& e = cfg.binaryOps[it->second];
-        // Assignment is a STATEMENT in HIR, but C lets it be used as a value
-        // (`while ((c = f()) != EOF)`). Lower it as a SeqExpr that performs the
-        // store then yields the stored value — the sound, position-independent
-        // form (hoisting the store out would be wrong inside a loop condition).
-        // Covers compound assignment too (`(x += 1)` reads, applies the op, writes).
-        if (e.target == "Assign") {
-            // lhsN / rhsN were already extracted by the scan above.
-            auto lv = lhsN.valid() ? classifyLvalue(lhsN) : std::nullopt;
-            if (!lv || !rhsN.valid())
-                return exprError(node, "assignment sub-expression needs an lvalue and a value");
-            // D-C-ATOMIC-COMPOUND-ASSIGNMENT-AND-INCREMENT-ARE-A-LOAD-THEN-A-SEPARATE-STORE:
-            // the value-position twin of `finishAssign`'s atomic arm.
-            if (isAtomicLvalue(*lv)
-                && (!e.compoundBase.empty() || isAtomicScalarType(lv->type))) {
-                std::optional<HirOpKind> compoundOp;
-                if (!e.compoundBase.empty()) {
-                    auto op = coreOpFromName(e.compoundBase);
-                    if (!op || arityOf(*op) != HirOpArity::Binary)
-                        return exprError(node, std::format("compound base op '{}' is not binary",
-                                                           e.compoundBase));
-                    compoundOp = *op;
-                }
-                return atomicAssignValue(node, *lv, lowerExpr(rhsN), compoundOp);
-            }
-            HirNodeId stored;
-            if (e.compoundBase.empty()) {
-                // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): coerce the plain-`=` RHS
-                // to the lvalue type (mirrors `lowerAssign`'s statement path) -- the
-                // twin of `finishAssign`'s plain arm; see the comment there.
-                stored = coerce(lowerExpr(rhsN), lv->type).id;      // plain `=`
-            } else {
-                auto op = coreOpFromName(e.compoundBase);           // `OP=`
-                if (!op || arityOf(*op) != HirOpArity::Binary)
-                    return exprError(node, std::format("compound base op '{}' is not binary",
-                                                       e.compoundBase));
-                // c74 (D-CSUBSET-32BIT-ALU-FORMS): a VALUE-position compound assign
-                // (`(flags &= ~M)`, `while ((x |= b))`) must integer-PROMOTE the base
-                // op exactly like the statement-position `lowerCompoundAssign` (C99
-                // `a OP= b` == `a = (T)((a) OP (b))`, the OP computed at the COMMON
-                // type) — else a sub-int lvalue builds a Char/U8-typed BinaryOp that
-                // walls at the sub-native ALU gate (sqlite's `p->flags &= ~M` in an
-                // if/while). Compute at `common`; narrow the result back to the
-                // lvalue type for the store. A non-arithmetic common (Ptr compound
-                // `p += n`) keeps opType == lv->type → the c41 stride-Gep path,
-                // byte-identical to before (no coerce, no narrow).
-                E lhsE{lvRead(*lv), lv->type};
-                E rhsE = lowerExpr(rhsN);
-                TypeId const common = commonArithType(lhsE.type, rhsE.type);
-                TypeId const opType = common.valid() ? common : lv->type;
-                if (common.valid()) {
-                    lhsE = coerce(lhsE, common);
-                    rhsE = coerce(rhsE, common);
-                }
-                HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
-                    std::array{lhsE.id, rhsE.id}, opType, encodeOp(*op));
-                stored = (opType.v != lv->type.v)
-                    ? coerce(E{opResult, opType}, lv->type).id
-                    : opResult;
-            }
-            std::vector<HirNodeId> stmts = lv->prep;
-            stmts.push_back(lvWrite(*lv, stored));
-            HirNodeId yield = lvRead(*lv);   // the new value (re-read of the lvalue)
-            return {track(builder.makeSeqExpr(stmts, yield, lv->type, HirFlags::Synthetic), node),
-                    lv->type};
-        }
-        // FC5: the comma operator `a, b` — evaluate `a` for its side effects and
-        // DISCARD its value (an ExprStmt), then yield `b` (value + type). The
-        // existing SeqExpr substrate models exactly this (and its MIR lowering
-        // evaluates the effect-statements in order, then yields the result). Built
-        // NON-synthetic (programmer source — carries the comma's own span). Chains
-        // `a, b, c` nest left-assoc into Seq([ExprStmt(Seq([ExprStmt a], b))], c) =
-        // evaluate a, b (discard), value c — correct C semantics.
-        if (e.target == "Comma") {
-            E lhsE = lowerExpr(lhsN);
-            HirNodeId const effect = builder.makeExprStmt(lhsE.id);  // emitted BETWEEN lhs and rhs
-            E rhsE = lowerExpr(rhsN);
-            return combineComma(node, effect, rhsE);
-        }
-        return combineBinary(node, e, lowerExpr(lhsN), lowerExpr(rhsN));
+        // ⛔ P68 round 9 (lane `cs`): NOTHING PAST THE LOOKUP ABOVE IS REACHABLE, SO
+        // IT IS A LOUD REFUSAL RATHER THAN A SECOND COPY OF THE PATHS THAT RUN.
+        // `lowerExpr`'s driver classifies every binary node with THE SAME scan and
+        // lookup as above, and `plainBinaryEntry` / `commaBinary` /
+        // `assignBinaryEntry` between them claim every well-formed node whose
+        // operator maps — the plain operators through the Binary frame
+        // (`combineBinary`), the comma through the Comma frame (`combineComma`),
+        // `=` and every `OP=` through the Assign frame (`finishAssign`). The driver
+        // calls this function only when all three decline: exactly the malformed and
+        // unmapped nodes the two checks above report. This body used to carry its
+        // own Assign, Comma and plain-operator arms — copies no input could run,
+        // which therefore could only drift from the paths that do (the
+        // pointer-mixed compound route was being "kept in step" here by hand when
+        // that was noticed). A node that ever lands here names the broken invariant.
+        return exprError(node, std::format(
+            "internal invariant broken: the binary node for operator '{}' (target '{}') "
+            "reached the malformed-node fallback although its operator maps; a "
+            "well-formed binary node lowers through the expression driver's "
+            "Binary, Comma or Assign frame",
+            tree().text(opTok), cfg.binaryOps[it->second].target));
     }
 
     // The COMMA epilogue given the lhs `effect` (the `ExprStmt(lhs)` already
-    // emitted between lhs and rhs) and the lowered `rhsE`. Shared by `lowerBinary`
-    // and the `lowerExpr` driver's Comma frame. Byte-identical to the prior inline
-    // tail: `a, b` = SeqExpr([ExprStmt a], b) yielding b's value+type.
+    // emitted between lhs and rhs) and the lowered `rhsE`, for the `lowerExpr`
+    // driver's Comma frame: `a, b` = SeqExpr([ExprStmt a], b) yielding b's
+    // value+type.
     E combineComma(NodeId node, HirNodeId effect, E rhsE) {
         // ── C 6.5.17p2 [[D-CSUBSET-VLA-SIZEOF-TYPEFORM]] part (2) ────────────
         // The comma's result has the type AND VALUE of the right operand, and
@@ -5974,6 +5999,30 @@ struct Lowerer {
     // inline tail of `lowerUnary`.
     E combineUnaryOp(NodeId node, HirOperatorEntry const& e, E operand) {
         if (e.target == "AddressOf") {
+            // ★★ C 6.5.3.2p1 (P68, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED):
+            // "The operand of the unary & operator shall be … an lvalue that
+            // designates an object that … is not declared with the register
+            // storage-class specifier." The object is found by walking the
+            // lowered operand to the variable it designates — through a member
+            // or an element of an ARRAY, never through a pointer (`&p->f`,
+            // `&p[i]` address the POINTEE). ✔MEASURED 2026-09-19, gcc 13.3.0 and
+            // clang 18.1.3 both refuse `&v`, `&(v)`, `&v.m`, `&v[i]` and `&` of a
+            // `register` PARAMETER ("address of register variable requested");
+            // DSS compiled every one. Which specifier forbids it is the
+            // language's `{addressNotTakeable: true}` facet, never a keyword.
+            if (SymbolRecord const* obj = designatedObjectRecord(operand.id);
+                obj != nullptr && obj->addressNotTakeable) {
+                emitH(DiagnosticCode::S_AddressOfRegisterObject, node,
+                      std::format("the address of '{}' is requested, and it is "
+                                  "declared with a storage-class specifier that "
+                                  "forbids it (C 6.5.3.2p1: the operand of unary "
+                                  "`&` shall not be declared `register`; gcc and "
+                                  "clang: \"address of register variable "
+                                  "requested\") "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name));
+                return {errorNode(node), InvalidType};
+            }
             TypeId const result = operand.type.valid() ? interner.pointer(operand.type) : InvalidType;
             return {track(builder.makeAddressOf(operand.id, result), node), result};
         }
@@ -6149,10 +6198,10 @@ struct Lowerer {
     // The operator entry for a PLAIN binary node — i.e. one whose operands the
     // driver flattens through a frame (arithmetic / comparison / shift / logical
     // and-or, all combined by `combineBinary`). Returns nullptr for the bespoke
-    // forms `lowerBinary` owns (Assign → SeqExpr store, Comma → ExprStmt+SeqExpr)
-    // and for malformed/unmapped nodes — the driver then delegates the whole node
-    // to `lowerBinary` unchanged. Mirrors `lowerBinary`'s extraction + lookup so
-    // the same node routes the same way.
+    // forms the Assign and Comma frames own (Assign → SeqExpr store, Comma →
+    // ExprStmt+SeqExpr) and for malformed/unmapped nodes, which the driver hands to
+    // `lowerBinary` to report. The three classifiers and `lowerBinary` share one
+    // extraction + lookup, so a node routes exactly one way.
     [[nodiscard]] HirOperatorEntry const*
     plainBinaryEntry(NodeId node, NodeId opTok, NodeId lhsN, NodeId rhsN) {
         if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return nullptr;  // malformed
@@ -6165,9 +6214,9 @@ struct Lowerer {
 
     // True iff `node` is a well-formed COMMA binary (both operands present, the op
     // maps to the `Comma` target) — the form the driver flattens through a Comma
-    // frame. Assign / malformed / non-comma return false and keep delegating to
-    // `lowerBinary`. Mirrors `lowerBinary`'s extraction + lookup. On success sets
-    // `lhsN`/`rhsN` to the operands (already extracted by the caller's scan).
+    // frame. Assign / malformed / non-comma return false (the Assign classifier
+    // or, for a malformed / unmapped node, `lowerBinary`'s report takes it). The
+    // operands are the ones the caller's scan already extracted.
     [[nodiscard]] bool commaBinary(NodeId opTok, NodeId lhsN, NodeId rhsN) {
         if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return false;  // malformed
         auto it = binOp_.find(tree().tokenKind(opTok).v);
@@ -6178,10 +6227,9 @@ struct Lowerer {
     // The operator entry for an ASSIGNMENT binary (`=` or a compound `OP=`) — the
     // form the driver flattens through an Assign frame (its RHS re-enters the
     // work-stack). Returns nullptr for the plain/comma forms the other classifiers
-    // own and for malformed/unmapped nodes, so the driver delegates the whole node
-    // to `lowerBinary` unchanged. Mirrors `lowerBinary`'s extraction + lookup so
-    // the same node routes the same way; `e.compoundBase` (empty for plain `=`)
-    // distinguishes plain from compound, exactly as the recursive Assign arm.
+    // own and for malformed/unmapped nodes, which the driver hands to `lowerBinary`
+    // to report. `e.compoundBase` (empty for plain `=`) distinguishes plain from
+    // compound.
     [[nodiscard]] HirOperatorEntry const*
     assignBinaryEntry(NodeId node, NodeId opTok, NodeId lhsN, NodeId rhsN) {
         if (!opTok.valid() || !lhsN.valid() || !rhsN.valid()) return nullptr;  // malformed
@@ -6359,6 +6407,27 @@ struct Lowerer {
                 };
                 if (isVoidPtr(thenD) && isObjectPtr(elseD))      common = thenD;
                 else if (isVoidPtr(elseD) && isObjectPtr(thenD)) common = elseD;
+            }
+            // ★★ P68 round 9 (lane `cs`): two arms contributing pointers to
+            // INCOMPATIBLE types have type `void *` — the EXACT mirror of the semantic
+            // `combineTernary` arm, where the meaning fork (gcc/clang `void *`, MSVC the
+            // second operand's type) is measured and decided. Setting `common` drives
+            // the coerce calls below: an object-pointer arm takes the Ptr→void* arm, an
+            // array arm the `toVoidPtr` decay, a function designator or function
+            // pointer the `allowVoidPtrFnConvert` arm. Before this the conditional
+            // typed as its THEN arm and the else arm reached `makeTernary` uncoerced
+            // (D-CSUBSET-INCOMPATIBLE-ELEMENT-ARRAY-TERNARY: `c ? "ab" : intArr` became
+            // a type-confused aggregate copy of the first arm).
+            if (!common.valid()
+                && sem.pointerConversions.incompatiblePointerConvertsDiagnosed) {
+                TypeId const thenP = contributedPointee(interner, thenE.type);
+                TypeId const elseP = contributedPointee(interner, elseE.type);
+                if (thenP.valid() && elseP.valid()
+                    && !pointerPairingAdmitted(interner, thenP, elseP,
+                                               /*voidPairingAdmitted=*/true,
+                                               sem.pointerConversions)) {
+                    common = interner.pointer(interner.primitive(TypeKind::Void));
+                }
             }
         }
         if (common.valid()) {
@@ -7031,11 +7100,10 @@ struct Lowerer {
                 StmtFrame fr{.kind = StmtFrame::Kind::SehTry, .node = n};
                 NodeId finallyArm{};
                 if (!sehPrologue(n, fr.n0, fr.condNode, fr.n1, finallyArm)) {
+                    // Anchored: D-CSUBSET-SEH-FINALLY (open since its 2026-09-24 re-verdict: MSVC runs the handler).
                     unsupported(finallyArm.valid() ? finallyArm : n,
                                 "SEH '__try { } __finally { }' termination handlers "
-                                "are not supported (D-CSUBSET-SEH-FINALLY: "
-                                "trigger-gated — no shipped consumer; sqlite uses "
-                                "only __except)");
+                                "are not supported yet");
                     stmtResult = errorNode(n);
                     return;
                 }
@@ -7043,9 +7111,8 @@ struct Lowerer {
                 return;
             }
             if (k == "SehLeave") {
-                unsupported(n, "SEH '__leave' is not supported "
-                               "(D-CSUBSET-SEH-LEAVE: trigger-gated — no shipped "
-                               "consumer; sqlite does not use it)");
+                // Anchored: D-CSUBSET-SEH-LEAVE (open since its 2026-09-24 re-verdict: MSVC runs it).
+                unsupported(n, "SEH '__leave' is not supported yet");
                 stmtResult = errorNode(n);
                 return;
             }
@@ -7247,7 +7314,12 @@ struct Lowerer {
                 std::vector<HirNodeId> children;
                 children.reserve(f.operands.size());
                 bool refused = false;
-                for (auto const& op : f.operands) {
+                // The operands bound to a register through a GNU LOCAL REGISTER
+                // VARIABLE (P68, D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED),
+                // kept for the statement-level checks after the loop.
+                std::vector<BoundAsmOperand> boundOperands;
+                for (std::size_t oi = 0; oi < f.operands.size(); ++oi) {
+                    auto const& op = f.operands[oi];
                     if (op.malformed) {
                         stmtResult = reportedError(
                             op.operandNode.valid() ? op.operandNode : n,
@@ -7341,12 +7413,73 @@ struct Lowerer {
                             }
                         }
                     }
-                    desc.operands.push_back(std::move(rec));
+                    // ★★ A MATCHING CONSTRAINT SHARES ITS OUTPUT'S LOCATION (P68,
+                    // D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER): the
+                    // input inherits the output's resolution — class, pinned
+                    // register or form — because GNU defines `"N"` as "the same
+                    // location as operand N". Outputs precede inputs in `f`, so
+                    // operand N is already filed. The semantic tier refuses every
+                    // illegal match by name; one arriving here anyway (a caller
+                    // that skipped the semantic gate) is refused, never guessed.
+                    if (parsed.value.matchedOperand.has_value()) {
+                        std::uint32_t const want = *parsed.value.matchedOperand;
+                        if (op.isOutput || want >= desc.operands.size()
+                            || !desc.operands[want].isOutput) {
+                            stmtResult = reportedError(
+                                op.constraintNode.valid() ? op.constraintNode : n,
+                                "inline-asm matching constraint \"" + op.constraint
+                                + "\" does not name an earlier OUTPUT operand — the "
+                                  "semantic tier reports this as "
+                                  "S_InlineAsmConstraintUnsupportedForm "
+                                  "(D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER)");
+                            refused = true;
+                            break;
+                        }
+                        HirInlineAsmOperand const& matched = desc.operands[want];
+                        rec.regClassResolved    = matched.regClassResolved;
+                        rec.regClass            = matched.regClass;
+                        rec.fixedRegister       = matched.fixedRegister;
+                        rec.operandKindResolved = matched.operandKindResolved;
+                        rec.operandKind         = matched.operandKind;
+                    }
 
-                    E const value = lowerExpr(op.valueExpr);
+                    E value = lowerExpr(op.valueExpr);
+                    // ★★ AN INPUT THAT IS NOT A MEMORY FORM TAKES THE OPERAND'S
+                    // VALUE, AND AN ARRAY'S VALUE IS A POINTER TO ITS FIRST
+                    // ELEMENT (C 6.3.2.1p3) — P68 round 8,
+                    // D-ASM-ARRAY-INPUT-OPERAND-NOT-DECAYED. `"r"(cells)` hands
+                    // the template `&cells[0]` on gcc 13.3.0 and clang 18.1.3
+                    // (✔MEASURED 2026-09-21: `ldr %0, [%1, #8]` over it reads
+                    // cells[1]); DSS carried the ARRAY and refused it at the
+                    // carriage ("binds a 16-byte 'Array' value"). Routed through
+                    // the shared `arrayToPointerDecay` + `coerce`, the decay every
+                    // other value context performs. ⚠ A MEMORY-FORM input (`"m"`)
+                    // names the OBJECT and keeps it; an output is an lvalue and
+                    // never decays.
+                    if (!op.isOutput
+                        && !(rec.operandKindResolved
+                             && static_cast<OperandKindFilter>(rec.operandKind)
+                                    == OperandKindFilter::MemBase)) {
+                        TypeId const decayed =
+                            arrayToPointerDecay(interner, value.type);
+                        if (decayed.valid() && decayed != value.type) {
+                            value = coerce(value, decayed);
+                        }
+                    }
+                    if (!bindLocalRegisterVariable(op, oi, value, rec, desc,
+                                                   boundOperands)) {
+                        stmtResult = errorNode(n);
+                        refused = true;
+                        break;
+                    }
+                    desc.operands.push_back(std::move(rec));
                     children.push_back(value.id);
                 }
                 if (refused) return;
+                if (!checkBoundRegisterConflicts(f, ia, boundOperands)) {
+                    stmtResult = errorNode(n);
+                    return;
+                }
 
                 // ── the clobbers: the two configured spellings hoisted to flags ──
                 // ⚠ `"memory"` / `"cc"` are NEVER C++ literals here — they are
@@ -7913,8 +8046,8 @@ struct Lowerer {
         // (`-std=c2x`) and clang 18.1.3 (`-std=c23`), probed SEPARATELY, both say
         // "lvalue required as left operand of assignment" / "expression is not
         // assignable" at the user's own token.
-        // ⓘ `const int x; x = 5;` is a DIFFERENT gap — the `Ref` is addressable
-        // and passes this test — still open as [[D-CSUBSET-INCDEC-CONST-LVALUE]].
+        // ⓘ `const int x; x = 5;` is not this test's: the `Ref` is addressable
+        // and passes it, and the semantic tier refuses it first (S_ConstViolation).
         if (lhs.type.valid() && !loweredNodeIsAddressable(lhs.id)) {
             emitH(DiagnosticCode::S_AssignNeedsModifiableLvalue, lhsN,
                   "the left operand of an assignment must be a modifiable lvalue "
@@ -7958,11 +8091,15 @@ struct Lowerer {
                 // exprError after this one — both loud, 0xE040 first). Plain
                 // reads never pass through here (lowerExpr
                 // folds them) and `&__func__` rides the operator-table
-                // AddressOf path — both stay legal. Simple `=` / `+=` are
-                // already stopped at SEMANTIC by the symbol's isConst
-                // (S_ConstViolation), so this guard is the inc/dec class's
-                // fail-loud gate. `__func__[0] = 'x'` is the pre-existing
-                // rodata-write class (D-CSUBSET-INCDEC-CONST-LVALUE family).
+                // AddressOf path — both stay legal. `=`, `+=` and (since P68
+                // round 8) `++` / `--` are all stopped at SEMANTIC by the
+                // symbol's isConst (S_ConstViolation), so this guard is the
+                // BACKSTOP that fires when that check did not stop the build (a
+                // suppressed S_ConstViolation). A write to an ELEMENT
+                // (`__func__[0] = 'x'`) does not come here and is not refused
+                // today: gcc, clang and mingw-w64 refuse it while MSVC accepts
+                // it, a reference split tracked OPEN in the production registry
+                // under its own row.
                 SymbolId const sym = model.symbolAt(c);
                 if (auto const* rec = model.recordFor(sym);
                     rec != nullptr && rec->isPredefinedFunctionName) {
@@ -8113,11 +8250,12 @@ struct Lowerer {
     // (a literal `5++` / `++5`, an arithmetic result) lowers to a non-addressable
     // HIR node (Literal / BinaryOp / …), which has no object to read-modify-write —
     // reject it here rather than synthesize a write-back to a non-object.
-    // `classifyLvalue` itself stays permissive (the same gap plain assignment has —
-    // `5 = 3`; the `const`-lvalue case `const int x; x++;` is also still
-    // unmodelled), anchored D-CSUBSET-INCDEC-CONST-LVALUE. Lowers the operand
-    // ONCE (no double-lowering) and is the single source the three ++/-- sites
-    // share, so the guard + diagnostic stay identical across pre/post/stmt.
+    // `classifyLvalue` asks the same shape question for an assignment
+    // (`loweredNodeIsAddressable`). A `const`-qualified lvalue (`const int x;
+    // x++;`) IS addressable and passes this guard; the semantic tier's const-write
+    // check refuses it first (S_ConstViolation, since P68 round 8). Lowers the
+    // operand ONCE (no double-lowering) and is the single source the three ++/--
+    // sites share, so the guard + diagnostic stay identical across pre/post/stmt.
     [[nodiscard]] std::optional<Lvalue> classifyIncDecLvalue(NodeId operandN, NodeId anchor) {
         if (auto s = simpleLvalue(operandN)) {     // a plain variable is always an lvalue
             if (!s->second.valid()) return std::nullopt;
@@ -8496,6 +8634,20 @@ struct Lowerer {
             //     VLA where C23 6.7.10p4 promises zeros — which is why the MIR side
             //     fails loud rather than falling through when it cannot size the
             //     object.
+            // P68 round 9 (lane `cs`): an array longer than the placement cursor's
+            // index space is not zero-filled here either. This arm mints one zero
+            // child per element, and a brace list reaches it for a member the cursor
+            // refused to enter (`struct H { char big[4294967297]; int k; } h = {1};`),
+            // which would otherwise build four billion of them — every caller that
+            // zeroes an ARRAY is a brace list's, so the stated limit is the same one.
+            if (len > 0 && static_cast<std::uint64_t>(len) > initializer_cursor::kMaxLength) {
+                out = reportedError(at,
+                    std::format("zero-filling an array of {} elements is past this "
+                                "implementation's limit of {} elements for an array a brace "
+                                "list initializes (the lowering builds one zero per element)",
+                                len, initializer_cursor::kMaxLength));
+                return true;
+            }
             f.type      = type;
             f.how       = ZeroAssemble::Aggregate;
             f.elemType  = elemT;
@@ -8647,6 +8799,58 @@ struct Lowerer {
         return coerced.id;
     }
 
+    // ── P68 round 9 (lane `cs`): A BRACE-INIT ELEMENT'S DIAGNOSED CONVERSION ─────
+    // (D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS)
+    //
+    // A brace-init element is the one initialization position the semantic tier
+    // never judges — only this tier knows which slot a positional or designated
+    // element lands in (the brace-level walk) — so the conversions the language
+    // admits WITH A DIAGNOSTIC (type_rules.hpp's `diagnosedConversion`, the one
+    // classifier every site asks) are reported HERE for it, in the same code and
+    // sentence the semantic tier reports at every other initialization. ✔MEASURED
+    // 2026-09-23, each reference separately and every program RUN: `struct A *arr[1]
+    // = { &b };`, `struct H h = { &b };`, `struct H h = { .p = &b };`, a file-scope
+    // `struct A *gtab[1] = { &gb };`, `struct H h = { v }` for an integer `v` and
+    // `int *a[1] = { 5 };` are built and run by gcc 13.3.0, mingw-w64 13.2.0 and MSVC
+    // 19.51 with a warning (clang 18.1.3 too for the pointer pairs). DSS stopped the
+    // pointer pairs with an INTERNAL verifier message (H_VerifierFailure: `coerce`
+    // passed the element through with its own type) and accepted `{ 5 }` into a
+    // pointer SILENTLY (the literal arm of `coerce` trusts a semantic admission that
+    // never ran for a brace element).
+    //
+    // A null pointer constant — an integer constant expression with value 0, folded
+    // by this tier's own CST evaluator (`evalCstConstInt`, the one the index
+    // designators use) — is C's own conversion and draws nothing. So does any pair
+    // the ORDINARY rules admit (`isAssignableUnder`, the gates the semantic sites
+    // pass): only a pair they decline is a diagnosed conversion.
+    void reportDiagnosedBraceElement(NodeId valueNode, TypeId from, TypeId to) {
+        if (!from.valid() || !to.valid()) return;
+        DiagnosedConversion const cls =
+            diagnosedConversion(interner, to, from, sem.pointerConversions);
+        if (cls == DiagnosedConversion::None) return;
+        if (isAssignableUnder(sem, interner, to, from,
+                              /*charArrayFromStringLiteralInit=*/false)) {
+            return;
+        }
+        if (cls == DiagnosedConversion::IntegerToPointer
+            && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
+            auto const folded = evalCstConstInt(valueNode);
+            if (folded.has_value() && *folded == 0) return;   // a null pointer constant
+        }
+        emitHAt(diagnosedConversionCode(cls), DiagnosticSeverity::Warning, valueNode,
+                diagnosedConversionSentence(cls, DiagnosedConversionSite::Initialization,
+                                            tree().text(valueNode)));
+    }
+
+    // The scalar arm of a brace element: lower, report a diagnosed conversion, then
+    // coerce to the slot exactly as before (`coerce` realizes every class the
+    // classifier names, so admit ⟺ realize holds here too).
+    [[nodiscard]] HirNodeId lowerBraceElementValue(NodeId valueNode, TypeId slotType) {
+        E const ve = lowerExpr(valueNode);
+        reportDiagnosedBraceElement(valueNode, ve.type, slotType);
+        return coerce(ve, slotType).id;
+    }
+
     // c79 (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY): the CALL-ARG sibling of
     // `lowerExprOrBraceInit` - identical brace-init arm, but the scalar
     // arm routes through `coerceCallArg` so an argument with NO declared
@@ -8661,9 +8865,7 @@ struct Lowerer {
         if (isBraceInitList(core)) {
             return lowerBraceInit(core, paramType);
         }
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: forward the CST `argNode` so a
-        // shipped-descriptor int-pointee admission realizes its Ptr→Ptr bitcast.
-        return coerceCallArg(lowerExpr(argNode), paramType, argNode).id;
+        return coerceCallArg(lowerExpr(argNode), paramType).id;
     }
 
     // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
@@ -8792,6 +8994,10 @@ struct Lowerer {
     // the postfix classifier `postfixFlattenPlan`.
     [[nodiscard]] SymbolId vlaObjectOperandSymbol(NodeId operand) {
         NodeId cur = operand;
+        // P68 round 12 (lane `cs`): the indirections (subscripts and unary `*`) consumed
+        // on the way to the root — a POINTER to a variable-length array answers after
+        // exactly one of them (`sizeof *p`, `sizeof p[i]`: the pointee), see below.
+        int indirections = 0;
         for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
             if (isToken(cur)) return SymbolId{};   // a bare non-identifier token operand
             // VLA C3: a postfix subscript (`a[0]`, `a[i][j]`) — descend the BASE
@@ -8804,47 +9010,72 @@ struct Lowerer {
                 if (postfixFlattenPlan(cur, baseN, subscriptN, e)
                         == PostfixFlatten::Index
                     && baseN.valid()) {
+                    ++indirections;
                     cur = baseN;
                     continue;
                 }
             }
             // Classify children: SUB-EXPRESSION nodes vs. a direct identifier token.
-            // (Operator/punctuation tokens — `(`, `)`, `,`, `?` — are neither.)
+            // (Operator/punctuation tokens — `(`, `)`, `,`, `?` — are neither; the unary
+            // operator that DEREFERENCES is counted, the language's own `Deref` target.)
             NodeId identTok{}, sub{};
             int subCount = 0;
+            bool derefHere = false;
             for (NodeId c : visible(cur)) {
                 if (isToken(c)) {
                     if (sem.identifierToken.valid()
-                        && tree().tokenKind(c).v == sem.identifierToken.v)
+                        && tree().tokenKind(c).v == sem.identifierToken.v) {
                         identTok = c;
+                    } else if (auto const it = unOp_.find(tree().tokenKind(c).v);
+                               it != unOp_.end()
+                               && cfg.unaryOps[it->second].target == "Deref") {
+                        derefHere = true;
+                    }
                 } else {
                     ++subCount;
                     sub = c;
                 }
             }
+            if (derefHere) ++indirections;
             // Terminal: a bare identifier operand (no sub-expressions). Resolve it to a
-            // VLA OBJECT via the symbol's own DECLARED type (stamp-independent + precise)
-            // — this rejects a VLA-yielding-but-non-object operand like `sizeof *p` (the
-            // identifier `p` is a pointer whose pointee is a VLA). VLA C3: accept
-            // `typeContainsVla` too so a FIXED-outer VLA object (`int a[5][n]` — declared
-            // type array(vlaArray,5), not isVlaArray) is a valid `sizeof a` object.
+            // VLA OBJECT via the symbol's own DECLARED type (stamp-independent + precise).
+            // VLA C3: accept `typeContainsVla` too so a FIXED-outer VLA object (`int
+            // a[5][n]` — declared type array(vlaArray,5), not isVlaArray) is a valid
+            // `sizeof a` object.
+            // ★ P68 round 12 (lane `cs`): and a POINTER to a variable-length array reached
+            // through EXACTLY ONE indirection — `sizeof *p`, `sizeof p[i]` — whose operand
+            // is the pointee, the size the pointer froze as its row stride at its own
+            // declaration (`storePtrToVlaStride`, or the typedef's copied down): the MIR
+            // SizeOf arm reads the SAME `(p, pointee)` slot the pointer's arithmetic
+            // steps by. This used to be rejected here on purpose ("a VLA-yielding-but-
+            // non-object operand") and then refused at the static fold; gcc 13.3.0, clang
+            // 18.1.3 and mingw-w64 13.2.0 answer the pointee's size (✔MEASURED 2026-09-24,
+            // lane `cs`'s `.temp/probe/vtp`). Deeper indirections through a pointer stay
+            // unrecorded, and so stay refused loudly by that fold.
             if (subCount == 0) {
                 if (!identTok.valid()) return SymbolId{};
                 SymbolId const sym = model.symbolAt(identTok);
                 SymbolRecord const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
-                return (rec != nullptr
-                        && (interner.isVlaArray(rec->type)
-                            || interner.typeContainsVla(rec->type)))
-                           ? sym
-                           : SymbolId{};
+                if (rec == nullptr) return SymbolId{};
+                if (interner.isVlaArray(rec->type) || interner.typeContainsVla(rec->type))
+                    return sym;
+                if (indirections == 1 && interner.kind(rec->type) == TypeKind::Ptr) {
+                    auto const pointee = interner.operands(rec->type);
+                    if (!pointee.empty()
+                        && (interner.isVlaArray(pointee[0])
+                            || interner.typeContainsVla(pointee[0])))
+                        return sym;
+                }
+                return SymbolId{};
             }
-            // Transparent grouping wrapper (parens / operand / postfix): exactly ONE
-            // sub-expression and no stray identifier — descend. Anything else (≥2
-            // sub-expressions = a comma/ternary/binary composite, or an identifier
-            // alongside a sub-expression) is NOT a direct object reference → reject: the
-            // caller records nothing and the existing fail-loud static path stands (so
-            // `sizeof(b, a)` / `sizeof(0, a)` fail loud rather than silently loading a
-            // VLA's frozen size — C decays a composite operand to a pointer).
+            // Transparent grouping wrapper (parens / operand / postfix / a unary `*` over
+            // a sub-expression): exactly ONE sub-expression and no stray identifier —
+            // descend. Anything else (≥2 sub-expressions = a comma/ternary/binary
+            // composite, or an identifier alongside a sub-expression) is NOT a direct
+            // object reference → reject: the caller records nothing and the existing
+            // fail-loud static path stands (so `sizeof(b, a)` / `sizeof(0, a)` fail loud
+            // rather than silently loading a VLA's frozen size — C decays a composite
+            // operand to a pointer).
             if (subCount == 1 && !identTok.valid()) { cur = sub; continue; }
             return SymbolId{};
         }
@@ -9059,6 +9290,15 @@ struct Lowerer {
             builder.makeSizeOf(track(builder.makeTypeRef(elem), node), sizeType,
                                HirFlags::Synthetic),
             node);
+        // P68 round 12 (lane `cs`): an element that is STILL variable-length after
+        // the type name's own suffixes came from a typedef (`typedef int V[n];
+        // sizeof(V[3])`) — its size is the one that typedef FROZE (C17 6.7.8p3),
+        // so the element's SizeOf reads that slot at MIR, exactly as `sizeof v`
+        // of a `V v;` object does. No typedef found is left to the static fold,
+        // which keeps refusing loudly.
+        if (interner.isVlaArray(elem) || interner.typeContainsVla(elem))
+            if (SymbolId const owner = vlaTypedefOwnerOfTypeName(scan); owner.valid())
+                sizeofVlaSymAcc.emplace_back(elemSize.v, owner.v);
         HirNodeId const total =
             product.valid()
                 ? track(builder.makeBinaryOp(HirOpKind::Mul, product, elemSize,
@@ -9159,12 +9399,97 @@ struct Lowerer {
             NodeId operandN{};
             for (NodeId c : visible(scan))
                 if (tree().kind(c) == NodeKind::Internal) { operandN = c; break; }
+            SymbolId recorded{};
             if (operandN.valid())
                 if (SymbolId const opSym = vlaObjectOperandSymbol(operandN);
-                    opSym.valid())
+                    opSym.valid()) {
                     sizeofVlaSymAcc.emplace_back(so.v, opSym.v);
+                    recorded = opSym;
+                }
+            // P68 round 12 (lane `cs`): the TYPE form with no suffix of its own
+            // (`lowerVlaTypeNameSizeof` declined) — `sizeof(V)`, `sizeof(volatile V)`
+            // of a variable-length typedef. Its size was FROZEN when the typedef was
+            // reached (C17 6.7.8p3), so the SizeOf reads the owning typedef's slot,
+            // keyed by shape at MIR, as `sizeof v` of a `V v;` object does.
+            // ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/vt` vt09 / vt11): gcc
+            // 13.3.0 and clang 18.1.3, both modes, answer V's frozen size; DSS
+            // refused "sizeof of an incomplete or un-sizeable type".
+            if (!recorded.valid() && !valueForm)
+                if (SymbolId const owner = vlaTypedefOwnerOfTypeName(scan); owner.valid())
+                    sizeofVlaSymAcc.emplace_back(so.v, owner.v);
         }
         return {so, u64};
+    }
+
+    // P68 round 12 (lane `cs`): the typedef that OWNS the frozen size of the
+    // variable-length level a TYPE NAME reaches through a typedef name — the name
+    // its specifier writes (the semantic tier records which typedef each such
+    // token names), through the chain rule `vlaTypedefOrigin` already keeps
+    // (`typedef R S;` names R's slot). The walk skips every array suffix: a bound
+    // expression may name a variable or a cast's typedef, and neither is the
+    // type's head. Iterative and budgeted; InvalidSymbol when no typedef name in
+    // the head owns a variable-length type.
+    [[nodiscard]] SymbolId vlaTypedefOwnerOfTypeName(NodeId typeName) {
+        if (!sem.declarators.has_value() || !sem.identifierToken.valid())
+            return SymbolId{};
+        DeclaratorConfig const& dc = *sem.declarators;
+        std::vector<NodeId> stack{typeName};
+        for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (isToken(c)) {
+                if (tree().tokenKind(c).v != sem.identifierToken.v) continue;
+                SymbolId const named = model.typedefNamedAt(c);
+                if (!named.valid()) continue;
+                SymbolRecord const* rec = model.recordFor(named);
+                if (rec == nullptr) continue;
+                SymbolId const owner =
+                    rec->vlaTypedefOrigin.valid() ? rec->vlaTypedefOrigin : named;
+                SymbolRecord const* ownerRec = model.recordFor(owner);
+                if (ownerRec != nullptr && ownerRec->type.valid()
+                    && (interner.isVlaArray(ownerRec->type)
+                        || interner.typeContainsVla(ownerRec->type)))
+                    return owner;
+                continue;
+            }
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == dc.arraySuffixRule.v) continue;
+            auto const kids = visible(c);
+            for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+        }
+        return SymbolId{};
+    }
+
+    // P68 round 12 (lane `cs`): `t` with every VARIABLE-LENGTH level's length replaced by one — the `_Alignof`
+    // operand of a type whose layout a runtime length would otherwise deny (see `lowerAlignof`). ITERATIVE over
+    // the array spine (no recursion proportional to the declarator's depth): each level's qualifier skin and
+    // type-level alignment are read off the level itself and re-applied to the rebuilt level, fixed lengths are
+    // kept, and the element under the last array level is kept as it is. An INCOMPLETE level (no length at all)
+    // returns `t` unchanged: that type has no alignment to give, and the MIR fold keeps refusing it loudly.
+    [[nodiscard]] TypeId withEveryRuntimeLengthOne(TypeId const original) {
+        struct Level {
+            std::int64_t  length;
+            std::int64_t  skinBits;
+            std::uint32_t skinAlign;
+        };
+        std::vector<Level> levels;
+        TypeId t = original;
+        while (t.valid() && interner.kind(t) == TypeKind::Array) {
+            auto const sc  = interner.scalars(t);
+            auto const ops = interner.operands(t);
+            if (sc.empty() || ops.empty()) return original;
+            bool const runtime = interner.isVlaArray(t);
+            if (!runtime && sc[0] < 0) return original;
+            levels.push_back(Level{runtime ? std::int64_t{1} : sc[0],
+                                   interner.qualifierBits(t), interner.typeAlignOverride(t)});
+            t = ops[0];
+        }
+        for (std::size_t i = levels.size(); i-- > 0;) {
+            t = interner.array(t, levels[i].length);
+            if (levels[i].skinBits != 0 || levels[i].skinAlign != 0)
+                t = interner.qualified(t, levels[i].skinBits, levels[i].skinAlign);
+        }
+        return t;
     }
 
     // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `_Alignof unary-expression` →
@@ -9229,6 +9554,17 @@ struct Lowerer {
         if (!sized.valid()) {
             return exprError(node, "_Alignof operand did not resolve to a type");
         }
+        // P68 round 12 (lane `cs`): the alignment of a type holding a VARIABLE-LENGTH array level. C 6.5.3.4p3 gives
+        // an array type its element type's alignment and does not evaluate the operand, so the answer is static
+        // even where the length is not — but the MIR fold reads it through a LAYOUT, and a runtime-sized level has
+        // none. An array's alignment never depends on its length, so the operand that reaches MIR is the same type
+        // with every runtime length replaced by one: every level, qualifier skin and type-level alignment (a
+        // typedef's `aligned`) kept, so the layout answers exactly what the variable-length type would.
+        // ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/vt` vt15 / vt16): gcc 13.3.0 and clang 18.1.3, at
+        // -std=c17 -pedantic-errors and -std=c2x, give `_Alignof(int)` for `_Alignof(int[n])` and for a VLA
+        // typedef's name; DSS refused both ("_Alignof of an incomplete or un-alignable type").
+        if (interner.isVlaArray(sized) || interner.typeContainsVla(sized))
+            sized = withEveryRuntimeLengthOne(sized);
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         // `size_t`, the same declared entry `lowerSizeof` mints (C 6.5.3.4p5).
         TypeId const u64 = synthesizedType(sem.alignofResultType, TypeKind::U64);
@@ -9611,14 +9947,10 @@ struct Lowerer {
         return {track(cast, castNode), target};
     }
 
-    // D5.3 cycle 1b.2: resolve an `designatedIndex` CST `[i]` to an
-    // integer offset by walking the wrapped expression to its leaf
-    // token and decoding as an integer literal. Sufficient for the
-    // realistic v1 corpus (`[0]` / `[7]` / `[0x10]` etc.). Arbitrary
-    // const-expression indices are mapped as a real-blocker substrate
-    // item (needs CST-side const-eval — the HIR builder is write-only
-    // and `const_eval` consumes HIR). Returns nullopt + emits a real
-    // diagnostic when the index isn't a recognizable integer literal.
+    // D5.3 cycle 1b.2: resolve a `designatedIndex` CST `[i]` to its value through
+    // the CST constant evaluator (`evalCstConstInt` — C 6.7.9p6's integer constant
+    // expression, literals and enumeration constants and the operators over them).
+    // nullopt when the index does not fold; the caller reports it.
     [[nodiscard]] std::optional<std::int64_t>
     resolveIndexDesignatorLiteral(NodeId diNode) {
         NodeId exprChild{};
@@ -9730,6 +10062,21 @@ struct Lowerer {
             TypeId const ty = resolveStampedTypeBelow(typeRefN);
             return classifyCstCastTarget(interner, ty, charIsUnsigned_);
         };
+        // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
+        // a wide/UTF character constant's element core, read back off the body
+        // token the semantic tier STAMPED — this tier lacks the pair, and the
+        // stamp is the pair's answer (`lowerWideCharLiteral` reads the same one, so
+        // the folded value and the lowered literal share a core). A `Void` stamp is
+        // the semantic tier's type-drop for a constant the pair cannot type: no
+        // core, no fold.
+        env.resolveWideCharCore = [this](NodeId literal) -> std::optional<TypeKind> {
+            if (!isWideCharOpenerKind(charOpenerTokenKind(literal))) return std::nullopt;
+            NodeId const bodyTok = childTokenOfKind(literal, cfg.charBodyToken);
+            if (!bodyTok.valid()) return std::nullopt;
+            TypeKind const core = charElementCoreOf(bodyTok);
+            if (!isWideCharCore(core)) return std::nullopt;
+            return core;
+        };
         EvalOptions options;
         options.allowFloat = true;
         // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the same answer the semantic
@@ -9753,20 +10100,33 @@ struct Lowerer {
     // direct-mutation paths grow (the variant rewrite is the compile-
     // checked form; cycle 1b chose the field form to keep diff size
     // small for the substrate-only landing).
+    // P68 round 9 (lane `cs`): a UNION slot's `nested` is empty or holds exactly ONE
+    // slot — the member `unionMember` names — because a union is initialized through
+    // one member, and a later initializer for another member replaces the earlier one
+    // (C 6.7.9p19). It flattens to the union's 1-child aggregate of that member.
     struct InitSlot {
-        std::optional<HirNodeId> value;
-        std::vector<InitSlot>    nested;
-        TypeId                   slotType{};
+        std::optional<HirNodeId>     value;
+        std::vector<InitSlot>        nested;
+        TypeId                       slotType{};
+        std::optional<std::uint32_t> unionMember;
     };
     // Idempotent: turn `s` into an in-progress sub-aggregate with one
     // nested slot per field/element of `s.slotType`. Discards a
     // previously-stored direct value (a later designator that addresses
     // a strict sub-position overrides the earlier wholesale write per
     // C99 §6.7.8p19's "later wins" rule).
-    void initSlotAsAggregate(InitSlot& s) {
-        if (!s.nested.empty()) return;
+    //   Returns false — building NOTHING — for an array longer than the placement
+    // cursor's index space (`initializer_cursor::kMaxLength`). One slot per element
+    // is the whole cost of a brace list here (✔MEASURED about 195 bytes each), and the
+    // cursor never addresses past that length, so a longer one is an internal
+    // invariant break its caller reports LOUD: the level's open refuses such an object
+    // before it gets here, and the cursor refuses to enter a longer member. P68 round
+    // 9 (lane `cs`): the guard is here, where the cost is incurred, so no single
+    // missing check can turn a declared length into billions of slots.
+    [[nodiscard]] bool initSlotAsAggregate(InitSlot& s) {
+        if (!s.nested.empty()) return true;
         s.value.reset();
-        if (!s.slotType.valid()) return;
+        if (!s.slotType.valid()) return true;
         TypeKind const k = interner.kind(s.slotType);
         if (k == TypeKind::Struct) {
             // Projected for the same reason as `slotType` in `lowerBraceInit`:
@@ -9792,29 +10152,53 @@ struct Lowerer {
             // into slots, so leave `nested` EMPTY: `flattenInitSlot` then routes the
             // slot through `synthZeroOrError`, which owns the two sentinels.
             if (!ops.empty() && !scals.empty() && scals[0] >= 0) {
+                if (static_cast<std::uint64_t>(scals[0]) > initializer_cursor::kMaxLength)
+                    return false;
                 s.nested.resize(static_cast<std::size_t>(scals[0]));
                 TypeId const elem = reprOf(ops[0]);
                 for (auto& n : s.nested) n.slotType = elem;
             }
         }
+        return true;
     }
-    // Write `val` at the slot reachable from `s` by following the path
-    // of nested-slot indices. Out-of-range step → silent no-op (callers
-    // bounds-check up front; this guard is defense-in-depth).
+    // Write `val` at the slot reachable from `s` by following the path of member /
+    // element indices. A step into a UNION slot selects that member, replacing a
+    // different member written before (C 6.7.9p19: the later initializer wins).
+    // Returns false when a step names no slot. Every path comes from the placement
+    // cursor, which validated it, so false is an internal invariant break the caller
+    // reports LOUD. ★ P68 round 9 (lane `cs`): this was a SILENT no-op "defense in
+    // depth", and a union step always took it — `initSlotAsAggregate` builds no slot
+    // for a union — so `struct S s = {.u.i = 40, 2}` dropped the 40 and ran 2 where
+    // gcc, clang, mingw-w64 and MSVC run 42 (✔MEASURED `.temp/probe/r9b` c14), and an
+    // out-of-range `{[0][5] = 1}` built silently.
     // A plain loop, not recursion: the depth followed the DESIGNATOR PATH LENGTH,
     // which is the user's source (feedback-no-input-proportional-recursion).
-    void writeInitSlotAt(InitSlot& s,
-                         std::span<std::uint32_t const> path,
-                         HirNodeId val) {
+    [[nodiscard]] bool writeInitSlotAt(InitSlot& s,
+                                       std::span<std::uint32_t const> path,
+                                       HirNodeId val) {
         InitSlot* cur = &s;
         while (!path.empty()) {
-            initSlotAsAggregate(*cur);
-            if (path[0] >= cur->nested.size()) return;
-            cur  = &cur->nested[path[0]];
+            if (cur->slotType.valid() && interner.kind(cur->slotType) == TypeKind::Union) {
+                if (path[0] >= interner.operands(cur->slotType).size()) return false;
+                if (cur->nested.size() != 1 || cur->unionMember != path[0]) {
+                    cur->value.reset();
+                    cur->nested.assign(1, InitSlot{});
+                    // Re-read per call: `reprOf` interns (see `initSlotAsAggregate`).
+                    cur->nested[0].slotType =
+                        reprOf(interner.operands(cur->slotType)[path[0]]);
+                    cur->unionMember = path[0];
+                }
+                cur = &cur->nested[0];
+            } else {
+                if (!initSlotAsAggregate(*cur) || path[0] >= cur->nested.size()) return false;
+                cur = &cur->nested[path[0]];
+            }
             path = path.subspan(1);
         }
         cur->nested.clear();
+        cur->unionMember.reset();
         cur->value = val;
+        return true;
     }
     // Flatten a slot to its HIR node: a direct value when set, a
     // recursive `ConstructAggregate` when sub-aggregating, or
@@ -9872,171 +10256,23 @@ struct Lowerer {
         return delivered;
     }
 
-    // D5.4: union brace-init lowering. Unions hold exactly ONE active
-    // variant at a time; their brace-init must therefore initialize
-    // exactly one of the declared variants. C99 §6.7.8p17–p18 (the
-    // current-object framework + the "only the first named member of
-    // a union" rule for no-designator initializers):
-    //   • positional `{ expr }` → initializes the FIRST variant.
-    //   • designator `{ .name = expr }` → initializes the named
-    //     variant. With no other variants zero-filled (overlapping
-    //     storage; only the chosen variant is live).
-    //   • multiple elements → diagnostic. The grammar's brace-init
-    //     allows N elements; the SEMANTICS for unions cap at 1.
-    //   • chained designators `{.a.b = ...}` → diagnostic. Variant
-    //     access has no sub-position semantics in C99; chained dot
-    //     would walk INTO the chosen variant and is not yet supported.
-    // Result: a 1-child `ConstructAggregate(value, contextType)`.
-    // Empty `{}` produces the same shape as `synthZeroOrError(union)`
-    // (first-variant zero-fill per C99 §6.7.8p21).
-    //
-    // ★★ THIS IS THE NON-RECURSIVE HALF ONLY. Everything here is decided from the
-    // CST and the type — it stops at the ONE value the chosen variant still needs.
-    // `openBraceLevel` folds that value in as a ONE-SLOT level of the brace-init
-    // work stack, so a union nested inside braces costs heap like every other
-    // level instead of keeping a second host-recursion edge alive
-    // (feedback-no-input-proportional-recursion).
-    struct UnionBracePrep {
-        std::optional<HirNodeId> immediate;      // fully answered right here
-        NodeId                   valueExprCst{}; // else: lower this value...
-        TypeId                   variantType{};  // ...against this variant type
-    };
-    [[nodiscard]] UnionBracePrep prepareUnionBraceInit(NodeId braceInitListNode,
-                                                       TypeId contextType) {
-        auto const variants = interner.operands(contextType);
-        if (variants.empty()) {
-            return {.immediate = reportedError(braceInitListNode,
-                "union brace-init target has no variants")};
-        }
-        // Collect all initElement children up front so we can diagnose
-        // multi-element forms before lowering anything.
-        std::vector<NodeId> elements;
-        for (NodeId c : visible(braceInitListNode)) {
-            if (isToken(c)) continue;
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            if (cfg.initElementRule.valid()
-             && tree().rule(c).v == cfg.initElementRule.v) {
-                elements.push_back(c);
-            }
-        }
-        if (elements.empty()) {
-            // Empty `{}` — default-initialize the first variant per
-            // §6.7.8p10 (overlap with synthZeroOrError's union path).
-            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
-        }
-        if (elements.size() > 1) {
-            reportedError(braceInitListNode,
-                "union brace-init must initialize at most one variant");
-            // Take the structurally-valid zero-fill path so the
-            // pipeline downstream sees a typed aggregate without
-            // having to discriminate "really succeeded" from
-            // "succeeded with diagnostics". res->ok is already false.
-            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
-        }
-        NodeId const elem = elements[0];
-
-        // Walk the initElement: find an optional `designatedField`
-        // (designators decide WHICH variant); the value expression is
-        // the trailing non-designator non-token child. Index designators
-        // are nonsensical for unions (variants are name-indexed only).
-        // Multiple designators in one element (chained `.a.b = ...`)
-        // would walk INTO the chosen variant — diagnose, don't silently
-        // last-win on the leaf.
-        std::optional<std::uint32_t> targetVariant;
-        bool failed = false;
-        int designatorCount = 0;
-        NodeId valueExprCst{};
-        for (NodeId c : visible(elem)) {
-            if (isToken(c)) continue;
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            auto const [designatorCore, r] = peelToDesignatorLeaf(c);
-            if (cfg.designatedFieldRule.valid()
-             && r == cfg.designatedFieldRule.v) {
-                ++designatorCount;
-                if (designatorCount > 1) {
-                    reportedError(designatorCore,
-                        "chained designator on a union is not supported "
-                        "(a union initializer must select exactly one "
-                        "variant)");
-                    failed = true;
-                    continue;
-                }
-                NodeId const nameTok = firstIdentifierToken(designatorCore);
-                if (!nameTok.valid()) {
-                    reportedError(designatorCore,
-                        "variant designator is missing its name");
-                    failed = true;
-                    continue;
-                }
-                ScopeId const unionScope =
-                    model.compositeScopeFor(interner.stripVolatile(contextType));
-                if (!unionScope.valid()) {
-                    reportedError(designatorCore,
-                        "could not resolve members of the target union "
-                        "type");
-                    failed = true;
-                    continue;
-                }
-                std::string const name{tree().text(nameTok)};
-                auto const& scope = model.scopeRecord(unionScope);
-                auto sit = scope.bindings.find(name);
-                if (sit == scope.bindings.end()) {
-                    reportedError(designatorCore,
-                        "designator names a variant that doesn't belong "
-                        "to the target union type");
-                    failed = true;
-                    continue;
-                }
-                auto const* rec = model.recordFor(sit->second);
-                if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
-                    reportedError(designatorCore,
-                        "variant designator resolved to a non-variant "
-                        "symbol");
-                    failed = true;
-                    continue;
-                }
-                if (rec->fieldIndex >= variants.size()) {
-                    reportedError(designatorCore,
-                        "union variant index out of range");
-                    failed = true;
-                    continue;
-                }
-                targetVariant = rec->fieldIndex;
-                continue;
-            }
-            if (cfg.designatedIndexRule.valid()
-             && r == cfg.designatedIndexRule.v) {
-                ++designatorCount;
-                reportedError(designatorCore,
-                    "index designators are not meaningful on union types");
-                failed = true;
-                continue;
-            }
-            valueExprCst = c;
-        }
-        if (failed) {
-            // Still emit a structurally-valid (first-variant zero-fill)
-            // aggregate so downstream lowering doesn't cascade. res->ok
-            // is already false via reportedError.
-            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
-        }
-        if (!valueExprCst.valid()) {
-            // `union U u = { };` — already handled at the empty-list
-            // check above; reaching here implies a malformed initElement.
-            reportedError(elem, "union init element has no value expression");
-            return {.immediate = synthZeroOrError(braceInitListNode, contextType)};
-        }
-        std::uint32_t const variant = targetVariant.value_or(0);
-        // Union HIR shape: a 1-child ConstructAggregate whose single child is the
-        // chosen variant's value. The variant index is implicit-by-type (the
-        // value's HIR type identifies WHICH variant); a future explicit-tag
-        // substrate can layer an index attribute when codegen needs it. The
-        // aggregate itself is minted by `finishBraceLevel`, which `track`s it at
-        // the brace-init list's span for the same reason the struct/array arm does
-        // (D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN) — the union's top-level
-        // aggregate is what later tiers report against.
-        return {.valueExprCst = valueExprCst, .variantType = variants[variant]};
-    }
+    // D5.4 / P68 round 9 (lane `cs`): a UNION's brace list is placed by the same element
+    // walk as a structure's or an array's (`nextBraceDescent`, through the placement
+    // cursor), because C gives it the same current-object rules (C 6.7.9p17-p20): a
+    // positional element initializes the FIRST member — eliding into it when that member
+    // is an aggregate the value does not initialize whole — a designator selects its
+    // member, however deep the designator goes (`{ .a.v = 42 }`), a later designator for
+    // another member replaces the earlier one (C 6.7.9p19), and once the member is
+    // initialized every further positional element is EXCESS. The level's one root slot
+    // is the union itself; `writeInitSlotAt` keeps its single member slot, and it
+    // flattens to the 1-child aggregate of that member (the variant is implicit by type).
+    // The empty `{}` zero-fills the first member, as `synthZeroOrError` does.
+    // ✔MEASURED 2026-09-23 (`.temp/probe/r9b`, `r9c`, every build RUN): gcc 13.3.0,
+    // clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51 build `union U u = {40, 2}` (the
+    // first member a two-int struct), `{.a.v = 42}` and `{.f = 1.0f, .i = 42}` to C's
+    // value; `{42, 7}` is excess (gcc/clang/mingw at c2x warn, MSVC refuses C2078), and
+    // `{[0] = 42}` is refused by all four. DSS refused the first three ("at most one
+    // variant", "chained designator on a union is not supported").
 
     // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): the CLOSED allowlist
     // (design-audit F4) of scalar TypeKinds a brace initializer may target.
@@ -10160,39 +10396,28 @@ struct Lowerer {
                   "EXPRESSION, not a nested brace list (C23 6.7.10p12)");
             return errorNode(braceInitListNode, contextType);
         }
-        // The single-expression form — lower + coerce exactly like `= expr`
-        // (the shared funnel; the brace-list arm inside it is unreachable
+        // The single-expression form — lower + coerce exactly like `= expr`, and,
+        // being a brace ELEMENT the semantic tier never judges, report its own
+        // diagnosed conversion (P68 round 9; the brace-list arm is unreachable
         // after the N2 gate above).
-        return lowerExprOrBraceInit(valueExprCst, contextType);
+        return lowerBraceElementValue(valueExprCst, contextType);
     }
 
     // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
     // CONTEXT TYPE (the resolved type the brace-init must produce — a
-    // struct or array). Produces a positional `HirKind::ConstructAggregate`
+    // struct, union or array). Produces a `HirKind::ConstructAggregate`
     // whose every slot is set: explicit elements at their chosen
     // position, omitted slots zero-filled via `synthZeroOrError(fieldType)`.
-    // Supports:
-    //   • positional elements `{a, b, c}` with C99 §6.7.8 fill-cursor
-    //   • single-level field designator `{.x = a, .y = b}`
-    //   • dot-chained field designator `{.a.v = 1}` (SP3 — type-aware
-    //     name lookup via `compositeScopeFor(currentType)` + cursor
-    //     descent into the resolved field's type)
-    //   • index designator `{[2] = a}` with integer-literal indices
-    //   • mixed positional / designator with cursor restart at the
-    //     designated position (§6.7.8p17)
-    //   • chained-brace nesting `{.outer = {.inner = a}}` — ONE HEAP FRAME PER
-    //     BRACE LEVEL, driven by `lowerBraceInit` below; see `BraceLevel`
-    //   • zero-fill omitted slots (§6.7.8p21)
-    //
-    // One real-blocker substrate item remaining:
-    //   • index-designator `[expr] = ...` with non-literal indices —
-    //     requires CST-side const-eval (HIR builder is write-only and
-    //     `const_eval` consumes HIR). Anchored at plan 12.5 §0.2 D6.
-    //     Locked-in by `D5_3_NonLiteralIndexDesignatorEmitsDiag`.
-    //
-    // Union brace-init is folded in as a ONE-SLOT level via
-    // `prepareUnionBraceInit` above (separate semantics — one active
-    // variant). D5.4 ✅.
+    // WHERE each element lands is the placement cursor's answer
+    // (`analysis/semantic/initializer_cursor.hpp`, C 6.7.9p17-p20, shared with the
+    // semantic tier that sizes an array of unknown size): positional elements in
+    // order, BRACE ELISION into an aggregate subobject the value does not initialize
+    // whole, a designator — field (`.a.v`, through anonymous members too) or index
+    // (`[k]`, an integer constant expression) — moving the position, which then
+    // continues after the designated subobject INSIDE its aggregate, and a union
+    // taking one member. Chained-brace nesting `{.outer = {.inner = a}}` is ONE HEAP
+    // FRAME PER BRACE LEVEL, driven by `lowerBraceInit` below; see `BraceLevel`.
+    // Omitted slots zero-fill (C 6.7.9p21).
 
     // ── THE BRACE-INIT LEVEL FRAME ──────────────────────────────────────────
     //
@@ -10245,49 +10470,145 @@ struct Lowerer {
     // element k's whole subtree before element k+1's, and slot order is not
     // element order once designators reorder.
     struct BraceLevel {
-        enum class Kind : std::uint8_t { StructOrArray, Union };
-        Kind          kind      = Kind::StructOrArray;
-        NodeId        braceCst{};
-        TypeId        contextType{};
-        bool          isStruct  = false;
-        std::uint32_t slotCount = 0;
-        std::vector<bool>     positionallySkippable;
-        std::vector<InitSlot> rootSlots;
+        NodeId   braceCst{};
+        TypeId   contextType{};
+        // The level's object: a structure's / array's slot holds one nested slot per
+        // member / element from the start; a union's holds the one member written.
+        InitSlot root;
         // A SNAPSHOT, taken once when the level opens: `visible()` rebuilds its
         // vector per call, and this loop is SUSPENDED across every nested level.
-        // StructOrArray → the `initElement` nodes. Union → the ONE already-
-        // resolved value expression (its variant was chosen in `openBraceLevel`).
         std::vector<NodeId> elements;
         std::size_t         elemIdx = 0;
-        std::uint32_t       cursor  = 0;
+        // P68 round 9 (lane `cs`): WHERE each element lands — C 6.7.9p17-p20's current
+        // object, a PATH that brace elision descends and a completed subaggregate
+        // pops (`analysis/semantic/initializer_cursor.hpp`, the placement the semantic
+        // tier sized an array of unknown size with).
+        std::optional<initializer_cursor::Cursor> placement;
         // The SUSPENDED element, live only while a child level is running.
-        // ⚠ The residual is OWNED. The recursive form held a `std::span` into
+        // ⚠ The path is OWNED. The recursive form held a `std::span` into
         // `designatorPath`, a per-iteration local — that span cannot survive a
         // suspension, and copying it is the one substantive difference between
         // this frame and the stack frame it replaces.
-        std::uint32_t              pendingTarget = 0;
-        std::vector<std::uint32_t> pendingResidual;
+        std::vector<std::uint32_t> pendingPath;
+        // P68 round 9 (lane `cs`): the level's first EXCESS positional element has
+        // been reported (S_ExcessInitializerElements is said once per brace list,
+        // as gcc and clang say it; every excess element is dropped).
+        bool                       excessReported = false;
     };
 
     // What ONE element of a level still needs before its slot can be written: the
-    // slot to write, the residual designator path within it, and the value to
-    // lower against a target type. Resolving this needs NOTHING previously
-    // LOWERED — only `cursor` and the designator walk — which is what makes the
-    // element loop safely suspendable at its single descent point.
+    // path from the level's object to the subobject it initializes, and the value to
+    // lower against that subobject's type. Resolving this needs NOTHING previously
+    // LOWERED — only the placement cursor and the designator walk — which is what
+    // makes the element loop safely suspendable at its single descent point.
     struct BraceDescent {
-        std::uint32_t              target = 0;
-        std::vector<std::uint32_t> residual;
+        std::vector<std::uint32_t> path;
         NodeId                     valueExprCst{};
         TypeId                     valueTargetType{};
     };
 
-    // Advance `slot` past any positionally-skippable (anon bit-field) field.
-    // FC8 D-CSUBSET-BITFIELD-INIT — see `openBraceLevel` for how the mask is built.
-    [[nodiscard]] static std::uint32_t skipAnonIn(BraceLevel const& f,
-                                                  std::uint32_t slot) {
-        while (slot < f.slotCount && f.positionallySkippable[slot]) ++slot;
-        return slot;
+    // FC8 D-CSUBSET-BITFIELD-INIT (C 6.7.9p9): the positions of a structure's or
+    // union's UNNAMED bit-fields, which positional initialization skips. A member is
+    // named iff the composite's scope binds a real (non-synthetic) name to its index;
+    // an anonymous structure / union member is a member, not a bit-field, so it is
+    // never skipped. With no resolvable scope nothing is skipped — never mis-skip a
+    // named bit-field. Memoized per composite type: the cursor asks per position.
+    [[nodiscard]] std::vector<bool> const& unnamedBitFieldMask(TypeId t) const {
+        TypeId const m = interner.stripVolatile(t);
+        auto [it, inserted] = unnamedBitFields_.try_emplace(m.v);
+        std::vector<bool>& mask = it->second;
+        if (!inserted) return mask;
+        std::size_t const n = interner.operands(m).size();
+        mask.assign(n, false);
+        ScopeId const sscope = model.compositeScopeFor(m);
+        if (!sscope.valid()) return mask;
+        std::vector<bool> named(n, false);
+        for (auto const& [bname, bsym] : model.scopeRecord(sscope).bindings) {
+            // ONE OWNER for this spelling (core/types/anon_member_name.hpp) — it had
+            // three inline copies, and the third one going stale is how a per-CU node
+            // id ended up inside a cross-CU type identity.
+            if (isSyntheticAnonymousName(bname)) continue;
+            auto const* brec = model.recordFor(bsym);
+            if (brec == nullptr || brec->kind != DeclarationKind::Variable) continue;
+            if (brec->fieldIndex < n) named[brec->fieldIndex] = true;
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!named[i]
+                && interner.fieldBitWidth(m, static_cast<std::uint32_t>(i)).has_value())
+                mask[i] = true;
+        }
+        return mask;
     }
+    mutable std::unordered_map<std::uint32_t, std::vector<bool>> unnamedBitFields_;
+
+    // THE PLACEMENT CURSOR'S VIEW OF THIS TIER'S TYPES. It answers with the SLOT
+    // types — each member's representation projection, the types `initSlotAsAggregate`
+    // and `writeInitSlotAt` give the slots — so every path the cursor returns
+    // addresses a slot, and the type it names is the one the value is lowered against.
+    class BraceTypeView final : public initializer_cursor::TypeView {
+    public:
+        explicit BraceTypeView(Lowerer const& l) : l_(l) {}
+        [[nodiscard]] initializer_cursor::Shape shape(TypeId t) const override {
+            using initializer_cursor::Shape;
+            if (!t.valid()) return Shape::Scalar;
+            switch (l_.interner.kind(t)) {
+                case TypeKind::Struct: return Shape::Struct;
+                case TypeKind::Union:  return Shape::Union;
+                case TypeKind::Array:  return Shape::Array;
+                default:               return Shape::Scalar;
+            }
+        }
+        // The FULL length: the cursor owns the 32-bit limit (it narrowed silently here).
+        [[nodiscard]] std::optional<std::uint64_t> count(TypeId t) const override {
+            using initializer_cursor::Shape;
+            switch (shape(t)) {
+                case Shape::Struct:
+                case Shape::Union:
+                    return static_cast<std::uint64_t>(l_.interner.operands(t).size());
+                case Shape::Array: {
+                    auto const scals = l_.interner.scalars(t);
+                    // ★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT: a negative
+                    // length is the incomplete / VLA sentinel — no element count.
+                    if (scals.empty() || scals[0] < 0) return std::nullopt;
+                    return static_cast<std::uint64_t>(scals[0]);
+                }
+                case Shape::Scalar: break;
+            }
+            return std::nullopt;
+        }
+        [[nodiscard]] TypeId member(TypeId t, std::uint32_t i) const override {
+            // A TypeId VALUE is copied out of the operand span before `reprOf` runs,
+            // because `reprOf` interns (see `initSlotAsAggregate`).
+            auto const ops = l_.interner.operands(t);
+            if (shape(t) == initializer_cursor::Shape::Array) {
+                if (ops.empty()) return InvalidType;
+                TypeId const elem = ops[0];
+                return l_.reprOf(elem);
+            }
+            if (i >= ops.size()) return InvalidType;
+            TypeId const field = ops[i];
+            return l_.reprOf(field);
+        }
+        [[nodiscard]] bool unnamedBitField(TypeId t, std::uint32_t i) const override {
+            auto const& mask = l_.unnamedBitFieldMask(t);
+            return i < mask.size() && mask[i];
+        }
+
+    private:
+        Lowerer const& l_;
+    };
+    BraceTypeView braceView_{*this};
+
+    // The three facts `anon_member_search::findPromotedMember` asks, answered from the
+    // frozen semantic model (the semantic tier answers them from its own state).
+    struct AnonMemberAccess {
+        SemanticModel const& m;
+        [[nodiscard]] ScopeRecord const* scope(ScopeId id) const {
+            return id.valid() ? &m.scopeRecord(id) : nullptr;
+        }
+        [[nodiscard]] SymbolRecord const* record(SymbolId id) const { return m.recordFor(id); }
+        [[nodiscard]] ScopeId compositeScope(TypeId t) const { return m.compositeScopeFor(t); }
+    };
 
     // ── THE DRIVER ──────────────────────────────────────────────────────────
     // The public entry every brace-init route funnels through (decl init /
@@ -10310,10 +10631,12 @@ struct Lowerer {
                 // A child level just finished: land it in the slot this level
                 // suspended on, then resume the element loop where it stopped.
                 pendingDelivery = false;
-                writeInitSlotAt(f.rootSlots[f.pendingTarget], f.pendingResidual,
-                                delivered);
-                f.cursor = f.pendingTarget + 1;
-                f.pendingResidual.clear();
+                if (!writeInitSlotAt(f.root, f.pendingPath, delivered)) {
+                    reportedError(f.braceCst,
+                        "internal invariant broken: a nested brace list's placement "
+                        "names no slot of the enclosing brace level");
+                }
+                f.pendingPath.clear();
             }
             std::optional<BraceDescent> d = nextBraceDescent(f);
             if (!d.has_value()) {
@@ -10327,18 +10650,22 @@ struct Lowerer {
             if (!isBraceInitList(core)) {
                 // The scalar arm of `lowerExprOrBraceInit`, taken directly:
                 // `lowerExpr` is its own work stack, so this costs O(1) host
-                // frames however deep the expression is.
+                // frames however deep the expression is. A brace ELEMENT reports
+                // its own diagnosed conversion (P68 round 9) — the semantic tier
+                // never judges one.
                 HirNodeId const v =
-                    lowerCoercedValueExpr(d->valueExprCst, d->valueTargetType);
-                writeInitSlotAt(f.rootSlots[d->target], d->residual, v);
-                f.cursor = d->target + 1;
+                    lowerBraceElementValue(d->valueExprCst, d->valueTargetType);
+                if (!writeInitSlotAt(f.root, d->path, v)) {
+                    reportedError(d->valueExprCst,
+                        "internal invariant broken: a brace element's placement "
+                        "names no slot of its brace level");
+                }
                 continue;
             }
             // A NESTED brace level. Everything the resume needs is stored on the
             // frame BEFORE the push, because a push can REALLOCATE `stack` and
             // leave `f` dangling — nothing may touch `f` after this point.
-            f.pendingTarget   = d->target;
-            f.pendingResidual = std::move(d->residual);
+            f.pendingPath = std::move(d->path);
             if (auto imm = openBraceLevel(core, d->valueTargetType, stack);
                 imm.has_value()) {
                 // The child answered without needing a level of its own (an
@@ -10349,6 +10676,93 @@ struct Lowerer {
             }
         }
         return delivered;
+    }
+
+    // The string literal that leads a character array's brace list (C 6.7.9p14),
+    // and the first element after it (EXCESS, C 6.7.9p2), or nullopt when the list
+    // is not that form: its first element is designated, a brace list, or anything
+    // but a string literal, or the literal's element is not one the array's element
+    // accepts (`stringLiteralArrayInitCompatible`, the unbraced form's own test — so
+    // `char *p[] = {"abc"}` and `int a[] = {"abc"}` keep the string as an ELEMENT).
+    // Decided from the CST and the semantic stamps; nothing is lowered.
+    struct BracedString {
+        NodeId value{};         // the leading element's value (lowered as the string)
+        NodeId firstExcess{};   // the first element after it, or invalid
+    };
+    [[nodiscard]] std::optional<BracedString>
+    bracedStringInitializer(NodeId braceInitListNode, TypeId arrayType) {
+        if (!cfg.initElementRule.valid()) return std::nullopt;
+        std::vector<NodeId> elems;
+        for (NodeId e : visible(braceInitListNode)) {
+            if (isToken(e) || tree().kind(e) != NodeKind::Internal) continue;
+            if (tree().rule(e).v == cfg.initElementRule.v) elems.push_back(e);
+        }
+        if (elems.empty()) return std::nullopt;
+        NodeId value{};
+        std::size_t internals = 0;
+        for (NodeId c : visible(elems.front())) {
+            if (isToken(c) || tree().kind(c) != NodeKind::Internal) continue;
+            ++internals;
+            value = c;
+        }
+        if (internals != 1) return std::nullopt;   // a designator precedes the value
+        if (!stringLiteralInitializesArray(peelToBraceInitOrCore(value), arrayType))
+            return std::nullopt;
+        return BracedString{value, elems.size() > 1 ? elems[1] : NodeId{}};
+    }
+
+    // C 6.7.9p14: whether a brace element's (non-list) value `core` is a string
+    // literal whose characters the character array `arrayType`'s element accepts
+    // (`stringLiteralArrayInitCompatible`, the unbraced form's own test — so a string
+    // meeting `char *` or `int` stays an ELEMENT). The braced-string form asks it of
+    // the list's first element; the placement cursor asks it of an element meeting a
+    // character-array subobject, which the string then initializes whole instead of
+    // being elided into (`struct V {char s[4]; int x;} v[] = {"ab", 19}`). Decided
+    // from the CST and the semantic stamps; nothing is lowered.
+    [[nodiscard]] bool stringLiteralInitializesArray(NodeId core, TypeId arrayType) {
+        if (!core.valid() || !arrayType.valid() || isBraceInitList(core)) return false;
+        if (interner.kind(arrayType) != TypeKind::Array) return false;
+        auto const toOps = interner.operands(arrayType);
+        if (toOps.empty()) return false;
+        TypeKind const toElemKind = interner.kind(toOps[0]);
+        NodeId str = stringLiteralNodeOf(core);
+        if (!str.valid() && tree().kind(core) == NodeKind::Internal) {
+            for (NodeId g : visible(core)) {   // `core` may BE the literal's node
+                if (isToken(g) && isStringOpenerKind(tree().tokenKind(g))) str = core;
+                break;
+            }
+        }
+        if (!str.valid()) return false;
+        TypeId lit = model.typeAt(str);
+        if (!lit.valid()) lit = model.typeAt(core);
+        if (!lit.valid()) {
+            for (NodeId g : visible(str)) {
+                if (!isToken(g)) continue;
+                lit = model.typeAt(g);
+                if (lit.valid()) break;
+            }
+        }
+        if (!lit.valid() || interner.kind(lit) != TypeKind::Array) return false;
+        auto const fromElem = interner.operands(lit);
+        return !fromElem.empty()
+            && detail::type_rules::stringLiteralArrayInitCompatible(
+                   toElemKind, interner.kind(fromElem[0]));
+    }
+
+    // C 6.7.9p13-p14: whether a brace element's (non-list) value `core` initializes an
+    // aggregate or union subobject of type `t` WHOLE rather than being elided into its
+    // first member — an expression of that structure's or union's own type, or a
+    // string literal for a character array (`stringLiteralInitializesArray`). The
+    // placement cursor asks it while eliding. Decided from the semantic stamps and the
+    // CST; nothing is lowered, which is what keeps an EXCESS element unevaluated.
+    [[nodiscard]] bool initializesWhole(NodeId core, TypeId t) {
+        if (!core.valid() || !t.valid()) return false;
+        TypeKind const k = interner.kind(t);
+        if (k == TypeKind::Array) return stringLiteralInitializesArray(core, t);
+        if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+        TypeId vt = semTypeAt(core);
+        if (!vt.valid()) vt = resolveStampedTypeBelow(core);
+        return vt.valid() && interner.stripVolatile(vt) == interner.stripVolatile(t);
     }
 
     // Open a level for `braceInitListNode` against `contextType`, or answer the
@@ -10384,46 +10798,55 @@ struct Lowerer {
                 "array (Void / function / other non-object types stay loud "
                 "by the closed scalar allowlist)");
         }
-        // D5.4: union brace-init has distinct semantics from struct —
-        // at most ONE element, initializing exactly one variant.
-        // Positional → first variant; designator → that variant. No
-        // zero-fill across overlapping variants. Its resolution is a dedicated
-        // path; the rest of this function handles struct + array.
-        //
-        // A union is a ONE-SLOT LEVEL: `prepareUnionBraceInit` answers outright
-        // for every shape that has no value to lower, and otherwise hands back
-        // the single value expression + the chosen variant's type. The lone slot
-        // then flows through the SAME suspend/resume/flatten machinery as a
-        // struct field, so a union nested inside braces costs heap like anything
-        // else. `flattenInitSlot` on a slot whose `value` is set returns that
-        // value untouched, so the emitted shape is still the 1-child
-        // `ConstructAggregate` the recursive form built.
+        // ── P68 round 9 (lane `cs`): A STRING LITERAL "OPTIONALLY ENCLOSED IN
+        //    BRACES" (C 6.7.9p14) ──────────────────────────────────────────────
+        // A character array's brace list led by an UNDESIGNATED string literal whose
+        // element the array's element accepts is initialized by that string, exactly
+        // as the unbraced form is — so it answers outright, through the unbraced
+        // form's own `coerce` (the retype arm), with no level. Any further element is
+        // EXCESS (C 6.7.9p2): reported and dropped unevaluated, as for every level.
+        // ✔MEASURED 2026-09-23 (`.temp/probe/r8b` d01, `r8d`, `r8e`, every build
+        // RUN): `char s[] = { "abc" }` is 4 bytes holding "abc" on gcc 13.3.0,
+        // clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51; `char s[] = {"a","b"}` is
+        // built by clang alone (-std=c2x, a warning), holding "a". Before this arm
+        // the level took "abc" as its first `char` ELEMENT: refused loud at the P0
+        // fold (H_VerifierFailure), then — once row 1 let an array convert to an
+        // integer with a warning — BUILT with the pointer's low byte (exit 1).
+        if (isArray) {
+            if (auto const bs = bracedStringInitializer(braceInitListNode, contextType)) {
+                if (bs->firstExcess.valid()) {
+                    emitHAt(DiagnosticCode::S_ExcessInitializerElements,
+                            DiagnosticSeverity::Warning, bs->firstExcess,
+                            "this character array is initialized by the string "
+                            "literal that leads its braces (C 6.7.9p14); every "
+                            "further element is excess, a constraint violation "
+                            "(C 6.7.9p2), and is dropped, not evaluated");
+                }
+                return coerce(lowerExpr(bs->value), contextType).id;
+            }
+        }
+        // D5.4 / P68 round 9 (lane `cs`): a UNION's list opens an ordinary level — the
+        // element walk places it (see the note above `isScalarBraceInitKind`). Only
+        // the empty form answers outright: the first member, zeroed.
         if (isUnion) {
-            UnionBracePrep prep =
-                prepareUnionBraceInit(braceInitListNode, contextType);
-            if (prep.immediate.has_value()) return *prep.immediate;
-            BraceLevel uf;
-            uf.kind        = BraceLevel::Kind::Union;
-            uf.braceCst    = braceInitListNode;
-            uf.contextType = contextType;
-            uf.slotCount   = 1;
-            uf.rootSlots.resize(1);
-            uf.rootSlots[0].slotType = prep.variantType;
-            uf.elements.push_back(prep.valueExprCst);
-            stack.push_back(std::move(uf));
-            return std::nullopt;
+            if (interner.operands(contextType).empty()) {
+                return reportedError(braceInitListNode,
+                    "union brace-init target has no variants");
+            }
+            if (braceInitElementCount(braceInitListNode) == 0)
+                return synthZeroOrError(braceInitListNode, contextType);
         }
         // ★★ D-HIR-SENTINEL-ARRAY-LENGTH-EXPANDED-AS-A-COUNT — the THIRD site of
         // the same class (`initSlotAsAggregate` and `synthZeroOrError` carry the
         // other two; the HIR verifier's Array child-count rule is the fourth).
         // A RUNTIME-SIZED array — `kVlaLength` (-2) or `kIncompleteArrayLength`
         // (-1) in `scalars()[0]` — has NO static slot count, and the positional
-        // machinery below is built entirely out of one: `slotCount` is a
+        // machinery below is built entirely out of one: the slot count was a
         // `std::uint32_t`, so -2 became 4,294,967,294 and the very next statement
-        // (`std::vector<bool> positionallySkippable(slotCount, false)`) allocated
-        // half a gigabyte before looping over four billion slots. ✔MEASURED: the
-        // compiler simply never returned on `int a[argc] = {};` — a HANG, which is
-        // the one failure mode worse than a crash because no watchdog reports it.
+        // allocated a per-slot mask of half a gigabyte before looping over four
+        // billion slots. ✔MEASURED: the compiler simply never returned on
+        // `int a[argc] = {};` — a HANG, which is the one failure mode worse than a
+        // crash because no watchdog reports it.
         //   The EMPTY brace initializer is the whole of what may legally arrive
         // here on such a type (C23 6.7.10p4 for the VLA; an incomplete array with a
         // NON-empty initializer was already sized from that initializer by the
@@ -10443,105 +10866,62 @@ struct Lowerer {
                 return synthZeroOrError(braceInitListNode, contextType);
             }
         }
-        std::uint32_t slotCount = 0;
-        TypeId elemTypeForArray{};
-        std::span<TypeId const> structFields{};
-        if (isStruct) {
-            structFields = interner.operands(contextType);
-            slotCount = static_cast<std::uint32_t>(structFields.size());
-        } else {
-            auto const scals = interner.scalars(contextType);
-            auto const ops   = interner.operands(contextType);
-            if (!scals.empty()) slotCount = scals[0];
-            if (!ops.empty())   elemTypeForArray = ops[0];
-        }
-        if (slotCount == 0) {
+        // The placement cursor judges the level's object FIRST: an array longer than its
+        // index space (`initializer_cursor::kMaxLength`) is refused here, BEFORE
+        // `initSlotAsAggregate` builds one slot per element. P68 round 9 (lane `cs`):
+        // the length was narrowed to 32 bits right here, so a declared length of
+        // exactly 2^32 was refused as "zero slots" and 2^32 + 1 went on to build four
+        // billion slots.
+        initializer_cursor::Cursor placement{contextType, braceView_};
+        if (auto const tooLong = placement.unrepresentableObjectLength()) {
             return reportedError(braceInitListNode,
-                "brace-init target type has zero slots");
+                std::format("this brace initializer initializes an array of {} elements, past "
+                            "this implementation's limit of {} elements for an array a brace "
+                            "list initializes (the lowering builds one slot per element)",
+                            *tooLong, initializer_cursor::kMaxLength));
         }
-        // D-CSUBSET-NULLPTR-T-DECLARABLE: a brace-init SLOT is an ACCESS of the
-        // composite's field / element, so its type is projected here — the
-        // representation projection deliberately stops at a NOMINAL composite
-        // (rebuilding `struct S` would mint a different type), which makes every
-        // field ACCESS the place that owes the projection. Without it a
-        // `nullptr_t` member's slot keeps the semantic kind and the element's
-        // coercion target is a type MIR refuses: ✔MEASURED,
-        // `struct S { int a; nullptr_t n; int b; }; struct S s = {1, nullptr, 2};`
-        // failed `H0003 ConstructAggregate child[1] type 1 doesn't match field
-        // type 8`. `reprOf` is identity for every field that is not one.
-        // ⚠ AND IT RE-READS THE OPERANDS PER CALL. `reprOf` INTERNS when it
-        // really projects, which reallocates the interner's operand pool;
-        // `structFields` is the DECAYED `std::span` form, whose staleness guard
-        // was already consumed at the decay, so a capture-once read would dangle
-        // silently after the first projected field
-        // (D-TYPEINTERNER-OPERAND-SPAN-LIFETIME-GUARD). `elemTypeForArray` is a
-        // TypeId VALUE and needs no re-read.
-        auto slotType = [&](std::uint32_t i) -> TypeId {
-            if (!isStruct) return reprOf(elemTypeForArray);
-            return reprOf(interner.operands(contextType)[i]);
-        };
-
-        // FC8 D-CSUBSET-BITFIELD-INIT (C 6.7.9): an UNNAMED bit-field
-        // (`unsigned : 0;` packing break, or `unsigned : 3;`) is NOT initialized
-        // by a POSITIONAL initializer — the cursor skips it (only NAMED fields
-        // consume a positional slot). It still occupies a type-field slot (so the
-        // packed layout is right), so without this skip a `{a,b,c}` whose struct
-        // has an interior anonymous bit-field would land `c` on the anon slot and
-        // zero-fill the real next field — a silent miscompile. A DESIGNATED write
-        // is unaffected: anon fields carry synthetic `<anon:…>` names no user
-        // designator can name. `positionallySkippable[i]` is true for an anon
-        // bit-field field; ordinary fields + named bit-fields are initializable.
-        std::vector<bool> positionallySkippable(slotCount, false);
-        if (isStruct) {
-            // A field index is NAMED iff the composite's scope binds a real
-            // (non-synthetic) name to it. Anonymous fields bind under `<anon:…>`.
-            ScopeId const sscope =
-                model.compositeScopeFor(interner.stripVolatile(contextType));
-            // Only classify when the composite scope is resolvable — otherwise we
-            // can't tell named from anonymous, so skip NOTHING (never mis-skip a
-            // named bit-field; the worst case degrades to the prior behaviour).
-            if (sscope.valid()) {
-                std::vector<bool> named(slotCount, false);
-                for (auto const& [bname, bsym] : model.scopeRecord(sscope).bindings) {
-                    // ONE OWNER for this spelling (core/types/anon_member_name.hpp) —
-                    // it had three inline copies, and the third one going stale is
-                    // how a per-CU node id ended up inside a cross-CU type identity.
-                    if (isSyntheticAnonymousName(bname)) continue;
-                    auto const* brec = model.recordFor(bsym);
-                    if (brec == nullptr || brec->kind != DeclarationKind::Variable)
-                        continue;
-                    if (brec->fieldIndex < slotCount) named[brec->fieldIndex] = true;
-                }
-                for (std::uint32_t i = 0; i < slotCount; ++i) {
-                    // Only an UNNAMED bit-field is skippable; an ordinary unnamed
-                    // field cannot occur in C (a declarator with no name declares
-                    // nothing — rejected at semantic), so keying on `fieldBitWidth`
-                    // present is exact for the skippable case.
-                    if (!named[i] && interner.fieldBitWidth(contextType, i).has_value())
-                        positionallySkippable[i] = true;
-                }
+        if (!isUnion) {
+            std::uint64_t slotCount = 0;
+            if (isStruct) {
+                slotCount = interner.operands(contextType).size();
+            } else if (auto const scals = interner.scalars(contextType); !scals.empty()) {
+                slotCount = static_cast<std::uint64_t>(scals[0]);   // >= 0: the sentinels returned above
+            }
+            if (slotCount == 0) {
+                return reportedError(braceInitListNode,
+                    "brace-init target type has zero slots");
             }
         }
-        // The level is now fully determined by the CST and the type, so build it
-        // and let the driver run its element loop. `skipAnon` became
-        // `skipAnonIn(frame, slot)` — the mask lives on the frame, and a lambda
-        // capturing a local by reference cannot survive the suspension.
+        // The level is now fully determined by the CST and the type, so build it and
+        // let the driver run its element loop.
+        //   D-CSUBSET-NULLPTR-T-DECLARABLE: a brace-init SLOT is an ACCESS of the
+        // composite's field / element, so its type is the member's REPRESENTATION
+        // projection — `initSlotAsAggregate` gives the slots those types and the
+        // placement cursor's view (`BraceTypeView`) answers with the same ones, so the
+        // type an element is lowered against is its slot's (✔MEASURED before the
+        // projection: `struct S { int a; nullptr_t n; int b; }; struct S s = {1,
+        // nullptr, 2};` failed `H0003 ConstructAggregate child[1] type 1 doesn't match
+        // field type 8`).
+        //   FC8 D-CSUBSET-BITFIELD-INIT (C 6.7.9p9): an UNNAMED bit-field (`unsigned :
+        // 0;`, `unsigned : 3;`) is not initialized by a POSITIONAL element — the
+        // cursor skips it (`unnamedBitFieldMask`), at this level and inside every
+        // aggregate elision reaches. It still occupies a slot, so the packed layout is
+        // right; without the skip `{a, b, c}` over an interior unnamed bit-field
+        // landed `c` on it and zero-filled the real next field — a silent miscompile.
         BraceLevel f;
-        f.braceCst              = braceInitListNode;
-        f.contextType           = contextType;
-        f.isStruct              = isStruct;
-        f.slotCount             = slotCount;
-        f.positionallySkippable = std::move(positionallySkippable);
-
-        // Root level of the InitSlot tree — one slot per top-level
-        // field/element. Single-designator writes have empty residual
-        // path (store directly at the slot); dot-chained writes have
-        // a non-empty residual that descends into the slot's `nested`
-        // sub-aggregate via `writeInitSlotAt`.
-        f.rootSlots.resize(slotCount);
-        for (std::uint32_t i = 0; i < slotCount; ++i)
-            f.rootSlots[i].slotType = slotType(i);
-
+        f.braceCst      = braceInitListNode;
+        f.contextType   = contextType;
+        f.root.slotType = contextType;
+        // A structure's / array's aggregate has one child per member / element from
+        // the start; a union's one member slot is made by the write that selects it.
+        if (!isUnion && !initSlotAsAggregate(f.root)) {
+            // Unreachable while the cursor's verdict above holds: it is the slot
+            // builder's own refusal to build past the cursor's index space.
+            return reportedError(braceInitListNode,
+                "internal invariant broken: a brace initializer's object is longer than "
+                "the placement cursor's index space, and no slot was built for it");
+        }
+        f.placement.emplace(std::move(placement));
         for (NodeId elem : visible(braceInitListNode)) {
             if (isToken(elem)) continue;
             if (tree().kind(elem) != NodeKind::Internal) continue;
@@ -10554,34 +10934,28 @@ struct Lowerer {
     }
 
     // Advance `f`'s element loop to the next element that needs a VALUE lowered,
-    // resolving its designator chain on the way. Returns nullopt once the level's
-    // elements are exhausted.
+    // resolving its designator chain on the way and asking the placement cursor where
+    // it lands. Returns nullopt once the level's elements are exhausted.
     //
     // ⚠ ELEMENTS THAT FAIL RESOLUTION ARE DIAGNOSED AND SKIPPED **HERE**, exactly
     // where the recursive form skipped them, so each such diagnostic keeps its
     // original position in the stream relative to the values lowered around it.
     // Nothing in this resolution reads a previously LOWERED value; it reads only
-    // `f.cursor` and the designator walk.
+    // the placement cursor, the designator walk and the semantic stamps.
     [[nodiscard]] std::optional<BraceDescent> nextBraceDescent(BraceLevel& f) {
         while (f.elemIdx < f.elements.size()) {
             NodeId const elem = f.elements[f.elemIdx++];
-            if (f.kind == BraceLevel::Kind::Union) {
-                // `prepareUnionBraceInit` already picked the variant and the
-                // value; `elem` IS that value expression, and it lands in the
-                // level's single slot with no residual.
-                return BraceDescent{.target          = 0,
-                                    .residual        = {},
-                                    .valueExprCst    = elem,
-                                    .valueTargetType = f.rootSlots[0].slotType};
-            }
 
             // SP3.c: walk the initElement's children collecting a FULL
             // designator path (single OR dot-chained). At each step we
             // descend into the type that the previous step pointed to,
             // so a chain like `.a.v = 1` resolves `.v` in field `.a`'s
-            // struct scope (the InitSlot tree's `nested` substrate is
-            // what makes the multi-step write semantically right).
-            std::vector<std::uint32_t> designatorPath;
+            // scope (the InitSlot tree's `nested` substrate is what makes
+            // the multi-step write semantically right).
+            // FULL width: the placement cursor, not this walk, decides what fits its
+            // index space (P68 round 9, lane `cs`: an index was narrowed to 32 bits
+            // here, so `{[4294967296] = 7}` landed in element 0).
+            std::vector<std::uint64_t> designatorPath;
             TypeId designatorCurrentType = f.contextType;
             bool designatorFailed = false;
             NodeId valueExprCst{};
@@ -10593,10 +10967,9 @@ struct Lowerer {
                 auto const [designatorCore, r] = peelToDesignatorLeaf(c);
                 if (cfg.designatedFieldRule.valid()
                  && r == cfg.designatedFieldRule.v) {
-                    // Resolve `.name` against the CURRENT type's scope.
-                    // For the first designator, current=contextType; for
-                    // each subsequent step, current= the resolved
-                    // field's type (descends per the C99 chain rule).
+                    // Resolve `.name` against the CURRENT type's member scope:
+                    // the list's object for the first step, the previous step's
+                    // member for each later one (the C chain rule).
                     NodeId const nameTok = firstIdentifierToken(designatorCore);
                     if (!nameTok.valid()) {
                         reportedError(designatorCore,
@@ -10604,32 +10977,59 @@ struct Lowerer {
                         designatorFailed = true;
                         continue;
                     }
-                    ScopeId const structScope =
+                    ScopeId const memberScope =
                         model.compositeScopeFor(
                             interner.stripVolatile(designatorCurrentType));
-                    if (!structScope.valid()) {
+                    if (!memberScope.valid()) {
                         reportedError(designatorCore,
-                            "field designator's container is not a struct");
+                            "field designator's container is not a structure or "
+                            "union");
                         designatorFailed = true;
                         continue;
                     }
                     std::string const name{tree().text(nameTok)};
-                    auto const& scope = model.scopeRecord(structScope);
-                    auto sit = scope.bindings.find(name);
-                    if (sit == scope.bindings.end()) {
+                    auto const& scope = model.scopeRecord(memberScope);
+                    SymbolRecord const* rec = nullptr;
+                    SymbolId fieldSym{};
+                    std::vector<std::uint32_t> anonIndices;
+                    if (auto sit = scope.bindings.find(name); sit != scope.bindings.end()) {
+                        fieldSym = sit->second;
+                        rec = model.recordFor(fieldSym);
+                    } else {
+                        // P68 round 9 (lane `cs`): a member of an ANONYMOUS structure
+                        // or union member is a member of the containing one (C
+                        // 6.7.2.1p13) — the designator's path crosses the anonymous
+                        // members, and the continuation stays inside them.
+                        auto const promoted = anon_member_search::findPromotedMember(
+                            memberScope, name, AnonMemberAccess{model});
+                        if (promoted.has_value() && promoted->ambiguous) {
+                            reportedError(designatorCore,
+                                "field designator names a member that two anonymous "
+                                "members of the target both declare");
+                            designatorFailed = true;
+                            continue;
+                        }
+                        if (promoted.has_value()) {
+                            fieldSym    = promoted->symbol;
+                            rec         = model.recordFor(fieldSym);
+                            anonIndices = promoted->anonIndices;
+                        }
+                    }
+                    if (!fieldSym.valid()) {
                         reportedError(designatorCore,
                             "field designator names a field that doesn't "
                             "belong to the target struct type");
                         designatorFailed = true;
                         continue;
                     }
-                    auto const* rec = model.recordFor(sit->second);
                     if (rec == nullptr || rec->kind != DeclarationKind::Variable) {
                         reportedError(designatorCore,
                             "field designator resolved to a non-field symbol");
                         designatorFailed = true;
                         continue;
                     }
+                    designatorPath.insert(designatorPath.end(), anonIndices.begin(),
+                                          anonIndices.end());
                     designatorPath.push_back(rec->fieldIndex);
                     designatorCurrentType = reprOf(rec->type);
                     continue;
@@ -10653,10 +11053,7 @@ struct Lowerer {
                     // Descend into the array element's type (so a
                     // subsequent designator can target a sub-position).
                     // Invalid current type (prior chain step landed on
-                    // an unresolved field) → fail LOUD; without this
-                    // arm the index would silently append to the path
-                    // and `writeInitSlotAt` would no-op past an empty
-                    // `nested`, dropping the init silently.
+                    // an unresolved field) → fail LOUD.
                     if (!designatorCurrentType.valid()) {
                         reportedError(designatorCore,
                             "index designator on an unresolved or "
@@ -10664,8 +11061,14 @@ struct Lowerer {
                         designatorFailed = true;
                         continue;
                     }
-                    if (interner.kind(designatorCurrentType)
-                        != TypeKind::Array) {
+                    TypeKind const ck = interner.kind(designatorCurrentType);
+                    if (ck == TypeKind::Union) {
+                        reportedError(designatorCore,
+                            "index designators are not meaningful on union types");
+                        designatorFailed = true;
+                        continue;
+                    }
+                    if (ck != TypeKind::Array) {
                         reportedError(designatorCore,
                             "index designator on a non-array type");
                         designatorFailed = true;
@@ -10679,9 +11082,15 @@ struct Lowerer {
                         designatorFailed = true;
                         continue;
                     }
+                    if (*idx < 0) {
+                        reportedError(designatorCore,
+                            "an index designator's value must not be negative "
+                            "(C 6.7.9p6)");
+                        designatorFailed = true;
+                        continue;
+                    }
                     designatorCurrentType = ops[0];
-                    designatorPath.push_back(
-                        static_cast<std::uint32_t>(*idx));
+                    designatorPath.push_back(static_cast<std::uint64_t>(*idx));   // >= 0: lossless
                     continue;
                 }
                 valueExprCst = c;
@@ -10693,51 +11102,81 @@ struct Lowerer {
                 continue;
             }
 
-            // Determine the OUTER target slot index + the residual path
-            // for nested writes. FC8 D-CSUBSET-BITFIELD-INIT: a POSITIONAL
-            // element skips any anonymous bit-field at the cursor (C 6.7.9);
-            // a DESIGNATED element targets its named field directly (anon
-            // fields are unnameable), so the skip applies only to positional.
-            std::uint32_t target = skipAnonIn(f, f.cursor);
-            std::vector<std::uint32_t> residualPath;
-            if (!designatorPath.empty()) {
-                target = designatorPath[0];
-                f.cursor = target;
-                residualPath.assign(designatorPath.begin() + 1,
-                                    designatorPath.end());
+            // WHERE THE ELEMENT LANDS — the placement cursor (C 6.7.9p17-p20): the
+            // designated subobject or the next positional one, elided into while the
+            // value does not initialize it whole; the continuation after either is
+            // the cursor's, so a deep designator continues INSIDE its aggregate.
+            NodeId const valueCore = peelToBraceInitOrCore(valueExprCst);
+            initializer_cursor::Placement const placed = f.placement->place(
+                std::span<std::uint64_t const>{designatorPath}, isBraceInitList(valueCore),
+                [&](TypeId t) { return initializesWhole(valueCore, t); });
+            using PlacementKind = initializer_cursor::Placement::Kind;
+            if (placed.kind == PlacementKind::Excess) {
+                // ── P68 round 9 (lane `cs`): an EXCESS POSITIONAL element ──
+                // C 6.7.9p2 makes it a constraint violation; gcc 13.3.0, mingw-w64
+                // 13.2.0 and clang 18.1.3 (-std=c2x) BUILD it with a warning and
+                // DROP it — ✔MEASURED 2026-09-23 (`.temp/probe/r8e`, `r8f`, `r9c`):
+                // the programs run to the value the first slots hold, and a call in
+                // the excess element never runs. So it is reported once per brace
+                // list and dropped UNEVALUATED — a union's list too, once its member
+                // is initialized.
+                if (!f.excessReported) {
+                    f.excessReported = true;
+                    TypeKind const ok = interner.kind(f.contextType);
+                    std::string const capacity =
+                        ok == TypeKind::Union
+                            ? std::string{"union takes (one member)"}
+                            : std::format("{} has slots ({})",
+                                          ok == TypeKind::Struct ? "structure" : "array",
+                                          f.root.nested.size());
+                    emitHAt(DiagnosticCode::S_ExcessInitializerElements,
+                            DiagnosticSeverity::Warning, elem,
+                            std::format("this brace initializer has more elements "
+                                        "than its {}; the excess is a constraint "
+                                        "violation (C 6.7.9p2) and is dropped, not "
+                                        "evaluated", capacity));
+                }
+                continue;
             }
-            if (target >= f.slotCount) {
+            if (placed.kind == PlacementKind::OutOfRange) {
+                // A DESIGNATOR naming no subobject — an index past a bounded end, at
+                // any depth. gcc, clang and mingw-w64 refuse it (✔MEASURED `r9c`
+                // c33); MSVC 19.51 builds `{[0][5] = 1}` silently and drops or
+                // misplaces the value (`r9d`), which is no semantics to follow.
                 reportedError(elem,
                     "init element targets position out of aggregate range");
                 continue;
             }
-            // The value's target type is the slot's type AFTER following
-            // the designator path. When no path, the root slot's own type.
-            TypeId const valueTargetType =
-                designatorPath.empty() ? f.rootSlots[target].slotType
-                                       : designatorCurrentType;
-
-            // The driver lowers the value and then performs
-            // `writeInitSlotAt(slot, residual, value)`, which writes at the slot
-            // reachable from the root slot by the residual path: single-level
-            // designators have an empty residual, while dot-chained designators
-            // have a non-empty one that descends into nested sub-aggregates.
-            return BraceDescent{.target          = target,
-                                .residual        = std::move(residualPath),
+            if (placed.kind == PlacementKind::Unrepresentable) {
+                // P68 round 9 (lane `cs`): an element the cursor's index space cannot
+                // hold — an array inside this level longer than
+                // `initializer_cursor::kMaxLength`, or an index past it — is refused
+                // LOUDLY; it was narrowed to 32 bits and placed at the wrapped index.
+                reportedError(elem,
+                    placed.beyondIsLength
+                        ? std::format("this element is placed inside an array of {} elements, "
+                                      "past this implementation's limit of {} elements for an "
+                                      "array a brace list initializes (the lowering builds one "
+                                      "slot per element)",
+                                      placed.beyond, initializer_cursor::kMaxLength)
+                        : std::format("this element is placed at index {}, past this "
+                                      "implementation's limit of {} elements for an array a "
+                                      "brace list initializes (the lowering builds one slot per "
+                                      "element)",
+                                      placed.beyond, initializer_cursor::kMaxLength));
+                continue;
+            }
+            return BraceDescent{.path            = placed.path,
                                 .valueExprCst    = valueExprCst,
-                                .valueTargetType = valueTargetType};
+                                .valueTargetType = placed.type};
         }
         return std::nullopt;
     }
 
     // Every element of `f` has been resolved and written: assemble the level's
-    // own aggregate. `flattenInitSlot` is itself an explicit post-order heap
-    // stack, so this costs no host frames either.
+    // own aggregate by flattening its root slot. `flattenInitSlot` is itself an
+    // explicit post-order heap stack, so this costs no host frames either.
     [[nodiscard]] HirNodeId finishBraceLevel(BraceLevel const& f) {
-        std::vector<HirNodeId> children;
-        children.reserve(f.rootSlots.size());
-        for (auto const& s : f.rootSlots)
-            children.push_back(flattenInitSlot(f.braceCst, s));
         // D-DIAG-BRACE-INIT-AGGREGATE-SOURCE-SPAN: `track` the TOP-LEVEL aggregate at
         // the brace-init list's CST span. The node is `Synthetic` (it has no 1:1
         // source token of its own), but it IS the node every later tier reports
@@ -10745,9 +11184,7 @@ struct Lowerer {
         // those diagnostics print with no `--> file:line`, leaving the user to grep for
         // the construct by hand. The nested zero-fill children stay span-less: they are
         // C's implicit defaults, not text the user wrote.
-        return track(builder.makeConstructAggregate(children, f.contextType,
-                                                    HirFlags::Synthetic),
-                     f.braceCst);
+        return track(flattenInitSlot(f.braceCst, f.root), f.braceCst);
     }
 
     // A fresh SymbolId for a lowering-synthesized temporary, minted above the
@@ -10978,6 +11415,230 @@ struct Lowerer {
     // callers, two bugs.
     // ⓘ A FnSig-typed `Ref` (a function DESIGNATOR — `f = 5;`, `++f`) is excluded:
     // a function is not an object, and C 6.5.16p2 wants a MODIFIABLE lvalue.
+    // ★ THE VARIABLE A LOWERED LVALUE DESIGNATES, or nullptr (P68,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). A `Ref` names it; a
+    // `MemberAccess` or an `Index` over an ARRAY value designates part of its
+    // base, so the walk continues into the base; a `MemberAccess` over a `Deref`
+    // (`p->f`) or an `Index` over a POINTER (`p[i]`) designates the POINTEE, so
+    // the walk stops — the address taken there is not the variable's. Bounded,
+    // like every walk in this file, so a malformed tree fails soft.
+    [[nodiscard]] SymbolRecord const* designatedObjectRecord(HirNodeId id) {
+        for (int guard = 0; guard < 256 && id.valid(); ++guard) {
+            HirKind const k = builder.kind(id);
+            if (k == HirKind::Ref) {
+                SymbolId const sym{builder.payload(id)};
+                return sym.valid() ? model.recordFor(sym) : nullptr;
+            }
+            if (k != HirKind::MemberAccess && k != HirKind::Index) return nullptr;
+            auto const kids = builder.children(id);
+            if (kids.empty()) return nullptr;
+            HirNodeId const base = kids.front();
+            if (!base.valid() || builder.kind(base) == HirKind::Deref) return nullptr;
+            if (k == HirKind::Index) {
+                TypeId const bt = builder.typeId(base);
+                if (!bt.valid() || interner.kind(bt) != TypeKind::Array) return nullptr;
+            }
+            id = base;
+        }
+        return nullptr;
+    }
+
+    // One inline-asm operand bound to a machine register through a GNU LOCAL
+    // REGISTER VARIABLE — what the statement-level checks compare.
+    struct BoundAsmOperand {
+        std::size_t   index = 0;          // position in the captured operand list
+        SymbolId      sym{};              // the variable
+        std::uint16_t fullRegister = 0;   // the full-width register it names
+        bool          isOutput = false;
+        bool          isMatched = false;  // an input tied by a matching constraint
+        NodeId        at{};               // the value expression, for the span
+        std::string   variable;           // its name, for the message
+        std::string   spelled;            // the register as its label spells it
+    };
+
+    // ★★★ THE GNU LOCAL REGISTER VARIABLE BINDING (P68,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED). 📄 GCC, "Local Register
+    // Variables": *"The only supported use for this feature is to specify
+    // registers for input and output operands when calling Extended asm … Then
+    // use the local variable for the asm operand and specify any constraint
+    // letter that matches the register."* ⇒ a REGISTER-form operand whose value
+    // IS such a variable is PINNED to its register — the `fixedRegister` field a
+    // pinning letter (x86 `"a"`) already fills, so every tier below realizes it
+    // with no new mechanism (MIR→LIR's `canonicalAsmRegister` follows `subOf`,
+    // so a `w9` label binds x9 at the value's width). ✔MEASURED 2026-09-19, gcc
+    // 13.3.0 and clang 18.1.3 SEPARATELY, both targets, -O0/-O2, every binary
+    // RUN: the binding holds for inputs, outputs, `+`, tied, `asm goto`, GPR
+    // and FP registers, sub-register names, char/int/float/struct values.
+    // Returns false after REPORTING a refusal; true otherwise (bound or not).
+    [[nodiscard]] bool bindLocalRegisterVariable(
+            InlineAsmOperandFact const& op, std::size_t oi, E const& value,
+            HirInlineAsmOperand& rec, HirInlineAsmDescriptor& desc,
+            std::vector<BoundAsmOperand>& bound) {
+        TargetSchema const* target = model.target();
+        if (target == nullptr) return true;          // unasked, not guessed
+        SymbolRecord const* obj = designatedObjectRecord(value.id);
+        if (obj == nullptr || obj->asmRegister.empty()) return true;
+        NodeId const at = op.valueExpr.valid() ? op.valueExpr : op.operandNode;
+        bool const isWholeVariable =
+            value.id.valid() && builder.kind(value.id) == HirKind::Ref;
+        // ── a MEMORY-form operand asks for the object's ADDRESS ──
+        // ✔MEASURED: both references refuse a bound variable (or a part of
+        // one) on `"m"` — gcc "address of register variable 'v' requested",
+        // clang "Don't know how to handle indirect register inputs yet". (A
+        // PLAIN `register` object with no label is a different case: clang
+        // accepts it on `"m"` and runs it, so it is admitted — it never
+        // reaches here, having no `asmRegister`.)
+        if (rec.operandKindResolved) {
+            if (static_cast<OperandKindFilter>(rec.operandKind)
+                == OperandKindFilter::MemBase) {
+                emitH(DiagnosticCode::S_AddressOfRegisterObject, at,
+                      std::format("'{}' is a local register variable bound to "
+                                  "'{}', and a memory-form operand (constraint "
+                                  "\"{}\") asks for its address — the object "
+                                  "lives in a register at the statement (gcc: "
+                                  "\"address of register variable requested\"; "
+                                  "clang refuses it too) "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name, obj->asmRegister, op.constraint));
+                return false;
+            }
+            return true;   // an immediate form: a variable is no constant, and
+                           // hir_to_mir refuses the non-constant value by name
+        }
+        // A PART of the variable (`v.m`, `v[i]`) on a register form is an
+        // ordinary value: the binding is the variable's, not its member's.
+        if (!isWholeVariable) return true;
+        auto const full = target->fullRegisterOf(obj->asmRegister);
+        if (!full.has_value()) return true;   // refused at the declaration
+        auto const* rinfo = target->registerInfo(*full);
+        std::string const named = rinfo != nullptr ? rinfo->name : obj->asmRegister;
+        // ★★ AN INPUT WHOSE VARIABLE IS NEVER WRITTEN READS ITS REGISTER AS IT
+        // STANDS (P68 round 8; `SymbolRecord::denotesItsRegister` carries the
+        // proof and the measurement): nothing is copied in below.
+        bool const asItStands = !op.isOutput && obj->denotesItsRegister;
+        // ── the letter must MATCH the register (the manual's own words) ──
+        // ⚠ Two references ACCEPT a mismatch and DISAGREE on it (gcc drops the
+        // binding and uses a register of the letter's class; clang keeps the
+        // bound register), so no meaning is chosen: it is refused by name.
+        if (!rec.fixedRegister.empty()) {
+            auto const pin = target->fullRegisterOf(rec.fixedRegister);
+            if (!pin.has_value() || *pin != *full) {
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, at,
+                      std::format("'{}' is a local register variable bound to "
+                                  "'{}', and operand {} (constraint \"{}\") "
+                                  "places it in '{}' — {}. gcc and clang both "
+                                  "accept this and DISAGREE on which register "
+                                  "the operand is (gcc: the constraint's; clang: "
+                                  "the variable's), so it is refused rather than "
+                                  "given one meaning "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name, obj->asmRegister, oi, op.constraint,
+                                  rec.fixedRegister,
+                                  rec.constraint.matchedOperand.has_value()
+                                      ? "the location of the output it matches"
+                                      : "the register its letter pins"));
+                return false;
+            }
+            rec.registerAsItStands = asItStands;
+        } else if (rec.regClassResolved) {
+            if (rinfo == nullptr
+                || static_cast<std::uint8_t>(rinfo->regClass) != rec.regClass) {
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, at,
+                      std::format("'{}' is a local register variable bound to "
+                                  "'{}', and operand {} (constraint \"{}\") "
+                                  "selects a register class that does not "
+                                  "contain it. The manual's rule is \"specify "
+                                  "any constraint letter that matches the "
+                                  "register\"; gcc and clang both accept a "
+                                  "mismatch and DISAGREE on it (gcc uses a "
+                                  "register of the letter's class, clang the "
+                                  "bound one), so it is refused rather than "
+                                  "given one meaning "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  obj->name, obj->asmRegister, oi, op.constraint));
+                return false;
+            }
+            rec.fixedRegister      = obj->asmRegister;
+            // The pin is the VARIABLE's, so a value wider than the register
+            // continues in the one the target declares (`continuesIn`) — a
+            // LETTER pin never does (both references refuse that shape).
+            rec.pinnedByVariable   = true;
+            rec.registerAsItStands = asItStands;
+            // A MATCHED input pins the OUTPUT it shares a location with, when
+            // that output was not already pinned: the two are one location.
+            if (rec.constraint.matchedOperand.has_value()) {
+                auto& out = desc.operands[*rec.constraint.matchedOperand];
+                if (out.fixedRegister.empty()) {
+                    out.fixedRegister    = obj->asmRegister;
+                    out.pinnedByVariable = true;
+                }
+            }
+        } else {
+            return true;   // an unresolved letter: the semantic tier refused it
+        }
+        bound.push_back(BoundAsmOperand{
+            oi, SymbolId{builder.payload(value.id)}, *full, op.isOutput,
+            rec.constraint.matchedOperand.has_value(), at, obj->name, named});
+        return true;
+    }
+
+    // The STATEMENT-level refusals of the binding (P68,
+    // D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED), each ✔MEASURED 2026-09-19:
+    //   (a) a bound register named in the clobber list — gcc AND clang refuse
+    //       ("'asm' specifier for variable 'v' conflicts with 'asm' clobber
+    //       list");
+    //   (b) two INPUTS bound to one register through two DIFFERENT variables —
+    //       both references accept and DISAGREE (gcc: the value assigned last;
+    //       clang: the operand listed last), so no meaning exists to carry.
+    [[nodiscard]] bool checkBoundRegisterConflicts(
+            InlineAsmFacts const& f, InlineAsmConfig const& ia,
+            std::vector<BoundAsmOperand> const& bound) {
+        TargetSchema const* target = model.target();
+        if (target == nullptr || bound.empty()) return true;
+        for (auto const& c : f.clobbers) {
+            if (!ia.memoryClobber.empty() && c.text == ia.memoryClobber) continue;
+            if (!ia.conditionCodeClobber.empty() && c.text == ia.conditionCodeClobber)
+                continue;
+            auto const cf = target->fullRegisterOf(c.text);
+            if (!cf.has_value()) continue;   // S_InlineAsmClobberUnknown's case
+            for (auto const& b : bound) {
+                if (b.fullRegister != *cf) continue;
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, c.node,
+                      std::format("clobber \"{}\" names register '{}', which "
+                                  "operand {} binds through the local register "
+                                  "variable '{}' — a register cannot both carry "
+                                  "an operand and be promised dead (gcc and "
+                                  "clang: \"asm-specifier for variable conflicts "
+                                  "with asm clobber list\") "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  c.text, b.spelled, b.index, b.variable));
+                return false;
+            }
+        }
+        for (std::size_t i = 0; i < bound.size(); ++i) {
+            if (bound[i].isOutput || bound[i].isMatched) continue;
+            for (std::size_t j = i + 1; j < bound.size(); ++j) {
+                if (bound[j].isOutput || bound[j].isMatched) continue;
+                if (bound[j].fullRegister != bound[i].fullRegister) continue;
+                if (bound[j].sym.v == bound[i].sym.v) continue;
+                emitH(DiagnosticCode::S_InlineAsmBoundRegisterConflict, bound[j].at,
+                      std::format("inputs {} and {} are bound to register '{}' "
+                                  "through two different local register "
+                                  "variables ('{}' and '{}'), and one register "
+                                  "cannot hold two values. gcc and clang both "
+                                  "accept this and DISAGREE on the value it holds "
+                                  "(gcc: the one assigned last; clang: the operand "
+                                  "listed last), so it is refused rather than "
+                                  "given one meaning "
+                                  "(D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED)",
+                                  bound[i].index, bound[j].index, bound[i].spelled,
+                                  bound[i].variable, bound[j].variable));
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] bool loweredNodeIsAddressable(HirNodeId id) {
         HirKind const k = id.valid() ? builder.kind(id) : HirKind::Error;
         if (k == HirKind::Ref) {
@@ -11022,11 +11683,11 @@ struct Lowerer {
         // user's own file. The defect is older than that change and independent
         // of it — bare `8 = 5;` takes the identical route with no descriptor in
         // the picture.
-        // ⓘ The `const`-QUALIFIED lvalue (`const int x; x = 5;`) is a DIFFERENT
-        // gap, still open as [[D-CSUBSET-INCDEC-CONST-LVALUE]]: a const lvalue IS
-        // addressable and passes this shape test, and the simple-variable path
-        // above never reaches here anyway. Narrowing that is a `const`-modelling
-        // question in the type lattice, not a shape question.
+        // ⓘ The `const`-QUALIFIED lvalue (`const int x; x = 5;`) is not this
+        // test's: a const lvalue IS addressable and passes it, and the
+        // simple-variable path above never reaches here anyway. The semantic
+        // tier refuses it first (S_ConstViolation), because that is where the
+        // declared qualifiers are known.
         if (!loweredNodeIsAddressable(target.id)) {
             emitH(DiagnosticCode::S_AssignNeedsModifiableLvalue, exprCst,
                   "the left operand of an assignment must be a modifiable lvalue "
@@ -11103,6 +11764,12 @@ struct Lowerer {
         // narrow result back to lhs's type for the store. (FC3 c1: the
         // common type comes from the language's UAC block when declared.)
         HirNodeId const lhsRead = lvRead(*lv);
+        // `x += p` / `p -= q`: the binary operator's own value, then the conversion
+        // to the lvalue's type (see `compoundTakesTheBinaryCombine`).
+        if (compoundTakesTheBinaryCombine(*op, lv->type, rhs.type)) {
+            E const combined = combineCoreBinary(binNode, *op, E{lhsRead, lv->type}, rhs);
+            return asStmt(*lv, lvWrite(*lv, coerce(combined, lv->type).id), binNode);
+        }
         TypeId const common = commonArithType(lv->type, rhs.type);
         E lhsE{lhsRead, lv->type};
         E rhsE = rhs;
@@ -11182,6 +11849,10 @@ struct Lowerer {
     // correct here for the same reason it is correct for a direct call: the
     // declaration says the callee does not return.
     [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
+        // P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE): GNU
+        // `__builtin_unreachable()` terminates like a direct noreturn call.
+        if (builder.kind(id) == HirKind::BuiltinCall)
+            return static_cast<BuiltinLowering>(builder.payload(id)) == BuiltinLowering::Unreachable;
         if (builder.kind(id) != HirKind::Call) return false;
         auto const kids = builder.children(id);
         if (kids.empty() || builder.kind(kids.front()) != HirKind::Ref) return false;
@@ -13026,7 +13697,7 @@ struct Lowerer {
         // same symbol the four `recordX` calls below read, on the ONE attribute
         // that must share a side-table entry with the linkage this call stores.
         recordLinkage(fn_, linkAttr, sym);
-        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
@@ -13474,7 +14145,7 @@ struct Lowerer {
         // same symbol the four `recordX` calls below read, on the ONE attribute
         // that must share a side-table entry with the linkage this call stores.
         recordLinkage(fn_, linkAttr, sym);
-        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
@@ -13607,7 +14278,7 @@ struct Lowerer {
         // on top of this base inside `recordExtern`, not here.
         LinkageAttr const externPrefixLink =
             linkageFrom(linkagePrefixRoots(node, decl), decl);
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): the OPTIONAL trailing
+        // The extern library-name syntax (step 13.3): the OPTIONAL trailing
         // `stringLiteralExpr` after the declarator list is a DSS per-declaration
         // import-library override (`extern void* GetStdHandle(int) "kernel32.dll";`
         // — examples/c/hello_writefile). Decode it ONCE and apply the same
@@ -13792,7 +14463,7 @@ struct Lowerer {
             // because `extern int a = 1, b;` is one declaration with two different
             // answers.
             //
-            // ★★★ P65 (the FILE-SCOPE half of D-FF2-3) —
+            // ★★★ P65 (the FILE-SCOPE half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE) —
             // THE ARM SPLITS ON WHAT THE SEMANTIC TIER ALREADY DECIDED, NOT ON A
             // SECOND READING OF THE SCOPE. `isExternDeclaration` is Pass 1's answer
             // from `declarationIsNonDefining`, which now applies C 6.9.2p1: a
@@ -13809,7 +14480,7 @@ struct Lowerer {
             //     scope (gcc 13.3.0 and clang 18.1.3 with a warning, MSVC
             //     19.51.36231 silently) and all three emit a DEFINED symbol.
             //   * STILL an extern declaration ⇒ BLOCK scope, and C 6.7.11p5 makes
-            //     an initializer a constraint violation there. D-FF2-3's loud
+            //     an initializer a constraint violation there. D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE's loud
             //     refusal is unchanged and is what all three references also do
             //     (gcc "'x' has both 'extern' and initializer", clang "declaration
             //     of block scope identifier with linkage cannot have an
@@ -13887,7 +14558,7 @@ struct Lowerer {
         }
     }
 
-    // D-CSUBSET-EXTERN-LIBRARY-SYNTAX (step 13.3): decode the OPTIONAL trailing
+    // The extern library-name syntax (step 13.3): decode the OPTIONAL trailing
     // `stringLiteralExpr` library-override on an extern declaration (`extern void
     // f() "lib";`) — the per-declaration import-library name. Scans the declaration's
     // role children (the stringLiteralExpr sits after the initDeclaratorList, before
@@ -13922,7 +14593,7 @@ struct Lowerer {
     // True iff `d` (a declarator/initDeclarator from collectDeclarators) carries an
     // initializer — an initDeclarator with a visible Internal child that is NOT the
     // declarator (the `= initValue` subtree). Used to reject an extern-with-
-    // initializer (D-FF2-3). Mirrors lowerVarLikeInto's init-detection scan.
+    // initializer (D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE). Mirrors lowerVarLikeInto's init-detection scan.
     // TF-C62 (D-CSUBSET-GNU-ATTRIBUTE) + TF-C88 (D-CSUBSET-ASM-LABEL-SYMBOL-RENAME): is `c` an
     // AFTER-DECLARATOR DECORATION rather than the initializer? The init-detection
     // scans read "the first visible Internal child that is not the declarator" as
@@ -13947,7 +14618,7 @@ struct Lowerer {
         return initDeclaratorInitNode(d, dc).valid();
     }
 
-    // P65 (the file-scope half of D-FF2-3): the SAME scan
+    // P65 (the file-scope half of D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE): the SAME scan
     // as a NODE rather than a bool, because a declarator whose initializer is
     // legal must now be LOWERED and not merely detected. It is one scan with
     // three consumers — the has-initializer predicate above, `lowerVarLikeInto`'s
@@ -14008,7 +14679,7 @@ struct Lowerer {
         // same symbol the four `recordX` calls below read, on the ONE attribute
         // that must share a side-table entry with the linkage this call stores.
         recordLinkage(fn_, linkAttr, sym);
-        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE)
+        recordNoInline(fn_, sym);        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         recordAlwaysInline(fn_, sym);    // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         recordNoOptimize(fn_, sym);      // TF-C85 (#pragma optimize region)
         recordNoSanitizeThread(fn_, sym);  // TF-C92 (D-CSUBSET-NO-SANITIZE-THREAD)
@@ -14165,7 +14836,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
-    // TF-C78 (D-CSUBSET-NOINLINE): shared (Function decl node → NoInlineAttr)
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): shared (Function decl node → NoInlineAttr)
     // accumulator, moved onto result->noInlineMap after finish().
     std::vector<std::pair<HirNodeId, NoInlineAttr>> noInlineAcc;
     // TF-C81 (D-CSUBSET-ALWAYSINLINE): shared (Function decl node →
@@ -14332,7 +15003,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
                                                   std::move(inlineAsmPool));
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
-    for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE)
+    for (auto& [id, attr] : noInlineAcc)   // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK)
         result->noInlineMap.set(id, attr);
     for (auto& [id, attr] : alwaysInlineAcc)   // TF-C81 (D-CSUBSET-ALWAYSINLINE)
         result->alwaysInlineMap.set(id, attr);
@@ -14368,9 +15039,11 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
                          // descriptor handle against the pool this same
                          // lowering just filled.
                          &result->inlineAsmPool};
-    (void)verifier.verify(reporter);
+    // The verifier's OWN verdict, not only the delta: a refusal the reporter drops
+    // as a recent duplicate or past a cap must still fail the lowering (P68).
+    bool const verified = verifier.verify(reporter);
 
-    result->ok = reporter.errorCount() == errBefore;
+    result->ok = verified && reporter.errorCount() == errBefore;
     return result;
 }
 

@@ -1,0 +1,14 @@
+# PURPOSE: pin the package pipeline's release-path step sequence and refuse an artifacts-only run that can reach a release.
+name: check-pkg-pipeline
+description: >-
+  The action pins the package pipeline's release path, then proves every clause can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `pkg_pipeline_modes_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-pkg-pipeline.py
+    successPattern: 'OK \(the release path is pinned'
+    requireInputsUnmoved: true

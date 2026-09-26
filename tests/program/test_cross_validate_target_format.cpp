@@ -1,4 +1,4 @@
-// Plan 14 §3.1 D-LK6-8.2 closure tests — target↔format cross-validation.
+// Plan 14 §3.1 D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET closure tests — target↔format cross-validation.
 //
 // ⚠ THE SUBJECT OF THIS FILE CHANGED IN P44 AND THE OLD HEADER DESCRIBED A
 // MECHANISM THAT NO LONGER EXISTS. D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES
@@ -172,7 +172,7 @@ TEST(CrossValidateTargetFormat, Arm64ElfMatches) {
 // ── The SIGILL-surface fix: mismatch fails loud ───────────────
 
 TEST(CrossValidateTargetFormat, Arm64TargetWithX86_64FormatFailsLoud) {
-    // The exact CRITICAL silent-failure scenario from D-LK6-8.2:
+    // The exact CRITICAL silent-failure scenario from D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET:
     // user supplies `arm64:elf64-x86_64-linux-exec` or a hand-edited
     // format JSON declaring `machine: 62` on an ARM64-targeted file.
     // Pre-D-LK6-8.2 the dispatch silently emitted x86_64 PLT stubs

@@ -133,7 +133,7 @@ TEST(LirRegAlloc, EmptyModuleProducesNoResults) {
 
 // ── Post-fold #5 code-reviewer-#82 pin: ccIndex flow ─────────
 TEST(LirRegAlloc, CcIndex1RecordsThroughToFuncAllocation) {
-    // Pin the D-FF3-3 wiring: passing ccIndex=1 must be recorded
+    // Pin the D-FF3-3-RESOLVED-CC-INDEX-THREADED wiring: passing ccIndex=1 must be recorded
     // on every LirFuncAllocation. Without this pin a regression
     // that drops the threaded index back to 0 would silently
     // re-emit SysV register assignments on PE+x86_64 targets.
@@ -1278,8 +1278,8 @@ ccAllocatableNames(TargetSchema const& sch, std::uint16_t ccIndex) {
 // what makes this a pin instead of a coincidence: it does not depend on
 // register pressure happening to reach any particular ordinal.
 //
-// D-TEST-RESERVED-STACK-POINTER-PIN-BLIND-TO-FILTER-REMOVAL: the previous
-// form asserted only `physReg().id != rspOrdinal` over one 20-value
+// The previous form of this pin was BLIND TO THE FILTER'S REMOVAL: it
+// asserted only `physReg().id != rspOrdinal` over one 20-value
 // function, and MEASURABLY could not fail — deleting
 // `if (!allocatable.contains(info.name)) continue;` from buildFreeLists
 // (rsp's ONLY exclusion mechanism) left it green, because that function
@@ -1379,7 +1379,7 @@ TEST(LirRegAlloc, ReservedStackPointerNeverAllocated) {
 
 // ★ THE VLA FRAME-POINTER RESERVATION — a CONDITIONAL property.
 //
-// D-TEST-VLA-FRAME-POINTER-RESERVATION-NO-UNIT-PIN: `reservedFramePointer`
+// There was NO UNIT PIN over this reservation: `reservedFramePointer`
 // had ZERO occurrences anywhere under tests/. MEASURED: deleting
 // `if (reservedFramePointer.has_value() && i == *reservedFramePointer)
 // continue;` from buildFreeLists left regalloc 29/29 AND callconv 85/85
@@ -2600,8 +2600,9 @@ TEST(LirRegAllocCoalesce, TiedOperandPairSharesOneRegister) {
 }
 
 TEST(LirRegAllocCoalesce, ParameterIsPreColoredIntoItsIncomingArgRegister) {
-    // D-ML7-2.5. With the parameter homed in its own incoming argument
-    // register, `materializeCallingConvention`'s `maybeMov` emits nothing.
+    // Plan-12 step ML7, cycle 2.5. With the parameter homed in its own
+    // incoming argument register, `materializeCallingConvention`'s `maybeMov`
+    // emits nothing.
     auto lowered = lowerCToLir("int f(int x) { return x; }");
     ASSERT_TRUE(lowered.lir.ok);
     auto const* cc = lowered.target->callingConvention(0);
@@ -2646,7 +2647,7 @@ TEST(LirRegAllocCoalesce, ParameterIsPreColoredIntoItsIncomingArgRegister) {
 }
 
 TEST(LirRegAllocCoalesce, ComputedOutgoingArgumentIsPreColoredIntoItsArgRegister) {
-    // D-ML7-2.5, the USE side — the mirror of
+    // D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG, the USE side — the mirror of
     // `ParameterIsPreColoredIntoItsIncomingArgRegister`, and the half that had
     // been withheld.
     //

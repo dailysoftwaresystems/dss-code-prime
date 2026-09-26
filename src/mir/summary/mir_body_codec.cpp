@@ -108,8 +108,8 @@ void refuse(DiagnosticReporter& reporter, std::string what) {
     d.severity = DiagnosticSeverity::Error;
     d.actual   = "decodeModuleBody: " + std::move(what)
                  + " — a body drives codegen decisions, so a misread one is a "
-                   "miscompile and guessing is never the safe option "
-                   "(D-OPT11-LAZY-IMPORT-EDGE).";
+                   "miscompile and guessing is never the safe option.";
+    // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
     reporter.report(std::move(d));
 }
 
@@ -136,7 +136,8 @@ encodeModuleBody(Mir const& mir, TypeInterner const& interner,
         d.actual =
             "encodeModuleBody: the module could not be rendered re-parseably, "
             "so no `.dss.mir` payload was produced. Emitting one anyway would "
-            "ship a section a decoder must refuse (D-OPT11-LAZY-IMPORT-EDGE).";
+            "ship a section a decoder must refuse.";
+        // Anchored: D-OPT11-LAZY-IMPORT-EDGE.
         reporter.report(std::move(d));
         return {};
     }

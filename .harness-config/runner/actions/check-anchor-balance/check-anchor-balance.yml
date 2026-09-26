@@ -1,0 +1,14 @@
+# PURPOSE: refuse a cycle that ends with more OPEN deferral-registry rows than it began.
+name: check-anchor-balance
+description: >-
+  The action proves the anchor-balance vocabulary can fail (the live balance is `dssharness check-anchor-balance`).
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `anchor_balance_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-anchor-balance.py --self-test
+    successPattern: 'self-test: \d+ case\(s\), 0 failed'
+    requireInputsUnmoved: true

@@ -199,9 +199,14 @@ struct LoweringRun {
 // rather than fall back to the 1-operand form.
 // A grammar that fails to load leaves `loadErrors` non-empty and `module`
 // unset — the shape the "two roles on one rule is a LOAD error" test asserts.
+//
+// `formatKind` is the object format kind the unit is assembled for — only the
+// key the dialect's address-part operators are read under (P68 round 9);
+// nullopt (the default) states none, and every such operator is refused.
 [[nodiscard]] inline std::unique_ptr<LoweringRun>
 lowerAsmTextWithTarget(nlohmann::json const& doc, std::string_view source,
-                       std::shared_ptr<TargetSchema> target) {
+                       std::shared_ptr<TargetSchema> target,
+                       std::optional<ObjectFormatKind> formatKind = std::nullopt) {
     auto run = std::make_unique<LoweringRun>();
 
     auto grammarR = GrammarSchema::loadFromText(doc.dump(), "<test-dialect>");
@@ -224,19 +229,20 @@ lowerAsmTextWithTarget(nlohmann::json const& doc, std::string_view source,
 
     run->module = lowerAsmTextToLir(
         run->unit->trees()[0], *run->grammar, *run->target,
-        run->grammar->assembly().entryLabels, run->reporter);
+        run->grammar->assembly().entryLabels, run->reporter, formatKind);
     return run;
 }
 
 // The shipped-target form — every structural test's entry point.
 [[nodiscard]] inline std::unique_ptr<LoweringRun>
 lowerAsmText(nlohmann::json const& doc, std::string_view source,
-             std::string_view targetName = "x86_64") {
+             std::string_view targetName = "x86_64",
+             std::optional<ObjectFormatKind> formatKind = std::nullopt) {
     auto targetR = TargetSchema::loadShipped(targetName);
     if (!targetR.has_value()) {
         throw std::runtime_error{"cannot load shipped target schema"};
     }
-    return lowerAsmTextWithTarget(doc, source, *targetR);
+    return lowerAsmTextWithTarget(doc, source, *targetR, formatKind);
 }
 
 // Did the grammar load AND the parse produce zero errors? A test asserting a

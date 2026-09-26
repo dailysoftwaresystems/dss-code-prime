@@ -24,6 +24,7 @@
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"                 // the real pairs a REAL descriptor is read on
 
 #include <gtest/gtest.h>
 
@@ -1059,6 +1060,504 @@ TEST(ShippedLibDescriptor, SymbolLinkNameMalformedShapesFailLoud) {
             ] } }] })JSON"));
 }
 
+// ── P68 round 12 (S2a-1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): a per-pair
+//    `signature` ─────────────────────────────────────────────────────────────
+//
+// A prototype that differs by pair carries the `version`/`linkName` shape —
+// `{ "variants": [ { "when": {…}, "value": "fn(…)" }, …, { "default": true,
+// "value": "fn(…)" } ] }` — decoded by the SAME `decodePerTargetSymbolString`
+// and matched by the ONE `when` selector (core/types/variant_when.hpp). What a
+// signature adds is the ZERO-MATCH rule: an unversioned symbol and an unaliased
+// link name are VALUES, so `version`/`linkName` keep empty when no arm matches;
+// a symbol with no prototype on this pair has no such value, so the read is
+// REFUSED, naming the pair, unless a `default` arm says outright that it serves
+// every other pair. The arm TEXTS below are distinguishable stand-ins: each pin
+// asserts WHICH arm the pair selected, never what a real prototype is.
+
+namespace {
+// The kind of the RESULT of symbol `f` read on the pair, or nullopt when the read
+// fails — with every diagnostic appended to `diags` for the failure message.
+[[nodiscard]] std::optional<TypeKind>
+perPairResultKind(fs::path const& path, DataModel dm, std::optional<std::string_view> arch,
+                  std::optional<ObjectFormatKind> fmt,
+                  std::optional<LongDoubleFormat> ldf, std::string& diags) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    ShippedPairFacts facts;
+    facts.dataModel        = dm;
+    facts.longDoubleFormat = ldf;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, dm, arch, fmt, {},
+                                         nullptr, ldf.has_value() ? &facts : nullptr);
+    for (auto const& d : rep.all()) diags += "\n  " + d.actual;
+    if (!desc.has_value()) return std::nullopt;
+    for (auto const& s : desc->symbols)
+        if (s.name == "f") return interner.kind(interner.fnResult(s.signature));
+    diags += "\n  <symbol f missing>";
+    return std::nullopt;
+}
+}  // namespace
+
+// BOTH axes S2a-1 selects on, every arm of each: the data model (the migrated
+// `long` rows) and the long-double format (the axis `long double` prototypes
+// need, which the retired data-model-only map could not say at all).
+TEST(ShippedLibDescriptor, SymbolSignatureVariantSelectsThePairsArm) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const byModel = writeTemp(dir, "sig_dm.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": { "variants": [
+                { "when": { "dataModel": "LP64" },  "value": "fn(i32) -> i64" },
+                { "when": { "dataModel": "LLP64" }, "value": "fn(i32) -> i32" }
+            ] } }
+        ]
+    })JSON");
+    std::string diags;
+    EXPECT_EQ(perPairResultKind(byModel, DataModel::Lp64, "x86_64", ObjectFormatKind::Elf,
+                                std::nullopt, diags),
+              TypeKind::I64) << diags;
+    EXPECT_EQ(perPairResultKind(byModel, DataModel::Llp64, "x86_64", ObjectFormatKind::Pe,
+                                std::nullopt, diags),
+              TypeKind::I32) << diags;
+
+    auto const byLongDouble = writeTemp(dir, "sig_ldf.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": { "variants": [
+                { "when": { "longDoubleFormat": "x87-80" },  "value": "fn() -> i8" },
+                { "when": { "longDoubleFormat": "ieee128" }, "value": "fn() -> i16" },
+                { "when": { "longDoubleFormat": "f64" },     "value": "fn() -> i32" }
+            ] } }
+        ]
+    })JSON");
+    EXPECT_EQ(perPairResultKind(byLongDouble, DataModel::Lp64, "x86_64", ObjectFormatKind::Elf,
+                                LongDoubleFormat::X87_80, diags),
+              TypeKind::I8) << diags;
+    EXPECT_EQ(perPairResultKind(byLongDouble, DataModel::Lp64, "arm64", ObjectFormatKind::Elf,
+                                LongDoubleFormat::Ieee128, diags),
+              TypeKind::I16) << diags;
+    EXPECT_EQ(perPairResultKind(byLongDouble, DataModel::Llp64, "x86_64", ObjectFormatKind::Pe,
+                                LongDoubleFormat::F64, diags),
+              TypeKind::I32) << diags;
+}
+
+// NO SILENT FALLBACK. A pair no arm selects — and no `default` — is refused,
+// and the refusal NAMES the pair; the same document on a pair an arm does select
+// reads clean (the control that proves the refusal is the pair's, not a shape
+// error). The retired map answered this case with its BASE signature, i.e. the
+// LP64 text on an ILP32 pair, in silence.
+TEST(ShippedLibDescriptor, SymbolSignatureVariantMatchingNoArmIsRefusedNamingThePair) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sig_nomatch.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": { "variants": [
+                { "when": { "dataModel": "LP64" },  "value": "fn(i32) -> i64" },
+                { "when": { "dataModel": "LLP64" }, "value": "fn(i32) -> i32" }
+            ] } }
+        ]
+    })JSON");
+    std::string diags;
+    EXPECT_EQ(perPairResultKind(path, DataModel::Lp64, "x86_64", ObjectFormatKind::Elf,
+                                std::nullopt, diags),
+              TypeKind::I64) << "control: an arm selects this pair" << diags;
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Ilp32,
+                                             "wasm32", ObjectFormatKind::Wasm);
+        EXPECT_FALSE(desc.has_value());
+        EXPECT_TRUE(anyDiagMentions(rep, "'signature' has no variant matching the active pair"))
+            << "the refusal must be THE no-match one";
+        EXPECT_TRUE(anyDiagMentions(rep, "dataModel='ILP32'"))
+            << "the refusal must name the pair it refused";
+        EXPECT_TRUE(anyDiagMentions(rep, "no 'default' arm"));
+    }
+}
+
+// An EXPLICIT `default` serves exactly the pairs no `when` arm selects — never a
+// pair an arm does (the arm wins), and at most one may be written.
+TEST(ShippedLibDescriptor, SymbolSignatureVariantDefaultArmServesOnlyUnselectedPairs) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "sig_default.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": { "variants": [
+                { "when": { "format": "pe" }, "value": "fn() -> i32" },
+                { "default": true,            "value": "fn() -> i64" }
+            ] } }
+        ]
+    })JSON");
+    std::string diags;
+    EXPECT_EQ(perPairResultKind(path, DataModel::Llp64, "x86_64", ObjectFormatKind::Pe,
+                                std::nullopt, diags),
+              TypeKind::I32) << "the arm that selects pe wins over the default" << diags;
+    EXPECT_EQ(perPairResultKind(path, DataModel::Lp64, "x86_64", ObjectFormatKind::Elf,
+                                std::nullopt, diags),
+              TypeKind::I64) << "no arm selects elf: the default serves it" << diags;
+    EXPECT_EQ(perPairResultKind(path, DataModel::Lp64, "arm64", ObjectFormatKind::MachO,
+                                std::nullopt, diags),
+              TypeKind::I64) << diags;
+}
+
+// Every malformed per-pair signature fails the read — on a pair where the
+// malformed part is NOT the selected one too (EAGER: an arm or a default no
+// current pair selects must not lurk until one does).
+TEST(ShippedLibDescriptor, SymbolSignatureVariantMalformedShapesFailLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    int caseNo = 0;
+    auto readsClean = [&](std::string const& signatureJson) -> bool {
+        auto const path = writeTemp(dir, "sigbad" + std::to_string(caseNo++) + ".json",
+                                    R"({ "header":"x.h", "symbols":[{ "name":"f", "signature": )"
+                                        + signatureJson + " }] }");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                             "x86_64", ObjectFormatKind::Elf);
+        return desc.has_value() && !rep.hasErrors();
+    };
+    // Neither a string nor an object.
+    EXPECT_FALSE(readsClean(R"(3)"));
+    // An object with no `variants`, an empty one, a non-array one.
+    EXPECT_FALSE(readsClean(R"({})"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": "fn() -> i32" })"));
+    // An unknown key beside `variants` (a closed vocabulary: "fallback" is exactly
+    // the silent rule the form forbids).
+    EXPECT_FALSE(readsClean(
+        R"({ "variants": [ { "when": { "format": "elf" }, "value": "fn() -> i32" } ], "fallback": "fn() -> i32" })"));
+    // An arm with neither `when` nor `default`; a missing, non-string or empty `value`.
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "value": "fn() -> i32" } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "when": { "format": "elf" } } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "when": { "format": "elf" }, "value": 3 } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "when": { "format": "elf" }, "value": "" } ] })"));
+    // An unknown `when` key, an empty `when`, unknown data-model and long-double spellings.
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "when": { "ach": "x86_64" }, "value": "fn() -> i32" } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "when": {}, "value": "fn() -> i32" } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "when": { "dataModel": "LP62" }, "value": "fn() -> i32" } ] })"));
+    EXPECT_FALSE(readsClean(
+        R"({ "variants": [ { "when": { "longDoubleFormat": "x87-81" }, "value": "fn() -> i32" } ] })"));
+    // TWO arms selecting the active pair (x86_64/elf) — ambiguous, never last-wins.
+    EXPECT_FALSE(readsClean(R"({ "variants": [
+        { "when": { "format": "elf" },   "value": "fn() -> i32" },
+        { "when": { "arch": "x86_64" }, "value": "fn() -> i64" } ] })"));
+    // Two `default` arms; a `default` that is not the literal true; a `default`
+    // carrying a `when` (a guarded arm is not a default).
+    EXPECT_FALSE(readsClean(R"({ "variants": [
+        { "default": true, "value": "fn() -> i32" }, { "default": true, "value": "fn() -> i64" } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [ { "default": false, "value": "fn() -> i32" } ] })"));
+    EXPECT_FALSE(readsClean(
+        R"({ "variants": [ { "default": true, "when": { "format": "pe" }, "value": "fn() -> i32" } ] })"));
+    // EAGER: an arm this pair does not select, and a default this pair does not
+    // reach, must still decode.
+    EXPECT_FALSE(readsClean(R"({ "variants": [
+        { "when": { "format": "elf" }, "value": "fn() -> i32" },
+        { "when": { "format": "pe" },  "value": "fn(notatype) -> i32" } ] })"));
+    EXPECT_FALSE(readsClean(R"({ "variants": [
+        { "when": { "format": "elf" }, "value": "fn() -> i32" },
+        { "default": true,             "value": "fn(notatype) -> i32" } ] })"));
+    // sanity: a well-formed per-pair signature DOES read clean, with and without
+    // a default (the negatives above are not failing for an unrelated reason).
+    EXPECT_TRUE(readsClean(R"({ "variants": [
+        { "when": { "format": "elf" }, "value": "fn() -> i32" },
+        { "when": { "format": "pe" },  "value": "fn() -> i64" } ] })"));
+    EXPECT_TRUE(readsClean(R"({ "variants": [
+        { "when": { "format": "pe" }, "value": "fn() -> i64" },
+        { "default": true,            "value": "fn() -> i32" } ] })"));
+}
+
+// A `default` arm is a SIGNATURE rule. On `version`/`linkName` "no arm" is already
+// a value (unversioned, the plain name), so a default arm there is a key the
+// closed vocabulary refuses — it could only be a copy-paste from a signature.
+TEST(ShippedLibDescriptor, DefaultArmIsRefusedOnVersionAndLinkName) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    int caseNo = 0;
+    auto readsClean = [&](std::string const& key) -> bool {
+        auto const path = writeTemp(dir, "defbad" + std::to_string(caseNo++) + ".json",
+                                    R"({ "header":"x.h", "library":{"elf":"libc.so.6"},
+            "symbols":[{ "name":"f","signature":"fn() -> i32", ")" + key + R"(":
+                { "variants": [ { "default": true, "value": "X_1" } ] } }] })");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                             "x86_64", ObjectFormatKind::Elf);
+        return desc.has_value() && !rep.hasErrors();
+    };
+    EXPECT_FALSE(readsClean("version"));
+    EXPECT_FALSE(readsClean("linkName"));
+}
+
+// The retired key is REFUSED, not ignored: a descriptor still carrying
+// `signatureByDataModel` would otherwise load clean and bind its base text on
+// every pair — the LLP64 arm silently gone.
+TEST(ShippedLibDescriptor, RetiredSignatureByDataModelKeyIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "retired.json", R"JSON({
+        "header": "x.h",
+        "symbols": [
+            { "name": "f", "signature": "fn(i64) -> i64",
+              "signatureByDataModel": { "LLP64": "fn(i32) -> i32" } }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Llp64,
+                                         "x86_64", ObjectFormatKind::Pe);
+    EXPECT_FALSE(desc.has_value() && !rep.hasErrors());
+    EXPECT_TRUE(anyDiagMentions(rep, "signatureByDataModel"))
+        << "the refusal must name the retired key";
+}
+
+// ── P68 round 12 (S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): a typedef
+//    that names its OWNER ────────────────────────────────────────────────────────
+//
+// `{ "name": "size_t", "shippedTypedef": { "header": "stddef.h" } }` — C's own model:
+// many headers declare `size_t`, one type defines it. The reference takes the owner's
+// WHOLE answer on the pair: its type (the owner's TypeId itself, in the same interner)
+// and "not declared here" too. Every fixture below is a small shipped root whose files
+// are named by their own headers — the provenance the reader finds an owner by.
+
+namespace {
+[[nodiscard]] std::optional<ShippedLibDescriptor>
+readOnPair(fs::path const& path, TypeInterner& interner, TypeRegistry& typeReg,
+           DataModel dm, std::string_view arch, ObjectFormatKind fmt, std::string& diags) {
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, dm, arch, fmt);
+    for (auto const& d : rep.all()) diags += "\n  " + d.actual;
+    if (rep.hasErrors()) return std::nullopt;
+    return desc;
+}
+
+[[nodiscard]] std::optional<TypeId> typedefIn(ShippedLibDescriptor const& d, std::string_view name) {
+    for (auto const& t : d.typedefs)
+        if (t.name == name) return t.type;
+    return std::nullopt;
+}
+
+// An owner declaring `sz` on elf and pe, with a different identity on each.
+constexpr char const* kRefOwner = R"JSON({ "header": "own.h", "typedefs": [
+    { "name": "sz", "variants": [
+        { "when": { "format": "elf" }, "type": "u64 \"unsigned long\"" },
+        { "when": { "format": "pe" },  "type": "u64 \"unsigned long long\"" } ] } ] })JSON";
+}  // namespace
+
+// The reference IS the owner's type — one TypeId, not an equal copy — on each pair, and
+// the referrer's own signatures spell it.
+TEST(ShippedLibDescriptor, TypedefReferenceIsTheOwnersTypeOnEachPair) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref"};
+    auto const owner = writeTemp(dir, "own.json", kRefOwner);
+    auto const ref   = writeTemp(dir, "ref.json", R"JSON({ "header": "ref.h",
+        "typedefs": [ { "name": "sz", "shippedTypedef": { "header": "own.h" } } ],
+        "symbols": [ { "name": "f", "signature": "fn(sz) -> sz" } ] })JSON");
+    struct Pair { ObjectFormatKind fmt; DataModel dm; };
+    for (Pair const p : {Pair{ObjectFormatKind::Elf, DataModel::Lp64},
+                         Pair{ObjectFormatKind::Pe, DataModel::Llp64}}) {
+        SCOPED_TRACE(std::string{objectFormatKindName(p.fmt)});
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        auto const o = readOnPair(owner, interner, typeReg, p.dm, "x86_64", p.fmt, diags);
+        auto const r = readOnPair(ref, interner, typeReg, p.dm, "x86_64", p.fmt, diags);
+        ASSERT_TRUE(o.has_value() && r.has_value()) << diags;
+        auto const ot = typedefIn(*o, "sz");
+        auto const rt = typedefIn(*r, "sz");
+        ASSERT_TRUE(ot.has_value() && rt.has_value());
+        EXPECT_EQ(*rt, *ot) << "the reference is the owner's type itself";
+        ASSERT_EQ(r->symbols.size(), 1u);
+        EXPECT_EQ(interner.fnResult(r->symbols[0].signature), *ot);
+    }
+}
+
+// THE OWNER'S ABSENCE IS THE REFERRER'S TOO — and the loud path is WITNESSED, not
+// assumed: where the owner declares nothing, the referrer declares nothing and reads
+// clean, and a signature that names the type there is REFUSED as an unknown type.
+TEST(ShippedLibDescriptor, TypedefReferenceTakesTheOwnersAbsenceAndAUseIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-absent"};
+    (void)writeTemp(dir, "peonly.json", R"JSON({ "header": "peonly.h", "typedefs": [
+        { "name": "w", "variants": [ { "when": { "format": "pe" }, "type": "u16" } ] } ] })JSON");
+    auto const decl = writeTemp(dir, "decl.json", R"JSON({ "header": "decl.h",
+        "typedefs": [ { "name": "w", "shippedTypedef": { "header": "peonly.h" } } ] })JSON");
+    auto const use = writeTemp(dir, "use.json", R"JSON({ "header": "use.h",
+        "typedefs": [ { "name": "w", "shippedTypedef": { "header": "peonly.h" } } ],
+        "symbols": [ { "name": "g", "signature": "fn(w) -> i32" } ] })JSON");
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        auto const d = readOnPair(decl, interner, typeReg, DataModel::Llp64, "x86_64",
+                                  ObjectFormatKind::Pe, diags);
+        ASSERT_TRUE(d.has_value()) << diags;
+        EXPECT_TRUE(typedefIn(*d, "w").has_value()) << "control: the owner declares it on pe";
+        EXPECT_TRUE(readOnPair(use, interner, typeReg, DataModel::Llp64, "x86_64",
+                               ObjectFormatKind::Pe, diags).has_value()) << diags;
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        auto const d = readOnPair(decl, interner, typeReg, DataModel::Lp64, "x86_64",
+                                  ObjectFormatKind::Elf, diags);
+        ASSERT_TRUE(d.has_value()) << "not declared here is not an error" << diags;
+        EXPECT_FALSE(typedefIn(*d, "w").has_value()) << "the owner declares nothing on elf";
+        DiagnosticReporter rep;
+        auto const u = readShippedLibDescriptor(use, interner, typeReg, rep, DataModel::Lp64,
+                                                "x86_64", ObjectFormatKind::Elf);
+        EXPECT_FALSE(u.has_value());
+        EXPECT_TRUE(anyDiagMentions(rep, "unknown type 'w'"))
+            << "the use is refused as an unknown type, loudly";
+        EXPECT_TRUE(anyDiagMentions(rep, "has a 'signature' that failed to decode"));
+    }
+}
+
+// A header that declares the name on FEWER pairs than its owner gates a reference ARM.
+TEST(ShippedLibDescriptor, TypedefReferenceArmGatesTheReferrer) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-arm"};
+    (void)writeTemp(dir, "all.json", R"JSON({ "header": "all.h", "typedefs": [
+        { "name": "c", "type": "i16" } ] })JSON");
+    auto const gated = writeTemp(dir, "gated.json", R"JSON({ "header": "gated.h", "typedefs": [
+        { "name": "c", "variants": [ { "when": { "format": "pe" },
+                                       "shippedTypedef": { "header": "all.h" } } ] } ] })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    std::string diags;
+    auto const pe = readOnPair(gated, interner, typeReg, DataModel::Llp64, "x86_64",
+                               ObjectFormatKind::Pe, diags);
+    auto const elf = readOnPair(gated, interner, typeReg, DataModel::Lp64, "x86_64",
+                                ObjectFormatKind::Elf, diags);
+    ASSERT_TRUE(pe.has_value() && elf.has_value()) << diags;
+    EXPECT_TRUE(typedefIn(*pe, "c").has_value());
+    EXPECT_FALSE(typedefIn(*elf, "c").has_value()) << "the arm gates the referrer to pe";
+}
+
+// Every refusal the ruling names, each with its own sentence, each beside a control
+// that reads clean — so a refusal that fired for an unrelated reason cannot pass.
+TEST(ShippedLibDescriptor, TypedefReferenceRefusals) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-bad"};
+    (void)writeTemp(dir, "own.json", kRefOwner);
+    (void)writeTemp(dir, "hop.json", R"JSON({ "header": "hop.h", "typedefs": [
+        { "name": "sz", "shippedTypedef": { "header": "own.h" } } ] })JSON");
+    // A cycle ACROSS names, every reference aimed at a DEFINITION (so no reference-to-a-
+    // reference refusal can fire first): cya DEFINES X and Z and names cyb for Y; cyb
+    // DEFINES Y and names cya for Z. Resolving cya.X decodes cya, whose Y decodes cyb,
+    // whose Z needs cya again — the cycle.
+    (void)writeTemp(dir, "cya.json", R"JSON({ "header": "cya.h", "typedefs": [
+        { "name": "X", "type": "i32" },
+        { "name": "Y", "shippedTypedef": { "header": "cyb.h" } },
+        { "name": "Z", "type": "u8" } ] })JSON");
+    (void)writeTemp(dir, "cyb.json", R"JSON({ "header": "cyb.h", "typedefs": [
+        { "name": "Y", "type": "i16" },
+        { "name": "Z", "shippedTypedef": { "header": "cya.h" } } ] })JSON");
+    int n = 0;
+    auto refusedWith = [&](std::string const& typedefJson, std::string_view needle) {
+        std::string const name = "bad" + std::to_string(n++);
+        auto const p = writeTemp(dir, name + ".json", R"({ "header": ")" + name
+                                     + R"(.h", "typedefs": [ )" + typedefJson + " ] }");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const d = readShippedLibDescriptor(p, interner, typeReg, rep, DataModel::Lp64,
+                                                "x86_64", ObjectFormatKind::Elf);
+        bool const refused = !d.has_value() || rep.hasErrors();
+        return refused && anyDiagMentions(rep, needle);
+    };
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "header": "nowhere.h" } })",
+                            "no shipped descriptor for that header is beside this one"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "nosuch", "shippedTypedef": { "header": "own.h" } })",
+                            "declares no typedef 'nosuch' on any pair"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "header": "hop.h" } })",
+                            "is itself a reference"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "X", "shippedTypedef": { "header": "cya.h" } })",
+                            "closes a cycle of typedef references"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "type": "u64", "shippedTypedef": { "header": "own.h" } })",
+                            "states its type twice"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": "own.h" })",
+                            "'shippedTypedef' must be an object"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "hdr": "own.h" } })",
+                            "unknown key 'hdr'"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "header": "" } })",
+                            "needs a non-empty string 'header'"));
+    // A referrer whose file does not carry its own header's name has no shipped root.
+    {
+        auto const p = writeTemp(dir, "misnamed.json", R"JSON({ "header": "other.h", "typedefs": [
+            { "name": "sz", "shippedTypedef": { "header": "own.h" } } ] })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        (void)readShippedLibDescriptor(p, interner, typeReg, rep, DataModel::Lp64, "x86_64",
+                                       ObjectFormatKind::Elf);
+        EXPECT_TRUE(anyDiagMentions(rep, "does not end in its own header's name"));
+    }
+    // CONTROL: a well-formed reference beside the same fixtures reads clean.
+    {
+        auto const p = writeTemp(dir, "good.json", R"JSON({ "header": "good.h", "typedefs": [
+            { "name": "sz", "shippedTypedef": { "header": "own.h" } } ] })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        EXPECT_TRUE(readOnPair(p, interner, typeReg, DataModel::Lp64, "x86_64",
+                               ObjectFormatKind::Elf, diags).has_value()) << diags;
+    }
+}
+
+// ── P68 round 12 (S2a-2a): a per-pair signature with no arm, by DECLARED availability ──
+// Available on the pair: refused, naming the pair and the symbol. Not available on the
+// pair: the symbol is simply absent there — the rule a typedef or struct variant with
+// no arm already follows — and every arm is still decoded. Availability is the row's
+// DECLARED `availableObjectFormats`, never inferred from which arms exist.
+TEST(ShippedLibDescriptor, SymbolSignatureNoArmFollowsDeclaredAvailability) {
+    ScratchDir dir{Location::Temp, "shipped-lib-avail"};
+    auto const path = writeTemp(dir, "ld.json", R"JSON({ "header": "ld.h", "symbols": [
+        { "name": "wide", "availableObjectFormats": ["elf", "pe"],
+          "signature": { "variants": [
+              { "when": { "longDoubleFormat": "x87-80" }, "value": "fn() -> i64" } ] } },
+        { "name": "elfonly", "availableObjectFormats": ["elf"],
+          "signature": { "variants": [
+              { "when": { "longDoubleFormat": "x87-80" }, "value": "fn() -> i32" } ] } } ] })JSON");
+    auto readWith = [&](LongDoubleFormat ldf, std::string_view arch, ObjectFormatKind fmt,
+                        DataModel dm, DiagnosticReporter& rep) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        ShippedPairFacts facts;
+        facts.dataModel        = dm;
+        facts.longDoubleFormat = ldf;
+        auto d = readShippedLibDescriptor(path, interner, typeReg, rep, dm, arch, fmt, {},
+                                          nullptr, &facts);
+        std::vector<std::string> names;
+        if (d.has_value())
+            for (auto const& s : d->symbols) names.push_back(s.name);
+        return std::make_pair(d.has_value() && !rep.hasErrors(), names);
+    };
+    {   // control: x87-80 on ELF x86_64 selects both arms
+        DiagnosticReporter rep;
+        auto const [clean, names] =
+            readWith(LongDoubleFormat::X87_80, "x86_64", ObjectFormatKind::Elf, DataModel::Lp64, rep);
+        EXPECT_TRUE(clean);
+        EXPECT_EQ(names, (std::vector<std::string>{"wide", "elfonly"}));
+    }
+    {   // AVAILABLE with no arm: `wide` on pe (f64) is refused, naming the pair and the symbol
+        DiagnosticReporter rep;
+        auto const [clean, names] =
+            readWith(LongDoubleFormat::F64, "x86_64", ObjectFormatKind::Pe, DataModel::Llp64, rep);
+        EXPECT_FALSE(clean);
+        EXPECT_TRUE(anyDiagMentions(rep, "symbol 'wide'"));
+        EXPECT_TRUE(anyDiagMentions(rep, "longDoubleFormat='f64'"));
+        EXPECT_FALSE(anyDiagMentions(rep, "symbol 'elfonly'"))
+            << "an UNAVAILABLE symbol with no arm is not a refusal";
+    }
+    {   // UNAVAILABLE with no arm: on arm64 ELF (ieee128) `wide` is available and refused, but
+        // on a format that excludes both, neither is refused and neither is injected
+        DiagnosticReporter rep;
+        auto const [clean, names] =
+            readWith(LongDoubleFormat::F64, "arm64", ObjectFormatKind::MachO, DataModel::Lp64, rep);
+        EXPECT_TRUE(clean) << "neither symbol exists on Mach-O, so neither is refused there";
+        EXPECT_TRUE(names.empty()) << "and neither is injected";
+    }
+}
+
 // ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT AND NOT ONLY THE ROOT ─────────
 //
 // The repo-wide convention is that ANY config object may carry a `$`-prefixed
@@ -1512,7 +2011,7 @@ TEST(ShippedLibDescriptor, ClosureCycleTerminates) {
 //
 // ★★★ `validateShippedIncludeClosure` shipped in cycle P7 with NO test, and the
 // two diagnostic codes it owns were therefore pinned by nothing. That was not
-// caught for a cycle because `scripts/check-diagnostic-codes/check-diagnostic-codes.py` stops at its
+// caught for a cycle because `.harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py` stops at its
 // FIRST failing category, and a cross-branch reservation collision was firing
 // above it — so the uncovered-code report never printed. A gate that reports one
 // category at a time hides everything behind it.
@@ -2237,7 +2736,7 @@ TEST(ShippedLibDescriptor, StructVariantAmbiguousMatchFailsLoud) {
 // undecodable field type. Even though we compile for the OTHER (active) target —
 // whose variant is well-formed — the read FAILS LOUD: every variant's field list
 // is decoded at read time, so a malformed inactive variant never lurks until its
-// target's first compile (mirrors signatureByDataModel).
+// target's first compile (mirrors a per-pair `signature`'s arms).
 TEST(ShippedLibDescriptor, StructVariantEagerDecodeMalformedInactiveFailsLoud) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "eager.json", R"JSON({
@@ -3679,52 +4178,66 @@ TEST(ShippedLibDescriptor, RealWindowsDriveTypeSurface) {
 // `signature` decodes via the one type-text codec. A malformed JSON or an
 // unencodable signature in a shipped descriptor breaks the standard-library
 // surface — fail loud HERE, not at a user's `#include`.
+//
+// ★ ON EVERY REAL PAIR, NOT WITH NONE (P68 round 12, S2a-1). This read passed no
+// arch and no format, so it decoded a document no compile reads: a typedef
+// whose arms are keyed on the format (`size_t`) is never selected there, and a
+// `signature` arm keyed on the long-double format matches nothing. The compile
+// reads a descriptor only with a pair, so this sweep now reads each one on each
+// distinct shipped read (`shipped_read_pairs.hpp`) with that pair's own facts.
 TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
     fs::path const shippedRoot = shippedLibsRoot();
     ASSERT_FALSE(shippedRoot.empty())
         << "could not locate src/dss-config/shippedLibs from cwd";
+    auto const& pairs = dss::test_support::shippedReadPairs();
+    ASSERT_FALSE(pairs.empty());
 
     std::size_t count = 0;
     for (auto const& entry : fs::recursive_directory_iterator(shippedRoot)) {
         if (!entry.is_regular_file() || entry.path().extension() != ".json")
             continue;
         ++count;
-        // Fresh interner per descriptor — each shipped lib is read into its
-        // consuming CU's interner in production.
-        TypeInterner interner{CompilationUnitId{1}};
-        TypeRegistry typeReg;
-        DiagnosticReporter rep;
-        // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): thread the SysV va_list
-        // binding exactly as production does (stdio.json's vfprintf).
-        auto const namedTypes = sysvVaListBinding(interner);
-        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
-                                             DataModel::Lp64, std::nullopt,
-                                             std::nullopt, namedTypes);
-        EXPECT_TRUE(desc.has_value())
-            << "shipped descriptor failed to load: "
-            << entry.path().generic_string();
-        EXPECT_FALSE(rep.hasErrors())
-            << "shipped descriptor emitted diagnostics: "
-            << entry.path().generic_string();
-        if (desc.has_value()) {
-            EXPECT_FALSE(desc->header.empty())
-                << "shipped descriptor has empty header: "
+        for (auto const& pair : pairs) {
+            SCOPED_TRACE(pair.label());
+            // Fresh interner per descriptor — each shipped lib is read into its
+            // consuming CU's interner in production.
+            TypeInterner interner{CompilationUnitId{1}};
+            TypeRegistry typeReg;
+            DiagnosticReporter rep;
+            // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): thread the SysV va_list
+            // binding exactly as production does (stdio.json's vfprintf).
+            auto const namedTypes = sysvVaListBinding(interner);
+            ShippedPairFacts const facts = pair.pairFacts();
+            auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
+                                                 pair.dataModel(), pair.activeTarget(),
+                                                 pair.activeFormat(), namedTypes, nullptr,
+                                                 &facts);
+            EXPECT_TRUE(desc.has_value())
+                << "shipped descriptor failed to load: "
                 << entry.path().generic_string();
-            // Provenance integrity: `header` MUST match the descriptor's path
-            // RELATIVE to shippedRoot, subdir-PRESERVING (mirrors the resolver:
-            // `<stdio.h>`->stdio.json->"stdio.h"; `<sys/types.h>`->sys/types.json
-            // ->"sys/types.h"). RED if a clone left stdlib.json saying stdio.h, OR
-            // a `sys/*` descriptor flattens its provenance to the bare stem.
-            fs::path const rel = fs::relative(entry.path(), shippedRoot);
-            std::string const expectedHeader =
-                (rel.parent_path() / rel.stem()).generic_string() + ".h";
-            EXPECT_EQ(desc->header, expectedHeader)
-                << "header provenance must match the subdir-preserving filename in "
+            EXPECT_FALSE(rep.hasErrors())
+                << "shipped descriptor emitted diagnostics: "
                 << entry.path().generic_string();
-            for (auto const& s : desc->symbols) {
-                EXPECT_TRUE(s.signature.valid())
-                    << "symbol '" << s.name << "' has invalid signature in "
+            if (desc.has_value()) {
+                EXPECT_FALSE(desc->header.empty())
+                    << "shipped descriptor has empty header: "
                     << entry.path().generic_string();
+                // Provenance integrity: `header` MUST match the descriptor's path
+                // RELATIVE to shippedRoot, subdir-PRESERVING (mirrors the resolver:
+                // `<stdio.h>`->stdio.json->"stdio.h"; `<sys/types.h>`->sys/types.json
+                // ->"sys/types.h"). RED if a clone left stdlib.json saying stdio.h, OR
+                // a `sys/*` descriptor flattens its provenance to the bare stem.
+                fs::path const rel = fs::relative(entry.path(), shippedRoot);
+                std::string const expectedHeader =
+                    (rel.parent_path() / rel.stem()).generic_string() + ".h";
+                EXPECT_EQ(desc->header, expectedHeader)
+                    << "header provenance must match the subdir-preserving filename in "
+                    << entry.path().generic_string();
+                for (auto const& s : desc->symbols) {
+                    EXPECT_TRUE(s.signature.valid())
+                        << "symbol '" << s.name << "' has invalid signature in "
+                        << entry.path().generic_string();
+                }
             }
         }
     }
@@ -3733,77 +4246,93 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
 }
 
 // Model 3 (2026-06-09): the descriptors are PLATFORM-NEUTRAL — ONE stdlib.json /
-// stdio.json with a per-format `library` map. The 6 `long`-bearing symbols carry
-// the C `long`/`unsigned long` type in the **LP64** (i64/u64) form, which is
-// correct for the runnable linux/macos targets. `AllShippedDescriptorsDecode`
+// stdio.json with a per-format `library` map. The `long`-bearing symbols carry
+// the C `long`/`unsigned long` type, whose WIDTH is the pair's data model: i64/u64
+// on LP64 (ELF, Mach-O), i32/u32 on LLP64 (pe). `AllShippedDescriptorsDecode`
 // only proves the signatures DECODE — both `i32` and `i64` are valid types, so a
-// regression that reverted these to the Windows LLP64 (i32/u32) widths would
-// stay GREEN there. This pins the ACTUAL neutral result widths STRUCTURALLY
-// (interner accessors, not a string compare) so a width revert goes RED.
+// regression that swapped the widths would stay GREEN there. This pins the
+// ACTUAL widths STRUCTURALLY (interner accessors, not a string compare) so a
+// width revert goes RED.
 //
-// The Windows LLP64 (i32/u32) form for these 6 is latently DEFERRED — UNEXERCISED
-// by any corpus/test — and tracked by `D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH`
-// (a `long` whose width depends on the data model). When that anchor lands a
-// per-target primitive-width model, the neutral descriptor's `long` will resolve
-// to i32 on Windows and i64 on Unix; until then the neutral i64/u64 is the single
-// authored form and this test guards it.
-TEST(ShippedLibDescriptor, ShippedStdlibSignaturesAreLp64) {
+// ★ BOTH ARMS, ON EVERY PAIR (P68 round 12, S2a-1). This test pinned the LP64
+// form alone, read with NO pair, and said the LLP64 form was "latently deferred"
+// — it stopped being deferred when D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH
+// gave each row a per-data-model signature, and nothing here noticed. Each row
+// is now a per-pair `signature` whose `when: {dataModel}` arms the pair selects
+// (S2a-1 moved them from the retired `signatureByDataModel` map), so the pin
+// reads every row on every distinct shipped pair and demands the arm that pair
+// selects — a swapped arm, a dropped arm or an arm keyed on the wrong model
+// goes RED on the pair it breaks.
+namespace {
+// Every `long` position of the per-pair rows. `pos` −1 is the result.
+struct LongPosition {
+    char const* lib;
+    char const* sym;
+    int         pos;
+    TypeKind    lp64;
+    TypeKind    llp64;
+};
+constexpr LongPosition kLongPositions[] = {
+    {"stdlib", "atol",    -1, TypeKind::I64, TypeKind::I32},
+    {"stdlib", "strtol",  -1, TypeKind::I64, TypeKind::I32},
+    {"stdlib", "strtoul", -1, TypeKind::U64, TypeKind::U32},
+    {"stdlib", "labs",    -1, TypeKind::I64, TypeKind::I32},
+    // labs takes long too — pinned so a revert of the ARG width (not just the
+    // result) also goes RED.
+    {"stdlib", "labs",     0, TypeKind::I64, TypeKind::I32},
+    {"stdlib", "ldiv",     0, TypeKind::I64, TypeKind::I32},
+    {"stdlib", "ldiv",     1, TypeKind::I64, TypeKind::I32},
+    {"stdio",  "ftell",   -1, TypeKind::I64, TypeKind::I32},
+    {"stdio",  "fseek",    1, TypeKind::I64, TypeKind::I32},
+};
+}  // namespace
+
+TEST(ShippedLibDescriptor, ShippedLongPositionsTakeThePairsDataModelArm) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
 
-    // Find a named function symbol in the FLAT <lib>.json and return its FnSig
-    // (interner kept alive by the caller via the returned descriptor).
-    auto fnSigOf = [&](TypeInterner& interner, char const* lib,
-                       char const* symName) -> TypeId {
-        TypeRegistry typeReg;
-        DiagnosticReporter rep;
-        auto const namedTypes = sysvVaListBinding(interner);   // c82
-        auto desc = readShippedLibDescriptor(
-            root / (std::string(lib) + ".json"), interner, typeReg, rep,
-            DataModel::Lp64, std::nullopt, std::nullopt, namedTypes);
-        EXPECT_TRUE(desc.has_value()) << lib << ".json failed to load";
-        EXPECT_FALSE(rep.hasErrors()) << lib << ".json emitted diagnostics";
-        if (!desc.has_value()) return {};
-        for (auto const& s : desc->symbols) {
-            if (s.name == symName) {
-                EXPECT_EQ(interner.kind(s.signature), TypeKind::FnSig)
-                    << symName << " is not a function in " << lib;
-                return s.signature;
+    std::size_t lp64Pairs = 0;
+    std::size_t llp64Pairs = 0;
+    for (auto const& pair : dss::test_support::shippedReadPairs()) {
+        SCOPED_TRACE(pair.label());
+        bool const lp64 = pair.dataModel() == DataModel::Lp64;
+        ASSERT_TRUE(lp64 || pair.dataModel() == DataModel::Llp64)
+            << "a shipped pair of a third data model: give this table its column";
+        (lp64 ? lp64Pairs : llp64Pairs) += 1;
+        for (LongPosition const& at : kLongPositions) {
+            SCOPED_TRACE(std::string{at.lib} + "::" + at.sym + " position "
+                         + std::to_string(at.pos));
+            TypeInterner interner{CompilationUnitId{1}};
+            TypeRegistry typeReg;
+            DiagnosticReporter rep;
+            auto const namedTypes = sysvVaListBinding(interner);   // c82
+            ShippedPairFacts const facts = pair.pairFacts();
+            auto desc = readShippedLibDescriptor(
+                root / (std::string(at.lib) + ".json"), interner, typeReg, rep,
+                pair.dataModel(), pair.activeTarget(), pair.activeFormat(), namedTypes,
+                nullptr, &facts);
+            ASSERT_TRUE(desc.has_value()) << at.lib << ".json failed to load";
+            EXPECT_FALSE(rep.hasErrors()) << at.lib << ".json emitted diagnostics";
+            auto const sym = std::find_if(desc->symbols.begin(), desc->symbols.end(),
+                                          [&](ShippedSymbol const& s) { return s.name == at.sym; });
+            ASSERT_NE(sym, desc->symbols.end()) << at.sym << " not found in " << at.lib;
+            ASSERT_EQ(interner.kind(sym->signature), TypeKind::FnSig);
+            TypeId position = InvalidType;
+            if (at.pos < 0) {
+                position = interner.fnResult(sym->signature);
+            } else {
+                auto const params = interner.fnParams(sym->signature);
+                ASSERT_GT(params.size(), static_cast<std::size_t>(at.pos));
+                position = params[static_cast<std::size_t>(at.pos)];
             }
+            EXPECT_EQ(interner.kind(position), lp64 ? at.lp64 : at.llp64)
+                << "the arm this pair's data model selects";
         }
-        ADD_FAILURE() << symName << " not found in " << lib;
-        return {};
-    };
-    // The FnSig RESULT kind of <lib>::<sym>.
-    auto resultKindOf = [&](char const* lib, char const* symName) -> TypeKind {
-        TypeInterner interner{CompilationUnitId{1}};
-        TypeId const sig = fnSigOf(interner, lib, symName);
-        return sig.valid() ? interner.kind(interner.fnResult(sig)) : TypeKind::Void;
-    };
-    // The FnSig PARAM[i] kind of <lib>::<sym> (for fseek's offset).
-    auto paramKindOf = [&](char const* lib, char const* symName,
-                           std::size_t i) -> TypeKind {
-        TypeInterner interner{CompilationUnitId{1}};
-        TypeId const sig = fnSigOf(interner, lib, symName);
-        if (!sig.valid()) return TypeKind::Void;
-        auto const params = interner.fnParams(sig);
-        EXPECT_GT(params.size(), i) << symName << " has too few params";
-        return i < params.size() ? interner.kind(params[i]) : TypeKind::Void;
-    };
-
-    // Pin EVERY `long`-bearing symbol (not a subset — a per-symbol copy-paste is
-    // the exact failure mode). stdlib: atol/strtol return long, strtoul returns
-    // unsigned long, labs takes+returns long. stdio: ftell returns long, fseek's
-    // offset (param[1]) is long. LP64: `long` = 64-bit → i64; `unsigned long` → u64.
-    EXPECT_EQ(resultKindOf("stdlib", "atol"),    TypeKind::I64);
-    EXPECT_EQ(resultKindOf("stdlib", "strtol"),  TypeKind::I64);
-    EXPECT_EQ(resultKindOf("stdlib", "strtoul"), TypeKind::U64);
-    EXPECT_EQ(resultKindOf("stdlib", "labs"),    TypeKind::I64);
-    EXPECT_EQ(resultKindOf("stdio",  "ftell"),   TypeKind::I64);
-    EXPECT_EQ(paramKindOf("stdio",   "fseek", 1), TypeKind::I64);
-    // labs takes long too (param[0]) — pin it so a revert of the ARG width
-    // (not just the result) also goes RED.
-    EXPECT_EQ(paramKindOf("stdlib",  "labs", 0),  TypeKind::I64);
+    }
+    // Both arms must actually have been READ — a sweep that met only one data
+    // model would pin half the claim and report it whole.
+    EXPECT_GE(lp64Pairs, 1u) << "no LP64 pair was read";
+    EXPECT_GE(llp64Pairs, 1u) << "no LLP64 pair was read";
 }
 
 // Model 3 per-format `library` MAP: a shipped descriptor routes a DIFFERENT
@@ -3819,9 +4348,14 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     TypeRegistry typeReg;
     DiagnosticReporter rep;
     auto const namedTypes = sysvVaListBinding(interner);   // c82: vfprintf's va_list
+    // Read on a REAL pair (P68 round 12, S2a-1): the map below is read whole, on
+    // any pair, but a compile never reads the descriptor without one.
+    auto const* pair = dss::test_support::shippedReadPair("x86_64", ObjectFormatKind::Elf);
+    ASSERT_NE(pair, nullptr);
+    ShippedPairFacts const facts = pair->pairFacts();
     auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep,
-                                         DataModel::Lp64, std::nullopt,
-                                         std::nullopt, namedTypes);
+                                         pair->dataModel(), pair->activeTarget(),
+                                         pair->activeFormat(), namedTypes, nullptr, &facts);
     ASSERT_TRUE(desc.has_value());
     EXPECT_FALSE(rep.hasErrors());
     // The neutral descriptor names the correct runtime per format — the whole
@@ -4492,13 +5026,16 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
 //       Worse, the in-process examples runner and the CLI harness then disagree on
 //       the COLUMN for the same diagnostic (31:11 vs 31:1) — there is no honest
 //       line:col to put in a manifest.
-//   (2) D-TEST-POSITIONED-FALSE-REQUIRES-SPANLESS-RENDERING — `positioned:false`
-//       is not an escape hatch. The integrated CLI arm matches a
-//       code-only expectation by grepping for the SYMBOLIC rendering
-//       `error[S_UnknownType]`, and the CLI emits that spelling ONLY for
-//       SPAN-LESS diagnostics — a spanned one renders `error[S0006]`
-//       (D-DIAG-TWO-CODE-RENDERINGS). So `positioned:false` is today usable only
-//       for genuinely span-less codes, an undocumented coupling.
+//   (2) `positioned:false` WAS NOT AN ESCAPE HATCH. The integrated CLI arm
+//       matches a code-only expectation by grepping for the SYMBOLIC rendering
+//       `error[S_UnknownType]`, and the CLI emitted that spelling ONLY for
+//       SPAN-LESS diagnostics — a spanned one rendered `error[S0006]`. So
+//       `positioned:false` was usable only for genuinely span-less codes, an
+//       undocumented coupling.
+//       ⚠ D-DIAG-TWO-CODE-RENDERINGS, the split that CAUSED this, has since
+//       closed by unifying every render surface on the symbolic name, so this
+//       coupling is reported gone. RE-MEASURE it before re-taking the pe-arm
+//       decision below on the strength of this paragraph.
 // A pe corpus arm lands when those are fixed; until then the pe axis is pinned
 // HERE, strictly, and it does red alone (add a pe variant to any of the nine).
 TEST(ShippedLibDescriptor, RealSysTypesBsdSpellingGroupPerFormat) {
@@ -5037,29 +5574,52 @@ static std::optional<ShippedLibDescriptor> decodeShippedFor(
 // pinned from the REAL stddef.json through the REAL layout engine.
 // RED-ON-DISABLE: drop the pe variant → wchar_t decodes at the elf i32 → the
 // pe width assert fails.
+//
+// P68 round 9 (D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX): the row no longer carries
+// the core — it is `{"name": "wchar_t", "abiTypedef": "wchar_t"}`, realized from
+// the TARGET's `abiTypedefs` for the pair, the one source `L'…'` reads too. So the
+// descriptor is decoded here as the analyzer decodes it: with the pair's facts
+// (the shipped x86_64 target's table for `fmt`, and the format's own data model).
+// Without them the row is UNREALIZED — declared by no one, never guessed — which
+// the last assertion pins.
 TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
     fs::path const root = shippedLibsRoot();
     ASSERT_FALSE(root.empty());
-    auto widthFor = [&](ObjectFormatKind fmt) -> std::uint64_t {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto widthFor = [&](ObjectFormatKind fmt, bool withPairFacts) -> std::uint64_t {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry typeReg;
-        auto desc = decodeShippedFor(root / "stddef.json", interner, typeReg, fmt);
+        DataModel const model = fmt == ObjectFormatKind::Pe ? DataModel::Llp64 : DataModel::Lp64;
+        ShippedPairFacts facts;
+        facts.dataModel = model;
+        for (std::string_view const name : (*targetR)->abiTypedefNames()) {
+            if (auto const core = (*targetR)->abiTypedefCore(name, fmt); core.has_value()) {
+                facts.abiTypedefs.emplace_back(std::string{name}, *core);
+            }
+        }
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(root / "stddef.json", interner, typeReg, rep, model,
+                                             std::string_view{"x86_64"}, fmt, {}, nullptr,
+                                             withPairFacts ? &facts : nullptr);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
         if (!desc) return 0;
         for (auto const& td : desc->typedefs) {
             if (td.name == "wchar_t") {
-                auto layout = computeLayout(td.type, interner, kNatural16,
-                                            DataModel::Lp64);
+                auto layout = computeLayout(td.type, interner, kNatural16, model);
                 EXPECT_TRUE(layout.has_value());
                 return layout ? layout->size : 0;
             }
         }
-        ADD_FAILURE() << "wchar_t typedef absent from stddef.json";
         return 0;
     };
-    EXPECT_EQ(widthFor(ObjectFormatKind::Pe), 2u)
+    EXPECT_EQ(widthFor(ObjectFormatKind::Pe, true), 2u)
         << "pe wchar_t is the 16-bit Windows code unit";
-    EXPECT_EQ(widthFor(ObjectFormatKind::Elf), 4u);
-    EXPECT_EQ(widthFor(ObjectFormatKind::MachO), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::Elf, true), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::MachO, true), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::Elf, false), 0u)
+        << "without the pair's ABI table, wchar_t must be declared by no one — never guessed";
 }
 
 // c113 (D-CSUBSET-INTRINSIC-BARRIER): the shipped <intrin.h> descriptor.
@@ -5740,39 +6300,49 @@ TEST(ShippedLibDescriptor, EveryShippedSynthesizeTagIsPinnedToItsFamily) {
         << "could not locate src/dss-config/shippedLibs from cwd";
 
     std::unordered_set<std::string> declared;
-    for (auto const& entry : fs::recursive_directory_iterator(shippedRoot)) {
-        if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
-        TypeInterner interner{CompilationUnitId{1}};
-        TypeRegistry typeReg;
-        DiagnosticReporter rep;
-        auto const namedTypes = sysvVaListBinding(interner);
-        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
-                                             DataModel::Lp64, std::nullopt,
-                                             std::nullopt, namedTypes);
-        ASSERT_TRUE(desc.has_value())
-            << "shipped descriptor failed to load: " << entry.path().generic_string();
-        for (auto const& s : desc->symbols) {
-            if (s.synthesize.empty()) continue;
-            declared.insert(s.synthesize);
-            // The loader already rejects an unknown id at READ time; this asserts the
-            // SECOND half — that the id is also CLASSIFIABLE, which is what the driver
-            // seams need and what the loader does not check.
-            auto const fam = shimFamilyOf(s.synthesize);
-            ASSERT_TRUE(fam.has_value())
-                << "shipped recipe '" << s.synthesize << "' in "
-                << entry.path().generic_string() << " belongs to no shim family";
-            bool pinned = false;
-            for (auto const& r : kPinnedRecipes) {
-                if (s.synthesize == r.id) {
-                    pinned = true;
-                    EXPECT_EQ(*fam, r.family)
-                        << "shipped recipe '" << s.synthesize << "' changed family";
+    // On EVERY distinct real pair (P68 round 12, S2a-1): a `synthesize` tag is
+    // not per pair today, but the sweep reads each descriptor the way a compile
+    // does, and a tag a pair-keyed row added on one pair only must still be seen.
+    auto const& pairs = dss::test_support::shippedReadPairs();
+    ASSERT_FALSE(pairs.empty());
+    for (auto const& pair : pairs) {
+        for (auto const& entry : fs::recursive_directory_iterator(shippedRoot)) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+            SCOPED_TRACE(pair.label());
+            TypeInterner interner{CompilationUnitId{1}};
+            TypeRegistry typeReg;
+            DiagnosticReporter rep;
+            auto const namedTypes = sysvVaListBinding(interner);
+            ShippedPairFacts const facts = pair.pairFacts();
+            auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
+                                                 pair.dataModel(), pair.activeTarget(),
+                                                 pair.activeFormat(), namedTypes, nullptr,
+                                                 &facts);
+            ASSERT_TRUE(desc.has_value())
+                << "shipped descriptor failed to load: " << entry.path().generic_string();
+            for (auto const& s : desc->symbols) {
+                if (s.synthesize.empty()) continue;
+                declared.insert(s.synthesize);
+                // The loader already rejects an unknown id at READ time; this asserts the
+                // SECOND half — that the id is also CLASSIFIABLE, which is what the driver
+                // seams need and what the loader does not check.
+                auto const fam = shimFamilyOf(s.synthesize);
+                ASSERT_TRUE(fam.has_value())
+                    << "shipped recipe '" << s.synthesize << "' in "
+                    << entry.path().generic_string() << " belongs to no shim family";
+                bool pinned = false;
+                for (auto const& r : kPinnedRecipes) {
+                    if (s.synthesize == r.id) {
+                        pinned = true;
+                        EXPECT_EQ(*fam, r.family)
+                            << "shipped recipe '" << s.synthesize << "' changed family";
+                    }
                 }
+                EXPECT_TRUE(pinned)
+                    << "shipped recipe '" << s.synthesize
+                    << "' is not pinned in kPinnedRecipes — add it (with its family) so the "
+                       "vocabulary stays covered";
             }
-            EXPECT_TRUE(pinned)
-                << "shipped recipe '" << s.synthesize
-                << "' is not pinned in kPinnedRecipes — add it (with its family) so the "
-                   "vocabulary stays covered";
         }
     }
 
@@ -6006,9 +6576,11 @@ TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
-    // Decode keeps EVERY symbol row regardless of the requested format (the
+    // Decode keeps every symbol row regardless of the requested format (the
     // per-symbol gate filters at INJECTION — the c106 pin-shape lesson), so one
-    // Elf-kind read exposes both symbols' availability sets.
+    // Elf-kind read exposes both symbols' availability sets. (The one exception,
+    // since P68 round 12: a per-pair signature with no arm on a pair its row is NOT
+    // available on is left out there; neither row here is per-pair.)
     auto desc = readShippedLibDescriptor(stdlibPath, interner, typeReg, rep,
                                          DataModel::Lp64,
                                          std::string_view{"x86_64"},
@@ -6825,7 +7397,7 @@ TEST(ShippedLibDescriptor, RealStdlibJsonSetlocaleUngatedAllFormats) {
         ASSERT_EQ(ps.size(), 2u) << "setlocale(category, locale)";
         EXPECT_EQ(r.interner.kind(ps[0]), TypeKind::I32)
             << "the category is a plain C int — i32 under LP64 AND LLP64, hence no "
-               "signatureByDataModel arm";
+               "data-model `signature` arm";
         ASSERT_EQ(r.interner.kind(ps[1]), TypeKind::Ptr);
         {
             auto const pp = r.interner.operands(ps[1]);
@@ -6994,7 +7566,7 @@ TEST(ShippedLibDescriptor, RealUnistdJsonDarwinFsSysctlMachoOnly) {
         // void *, size_t)` — u_int is 4-byte unsigned (sys/_types/_u_int.h),
         // size_t/size_t* are 8-byte unsigned on every macho64 format (all eight
         // declare dataModel LP64), which is exactly why the row may ship a FLAT
-        // signature with no signatureByDataModel.
+        // signature with no data-model arm.
         expectMachoOnlyFn(m, "sysctl", K::I32,
                           {K::Ptr, K::U32, K::Ptr, K::Ptr, K::Ptr, K::U64},
                           {K::I32, std::nullopt, K::Void, K::U64, K::Void,

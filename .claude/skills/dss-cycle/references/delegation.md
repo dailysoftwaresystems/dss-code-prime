@@ -1,5 +1,14 @@
 # Delegation is the default
 
+## Contents
+- Step C.0 — delegation is the default: what to delegate, and parallelism by disjoint file sets
+- At most 4 reasoning agents at a time (operator instruction, 2026-08-19) — what counts against the
+  cap; dividing the `-j` budget; why a cap; disjointness is not enough; a byte-changing measurement goes
+  in a worktree; what the orchestrator keeps; prompt quality; every brief says "anchor AND close"
+
+This file numbers the steps the older way; the crosswalk to `SKILL.md`'s 0–12 is at the top of
+`workflow-steps.md`. The rules for writing and running a lane brief continue in `lane-discipline.md`.
+
 ### Step C.0 — DELEGATION IS THE DEFAULT (read before every step below)
 
 **Every step of this cycle that is not inherently serial runs in a SUBAGENT. This is not an
@@ -49,9 +58,8 @@ a remote leg over a carriage, a watcher — background or foreground, however ma
 They consume machine, not judgment, so run as many as the machine and the tree can take.
 
 ⚠⚠ **BUT "AS MANY AS THE MACHINE CAN TAKE" IS A BUDGET THE ORCHESTRATOR MUST DIVIDE, AND UNTIL
-2026-08-23 NOTHING DIVIDED IT.** ✔MEASURED (cycle P28,
-`D-CYCLE-LANE-CTEST-PARALLELISM-IS-UNBOUNDED-IN-AGGREGATE`): P17 made `-j 8` the default for
-`run-gate` and `local-build`, which is right for ONE gate. With four lanes each running its own
+2026-08-23 NOTHING DIVIDED IT.** ✔MEASURED (cycle P28): P17 made `-j 8` the default for the
+build and gate runners, which is right for ONE gate. With four lanes each running its own
 `ctest -j 8` in its own build tree, the aggregate is **32 concurrent test processes**, and a lane
 measured single example tests going from **~6 s to ~200 s** — a ~33x degradation. One lane
 **abandoned a 639-test gate** it had already earned, because at that rate it projected to ~4 hours
@@ -60,7 +68,7 @@ is measured, not inferred from the slowdown.
 ★ **The lane cannot see this and must not be asked to.** From inside a lane, a slow suite is
 indistinguishable from a slow machine. Only the orchestrator knows the lane count.
 ⇒ **THE ORCHESTRATOR ASSIGNS EACH LANE ITS `-j` IN THE BRIEF**, and the brief states the number
-rather than leaving the default.
+rather than leaving the default. ⏳ SCRIPT-ERA (superseded 2026-09-24: through DssHarness no `-j` is passed — each leg's parallelism comes from config.json's buildCores and testCores — and the budget is two heavy local jobs, each admitted below 76% committed memory; see the memory budget below)
 ⚠⚠ **AND `cores / N` IS NOT THE RIGHT NUMBER — THAT WAS MEASURED WRONG THE SAME DAY IT WAS
 WRITTEN.** ✔The host has **32** logical processors, so four lanes at `-j 8` IS `cores / N` exactly,
 and it is the configuration that produced the 33x degradation above. **A ctest ENTRY IS NOT A
@@ -69,14 +77,23 @@ each invoking the CLI, and the examples runner compiles — so `N x j` counts *s
 compilers underneath them, and lane BUILDS compete for the same cores at the same time.
 ⇒ Size it **well below** `cores / N`: with N lanes that also build, `cores / (2N)` is the starting
 point, and the orchestrator raises it only after watching a run rather than lowering it after a
-lane gives up. ★ The number to watch is not CPU% — it is **per-test wall clock against its own
+lane gives up. ⏳ SCRIPT-ERA (superseded 2026-09-24: no `-j` is sized per lane any more; the per-test wall clock that follows is still the signal of contention; see the memory budget below) ★ The number to watch is not CPU% — it is **per-test wall clock against its own
 baseline**: this project's example tests run in ~6 s uncontended, so a 20 s example is the signal,
 long before anything looks saturated.
 ⛔ Do NOT fix this by serialising the lanes: the operator rejected serialisation by name in
 2026-07-31 (*"I HATE WORKAROUNDS"*), and the defect is not that lanes run at once, it is that
 nobody divided the budget.
 ★ Corollary for the orchestrator's own gate: the attributable whole-tree run happens **after** the
-fold, when no lane is live, so it gets the whole machine and the full `-j`.
+fold, when no lane is live, so it gets the whole machine and the full `-j`. ⏳ SCRIPT-ERA (superseded 2026-09-24: through DssHarness the whole machine is the configured buildCores and testCores, and no `-j` is passed; see the memory budget below)
+
+★★★ **AND MEMORY IS A BUDGET TOO — ✔MEASURED P68 round 9, 2026-09-23.** Four lanes plus main's verify
+drove this host to its commit limit (**81.0 of 113.7 GB** committed) and the Claude host process died,
+and every lane agent with it. ⇒ **At most two heavy local jobs on this host at once, each admitted only
+below 76% committed memory, and a lane starts a heavy job only on the orchestrator's GO.** A heavy job is
+a build or a test run through DssHarness. There is no `-j` knob to divide any more: DssHarness sets each
+leg's parallelism from `.harness-config/config.json` — `buildCores` for the build, `testCores` for the
+tests — ✔MEASURED 2026-09-25: 6 each, the `defaults`, which `hosts.local` does not override. The
+admission gate is the orchestrator's — an interim until the host-memory-gate action lands in the next PR.
 
 ⚠ **Why a cap at all, and it is not politeness to the host.** Two costs rise with lane count and
 neither is visible from inside a lane:
@@ -85,7 +102,8 @@ neither is visible from inside a lane:
   window in which a sibling's half-written state makes some other lane's measurement false.
 - **The orchestrator.** It must hold every live lane's brief, its owned paths, and its returned
   result well enough to judge them. Past four, the orchestrator stops judging and starts
-  relaying — which is exactly the failure `⚠⚠ A LANE BRIEF THAT PRESCRIBES THE FIX` warns about,
+  relaying — which is exactly the failure `lane-discipline.md` rule 6 warns about — *AND THE SAME
+  STANDARD BINDS A MECHANISM, NOT ONLY AN INTERFACE: A BRIEF THAT NAMES THE FIELD A DECISION READS…* —
   arriving from the other direction.
 
 ★ **Fewer is often right.** Four is a ceiling, not a target: two well-briefed lanes on genuinely
@@ -114,10 +132,9 @@ sibling lane the same day hit the wall, moved to a throwaway worktree, verified,
   a clean verdict and a next-free diagnostic ordinal ~200 slots off, from bytes existing in no real
   tree. Nothing was wrong with the instrument.
 - Give each lane a **lane-private scratch subdirectory**; the session scratchpad is shared.
-- See [[D-GATE-H0-WORKTREE-RULE-IS-WRITTEN-AND-UNENFORCED]] for the full measurement.
 
 **★ DO NOT DELEGATE — the orchestrator keeps these:**
-- **Step 6, the gate** (builds, ctest, the 3-leg run, the sqlite re-probe). A delegated
+- **Step 6, the gate** (builds, ctest, the eight-run `{Debug, Release} × four legs` gate, the sqlite re-probe). A delegated
   build/gate agent reliably **yields mid-build** — it kicks the build off, reports "standing
   by", and leaves an orphaned detached job. This has bitten this project repeatedly. Drive
   builds yourself, FOREGROUND-BLOCKING, or via a harness-tracked `run_in_background` command

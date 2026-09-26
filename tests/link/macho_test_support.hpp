@@ -163,10 +163,12 @@ using ::dss::link_format::test::readU64LE;
 // That leaves the static walker live code with no schema to drive it, which
 // is what this returns: **the shipped exec document MINUS its signature
 // request, and nothing else changed.** Keeping every other field is not
-// tidiness — `macho64-arm64-darwin-exec` also declares `image.buildVersion`,
-// which `encodeExec` refuses on its own, and dropping that too would silently
-// delete the only pin that boundary has that runs.
-// D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION
+// tidiness — both darwin exec documents declare `image.buildVersion`, which
+// `encodeExec` EMITS since D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION closed
+// (it used to refuse the key), and dropping that too would silently delete
+// the static-arm byte pins that read the command back: MachOArm64Exit's
+// StaticExecArmEmitsTheDeclaredBuildVersion and the dylib writer's static
+// cells.
 //
 // ★ THE CROSS-CHECK IS THE POINT, NOT THE COPY. A synthetic document that
 // merely resembles the shipped one drifts out from under its pins the first
@@ -180,9 +182,10 @@ loadUnsignedExec(std::string_view shippedExecName) {
     // Values copied from the shipped documents. Divergences from a sibling
     // are REAL and per-port: arm64 uses a 16 KiB VM segment page (Apple
     // Silicon rejects 4 KiB-aligned segments at exec) with __text at
-    // pageZero+0x4000, and declares `image.buildVersion`; x86_64 uses the
-    // 4 KiB default with __text at pageZero+0x1000 and deliberately omits
-    // `buildVersion`. Neither carries `codeSignature` — that omission is
+    // pageZero+0x4000, and declares `image.buildVersion` (macos 11.0); x86_64
+    // uses the 4 KiB default with __text at pageZero+0x1000, and declares it
+    // too (macos 10.14, since 2026-09-24). Neither carries `codeSignature` —
+    // that omission is
     // this fixture's entire reason to exist.
     //
     // ⚠ BOTH DECLARE `weakDefinition`, because both shipped exec documents do
@@ -217,6 +220,8 @@ loadUnsignedExec(std::string_view shippedExecName) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294983680}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"ARM64_RELOC_BRANCH26","kind":1,"nativeId":620756992,"isCall":true},
         {"name":"ARM64_RELOC_PAGE21","kind":2,"nativeId":889192448},
@@ -243,11 +248,14 @@ loadUnsignedExec(std::string_view shippedExecName) {
         "pageZeroSize": 4294967296,
         "dylinkerPath": "/usr/lib/dyld",
         "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
-        "bindNow": true
+        "bindNow": true,
+        "buildVersion": {"platform":"macos","minOs":"10.14","sdk":"10.14"}
       },
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},

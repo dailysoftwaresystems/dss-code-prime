@@ -72,6 +72,14 @@ constexpr WeakDefinitionDialect kMachOWeakDialects[] = {
     WeakDefinitionDialect::SymbolFlag,
 };
 
+// D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH. The runpath carrier THIS backend's
+// walker records: `macho.cpp`'s dynamic-image writer emits one
+// `rpath_command` per recorded path. One row, so a document declaring
+// `elf-dynamic-entry` is refused at LOAD.
+constexpr RunpathCarrier kMachORunpathCarriers[] = {
+    RunpathCarrier::MachoLoadCommand,
+};
+
 // ── `mach_header` geometry the BYTE PROBE reads (Apple `<mach-o/loader.h>`) ─
 //
 // `filetype` is the fourth word of BOTH `mach_header` and `mach_header_64` —
@@ -145,6 +153,10 @@ public:
     [[nodiscard]] std::span<WeakDefinitionDialect const>
     weakDefinitionDialects() const noexcept override {
         return kMachOWeakDialects;
+    }
+    [[nodiscard]] std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept override {
+        return kMachORunpathCarriers;
     }
 
     [[nodiscard]] bool
@@ -1520,9 +1532,21 @@ public:
         // no stack-reserve VEHICLE (see stackReserveVehicles(), which is what
         // the old `(void)request` was about), but it carries the per-EMISSION
         // artifact identity an MH_DYLIB's `image.installName` may name — and a
-        // walker that never saw it could only answer with a constant.
+        // walker that never saw it could only answer with a constant. It also
+        // carries the RUNPATHS the dynamic writer records as LC_RPATH commands
+        // (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH).
         return macho::encode(module, targetSchema, objectFormatSchema,
                              reporter, request);
+    }
+
+    // [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]:
+    // where `encode` above puts each import's `__stubs` entry — answered by the
+    // writer's own TU, beside the layout it describes.
+    [[nodiscard]] link::ImportCallStubLayout
+    importCallStubLayout(AssembledModule const&    module,
+                         TargetSchema const&       /*targetSchema*/,
+                         ObjectFormatSchema const& objectFormatSchema) const override {
+        return macho::importCallStubLayout(module, objectFormatSchema);
     }
 
     // D-PROGRAM-TIER-RETAINS-FORMAT-IDENTITY-BRANCHES: the read counterpart of

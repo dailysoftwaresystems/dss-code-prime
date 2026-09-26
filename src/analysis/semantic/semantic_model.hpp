@@ -179,8 +179,10 @@ struct DSS_EXPORT SymbolRecord {
     // 'main'`, and leaving this nullopt on protos is what reproduces that.
     std::optional<EntryMaterialization> entryVerb;
     // SE4 const-correctness: set when the decl's `constMarker` token was
-    // found in the type subtree. A reassignment of a const symbol emits
-    // S_ConstViolation.
+    // found in the type subtree — or, since P68 round 8, when the TYPEDEF its
+    // head names is itself const-qualified (`typedef const int CI; CI x;`),
+    // which the semantic tier applies once that head is resolved (Pass 1.5).
+    // A reassignment of a const symbol emits S_ConstViolation.
     bool            isConst = false;
     // ★★ P48 (D-CSUBSET-POINTEE-CONST-ENFORCEMENT): `isConst` above answers ONE
     // question — is the declared OBJECT const — and that is why const enforcement
@@ -206,6 +208,11 @@ struct DSS_EXPORT SymbolRecord {
     // const-lvalue check then makes NO claim about the deeper levels rather than
     // inventing "unqualified". A missed diagnostic is the safe direction; a
     // fabricated one refuses correct code.
+    //
+    // ⓘ A head that NAMES A TYPEDEF contributes the typedef's own spine beneath
+    // this declarator's levels (P68 round 8), so `CI *p` carries the pointee
+    // const `const int *p` carries; a typedef making no claim makes this spine
+    // none either.
     //
     // ⓘ Level 0 is deliberately NOT read by the const-lvalue check — `isConst`
     // above stays the sole answer there, so every verdict that existed before P48
@@ -322,7 +329,7 @@ struct DSS_EXPORT SymbolRecord {
     // ExternGlobal node suppressed). Two non-defining declarations are idempotent;
     // two definitions still collide (S_RedeclaredSymbol). Default false.
     bool            isExternDeclaration = false;
-    // c33 (D-CSUBSET-TENTATIVE-DEFINITION): TRUE iff this symbol was minted from a
+    // c33 (D-CSUBSET-TENTATIVE-DEFINITION-MERGE): TRUE iff this symbol was minted from a
     // file-scope OBJECT declaration with NO initializer — a TENTATIVE DEFINITION
     // (C 6.9.2). Like `extern`/proto it is NON-DEFINING for redeclaration-merge
     // purposes: it merges with a later real (initialized) definition (the def wins
@@ -430,7 +437,7 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
-    // TF-C78 (D-CSUBSET-NOINLINE): TRUE iff this FUNCTION symbol is declared
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): TRUE iff this FUNCTION symbol is declared
     // `__attribute__((noinline))` (GNU; no C11/C23 standard spelling). Set at
     // Pass-1.5 declarator resolution from the `attributeSemantics` table's
     // `noInline` effect verb — NOT from a hardcoded name test — gated on the
@@ -595,10 +602,11 @@ struct DSS_EXPORT SymbolRecord {
     // pointer-arg relaxation on whether a callee came from a shipped FFI descriptor.
     // That made the admission a property of the DECLARATION'S PROVENANCE rather than
     // of the TYPES, and a real header (Darwin `tcl.h`, where `Tcl_WideInt` is `long`)
-    // hits the identical shape and was still refused. The gate is now "is this a
-    // DIRECT call", threaded as a parameter at the one call site that knows, so no
-    // per-symbol field is needed. If you find yourself re-adding a provenance flag to
-    // widen or narrow a TYPE rule, that is the same mistake — narrow the PREDICATE.
+    // hits the identical shape and was still refused. Since P68 round 9 no callee
+    // property gates it at all: the conversion is one instance of a class the
+    // language admits with a diagnostic at every site, decided by the types. If you
+    // find yourself re-adding a provenance flag to widen or narrow a TYPE rule, that
+    // is the same mistake — narrow the PREDICATE.
     // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
     // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
     // declaration's specifier prefix carries the language's
@@ -633,6 +641,39 @@ struct DSS_EXPORT SymbolRecord {
     // B/C). Orthogonal to binding/visibility (a file-scope thread_local
     // keeps external linkage). Default false.
     bool            isThreadLocal = false;
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the machine register
+    // a GNU LOCAL REGISTER VARIABLE names — the asm label of a block-scope
+    // object whose declaration carries a `{asmLabelNamesRegister: true}`
+    // specifier (C's `register`), exactly as the source spelled it (`"x8"`,
+    // `"w9"`, `"eax"`), already RESOLVED against the target's register table
+    // (an unknown name is refused at the declaration and leaves this empty).
+    // EMPTY for every other symbol. Its ONE consumer is the inline-asm operand
+    // binding: a register-form operand whose value expression IS this object is
+    // pinned to this register (CST→HIR writes it into the operand's
+    // `fixedRegister`) — 📄 GCC: *"The only supported use for this feature is to
+    // specify registers for input and output operands when calling Extended
+    // asm."* Everywhere else the object is an ordinary automatic.
+    std::string     asmRegister;
+    // P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED, C 6.5.3.2p1): TRUE iff
+    // this object's declaration carries a `{addressNotTakeable: true}`
+    // specifier (C's `register`), so it may not be the operand of unary `&` —
+    // nor bound to a MEMORY-form asm operand, which is the same request made
+    // through a constraint letter (GNU: *address of register variable
+    // requested*). Default false.
+    bool            addressNotTakeable = false;
+    // ★★ P68 round 8 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): TRUE iff
+    // this GNU local register variable (`asmRegister` non-empty) is NEVER
+    // WRITTEN — it has no initializer, and every use of it is the bare value of
+    // an asm INPUT operand — so the only value it ever has is its register's
+    // content. CST→HIR then binds such an input AS IT STANDS
+    // (`HirInlineAsmOperand::registerAsItStands`): nothing is copied into the
+    // register. C 6.3.2.1p2 makes any read of the object undefined, so no
+    // defined program can tell; gcc gives it exactly this meaning (✔MEASURED
+    // 2026-09-19: `register unsigned long sp asm("sp")` read on `"r"` returns the
+    // stack pointer at -O0/-O2 on both targets, where clang copies the
+    // indeterminate slot IN and x86-64 -O0 dies). Computed after Pass 2, from
+    // the reverse use-index, so a use anywhere in the function disqualifies it.
+    bool            denotesItsRegister = false;
     // P50 (D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH, C 6.2.2p3): TRUE iff
     // this identifier has INTERNAL linkage — its declaration carries a
     // `{staticStorage: true}` specifier (the SAME `linkageSpecifiers` facet the
@@ -724,6 +765,14 @@ struct DSS_EXPORT SymbolRecord {
     // string literal's pool entry). Meaningful only when
     // `isPredefinedFunctionName` is set; empty otherwise.
     std::string     predefinedFunctionNameText;
+    // P68 round 9 (lane `cs`): TRUE for the FILE-SCOPE twin of a predefined
+    // function-name symbol — bound once per spelling in the language's builtin
+    // scope, so it is what a use OUTSIDE every function body resolves to (a
+    // function definition's own symbol shadows it inside the body). Its text is
+    // empty: gcc 13.3.0 and clang 18.1.3 both accept such a use with a warning and
+    // agree it names "" (sizeof 1); every use reports
+    // S_PredefinedIdentifierOutsideFunction. Default false.
+    bool            predefinedFunctionNameAtFileScope = false;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern
@@ -971,12 +1020,12 @@ public:
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
                   UnitAttribute<NodeId>                  nodeToSelectedExpr,
+                  UnitAttribute<SymbolId>                typedefNamedByToken,
                   UnitAttribute<std::uint64_t>           nodeToFoldedConstant,
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
-                  UnitAttribute<bool>                    intPointeeCompatNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
@@ -989,7 +1038,14 @@ public:
                   // `charIsUnsigned()`. Last, and defaulted, for the same
                   // reason `target` is.
                   std::optional<bool>                    charIsUnsigned =
-                      std::nullopt) noexcept
+                      std::nullopt,
+                  // D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE: the
+                  // expression typer's own work, reported so a COMPLEXITY pin can
+                  // assert a growth ratio instead of a wall clock. See the two
+                  // accessors below. Defaulted (0/0) for every direct constructor
+                  // caller that is not the analyzer.
+                  std::uint64_t                          exprTypeQueries = 0,
+                  std::uint64_t                          exprTypeNodeVisits = 0) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -997,18 +1053,20 @@ public:
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
           nodeToSelectedExpr_(std::move(nodeToSelectedExpr)),
+          typedefNamedByToken_(std::move(typedefNamedByToken)),
           nodeToFoldedConstant_(std::move(nodeToFoldedConstant)),
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
-          intPointeeCompatNodes_(std::move(intPointeeCompatNodes)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel),
           longDoubleFormat_(longDoubleFormat),
           target_(target),
-          charIsUnsigned_(charIsUnsigned) {}
+          charIsUnsigned_(charIsUnsigned),
+          exprTypeQueries_(exprTypeQueries),
+          exprTypeNodeVisits_(exprTypeNodeVisits) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -1044,6 +1102,25 @@ public:
     [[nodiscard]] SymbolId symbolAt(NodeId id) const;
     [[nodiscard]] TypeId   typeAt(NodeId id)   const;
 
+    // ── the expression typer's own work (D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE) ──
+    //
+    // `exprTypeQueries` — how many times the semantic tier ASKED for the type of an
+    // expression subtree. `exprTypeNodeVisits` — how many nodes those walks actually
+    // CLASSIFIED. The second over the first is the walk's average reach, and it is
+    // the number a complexity pin asserts: it is deterministic, host-independent,
+    // load-independent and identical in Debug and Release, so a statement about it
+    // is a fact about the ALGORITHM rather than about the box a test ran on. A
+    // wall-clock assertion would be sized on the machine that wrote it and would red
+    // on the slowest leg that runs it, naming the wrong event
+    // (`.harness-config/runner/actions/check-wall-clock-in-tests/` refuses new ones for that reason).
+    //
+    // ⚠ BOTH ARE LOAD-BEARING AND NEITHER SUBSTITUTES FOR THE OTHER. With only
+    // `nodeVisits`, "the derived-type record made this free" and "the type is no
+    // longer asked for at all" are the same reading, and the second is a
+    // correctness regression wearing a performance win's clothes.
+    [[nodiscard]] std::uint64_t exprTypeQueries()    const noexcept { return exprTypeQueries_; }
+    [[nodiscard]] std::uint64_t exprTypeNodeVisits() const noexcept { return exprTypeNodeVisits_; }
+
     // FC16 (D-CSUBSET-GENERIC-SELECTION): for a `_Generic` node, the NodeId of
     // the selected association's result-expression (the compile-time type-match
     // winner Pass 2 recorded). Returns InvalidNode for any node that is not a
@@ -1051,6 +1128,14 @@ public:
     // analyzer left untyped + errored). The CST→HIR `lowerGeneric` reads this to
     // lower ONLY the selected sub-expression.
     [[nodiscard]] NodeId   selectedGenericExpr(NodeId id) const;
+
+    // P68 round 12 (lane `cs`): the TYPEDEF a type-position identifier token
+    // names, as the type resolver decided it (the first, positional resolution),
+    // or InvalidSymbol for a token that names none. A typedef name in type
+    // position is a bare token the reference walker never binds, so `symbolAt`
+    // cannot say it; this can. Read by the CST→HIR lowering to find the typedef
+    // that owns a variable-length type a type NAME reaches (`sizeof(V)`).
+    [[nodiscard]] SymbolId typedefNamedAt(NodeId token) const;
 
     // P31: the COMPILE-TIME ANSWER for a node whose whole meaning is a number the
     // semantic tier computed — `__builtin_offsetof(T, m)` (the member's byte
@@ -1088,21 +1173,6 @@ public:
     // structural literal `0`, which the coerce arm admits directly).
     [[nodiscard]] bool isNullPointerConstant(NodeId id) const {
         return nullPointerConstantNodes_.has(id);
-    }
-
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: true iff `id` is a call-ARG source
-    // node the analyzer admitted via the shipped-FFI-descriptor integer-pointee
-    // pointer relaxation (a real C integer pointer — `long long*` etc. — passed to
-    // a descriptor `ptr<i64>`-style param whose pointee is same-REPRESENTATION but
-    // distinct-IDENTITY). The CST→HIR `coerce()` reads this to realize the Ptr→Ptr
-    // bitcast that retypes the arg to the param type (admit⟺realize parity, the
-    // `isNullPointerConstant` precedent). False for every other node — the mark is
-    // set ONLY when the relaxation was WHAT admitted the arg (strict-fail-then-relax-
-    // succeed), so a strictly-compatible arg is never marked. Callers MUST guard
-    // `id.valid()` before calling (the UnitAttribute routes by arenaTag; an untagged
-    // InvalidNode is ambiguous in a multi-tree CU).
-    [[nodiscard]] bool isIntPointeeCompat(NodeId id) const {
-        return intPointeeCompatNodes_.has(id);
     }
 
     // The full attributes — convenient for tooling / forEach iteration.
@@ -1223,6 +1293,9 @@ private:
     // FC16 (D-CSUBSET-GENERIC-SELECTION): `_Generic` node → selected assoc's
     // result-expression NodeId. See `selectedGenericExpr`.
     UnitAttribute<NodeId>                  nodeToSelectedExpr_;
+    // P68 round 12 (lane `cs`): type-position identifier token → the typedef it
+    // names. See `typedefNamedAt`.
+    UnitAttribute<SymbolId>                typedefNamedByToken_;
     // P31: the compile-time-answer side table — see `foldedConstantAt`.
     UnitAttribute<std::uint64_t>           nodeToFoldedConstant_;
     DiagnosticReporter                     diagnostics_;
@@ -1238,12 +1311,6 @@ private:
     // TREE-KEYED UnitAttribute (NodeId is tree-local — a flat set would alias node
     // indices across a multi-source CU's trees → cross-tree silent miscompile).
     UnitAttribute<bool>                                   nullPointerConstantNodes_;
-    // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT: call-arg source nodes the analyzer
-    // admitted via the shipped-descriptor integer-pointee pointer relaxation. The
-    // CST→HIR lowerer reads `isIntPointeeCompat` to materialize the Ptr→Ptr
-    // bitcast retyping the arg to the param type. TREE-KEYED UnitAttribute for the
-    // same cross-tree-aliasing reason as `nullPointerConstantNodes_`.
-    UnitAttribute<bool>                                   intPointeeCompatNodes_;
     // FF11: descriptor externs minted from resolved shipped-lib JSON
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
@@ -1264,6 +1331,10 @@ private:
     // [[D-CSUBSET-CONST-EVAL-CHAR-SIGNEDNESS]]: the analysis-time plain-`char`
     // signedness (see `charIsUnsigned()`).
     std::optional<bool>                                    charIsUnsigned_{};
+    // D-SEMANTIC-EXPRESSION-TYPER-REDERIVES-EVERY-SUBTREE: the expression typer's
+    // own work for this analysis (see the two accessors).
+    std::uint64_t                                          exprTypeQueries_ = 0;
+    std::uint64_t                                          exprTypeNodeVisits_ = 0;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

@@ -49,8 +49,7 @@ namespace {
 // Drive: tsql-subset source → CompilationUnit → SemanticModel. Asserts the front
 // end (parse + semantic) is clean so a lowering test never chases a phantom.
 [[nodiscard]] SemanticModel analyzeTsql(std::string src) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
-    // this was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
+    // This was `ADD_FAILURE() << "loadShipped(...) failed"; std::abort();`.
     // ✔MEASURED against an emptied shipped config, the abort took the whole
     // binary out at 0xC0000409 with no `[  FAILED  ]` line, no case name and
     // no summary -- every sibling test in this executable lost its verdict.
@@ -370,7 +369,6 @@ namespace {
 }
 
 [[nodiscard]] std::string readFile(fs::path const& p) {
-    // D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT:
     // `std::abort()` here killed the whole binary, so one unreadable golden
     // cost every sibling test its verdict. THROW -- GoogleTest reports an
     // escaping exception as a failure of the ONE running test. The read itself

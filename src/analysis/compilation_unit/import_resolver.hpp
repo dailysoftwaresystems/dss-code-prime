@@ -99,6 +99,14 @@ struct DSS_EXPORT ResolutionContext {
     // threads the real value through `UnitBuilder::setHeaderNameMatching`.
     HeaderNameMatching headerNameMatching = kDefaultHeaderNameMatching;
 
+    // [[D-PP-INCLUDE-RESOLVER-RELISTS-EVERY-DIRECTORY-PER-RESOLUTION]]: the
+    // COMPILE's `HeaderSearchCache` — the one the preprocessor already searched
+    // through for this CU — so this tier's `#include <h>` and descriptor-closure
+    // lookups reuse the listings the compile read instead of listing `systemDirs`
+    // again per include. A reference, and REQUIRED: this tier has no business
+    // owning a second view of the tree.
+    HeaderSearchCache& headerSearch;
+
     // D-FFI-DESCRIPTOR-INCLUDES-EDGE-GATE: the ACTIVE OBJECT FORMAT, threaded for
     // exactly the reason `headerNameMatching` above is — this tier and the
     // preprocessor tier walk the SAME shipped-descriptor closure, and a closure

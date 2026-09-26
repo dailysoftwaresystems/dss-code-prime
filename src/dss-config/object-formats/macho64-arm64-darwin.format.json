@@ -56,6 +56,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: Apple arm64 `long double` IS `double` (64-bit IEEE, 8/8) — a documented Apple divergence from generic AAPCS64's binary128. See macho64-arm64-darwin-exec.",
   "longDoubleFormat": "f64",
+  "$enumCompatibleTypeRuleComment": "P68 round 12 (lane `cs`): the integer type an enumeration without a fixed underlying type is compatible with (C 6.7.2.2p4) is the platform ABI's choice — this ABI's (gcc's and clang's documented rule): `unsigned int` when no value is negative, else `int`, wider when the values need it; the language's `enumerationCompatibleTypes.gnu` ladders say which C types that is.",
+  "enumCompatibleTypeRule": "gnu",
   "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O MH_OBJECT arm, c147 — the macho analog of the ELF c142 `.o` data sections): a relocatable object DOES carry data — a global lands in `__TEXT,__const` / `__DATA,__data` / `__DATA,__bss` / `__DATA,__const` with walker-computed flat-`.o`-space addrs and an N_SECT|N_EXT nlist_64 (n_sect = the section's 1-based ordinal, n_value = the item's FLAT address) the FINAL linker (ld64/clang) binds. Same format-blind `AssembledModule.dataItems` producer path as ELF/PE. D-LK-RELRO-CONST-DATA-RELOCATABLE (Mach-O arm): a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`) lands in `relro` = `__DATA,__const` and the writer emits its OWN relocation_info table (ARM64_RELOC_UNSIGNED, r_extern=1, addend IN the 8-byte slot bytes — Mach-O's in-place-addend convention; there is no RELA addend column); a reloc-bearing MUTABLE pointer global lands in `data`. TLS (`tdata`/`tbss`) stays UNDECLARED — the linker's acceptsDataSection gate rejects it loud (the MH_OBJECT walker emits no `__thread_data`/`__thread_vars`; the exec TLV machinery is MH_EXECUTE-only, D-CSUBSET-THREAD-LOCAL C4).",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
 
@@ -160,6 +162,10 @@
     }
   ],
 
+  "$relocationAddendsComment": "P68 round 9: WHERE a relocatable object of this format keeps a relocation's addend — `inPlace`: the record has no addend column, so the PATCHED FIELD holds DSS's addend (the format's own formula carries the bias the target declares). ✔MEASURED 2026-09-23: clang 18.1.3 writes `fc ff ff ff` into the field of `movl $5, counter(%rip)`. Read and written only through `link/format/relocation_addend.hpp` — the reader that assumed every foreign `.text` addend was 0 is what this closed.",
+  "relocationAddends": "inPlace",
+  "$inputSectionPlacementComment": "P68 round 9: an input section of a relocatable object in this format may be split at symbols ONLY when the object declares it divisible (MH_SUBSECTIONS_VIA_SYMBOLS in the mach_header, ld64's own rule; N_ALT_ENTRY still marks a symbol that is not a boundary). An object that does not declare it is read with every section as one unit, kept and dropped whole.",
+  "inputSectionPlacement": "subsectionsWhenDeclared",
   "relocations": [
     {
       "$comment": "32-bit PC-relative BL/B branch (call). r_type = ARM64_RELOC_BRANCH26 (2), r_pcrel = 1, r_length = 2 (4 bytes). Mach-O `relocation_info.r_info` packs bits 28..31=r_type, 27=r_extern, 25..26=r_length, 24=r_pcrel, 0..23=r_symbolnum. The MH_OBJECT walker emits the static portion (type+length+pcrel = 0x25000000) from this nativeId and ORs in r_extern + r_symbolnum at emit time. `kind` = 1 matches arm64.target.json's `call26` (the cross-reference the assembler emits + the walker validates). Mach-O has no Rela addend column — addends live in the patch bytes. ★ `isCall` (D-LK-MACHO-ISDATA-NO-CALL-SIGNAL, 2026-08-20): this wire relocation can ONLY target executable code, so an object reader that meets an undefined extern through it has PROVEN the extern is a function rather than a data object -- the only classification signal a symbol-name-only reference offers. It is declared HERE, on the format row, and not derived from the target's formula, because a formula describes ARITHMETIC and not ROLE: `S + A - P` is the identical arithmetic for a call and for a PC-relative data reference, so the x86_64 target's `linear` is honest and simply carries no role, while aarch64's `aarch64_call26` looked like a role only because that CPU's branch has its own instruction encoding. ✔MEASURED 2026-08-20: every macho64-x86_64 archive member calling any library function was unreadable for exactly this reason while the arm64 sibling read the same source cleanly. The target document cannot carry it -- it is PER-CPU and shared with ELF, where the same `rel32` genuinely serves data references too.",
@@ -178,13 +184,70 @@
       "$comment": "ADD/LDR pageoff low-12 (the `add`/`ldr` half of an address materialization). r_type = ARM64_RELOC_PAGEOFF12 (4), r_pcrel = 0, r_length = 2 → nativeId = (4<<28)|(2<<25)|(0<<24) = 0x44000000. `kind` = 3 matches arm64.target.json's `add_abs_lo12_nc`.",
       "name": "ARM64_RELOC_PAGEOFF12",
       "kind": 3,
-      "nativeId": 1140850688
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 2143289344, "value": 285212672 }
+      ]
     },
     {
       "$comment": "Absolute 64-bit data pointer. r_type = ARM64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 3 (8 bytes) → nativeId = (0<<28)|(3<<25)|(0<<24) = 0x06000000. `kind` = 4 matches arm64.target.json's `abs64`.",
       "name": "ARM64_RELOC_UNSIGNED",
       "kind": 4,
       "nativeId": 100663296
+    },
+    {
+      "$comment": "P68 round 9 (D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD): ONE wire type, ARM64_RELOC_PAGEOFF12, is an ADD's unscaled page offset (the kind-3 row above) and a load's or store's offset scaled by its access size (these five) — ld64 takes the scale from the instruction, and so does the reader: each row (named `ARM64_RELOC_PAGEOFF12:<size>`, because a row name is unique while the wire type is not) decodes for the instruction words its `decodeWhenInstruction` names (the load/store unsigned-immediate class, bits 29:27 = 111 and 25:24 = 01, split by size bits 31:30 and, for the 128-bit q form, V and opc<1>). ✔MEASURED 2026-09-23: at the round-9 base a clang 18 -O2 object's `ldr w8, [x8, _g32@PAGEOFF]` linked as `ldr w8, [x8, #0x60]` for a g32 at page offset 0x18 — the ADD's arithmetic on a load.",
+      "name": "ARM64_RELOC_PAGEOFF12:ldst8",
+      "kind": 12,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4278190080, "value": 956301312 },
+        { "mask": 4286578688, "value": 1023410176 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst16",
+      "kind": 13,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4211081216, "value": 2030043136 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst32",
+      "kind": 14,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4211081216, "value": 3103784960 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst64",
+      "kind": 15,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4211081216, "value": 4177526784 }
+      ]
+    },
+    {
+      "name": "ARM64_RELOC_PAGEOFF12:ldst128",
+      "kind": 16,
+      "nativeId": 1140850688,
+      "decodeWhenInstruction": [
+        { "mask": 4286578688, "value": 1031798784 }
+      ]
+    },
+    {
+      "$comment": "P68 round 11 (the Mach-O GOT_LOAD / GOT item): ARM64_RELOC_GOT_LOAD_PAGE21 (5), r_pcrel = 1, r_length = 2 → nativeId = (5<<28)|(2<<25)|(1<<24) = 0x55000000 — the ADRP of a GOT slot: ✔MEASURED 2026-09-24, clang 18 `-O2 --target=arm64-apple-macos11` reads an extern datum, an extern array element's address and an extern function's address through this pair, and DSS refused every such member at READ ('relocation nativeId 1677721600 … is not declared', the pair's second half). `kind` = 7 is arm64.target.json's `adr_got_page`: an image link lowers it to its declared twin `adr_prel_pg_hi21` against a slot it mints. The instruction field holds no addend.",
+      "name": "ARM64_RELOC_GOT_LOAD_PAGE21",
+      "kind": 7,
+      "nativeId": 1426063360
+    },
+    {
+      "$comment": "P68 round 11: ARM64_RELOC_GOT_LOAD_PAGEOFF12 (6), r_pcrel = 0, r_length = 2 → nativeId = (6<<28)|(2<<25)|(0<<24) = 0x64000000 — the 64-bit LDR of the slot the PAGE21 half pages to. `kind` = 8 is `ld64_got_lo12` (its twin `ldst64_abs_lo12_nc`, scale 3). The eh_frame shape, ARM64_RELOC_POINTER_TO_GOT, is not declared: the readers refuse a personality pointer by name until the unwind carrier has one (D-LK-MERGED-FOREIGN-FUNCTIONS-CARRY-NO-UNWIND-INFO-IN-THE-IMAGE).",
+      "name": "ARM64_RELOC_GOT_LOAD_PAGEOFF12",
+      "kind": 8,
+      "nativeId": 1677721600
     }
   ]
 }

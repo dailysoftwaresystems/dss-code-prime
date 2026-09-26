@@ -3,6 +3,7 @@
 #include "core/types/config_document_parse.hpp"  // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"  // isDocumentationKey + DSS_CHECK_KEY_VOCABULARY
 #include "core/types/parse_diagnostic.hpp"
+#include "link/runpath.hpp"                      // portableRunpathEntryRefusal — the ONE portable-runpath rule
 #include "program/platform_token.hpp"            // kRunOnPlatformTokens / isValidRunOnToken / runOnTokenList
 
 #include <nlohmann/json.hpp>
@@ -34,11 +35,11 @@ using json = nlohmann::json;
 // The human-readable "recognized fields" list in the diagnostic is DERIVED
 // from this array by `projectConfigKnownKeyList()` — see the header note. Do
 // not re-type it anywhere.
-constexpr std::array<std::string_view, 14> kKnownKeys = {
+constexpr std::array<std::string_view, 15> kKnownKeys = {
     "language", "artifactProfile", "targets", "sources", "output",
     "artifactName", "includes", "defines", "resolveLibraries",
-    "stackReserve", "preBuildScripts", "postBuildScripts", "dependsOn",
-    "dependencyArtifactCache",
+    "stackReserve", "runpaths", "preBuildScripts", "postBuildScripts",
+    "dependsOn", "dependencyArtifactCache",
 };
 DSS_CHECK_KEY_VOCABULARY(kKnownKeys);
 
@@ -58,6 +59,8 @@ struct WithdrawnCacheMember {
     std::string_view name;
     std::string_view why;
 };
+// Anchored: D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT
+// (the `eviction` member's withdrawal).
 constexpr std::array<WithdrawnCacheMember, 1> kWithdrawnCacheMembers = {
     WithdrawnCacheMember{
         "eviction",
@@ -68,9 +71,7 @@ constexpr std::array<WithdrawnCacheMember, 1> kWithdrawnCacheMembers = {
         "cache, pruning also reclaimed ZERO bytes — the compiler's build "
         "stamp is a directory component, so a superseded generation lands in "
         "a different root and was never reachable to delete. Remove the "
-        "member; a cache is reclaimed by deleting its root directory. "
-        "Anchored: "
-        "D-PROGRAM-RUNTIME-CACHE-PRUNE-DELETES-A-CONCURRENT-RUNS-LIVE-ARTIFACT"},
+        "member; a cache is reclaimed by deleting its root directory."},
 };
 
 // Comma-join a closed-key table for a diagnostic. ONE joiner for every table
@@ -224,7 +225,7 @@ bool readOptionalStringArray(json const& doc,
     return true;
 }
 
-// D-FFI-DECLARED-IMPORT-NAME — read the OPTIONAL `resolveLibraries` array.
+// Declared import names — read the OPTIONAL `resolveLibraries` array.
 //
 // Mirrors `readOptionalStringArray` (absent ⇒ empty + no error; a
 // present-but-empty `[]` is allowed; a non-array fails loud) but each ENTRY
@@ -827,14 +828,14 @@ parseProjectConfig(std::string_view jsonText,
     // CLI `-I` / `--define` / `--resolve-library`). Absent ⇒ empty (no error);
     // present must be an array of non-empty strings (else C_MalformedJson) —
     // `resolveLibraries` additionally accepts the extended
-    // `{"path", "importName"}` object entry (D-FFI-DECLARED-IMPORT-NAME); a
+    // `{"path", "importName"}` object entry (a declared import name); a
     // present-but-empty `[]` is allowed. `Program::compileProject` threads
     // these (merge/append) onto the Program's current state.
     if (!readOptionalStringArray(doc, "includes", pc.includes, sourceLabel, rep))
         return std::nullopt;
     if (!readOptionalStringArray(doc, "defines", pc.defines, sourceLabel, rep))
         return std::nullopt;
-    // D-FFI-DECLARED-IMPORT-NAME: `resolveLibraries` entries are a plain path
+    // Declared import names: `resolveLibraries` entries are a plain path
     // STRING *or* an extended `{"path", "importName"}` object — its own reader.
     if (!readOptionalResolveLibraries(doc, "resolveLibraries",
                                       pc.resolveLibraries, sourceLabel, rep))
@@ -943,6 +944,27 @@ parseProjectConfig(std::string_view jsonText,
             return std::nullopt;
         }
         pc.stackReserveBytes = n;
+    }
+
+    // `runpaths` (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — an OPTIONAL array of
+    // directories every image this project builds records for its loader to
+    // search for the libraries it needs; the file-driven, PORTABLE twin of the
+    // CLI `--rpath`. A manifest builds for MANY targets, so each entry must mean
+    // the same thing on every one of them: absolute, or rooted at `${ORIGIN}`
+    // (the directory of the image that carries the path, which each format's
+    // DOCUMENT spells its own way — `$ORIGIN`, `@loader_path`), with no other
+    // `$` and no `:`. That rule is `portableRunpathEntryRefusal`'s, stated once
+    // in link/runpath.hpp; its refusal names the CLI flag as the place for a
+    // loader-specific spelling. Absent ⇒ empty ⇒ nothing recorded (unchanged).
+    if (!readOptionalStringArray(doc, "runpaths", pc.runpaths, sourceLabel, rep))
+        return std::nullopt;
+    for (std::size_t i = 0; i < pc.runpaths.size(); ++i) {
+        if (auto const why = portableRunpathEntryRefusal(pc.runpaths[i])) {
+            emitProjectError(rep, DiagnosticCode::C_MalformedJson, sourceLabel,
+                             std::string{"field 'runpaths' entry ["}
+                                 + std::to_string(i) + "] is refused: " + *why);
+            return std::nullopt;
+        }
     }
 
     // The OPTIONAL build-lifecycle hooks + project prerequisites. All three

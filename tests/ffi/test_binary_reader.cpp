@@ -863,7 +863,7 @@ TEST(BinaryReaderReporter,
 
 TEST(BinaryReaderReporter,
      Elf64PartialCorruptionElevatesToErrorUnderWarningsAsErrors) {
-    // D-FF1-PARTIAL-CORRUPTION-WAE-PIN (2026-06-01): pin that
+    // PIN-FF1-PARTIAL-CORRUPTION-WAE-PIN (2026-06-01): pin that
     // --warnings-as-errors elevates F_BinaryReaderPartialCorruption
     // from Warning to Error end-to-end. The unsuppressable gate
     // bypasses --suppress + overrides (silencing) but NOT
@@ -1212,6 +1212,6 @@ TEST(BinaryReaderElfSymbolVersion, RealSystemZlibDeflateBoundIsVersioned) {
 // (Former `Ff1ProducedRowsHaveNoCSignature` test removed at FF2
 // post-#2 type-design fold: `cSignature` field dropped from
 // `ImportSurface` since no producer or consumer needed it.
-// Anchored D-FF2-1: re-add `optional<FnSigTypeId>` only if FF3 needs
+// Anchored D-FF2-1-IMPORTSURFACE-NO-CSIGNATURE-SLOT: re-add `optional<FnSigTypeId>` only if FF3 needs
 // to attach the resolved sig to the row instead of the HIR node.)
 

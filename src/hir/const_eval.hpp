@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/constant_form.hpp"   // ConstantForms (EvalOptions::admittedForms)
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/hir_literal_pool.hpp"
@@ -82,6 +83,19 @@
 //     `LossyFloatConversion` when the value can't round-trip through
 //     the target precision — for verifier consumers that want
 //     "you're losing bits" diagnostics; off by default for codegen.
+//   - ADDRESS constants (P68 round 13, lane `cs`) — only with
+//     `EvalOptions::foldAddressConstants` (the static-data producer's one consumer):
+//     `&` of an lvalue path (a symbol the caller's `resolveAddressableSymbol` answers,
+//     a string literal's object, `[]`, `.`, `*`), array and function designators, `*f`,
+//     pointer casts, an integer constant cast to a pointer (a NULL-base address), an
+//     address ± an integer, a `?:` selecting — folded to a `HirAddressValue` {symbol |
+//     NULL, byte offset}; and the 6.6p10 forms `EvalOptions::admittedForms` names
+//     (`constant_form.hpp`: an address in a pointer-wide integer, an address's truth
+//     value, comparisons and differences within one object, the identity and absorbing
+//     elements on an address integer, a const object's value / element / member, the
+//     comma operator). A sequence of its value alone folds without a form. Every other
+//     use of an address is `NotAConstantExpression` — the closed set is the measured
+//     one, and outside it is what every reference refuses.
 
 namespace dss {
 
@@ -142,6 +156,34 @@ using TypeSizeResolver =
 // different concerns don't tangle as more resolvers accrete (architecture-
 // review folded item D4 from plan 12.5 §0.2). The SizeOf resolver (`resolveTypeSize`)
 // is the second function-typed field this comment anticipated.
+// ── P68 round 13 (lane `cs`, the static-initializer item): the ADDRESS facts ──────────
+//
+// An ADDRESS CONSTANT (C 6.6p9) is folded to a `HirAddressValue` {base symbol, byte offset}
+// — the relocation the static-data producer emits — and the engine cannot know four things
+// about it on its own, so the caller answers them (the same separation `resolveTypeSize`
+// keeps the layout engine out of this file):
+//   * whether a symbol HAS a link-time address a static initializer may name (an object
+//     of static storage duration, a function) — nullopt for anything else (an automatic
+//     object, a parameter), and then the address is not a constant;
+//   * whether that address may be NULL: a weak DECLARATION with no definition in the
+//     module (the loader resolves an absent one to 0), so its truth value is unknown —
+//     ✔MEASURED gcc 13.3.0 ("initializer element is not computable at load time") and
+//     clang 18.1.3 refuse `_Bool b = &w;` / `&w != 0` for one, and build both for a weak
+//     DEFINITION (lane `cs`'s `.temp/probe/sti7`, `sti9`);
+//   * the symbol a STRING LITERAL's array object lives in (the producer interns them, so
+//     two literals with one content are one object — gcc folds `"abc" == "abc"` to 1);
+//   * a member's byte offset and an element's STRIDE, from the SAME layout the runtime
+//     `Gep` scales with, so a folded address is the address the program computes.
+struct AddressableSymbol {
+    bool mayBeNull = false;
+};
+using AddressableSymbolResolver =
+    std::function<std::optional<AddressableSymbol>(SymbolId)>;
+using StringLiteralSymbolResolver =
+    std::function<std::optional<SymbolId>(HirNodeId)>;
+using FieldOffsetResolver =
+    std::function<std::optional<std::uint64_t>(TypeId /*record*/, std::uint32_t /*field*/)>;
+
 struct EvalEnvironment {
     ConstSymbolResolver resolveConstSymbol{};   // CE2
     TypeSizeResolver    resolveTypeSize{};      // FC6 — SizeOf folding
@@ -150,6 +192,12 @@ struct EvalEnvironment {
     // const_eval) but returns the type's ALIGNMENT. Absent closure ⇒ AlignOf is
     // non-constant, exactly as SizeOf is without resolveTypeSize.
     TypeSizeResolver    resolveTypeAlign{};     // 6.5.3.4 — AlignOf folding
+    // P68 round 13 — the address facts above. Each absent closure ⇒ the fold that needs
+    // it is not a constant here (fail loud), never a guessed address.
+    AddressableSymbolResolver   resolveAddressableSymbol{};
+    StringLiteralSymbolResolver resolveStringLiteralSymbol{};
+    FieldOffsetResolver         resolveFieldOffset{};
+    TypeSizeResolver            resolveElementStride{};
 };
 
 // Caller-controlled policy. Pure bool knobs — no closures, no environment.
@@ -189,6 +237,15 @@ struct EvalOptions {
     // three of the four shipped legs and a silent wrong answer on the fourth,
     // which is the shape of defect this row exists for.
     std::optional<bool> charIsUnsigned{};
+    // ── P68 round 13 (lane `cs`, the static-initializer item): ADDRESS CONSTANTS ──
+    // When set, the engine folds C 6.6p9's address constants to `HirAddressValue`s — `&` of
+    // an lvalue path (a symbol, `[]`, `.`, `*`, a string literal), an array or function
+    // designator, a pointer cast, an integer constant cast to a pointer, an address plus or
+    // minus an integer constant (6.6p7) — and the 6.6p10 forms `admittedForms` names
+    // (`constant_form.hpp`). OFF by default: every consumer but the static-data producer
+    // keeps the long-standing "a pointer value is not foldable" contract.
+    bool          foldAddressConstants = false;
+    ConstantForms admittedForms{};
 };
 
 struct ConstEvalResult {

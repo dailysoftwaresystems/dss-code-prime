@@ -1,0 +1,17 @@
+{
+  "$comment": "★★★ THE PAGE AND THE PAGE OFFSET OF A SYMBOL, AS GAS WRITES THEM FOR ELF (P68 round 9, the aarch64 twins of D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER, and the ELF half of D-LK-MACHO-ARM64-PAGEOFF12-LOAD-PATCHED-AS-AN-ADD). `adrp` (bare, and with `:pg_hi21:`) + `add :lo12:`, and a load or store at every access size with `:lo12:` in its offset field (`ldr b0`, `ldr h1`, `ldr w3`, `ldr x3`, `str x4`, `ldr q2`), a constant after the name on both halves (`tail+8`), the one-word `adr` of a datum (R_AARCH64_ADR_PREL_LO21), `.quad .`, the location counter at a label and mid-block (`adr x7, .`, `adr x11, .-4`) and `adr` of a label of its own function used as a computed jump. ✔MEASURED 2026-09-23 at the round-9 base: `adrp` was an unknown mnemonic, `:lo12:` and `.` did not parse, `tail+8` was an illegal character, and `adr` was the two-word ADRP+ADD. gas 2.42 (aarch64-linux-gnu-gcc 13.3, -no-pie and -pie) runs this file to 42 under qemu; clang 18 refuses only `:pg_hi21:` ('expect relocation specifier'), which gas takes — one working reference makes it required. What each value proves, by the exit code: each load reads its own object only if the link divided the page offset by the access size (the `pad` in front keeps every object off page offset 0, where an unscaled field would happen to be right); `tail+8` reads 9 only if the addend reached both halves; each address check (21..23) and the computed jump (24) has its own exit code. The Mach-O spellings of the same program are `asm_arm64_page_and_page_offset_macho`. The `release` arm pins only that naming the release pipeline does not break the assembly path.",
+  "language": "asm-arm64-gas",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

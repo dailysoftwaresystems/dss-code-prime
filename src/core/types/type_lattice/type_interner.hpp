@@ -269,6 +269,21 @@ public:
     // atomic → the FC17.9(d) 1b atomic-access lowering).
     [[nodiscard]] bool isVolatileQualified(TypeId id) const;
     [[nodiscard]] bool isAtomicQualified(TypeId id) const;
+    // Is an OBJECT of type `id` a volatile object — `id`, looked through its ARRAY spine,
+    // volatile-qualified at some level? C 6.7.3p10 gives an array type's qualifiers to its
+    // ELEMENT type (C23 to both), and a declarator's qualifier is interned there, so
+    // `isVolatileQualified` alone answers "no" for `const volatile int a[2]`, every element of
+    // which is a volatile object. A pointer is NOT looked through (its pointee's qualifiers
+    // are not the object's), and neither is a structure or union: a volatile MEMBER does not
+    // make the object that holds it volatile. That is the line the references draw for a
+    // static initializer's read of a const object (P68 round 13, fold F7, MEASURED through
+    // `dssharness run probe-reference-cc`): gcc 13.3.0 and mingw-w64 13.2.0 fold `cs.v` of
+    // `static const struct { volatile int v; } cs`, and every reference — clang 18.1.3 and
+    // MSVC 19.51 too — refuses `cva[1]` of `static const volatile int cva[2]`, a 2-D one,
+    // an element of an array of const volatile structures, and a typedef'd volatile element.
+    // The ONE statement of what a volatile object is for that read: the semantic tier's
+    // static-initializer check and the static-data producer's fold both ask it.
+    [[nodiscard]] bool isVolatileObjectType(TypeId id) const;
     // array: operands=[element], scalars=[length]. slice: operands=[element].
     TypeId array(TypeId element, std::int64_t length);
     TypeId slice(TypeId element);
@@ -574,8 +589,41 @@ public:
     // enum: nominal name + scalars=[(int)underlyingTypeKind]. Variants
     // are NOT stored as operands (each enumerator is a Variable symbol
     // with the enum TypeId; the enum type itself is int-compatible).
+    // P68 round 12 (lane `cs`): an enum with a FIXED underlying type (C23 6.7.2.2,
+    // `enum E : long`) also keeps that type AS DECLARED — its vocabulary identity,
+    // not only its kind — as its one operand, because C 6.3.1.1p1 gives the enum
+    // the RANK of that type and the usual arithmetic conversions decide by rank,
+    // i.e. by name (`long` beside `unsigned int` on LLP64 is `unsigned long`; an
+    // anonymous I32 would give `unsigned int`). `declaredUnderlying` is that TypeId
+    // (InvalidType for an enum without a fixed underlying type — no operand, the
+    // record byte-identical to before). Its KIND must be `underlying`.
+    // ★ P68 round 12 (lane `cs`, the enumeration P1): an enum WITHOUT a fixed
+    // underlying type has one too — C23 6.7.3.3p2: "the enumeration's compatible
+    // type", which the implementation CHOOSES to hold every value (p13), and which
+    // the language declares how to choose (`semantics.enumerationCompatibleTypes`).
+    // Such an enum keeps its chosen type as its operand as well, told apart from a
+    // fixed one by `origin`: scalars=[kind, 1] for `Chosen`, [kind] for `Fixed`.
+    // They must differ because `enum E : unsigned int { … }` and an `enum E { … }`
+    // whose compatible type is `unsigned int` are different types (C23 6.2.7p1: a
+    // fixed underlying type is part of an enumeration's identity). An enum of a
+    // language that declares no choice keeps the kind-only record (no operand).
+    // `origin` is read only when `declaredUnderlying` is valid.
+    enum class EnumUnderlyingOrigin : std::uint8_t { Fixed, Chosen };
     TypeId enumType(std::string_view name,
-                    TypeKind underlying = TypeKind::I32);
+                    TypeKind underlying = TypeKind::I32,
+                    TypeId declaredUnderlying = InvalidType,
+                    EnumUnderlyingOrigin origin = EnumUnderlyingOrigin::Fixed);
+    // The fixed underlying type an enum was declared with (`enumType`'s
+    // `declaredUnderlying` with origin `Fixed`), or InvalidType when it has none,
+    // its type was chosen instead, or `id` is not an enum.
+    [[nodiscard]] TypeId enumDeclaredUnderlying(TypeId id) const;
+    // The compatible type CHOSEN for an enum without a fixed underlying type
+    // (origin `Chosen`), or InvalidType.
+    [[nodiscard]] TypeId enumChosenUnderlying(TypeId id) const;
+    // Either — the integer type an enum's record says it is COMPATIBLE with (C
+    // 6.7.2.2p4, C23 6.7.3.3p13, p16) — or InvalidType for a kind-only record or a
+    // non-enum.
+    [[nodiscard]] TypeId enumUnderlyingType(TypeId id) const;
     // C23 _BitInt(N) (D-CSUBSET-BITINT / C23 §6.2.5): a bit-precise integer of
     // EXACT width `widthBits`, signed iff `isSigned`. scalars=[widthBits, signed?1:0];
     // no operands, no name (structural identity — two `_BitInt(N)` of the same width
@@ -597,7 +645,7 @@ public:
     // before any consumer queries this. Aborts if `id` is not a BitInt.
     [[nodiscard]] TypeKind bitIntContainerKind(TypeId id) const;
     // fnSig: operands=[result, params...], scalars=[(int)cc, isVariadic].
-    // D-LANG-VARIADIC (step 13.4): variadic flips the second scalar slot;
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): variadic flips the second scalar slot;
     // non-variadic encodings remain 1-slot for cache stability against
     // every pre-13.4 TypeId. The declared params are the FIXED arg count
     // (matches LLVM's `(i32 (i8*, ...))*` convention — `...` is a
@@ -650,9 +698,13 @@ public:
     // undeclared name (every anonymous primitive) ranks 0, so a named entry
     // always out-ranks the anonymous representative of the same kind.
     //
-    // Used ONLY to break a tie between two operands of the SAME kind and
-    // DIFFERENT vocabulary names; when the kinds differ the existing
-    // width-keyed rank tables decide, unchanged.
+    // Read by the usual arithmetic conversions (`usualArithmeticCommonType`)
+    // in exactly two places: (1) the tie-break between two operands of the
+    // SAME kind and DIFFERENT vocabulary names; (2) the mixed-signedness pair
+    // of the SAME WIDTH (different kinds, `I64` vs `U64`), where C 6.3.1.8
+    // decides by conversion rank — the signed operand ranked higher converts
+    // both to its UNSIGNED COUNTERPART (P68 round 10). Every other pair of
+    // differing kinds is decided by the width-keyed rank tables, unchanged.
     void declareVocabularyRank(std::string_view vocabularyName, int rank);
     [[nodiscard]] int vocabularyRank(TypeId id) const;
 
@@ -670,12 +722,32 @@ public:
     // `id` is not a FnSig.
     [[nodiscard]] TypeId               fnResult(TypeId id) const;
     [[nodiscard]] GuardedSpan<TypeId>  fnParams(TypeId id) const;
-    // D-LANG-VARIADIC (step 13.4): true iff this FnSig was built via
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): true iff this FnSig was built via
     // the 4-arg `fnSig()` overload with `isVariadic=true`. Read from
     // scalars[1]. Pre-13.4 FnSigs (built via the 3-arg overload)
     // encode scalars=[(int)cc] only — `fnIsVariadic` returns false
     // for them (scalar count < 2 → no variadic encoding present).
     [[nodiscard]] bool                     fnIsVariadic(TypeId id) const;
+    // ★★ THE PARAMETERS A CALL'S ARGUMENTS BIND TO (P68 round 8, lane `ht`, part
+    // 2) — the ONE owner of that question, read by the semantic tier's call check,
+    // the HIR verifier's call check and the MIR verifier's call gate, so the three
+    // cannot answer it differently. It is the declared list (`fnParams`) up to, NOT
+    // including, the first parameter of UNQUALIFIED void, which ENDS the argument
+    // list. That parameter exists only in a declaration that is not a definition
+    // (`void f(void v);`, `void f(int a, void v);` — a C front end refuses one in a
+    // definition), and gcc's measured meaning for a call through it is exactly
+    // this: `f()` / `f(42)` compile and RUN against a `void f(void)` / `void
+    // f(int)` defined in another translation unit, and an argument at or past the
+    // void is "too many arguments", a `...` after it included. A QUALIFIED void (a
+    // `volatile` / `_Atomic` skin) does not end the list — gcc calls `f()` through
+    // one "too few arguments". Every signature without such a parameter answers
+    // `fnParams` itself. The declared list — type identity, a text spelling —
+    // stays `fnParams`: `void(void v)` and `void(void)` are distinct types.
+    [[nodiscard]] GuardedSpan<TypeId>      fnArgumentParams(TypeId id) const;
+    // …and whether arguments may follow them as a variadic tail: `fnIsVariadic`,
+    // unless a void parameter ended the list first (the `...` after it is then
+    // unreachable — gcc: "too many arguments").
+    [[nodiscard]] bool                     fnArgumentsVariadic(TypeId id) const;
 
     // ── THE OBJECT-REPRESENTATION PROJECTION (D-CSUBSET-NULLPTR-T-DECLARABLE) ──
     //

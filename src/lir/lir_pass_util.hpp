@@ -19,7 +19,7 @@
 
 // Shared substrate for LIR transformation passes (rewrite, callconv,
 // future inlining/optimization passes). Folds the cycle-3b / ML7
-// duplication identified by the simplifier as D-ML7-1.1: every pass
+// duplication identified by the simplifier as D-PLAN12-SHARED-LIR-PASS-UTIL-HPP-FOR-EMITTERMINATOR-REPORT: every pass
 // that walks an input `Lir` and builds a fresh one re-implements the
 // same diagnostic-emission, block-ref remapping, and terminator
 // dispatch — all of which are tier-invariant (target-blind, source-
@@ -106,6 +106,29 @@ declaresFallthroughBranchForm(TargetSchema const& schema,
                               std::uint16_t       opcode,
                               std::size_t         opCount) noexcept;
 
+// ── RULE R2'S WHOLE QUESTION, ASKED BY TWO PASSES ────────────────────────
+//
+// True iff a terminator with these operands and successors may DROP its
+// trailing BlockRef because `nextBlock` — the block laid out immediately
+// after it — is its LAST successor, and the target declares the shorter form
+// (`declaresFallthroughBranchForm`). The operand list must agree with the
+// successor list exactly (same count, blocks, order), which is `lir_verifier`'s
+// Rule 1b stated as a precondition and what makes the rule idempotent.
+//
+// ★ ONE OWNER, THREE CALLERS (P68 round 8 part 4): `lir_peephole`'s R2; the
+// inline-asm expansion, which turns a template's labels into blocks AFTER the
+// peephole ran — so a template's own conditional branches would otherwise keep
+// a trailing jump R2 never saw; and the assembly engine's conditional branch
+// (`asm_template_to_lir.cpp`), whose `.s` host knows the block laid out next
+// and whose output goes to the assembler with no peephole between them. The
+// verifier checks every result with the one rule it already has.
+[[nodiscard]] DSS_EXPORT bool
+canElideFallthroughOperand(TargetSchema const&        schema,
+                           std::uint16_t              opcode,
+                           std::span<LirOperand const> ops,
+                           std::span<LirBlockId const> succs,
+                           std::optional<LirBlockId>  nextBlock) noexcept;
+
 // Copy EVERY module-level SIDE STRUCTURE from the source module into the
 // destination builder, PRESERVING indices. Today that is two pools:
 //
@@ -143,8 +166,21 @@ declaresFallthroughBranchForm(TargetSchema const& schema,
 // ⚠ If you add a third pool, add it HERE and add its rules to
 // `checkSideStructureIntegrity` + `verifyLirRebuild` (`lir_verifier.cpp`);
 // do NOT add a second copy call anywhere.
+//
+// ★ P68 round 8 part 4: the FOURTH side structure, the asm-region pool (the
+// inline-asm bundle bodies, `lir_asm_region.hpp`), is carried here too — by
+// every pass except the ONE that consumes it.
 DSS_EXPORT void
 copyModuleSideStructures(Lir const& src, LirBuilder& dst);
+
+// ★ The consuming variant, for `expandAsmRegions` alone: every side structure
+// EXCEPT the asm-region pool, because that pass replaces each bundle with its
+// body and its output references no region. It is not a second copy of the
+// list — both functions carry the other structures through ONE internal
+// helper, so a structure added there reaches both — and its name states the
+// consumption, so a pass reaching for it by mistake says so in its own source.
+DSS_EXPORT void
+copyModuleSideStructuresConsumingAsmRegions(Lir const& src, LirBuilder& dst);
 
 // Carry the per-INSTRUCTION side data of one source instruction onto the
 // instruction a pass has just appended to `dst`.
@@ -193,6 +229,10 @@ copyModuleSideStructures(Lir const& src, LirBuilder& dst);
 //
 // Precondition: `copyModuleSideStructures` has already run on `dst`, so
 // the source handle's pool index is valid in the destination.
+//
+// ★ It carries BOTH per-instruction handles: the register-constraint set and
+// (P68 round 8 part 4) the asm-region bundle's body. A bundle that lost its
+// handle would be an instruction with operands and no meaning.
 DSS_EXPORT void
 carryInstSideData(Lir const& src, LirInstId srcInst,
                   LirBuilder& dst, LirInstId dstInst);
@@ -243,7 +283,10 @@ incomingArgRegister(TargetSchema const&            schema,
                     std::uint32_t                  payload);
 
 // ── THE IDENTITY-CLASS-MOVE QUESTION, WITH ONE OWNER ────────────────────
-// D-LIR-PEEPHOLE-CALLCONV-IDENTITY-COPY-CLAIM-HAS-NO-INSTRUMENT.
+// A per-pass claim about this population is falsifiable only while the
+// instrument that COUNTS it and the rule that ACTS on it ask the same
+// question; a second implementation counts a population the rule never
+// touches.
 //
 // "Is this instruction the declared register-to-register MOVE for its
 // result's register class, copying a physical register into ITSELF?" is

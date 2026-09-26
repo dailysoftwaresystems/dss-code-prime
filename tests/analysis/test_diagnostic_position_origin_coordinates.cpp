@@ -117,7 +117,8 @@ namespace fs = std::filesystem;
 // Shared schema fixture: loaded once, handed back BY REFERENCE to a cached
 // owner. Returning the `shared_ptr` by value would let
 // `helper()->accessor()` bind a reference into a schema owned only by the
-// temporary (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE).
+// temporary, which dies at the end of that full-expression
+// (heap-use-after-free).
 [[nodiscard]] std::shared_ptr<GrammarSchema const> const& cSubset() {
     static std::shared_ptr<GrammarSchema const> const schema = [] {
         auto loaded = GrammarSchema::loadShipped("c");
@@ -194,7 +195,7 @@ void writeFile(fs::path const& p, std::string_view text) {
 // named parts.
 //
 // ★★ WHY COMPOSED AND NOT SPELLED OUT AS A LITERAL. Written out, every
-// expectation in this file reads to `scripts/check-plan-citations` as a
+// expectation in this file reads to `.harness-config/runner/actions/check-plan-citations` as a
 // POSITIONAL CITATION, and that guard is right to be blunt about the shape: a
 // `path:line` written into a source file is a claim about a file that nothing
 // rechecks, and it stays plausible after it becomes wrong. These are the exact

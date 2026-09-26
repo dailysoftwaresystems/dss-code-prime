@@ -97,10 +97,20 @@ long identity(long v) { return v; }
 int  narrow(long v) { int n = v; return n; }
 ```
 
-| | `x86_64:elf64-x86_64-linux` (LP64) | `x86_64:pe64-x86_64-windows-exec` (LLP64) |
-|---|---|---|
-| `identity` | `fn(i64 "long") -> i64 "long"` | `fn(i32 "long") -> i32 "long"` |
-| `int n = v;` | `var %5 : i32 = cast [syn] : i32 (ref %4 : i64 "long")` | `var %5 : i32 = ref %4 : i32` |
+The two lines that differ, verbatim from the two artifacts:
+
+```
+x86_64:elf64-x86_64-linux (LP64)
+  function %1 : fn(i64 "long") -> i64 "long" {
+      var %5 : i32 = @loc(buf 3, 674..675) cast [syn] : i32 (@loc(buf 3, 674..675) ref %4 : i64 "long")
+
+x86_64:pe64-x86_64-windows-exec (LLP64)
+  function %1 : fn(i32 "long") -> i32 "long" {
+      var %5 : i32 = @loc(buf 3, 904..905) ref %4 : i32
+```
+
+(The spans differ too, and that is also the target: each target's predefine prologue is a different
+length, and a span indexes the preprocessed text — §4.3.)
 
 Under LLP64 the `Cast` **node is absent** — `long` and `int` are the same representation, so the
 conversion is an identity retag with nothing to represent. The *node set of the tree* changes with
@@ -113,9 +123,7 @@ dialect**. That is the right answer for a `.s`, and the wrong one for everything
 no `--language` is refused by name:
 
 ```
-error[D_UnknownFileExtension]: no source language for 'foo.c': no --language was given, so target
-'x86_64' selected its declared defaultAssemblyLanguage 'asm-x86_64-att' — which claims .s, .S and
-not '.c'. Pass --language <name> to name the source language explicitly.
+error[D_UnknownFileExtension]: no source language for '/tmp/ht-doc/doc_example.c': no --language was given, so target 'x86_64' selected its declared defaultAssemblyLanguage 'asm-x86_64-att' — which claims .s, .S and not '.c'. Pass --language <name> to name the source language explicitly.
 ```
 
 **Pass `--language c`.** Value flags also accept the `=` form (`--emit-hir=out.dsshir`).
@@ -142,12 +150,15 @@ int sum_fields(struct Point *p) {
 ```
 
 ```
-dsshir 4
-producer "0.0.2+gcd1331ebc3ef.dirty922bae8971de8a1b"
+dsshir 6
+producer "0.5.0+nogit20260919T193847Z.5"
 buffers {
-  buf 1 "/work/doc_example.c"
+  buf 1 "/tmp/ht-doc/doc_example.c"
   buf 2 "<built-in>"
-  buf 3 "/work/doc_example.c" synthesized from 1
+  buf 3 "/tmp/ht-doc/doc_example.c" synthesized from 1
+}
+types {
+  type 1 = struct "Point" {i32, i32}
 }
 symbols {
   %1 "Point"
@@ -155,23 +166,25 @@ symbols {
   %3 "p"
 }
 module "C" {
-  @loc(buf 3, 443..473)
-  type_decl %1 : struct "Point" {i32, i32}
-  @loc(buf 3, 476..533)
-  function %2 : fn(ptr<struct "Point" {i32, i32}>) -> i32 {
-    @loc(buf 3, 504..506)
-    param %3 : ptr<struct "Point" {i32, i32}>
-    @loc(buf 3, 508..533)
+  @loc(buf 3, 608..638)
+  type_decl %1 : type 1
+  @loc(buf 3, 641..698)
+  function %2 : fn(ptr<type 1>) -> i32 {
+    @loc(buf 3, 669..671)
+    param %3 : ptr<type 1>
+    @loc(buf 3, 673..698)
     block {
-      @loc(buf 3, 512..531)
-      return @loc(buf 3, 519..530) binop Add : i32 (...)
+      @loc(buf 3, 677..696)
+      return @loc(buf 3, 684..695) binop Add : i32 (@loc(buf 3, 684..688) member #0 : i32 (@loc(buf 3, 684..688) deref [syn] : type 1 (@loc(buf 3, 684..685) ref %3 : ptr<type 1>)), @loc(buf 3, 691..695) member #1 : i32 (@loc(buf 3, 691..695) deref [syn] : type 1 (@loc(buf 3, 691..692) ref %3 : ptr<type 1>)))
     }
   }
 }
 ```
 
 Note what is *not* there: no type ids, no symbol ids, no pointers into a compiler's memory. Every
-identity in the file is defined by the file.
+identity in the file is defined by the file — `%3` by the `symbols` section, `buf 3` by `buffers`,
+and `type 1`, the struct, by `types`, where its fields are spelled exactly once however many times
+the module mentions it.
 
 ---
 
@@ -182,13 +195,19 @@ legitimate carriage return. UTF-8. Strings are double-quoted with `\"` and `\\` 
 
 ```
 file       := "dsshir" INT "producer" STR preamble module
-preamble   := ext_kinds? ext_ops? intrinsics? buffers? symbols?   (non-empty sections only)
+preamble   := ext_kinds? ext_ops? intrinsics? buffers? types? symbols?   (non-empty sections only)
+types      := "types" "{" ("type" INT "=" composite)* "}"
+composite  := ("struct" | "union") STR
+              ( "opaque"
+              | "packed"? ("aligned" INT)? ("pack" INT)? "{" field ("," field)* "}" )
+field      := type ("@" INT | "~" INT)? ("bits" INT)? "packed"?
 module     := "module" flags? STR "{" decl* "}"
 decl       := function | global | type_decl | extern_function
             | extern_global | import_group | ext_node | error
 stmt       := block | if | while | do | for | switch
             | break | continue | return | expr | var | assign
             | unreachable | ext_node | error
+return     := "return" flags? ("void" | expr)
 expr       := lit | ref | call | intrinsic | binop | unop | cast | member
             | index | swizzle | construct | ternary | logical_and
             | logical_or | sizeof | alignof | addressof | deref | typeref
@@ -197,7 +216,27 @@ rmw        := "rmw" flags? SYM ":" type "(" expr "," expr ")"
               (an indivisible read-modify-write: the object's lvalue, then the
                update, which reads the observed value as `ref SYM`; yields the
                value the object held before the replacement that took effect)
-type       := (see docs/ir-type-text.md — one grammar, one decoder)
+type       := (see docs/ir-type-text.md — one grammar, one decoder), where a
+              COMPOSITE is always `"type" INT`, naming an entry of `types` (§4.7)
+```
+
+⚠ **A value-less return is `return void`, and `return` followed by anything that does not begin an
+expression is refused.** The value is the one optional child in this grammar that sits at the END of
+its statement and can open with `@`, and so can the next statement's `@loc` block — so the absence
+has to be spelled. v4 wrote a bare `return` and its reader took a following `@` for the start of the
+value: on `if (x) return; g();` it read `g();` as the return's operand, and `--emit-hir` refused its
+own artifact (✔measured on sqlite's `test/speedtest1.c`, P68). No look-ahead can settle it instead,
+because `error` and `ext_node` open a statement *and* render inline as an expression. The same
+reader refuses a STATEMENT in any expression slot (an operand, a condition, a value, an initializer)
+by name, rather than building one there.
+
+```
+      @loc(buf 3, 646..660)
+      if (@loc(buf 3, 650..651) binop Ne : bool (@loc(buf 3, 650..651) ref %3 : i32, lit [syn] int 0 : i32))
+        @loc(buf 3, 653..660)
+        return void
+      @loc(buf 3, 663..666)
+      expr @loc(buf 3, 663..666) call : void (@loc(buf 3, 663..664) ref %1 : fn() -> void)
 ```
 
 Sections are emitted **only when non-empty**, in the order shown. The two header lines are
@@ -205,7 +244,7 @@ Sections are emitted **only when non-empty**, in the order shown. The two header
 
 ### 4.1 `dsshir <version>` — the format version
 
-The first line. **Currently `4`.** A reader that does not understand the version must **refuse**,
+The first line. **Currently `6`.** A reader that does not understand the version must **refuse**,
 not guess. Our own parser does exactly that: a version it does not know is a hard
 `H_TextVersionMismatch` error and no module is produced.
 
@@ -215,11 +254,14 @@ The second line, and **mandatory**: a file without it is malformed, and our pars
 value is the compiler's build stamp:
 
 ```
-0.0.2                                        version only (clean tree, no git)
-0.0.2+gcd1331ebc3ef                          …plus the commit it was built from
-0.0.2+gcd1331ebc3ef.dirty922bae8971de8a1b    …plus a digest of uncommitted changes
-0.0.2+nogit20260907T091455Z.7                no git or no work tree
+0.5.0                                        version only (clean tree, no git)
+0.5.0+g90e0014fd50d                          …plus the commit it was built from
+0.5.0+g90e0014fd50d.dirtyd20789119c8c91de    …plus a digest of uncommitted changes
+0.5.0+nogit20260919T193847Z.5                no git or no work tree
 ```
+
+(The third and fourth are stamps two real builds printed — a work tree with uncommitted changes, and
+a copy of the sources with no `.git`; the first two are the same stamp's forms on a clean tree.)
 
 It contains no whitespace, so the whole stamp is one token.
 
@@ -236,9 +278,9 @@ cannot tell who wrote this" into "nobody claims to have written this."
 
 ```
 buffers {
-  buf 1 "/work/doc_example.c"
+  buf 1 "/tmp/ht-doc/doc_example.c"
   buf 2 "<built-in>"
-  buf 3 "/work/doc_example.c" synthesized from 1
+  buf 3 "/tmp/ht-doc/doc_example.c" synthesized from 1
 }
 ```
 
@@ -251,8 +293,8 @@ opened first (see §8).
 preprocessor's **synthesized text**, not a file on disk. Its byte offsets index the *preprocessed*
 program — after the predefine prologue, after every `-D`, with every `#include` spliced in — and
 they will not index the original file. The synthesized buffer is *constructed with the main source's
-name*, so without this marker `buf 3 "/work/doc_example.c"` would read as a real file and you would
-index the wrong text. `from <handle>` names the main origin buffer the synthesis started from.
+name*, so without this marker `buf 3 "/tmp/ht-doc/doc_example.c"` would read as a real file and you
+would index the wrong text. `from <handle>` names the main origin buffer the synthesis started from.
 
 A language with no preprocess pass produces no synthesized buffer; there, every row is plain and the
 offsets index the named file directly.
@@ -276,7 +318,7 @@ unnamed parameter).
 
 ### 4.5 `ext_kinds` / `ext_ops` / `intrinsics` — the open half
 
-DSS's node set is **open**: a language or domain can register HIR kinds beyond the 53 core ones (see
+DSS's node set is **open**: a language or domain can register HIR kinds beyond the 54 core ones (see
 §6). When a module uses them, they are declared by name in these sections and referenced as
 `ext_node` in the body. A reader that has covered every core kind can still meet one of these, and
 should refuse it **by name** rather than skip it.
@@ -286,6 +328,48 @@ should refuse it **by name** rather than skip it.
 Attached inline before a node. `H` is a `buffers` handle; `START`/`END` are byte offsets, end
 exclusive, **in the coordinate system of that buffer** — read §4.3 before using them.
 
+### 4.7 `types { … }` — every composite, defined once (new in v5)
+
+```
+types {
+  type 1 = struct "Point" {i32, i32}
+}
+```
+
+Every `struct` and `union` the module mentions — in a signature, a declaration, an expression's type,
+or another composite's fields — is **defined once** here, under an artifact-local handle, and every
+mention in the body **names it**: `type_decl %1 : type 1`, `param %3 : ptr<type 1>`. A composite is
+never spelled inline in a module; `struct "N" { … }` appears only as the right-hand side of an entry.
+This is the device every reference IR measured uses — clang's named `%struct.Point = type { i32, i32 }`
+defined once at module scope, gcc's `@N` handles in its raw tree dumps, MSVC's CodeView type indices —
+and the same one this file already uses for symbols (`%N`) and buffers (`buf N`).
+
+- **`H` is 1-based and artifact-local**, minted at the composite's first mention in text order: the
+  body first, then each definition in handle order (a definition's own fields can mention a composite
+  nothing before it did, which takes the next handle). It is a function of the module alone, so the
+  same input and revision give the same numbers (§8). Entries are written in handle order.
+- **An entry may name a handle defined after it**, and that is the ordinary case, not an edge: it is
+  how a cycle — `type 1 = struct "Node" {i32, ptr<type 1>}` — and mutual recursion are written (§5.1).
+  A reader needs the heads (`type H = struct|union "name"`) of the whole section before it can build
+  the fields; ours scans them first, exactly as an LLVM reader creates a named type before its body.
+- **Key your own interning on the handle, never on the text of the body.** Two composites that share
+  a name and a field list — the same `struct S { int v; }` declared in two scopes — are two types and
+  arrive as two entries with identical bodies. Folding them by content would merge them.
+- **An incomplete composite is an entry too** — for `struct Handle; struct Handle *open_handle(void);`
+  the table holds `type 1 = struct "Handle" opaque` and the prototype is `fn() -> ptr<type 1>`. It
+  has no field list, and it must not be read as `{}`, which is a legal *complete* zero-member
+  composite.
+- **The layout travels in the entry** (§5.2): `packed`, `aligned N` and `pack N` after the name,
+  and after each field `@N` (an explicit offset) or `~N` (a member alignment), `bits N` (a bit-field
+  width) and `packed` (a per-member packed).
+
+Refused, each by name: a mention of a handle the section does not define; `type 0` or a handle past
+32 bits; one handle defined twice; an entry that is not a `struct` or a `union`; an `aligned` / `pack`
+value that is not a representable power of two (or is `0`, which the writer never spells); layout
+markers that cannot be combined (explicit offsets with member alignments, with `packed`, or with
+bit-field widths); and, anywhere in the module, an inline `struct "N" { … }` / `union …` or a v3
+`rec <H>` — a module has exactly one spelling of each composite.
+
 ---
 
 ## 5. Self-containment: what a reader can reconstruct from the bytes alone
@@ -294,119 +378,166 @@ This is the property the format is built around, so here is exactly how far it g
 
 **Guaranteed to travel:**
 
-- **Every type the module references, structurally.** A `struct` spells its field types inline
-  (`struct "Point" {i32, i32}`), at *every* use site including through a pointer
-  (`ptr<struct "Point" {i32, i32}>`) — never as an opaque name or an id. Unions and array extents
-  likewise (`union "Bits" {i32, f32}`, `arr<i32, 4>` — a count, not a pointer). **Three ABI-relevant
-  layout attributes travel too** — packing (whole-composite and per-member), explicit field offsets,
-  and per-member alignment — because a type whose layout you cannot reconstruct is not one you can
-  state a property about. ⚠ Three others do **not**; see §5.2 before computing any size or offset:
+- **Every type the module references — each composite ONCE.** A `struct` or `union` is defined in the
+  `types` section with its field types (`type 1 = struct "Point" {i32, i32}`) and every use names it
+  (`ptr<type 1>`) — never as an opaque name, and never as an id into a compiler's memory: the handle is
+  the file's own, bound by the file (§4.7). Every other type is spelled structurally where it is used
+  (`arr<i32, 4>` — a count, not a pointer; `fn(ptr<type 1>) -> i32`). **Every layout attribute the
+  compiler gives a composite travels too** — packing (whole-composite and per-member), explicit field
+  offsets, per-member alignment, bit-field widths, a whole-composite `aligned(N)` and a `#pragma pack`
+  cap (§5.2) — because a type whose layout you cannot reconstruct is not one you can state a property
+  about:
 
   ```c
   struct __attribute__((packed)) P { char a; int b; };
   struct A { char a; int b __attribute__((aligned(8))); };
   ```
   ```
-  type_decl %1 : struct "P" packed {char, i32}
-  type_decl %2 : struct "A" {char ~0, i32 ~8}
+  types {
+    type 1 = struct "P" packed {char, i32}
+    type 2 = struct "A" {char ~0, i32 ~8}
+  }
+  …
+    type_decl %1 : type 1
+    type_decl %2 : type 2
   ```
   (`packed` is the whole-composite marker, `~N` a per-member alignment, `@N` an explicit offset.)
 - **Every source-level name**, in `symbols`.
-- **Every literal value**, inline (`lit int 42 : i32`, `lit str "hi" : arr<char,3>`).
+- **Every literal value**, inline (`lit int 42 : i32`, `lit str "hi" : arr<char, 3>`).
 - **The format version and the producer revision.**
 - **Source spans**, with their buffer named and classified.
 
-**Documented boundaries — these do *not* travel.** Most are deliberate; the layout-attribute row is
-a **gap**, and it is marked as one rather than dressed up as a decision:
+**Documented boundaries — these do *not* travel, deliberately**, plus one channel that is carried in a
+different place than you might look for it:
 
 | | |
 |---|---|
-| **enumerator names and values** | `enum "Color"` carries the enum's name, and its underlying width when that diverges from the default (`enum "E" : u8`). It does **not** carry `Red = 0, Green = 1`: enumerators are folded to literals at every use, so the *values* are in the body while the *names* are not. |
+| **enumerator names and values** | `enum "Color"` carries the enum's name, and its underlying width when that diverges from the default (`enum "E" : u8`); an enumeration with a FIXED underlying type (C23 `enum E : long`) carries that type as the type it is, vocabulary tag included (`enum "E" fixed i64 "long"`), because it is part of the enumeration's identity (v6); an enumeration WITHOUT one carries the compatible type its language chose the same way (`enum "E" chosen u32 "unsigned int"`, v6). It does **not** carry `Red = 0, Green = 1`: enumerators are folded to literals at every use, so the *values* are in the body while the *names* are not. |
 | **`const` and `restrict`** | Not interned — they never affect layout or codegen, so they are not part of type identity and cannot ride a type. (`volatile` and `_Atomic` *are* carried.) |
-| **bit-field widths, `__attribute__((aligned(N)))` on a composite, and a `#pragma pack(N)` cap** | ⚠ Three ABI-relevant layout attributes the type grammar has no spelling for. They are dropped **silently** on a round trip — see §5.2. ⚠ **Do not read this row as covering `aligned(N)` on a TYPEDEF** — that one is a *different channel* and it **is** carried, as `aligned<T, N>` (next row). The composite channel (`explicitAlign` on a struct/union definition) is the one still missing a spelling. |
-| **`__attribute__((aligned(N)))` on a *typedef*** | Carried, as **`aligned<T, N>`** — the `arr<T, N>` shape: the decorated type first, the byte count second. Written by cycle P66 (lane `al`), when an over-aligned type alias became representable at all. It rides the same transparent skin as `volatile`/`_Atomic` (one record, distinct interned identity, `kind()`/`operands()`/`scalars()` see through it), so a type carrying both spells as `aligned<volatile<i32>, 8>` and the reader merges them back into **one** record — the round trip is an identity, not a nesting that grows per hop. It is a **decoration, not a derivation level**: it does not touch the declarator spine the way `ptr<…>` and `arr<…>` do. `sizeof` is unaffected (`aligned<i32, 8>` is still 4 bytes wide, aligned 8) — which is why both gcc and clang refuse an *array* of such an alias, and so does DSS. ⚠ **P66 (lane `ag`): `N` may be WEAKER than the decorated type's natural alignment** — `aligned<i32, 2>` is a real, round-trippable type whose layout alignment is 2, because gcc, clang, mingw-w64 gcc and aarch64-gcc all lower a typedef's alignment (measured; the whole-composite channel does *not*, and has no spelling here anyway). So the byte count is the *answer*, not a floor, and a reader must not "correct" it upward. |
+| **`__attribute__((aligned(N)))` on a *typedef*** | Carried, as **`aligned<T, N>`** at the use — the `arr<T, N>` shape: the decorated type first, the byte count second. ⚠ Do not confuse it with the WHOLE-COMPOSITE `aligned N` of a `types` entry (§5.2): that one is part of the composite's definition, this one is a *decoration* on whatever type the alias names. Written by cycle P66 (lane `al`), when an over-aligned type alias became representable at all. It rides the same transparent skin as `volatile`/`_Atomic` (one record, distinct interned identity, `kind()`/`operands()`/`scalars()` see through it), so a type carrying both spells as `aligned<volatile<i32>, 8>` and the reader merges them back into **one** record — the round trip is an identity, not a nesting that grows per hop. It is a **decoration, not a derivation level**: it does not touch the declarator spine the way `ptr<…>` and `arr<…>` do. `sizeof` is unaffected (`aligned<i32, 8>` is still 4 bytes wide, aligned 8) — which is why both gcc and clang refuse an *array* of such an alias, and so does DSS. ⚠ **P66 (lane `ag`): `N` may be WEAKER than the decorated type's natural alignment** — `aligned<i32, 2>` is a real, round-trippable type whose layout alignment is 2, because gcc, clang, mingw-w64 gcc and aarch64-gcc all lower a typedef's alignment (measured; the whole-composite channel does *not*). So the byte count is the *answer*, not a floor, and a reader must not "correct" it upward. |
 | **aliasing information** | HIR has none. |
 | **undefined behaviour** | Not represented: no poison, no `nsw`/`nuw`, no overflow flags. Constant folding wraps. Integer-overflow soundness is entirely the reader's problem. |
 
-### 5.1 Cyclic composites: `rec <H>` (new in v3)
+### 5.1 Composites: defined once, referenced everywhere (v5); cycles are ordinary
 
 ```c
 struct Node { int v; struct Node *next; };   /* the ordinary linked list */
 ```
-
-This type's graph is **cyclic** — the second field is `ptr<struct Node>` whose operand is the struct
-itself. Because the format spells a type structurally, a walk with no back-reference form would
-expand it forever, so **v2 refused it**: exit non-zero, no file. That made every list, tree,
-intrusive container and parent pointer in real C unemittable.
-
-**v3 spells it.** A composite whose own type graph reaches itself carries a `rec <H>` marker
-directly after its name, and the point where the graph closes spells `rec <H>` in type position:
-
 ```
-type_decl %1 : struct "Node" rec 1 {i32, ptr<rec 1>}
+types {
+  type 1 = struct "Node" {i32, ptr<type 1>}
+}
+…
+  type_decl %1 : type 1
 ```
 
-**`H` is a handle for the composite, not for the spelling.** It is artifact-local (1, 2, 3 … in the
-order the writer first reaches each recursive composite) and every mention of the same composite in
-the same file uses the same number — the same device `symbols`/`%N` and `buffers`/`buf N` already
-use. That matters as soon as recursion is mutual, because one type then has **two** spellings in one
-file:
+This type's graph is **cyclic** — the second field points at the struct itself. v2 spelled types
+structurally and had no way to close the loop, so it **refused** the file; v3 added a `rec <H>`
+back-reference so the cycle could be written inside the one inline spelling. **v5 makes the cycle an
+ordinary case**: a composite is written once, in the `types` table, and the pointer that closes the
+loop is `ptr<type 1>` — a reference like any other. Nothing is ever expanded at a use, so nothing can
+expand forever, and no marker says "this one is recursive".
+
+Mutual recursion is just two entries that name each other:
 
 ```c
 struct A { int x; struct B *b; };
 struct B { int y; struct A *a; };
 ```
 ```
-type_decl %1 : struct "A" rec 1 {i32, ptr<struct "B" rec 2 {i32, ptr<rec 1>}>}
-type_decl %2 : struct "B" rec 2 {i32, ptr<struct "A" rec 1 {i32, ptr<rec 2>}>}
+types {
+  type 1 = struct "A" {i32, ptr<type 2>}
+  type 2 = struct "B" {i32, ptr<type 1>}
+}
+…
+  type_decl %1 : type 1
+  type_decl %2 : type 2
 ```
 
-Standing inside `A`, `B` is `struct "B" rec 2 {i32, ptr<rec 1>}`; standing alone it is the expanded
-form. Both are `B`, and the handle `2` is what says so. **If you rebuild types from this format, key
-your own interning on the handle, not on the text of the composite** — two spellings of one type
-would otherwise become two types, and nothing about the bytes would tell you.
+**Why v5 moved away from spelling a composite at every use.** Structural-at-every-use makes an
+artifact's size (type mentions) × (the reachable type graph): every typed node re-spells everything its
+type reaches, and real C's graphs are large and densely connected. ✔MEASURED (P68, WSL x86_64, a
+Release `dsscp`, retired instructions): on the first 1.18 MB of the sqlite amalgamation, `--emit-hir`
+under v4 ran **276 G instructions and died `std::bad_alloc`**, where the full compile of the same file
+is 3.24 G; under v5 it runs **3.35 G** and writes a 396 KB artifact that reads back byte for byte. The
+whole 9.57 MB amalgamation, which v4 could not finish in 12 minutes, emits under v5 in **60.1 G**
+(the full compile: 73.1 G), 35.8 MB, 493 composites in its table. The cost of the type text is now
+proportional to the mentions plus the graph, never their product — our suite pins that as a COUNT of
+type nodes spelled (`HirTextTypeSpellingCost.*` in `tests/hir/test_hir_text.cpp`).
+
+**`rec <H>` is subsumed in a module, and survives in a standalone type text.** A `.dsshir` module
+refuses `rec` (and any inline `struct "N" { … }`) by name — it has exactly one spelling per composite.
+A STANDALONE type string — the FFI-descriptor signatures `parseTypeFromText` decodes — has no table to
+reference, so it keeps the inline forms and the `rec <H>` back-reference unchanged
+([`ir-type-text.md`](./ir-type-text.md) §2.6), and it refuses `type <H>`, by name, as module-only.
 
 Rules a reader can rely on:
 
-- `rec <H>` in type position always names a composite that is **currently open** at that point —
-  an enclosing one. Our parser refuses anything else rather than binding it to a closed composite.
-- Handles are 1-based. `rec 0` is refused.
-- `rec` and `opaque` never appear together: `opaque` means the composite is *incomplete* and has no
-  field list, so nothing can close a cycle through it.
-- A handle spelled twice must describe the same composite both times. Two different bodies under one
-  handle is refused, by name.
+- Every composite the body mentions has **exactly one** entry, and every mention of it — in the body
+  and in other entries — is its `type <H>`.
+- Entries are numbered 1, 2, 3 … in the order the writer first mentions them, and written in that
+  order. A reference to a handle defined LATER in the section is ordinary; resolve the whole section's
+  heads before building its fields (§4.7).
+- **Key your interning on the handle, not on the entry's text.** Two entries with the same name and
+  the same body are two types (two scopes' `struct S { int v; }`) and must stay two.
+- `opaque` is an entry with no field list (an incomplete composite), never `{}` — `{}` is a legal
+  complete zero-member composite, and confusing the two is a silent size change.
 
-**Still refused, loudly:** a shape this codec cannot spell arrives as a diagnostic naming the type,
-and `--emit-hir` writes no file (§2.1) — never as a file with a `?` in it. The composite *shape* is
-now fully representable; §5.2 lists three composite *layout* attributes that are still dropped, and
-those are dropped **silently**, which is why they are called out rather than left to be discovered.
+**Refused, loudly:** a shape this codec cannot spell arrives as a diagnostic naming the type, and
+`--emit-hir` writes no file (§2.1) — never as a file with a `?` in it.
 
-For scale: over this repository's own C example corpus — **840 files**, one `--emit-hir` run each —
-**791 emit at exit 0** (v2: 790, with the one refusal being exactly this), and 49 are front-end
-rejections of sources DSS does not accept at all (the corpus's deliberate negative cases). But those
-are small examples; real client code is where lists and trees live, so the change is much larger
-than 1-in-840 suggests.
+For scale — ✔MEASURED (P68 round 8, WSL x86_64, a Release `dsscp`), over this repository's own C
+example corpus: **881 files**, every `.c` under `examples/c`, one `--emit-hir` run each at the first
+target its example declares: **856 emit at exit 0**, **25** are front-end rejections of sources DSS
+does not accept (the corpus's deliberate negative cases), and **none** is refused by the round-trip
+self-check. Against the v4 writer over the same 881 files no outcome moved; 238 artifacts got smaller
+(the largest shrink: to 2.7% of its v4 size), 614 are the same size (no composite at all) and 4 grew
+by at most 47 bytes (the table's own framing, for a struct mentioned once); the corpus's total went
+from 15.3 MB to 12.2 MB. Those are small examples — real client code is where large type graphs live,
+and there the difference is the sqlite one above, not a percentage.
 
-### 5.2 Three composite layout attributes that do *not* travel
+### 5.2 Every layout attribute of a composite travels (v5)
 
-A composite spells its packing, its explicit field offsets (`@N`) and its per-member alignment
-(`~N`), and those are enough to reconstruct most layouts. Three ABI-relevant attributes are **not**
-in the grammar and are dropped when the file is read back:
+A `types` entry spells every layout channel DSS gives a composite. Until v5, three of them — and a
+fourth nobody had listed — had no spelling and were dropped on a round trip **silently** (the file
+re-parsed cleanly and re-emitted the same bytes, because the re-emission spelled the stripped type
+exactly as the first emission had):
 
-| attribute | how you write it in C | what a re-read gives you |
+```c
+struct Flags { unsigned a : 3, b : 5; };
+struct Wide { char c; int i; } __attribute__((aligned(16)));
+#pragma pack(4)
+struct Capped { char c; long long x; };
+#pragma pack()
+```
+```
+types {
+  type 1 = struct "Flags" {u32 bits 3, u32 bits 5}
+  type 2 = struct "Wide" aligned 16 {char, i32}
+  type 3 = struct "Capped" pack 4 {char, i64 "long long"}
+}
+```
+
+| attribute | spelling | where |
 |---|---|---|
-| **bit-field widths** | `struct S { unsigned a : 3, b : 5; };` | two full-width members — a different size |
-| **whole-composite alignment** | `struct S { … } __attribute__((aligned(16)));` | the natural alignment |
-| **member-alignment cap** | `#pragma pack(4)` around the definition | no cap |
+| **whole-composite packed** | `packed` | after the name |
+| **whole-composite alignment** (`__attribute__((aligned(N)))` on the definition) | `aligned N` | after the name — v5 |
+| **member-alignment cap** (`#pragma pack(N)`) | `pack N` | after the name — v5 |
+| **explicit field offset** | `@N` | after a field (all fields or none) |
+| **member alignment** (`_Alignas` on a member) | `~N` | after a field (all or none; `~0` = none) — on a UNION member too, v5 |
+| **bit-field width** | `bits N` | after a field — v5 (`bits 0` is the unnamed packing break) |
+| **per-member packed** | `packed` | after a field |
 
-⚠ **This is a silent loss, not a refusal**, and it is stated here for that reason: the emitted file
-is well-formed and re-parses cleanly, so nothing in the bytes tells you a layout attribute was
-dropped. If you compute sizes or offsets from a `.dsshir`, treat a `struct` carrying any of these
-three as unreliable until the format carries them.
+The fourth is the one no one had listed: a member alignment on a **union** member. The compiler
+completes unions with it; v4's union spelling omitted `~N`. ✔MEASURED (P68 round 8): for
+`union U { char c; _Alignas(8) int i; };` — which gcc 13.3 and clang 18.1.3 both lay out as sizeof 8,
+alignof 8 — the v4 writer emitted `union "U" {char, i32}` at exit 0, so the alignment was simply not
+in the file; v5 emits `union "U" {char ~0, i32 ~8}`. The completeness is now held at compile time:
+the definition writer and reader are pinned to the signature of the one interner function that
+completes a composite, so a new layout channel stops the build until the format spells it.
 
-**What this is *not*:** the *values* laid out by the compiler are unaffected — this is a limitation
-of the text tier only, and every one of these attributes is honoured in a real compile. Nothing here
-changes what DSS emits as code.
+**What this is *not*:** none of this changes what DSS emits as code — every one of these attributes
+was always honoured in a real compile; what changed is that a reader of the `.dsshir` now gets them.
 
 ---
 
@@ -421,16 +552,21 @@ program. Output:
 
 ```
 dsshir-kinds 1
-dsshir-format-version 2
-producer "0.0.2+gcd1331ebc3ef.dirty922bae8971de8a1b"
+dsshir-format-version 6
+producer "0.5.0+nogit20260919T193847Z.5"
 core-kind-count 54
 kind "Module" position non-expr typed no symbol no
 kind "Function" position non-expr typed yes symbol yes
+...
 kind "Literal" position expr keyword "lit" typed yes symbol no
 kind "Ref" position expr keyword "ref" typed yes symbol yes
 ...
 kind "ReadModifyWrite" position expr keyword "rmw" typed yes symbol yes
+stmt-keyword-count 28
+stmt-keyword "block"
+...
 stmt-keyword "var"
+...
 stmt-keyword "param"
 ...
 extension-kind-base 256
@@ -477,7 +613,17 @@ window.** Concretely:
    what it does not recognise and rebuilds a `Node` with no `next`. **v4** added the `rmw` expression
    (an indivisible read-modify-write of an `_Atomic` object, §4): a v3 reader meeting it has no rule
    for the keyword — and one that skipped it would rebuild `x += v` as the separate load and store
-   whose lost updates the node exists to prevent.
+   whose lost updates the node exists to prevent. **v5** moved every composite into the `types`
+   section, referenced as `type <H>` (§4.7, §5.1); spelled every layout channel of a composite (`aligned
+   N`, `pack N`, `bits N`, and `~N` on a union member — §5.2); and spelled a value-less return
+   `return void` (§4). A v4 reader meets `types`, `type`, `aligned`, `pack`, `bits` and `void` with no
+   rule for any of them — and the last one matters most: a v4 reader that skipped `void` would be back
+   to reading the next statement as the return's value. **v6** spelled an enumeration's FIXED
+   underlying type, `enum "E" fixed i64 "long"` (§5): `enum E : long` and `enum E` are different
+   types (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. The same version spelled the compatible
+   type a language CHOSE for an enumeration without a fixed one, `enum "E" chosen u32 "unsigned int"`
+   (C23 6.7.3.3p13). A v5 reader meeting either spelling reads `enum "E"` and then meets `fixed` or
+   `chosen` with no rule for it.
 3. **We do not maintain a compatibility window.** This build understands **one** version and refuses
    every other, in both directions — a v1 file is refused by a v2 parser just as a v3 file is. One
    grammar, no conditional parsing, no "mostly works".
@@ -486,9 +632,10 @@ window.** Concretely:
    and plan to re-emit rather than to migrate files.
 5. **After C++ lands the format is expected to stabilise** and bumps to become rare.
 
-**What is stable today** (as stable as anything in a `4`): the mode and its exit-code contract, the
+**What is stable today** (as stable as anything in a `6`): the mode and its exit-code contract, the
 two header lines and their order, the section order, the type syntax (shared with FFI descriptors,
-see [`ir-type-text.md`](./ir-type-text.md)), and the self-containment rules in §5.
+see [`ir-type-text.md`](./ir-type-text.md) — a module differs only in naming every composite through
+its `types` table), and the self-containment rules in §5.
 
 **What will grow:** the node set (new `HirKind`s as language features land — use `--dump-hir-kinds`),
 the type forms, and the attribute vocabulary.
@@ -503,9 +650,9 @@ re-derivable.
 
 **Same input + same producer revision ⇒ byte-identical output.** Nothing in the emitter reads a
 clock, a path, an address, or an unordered container's iteration order. Symbol handles are assigned
-in pre-order of first encounter; buffer handles are assigned by sorted internal id; the one
-caller-supplied collection whose order is not the caller's business is sorted by the emitter rather
-than trusted.
+in pre-order of first encounter; composite (`type`) handles in order of first mention in the text;
+buffer handles by sorted internal id; the one caller-supplied collection whose order is not the
+caller's business is sorted by the emitter rather than trusted.
 
 ⚠ This was measured, not assumed — and the first measurement **failed**. The artifact originally
 printed the compiler's internal `BufferId`, which is a process-global counter: one unchanged source
@@ -521,10 +668,19 @@ carrying the revision.
 
 Our own parser is `dss::parseHir` ([`src/hir/hir_text.hpp`](../src/hir/hir_text.hpp)). It
 
-- re-interns every type into a fresh interner,
+- re-interns every type into a fresh interner — each `types` entry as ONE composite keyed on its
+  handle, so two entries with identical bodies stay two types,
 - re-registers extension kinds / ops / intrinsics from the preamble,
 - rebuilds the symbol names, buffer table, literal pool and per-node side-tables,
-- and runs **`HirVerifier` on load**.
+- and runs **`HirVerifier` on load** — on a module it ACCEPTED. A file the reader refuses is refused
+  by the reader's own diagnostics alone: the tree its error recovery built is never verified, so no
+  verifier line follows the one that names the cause. (Verifying such a tree used to kill the
+  process outright on a malformed signature; measured and fixed in P68.) Among what the verifier
+  refuses: a function whose declared type is not a signature, or whose signature leaves its result
+  or a parameter unresolved (`fn() -> invalid`) — one diagnostic per declaration, naming every hole.
+  `ok` is the verifier's own verdict, not a count of what the reporter stored: a module it refuses
+  fails every read, even a second read into a reporter that drops the repeat as a duplicate, and no
+  `--suppress` list can silence a refusal it makes (every error code it emits is protected).
 
 `emitHir(parseHir(emitHir(h)))` is byte-identical, and the checked-in fixtures are pinned on that
 property — as is **every program in `examples/c`**, each emitted at its own declared target and
@@ -547,7 +703,10 @@ them machine-readable, ask — nothing about the current design prevents it.
 |---|---|
 | contract + the `HirTextContext`/`HirParseResult` surfaces | [`src/hir/hir_text.hpp`](../src/hir/hir_text.hpp) |
 | emitter, parser, and the one type-text grammar | `src/hir/hir_text.cpp` |
+| the verifier `parseHir` runs on an accepted module (declared signatures included) | `src/hir/hir_verifier.{hpp,cpp}` |
 | the CLI mode and its exit-code contract | `src/program/cli_args.{hpp,cpp}`, `src/program/program.cpp` (`Program::emitHirText`) |
 | the front-end stage stop | `src/program/compile_pipeline.{hpp,cpp}` (`buildCuHir`) |
 | checked-in fixtures | `tests/hir/corpus/*.dsshir`, `tests/hir/lowering_goldens/*.dsshir` |
+| the codec, as tests (composites, cycles, layout channels, the spelling-work count, `return void`) | `tests/hir/test_hir_text.cpp` |
 | the consumer contract, as tests | `tests/program/test_emit_hir_mode.cpp` |
+| the shared type grammar (standalone texts keep inline composites and `rec <H>`) | [`ir-type-text.md`](./ir-type-text.md) |

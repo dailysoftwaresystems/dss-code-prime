@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
+#include <variant>
 #include <vector>
 
 using namespace dss;
@@ -53,7 +55,7 @@ RoundTrip roundTrip(Mir const& mir, TypeInterner const& interner,
     MirTextContext ctx{&interner, &names};
     std::string first = emitMir(mir, ctx, r1);
     auto parsed = parseMir(first, CompilationUnitId{1}, r2);
-    MirTextContext ctx2{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx2{&parsed->interner, nullptr, &parsed->symbolNames};
     std::string second = emitMir(parsed->mir, ctx2, r3);
     return {std::move(first), std::move(second), parsed->ok};
 }
@@ -119,7 +121,7 @@ TEST(MirTextOperandForms, IndirectBrRoundTripsThroughTheReader) {
 // input reaches it directly.
 TEST(MirTextOperandForms, HandWrittenIndirectBrIsReadBack) {
     std::string const text =
-        "dssir 1\n"
+        "dssir 3\n"
         "symbols {\n"
         "  %1 \"cg\"\n"
         "}\n"
@@ -139,7 +141,7 @@ TEST(MirTextOperandForms, HandWrittenIndirectBrIsReadBack) {
     auto parsed = parseMir(text, CompilationUnitId{1}, r);
     ASSERT_TRUE(parsed->ok);
     DiagnosticReporter r2;
-    MirTextContext ctx{&parsed->interner, &parsed->symbolNames};
+    MirTextContext ctx{&parsed->interner, nullptr, &parsed->symbolNames};
     std::string const reemit = emitMir(parsed->mir, ctx, r2);
     EXPECT_EQ(text, reemit);
 }
@@ -376,17 +378,18 @@ TEST(MirTextOperandForms, TheUndecodableTypeMarkerIsRefusedByNameAndWarnsOnce) {
 // `parseOp` arm: `unknown opcode 'foo'` named nothing at all. The set is
 // projected off the same `opcodeInfo` walk `opcodeFromMnemonic` performs.
 //
-// ⚠ NO FEED-BACK ARM HERE, AND THE REASON IS SPECIFIC RATHER THAN LAZINESS.
-// Every other vocabulary pin in this tree feeds each advertised spelling back
-// through the reader; for mnemonics that is not merely awkward, it is UNSAFE —
-// each opcode has its own operand shape, and a bare mnemonic reaches
-// `MirBuilder::addInst` with zero operands, which ABORTS THE PROCESS on the
-// arity guard. So this arm asserts membership on spellings that exist ONLY in
-// `opcodeInfo`, which a retyped literal list could not have supplied.
+// This arm asserts membership on spellings that exist ONLY in `opcodeInfo`,
+// which a retyped literal list could not have supplied. The FEED-BACK arm —
+// every advertised mnemonic, written bare, read back — lives beside the other
+// never-abort pins, in `test_mir_text_reader_never_aborts.cpp`
+// (`EveryAcceptedMnemonicWrittenBareReturns`). It could not live here when this
+// arm was written: a bare mnemonic reached `MirBuilder::addInst` with zero
+// operands and ABORTED THE PROCESS on the arity guard. Since P68 (lane `ht`) the
+// reader asks the builder's own bounds first and refuses by name.
 TEST(MirTextOperandForms, UnknownOpcodeRefusalNamesTheAcceptedSet) {
     DiagnosticReporter r;
     auto parsed = parseMir(
-        "dssir 1\nsymbols { %1 \"f\" }\nmodule {\n"
+        "dssir 3\nsymbols { %1 \"f\" }\nmodule {\n"
         "  function %1 : fn() -> void {\n    block %b1 [entry] {\n"
         "      nosuchopcode\n      return\n    }\n  }\n}\n",
         CompilationUnitId{1}, r);
@@ -427,11 +430,11 @@ TEST(MirTextOperandForms, AnUnknownTypeNameIsRefusedRatherThanAborting) {
         EXPECT_FALSE(parsed->ok);
         EXPECT_TRUE(named) << "the refusal must name the offending spelling";
     };
-    probe("dssir 1\nsymbols { %1 \"f\" %2 \"g\" }\nmodule {\n"
+    probe("dssir 3\nsymbols { %1 \"f\" %2 \"g\" }\nmodule {\n"
           "  global %2 : bogus = zero\n"
           "  function %1 : fn() -> void {\n    block %b1 [entry] {\n"
           "      return\n    }\n  }\n}\n");
-    probe("dssir 1\nsymbols { %1 \"f\" }\nmodule {\n"
+    probe("dssir 3\nsymbols { %1 \"f\" }\nmodule {\n"
           "  function %1 : bogus {\n    block %b1 [entry] {\n"
           "      return\n    }\n  }\n}\n");
 }
@@ -443,7 +446,7 @@ TEST(MirTextOperandForms, ARefusedFunctionHeaderDoesNotCascadeOverItsBody) {
     // is re-offered to the MODULE loop and refused in turn.
     DiagnosticReporter r;
     auto parsed = parseMir(
-        "dssir 1\nsymbols { %1 \"f\" }\nmodule {\n"
+        "dssir 3\nsymbols { %1 \"f\" }\nmodule {\n"
         "  function %1 : bogus {\n"
         "    block %b1 [entry] {\n      return\n    }\n"
         "    block %b2 {\n      return\n    }\n"
@@ -474,7 +477,7 @@ TEST(MirTextOperandForms, ARefusedFunctionHeaderDoesNotCascadeOverItsBody) {
 // (a well-formed instruction plus an unconsumed remainder) without needing one.
 TEST(MirTextOperandForms, UnconsumedOperandTailIsRefusedByName) {
     std::string const text =
-        "dssir 1\n"
+        "dssir 3\n"
         "symbols {\n"
         "  %1 \"f\"\n"
         "}\n"
@@ -499,4 +502,99 @@ TEST(MirTextOperandForms, UnconsumedOperandTailIsRefusedByName) {
     EXPECT_TRUE(sawTailRefusal)
         << "the refusal must NAME the leftover text; otherwise an author reads a "
            "diagnostic about the NEXT line";
+}
+
+// ── (d) `symaddr` — a global initializer's `&x` (P68 round 8, lane `ht`, part 1c-b) ──
+//
+// THE READER HAD NO ARM FOR IT: the writer spells a `MirSymbolAddrValue` as
+// `symaddr %N [+ addend]` — every `&global` initializer in C — and the reader
+// refused its own output as "unknown literal tag 'symaddr'". And `collectSymbols`
+// never declared N unless it was one of the module's own functions or globals, so
+// an EXTERN named only by an initializer lost its name in the text. No test spelled
+// `symaddr` at all.
+namespace {
+
+Mir symbolAddressGlobal(TypeInterner& ti, std::int64_t addend) {
+    TypeId const i32  = ti.primitive(TypeKind::I32);
+    TypeId const pi32 = ti.pointer(i32);
+    MirBuilder b;
+    MirLiteralValue lit;
+    lit.value = MirSymbolAddrValue{7, addend};
+    lit.core  = TypeKind::Ptr;
+    std::uint32_t const idx = b.literalPoolAdd(std::move(lit));
+    b.addGlobal(pi32, SymbolId{1}, idx, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false, MirThreadStorage::Shared);
+    return std::move(b).finish();
+}
+
+std::string symaddrDoc(std::string const& symbols, std::string const& value) {
+    return "dssir 3\nsymbols {\n" + symbols + "}\nmodule {\n  global %1 : ptr<i32> = lit " + value +
+           " : ptr\n}\n";
+}
+
+std::vector<std::string> readDiagnostics(std::string const& text, bool* ok = nullptr) {
+    DiagnosticReporter r;
+    auto const res = parseMir(text, CompilationUnitId{1}, r);
+    if (ok != nullptr) *ok = res->ok;
+    std::vector<std::string> out;
+    for (auto const& d : r.all()) out.push_back(d.actual);
+    return out;
+}
+
+bool mentions(std::vector<std::string> const& v, std::string_view needle) {
+    for (auto const& x : v) if (x.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+std::string listed(std::vector<std::string> const& v) {
+    std::string out;
+    for (auto const& x : v) { out += "\n    "; out += x; }
+    return out;
+}
+
+} // namespace
+
+TEST(MirTextOperandForms, ASymbolAddressInitializerRoundTripsAndDeclaresItsExtern) {
+    for (std::int64_t const addend : {std::int64_t{0}, std::int64_t{8}, std::int64_t{-16}}) {
+        TypeInterner ti{CompilationUnitId{1}};
+        Mir const m = symbolAddressGlobal(ti, addend);
+        std::vector<std::string> const names{"", "p", "", "", "", "", "", "ext"};
+        RoundTrip const rt = roundTrip(m, ti, names);
+        EXPECT_NE(rt.firstEmit.find("symaddr %7"), std::string::npos) << rt.firstEmit;
+        EXPECT_NE(rt.firstEmit.find("%7 \"ext\""), std::string::npos)
+            << "the extern the initializer names is missing from `symbols`:\n" << rt.firstEmit;
+        EXPECT_TRUE(rt.parseOk) << "the reader refused its own writer's `symaddr`:\n"
+                                << rt.firstEmit;
+        EXPECT_EQ(rt.firstEmit, rt.secondEmit);
+
+        DiagnosticReporter r;
+        auto const parsed = parseMir(rt.firstEmit, CompilationUnitId{1}, r);
+        ASSERT_TRUE(parsed->ok);
+        ASSERT_EQ(parsed->mir.moduleGlobalCount(), 1u);
+        MirGlobalId const g = parsed->mir.globalAt(0);
+        auto const* sa = std::get_if<MirSymbolAddrValue>(
+            &parsed->mir.literalValue(parsed->mir.globalInitLiteralIndex(g)).value);
+        ASSERT_NE(sa, nullptr) << "the initializer did not read back as a symbol address";
+        EXPECT_EQ(sa->symbol, 7u);
+        EXPECT_EQ(sa->addend, addend);
+        EXPECT_EQ(parsed->symbolNames.at(7), "ext");
+    }
+}
+
+TEST(MirTextOperandForms, ASymbolAddressNamingNoDeclaredSymbolIsRefused) {
+    bool ok = true;
+    auto const undeclared = readDiagnostics(symaddrDoc("  %1 \"p\"\n", "symaddr %9"), &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(mentions(undeclared,
+                         "symaddr names symbol %9, which the `symbols` preamble does not declare"))
+        << listed(undeclared);
+    auto const sentinel = readDiagnostics(symaddrDoc("  %1 \"p\"\n", "symaddr %0"), &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(mentions(sentinel, "symaddr names symbol %0, the invalid-symbol sentinel"))
+        << listed(sentinel);
+    auto const addend = readDiagnostics(
+        symaddrDoc("  %1 \"p\"\n  %7 \"ext\"\n", "symaddr %7 + x"), &ok);
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(mentions(addend, "expected an integer addend after `symaddr %7 +`, got 'x'"))
+        << listed(addend);
 }

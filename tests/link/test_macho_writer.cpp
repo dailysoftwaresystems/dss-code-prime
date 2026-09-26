@@ -74,8 +74,8 @@ namespace {
 
 namespace {
 
-// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; local LE
-// readers harmonized to the shared substrate at
+// At the 8aabc04 audit fold the local LE readers were harmonized
+// to the shared substrate at
 // `tests/link/link_test_support.hpp`. The fold left local copies
 // in this file dead-but-present; the 5ac97ae audit fold (4-agent
 // convergence: code-reviewer HIGH-1 + type-design Q5 + simplifier
@@ -639,7 +639,7 @@ TEST(MachOWriter, ObjectWeakDefinitionRoundTripsBackToWeakThroughDssReader) {
 // values — a well-formed object whose relocations name the wrong symbols.
 //
 // ★ Emitting an alias at all is safe under MH_SUBSECTIONS_VIA_SYMBOLS, and that
-// was MEASURED, not assumed: scripts/macho-alias-ld64-matrix, 8 cells on real
+// was MEASURED, not assumed: .harness-config/runner/actions/macho-alias-ld64-matrix, 8 cells on real
 // Apple Silicon (plain second label / `.alt_entry` / a clang `.globl`+`.set`
 // control, each × with and without `-dead_strip`, linked against a caller
 // referencing ONLY the alias, plus a canonical-only control). Every cell: both
@@ -1666,8 +1666,9 @@ TEST(MachOWriter, Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef) {
            "fabricated-extern break this pin guards";
     EXPECT_EQ(bytes[n1 + 5], 1u)             // n_sect = __text
         << "block symbol lives in __text";
-    // n_desc = N_ALT_ENTRY (0x0200) — D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS
-    // -BLOCK-LABEL-NOT-ATOM. n_type/n_sect/n_value above are byte-for-byte what
+    // n_desc = N_ALT_ENTRY (0x0200) —
+    // D-LINK-NONEXTERNAL-DEFINED-SYMBOL-READ-AS-BLOCK-LABEL-NOT-ATOM.
+    // n_type/n_sect/n_value above are byte-for-byte what
     // a file-local (`static`) whole FUNCTION also carries, so before this bit
     // existed nothing on the wire distinguished the two and the archive-member
     // reader had to guess from N_EXT — guessing wrong for every `static`
@@ -2173,6 +2174,8 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
       "sections": [
         { "kind": "text", "name": "__text", "segment": "__TEXT", "type": 2147484672, "flags": 0, "addrAlign": 16, "entrySize": 0, "virtualAddress": 4294975488 }
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations": [
         { "name": "X86_64_RELOC_BRANCH", "kind": 1, "nativeId": 369098752 },
         { "name": "X86_64_RELOC_UNSIGNED_8", "kind": 2, "nativeId": 100663296 },
@@ -2203,7 +2206,16 @@ TEST(MachOExecWriter, SchemaTextVaInconsistentWithTextFileOffFailsLoud) {
 
 // ── Non-zero addend fails loud (Mach-O has no Rela addend) ─────
 
-TEST(MachOWriter, NonZeroAddendFailsLoud) {
+TEST(MachOWriter, NonZeroAddendIsWrittenIntoThePatchedField) {
+    // Mach-O's relocation_info has no addend column: an x86_64 addend lives in
+    // the PATCHED FIELD (`relocationAddends: inPlace`). This test used to
+    // demand a refusal of a non-zero `.text` addend. Every x86_64 producer
+    // writes one there (✔MEASURED 2026-09-23: clang 18.1.3 writes `fc ff ff
+    // ff` for `movl $5, counter(%rip)`, SIGNED_4), and an assembler emitting
+    // that instruction needs it. So the writer STAMPS it through the one owner
+    // of the rule (`link/format/relocation_addend.hpp`), and the reader gives
+    // it back. An arm64 instruction field still cannot hold one; that refusal
+    // belongs to the helper and is pinned with the arm64 relocations.
     auto loaded = loadShipped();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -2217,11 +2229,25 @@ TEST(MachOWriter, NonZeroAddendFailsLoud) {
     rel.addend = -4;
     caller.relocations.push_back(rel);
     mod.functions.push_back(std::move(caller));
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "_caller", SymbolBinding::Global,
+                                SymbolVisibility::Default}};
+    mod.externImports = {ExternImport{SymbolId{2}, "_callee", "", /*isData=*/false}};
 
     DiagnosticReporter rep;
     auto bytes = encodeUntrampolined(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    std::vector<std::uint8_t> const stamped{0xE8, 0xFC, 0xFF, 0xFF, 0xFF};
+    EXPECT_NE(std::search(bytes.begin(), bytes.end(), stamped.begin(), stamped.end()),
+              bytes.end())
+        << "the call's field must hold the addend -4 in place";
+
+    DiagnosticReporter rrep;
+    auto read = macho::readRelocatableObject(bytes, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(read.has_value()) << "errors=" << rrep.errorCount();
+    ASSERT_EQ(read->functions.size(), 1u);
+    ASSERT_EQ(read->functions[0].relocations.size(), 1u);
+    EXPECT_EQ(read->functions[0].relocations[0].addend, -4);
 }
 
 // ── Multi-function module exercises running-offset arithmetic ──
@@ -2841,13 +2867,14 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
 // ── New tests folded from 7-agent review of LK3 cycle 2 ────────
 
 TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
-    // c153 (D-LK3-3): MH_DYLIB is a SUPPORTED filetype now, but a
-    // dylib schema missing its image identity (installName, a
-    // loadDylibs entry, text VA == segmentPageSize) is still
-    // rejected by the dylib shape rules — the bare-minimum JSON that
-    // pre-c153 rejected on the filetype itself keeps failing, for
-    // the precise per-field reasons. (The ACCEPTED full dylib shape
-    // is pinned in test_macho_dylib_writer.cpp.)
+    // A dylib schema missing its image identity (installName, a
+    // loadDylibs entry, text VA == segmentPageSize) is rejected by the
+    // dylib shape rules, for the precise per-field reasons: the
+    // bare-minimum JSON that pre-c153 rejected on the filetype itself
+    // keeps failing.
+    // MH_DYLIB itself is a SUPPORTED filetype since c153, which is what
+    // `D-LK3-3` delivered; the ACCEPTED full dylib shape is pinned in
+    // test_macho_dylib_writer.cpp.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
       "cSymbolDecoration": { "scheme": "leading-underscore" },
@@ -3431,6 +3458,8 @@ TEST(MachOExecWriter, BindNowFalseFailsLoudCitingDLK613) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -3619,6 +3648,8 @@ loadChainedFixupsExecFormat() {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -3678,6 +3709,8 @@ loadChainedFixupsExecFormatWithData() {
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392},
         {"kind":"data","name":"__data","segment":"__DATA","type":0,"flags":0,"addrAlign":8,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -3900,6 +3933,8 @@ loadLegacyBindingExecFormat() {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -4103,6 +4138,8 @@ loadDataImportExecFormat(bool useChainedFixups) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},
@@ -4453,7 +4490,7 @@ TEST(MachOExecWriter, ChainedFixupsStartsInImageTracksTheImageSegmentCount) {
     }
 }
 
-// D-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be
+// PIN-LK6-14-SIZEOFCMDS-DELTA-PIN: chained path's sizeofcmds must be
 // exactly `kDysymtabCommandSize` (80) less than legacy path's (since
 // LC_DYSYMTAB is dropped on chained). Pins the ncmds/sizeofcmds
 // arithmetic against subtle drift.
@@ -4542,7 +4579,7 @@ TEST(MachOExecWriter, ChainedFixupsMultiPageGotFailsLoud) {
     constexpr std::uint32_t kPageSize    = 4096u;
     constexpr std::uint32_t kSlotSize    = 8u;
     constexpr std::uint32_t kSpillCount  = (kPageSize / kSlotSize) + 1u;
-    // FIXTURE-INVARIANT (D-TEST-MULTI-PAGE-FIXTURE-INVARIANT): all
+    // FIXTURE-INVARIANT (PIN-TEST-MULTI-PAGE-FIXTURE-INVARIANT): all
     // 513 externs share libSystem (libOrdinal=1 << 127 ceiling) and
     // the symbols-pool stays under 8 MiB (D-LK6-14-NAME-OFFSET-OVERFLOW).
     // The SOLE failure surface this fixture probes is
@@ -4951,6 +4988,8 @@ TEST(MachOExecWriter, MultipleExternsInTwoLibrariesEmitTwoLcLoadDylibRefs) {
       "sections":[
         {"kind":"text","name":"__text","segment":"__TEXT","type":2147484672,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":4294971392}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "subsectionsWhenDeclared",
       "relocations":[
         {"name":"X86_64_RELOC_BRANCH","kind":1,"nativeId":369098752},
         {"name":"X86_64_RELOC_UNSIGNED_8","kind":2,"nativeId":100663296},

@@ -209,6 +209,10 @@ roundTripVerify(TargetSchema const&            schema,
                 }
                 break;
             case LirOperandKind::SymbolRef:
+            // P68 round 9: a symbol plus a constant in a symbol position
+            // (`adrp x0, msg+8`) reaches the same symbol-bearing slot; its
+            // constant is the relocation's addend, never the field's bits.
+            case LirOperandKind::SymbolAddress:
                 // Symbol-bearing slots: disasm reports nullopt
                 // (D-AS5-3). The full symbol-identity check is the
                 // caller's Relocation cross-reference. Confirm the
@@ -253,8 +257,12 @@ roundTripVerify(TargetSchema const&            schema,
             }
             case LirOperandKind::None:
             case LirOperandKind::BlockRef:
+            // P68 round 9: the location counter is resolved at assemble time
+            // like a block reference — no round-trip value to compare.
+            case LirOperandKind::LocationCounter:
             case LirOperandKind::MemBase:
             case LirOperandKind::MemOffset:
+            case LirOperandKind::MemSymbolOffset:
                 report(reporter, DiagnosticCode::A_RoundTripMismatch,
                        DiagnosticSeverity::Error,
                        std::format("round-trip: opcode '{}' wire {} "

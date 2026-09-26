@@ -109,6 +109,30 @@ HirAsmConstraintParse parseAsmConstraint(std::string_view raw) {
         }
     }
 
+    // ★★ A SPELLING OF DECIMAL DIGITS ONLY IS A **MATCHING** CONSTRAINT (P68,
+    // D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER) — the NUMBER of
+    // the operand whose location this one shares. GNU grammar, so it is decided
+    // HERE with no target consulted, and `letter` stays empty: a target that
+    // "declared" a digit would be claiming a grammar word as a machine letter,
+    // which is exactly how every `"0"` used to be refused as an undeclared
+    // letter. The value is bounded (at most nine digits, so it cannot overflow)
+    // and a longer run is left to the caller's range check as the out-of-range
+    // operand number it is. A digit MIXED with letters (`"r0"`) is not this
+    // shape: it reaches the target as one spelling and is refused as undeclared.
+    bool allDigits = true;
+    for (char const c : spelling) {
+        if (c < '0' || c > '9') { allDigits = false; break; }
+    }
+    if (allDigits) {
+        std::uint32_t n = 0;
+        std::size_t const width = spelling.size() < 9 ? spelling.size() : 9;
+        for (std::size_t k = 0; k < width; ++k)
+            n = n * 10 + static_cast<std::uint32_t>(spelling[k] - '0');
+        if (spelling.size() > 9) n = 0xFFFFFFFFu;   // beyond any operand list
+        out.value.matchedOperand = n;
+        return out;
+    }
+
     out.value.letter.assign(spelling);
     return out;
 }

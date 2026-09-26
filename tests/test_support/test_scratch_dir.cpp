@@ -75,7 +75,7 @@ TEST(ScratchDirSubstrate, DifferentGroupsLandUnderDifferentSubdirs) {
     EXPECT_NE(a.path().parent_path(), b.path().parent_path());
 }
 
-// TF-C58 (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`) red-on-disable.
+// TF-C58 (the examples-runner parallel-contention flake) red-on-disable.
 // A STALE directory sitting on the slot the ctor is about to draw must be
 // STEPPED OVER, never reused. `MultipleScratchDirsGetDistinctPaths` above does
 // NOT catch this — the counter advances anyway, so it stayed green through the
@@ -150,7 +150,7 @@ TEST(ScratchDirSubstrate, OriginalCwdMatchesCurrentPathAtCtor) {
 //
 // ★★ WHY A PIN AND NOT JUST A FIX: the local gate is structurally incapable of
 // catching this. 8.3 shortening applies only to a component longer than 8
-// characters, and the local user directory is `rafae` (5) — short spelling ==
+// characters, and the local user directory is five characters long — short spelling ==
 // long spelling, so every such assertion is trivially satisfied here and would
 // stay green through any regression. A fix with no pin would be re-broken by
 // the next person who adds a fixture path, and re-discovered by CI.

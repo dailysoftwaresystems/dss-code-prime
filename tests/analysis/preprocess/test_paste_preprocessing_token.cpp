@@ -68,7 +68,7 @@ using namespace dss;
         auto loaded = GrammarSchema::loadShipped("c");
         if (!loaded.has_value()) {
             // THROW, never abort: an abort kills the whole binary and every
-            // sibling test loses its verdict (scripts/check-no-abort-in-tests).
+            // sibling test loses its verdict (.harness-config/runner/actions/check-no-abort-in-tests).
             throw std::runtime_error{"loadShipped(c) failed"};
         }
         return *loaded;

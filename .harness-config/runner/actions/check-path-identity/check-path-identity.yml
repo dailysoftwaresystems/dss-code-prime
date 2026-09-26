@@ -1,0 +1,14 @@
+# PURPOSE: refuse a second path canonicalizer -- path resolution lives in exactly one place.
+name: check-path-identity
+description: >-
+  The action refuses a second path canonicalizer, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `path_identity_guard`.
+steps:
+  - name: verify-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-path-identity.py
+    successPattern: 'check-path-identity selftest: OK'
+    requireInputsUnmoved: true

@@ -18,16 +18,17 @@ This is the property that distinguishes a *sweep* from a spot-fix. It is proven,
 
 Three habits address plan drift at three different scopes:
 
-- **`dss-cycle` step 8** updates the plans *in the same commit as the code*, per cycle — tactical,
+- **`dss-cycle` step 9** updates the plans *in the same commit as the code*, per cycle — tactical,
   keeps things tidy as work lands.
 - **`dss-audit` §I** fixes trivial staleness it *happens* to trip over — incidental, a side effect of
   auditing something else.
 - **`dss-plan-sweep`** (this skill) sweeps *all* plans *systematically* and reconciles *everything* —
   the formalization of the repo's existing "Plans staleness sweep" commits.
 
-The plans are a living contract: `.plans/NN-name - {ok,tbd}.md`, all three
-`_deferred-anchor-registry*.md` documents (`-production` / `-harness` hold what is LEFT; `-done`
-is the archive a closed row is MOVED to),
+The plans are a living contract: `.plans/NN-name - {ok,tbd}.md`, both
+`_deferred-anchor-registry*.md` documents (`-production` holds what is LEFT; `-done`
+is the archive a closed row is MOVED to — ⚠ there were three until the harness registry retired on
+2026-09-16),
 `README.md`, and the sibling skills. Over a burst of cycles they drift — a count moves, a "pending
 push" gets pushed, an anchor is struck in one plan but left open in another, a `⏳ planned` lands, a
 description outlives the code it described.

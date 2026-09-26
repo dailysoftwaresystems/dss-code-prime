@@ -1,0 +1,35 @@
+{
+  "$comment": "`long double` ARGUMENTS PASSED ON THE STACK and a `_Complex long double` RETURN, end to end (D-LIR-AAPCS64-LONG-DOUBLE-ARG-PAST-V7-REFUSED, D-LIR-AAPCS64-COMPLEX-LONG-DOUBLE-RETURN-PIECE-REFUSED). The discriminating arm is aarch64 Linux, where a binary128 past v7 is stacked 16-byte aligned and 16 bytes wide and a complex binary128 returns in q0:q1; each argument is a distinct value, so a datum read from its neighbour's slot fails its own check (exit 11–16, one per shape — `main.c` lists them). ✔MEASURED 2026-09-19: aarch64-linux-gnu-gcc 13.3.0 and clang 18.1.3 run it to 42 at -O0 and -O2 under qemu-aarch64; the P68 round-7 base refused every stacked `long double` on both sides of the call and the complex return. ⓘ Portable C: on x86_64 Linux `long double` is the x87 value (stack-passed by the ABI), on Windows and Apple arm64 it IS `double`, so every target runs the same program. ★ The `release` arm: every argument is scaled by a `volatile` seed, so the optimized pipeline still has to pass it.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

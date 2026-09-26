@@ -13,6 +13,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/tree_node.hpp"
 #include "core/types/type_lattice/core_type.hpp"
+#include "core/types/wide_string_encode.hpp"   // decodeWideCharCodepoint (the value tier's decode)
 #include "hir/const_eval.hpp"
 #include "hir/const_eval_arith.hpp"
 #include "hir/const_eval_operators.hpp"
@@ -24,6 +25,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -210,7 +212,7 @@ public:
               SourceBuffer const& synth, SourceBuffer const& scratch,
               LiteralKinds const& lits, DiagnosticReporter& rep,
               BufferId diagBufferId, std::string_view productTail,
-              std::optional<bool> charIsUnsigned)
+              PpCharConstantFacts const& charFacts)
         : toks_(std::move(toks)),
           schema_(schema),
           synth_(synth),
@@ -232,9 +234,9 @@ public:
           // ⓘ NO DATA MODEL ACCOMPANIES IT, and that is a property of C 6.10.1p4
           // rather than an omission: at phase-4 widths every candidate is 64
           // bits, so a WIDTH model cannot reach the signedness answer. See
-          // `preprocessorLiteralSignedness`.
+          // `preprocessorLiteral`.
           intLadder_(schema.semantics().integerLiteralTyping),
-          charIsUnsigned_(charIsUnsigned) {
+          charIsUnsigned_(charFacts.charIsUnsigned) {
         // The string-literal OPENER (C's `"`). A string literal lexes as an
         // opener token (`StringStart`) + a coalesced body; the body's schema
         // kind is in `lits_.string`, but the FIRST token the parser meets is the
@@ -248,16 +250,24 @@ public:
         // char constant in `#if` is an INT whose value is the (escape-decoded)
         // single byte (C 6.10.1p4 + 6.4.4.4). Both invalid ⇒ the language has no
         // char-literal form (toy/tsql) and the arm never fires.
-        // CYCLE B (C11/C23 6.4.4.4 wide/UTF chars): ONLY the narrow `'` opener is
-        // recognized here. A WIDE opener (`L'`/`u'`/`U'`/`u8'`) in `#if` is left
-        // UNHANDLED ON PURPOSE — it is not `charOpenKind_`, not an integer, and not a
-        // Word token, so `parsePrimary` falls through to its fail-loud "unexpected
-        // token in #if" (VERIFIED: `#if L'A'` → P_PreprocessorDirective, never a
-        // silent 0). Wide char constants in a `#if` controlling expression (their
-        // int value + the execution-charset mapping) are a later cycle; until then
-        // the honest behavior is a hard error, NOT a silent misevaluation.
         charOpenKind_ = schema_.hirLowering().charStartToken;
         charBodyKind_ = schema_.hirLowering().charBodyToken;
+        // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
+        // the WIDE/UTF openers (`L'`/`u'`/`U'`/`u8'`) are every char-literal-prefix
+        // row but the narrow one — read from the grammar, never spelled here — and
+        // each one's element core on the pair comes from the caller's facts. A
+        // declared opener whose core the pair does not supply refuses, loud, in
+        // `wideCharOperand`: it used to fall through to "unexpected token in #if"
+        // for every prefix, which gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0
+        // all accept (✔MEASURED, `#if L'a' == 97`).
+        for (auto const& px : schema_.hirLowering().charLiteralPrefixes) {
+            if (!px.startToken.valid()) continue;
+            if (charOpenKind_.valid() && px.startToken.v == charOpenKind_.v) continue;
+            wideOpeners_.insert(px.startToken.v);
+        }
+        for (auto const& [opener, core] : charFacts.wideCoreByOpener) {
+            wideCoreByOpener_.emplace(opener.v, core);
+        }
         // D-TOK-CLOSING-DELIMITER-HAS-NO-TOKEN: the closing `'` is a real token
         // now, so the char arm must CONSUME it or `evaluate()`'s end-of-run check
         // reports "trailing tokens after #if controlling expression" for the
@@ -388,6 +398,10 @@ private:
     // 0–127 bodies that are every real program still fold; only a high byte
     // refuses, loud.
     std::optional<bool>           charIsUnsigned_{};
+    // P68 round 9: the language's WIDE/UTF char openers, and the element core
+    // each has on the pair (`PpCharConstantFacts::wideCoreByOpener`).
+    std::unordered_set<std::uint32_t>              wideOpeners_;
+    std::unordered_map<std::uint32_t, TypeKind>    wideCoreByOpener_;
     std::size_t                   pos_ = 0;
     bool                          failed_ = false;
 
@@ -644,35 +658,53 @@ private:
         return condTrue ? std::move(*thenOpt) : std::move(*elseOpt);
     }
 
-    // ── D-PP-IF-UNSIGNED-INTMAX: is this integer literal SIGNED? ─────────────
+    // ── D-PP-IF-UNSIGNED-INTMAX: this integer literal's #if OPERAND ─────────
     //
-    // Delegated whole to `preprocessorLiteralSignedness` -- the language's own
-    // C 6.4.4.1 candidate ladder, run at C 6.10.1p4's phase-4 widths. The suffix
-    // match, the radix classification and the candidate order all come from
-    // `semantics.integerLiteralTyping`; nothing about which suffixes exist or
-    // what they admit is known here.
-    [[nodiscard]] std::optional<bool>
-    literalSignedness(std::string_view text, std::uint64_t magnitude) {
+    // Delegated whole to `preprocessorLiteral` -- the language's own C 6.4.4.1
+    // candidate ladder, run at C 6.10.1p4's phase-4 widths, and since P68 round 13
+    // (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED) the fixed-type rules too, whose
+    // VALUE is the magnitude reduced to their type (`#if 300i8 == 44`). The suffix
+    // match, the radix classification, the candidate order and the reduction all
+    // come from `semantics.integerLiteralTyping`; nothing about which suffixes
+    // exist or what they mean is known here.
+    [[nodiscard]] std::optional<PhaseFourLiteral>
+    literalOperand(std::string_view text, std::uint64_t magnitude) {
         // A language that declares no ladder (toy / tsql) keeps the signed
         // reading it has always had -- now at intmax width rather than 32 bits.
         // The identity property: no ladder, no change in signedness.
-        if (intLadder_.empty()) return true;
-
-        auto const sgn = preprocessorLiteralSignedness(text, numberStyle_,
-                                                       intLadder_, magnitude);
-        if (!sgn.has_value()) {
-            // No rule covers the matched suffix, or a candidate's signedness is
-            // not model-invariant. The loader cross-checks both, so this is
-            // substrate drift. The semantic tier ABORTS here; a preprocessor
-            // reports instead -- but it still REFUSES rather than guessing a
-            // signedness, because a guess selects a wrong branch in silence,
-            // which is the entire defect this row exists to remove.
-            fail(DiagnosticCode::P_PreprocessorDirective,
-                 "integer literal in #if matched no integerLiteralTyping rule "
-                 "(config invariant violated): " + std::string{text});
-            return std::nullopt;
+        if (intLadder_.empty()) {
+            return PhaseFourLiteral{PhaseFourLiteralStatus::Operand, magnitude, true};
         }
-        return *sgn;
+
+        PhaseFourLiteral const lit = preprocessorLiteral(
+            text, numberStyle_, intLadder_, magnitude, charIsUnsigned_);
+        switch (lit.status) {
+            case PhaseFourLiteralStatus::Operand:
+                return lit;
+            case PhaseFourLiteralStatus::CharSignednessUnknown:
+                // A `char`-typed literal (`i8`) reads at plain char's signedness,
+                // which C 6.2.5p15 leaves to the implementation and the TARGET
+                // declares -- and this run was given none (the LSP, the direct
+                // API). Refuse rather than pick one: the branch depends on it.
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "a literal whose type is plain `char` in #if takes that "
+                     "type's signedness, which is target-dependent (C 6.2.5p15), "
+                     "and no target was supplied to this preprocessor run: "
+                     + std::string{text});
+                return std::nullopt;
+            case PhaseFourLiteralStatus::NoRule:
+                break;
+        }
+        // No rule covers the matched suffix, or a candidate's signedness is not
+        // model-invariant. The loader cross-checks both, so this is substrate
+        // drift. The semantic tier ABORTS here; a preprocessor reports instead --
+        // but it still REFUSES rather than guessing a signedness, because a guess
+        // selects a wrong branch in silence, which is the entire defect this row
+        // exists to remove.
+        fail(DiagnosticCode::P_PreprocessorDirective,
+             "integer literal in #if matched no integerLiteralTyping rule "
+             "(config invariant violated): " + std::string{text});
+        return std::nullopt;
     }
 
     // ── D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING (C 6.10.1p4) ────────────
@@ -682,22 +714,21 @@ private:
     // default, and then evaluate exactly as DSS does — so this is a warning, not
     // a refusal, and the branch is unaffected.
     //
-    // ★ THE CONDITION IS RE-DERIVED FROM THE LADDER'S OWN VERBS, never from a
-    // hand-parsed suffix: `matchIntegerSuffix` and `integerLiteralIsPrefixed`
-    // are the SAME two the ladder used to reach its answer, so "was this
-    // reinterpreted" cannot drift from "what signedness did we use". A `u`-
-    // suffixed or hexadecimal literal reaches unsigned through a rule that
-    // ADMITS unsigned candidates — nothing was reinterpreted, and neither
-    // reference warns (both measured; see the diagnostic's note).
+    // ★ THE CONDITION IS THE LADDER'S OWN REPORT (`reinterpretedUnsigned`), never
+    // a hand-parsed suffix: the function that chose the unsigned reading says
+    // whether it chose it for a SIGNED type, so "was this reinterpreted" cannot
+    // drift from "what signedness did we use". A `u`-suffixed or hexadecimal
+    // literal reaches unsigned through a rule that ADMITS unsigned candidates —
+    // nothing was reinterpreted, and neither reference warns (both measured; see
+    // the diagnostic's note). Since P68 round 13 the report also covers a `wb`
+    // literal past INTMAX_MAX, which clang 18.1.3 reads unsigned with the same
+    // warning (D-PP-IF-BIT-PRECISE-LITERAL-READS-UNSIGNED).
     //
-    // ⓘ A language with no ladder never gets here: `literalSignedness` returns
-    // signed for that case and this predicate is false.
-    void warnIfImplicitlyUnsigned(std::string_view text, bool isSigned,
+    // ⓘ A language with no ladder never gets here: `literalOperand` returns a
+    // signed operand for that case and the report is false.
+    void warnIfImplicitlyUnsigned(std::string_view text, PhaseFourLiteral const& lit,
                                   SourceSpan span) {
-        if (isSigned) return;
-        if (intLadder_.empty()) return;
-        if (!matchIntegerSuffix(text, numberStyle_).empty()) return;  // suffixed
-        if (integerLiteralIsPrefixed(text, numberStyle_)) return;     // non-decimal
+        if (!lit.reinterpretedUnsigned) return;
         ParseDiagnostic d;
         d.code     = DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned;
         d.severity = DiagnosticSeverity::Warning;
@@ -707,8 +738,8 @@ private:
                    + "' is too large for a signed intmax_t and is interpreted as "
                      "UNSIGNED in this #if (C 6.10.1p4). A comparison against a "
                      "negative operand therefore converts that operand to "
-                     "uintmax_t and can select the opposite branch; add a 'u' "
-                     "suffix to say so, or use a value that fits intmax_t.";
+                     "uintmax_t and can select the opposite branch; spell it "
+                     "unsigned to say so, or use a value that fits intmax_t.";
         rep_.report(std::move(d));
     }
 
@@ -854,10 +885,99 @@ private:
                      + std::string{textOf(bodyTok)});
                 return std::nullopt;
             }
+            // ★ AND ITS `#if` READING IS SIGNED ONLY WHERE PLAIN `char` IS
+            // (D-PP-IF-NARROW-CHARACTER-CONSTANT-IGNORES-PLAIN-CHAR-SIGNEDNESS). This
+            // arm used to hand every narrow constant to `intmaxOperand` as SIGNED,
+            // so on aarch64 Linux — plain `char` unsigned — `#if 'a' - 98 < 0` took
+            // the `#if` arm where gcc 13.3.0 and clang 18.1.3 take the `#else`
+            // (✔MEASURED at 4d9a24c4: DSS exit 7 where the references exit 42): the
+            // references read a character constant in `#if` as `uintmax_t` iff its
+            // element type is unsigned, the rule `PpCharConstantFacts` records.
+            // With no pair the reading is `int`'s (C 6.4.4.4p10), signed.
             return intmaxOperand(
                 static_cast<std::uint64_t>(narrowCharConstantValue(
                     *cp, charIsUnsigned_.value_or(false))),
-                /*isSigned=*/true);
+                /*isSigned=*/!charIsUnsigned_.value_or(false));
+        }
+
+        // P68 round 9 (D-C-PREFIXED-CHARACTER-CONSTANT-IS-NOT-A-CONSTANT-EXPRESSION):
+        // a WIDE/UTF character constant — `L'a'`, `u'a'`, `U'a'`, `u8'a'` — the
+        // narrow arm's three-token shape behind its own opener. Its VALUE is the
+        // code unit read as the element type, decoded by the SHARED
+        // `decodeWideCharCodepoint` the value tier runs (so an escape too wide for
+        // the element is refused here exactly as there), and its `#if` reading is
+        // signed iff that element type is (`PpCharConstantFacts`).
+        if (wideOpeners_.contains(t.schemaKind.v)) {
+            SchemaTokenId const opener = t.schemaKind;
+            std::string spelled{textOf(t)};
+            advance();   // consume the prefixed opener
+            if (atEnd() || !charBodyKind_.valid()
+                || peek().schemaKind != charBodyKind_) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "malformed character constant in #if expression");
+                return std::nullopt;
+            }
+            Token const bodyTok = peek();
+            spelled += std::string{textOf(bodyTok)};
+            advance();   // consume the body
+            if (charCloseKind_.valid() && !atEnd()
+                && peek().schemaKind == charCloseKind_) {
+                spelled += std::string{textOf(peek())};
+                advance();   // consume the closer
+            }
+            auto const coreIt = wideCoreByOpener_.find(opener.v);
+            if (coreIt == wideCoreByOpener_.end()) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "the character constant " + spelled + " in #if has no element "
+                     "type here: its prefix names a platform type (such as wchar_t) "
+                     "that this target and object format do not declare, or no "
+                     "target was supplied to this preprocessor run");
+                return std::nullopt;
+            }
+            TypeKind const core = coreIt->second;
+            WideCharError err = WideCharError::ValueUnrepresentable;
+            auto const unit = decodeWideCharCodepoint(textOf(bodyTok), core, &err);
+            if (!unit.has_value()) {
+                char const* why = "its value does not fit its element type";
+                switch (err) {
+                    case WideCharError::EscapeValueTooWide:
+                        why = "an escape names a value wider than one code unit of "
+                              "its element type";
+                        break;
+                    case WideCharError::NotSingleCodepoint:
+                        why = "it is empty or names more than one character";
+                        break;
+                    case WideCharError::MalformedEscape:
+                    case WideCharError::InvalidUniversalName:
+                        why = "it has a malformed escape";
+                        break;
+                    case WideCharError::IllFormedUtf8:
+                        why = "its source bytes are not well-formed UTF-8";
+                        break;
+                    case WideCharError::Utf8UnitOutOfRange:
+                    case WideCharError::ValueUnrepresentable:
+                        break;
+                }
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "the character constant " + spelled + " in #if cannot be "
+                     "evaluated: " + why);
+                return std::nullopt;
+            }
+            // The element's width and sign from the ONE table the fold arithmetic
+            // reads (`intKindInfo`); no plain-`char` core reaches here.
+            auto const info = detail::intKindInfo(core, std::nullopt);
+            if (!info.has_value()) {
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "the character constant " + spelled + " in #if has an element "
+                     "type that is not an integer type");
+                return std::nullopt;
+            }
+            std::uint64_t value = static_cast<std::uint64_t>(*unit);
+            if (info->isSigned && info->bits < 64) {
+                std::uint64_t const sign = std::uint64_t{1} << (info->bits - 1);
+                value = (value ^ sign) - sign;   // sign-extend the element's bits
+            }
+            return intmaxOperand(value, info->isSigned);
         }
 
         // Integer literal (real, or a synthetic `defined`-result).
@@ -893,10 +1013,10 @@ private:
             // next token (the reference carets sit under the digits).
             SourceSpan const litSpan = t.span;
             advance();
-            auto const signedness = literalSignedness(text, *iv);
-            if (!signedness.has_value()) return std::nullopt;   // already reported
-            warnIfImplicitlyUnsigned(text, *signedness, litSpan);
-            return intmaxOperand(*iv, *signedness);
+            auto const operand = literalOperand(text, *iv);
+            if (!operand.has_value()) return std::nullopt;   // already reported
+            warnIfImplicitlyUnsigned(text, *operand, litSpan);
+            return intmaxOperand(operand->bits, operand->isSigned);
         }
 
         // Any other identifier that survived expansion -> 0 (C 6.10.1p4), which
@@ -1344,7 +1464,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
                    DiagnosticReporter&      rep,
                    PpHasEmbed const&        hasEmbed,
                    PpOperatorRevoked const& operatorRevoked,
-                   std::optional<bool>      charIsUnsigned,
+                   PpCharConstantFacts const& charFacts,
                    PpTokenTextFn const&     textOf,
                    PpEmbedFail const&       fail) {
     std::string const& definedKw = schema.preprocess().definedOperator;
@@ -1389,7 +1509,7 @@ evaluateEmbedLimit(std::span<Token const>   clause,
         [](std::vector<Token> const& run) { return run; };
     auto const value = evaluateIfExpressionValue(
         expanded, schema, identity, isDefined, hasInclude, synth, productText,
-        rep, hasEmbed, operatorRevoked, charIsUnsigned);
+        rep, hasEmbed, operatorRevoked, charFacts);
     if (!value.has_value()) {
         fail(anchor, "embed limit(...) is not an integer constant expression "
                      "(C23 6.10.4.2p1); see the preceding diagnostic");
@@ -1417,12 +1537,12 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      DiagnosticReporter&    rep,
                      PpHasEmbed const&      hasEmbed,
                      PpOperatorRevoked const& operatorRevoked,
-                     std::optional<bool>    charIsUnsigned) {
+                     PpCharConstantFacts const& charFacts) {
     // C 6.10.2p12: the question asked of the value is whether it "evaluates to
     // nonzero" -- the value engine below is the whole implementation.
     auto const value = evaluateIfExpressionValue(
         operandTokens, schema, macroExpand, isDefined, hasInclude, synth,
-        productText, rep, hasEmbed, operatorRevoked, charIsUnsigned);
+        productText, rep, hasEmbed, operatorRevoked, charFacts);
     if (!value.has_value()) return std::nullopt;
     return value->bits != 0;
 }
@@ -1438,7 +1558,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                           DiagnosticReporter&    rep,
                           PpHasEmbed const&      hasEmbed,
                           PpOperatorRevoked const& operatorRevoked,
-                          std::optional<bool>    charIsUnsigned) {
+                          PpCharConstantFacts const& charFacts) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
     // D-PP-HAS-EXTENSION-BUILTIN-ABSENT: every operator arm below is gated on
     // this. An operator the program has `#undef`'d is no longer an operator —
@@ -2020,7 +2140,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
                                  lim->clauseEnd - lim->clauseBegin),
                     toks[lim->nameIndex], schema, macroExpand, isDefined,
                     hasInclude, synth, productText, rep, hasEmbed,
-                    operatorRevoked, charIsUnsigned, freshWordOf, failParam);
+                    operatorRevoked, charFacts, freshWordOf, failParam);
                 // The nested expansion may have grown (and moved) the tail.
                 tail = productText ? productText() : std::string_view{};
                 if (!limit.has_value()) break;   // reported through failParam
@@ -2163,7 +2283,7 @@ evaluateIfExpressionValue(std::span<Token const> operandTokens,
     }
 
     IceParser parser{std::move(nonTrivia), schema, synth,    *scratchBuf, lits,
-                     rep,                  synth.id(), tail, charIsUnsigned};
+                     rep,                  synth.id(), tail, charFacts};
     return parser.evaluateValue();
 }
 

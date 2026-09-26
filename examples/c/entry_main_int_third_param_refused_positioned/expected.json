@@ -1,0 +1,17 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: a `main` whose signature matches no declared entry row is refused AT ITS DECLARATOR with a REAL SPAN (S_EntryShapeNotDeclared). This example used to refuse `int main(int, char**, char**)`, which is now SUPPORTED on every exec format (entry_main_envp); the refusal mechanism stays, so its pin moved to a third parameter no reference gives a meaning. MEASURED 2026-09-24 on `int main(int, char**, int)`: clang 18.1.3 refuses it (`third parameter of 'main' (environment) must be of type 'char **'`), gcc 13.3.0 and mingw-w64 gcc 13.2.0 warn (-Wmain), MSVC 19.51 accepts it silently. * THE SPAN IS THE POINT, hence `positioned: true` with an exact line:col: the predecessor check ran at the MIR tier, where `Mir` carries no BufferId/SourceSpan for a function. If the check regresses to a span-less tier this example goes RED even though the same code is still emitted. * THE CHECK IS FORMAT-INDEPENDENT, so a relocatable .o is refused too. * RED-ON-DISABLE: add a row fn(i32, ptr-ptr-char, i32) -> i32 to `main` in c.lang.json and this stops erroring -- and the language loader refuses that edit first (no verb materializes that list), the guard behind the guard.",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "S_EntryShapeNotDeclared",
+      "line": 32,
+      "col": 5
+    }
+  ]
+}

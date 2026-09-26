@@ -495,14 +495,14 @@ TEST(TypeInterner, FnSigEncodesResultParamsAndCc) {
     EXPECT_EQ(ti.fnResult(thunk).v, i32.v);
     EXPECT_TRUE(ti.fnParams(thunk).empty());
 
-    // D-LANG-VARIADIC (step 13.4): the 3-arg overload encodes non-
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): the 3-arg overload encodes non-
     // variadic (scalars=[cc], length 1) — backward-compat default
     // for every pre-13.4 call site.
     EXPECT_FALSE(ti.fnIsVariadic(sig));
 }
 
 TEST(TypeInterner, FnSigVariadicEncodingDistinctFromNonVariadic) {
-    // D-LANG-VARIADIC (step 13.4): the 4-arg `fnSig(...isVariadic)`
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4): the 4-arg `fnSig(...isVariadic)`
     // overload encodes scalars=[cc, isVariadic]. A variadic and a
     // non-variadic signature over the same param / result / cc
     // INTERN AS DISTINCT TypeIds (scalar count + value differ), and
@@ -744,6 +744,39 @@ TEST(TypeInternerVolatile, DistinctIdentityButTransparentKind) {
     // stripVolatile recovers the material id; idempotent on a non-qualified id.
     EXPECT_EQ(ti.stripVolatile(vi32).v, i32.v);
     EXPECT_EQ(ti.stripVolatile(i32).v, i32.v);
+}
+
+// P68 round 13, fold F7 — `isVolatileObjectType`: is an OBJECT of this type volatile? Its type,
+// looked through its ARRAY spine only: C 6.7.3p10 puts an array's qualifier on its element type
+// (where `isVolatileQualified` alone answers "no" for `const volatile int a[2]`, and F5 folded
+// `a[1]` in a static initializer while every reference refused it); a pointer's pointee and a
+// structure's member are NOT the object's qualifiers (gcc and mingw-w64 fold `cs.v` of a const,
+// non-volatile `cs` whose member `v` is volatile).
+// RED-ON-DISABLE: answer `isVolatileQualified(id)` alone (the array rows go false); walk into a
+// pointer or a member too (the pointer and member rows go true).
+TEST(TypeInternerVolatile, AnObjectIsVolatileThroughItsArraySpineOnly) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId vi32 = ti.volatileQualified(i32);
+    const TypeId a2   = ti.array(vi32, 2);                         // volatile int[2]
+    const TypeId a22  = ti.array(ti.array(vi32, 2), 2);            // volatile int[2][2]
+    const TypeId skin = ti.volatileQualified(ti.array(i32, 2));    // a skin over the array
+    std::array<TypeId, 1> const volMember{vi32};
+    const TypeId sVolMember = ti.structType("SV", volMember);      // struct { volatile int v; }
+    const TypeId vs = ti.volatileQualified(ti.structType("S", std::array<TypeId, 1>{i32}));
+    EXPECT_TRUE(ti.isVolatileObjectType(vi32));
+    EXPECT_TRUE(ti.isVolatileObjectType(a2));
+    EXPECT_TRUE(ti.isVolatileObjectType(a22));
+    EXPECT_TRUE(ti.isVolatileObjectType(skin));
+    EXPECT_TRUE(ti.isVolatileObjectType(vs));
+    EXPECT_TRUE(ti.isVolatileObjectType(ti.array(vs, 3)));        // an array of volatile structs
+    EXPECT_FALSE(ti.isVolatileQualified(a2)) << "the element carries it; the array does not";
+    EXPECT_FALSE(ti.isVolatileObjectType(i32));
+    EXPECT_FALSE(ti.isVolatileObjectType(ti.array(i32, 2)));
+    EXPECT_FALSE(ti.isVolatileObjectType(ti.pointer(vi32)));       // the POINTEE is volatile
+    EXPECT_FALSE(ti.isVolatileObjectType(sVolMember));             // a MEMBER is volatile
+    EXPECT_FALSE(ti.isVolatileObjectType(ti.array(sVolMember, 2)));
+    EXPECT_FALSE(ti.isVolatileObjectType(InvalidType));
 }
 
 TEST(TypeInternerVolatile, Canonicalizes) {

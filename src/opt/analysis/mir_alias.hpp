@@ -317,8 +317,9 @@ mirRegionBetween(
                     "dss::opt::analysis::mirRegionBetween fatal: "
                     "step-cap exceeded in forward walk from #%u — "
                     "malformed CFG (the verifier should have caught "
-                    "this; D-OPT-MEMORYSSA-CLOBBER-WALK trigger).\n",
+                    "this).\n",
                     loadBlock.v);
+                // Anchored: D-OPT-MEMORYSSA-CLOBBER-WALK (unreachable: the abort below).
                 std::abort();
             }
             MirBlockId const b = work.back();

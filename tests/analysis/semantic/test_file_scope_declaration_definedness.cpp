@@ -5,7 +5,7 @@
 // three axes where DSS sat BELOW the reference union under
 // `DSS = (gcc u clang u MSVC) u ISO C`:
 //
-//   (1) the FILE-SCOPE half of [[D-FF2-3]], which this cycle narrows —
+//   (1) the FILE-SCOPE half of [[D-FF2-3-EXTERN-DECLARATOR-INITIALIZER-RULE]], which this cycle narrows —
 //       `extern int x = 0;` at FILE scope. C 6.9.2p1: "a declaration of an
 //       identifier for an object that has file scope WITH AN INITIALIZER is a
 //       definition". The `extern` is REDUNDANT there, not contradictory.
@@ -300,6 +300,8 @@ TEST(FileScopeDeclarationDefinedness, AutoFileScopeInfersTheInitializersType) {
         "auto c = (char)3;\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const& in = model.lattice().interner();
     auto const* d = symbolNamed(model, "d");
     auto const* s = symbolNamed(model, "s");

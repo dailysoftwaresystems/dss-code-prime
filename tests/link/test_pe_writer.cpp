@@ -50,13 +50,14 @@ using dss::link_format::test::rejectSummary;
 
 namespace {
 
-// D-TEST-LE-READ-HELPERS CLOSED at 8aabc04 audit fold; complete-
-// hoist at 5ac97ae audit fold per code-architect Q1.
+// The little-endian read helpers are shared, not file-local:
+// hoisted at the 8aabc04 audit fold and completed at the 5ac97ae
+// one per code-architect Q1.
 using dss::link_format::test::readU16LE;
 using dss::link_format::test::readU32LE;
 using dss::link_format::test::readU64LE;
 // readI16LE is PE-only (used at one .reloc site); keep local until
-// a 2nd signed-LE consumer lands. Anchor D-TEST-LE-READ-SIGNED.
+// a 2nd signed-LE consumer lands. Anchor PIN-TEST-LE-READ-SIGNED.
 [[nodiscard]] std::int16_t readI16LE(std::span<std::uint8_t const> b,
                                       std::size_t off) {
     return static_cast<std::int16_t>(readU16LE(b, off));
@@ -1054,6 +1055,8 @@ namespace {
     }
     json += R"(
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -1648,11 +1651,18 @@ TEST(PeFormatJson, ZeroMachineRejectedByValidate) {
 
 // ── PE relocation addend=non-zero fails loud ───────────────────
 
-TEST(PeWriter, NonZeroAddendFailsLoud) {
-    // PE has no addend field on IMAGE_RELOCATION (addend lives in
-    // the patch bytes). If the assembler stamped a non-zero addend
-    // (ELF convention) the walker MUST surface a diagnostic instead
-    // of silently dropping (silent-failure C2 convergence).
+TEST(PeWriter, NonZeroAddendIsWrittenIntoThePatchedField) {
+    // PE has no addend field on IMAGE_RELOCATION: the addend lives in the
+    // PATCHED BYTES (`relocationAddends: inPlace`). This test used to demand a
+    // REFUSAL of a non-zero `.text` addend, and that refusal was the whole
+    // reason the COFF reader assumed "every `.text` addend is 0" -- which is
+    // false of every other producer (✔MEASURED 2026-09-23: clang writes
+    // `fc ff ff ff` into `movl $5, counter(%rip)`'s field, and a clang object
+    // linked by DSS ran to 32 instead of 42). The writer now STAMPS the addend
+    // where the format keeps it (`link/format/relocation_addend.hpp`), which is
+    // what an assembler emitting `movl $imm, sym(%rip)` needs. So this pins
+    // the other direction: nothing is refused and nothing is dropped. The
+    // addend is in the field, and the reader gives it back.
     auto loaded = loadShipped();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -1666,11 +1676,25 @@ TEST(PeWriter, NonZeroAddendFailsLoud) {
     rel.addend = -4;
     caller.relocations.push_back(rel);
     mod.functions.push_back(std::move(caller));
+    mod.symbols = {ModuleSymbol{SymbolId{1}, "caller", SymbolBinding::Global,
+                                SymbolVisibility::Default}};
+    mod.externImports = {ExternImport{SymbolId{2}, "callee", "", /*isData=*/false}};
 
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    std::vector<std::uint8_t> const stamped{0xE8, 0xFC, 0xFF, 0xFF, 0xFF};
+    EXPECT_NE(std::search(bytes.begin(), bytes.end(), stamped.begin(), stamped.end()),
+              bytes.end())
+        << "the call's field must hold the addend -4 in place";
+
+    DiagnosticReporter rrep;
+    auto read = pe::readRelocatableObject(bytes, *loaded.target, *loaded.format, rrep);
+    ASSERT_TRUE(read.has_value()) << "errors=" << rrep.errorCount();
+    ASSERT_EQ(read->functions.size(), 1u);
+    ASSERT_EQ(read->functions[0].relocations.size(), 1u);
+    EXPECT_EQ(read->functions[0].relocations[0].addend, -4);
 }
 
 // ── End-to-end via the format-blind `link()` dispatch ──────────
@@ -2922,6 +2946,8 @@ TEST(PeExecWriter, DataExternUnderUndeclaredDataImportBindingFailsLoud) {
       "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
       "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
     })");
     ASSERT_TRUE(fmt.has_value());
@@ -2970,6 +2996,12 @@ TEST(LinkerEndToEnd, PeExecAcceptsAndBindsDataExternImport) {
     mod.functions.push_back(std::move(fn));
     ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
     dataExt.isData = true;
+    // What MIR→LIR states for a data import its code reads through the IAT
+    // slot (`readThroughSlot`, the one owner of that statement). Without it the
+    // row is an OBJECT's direct reference to library data, which needs a copy
+    // relocation and is refused by name since P68 round 11
+    // (test_got_slot_lowering.cpp, section C).
+    dataExt.readThroughSlot = true;
     mod.externImports.push_back(std::move(dataExt));
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
@@ -3461,6 +3493,8 @@ namespace {
       "sections": [
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_ARM64_BRANCH26","kind":1,"nativeId":3},
         {"name":"IMAGE_REL_ARM64_ADDR64","kind":2,"nativeId":14},
@@ -3540,8 +3574,8 @@ TEST(PeExecWriter, NonX64MachineCarryingUnwindInfoFailsLoudButCfiFreeStillEncode
             << "an image whose unwind tables cannot be encoded must emit NO "
                "bytes -- never a silently unwind-less binary";
         EXPECT_GT(rep.errorCount(), 0u)
-            << "dropping .pdata/.xdata must be LOUD (D-WIN64-PDATA-ARM64-"
-               "SILENT-SKIP)";
+            << "dropping .pdata/.xdata must be LOUD ("
+               "D-WIN64-PDATA-ARM64-SILENT-SKIP)";
         EXPECT_EQ(::dss::test_support::countCode(
                       rep, DiagnosticCode::K_UnwindRuleUnrepresentable),
                   1u);
@@ -5331,6 +5365,8 @@ TEST(LinkerExternResolution, OkFalseWhenWalkerFailsLoud) {
         {"kind":"strtab","name":".strtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0},
         {"kind":"shstrtab","name":".shstrtab","type":3,"flags":0,"addrAlign":1,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "explicit",
+      "inputSectionPlacement": "unit",
       "relocations":[
         {"name":"R_X86_64_PC32","kind":1,"nativeId":2},
         {"name":"R_X86_64_64","kind":2,"nativeId":1},
@@ -5737,6 +5773,8 @@ TEST(PeExecWriter, RequireSectionRodataFailsLoudWhenSchemaOmitsRow) {
       "sections": [
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -5830,6 +5868,8 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
         {"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096},
         {"kind":"rodata","name":".rdata","type":1073741888,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -6244,6 +6284,8 @@ namespace {
       "sections": [
         {"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -6483,6 +6525,8 @@ peObjSectionDefAux(std::vector<std::uint8_t> const& obj,
       "sections": [
         {"kind":"text","name":".text","type":1615855648,"flags":0,"addrAlign":0,"entrySize":0}
       ],
+      "relocationAddends": "inPlace",
+      "inputSectionPlacement": "unit",
       "relocations": [
         {"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4},
         {"name":"IMAGE_REL_AMD64_ADDR64","kind":2,"nativeId":1},
@@ -6855,8 +6899,15 @@ namespace {
 // so every import took the slot); `Global` is the case the narrowing exists
 // for. One module shape serves both so the two answers are read off ONE
 // object, never off two fixtures that could drift apart.
+// ★ P68 round 9 (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT): the slot
+// pass reads each row's `readThroughSlot` — MIR→LIR's own answer — and no
+// longer re-derives it, so each row here states the answer MIR→LIR gives on
+// `fmt`, asked of the same two facts MIR→LIR asks: a DATA import under a
+// got-indirect binding, and a FUNCTION import the format's dispatch routes
+// through a slot (`externRefTakesImportSlot`, that question's one owner).
 [[nodiscard]] AssembledModule
-dataImportModule(bool alsoCallAFunctionExtern,
+dataImportModule(ObjectFormatSchema const& fmt,
+                 bool alsoCallAFunctionExtern,
                  SymbolBinding fnBinding = SymbolBinding::Weak,
                  bool alsoCallASecondFunctionExtern = false,
                  SymbolBinding fn2Binding = SymbolBinding::Global) {
@@ -6896,6 +6947,8 @@ dataImportModule(bool alsoCallAFunctionExtern,
     data.mangledName = "ea";
     data.libraryPath = "somelib.dll";
     data.isData      = true;
+    data.readThroughSlot =
+        fmt.dataImportBinding() == DataImportBinding::GotIndirect;
     mod.externImports.push_back(std::move(data));
     if (alsoCallAFunctionExtern) {
         ExternImport fnImp;
@@ -6904,6 +6957,7 @@ dataImportModule(bool alsoCallAFunctionExtern,
         fnImp.libraryPath = "somelib.dll";
         fnImp.isData      = false;
         fnImp.binding     = fnBinding;
+        fnImp.readThroughSlot = fmt.externRefTakesImportSlot(fnBinding);
         mod.externImports.push_back(std::move(fnImp));
     }
     if (alsoCallASecondFunctionExtern) {
@@ -6913,9 +6967,19 @@ dataImportModule(bool alsoCallAFunctionExtern,
         fnImp2.libraryPath = "somelib.dll";
         fnImp2.isData      = false;
         fnImp2.binding     = fn2Binding;
+        fnImp2.readThroughSlot = fmt.externRefTakesImportSlot(fn2Binding);
         mod.externImports.push_back(std::move(fnImp2));
     }
     return mod;
+}
+
+// The row of `mod` that imports `symbol`.
+[[nodiscard]] ExternImport& importRow(AssembledModule& mod, std::uint32_t symbol) {
+    for (auto& e : mod.externImports) {
+        if (e.symbol.v == symbol) return e;
+    }
+    ADD_FAILURE() << "no import row for symbol #" << symbol;
+    return mod.externImports.front();
 }
 
 // The relocation whose patch site is `va`, in `sec`'s table.
@@ -6941,7 +7005,8 @@ TEST(PeObjDataImportSlot, DataExternCodeReferenceNamesTheCarriedComdatSlot) {
     ASSERT_TRUE(loaded.format->objectImportSlot().has_value());
     EXPECT_EQ(loaded.format->objectImportSlot()->symbolPrefix, ".refptr.");
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/false);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
@@ -7028,7 +7093,8 @@ TEST(PeObjDataImportSlot, AFunctionExternReachesItsImportThroughASlotToo) {
         << "the shipped pe64 `.obj` format must route a WEAK import through "
            "the slot — that is the P0 this file exists for, and a narrowing "
            "that excluded `weak` would make every assertion below vacuous";
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true,
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/true,
                                            SymbolBinding::Weak);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
@@ -7088,7 +7154,8 @@ TEST(PeObjDataImportSlot, AStrongFunctionExternKeepsItsDirectReferenceOnTheShipp
     ASSERT_FALSE(loaded.format->externRefTakesImportSlot(SymbolBinding::Global));
 
     AssembledModule mod =
-        dataImportModule(/*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
+        dataImportModule(*loaded.format,
+                         /*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
                          /*alsoCallASecondFunctionExtern=*/true,
                          SymbolBinding::Global);
     DiagnosticReporter rep;
@@ -7146,7 +7213,7 @@ TEST(PeObjDataImportSlot, AFunctionExternKeepsItsDirectReferenceUnderDirectPlt) 
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/true);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
@@ -7189,7 +7256,7 @@ TEST(PeObjDataImportSlot, IndirectSlotDispatchWithNoSlotSpellingFailsLoud) {
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/true);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/true);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)
@@ -7204,11 +7271,13 @@ TEST(PeObjDataImportSlot, AnAbsoluteDataInitializerReferenceIsNotRetargeted) {
     // DATA ITEM, which represents an absolute-0 target perfectly well and is
     // already correct. Pointing it at the slot would store the SLOT'S address
     // where the program asked for the object's — off by exactly the one
-    // indirection this row is about, in the opposite direction. The pass keys
-    // on PC-RELATIVE for that reason, and this is the pin that says so.
+    // indirection this row is about, in the opposite direction. The pass
+    // retargets CODE relocations only for that reason (it said "pc-relative"
+    // until P68 round 9 made it the role), and this is the pin that says so.
     auto loaded = loadShipped();
     ASSERT_TRUE(loaded.target && loaded.format);
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/false);
     AssembledData ptr;
     ptr.symbol  = SymbolId{9};
     ptr.section = DataSectionKind::Data;
@@ -7242,6 +7311,112 @@ TEST(PeObjDataImportSlot, AnAbsoluteDataInitializerReferenceIsNotRetargeted) {
         << symTableDump(obj);
 }
 
+// ── P68 round 9: THE SLOT FOLLOWS THE ROW (D-LK-SIBLING-DATA-IMPORT-SLOT-BOUND-TO-THE-OBJECT)
+//
+// The pass used to decide WHICH imports get a carried slot by re-deriving
+// MIR→LIR's decision (`isData || externRefTakesImportSlot(binding)`); it now
+// reads the row's `readThroughSlot`, the answer MIR→LIR stamped where it chose
+// the shape. The two agree on every row MIR→LIR lowered, so these pins give the
+// pass rows on which they DISAGREE and read which one it followed.
+
+TEST(PeObjDataImportSlot, TheCarriedSlotFollowsTheRowNotTheImportsClass) {
+    // Three imports in ONE function, each row stating the opposite of what the
+    // import's class would re-derive: a DATA import and a WEAK function the
+    // code reaches DIRECTLY (what a `.s` writes — `movl ea(%rip)`, `call
+    // callee` — and what gas emits for it), and a STRONG function the code
+    // reads through a slot. A pass that re-derived the decision gives the first
+    // two a slot and the third none: every assertion below.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod =
+        dataImportModule(*loaded.format,
+                         /*alsoCallAFunctionExtern=*/true, SymbolBinding::Weak,
+                         /*alsoCallASecondFunctionExtern=*/true,
+                         SymbolBinding::Global);
+    importRow(mod, 50).readThroughSlot = false;   // data, read directly
+    importRow(mod, 51).readThroughSlot = false;   // weak function, called directly
+    importRow(mod, 52).readThroughSlot = true;    // strong function, through a slot
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+
+    auto const dataRel    = relocAt(obj, *text, 3u);
+    auto const weakCall   = relocAt(obj, *text, 20u);
+    auto const strongCall = relocAt(obj, *text, 26u);
+    ASSERT_TRUE(dataRel.has_value() && weakCall.has_value() && strongCall.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, dataRel->symbolTableIndex), "ea")
+        << "a DIRECT read of a data import stays direct: sent to a slot it "
+           "would load the import's ADDRESS" << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, weakCall->symbolTableIndex), "callee")
+        << "a DIRECT call stays direct: sent to a slot it would call the "
+           "pointer's bytes" << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, strongCall->symbolTableIndex), ".refptr.callee2")
+        << "a call that dereferences a slot must find one, whatever the "
+           "import's binding — without it the code reads the import's own "
+           "address as the pointer" << symTableDump(obj);
+    std::size_t slotSections = 0;
+    ObjSectionHeader const* slotSec = nullptr;
+    for (auto const& s : secs) {
+        if (s.name == ".rdata" && s.numberOfRelocations == 1u) {
+            ++slotSections;
+            slotSec = &s;
+        }
+    }
+    ASSERT_EQ(slotSections, 1u)
+        << "exactly one carried slot — the row that states a slot read"
+        << symTableDump(obj);
+    auto const fill = relocAt(obj, *slotSec, 0u);
+    ASSERT_TRUE(fill.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, fill->symbolTableIndex), "callee2")
+        << symTableDump(obj);
+}
+
+TEST(PeObjDataImportSlot, EveryCodeRelocationOfASlotReadNamesTheSlot) {
+    // BY ROLE, NOT BY PC-RELATIVITY. The row says every CODE reference to the
+    // import is half of a slot read, so every code relocation naming it names
+    // the slot. On x86_64 those are all PC-relative, and the pass used to key
+    // on that; a target that addresses a slot with an `adrp` + an ABSOLUTE
+    // `add :lo12:` would then have the page pointed at the slot and the page
+    // offset at the import — an address that is neither (`mergeModules`' arm64
+    // twin, `SiblingDataImportSlot.Arm64PageAndPageOffsetBothAddressTheSlot`).
+    // The absolute half is stood in for here by an `abs64` in the same
+    // function; a DATA item's absolute relocation stays on the import
+    // (`AnAbsoluteDataInitializerReferenceIsNotRetargeted`).
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = dataImportModule(*loaded.format,
+                                           /*alsoCallAFunctionExtern=*/false);
+    ASSERT_TRUE(importRow(mod, 50).readThroughSlot)
+        << "the shipped `.obj` format reads a data import through a slot";
+    Relocation absHalf;
+    absHalf.offset = 10;
+    absHalf.target = SymbolId{50};
+    absHalf.kind   = RelocationKind{2};   // x86_64 `abs64` — NOT pc-relative
+    mod.functions.front().relocations.push_back(absHalf);
+    DiagnosticReporter rep;
+    auto const image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << diagSummary(rep);
+    auto const& obj = image.bytes;
+    ASSERT_FALSE(obj.empty());
+    auto const secs = peObjSections(obj);
+    auto const* text = findSection(secs, ".text");
+    ASSERT_NE(text, nullptr);
+    auto const pcHalf  = relocAt(obj, *text, 3u);
+    auto const absSite = relocAt(obj, *text, 10u);
+    ASSERT_TRUE(pcHalf.has_value() && absSite.has_value());
+    EXPECT_EQ(peObjSymbolName(obj, pcHalf->symbolTableIndex), ".refptr.ea")
+        << symTableDump(obj);
+    EXPECT_EQ(peObjSymbolName(obj, absSite->symbolTableIndex), ".refptr.ea")
+        << "the absolute code relocation of a slot-read import is the other "
+           "half of the same slot address; naming the import splits the pair"
+        << symTableDump(obj);
+}
+
 // ── THE PAIRING RULE, BOTH DIRECTIONS ──────────────────────────────────
 //
 // `dataImportBinding` and `objectImportSlot` are ONE decision spelled in two
@@ -7267,7 +7442,7 @@ TEST(PeObjDataImportSlot, RelocatableBindingWithNoSlotSpellingFailsLoud) {
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/false);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)
@@ -7287,7 +7462,7 @@ TEST(PeObjDataImportSlot, SlotSpellingWithNoBindingFailsLoud) {
         "synthetic");
     ASSERT_TRUE(fmt.has_value()) << rejectSummary(fmt);
 
-    AssembledModule mod = dataImportModule(/*alsoCallAFunctionExtern=*/false);
+    AssembledModule mod = dataImportModule(**fmt, /*alsoCallAFunctionExtern=*/false);
     DiagnosticReporter rep;
     auto const image = linker::link(mod, **target, **fmt, rep);
     EXPECT_GT(rep.errorCount(), 0u)

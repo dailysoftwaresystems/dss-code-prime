@@ -8,9 +8,12 @@
 // shape the bar vetoes, and `cfi.hpp` is dependency-free by construction (it
 // includes `core/export.hpp` and the standard library only), so there is no
 // cycle to route around the way `sectionName` has to.
+#include "core/types/asm_template_text_forms.hpp"   // AsmTemplateTextForms
 #include "core/types/cfi.hpp"
 #include "core/types/rule_id.hpp"
 #include "core/types/strong_ids.hpp"   // LexerModeId — the template surface's mode
+#include "core/types/object_format_kind.hpp"   // ObjectFormatKind — the key of a symbol-part spelling
+#include "core/types/symbol_address_part.hpp"  // SymbolAddressPart
 
 #include <array>
 #include <cstdint>
@@ -372,9 +375,23 @@ enum class AsmOperandRole : std::uint8_t {
     Indirect,    // `*%rax`           → an indirect branch/call target
     Scalar,      // `42` / `foo`      → the value inside an immediate or displacement
     NegNumber,   // `-8`              → a negated integer
+    // `+4` / `-8` after a NAME (`msg+4`, `.LC0-8`) → the constant added to the
+    // symbol's address (P68 round 9, D-ASM-RIP-RELATIVE-SPELLING-NEEDS-AN-IP-REGISTER).
+    // ★ A ROLE OF ITS OWN BECAUSE `NegNumber` CANNOT BE IT: the scalar decode
+    // reads a `NegNumber` anywhere under a scalar as the whole value's sign,
+    // so `sym-8` bound to it would read as the number -8 and lose the symbol.
+    // The decode takes an addend off FIRST, and only the name remains.
+    Addend,
+    // `:lo12:` / `@PAGEOFF` around a NAME (`add x0, x0, :lo12:msg`, `ldr x1,
+    // [x0, msg@PAGEOFF]`) → WHICH PART of the symbol's address the operand
+    // denotes (P68 round 9, the aarch64 twins; `SymbolAddressPart`). The rule's
+    // one Identifier is the operator; `AssemblyConfig::symbolParts` says what
+    // it means, per object-format kind. Like `Addend`, it is taken off the
+    // scalar before the name is read.
+    SymbolPart,
 };
 
-inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 7>
+inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 9>
     kAsmOperandRoleNames{{
         {"register", AsmOperandRole::Register},
         {"immediate", AsmOperandRole::Immediate},
@@ -383,11 +400,16 @@ inline constexpr std::array<std::pair<std::string_view, AsmOperandRole>, 7>
         {"indirect", AsmOperandRole::Indirect},
         {"scalar", AsmOperandRole::Scalar},
         {"negNumber", AsmOperandRole::NegNumber},
+        {"addend", AsmOperandRole::Addend},
+        {"symbolPart", AsmOperandRole::SymbolPart},
     }};
 inline constexpr std::size_t kAsmOperandRoleCount =
     kAsmOperandRoleNames.size();
+// A SET of operand roles, one bit per `AsmOperandRole` (see
+// `AssemblyConfig::rolesForRule`).
+using AsmRoleMask = std::uint16_t;
 static_assert(kAsmOperandRoleCount
-                  == static_cast<std::size_t>(AsmOperandRole::NegNumber) + 1,
+                  == static_cast<std::size_t>(AsmOperandRole::SymbolPart) + 1,
               "every AsmOperandRole enumerator needs a config spelling — a role "
               "with no name is unbindable, and the loader's REQUIRE-ALL check "
               "would silently stop covering it");
@@ -439,6 +461,42 @@ struct AsmOperandSelector {
     // a condition spelling MEANS, which is what keeps `sysreg` out of the
     // shared substrate's vocabulary.
     std::string   name;
+};
+
+// ★★ A SPELLING OF ONE PART OF A SYMBOL'S ADDRESS, AND THE OBJECT FORMATS
+// WHOSE REFERENCE ASSEMBLER READS IT (P68 round 9, the aarch64 twins) — one row
+// of `assembly.symbolParts`. ✔MEASURED 2026-09-23: gas 2.42 and clang 18 for
+// ELF write `:lo12:msg` and `:pg_hi21:msg` and REFUSE `msg@PAGEOFF` /
+// `msg@PAGE`; clang 18 for Darwin writes `msg@PAGE` / `msg@PAGEOFF` and REFUSES
+// `:lo12:` and a bare `adrp` operand. So the spelling is accepted per FORMAT
+// KIND, and the kind is only a key into this list: the lowering asks "does a
+// row with this spelling name the active kind", never "is this ELF".
+struct AsmSymbolPartSpelling {
+    // The operator EXACTLY as written, punctuation included (`:lo12:`,
+    // `@PAGEOFF`) — the text of the dialect's `symbolPart` node, compared under
+    // the dialect's `spellingCase`. The punctuation is part of the spelling
+    // because it is what separates the two families: `@lo12` is neither.
+    std::string                   spelling;
+    SymbolAddressPart             part = SymbolAddressPart::Whole;
+    // Whether the operator is written BEFORE the name (`:lo12:msg`) or AFTER it
+    // (`msg@PAGEOFF`). The grammar lets the part rule stand on either side of a
+    // name, so this is what refuses `msg:lo12:` and `@PAGEOFF msg`, which no
+    // reference writes.
+    bool                          writtenBefore = true;
+    // The object-format kinds whose reference assembler takes this spelling.
+    // Never empty (the loader refuses a spelling no format reads).
+    std::vector<ObjectFormatKind> formatKinds;
+};
+
+// ★ WHAT A BARE SYMBOL MEANS IN ONE INSTRUCTION ROW, per format kind (P68 round
+// 9) — the row key `impliedSymbolPart`. gas reads `adrp x0, msg` as the PAGE of
+// `msg` (the instruction takes nothing else); clang for Darwin REFUSES it and
+// wants `msg@PAGE` (✔MEASURED 2026-09-23). A row declaring this gives a bare
+// symbol operand that part on the listed kinds; everywhere else a bare symbol
+// is the whole address, which the page-form encoding then refuses.
+struct AsmImpliedSymbolPart {
+    SymbolAddressPart             part = SymbolAddressPart::Whole;
+    std::vector<ObjectFormatKind> formatKinds;
 };
 
 // One `assembly.instructions[]` row: an assembly SPELLING and the target
@@ -520,6 +578,37 @@ struct AsmInstructionSpelling {
     // operands: a disagreement is refused, in both directions, exactly as gas
     // rejects `movl %rax,%ecx` and `movl %eax,%rcx`.
     std::optional<std::uint32_t> width;
+    // ★★★ OPTIONAL — THE WIDTH THIS SPELLING OPERATES AT WHEN **NOTHING
+    // WRITTEN STATES ONE**: no `width` on the row, and no operand whose name
+    // states a width. P68 round 8, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS.
+    //
+    // ★★ IT IS A MEASURED PROPERTY OF A REFERENCE, AND THE LOWERING SAYS SO
+    // EVERY TIME IT IS USED. ✔MEASURED 2026-09-21: GNU as 2.42 assembles AT&T
+    // `mov $1, (%rax)`, `add $1, (%rax)`, `test $1, (%rax)`, `not (%rax)` and
+    // their siblings at 32 bits (`c7 00 01 00 00 00`, `83 00 01`,
+    // `f7 00 01 00 00 00`, `f7 10`) and WARNS "no instruction mnemonic suffix
+    // given and no register operands; using default for `mov'"; clang 18.1.3
+    // REFUSES each ("ambiguous instructions require an explicit suffix"). One
+    // working reference makes the spelling required, with that reference's
+    // meaning — so the row states the number gas uses, and the lowering emits
+    // an (unsuppressable) warning naming it, exactly as gas does.
+    //
+    // ⚠ ABSENT KEEPS THE OLD MEANING: an operand-less spelling (`ret`, `jmp
+    // .L1`) operates at the width a flags-less LIR instruction means. PRESENT
+    // is legal only on a row that DERIVES its width (no `width`, no
+    // `destWidth`, no `destWidthFromOperands`) — beside a stated width it could
+    // never be reached, and the loader refuses a key that states nothing.
+    // ⓘ NOT EVERY SUCH WIDTH IS A DEFAULT: `movaps %xmm1, %xmm0` names two
+    // registers that state nothing (x86 xmm names state no width) and is a
+    // 128-bit move by its MNEMONIC — gas says nothing about it. So the warning
+    // is its own key, below; this one only states the number.
+    std::optional<std::uint32_t> unstatedWidth;
+    // ★ OPTIONAL, legal only beside `unstatedWidth`: the reference WARNS when it
+    // falls back to that width (GNU as: "no instruction mnemonic suffix given
+    // and no register operands; using default for `mov'"), so the lowering
+    // warns too — the acceptance comes from the reference and so does the
+    // loudness. False where the width is the mnemonic's own (`movaps`).
+    bool                         unstatedWidthWarns = false;
     // ★★★ OPTIONAL — THE DESTINATION'S WIDTH, WHEN THIS SPELLING WRITES A
     // RESULT WIDER (OR NARROWER) THAN THE VALUE IT OPERATES ON.
     // D-ASM-X86-WIDTH-EXTENDING-MOVES-UNSPELLABLE.
@@ -627,6 +716,10 @@ struct AsmInstructionSpelling {
 
     // OPTIONAL; EMPTY on every ordinary row. See `AsmOperandSelector`.
     std::vector<AsmOperandSelector> operandSelectors;
+
+    // OPTIONAL (P68 round 9): what a bare symbol operand of this row means on
+    // some format kinds. See `AsmImpliedSymbolPart`.
+    std::optional<AsmImpliedSymbolPart> impliedSymbolPart;
 
     // The selector declared at `index`, or nullptr.
     [[nodiscard]] AsmOperandSelector const*
@@ -781,6 +874,22 @@ struct DSS_EXPORT AssemblyConfig {
     RuleId labelTailRule{};
     RuleId operandSeqRule{};
 
+    // ★★★ GNU as's NUMERIC LOCAL LABELS (P68 round 8,
+    // D-ASM-LABELS-INSIDE-A-TEMPLATE-AND-NUMERIC-LOCAL-LABELS-REFUSED). `1:` may be
+    // defined any number of times; `1b` names the nearest definition BEFORE the
+    // reference and `1f` the nearest AFTER it (GNU as, "Local Symbol Names").
+    //   • `numericLabelRule` — the shared grammar's DEFINITION rule
+    //     (`asm.lang.json`'s `asmNumericLabel`: a number, then the label tail),
+    //     read by rule identity exactly as `labelTailRule` is;
+    //   • the two REFERENCE suffixes (`b` / `f` in gas) — dialect DATA, never
+    //     spelled in C++, and required to be `numberStyle.integerSuffixes` too,
+    //     because that is what makes `1b` ONE token (the loader refuses one that
+    //     is not). A dialect declaring none has no numeric labels; the loader
+    //     refuses a partial declaration.
+    RuleId      numericLabelRule{};
+    std::string localLabelBackwardSuffix;
+    std::string localLabelForwardSuffix;
+
     // ★★★ THE TEMPLATE SURFACE — how an EMBEDDED `__asm__` template differs
     // from a standalone `.s`, declared as two names rather than built into the
     // engine (D-ASM-DIALECT-DECLARES-NO-OPERAND-PLACEHOLDER, 2026-08-15).
@@ -920,11 +1029,27 @@ struct DSS_EXPORT AssemblyConfig {
     // validates the name against `targetRegClassFromName` (and refuses the
     // inoperable "none"), so an unknown class is a load error naming the
     // closed set — never a letter that silently scopes to nothing.
+    //
+    // ★★★ `selectsPairSecond` — THE LETTER NAMES THE **SECOND** REGISTER OF A
+    // TWO-REGISTER OPERAND, NOT A VIEW OF THE FIRST (the optional
+    // `"selects": "pairSecond"` key; D-ASM-MULTI-REGISTER-OPERAND-BINDING-NOT-REALIZED).
+    // ✔MEASURED 2026-09-18, aarch64-linux-gnu-gcc 13.3.0, -O0 and -O2, run
+    // under qemu: on a 16-byte value bound to `"r"` (a register PAIR), `%0`
+    // names the first x-register and `%H0` the second — `mov %0, %1; mov %H0,
+    // %2` writes both halves of an `__int128`. It is still a letter with a
+    // width (the second register's view), scoped exactly as its dialect
+    // scopes every letter (the aarch64 document scopes `H` to `gpr`: gcc
+    // refuses `%H` on a `"w"`-bound pair), so every rule above applies to
+    // it; what differs is only WHICH register it selects, and an operand
+    // bound to ONE register refuses it by name rather than answering with
+    // the first. The x86-64 AT&T dialect declares none: gcc gives the
+    // template no name for the second register there.
     struct AsmTemplateModifier {
         std::string   letter;      // as declared ("w")
         std::string   lexeme;      // sigil + letter, composed by the loader ("%w")
         std::uint32_t widthBits = 0;
         std::string   registerClass;  // "" = width-only; else a TargetRegClass name
+        bool          selectsPairSecond = false;
     };
     std::vector<AsmTemplateModifier> templateModifiers;
 
@@ -951,6 +1076,17 @@ struct DSS_EXPORT AssemblyConfig {
     // ⚠ EMPTY when this dialect hosts no templates; every reader is gated on
     // `templateModifierRule.valid()`, which cannot be true without it.
     std::string templatePlaceholderLexeme;
+
+    // ★★★ THE TEMPLATE TEXT FORMS THIS DIALECT'S TEMPLATE SURFACE EXPANDS
+    // BEFORE ITS LEXER RUNS (`assembly.templateTextForms`, P68 round 8,
+    // D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED): `%=`, the fixed forms
+    // (`%{` → `{`, `%;` → nothing), the forms a TARGET feature selects (`%~`),
+    // and the `{…|…}` dialect alternatives. See `asm_template_text_forms.hpp`
+    // for the measured table and why every row is per dialect. ✔MEASURED that a
+    // BASIC template (no colon) expands NOTHING in either reference, so only an
+    // EXTENDED template is expanded. Empty ⇒ the dialect's templates expand no
+    // text form, and any `%<punctuation>` in one is refused by name.
+    AsmTemplateTextForms templateTextForms;
 
     // The declared modifier whose composed lexeme is exactly `lexeme`, or
     // nullptr. ⚠ EXACT — never folded by `spellingCase`. A template placeholder
@@ -1057,6 +1193,62 @@ struct DSS_EXPORT AssemblyConfig {
         return best;
     }
 
+    // ★★★ AN ELEMENT OF A VECTOR REGISTER — `v1.d[1]`, `%1.s[3]` (P68 round 8,
+    // D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). ONE lane, named by a
+    // size SUFFIX and an INDEX. The suffix is the arrangement table's shape one
+    // step narrower — a width with no count — and like it serves both lexical
+    // surfaces (`v1.d` is one identifier in a `.s`, `%1.d` four tokens in a
+    // template). The index is the shared core's `asmElementIndex`, found by
+    // RuleId through `elementIndexRule`, never by its bracket bytes.
+    // ⚠ DECLARED TOGETHER OR NOT AT ALL: an index rule with no sizes would parse
+    // `[i]` with no width to read it at; sizes with no rule name a spelling no
+    // shape produces. The loader refuses either half alone.
+    struct AsmRegisterElement {
+        std::string   suffix;         // as declared, WITH its separator (".d")
+        std::uint32_t laneBits = 0;   // the element's width: 8, 16, 32 or 64
+        std::string   registerClass;  // required; a TargetRegClass name
+    };
+    std::vector<AsmRegisterElement> registerElements;
+    RuleId elementIndexRule{};
+
+    // What an ELEMENT spelling (the text before its index) ends with: how many
+    // bytes of suffix to strip, the element's width, and the register class the
+    // suffix is declared for — or nullopt when it ends with no size.
+    // ★ AN ELEMENT SIZE WINS; AN ARRANGEMENT IS THE FALLBACK, AND THAT IS gas's
+    // READING, MEASURED: GNU as 2.42 takes `v1.16b[3]` as `v1.b[3]` and
+    // `v1.8b[15]` as index 15 — the arrangement's LANE WIDTH is the element's,
+    // its count ignored — while clang 18.1.3 refuses the form. One working
+    // reference makes it required, and the width is still read off a declared
+    // table rather than parsed out of the text.
+    // ⚠ FOLDED BY `spellingCase`: both references accept `V2.S[1]`.
+    struct ElementSuffix {
+        std::size_t      length   = 0;
+        std::uint32_t    laneBits = 0;
+        std::string_view registerClass;
+    };
+    [[nodiscard]] std::optional<ElementSuffix>
+    elementSuffixOf(std::string_view written) const {
+        std::string const key = spellingKey(written);
+        std::optional<ElementSuffix> best;
+        auto const consider = [&](std::string const& suffix,
+                                  std::uint32_t laneBits,
+                                  std::string const& cls) {
+            std::string const s = spellingKey(suffix);
+            if (s.size() >= key.size()) return;
+            if (key.compare(key.size() - s.size(), s.size(), s) != 0) return;
+            if (best.has_value() && best->length >= s.size()) return;
+            best = ElementSuffix{s.size(), laneBits, cls};
+        };
+        for (auto const& e : registerElements) {
+            consider(e.suffix, e.laneBits, e.registerClass);
+        }
+        if (best.has_value()) return best;
+        for (auto const& a : registerArrangements) {
+            consider(a.suffix, a.laneBits, a.registerClass);
+        }
+        return best;
+    }
+
     // Indexed by `static_cast<std::size_t>(AsmOperandRole)`. Every role is
     // REQUIRED when the block is present — a partial `operandForms` is a load
     // error, never a silently-unrecognized operand shape.
@@ -1078,6 +1270,18 @@ struct DSS_EXPORT AssemblyConfig {
 
     std::vector<AsmInstructionSpelling> instructions;
     std::vector<AsmDirectiveSpelling>   directives;
+
+    // OPTIONAL (P68 round 9, the aarch64 twins): the spellings of a PART of a
+    // symbol's address this dialect reads, each with the object-format kinds
+    // that read it. See `AsmSymbolPartSpelling`. Empty ⇒ the dialect spells no
+    // part, and its `symbolPart` operand role must be null.
+    std::vector<AsmSymbolPartSpelling> symbolParts;
+
+    // OPTIONAL (P68 round 9): the spelling of the LOCATION COUNTER — the
+    // address of the instruction or data slot being written (`.` in GNU as:
+    // `adr x7, .`, `b .`, `.quad .`). Empty ⇒ the dialect has none, and the
+    // spelling is an ordinary name.
+    std::string locationCounter;
 
     // Label names that START A PROGRAM. ★ IT IS THE SAME FACT `c.lang.json`
     // states as `semantics.declarations[].entryFunctions`, stated at a tier that
@@ -1178,20 +1382,26 @@ struct DSS_EXPORT AssemblyConfig {
     // two NON-register roles on one rule, where no lookup can separate them.
     //
     // Returns a bitmask over `AsmOperandRole` (bit i = role i).
-    [[nodiscard]] std::uint8_t rolesForRule(RuleId rule) const noexcept {
+    [[nodiscard]] AsmRoleMask rolesForRule(RuleId rule) const noexcept {
+        // One bit per role. The ninth role (`symbolPart`, P68 round 9) is what
+        // widened the mask from a byte; a seventeenth must widen it again
+        // rather than wrap a bit away.
+        static_assert(kAsmOperandRoleCount <= 8 * sizeof(AsmRoleMask),
+                      "rolesForRule packs one bit per AsmOperandRole into "
+                      "AsmRoleMask — widen the mask before adding a role");
         if (!rule.valid()) return 0;
-        std::uint8_t mask = 0;
+        AsmRoleMask mask = 0;
         for (std::size_t i = 0; i < kAsmOperandRoleCount; ++i) {
             if (operandFormRules[i].valid()
                 && operandFormRules[i].v == rule.v) {
-                mask |= static_cast<std::uint8_t>(1u << i);
+                mask |= static_cast<AsmRoleMask>(1u << i);
             }
         }
         return mask;
     }
 
     [[nodiscard]] static constexpr bool
-    maskHas(std::uint8_t mask, AsmOperandRole role) noexcept {
+    maskHas(AsmRoleMask mask, AsmOperandRole role) noexcept {
         return (mask & (1u << static_cast<std::size_t>(role))) != 0;
     }
 

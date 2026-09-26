@@ -5,6 +5,7 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/image_request.hpp"      // ImageRequest — the per-EMISSION facts
+#include "link/import_call_stub_layout.hpp"
 #include "link/object_format_schema.hpp"
 
 #include <cstdint>
@@ -87,12 +88,26 @@ requestsCodeSignature(MachOImage const& im) noexcept {
 // placeholder. It DEFAULTS to `{}` so every existing direct caller compiles
 // unchanged; a caller that omits it while the schema's identity names the
 // artifact is REFUSED loud (`K_WalkerInputContractViolation`) rather than
-// given a fabricated identity — see `resolveArtifactIdentity`.
+// given a fabricated identity — see `resolveArtifactIdentity`. It also carries
+// the RUNPATHS the dynamic writer records as one LC_RPATH per path under the
+// format's declared `runpath` (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH), and this
+// entry point runs `enforceImageRequest` itself, the `pe::encode` precedent.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 encode(AssembledModule const&    module,
        TargetSchema const&       targetSchema,
        ObjectFormatSchema const& objectFormatSchema,
        DiagnosticReporter&       reporter,
        ImageRequest const&       request = {});
+
+// [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]]
+// Where `encode` will put each FUNCTION import's `__stubs` entry for this
+// module and format, as its distance past the end of `__text` — the answer the
+// branch-veneer pass needs to measure an import-bound call against the stub it
+// lands on (see `link/import_call_stub_layout.hpp`). Empty for every flavor
+// that emits no `__stubs`. The dynamic writer ASSERTS its real `__stubs`
+// against this answer when it lays them out.
+[[nodiscard]] DSS_EXPORT link::ImportCallStubLayout
+importCallStubLayout(AssembledModule const&    module,
+                     ObjectFormatSchema const& objectFormatSchema);
 
 } // namespace dss::macho

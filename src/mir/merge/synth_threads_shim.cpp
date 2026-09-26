@@ -435,18 +435,34 @@ bool synthesizeThreadsShim(
     // MirVerifier enforces stored==derived; the single-CU post-optimize path has no
     // verifier and codegen ignores markers, so the rederive is idempotent there).
     // Returns nothing; the caller emits the body then a terminator.
+    //
+    // ★★ THE LINKAGE IS THE SYNTHESIS-ONCE RULE (P68 round 11,
+    // D-LK-SYNTHESIZED-LIBRARY-BODY-DEFINED-STRONG-IN-EVERY-UNIT) — the same rule, for the
+    // same reason, as `synthesizeStdioShim`'s: a synthesized library body exists ONCE per
+    // linked image however many separately compiled units carry it. `Weak` is the linkage
+    // every writer expresses and the linker's all-weak arm collapses (ELF STB_WEAK, Mach-O
+    // N_WEAK_DEF, COFF COMDAT SELECT_ANY); `Hidden` keeps the body internal to its image —
+    // never exported, never preemptible, not a DCE root. ⓘ Today only the exec formats
+    // declare a `librarySynthesis` vehicle, so a threads body cannot yet sit in a static
+    // library or a runtime member (they refuse loudly); the rule is stated here all the
+    // same, because a family whose bodies stay strong is the defect waiting for the first
+    // format that declares one.
     auto begin = [&](SymbolId sym, TypeId fnSig) {
-        (void)builder.addFunction(fnSig, sym, SymbolBinding::Global,
-                                  SymbolVisibility::Default);
+        (void)builder.addFunction(fnSig, sym, SymbolBinding::Weak,
+                                  SymbolVisibility::Hidden);
         MirBlockId const entry = builder.createBlock(StructCfMarker::EntryBlock);
         builder.beginBlock(entry);
     };
 
-    // Cycle 2: emit the once-adapter ONCE, before the recipe loop (every call_once
-    // GlobalAddr-references it). Global-bound so DCE — which runs AFTER the multi-CU
-    // synth, pre-optimize — keeps it: an OS-invoked callback is never a direct-call
-    // target, so it would otherwise look dead (the synthesizePeStartup `_dss_pe_start`
-    // precedent). Its 3 params match PINIT_ONCE_FN; only `param` (the C11 fn) is used, but
+    // Cycle 2: emit the once-adapter ONCE, before the recipe loop (on the win32 vehicle
+    // every call_once GlobalAddr-references it). It is a synthesized body like any other, so
+    // it takes the same Weak + Hidden linkage from `begin`. On the win32 vehicle DCE keeps
+    // it through call_once's `GlobalAddr` (a live function naming it), which is also what
+    // kept it before — an OS-invoked callback is never a direct-call target. The pthread
+    // vehicle hands pthread_once the C11 function as is, so nothing names the adapter there
+    // and DCE drops it, as it did before the linkage changed (✔MEASURED 2026-09-24: no
+    // `___dss_once_tramp` in a Mach-O arm64 image, before or after). Its 3 params match
+    // PINIT_ONCE_FN; only `param` (the C11 fn) is used, but
     // all 3 Args are emitted so their ordinals stay contiguous (0,1,2) — DCE keeps every
     // Arg as a root (D-OPT-VARIADIC-RELEASE-ARGINDEX), so the unused io/ctx survive.
     if (onceTrampSym.has_value()) {
@@ -874,8 +890,10 @@ bool synthesizeThreadsShim(
                 // A recipe id present in the descriptor vocabulary but with NO win32 arm — a
                 // vocab/switch drift. Fail loud (never a silently-undefined shim). The loader
                 // closed-vocab guard makes this unreachable in practice; this is the backstop.
+                // Anchored: D-CSUBSET-C11-THREADS-HEADER.
                 emitErr(reporter, "synthesizeThreadsShim: no win32 synth arm for recipe id '"
-                                      + recipe + "' (D-CSUBSET-C11-THREADS-HEADER vocab/switch drift)");
+                                      + recipe + "' — the recipe vocabulary and this switch have "
+                                        "drifted apart: add the arm, or remove the id from the vocabulary");
                 return false;
             }
         } else {  // LibrarySynthVehicle::Pthread
@@ -1246,8 +1264,10 @@ bool synthesizeThreadsShim(
                 // A recipe id present in the descriptor vocabulary but with NO pthread arm — a
                 // vocab/switch drift. Fail loud (never a silently-undefined shim). The loader
                 // closed-vocab guard makes this unreachable in practice; this is the backstop.
+                // Anchored: D-CSUBSET-C11-THREADS-MACHO.
                 emitErr(reporter, "synthesizeThreadsShim: no pthread synth arm for recipe id '"
-                                      + recipe + "' (D-CSUBSET-C11-THREADS-MACHO vocab/switch drift)");
+                                      + recipe + "' — the recipe vocabulary and this switch have "
+                                        "drifted apart: add the arm, or remove the id from the vocabulary");
                 return false;
             }
         }

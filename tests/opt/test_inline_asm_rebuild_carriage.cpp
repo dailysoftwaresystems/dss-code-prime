@@ -106,15 +106,14 @@ public:
 //
 // ★★ EVERY FIELD THE DESCRIPTOR GAINS MUST BE ADDED HERE, AND THE FIRST TWO
 // SHOWED WHY. `isExtended` and `MirAsmOperand::tiedOutput` arrived after this
-// fixture was written and were NOT pinned (the row
-// `D-TEST-MIR-ASM-DESCRIPTOR-NEW-FIELDS-UNPINNED-THROUGH-REBUILD`, which closed by
-// adding them). Today nothing can drop any of them — every rebuild site passes
-// `src.asmDescriptor(id)` WHOLE by value, so new members ride along for free — and
-// that is exactly the trap: the pin's strength is a property of how the copy
-// happens to be spelled today, not of anything asserted. The exposure is a future
-// refactor to a field-by-field copy, which is the silent-drop class
-// `mir_asm_descriptor.hpp`'s own docblock exists to guard ("A POOL INDEX IS NOT
-// SELF-CARRYING, AND THAT IS THE WHOLE HAZARD").
+// fixture was written and were NOT pinned through the rebuild until a later
+// cycle added them here. Today nothing can drop any of them — every rebuild
+// site passes `src.asmDescriptor(id)` WHOLE by value, so new members ride along
+// for free — and that is exactly the trap: the pin's strength is a property of
+// how the copy happens to be spelled today, not of anything asserted. The
+// exposure is a future refactor to a field-by-field copy, which is the
+// silent-drop class `mir_asm_descriptor.hpp`'s own docblock exists to guard
+// ("A POOL INDEX IS NOT SELF-CARRYING, AND THAT IS THE WHOLE HAZARD").
 // ⚠ EVERY ONE IS SET TO A NON-DEFAULT VALUE on purpose: `isExtended` defaults to
 // the BASIC surface, `tiedOutput` to `nullopt`, and both spelling lists to EMPTY,
 // so a sentinel that used the defaults could not tell a dropped field from a field

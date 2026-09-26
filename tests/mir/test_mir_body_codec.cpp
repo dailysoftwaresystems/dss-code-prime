@@ -27,9 +27,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <format>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace dss;
@@ -97,6 +99,19 @@ std::vector<ModuleSummary> summarize(std::vector<TestCu> const& cus) {
     return out;
 }
 
+// A DECODED body's names arrive sparse — one entry per symbol the body declares
+// (`MirParseResult::symbolNames`, P68 lane `ht` part 1c). This test's modules
+// number their symbols 1..N, so spreading them into the dense form the rest of
+// this file (and `LazyImportCu`) takes costs N entries.
+std::vector<std::string> denseNames(std::unordered_map<std::uint32_t, std::string> const& names) {
+    std::vector<std::string> dense;
+    for (auto const& [v, n] : names) {
+        if (dense.size() <= v) dense.resize(static_cast<std::size_t>(v) + 1);
+        dense[v] = n;
+    }
+    return dense;
+}
+
 std::string structuralDump(Mir const& mir,
                            std::vector<std::string> const& names) {
     auto nameOf = [&](SymbolId s) {
@@ -154,7 +169,7 @@ TEST(MirBodyCodec, RoundTripPreservesTheModule) {
     ASSERT_TRUE(decoded.has_value()) << "errorCount=" << rep.errorCount();
     EXPECT_EQ(decoded->moduleDigest, "digest-1");
     EXPECT_EQ(decoded->targetIdentity, kTarget);
-    EXPECT_EQ(structuralDump(decoded->parsed->mir, decoded->parsed->symbolNames),
+    EXPECT_EQ(structuralDump(decoded->parsed->mir, denseNames(decoded->parsed->symbolNames)),
               structuralDump(cu.mir, cu.names));
 }
 
@@ -255,7 +270,7 @@ TEST(MirBodyCodec, ADecodedBodyImportsIdenticallyToTheInMemoryOne) {
             decoded = decodeModuleBody(bytes, CompilationUnitId{2}, "digest-1",
                                        kTarget, rep);
             EXPECT_TRUE(decoded.has_value());
-            decodedNames = decoded->parsed->symbolNames;
+            decodedNames = denseNames(decoded->parsed->symbolNames);
         }
 
         std::vector<LazyImportCu> views;

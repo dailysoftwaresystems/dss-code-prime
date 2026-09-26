@@ -4,6 +4,8 @@
 #include "core/types/config_key_vocabulary.hpp"  // detail::renderAllowedList — the ONE closed-set renderer
 #include "core/types/object_format_kind.hpp"  // ObjectFormatKind (the BRIDGE type — see the tier note)
 #include "core/types/strong_ids.hpp"          // CompilationUnitId — by VALUE in readRelocatableObject
+#include "link/import_call_stub_layout.hpp"  // link::ImportCallStubLayout — by VALUE in importCallStubLayout
+#include "link/runpath.hpp"                  // RunpathCarrier — `std::span<RunpathCarrier const>` needs the complete type
 
 #include <cstdint>
 #include <functional>
@@ -225,6 +227,21 @@ public:
     [[nodiscard]] virtual std::span<WeakDefinitionDialect const>
     weakDefinitionDialects() const noexcept = 0;
 
+    // The `runpath.carrier` verbs this backend's WALKER records
+    // (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH) — the third config vocabulary whose
+    // rows name an encoder, asked the same way as the two above: `validate()`
+    // refuses a document declaring a carrier no walker writes, or one written
+    // by a DIFFERENT backend, so a runpath can never be declared, accepted and
+    // then dropped by the walker that was handed it. Empty for every backend
+    // whose walker records none — which is not a refusal of the request: a
+    // format with no declaration accepts it with a warning (see
+    // `link/runpath.hpp` for the PE measurement that decided that).
+    //
+    // ★ PURE, like its two siblings: every backend must ANSWER, so a new
+    // format cannot inherit a silent "records nothing" it never chose.
+    [[nodiscard]] virtual std::span<RunpathCarrier const>
+    runpathCarriers() const noexcept = 0;
+
     // ── Capability predicates (NEVER identity predicates) ───────────────
 
     // Does this schema describe a LOAD-TIME-BOUND image (ELF ET_EXEC/ET_DYN,
@@ -360,6 +377,30 @@ public:
     [[nodiscard]] virtual bool
     realizesCoalescingScopeReferences() const noexcept { return false; }
 
+    // ── [[D-LK-SYNTHETIC-ENTRY-IMPORT-CALL-OVERFLOWS-PAST-THE-BRANCH-REACH]] ──
+    //
+    // Where THIS backend's writer will put the call stub of each import that
+    // `module` binds, as an upper bound on the stub's distance past the end of
+    // `.text` — see `link/import_call_stub_layout.hpp` for why a bound, and why
+    // it must hold for every `.text` size. The branch-veneer pass reads it to
+    // measure an import-bound call exactly as GNU ld and ld.lld do: against
+    // the stub it lands on.
+    //
+    // ★ A WALKER CAPABILITY, like `realizesCoalescingScopeReferences()` above,
+    // because only the code that lays the stubs out knows where they go; and
+    // each implementation's writer ASSERTS its real layout against this answer
+    // when it emits the stubs, so the two cannot drift silently.
+    //
+    // ★ DEFAULT: NO STUBS. A backend whose writer emits no call stub — or no
+    // bounded branch at all — answers nothing, and a branch to an import is
+    // then measured by the relocation applier alone, exactly as before.
+    [[nodiscard]] virtual link::ImportCallStubLayout
+    importCallStubLayout(AssembledModule const&    /*module*/,
+                         TargetSchema const&       /*targetSchema*/,
+                         ObjectFormatSchema const& /*objectFormatSchema*/) const {
+        return {};
+    }
+
     // ── Emit ────────────────────────────────────────────────────────────
 
     // Encode a linked module into this format's bytes. Replaces the 6-arm
@@ -370,9 +411,12 @@ public:
     // the linker's pre-walker gate refuses any request whose vehicle this
     // schema does not declare, and `stackReserveVehicles()` above is what the
     // load-time rule checks that declaration against. A backend with no
-    // vehicle can only ever be handed an EMPTY request. "Declared but
-    // silently dropped" stays unreachable, now by a capability chain rather
-    // than by a hand-maintained argument list.
+    // vehicle can only ever be handed a request with no stack reserve.
+    // "Declared but silently dropped" stays unreachable, now by a capability
+    // chain rather than by a hand-maintained argument list. The request's
+    // RUNPATHS do reach every backend (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH):
+    // a backend whose walker records none was reported by the gate's warning,
+    // and one that records them does so from the format's declaration.
     [[nodiscard]] virtual std::vector<std::uint8_t>
     encode(AssembledModule const&    module,
            TargetSchema const&       targetSchema,

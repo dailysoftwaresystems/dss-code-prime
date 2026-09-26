@@ -47,6 +47,54 @@ std::string recordedImportIdentity(std::string_view declaredImportName,
     return std::string{readerLibraryPath};
 }
 
+// The thread-storage-duration agreement rule. Doc + rationale + the measured
+// wrong-artifact evidence live on the declaration in `ingest.hpp`; the callers
+// are `ingest()` below (the C/HIR binder) and the `encode` tier's `.s` extern
+// binder in `program/compile_pipeline.cpp` — the same two binders that share
+// `recordedImportIdentity`, for the same reason.
+//
+// ⚠ THE CODE IS BORROWED DELIBERATELY, NOT FOR WANT OF A BETTER ONE.
+// `K_ExternImportAttributeConflict` already means "two declarations of ONE
+// imported symbol disagree about an attribute that SELECTS THE BINDING MODEL",
+// names `isThreadLocal` as one of those attributes, and carries the remediation
+// this fault has ("make the declarations agree"). It is already a member of
+// `kUnsuppressableCodes`, which a silent-miscompile guard REQUIRES: outside
+// that table the reporter's dedup window and per-code cap can drop the
+// diagnostic and restore the silence. What this site broadens is WHOSE second
+// declaration it is — the LIBRARY'S OWN DEFINITION rather than a sibling CU's
+// `extern` — and that widening is not yet written into the code's docblock in
+// `core/types/parse_diagnostic.hpp`, which this lane does not hold.
+bool reportLibraryThreadStorageDisagreement(std::string_view    mangledName,
+                                            std::string_view    libraryIdentity,
+                                            SymbolKind          librarySymbolKind,
+                                            bool                declaredThreadLocal,
+                                            DiagnosticReporter& reporter) {
+    if (librarySymbolKind != SymbolKind::Tls) return false;
+    if (declaredThreadLocal) return false;
+    dss::report(
+        reporter, DiagnosticCode::K_ExternImportAttributeConflict,
+        DiagnosticSeverity::Error,
+        std::format(
+            "extern import '{}': library '{}' defines it with THREAD STORAGE "
+            "DURATION (a thread-local), but the reference declares it as an "
+            "ordinary object — a non-thread-local reference cannot name a "
+            "thread-local definition (C23 6.7.1p3 requires the storage "
+            "duration to agree on every declaration). The two bind through "
+            "different machinery and neither substitutes for the other: an "
+            "ordinary data import binds got-indirect, ONE process-shared "
+            "address for every thread, so accepting this would hand the "
+            "program a datum that is not its thread's. Declare the reference "
+            "`_Thread_local` (or `thread_local`) to match the definition. "
+            "⚠ Doing so currently reaches a second, DIFFERENT refusal — "
+            "binding a library thread-local needs the initial-exec TLS model, "
+            "which is not implemented "
+            "(D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC); an intra-program "
+            "`extern thread_local` resolves by compiling it with its defining "
+            "translation unit. (D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA)",
+            mangledName, libraryIdentity));
+    return true;
+}
+
 // ── The FormatGuess → ObjectFormatKind vocabulary map ───────────────────────
 //
 // A pure TRANSLATION between two closed enums, in the same shape as
@@ -569,28 +617,29 @@ toFfiVisibility(SymbolVisibility v) noexcept {
 // Returns std::nullopt on hard failure (each path emits its own
 // F_* diagnostic via the underlying reader).
 //
-// `format` is threaded in for the BinaryLibrarySource arm alone: a binary
-// source is the one shape whose CONTENT can disagree with the target's object
-// format, and `readImportsForTargetFormat` is the shared chokepoint that says
-// so (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL). The header arms
-// are unaffected -- a `.h` declares no object format, so there is nothing to
-// compare and no arm here branches on `format` itself.
+// `pair.format` is what the BinaryLibrarySource arm checks the binary against:
+// a binary source is the one shape whose CONTENT can disagree with the target's
+// object format, and `readImportsForTargetFormat` is the shared chokepoint that
+// says so (D-FFI-RESOLVE-LIBRARY-WRONG-FORMAT-GUARD-IS-INCIDENTAL). The header
+// arms read each header UNDER the pair (D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE:
+// a `.h` declares no object format, but what it MEANS depends on one), and no
+// arm here branches on the format itself.
 [[nodiscard]] std::vector<ImportSurface>
-readSource(IngestionSource const& src, ObjectFormatSchema const& format,
+readSource(IngestionSource const& src, HeaderReadPair const& pair,
            DiagnosticReporter& reporter, bool& outFailed) {
     return std::visit(
         [&](auto const& s) -> std::vector<ImportSurface> {
             using T = std::decay_t<decltype(s)>;
             if constexpr (std::is_same_v<T, BinaryLibrarySource>) {
-                auto r = readImportsForTargetFormat(s.path, format, reporter);
+                auto r = readImportsForTargetFormat(s.path, pair.format, reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
             } else if constexpr (std::is_same_v<T, CHeaderSource>) {
-                auto r = readCHeader(s.path, s.importLibrary, reporter);
+                auto r = readCHeader(s.path, s.importLibrary, pair, reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
             } else if constexpr (std::is_same_v<T, CHeaderDirSource>) {
-                auto r = readCHeaderDirectory(s.dir, s.importLibrary,
+                auto r = readCHeaderDirectory(s.dir, s.importLibrary, pair,
                                               reporter);
                 if (!r) { outFailed = true; return {}; }
                 return std::move(*r);
@@ -644,6 +693,7 @@ toCanonicalName(ImportSurface const& row, CSymbolDecorationScheme scheme,
 std::expected<std::vector<ImportSurface>, HeaderReadError>
 readCHeaderDirectory(std::filesystem::path const& headerDir,
                      std::string_view             importLibrary,
+                     HeaderReadPair const&        pair,
                      DiagnosticReporter&          reporter) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -684,7 +734,7 @@ readCHeaderDirectory(std::filesystem::path const& headerDir,
     // the whole directory read if EVERY file failed.
     std::optional<HeaderReadError> firstError;
     for (auto const& path : headers) {
-        auto r = readCHeader(path, importLibrary, reporter);
+        auto r = readCHeader(path, importLibrary, pair, reporter);
         if (!r) {
             ++failedFiles;
             if (!firstError) firstError = std::move(r.error());
@@ -731,9 +781,13 @@ ingest(std::span<IngestionSource const> sources,
     // FfiMetadata via FF4 for those targets would silently emit
     // wrong-shape metadata once plan 17/18 grows real ingestion
     // paths.
+    // The resolved calling convention, kept for the header arms below: they read
+    // each header under this exact pair (`HeaderReadPair`).
+    TargetCallingConvention const* resolvedCc = nullptr;
     {
         auto abi = resolveAbi(target, format, reporter);
         if (!abi) return returnWithSnapshot();
+        resolvedCc = abi->cc;
         if (abi->cc == nullptr) {
             // post-fold #6 silent-failure C2: dedicated code (not
             // `D_PlanNotLanded` reuse). The (operand-stack /
@@ -759,7 +813,7 @@ ingest(std::span<IngestionSource const> sources,
     struct TaggedRow {
         ImportSurface row;
         bool fromBinary = false;
-        // D-FFI-DECLARED-IMPORT-NAME: the caller-STATED runtime identity of the
+        // The DECLARED import name: the caller-STATED runtime identity of the
         // SOURCE this row came from (`BinaryLibrarySource::declaredImportName`;
         // empty == not stated). Carried per-row because the precedence is
         // decided per-EXTERN below, where only the matched row is in scope --
@@ -768,9 +822,10 @@ ingest(std::span<IngestionSource const> sources,
     };
     std::vector<TaggedRow> aggregated;
 
+    HeaderReadPair const pair{target, format, resolvedCc};
     for (auto const& src : sources) {
         bool failed = false;
-        auto rows = readSource(src, format, reporter, failed);
+        auto rows = readSource(src, pair, reporter, failed);
         if (failed) return returnWithSnapshot();
         bool const fromBinary =
             std::holds_alternative<BinaryLibrarySource>(src);
@@ -782,7 +837,7 @@ ingest(std::span<IngestionSource const> sources,
         // the reader's label intact (the pre-c162 header/JSON behavior).
         // This is precedence LEVEL 3 -- levels 1 + 2 are ranked over it at
         // the per-extern decision site below.
-        std::string declaredImportName;  // D-FFI-DECLARED-IMPORT-NAME (level 1)
+        std::string declaredImportName;  // the declared import name (level 1)
         if (fromBinary) {
             auto const& bin = std::get<BinaryLibrarySource>(src);
             if (!bin.importName.empty()) {
@@ -898,6 +953,25 @@ ingest(std::span<IngestionSource const> sources,
         if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
 
+        // D-FFI-LIBRARY-TLS-EXPORT-BINDS-AS-PLAIN-DATA: the matched row is the
+        // LIBRARY'S OWN ANSWER about this name, and this is the first and only
+        // moment both answers are in scope — the declaration's storage duration
+        // (`ext.isThreadLocal`, the source spelling) and the definition's
+        // (`matched.row.kind`, what the export table says). BIND ONLY IF THEY
+        // AGREE. The reader has classified `STT_TLS` since FF1 shipped and
+        // nothing consumed it; that dangling fact is what let a plain
+        // `extern int` bind a thread-local as ordinary data and read the
+        // library's ELF header at run time. Reported as an Error, so the row is
+        // left UNBOUND rather than written half-right behind a refusal.
+        if (reportLibraryThreadStorageDisagreement(
+                linkerName,
+                recordedImportIdentity(matched.declaredImportName,
+                                       matched.row.soname,
+                                       matched.row.libraryPath),
+                matched.row.kind, ext.isThreadLocal, reporter)) {
+            continue;
+        }
+
         FfiMetadata meta{};
         meta.mangledName   = linkerName;
         meta.linkage       = toFfiLinkage(matched.row.linkage);
@@ -908,7 +982,7 @@ ingest(std::span<IngestionSource const> sources,
         // name is emitted from `ExternImport.libraryPath` == this field, so
         // this expression IS the artifact's runtime dependency.
         //
-        //   1. D-FFI-DECLARED-IMPORT-NAME — the caller STATED the identity.
+        //   1. A DECLARED import name — the caller STATED the identity.
         //      Beats everything: the file we READ may be a cross-compilation
         //      STAND-IN whose own embedded identity names a path that will not
         //      exist on the target (a MacPorts `/opt/local/...` LC_ID_DYLIB
@@ -979,7 +1053,7 @@ ingest(std::span<IngestionSource const> sources,
             // (b) ONLY ABOUT THE FILE WE ACTUALLY READ. `meta.importLibrary`
             //     above may be a caller's DECLARED identity that deliberately
             //     differs from the binary on disk — the cross-compilation
-            //     stand-in / `.tbd` contract (D-FFI-DECLARED-IMPORT-NAME).
+            //     stand-in / `.tbd` contract (a declared import name).
             //     The verneed we emit names `importLibrary`, so requesting a
             //     version we saw in a DIFFERENT file would demand it of a
             //     library whose version set we never observed, turning a
@@ -1009,7 +1083,7 @@ ingest(std::span<IngestionSource const> sources,
         // distinct ExternImport.soname path is the future refinement, not
         // needed for the runtime-correct dependency).
         //
-        // NOT re-pointed by a level-1 declaration (D-FFI-DECLARED-IMPORT-NAME):
+        // NOT re-pointed by a level-1 declaration (a declared import name):
         // this field answers "what did the file we read declare about itself",
         // `importLibrary` answers "what identity do we RECORD". When a caller
         // states an identity the two legitimately differ (that is the whole
@@ -1126,7 +1200,7 @@ synthesizeFfiFromSourceDecls(
                                          ext.linkName);
         meta.linkage       = FfiLinkage::Strong;
         meta.visibility    = FfiVisibility::Default;
-        // D-CSUBSET-EXTERN-LIBRARY-SYNTAX closure (step 13.3) + UCRT-P4
+        // The extern library-name syntax closure (step 13.3) + UCRT-P4
         // (Decision 1): the ROW's per-symbol library is now the ONLY
         // source of an import library. It arrives from the PLATFORM's
         // shipped-descriptor realization (already folded to this

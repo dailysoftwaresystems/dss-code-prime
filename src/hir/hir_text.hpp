@@ -30,6 +30,9 @@
 //   - Types are CU-ephemeral `TypeId`s; the text renders them STRUCTURALLY
 //     (`i64`, `ptr<i64>`, `fn(i32)->void`), so emit/parse both need a
 //     `TypeInterner` to decode / re-intern — exactly as `HirVerifier` takes one.
+//     A COMPOSITE (struct / union) is the one exception: it is DEFINED ONCE in
+//     the `types` preamble section and every use names it (`type <H>`) — see the
+//     v5 note below.
 //   - Symbol names are NOT in the `Hir` (a node carries only an opaque `SymbolId`);
 //     they are first-class file content sourced from an injected name table on
 //     emit, and reconstructed into `HirParseResult::symbolNames` on parse so a
@@ -39,7 +42,7 @@
 //     carries only its pool index in `payload`). Like the side-tables, emit
 //     takes the pool by pointer and parse hands a rebuilt one back. When a pool
 //     is supplied, a `Literal` renders its VALUE inline (`lit int 42 : i32`,
-//     `lit str "hi" : arr<char,3>`) so the value round-trips; absent a pool it
+//     `lit str "hi" : arr<char, 3>`) so the value round-trips; absent a pool it
 //     falls back to the bare index form (`lit #<index> : <type>`) — still
 //     self-contained and re-parseable, just value-less (used by hand-built test
 //     modules that have no pool).
@@ -61,30 +64,42 @@
 //
 // ★★ THE SELF-CONTAINMENT RULE, STATED ONCE. A reader holding ONLY the bytes
 // must be able to reconstruct every type and every name the module references,
-// with no side channel. That is why types render STRUCTURALLY (a `struct`
-// spells its fields, its offsets and its packing inline, not an id), why names
-// travel in `symbols`, and why buffers travel in `buffers`.
+// with no side channel. That is why every type TRAVELS (a composite's fields,
+// offsets, alignments, bit widths and packing are all in the file, never an
+// id into a compiler's memory), why names travel in `symbols`, and why buffers
+// travel in `buffers`.
 //
-// ★★★ v3: A CYCLIC COMPOSITE IS SPELLED, NOT REFUSED — `struct S { struct S
-// *next; }`, the ordinary linked list, and every tree, intrusive container and
-// parent pointer in real C. A composite whose own type graph reaches itself
-// carries a `rec <H>` marker after its name, and the re-entry point spells
-// `rec <H>` in type position instead of expanding forever:
+// ★★★ v5: EACH COMPOSITE IS DEFINED ONCE, AND EVERY USE REFERENCES IT.
 //
-//     struct "Node" rec 1 {i32, ptr<rec 1>}
+//     types {
+//       type 1 = struct "Node" {i32, ptr<type 1>}
+//     }
+//     …  param %3 : ptr<type 1>
 //
-// ⚠⚠ THE HANDLE IS PER-COMPOSITE AND ARTIFACT-GLOBAL, NEVER PER-SPELLING, AND
-// THAT IS THE WHOLE CORRECTNESS ARGUMENT. A relative (De Bruijn `^N`) marker
-// would have made ONE type's spelling depend on WHERE it was reached from —
-// mutually recursive `A`/`B` spell `B` one way standing inside `A` and another
-// way standing alone — so a content-keyed reader would rebuild TWO `B`s from
-// one, splitting a type's identity across a round trip whose BYTES still
-// matched. The handle is the same device `symbols`/`%N` and `buffers`/`buf N`
-// already use for the file's other CU-ephemeral identities, and it is what the
-// parser keys its forward mint on, so handle H ⇒ exactly one TypeId per file.
-// ⓘ `opaque` remains a DIFFERENT and non-overlapping marker: it says the
-// composite is INCOMPLETE (no field list at all), and an incomplete composite
-// has no fields to close a cycle through, so `rec` and `opaque` never co-occur.
+// Until v4 a composite was spelled STRUCTURALLY AT EVERY USE — its whole field
+// list inline, through every pointer — so the artifact's size was (type
+// mentions) × (the reachable type graph). ✔MEASURED on sqlite (P68 round 7,
+// lane `cr`): 1.18 MB of the amalgamation took 275.9 G instructions and died
+// `std::bad_alloc` in `--emit-hir`, where the whole COMPILE of the same file is
+// 3.23 G. Every reference IR measured (clang's `%struct.A = type {…}`, gcc's
+// `@N` tree-dump handles, MSVC's CodeView type indices) defines a composite once
+// and refers to it by handle; this format now does the same, so a module with
+// N mentions of a composite whose graph has G nodes spells O(N + G) type nodes
+// (`hirTextTypeNodesSpelledTake` counts them).
+//
+// ⚠⚠ THE HANDLE IS PER-COMPOSITE AND ARTIFACT-GLOBAL, NEVER PER-SPELLING. It is
+// minted at the composite's first REFERENCE, in text order, so it is a function
+// of the module alone; it is the same device `symbols`/`%N` and `buffers`/`buf N`
+// already use for the file's other CU-ephemeral identities, and the parser keys
+// its forward mint on it, so handle H ⇒ exactly one TypeId per file — two
+// composites that happen to share a name and a field list (two scopes' `struct
+// S`) stay two types. A CYCLE is therefore an ordinary case rather than a
+// special one: `ptr<type 1>` inside the definition of `type 1` is a reference
+// like any other. The v3 `rec <H>` back-reference is SUBSUMED in a module and
+// refused there; it survives only in a STANDALONE type text
+// (`parseTypeFromText`), which has no table to reference.
+// ⓘ `opaque` marks an INCOMPLETE composite (no field list at all) and is an
+// ordinary table entry: `type 2 = struct "FILE" opaque`.
 
 namespace dss {
 
@@ -112,7 +127,20 @@ class TypeRegistry;
 // stray token — which is the correct outcome and exactly why the number moves:
 // the alternative is a reader that skips what it does not recognise and rebuilds
 // a `Node` with no `next`.
-inline constexpr std::uint32_t kHirTextFormatVersion = 4;
+// v4 added the `rmw` expression.
+// v5 moved every composite into the `types` section (defined once, referenced as
+// `type <H>`), gave a composite definition a spelling for EVERY layout channel
+// the interner carries (whole-composite `aligned N`, the `pack N` cap, per-field
+// `bits N`, and `~N` on a union member, which v4 dropped), and spelled a
+// value-less return `return void`: a v4 reader meeting `return` followed by the
+// next statement's `@loc` took that statement for the return's VALUE — ✔MEASURED
+// on sqlite's `test/speedtest1.c`, whose `if (c) return;` then-arms made
+// `--emit-hir` refuse its own artifact (P68 round 8, lane `ht`).
+// v6 spelled an enumeration's FIXED underlying type, `enum "E" fixed i64 "long"`
+// (P68 round 12, lane `cs`): `enum E : long` and `enum E` are different types
+// (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. A v5 reader meeting the
+// v6 spelling reads `enum "E"` and then meets `fixed` with no rule for it.
+inline constexpr std::uint32_t kHirTextFormatVersion = 6;
 
 // ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
 //
@@ -277,6 +305,19 @@ struct DSS_EXPORT HirTextContext {
 [[nodiscard]] DSS_EXPORT std::string emitHir(Hir const& hir, HirTextContext const& ctx,
                                              DiagnosticReporter& reporter);
 
+// ── hirTextTypeNodesSpelledTake — THE WRITER'S TYPE-SPELLING WORK, COUNTED ────
+//
+// The number of type NODES `emitHir` has rendered on this thread since the last
+// call (each primitive, each `ptr<…>`, each `type <H>` reference, each field of a
+// `types` definition counts once), and resets it. It is the instrument that
+// states the v5 property as a number: a module with N mentions of a composite
+// whose reachable graph has G nodes spells O(N + G) nodes — doubling N adds the
+// mentions' own cost and nothing of G — where v4 spelled O(N × G).
+// Deterministic, host- and load-independent, so a pin COUNTS and never times.
+// Per-THREAD, because the driver's per-CU pool may emit several modules at once
+// (the `mirDomSlotsSweptTake` precedent).
+[[nodiscard]] DSS_EXPORT std::uint64_t hirTextTypeNodesSpelledTake() noexcept;
+
 // ── renderHirKindInventory ────────────────────────────────────────────────────
 //
 // This build's HIR node-kind inventory, as machine-readable text: every core
@@ -386,6 +427,13 @@ struct DSS_EXPORT HirParseResult {
 // `reporter` on malformed or unknown type text; it never returns a partially
 // constructed type silently. Trailing tokens after a complete type are reported
 // (the input must be a single type, nothing more).
+//
+// ⚠ A STANDALONE TYPE TEXT IS SELF-CONTAINED, AND THAT IS WHY IT KEEPS THE INLINE
+// COMPOSITE FORMS a `.dsshir` module no longer uses: `struct "N" {…}`, `union
+// "N" {…}`, `struct "N" opaque`, and `rec <H>` for a cycle. A module's
+// `type <H>` reference names an entry of that module's `types` section, and a
+// standalone text has no such section, so `type <H>` is REFUSED here by name
+// rather than read as an unknown identifier.
 //
 // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): `namedTypes` is an optional set of
 // caller-supplied NAME → TypeId bindings (core/types/named_type_binding.hpp)

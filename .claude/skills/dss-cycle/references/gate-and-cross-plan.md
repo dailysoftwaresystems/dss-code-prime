@@ -1,13 +1,29 @@
 # The fail-loud gate + the cross-plan update
 
+## Contents
+- Step 6 — Fail-loud gate: the build is verifiable (`check-ninja-deps`) · a ctest run that overlapped a
+  build is void · any shared input moving under a run · a wrapper cannot report its verdict if a command
+  follows it · no new `abort()` in test code · the anchor-registry and script-index guards · §A.7
+  nothing worked around · the anchor balance gate · four rows that are the same row · the
+  diagnostic-code allocation gate
+- Step 8 — Cross-plan update
+  - 8.1 The handoff document — rewrite it encode-first and replace it atomically
+  - 8.2 Concurrent branches / PRs
+  - 8.3 Timeline
+  - 8.4 The rules that keep the handoff worth reading
+
+This file numbers the steps the older way (Step 6 is `SKILL.md`'s step 7, Step 8 its step 9); the
+crosswalk is at the top of `workflow-steps.md`.
+
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+
 ### Step 6 — Fail-loud gate
 This is the canonical gate checklist (§A.6 is its one-line statement). Verify every item:
-- `cmake --build build` clean (no link errors).
+- `dssharness build --legs <leg>` clean (no link errors); `dssharness test` builds first.
 - **★★★ THE BUILD IS VERIFIABLE — run this BEFORE trusting any ctest result:**
 
   ```bash
-  python scripts/check-ninja-deps/check-ninja-deps.py            # no argument: it finds the tree
-  python scripts/check-ninja-deps/check-ninja-deps.py build/p29-x  # or name YOUR lane's tree
+  dssharness run check-ninja-deps --legs windows-x86_64-debug   # builds the leg, then reads ITS build directory
   ```
 
   ⚠⚠ **THIS LINE USED TO READ `… check-ninja-deps.py build-dbg`, AND THAT PATH HAS NOT EXISTED SINCE
@@ -15,28 +31,28 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   `SKIP build-dbg -- no build.ninja` and exited **0**, so a cycle following this reference verbatim
   ran the build-verifiability check against a nonexistent directory and read `rc=0` as a pass.
   Both halves are fixed: the invocation above, and the tool — a named directory that does not exist
-  is now **exit 2**, never a skip (`D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST`).
+  is now **exit 2**, never a skip.
   A directory that exists but is not a ninja tree is also exit 2 unless you pass `--allow-non-ninja`,
   which prints a SKIP naming the flag — an unasked-for skip is indistinguishable from a pass.
   ⓘ The no-argument form auto-picks `build/dbg`, else the pre-migration `build-dbg`, else fails loud
-  on `build/dbg`. **Name your own tree when you are a lane** — the whole point is to verify the tree
+  on `build/dbg`. ⏳ SCRIPT-ERA (superseded 2026-09-24: the runner's freshness step is handed THIS leg's {buildDir}, so a lane's own tree is the one read; see actions.md) **Name your own tree when you are a lane** — the whole point is to verify the tree
   the ctest result came from.
   ⓘ Its `--self-test` (7 parser cases + 5 target-verdict cases) now rides ctest as
   `ninja_deps_selftest_guard`. The PROBE form still cannot be a ctest entry: it needs a build
-  directory, and a source checkout has none.
+  directory, and a source checkout has none. SUPERSEDED 2026-09-14 by the build/ninja-deps-freshness ctest entry, which runs the probe over the build directory ctest itself runs in (see round-gate-and-ci.md)
 
   A green ctest proves nothing about the current source if the objects it linked were never
   rebuilt, and that is not hypothetical here: `ninja -t deps` has twice reported `#deps 0` on
   live objects — **10 of 403** on 2026-08-13, then **51 of 430** after a seven-lane concurrent
   cycle, **16 of those being `src/` TUs compiled into the shipped DLL**. A gate run in that state
   is a green suite over a partly-stale compiler: the same class as a false-green red-on-disable,
-  arriving through the build system instead of through a test
-  (`D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS`).
+  arriving through the build system instead of through a test.
   ⚠ `#deps 0` is NEVER legitimate — ✔MEASURED that even a TU with zero `#include` directives
   records `#deps 1` (gcc lists the source itself), so a zero count is always a lost record, never
   a header-free file. The tool treats an EMPTY parse as FATAL too: "nothing found" and "nothing
   ran" look identical from outside, and this project has been burned by that ambiguity before.
-- `ctest --test-dir build --output-on-failure` 100%, including the new tests.
+- `dssharness test --legs windows-x86_64-debug --json --time` 100%, including the new tests — the round
+  gate is `dssharness test --legs gate`, the eight legs; `--filter <regex>` iterates but never concludes.
 - ★★★ **A CTEST RUN THAT OVERLAPPED A BUILD IS VOID IN BOTH DIRECTIONS — AND IT CAN STILL LOOK
   GREEN.** ✔MEASURED 2026-08-17: a lane ran `ninja` while its own gate was executing (the documented
   *mid-run DLL relink is never OK* hazard), and the run **reported 875/875** while emitting ~400
@@ -93,15 +109,14 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   is no standing regression and the log is void — ✔that is exactly what settled the case
   above, in one command, against 501 failures.
 - ★★★ **A WRAPPER CANNOT REPORT ITS VERDICT IF YOU APPEND A COMMAND AFTER IT — AND THE
-  FAILURE IS SILENT AND FLATTERING.** ✔MEASURED 2026-08-24 (cycle P31,
-  `D-CYCLE-A-TRAILING-ECHO-REPLACED-A-FAILED-GATE-S-EXIT-CODE-WITH-ZERO`): the fold gate
+  FAILURE IS SILENT AND FLATTERING.** ✔MEASURED 2026-08-24 (cycle P31): the fold gate
   exited **8** with `stale_refusal_citations_guard` RED, and the background-task notification
   said **`completed (exit code 0)`**. The invocation ended `…; echo "RUNGATE_EXIT=$?"`. The
   echo read the code CORRECTLY and printed `RUNGATE_EXIT=8` — and then, being the last
   command in the compound, **became the terminal state**, which is the one thing the
   notification channel carries. ★ **The instinct was right and the placement destroyed the
   signal it existed to make visible.**
-  ⇒ **Never append a command after `run-gate.sh`.** Its last line is already the verdict.
+  ⇒ **Never append a command after the gate command.** Its last line is already the verdict.
   Where a witness line is genuinely wanted, PRESERVE the code across it:
   `…; rc=$?; echo "RUNGATE_EXIT=$rc"; exit "$rc"`.
   ⚠ **This is the standing watcher rule one hop further out.** *"A watcher must observe every
@@ -113,7 +128,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 - **no NEW `abort()` in test code:**
 
   ```bash
-  python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py
+  dssharness run check-no-abort-in-tests
   ```
 
   `std::abort()` in a fixture kills the whole test PROCESS, so every sibling test in that
@@ -126,37 +141,29 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   `ADD_FAILURE(); std::abort();` idiom copy-pasted), so those are recorded in an `INVENTORY` whose
   per-file ceilings may only come **down**. A new site reds; a *fixed* site also reds until the
   ceiling is lowered, because unclaimed headroom is where the next regression hides. ⚠ Do not
-  confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. Burn-down is
-  `D-TEST-ABORT-IN-A-FIXTURE-HAS-NO-GUARD`, which stays OPEN until the inventory is.
-  ⓘ Self-tests: `python scripts/check-no-abort-in-tests/check-no-abort-in-tests.py --selftest` (the comment/string stripper is
+  confuse `INVENTORY` with `ALLOWLIST` — the latter is by PROOF and is empty. The burn-down stays
+  open in the registry until the inventory is empty.
+  ⓘ Self-tests: `dssharness run check-no-abort-in-tests` runs them after the check (the comment/string stripper is
   the whole correctness — a bare token grep would red on the very file that documents the fix).
-- anchor-registry guard OK: `scripts/check-anchor-registry/check-anchor-registry.ps1` (or `.sh`).
+- anchor-registry guard OK: `dssharness run check-anchor-registry`
+  (ctest `anchor_registry_guard`; one program on every host).
   ⓘ Exit **4** now means *a citation names a RETIRED anchor id* — a name whose registry row opens
   with the `RETIRED-ID` marker. Resolution is substring-anywhere (load-bearing: it is what lets a
   line-wrapped citation resolve), so it cannot otherwise tell a live name from a dead one — a stale
-  id resolved for weeks on the strength of the row written to report it as stale
-  (`D-GATE-ANCHOR-CITATION-RESOLVES-VIA-ITS-OWN-BUG-REPORT`).
-- script-index guard OK: `python scripts/check-scripts-index/check-scripts-index.py`.
+  id resolved for weeks on the strength of the row written to report it as stale.
+- script-index guard OK: `dssharness run check-scripts-index`.
   Rides ctest as `scripts_index_guard`, so it runs anyway — run it directly when this cycle
   added, renamed, deleted or REPURPOSED a script. It reds when the tree and the two indexes
-  (`scripts/README.md`, `references/scripts.md`) disagree, or when a script's own `PURPOSE:`
-  line differs from its index row. Regenerate both with `--write`; never hand-edit the block
-  between the generated-index markers.
-- shell-portability guard OK: `python scripts/check-shell-portability/check-shell-portability.py`.
-  Rides ctest as `shell_portability_guard`, so it runs anyway — run it directly when this cycle
-  touched a `.sh`. It refuses two shapes that are fatal on **macOS bash 3.2** and invisible
-  everywhere else: a `case` inside `$( … )` whose patterns are not `(`-prefixed, and a bash-4+
-  construct in a file with no `BASH_VERSINFO` gate above it.
-  ★★ ⚠ **`bash -n` CANNOT FIND THE FIRST ONE** — ✔MEASURED 2026-08-22: the probe file parses clean
-  under 3.2 (exit 0) and fails only when the substitution is EXPANDED. Do not "check it with the old
-  shell" instead; that instrument is blind by construction. The cost of not having this guard was
-  `anchor_registry_guard` dying inside its OWN self-test on `macos-latest`, so the anchor registry
-  had never been checked on that host (`D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2`).
-  ⓘ It walks the TREE and asks git only what is IGNORED — never `git ls-files`. ✔MEASURED on the
-  macOS leg the same day: a carriage's checkout sits at an old commit with the working tree rsynced
-  over it, so the INDEX named seven deleted `tools/*.sh` paths and the guard reported seven
-  violations on a host where nothing was wrong. Every carriage has that shape, so the distinction is
-  operational, not academic (`D-GATE-SHELL-PORTABILITY-SCANNED-THE-INDEX-NOT-THE-TREE`).
+  (`.harness-config/runner/actions/README.md`, `references/actions.md`) disagree, or when a script's own `PURPOSE:`
+  line differs from its index row. Regenerate both with `dssharness run check-scripts-index-write`; never hand-edit the block
+  between the generated-index markers. ★ It also refuses any `.sh` or `.ps1` under the actions root,
+  by name: every action runs one Python program on every host (operator ruling 2026-09-21).
+- ⓘ There is no shell-portability guard any more: its subject, the `.sh` programs of the actions
+  tree, was retired on 2026-09-21 (what covers it is in `cmake/DssHarnessDeletionInventory.md`).
+  Its lesson outlives it: a guard running on a carriage's checkout asks git only what is IGNORED,
+  never `git ls-files` — ✔MEASURED 2026-08-22, a checkout sitting at an old commit with the working
+  tree synced over it made the INDEX name seven deleted `tools/*.sh` paths, and a guard reading the
+  index reported seven violations on a host where nothing was wrong.
 - agnosticism scan clean (no hardcoded language/CPU/format in shared substrate).
 - CI-hazard screen clean (from Step 5): no GCC-vs-MSVC portability traps. Local green ≠ CI green.
 - review folded clean.
@@ -170,12 +177,12 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   a gate item with a number, checked exactly like ctest. Count before and after and report both:
 
   ```bash
-  python scripts/check-anchor-balance/check-anchor-balance.py
+  dssharness check-anchor-balance --base <cycle-start-sha>   # the live balance; --json writes the receipt
   ```
 
   It prints OPEN-at-base, OPEN-now, and **the name of every row that opened or closed** — the count
   alone cannot tell you which, and "which" is the question. Exit 1 when the cycle leaves more open
-  than it found.
+  than it found. ⏳ SCRIPT-ERA (superseded 2026-09-17: the live balance is the `dssharness check-anchor-balance` verb, and its exit codes are DssHarness's own; see dss-harness.md)
 
   `after > before` ⇒ **the gate FAILS.** Close the difference, or escalate the one you cannot close
   as a **§B decision** — the user chooses to carry it; the cycle does not decide that for itself.
@@ -185,7 +192,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   `🔴|🟠|⚠` and was blind to `⏳`, so it reported **269** open rows where there were **579**, and a
   cycle that closed one 🟠 row while opening one ⏳ row would have been congratulated for an
   improvement. ✔MEASURED 2026-08-11, on the very cycle that introduced the gate — the row it could
-  not see was `D-OPT6-LICM-SPECULATIVE-LOAD-HOIST`, a HIGH miscompile. The tool inverts the rule:
+  not see was a HIGH-severity speculative-load-hoist miscompile. The tool inverts the rule:
   **a row is OPEN unless its status cell carries an explicit `✅`**, so a glyph nobody has thought of
   yet counts as open, which is the safe direction. `--self-test` pins that inversion (including a
   deliberately novel glyph); run it if you touch the script. Enumerating the open glyphs is the same
@@ -198,11 +205,11 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   **two homes** for an anchor (this registry AND the owning plan's deferral table) and §F.4 lets a
   `src/` citation resolve to either — but the tool counted only registry rows. ⇒ **a cycle that
   closed a registry row and deferred the work into a plan row was reported as an IMPROVEMENT.**
-  Both homes are now counted, so MOVING a deferral between them is arithmetically NEUTRAL.
+  Both homes are now counted, so MOVING a deferral between them is arithmetically NEUTRAL. SUPERSEDED 2026-09-25 by the registries being the only home a row can have — the door writes nothing else, so a plan-side deferral table is no longer a sanctioned home, ✔MEASURED that day the program's plan-side count was 0, and the live balance is the `dssharness check-anchor-balance` verb, which compares by id across both registries; the program's registry+plans denominator, its --breakdown and its DEBT lines are history (see no-follow-ups.md)
   - **✔MEASURED the day it was fixed: `661 → 662 → 987`**, decomposing with no residue. The
     registry-only number was itself wrong (**+2 −1**): the row regex `^\| \`(D-[A-Z0-9-]+)\` \|`
-    admitted no `_`, so **two OPEN rows were INVISIBLE** (`D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY`,
-    `D-TEST-CORPUS-NO-QEMU-X86_64-ON-ARM64-HOST`) — ★ **a row the gate cannot SEE cannot be seen
+    admitted no `_`, so **two OPEN rows were INVISIBLE** — the two whose ids carry an underscore,
+    one naming `QEMU_LD_PREFIX` and the other `x86_64` — ★ **a row the gate cannot SEE cannot be seen
     to OPEN either** — and one row it counted lives in the registry's own **“Allowlist (code-internal
     pins, NOT deferrals)”** table. The remaining **+325** is the plan side (231 deferred-items, 84
     reserved, 10 registry-shaped).
@@ -216,7 +223,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
     is **not a table at all**; `09.5`/`24`/`28` use §9/§6/§12 and `08` uses §2.5–§2.8. Three anchor
     shapes are counted (the registry's 4-column; `# | Deferred item |` with **five** different tails;
     and `Anchor | Owns`, which has **no status column** so every row is unconditionally OPEN); four
-    non-deferral shapes are excluded BY NAME. Row inclusion is decided **by table, never by how an
+    non-deferral shapes are excluded BY NAME. SUPERSEDED 2026-09-01 by the six-cell registry row — the registry documents use `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`; the program still recognizes the four-cell shape, which survives in plan-side §3.1 tables and plan-17 §5.4, but since 2026-09-25 a plan-side table is no longer a home a row can have, and the live balance, `dssharness check-anchor-balance`, reads only the two registries (see no-follow-ups.md) Row inclusion is decided **by table, never by how an
     anchor is spelled** — which is what makes the underscore blind spot unrepeatable by construction.
   - **Severity rule, and it is not a softening: FATAL iff the measurement is INCOMPLETE.** An
     unrecognized table shape or an orphan row means rows exist that could not be counted → exit 1. A
@@ -229,29 +236,21 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
 
   ★★ **THE FAILURE MODE THIS EXISTS TO KILL, ✔MEASURED 2026-08-11 and it is not subtle:** a lane was
   dispatched to FIX the predefined-macro set. When it was stopped it had written **nine new OPEN rows
-  describing predefined-macro gaps** — `D-PP-COMPILER-IDENTITY-INCOHERENT`,
-  `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT`, `D-PP-CODE-MODEL-PREDEFINES` and six more — i.e. it had
+  describing predefined-macro gaps** — an incoherent compiler identity, absent implementation-detail
+  predefines, the code-model predefines, and six more — i.e. it had
   converted its own assignment into nine reasons to do it later, each one honestly written and
   correctly cross-referenced. **A row that restates the task you were given is not documentation, it
   is the task not being done.** Before writing ANY row, answer in one sentence: *is this the work I
   was sent to do?* If yes, the row is forbidden and the work is mandatory. That cycle's 22 committed
   rows over five commits are the same arithmetic at a slower rate.
 
-  ⓘ ANCHOR-GUARD-QUOTED-NOT-CITED: `D-PP-COMPILER-IDENTITY-INCOHERENT` `D-PP-IMPL-DETAIL-PREDEFINES-ABSENT` `D-PP-CODE-MODEL-PREDEFINES`
-  — the three ids in the paragraph above are **quoted, not cited**. They name rows that were correctly
-  DELETED, so they resolve to nothing **by design**, and the sentence only carries weight because they
-  are the real names. They must not be given rows, allowlisted, or blurred into placeholders to make a
-  tool green: the record is the authority, the guard is the instrument. The anchor guard exempts them
-  **in this file only**, and reds if any of them is ever cited elsewhere, acquires a plan row, or stops
-  appearing above — see the QUOTED-NOT-CITED block in
-  `scripts/check-anchor-registry/check-anchor-registry.sh`.
 - **★ FOUR ROWS THAT LOOK DIFFERENT AND ARE THE SAME ROW.** Before appending, grep the registry for
   the SYMPTOM, the ARTEFACT and the FILE NAMES in your evidence — not the title you have in mind
   (§C.-1 1b). Nine rows about one absent macro family is one row, or better, one fix.
 - **★★ THE DIAGNOSTIC-CODE ALLOCATION GATE — the ordinal space has no lock, so this is the lock.**
 
   ```bash
-  python scripts/check-diagnostic-codes/check-diagnostic-codes.py
+  dssharness run check-diagnostic-codes
   ```
 
   `DiagnosticCode` is one flat ordinal space whose values are PUBLISHED identities (`error[D0029]`,
@@ -260,9 +259,9 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   - ✔**Two concurrent lanes allocated `0xD029`.** One lane was told the slot was free; another had
     already taken it for `D_DependencyBuildFailed`. Nothing mechanical noticed — it was caught only
     because the second lane RE-MEASURED the header instead of trusting its brief. That is diligence,
-    not a mechanism, and it is the same non-mechanism `scripts/run-gate/run-gate.sh` exists to replace.
-  - ✔**A code shipped with no test at all.** `D-AP6-NEW-DIAGNOSTIC-CODES-HAD-NO-VALUE-PIN` closed on
-    exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
+    not a mechanism, and it is the same non-mechanism a WITNESSED run replaces.
+  - ✔**A code shipped with no test at all.** The row demanding a value pin for every new diagnostic
+    code closed on exactly this and **re-opened one cycle later**: `D_LanguageTargetIsaMismatch` (0xD02A) landed
     engine code in `src/` while appearing in ZERO test files.
 
   ★ **The instrument reads the ENUM, never a hand-maintained table.** The contiguity pin in
@@ -284,11 +283,15 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
     that built its baseline, which had called `P_InvalidEscape` covered on the strength of
     `P_InvalidEscapeSequence` appearing in a test.
   - A collapsed parse (enum block not found, implausibly few enumerators, no test sources) exits **2**
-    rather than reporting "0 duplicates, OK" — the instrument that enforces run-gate's lesson must not
+    rather than reporting "0 duplicates, OK" — the instrument that enforces the witness lesson must not
     embody its inverse.
   - `--self-test` covers the collision shapes a text-compare would miss (`0xd029` vs `0xD029`,
     decimal vs hex), the commented-out-enumerator false positive, the comment-strip property, and the
     collapse guards. Run it if you touch the script.
+  - ★ **Before you ALLOCATE, run it with `--cross-branch`:** [→ `--cross-branch` is not a runner step yet, so it runs as `python .harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py --cross-branch`](actions.md) the plain form's "next free" is only this
+    tree's answer, while `--cross-branch` also reads every other worktree's working header and every ref
+    not merged into HEAD, fails on an ordinal two of them allocated differently, and prints the next free
+    slot per band over all of them — the number an allocator actually needs.
 
 **Any red the cycle cannot self-repair → STOP and report the blocker. Do not push broken.**
 Better to wake the user to "stopped at step N, here is the blocker" than to push something
@@ -298,11 +301,12 @@ subtly wrong.
 Keep the plans honest in the **same commit** as the code:
 - Update plan 00 §0 status table + §0.1 stepper row (flip status, update ctest count).
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
-  (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one).
+  (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one). [→ since 2026-09-25 a plan's §3.1 table is no longer a home a row can have: the registry row is the one that closes, by MOVING](anchors-and-deferrals.md)
 - In the registry: **close a row by MOVING it**, never by editing a status in place —
-  `bash scripts/anchors/set-anchor.sh <ANCHOR> --status closed --closing '...' --apply` stamps the
+  `dssharness set-anchor <ANCHOR> --status closed --closing '...'` stamps the
   `Status` column and lifts the row out of its working registry into
-  `_deferred-anchor-registry-done.md`. Add new anchors with `write-anchor.sh ... --insert --apply`.
+  `_deferred-anchor-registry-done.md`. Add new anchors with `dssharness write-anchor <ID> ...` (it
+  WRITES unless given `--anchor-dry-run`).
   **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive
   exists rather than a deletion (operator, 2026-09-01). ⚠ Hand-editing a table is refused by
   `check-anchor-balance`'s partition arm; a hand-typed row can also wrap the anchor id, which does
@@ -321,7 +325,7 @@ never a dated sibling. If it does not exist, **create it this cycle**.
 
 ##### ⛔ REWRITE IT ENCODE-FIRST AND REPLACE ATOMICALLY — never open the real file for writing
 
-✔MEASURED 2026-08-24 (cycle P29, `D-CYCLE-HANDOFF-PATCHER-TRUNCATES-ITS-TARGET-BEFORE-IT-CAN-FAIL`):
+✔MEASURED 2026-08-24 (cycle P29):
 an orchestrator patch script did `io.open(path, "w", …)` and then `fh.write(...)`. The write raised
 on a lone surrogate pair in one of its own literals — **and `"w"` had already TRUNCATED the file**, so
 a **377 KB handoff became 0 bytes**. It was recovered with `git checkout --` only because the handoff
@@ -382,7 +386,7 @@ The handoff is the only channel between them, so it carries — **measured, not 
   session every cycle and is the most likely conflict in the repo. Plan 00 and the shared
   `CMakeLists.txt`/`parse_diagnostic.hpp` slot tables are next.
 - 📄 **Restate the staging rule**, because it is the mitigation: **stage by explicit path, never
-  `git add -A`** (`D-CYCLE-CANNOT-ASSUME-IT-OWNS-THE-WORKING-TREE`). A concurrent workstream's
+  `git add -A`**. A concurrent workstream's
   edits can be sitting in this very working tree.
 - ⚠ **Diagnostic-code slots and anchor names are cross-branch resources.** Two sessions taking the
   same `K_*` slot or minting the same `D-*` name conflict *semantically* — git merges both cleanly
@@ -419,6 +423,6 @@ what makes "two cycles running shipped on one leg" visible as a pattern instead 
   cannot be compressed, that is a signal the project has more open fronts than priorities, and
   saying so IS the handoff.
 - ⚠ **A handoff written from memory is worse than none.** Re-measure the numbers at cycle end
-  (`ctest`, `scripts/check-anchor-balance/check-anchor-balance.py`, `git log --oneline -1`) and paste what they printed.
+  (the round gate's ledger, `dssharness test --legs gate --json`; `dssharness check-anchor-balance`; `git log --oneline -1`) and paste what they printed.
   This repo has recorded three counts written from memory that all erred LOW; the handoff is the
   single most-quoted document in the project, so a wrong number there propagates furthest.

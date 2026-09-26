@@ -216,7 +216,8 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
                 "funcId v=%u has SymbolId v=0 (anonymous / synthetic) — "
                 "DCE's symbol-keyed BFS cannot disambiguate. Caller "
                 "must assign a unique non-zero SymbolId before invoking "
-                "the optimizer (D-OPT3-DCE-ANONYMOUS-SYMBOL).\n", f.v);
+                "the optimizer.\n", f.v);
+            // Anchored: D-OPT3-DCE-ANONYMOUS-SYMBOL (unreachable: the abort below).
             std::abort();
         }
         auto const [it, inserted] = symToFunc.emplace(sv, f);
@@ -225,9 +226,9 @@ void collectSymbolAddrTargets(MirLiteralValue const& v,
                 "dss::opt::passes::scanLiveSymbols fatal: SymbolId v=%u "
                 "appears on multiple functions (funcId v=%u and v=%u) — "
                 "DCE's inter-procedural BFS requires unique SymbolIds. "
-                "Weak/COMDAT-style aliasing is not supported in this cycle "
-                "(D-OPT3-DCE-DUPLICATE-SYMBOL).\n",
+                "Weak/COMDAT-style aliasing is not supported.\n",
                 sv, it->second.v, f.v);
+            // Anchored: D-OPT3-DCE-DUPLICATE-SYMBOL (unreachable: the abort below).
             std::abort();
         }
     }
@@ -378,7 +379,7 @@ public:
     // not a formatting nit, it MINTS A SECOND ANCHOR. The first spelling here
     // was `…-ABORTS-THE-MIR-` + `REBUILDER` on the next comment line, and
     // `anchor_registry_guard` correctly reported an unregistered
-    // `D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR` (its scanner reads one line,
+    // id cut short at `…-ABORTS-THE-MIR` (its scanner reads one line,
     // and the truncation then matched as a prefix in four other files).
     // See D-OPT-ASM-GOTO-WITH-OUTPUTS-ABORTS-THE-MIR-REBUILDER.)
 
@@ -418,8 +419,9 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
             // SECOND spelling of its own name.
             d.actual   = std::format(
                 "opt::{}: skipped — module has >= 1 runtime-init global; "
-                "func-id remap not yet implemented "
-                "(D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS).", kPassName);
+                "func-id remap not yet implemented, so the module is left "
+                "as it was.", kPassName);
+            // Anchored: D-OPT2-CONST-FOLD-RUNTIME-INIT-GLOBALS.
             reporter.report(std::move(d));
             result.ok = true;
             return result;

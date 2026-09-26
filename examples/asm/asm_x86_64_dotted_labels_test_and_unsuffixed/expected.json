@@ -1,0 +1,24 @@
+{
+  "$comment": "`.L` labels as branch targets, `testl`/`testb`/`test`, `sete`, and unsuffixed `mov`/`xor`/`cmp`/`add`/`lea` in a standalone AT&T `.s` (D-ASM-DOTTED-LABEL-AS-A-BRANCH-TARGET-REFUSED, D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS). ✔MEASURED 2026-09-21: GNU as 2.42 and clang 18.1.3 both assemble it and the gas-built binary exits 42 on x86_64 Linux; the P68 round-7 base refused it (`unknown mnemonic 'mov'`). Exit 11, 12 or 13 names the check that went wrong. Only rax/rcx/rdx are touched, volatile under System V and Win64 alike. ★ The `release` arm, scoped honestly: assembly text forms no MIR, so no pipeline can transform it — the arm pins that `--config=release` still produces a working binary from it.",
+  "language": "asm-x86_64-att",
+  "source": "main.s",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

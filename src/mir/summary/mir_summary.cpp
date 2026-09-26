@@ -86,22 +86,35 @@ void sortUnique(std::vector<std::string>& v) {
 // Per-block loop-nest depth for one function: how many natural loops contain
 // each block. The hotness proxy `SummaryCallSite::loopDepth` reports.
 //
-// Uses the CANDIDATE-SCOPED `mirNaturalLoops` overload with the completeness
-// recipe its docblock specifies (the function's own range ∪ its RPO ∪ the
-// module's self-looping blocks). The whole-module overload would be
-// byte-identical but O(functions × module blocks) — the exact shape
+// Uses the CANDIDATE-SCOPED `mirNaturalLoops` over `mirBackEdgeCandidates` —
+// the one statement of which loops belong to a function (its own blocks), the
+// same forest the struct-CF derivation and LICM see. A sweep over the whole
+// module would be O(functions × module blocks) — the exact shape
 // [[D-OPT-LICM-NATURAL-LOOPS-MODULE-WIDE-SCAN]] was opened for, and a summary
-// walk that reintroduced it would put an O(N²) back into every compile.
+// walk that reintroduced it would put an O(N²) back into every compile. (Until
+// 2026-09-18 the candidate set also carried every module self-looping block —
+// never counted here, since only this function's call sites read a depth.)
+//
+// ★ AND THE DOMINATOR TREE IS THE SAME TRAP ONE LINE EARLIER. The FRESH
+// `computeMirDomTree` allocates and sweeps FIVE whole-module arrays for one
+// function's tree, so calling it once per function re-created exactly the
+// O(functions × module blocks) shape the paragraph above rules out — the
+// sibling of D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION, found by
+// searching for that shape. `domScratch` is the caller's ONE scratch for
+// this module (D-OPT-DOMTREE-SCRATCH-REUSE): the trees are byte-identical
+// (pinned against the fresh overload in test_mir_dom.cpp) and each costs
+// only this function's blocks.
 void computeLoopDepths(Mir const& mir, MirFuncId f,
                        std::vector<MirBlockId> const& rpo,
                        std::vector<std::vector<MirBlockId>> const& preds,
-                       std::span<std::uint32_t const> moduleSelfLoops,
                        std::vector<std::uint32_t>& candidateScratch,
+                       MirDomScratch& domScratch,
                        std::unordered_map<std::uint32_t, std::uint32_t>& out) {
     out.clear();
     if (rpo.empty()) return;
-    MirDomTree const dom = computeMirDomTree(mir, mir.funcEntry(f), rpo, preds);
-    mirBackEdgeCandidates(mir, f, rpo, moduleSelfLoops, candidateScratch);
+    MirDomTree const& dom =
+        computeMirDomTree(mir, mir.funcEntry(f), rpo, preds, domScratch);
+    mirBackEdgeCandidates(mir, f, rpo, candidateScratch);
     std::vector<MirNaturalLoop> const loops =
         mirNaturalLoops(mir, dom, preds, candidateScratch);
     for (MirNaturalLoop const& loop : loops) {
@@ -173,9 +186,8 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
     };
 
     std::vector<std::vector<MirBlockId>> const preds = mirBuildPredecessors(mir);
-    std::vector<std::uint32_t> moduleSelfLoops;
-    mirModuleSelfLoopBlocks(mir, moduleSelfLoops);
     std::vector<std::uint32_t> candidateScratch;
+    MirDomScratch domScratch;   // ONE per module: each function's tree costs its own blocks
     std::unordered_map<std::uint32_t, std::uint32_t> loopDepth;
 
     std::size_t const nf = mir.moduleFuncCount();
@@ -199,7 +211,7 @@ ModuleSummary buildModuleSummary(SummaryCuInput const& cu) {
         // from the entry — the same reachable set every pass works on.
         std::vector<MirBlockId> const rpo =
             mirReversePostOrder(mir, mir.funcEntry(f));
-        computeLoopDepths(mir, f, rpo, preds, moduleSelfLoops, candidateScratch,
+        computeLoopDepths(mir, f, rpo, preds, candidateScratch, domScratch,
                           loopDepth);
 
         // ⚠ Walk blocks in NATURAL MODULE ORDER (`funcBlockAt`), not RPO. The

@@ -1,5 +1,6 @@
 #include "hir/hir_text.hpp"
 
+#include "core/types/alignment.hpp"  // Alignment::fromBytes — a `types` entry's `aligned N` / `pack N` domain
 #include "core/types/config_key_vocabulary.hpp"  // renderAllowedList (orMalformed projects the table)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"  // EnumNameTable / allNames — the ONE owner of each text spelling set
@@ -7,6 +8,7 @@
 #include "core/types/semantic_config.hpp"  // BuiltinLowering / kBuiltinLoweringTable — the `builtincall` payload's closed set
 #include "core/types/source_span.hpp"
 #include "core/types/target_schema.hpp"  // callConvName / kCallConvTable
+#include "core/types/type_lattice/composite_definition.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_registry.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
@@ -26,12 +28,14 @@
 #include <cstdlib>   // std::strtod — the float reader decodes token TEXT
 #include <deque>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -39,26 +43,36 @@
 // glance (whitespace-insignificant; LF only; canonical formatting below):
 //
 //   file       := "dsshir" INT "producer" STR preamble module
-//   preamble   := ext_kinds? ext_ops? intrinsics? buffers? symbols?
+//   preamble   := ext_kinds? ext_ops? intrinsics? buffers? types? symbols?
 //                 (non-empty sections only)
+//   types      := "types" "{" ("type" INT "=" composite)* "}"
+//   composite  := ("struct" | "union") STR
+//                 ( "opaque" | "packed"? ("aligned" INT)? ("pack" INT)?
+//                   "{" field ("," field)* "}" )
+//   field      := type ("@" INT | "~" INT)? ("bits" INT)? "packed"?
 //   module     := "module" flags? STR "{" decl* "}"
 //   decl       := function | global | type_decl | extern_function
 //               | extern_global | import_group | ext_node | error
 //   stmt       := block | if | while | do | for | switch
 //               | break | continue | return | expr | var | assign
 //               | unreachable | ext_node | error
+//   return     := "return" flags? ("void" | expr)
 //   expr       := lit | ref | call | intrinsic | binop | unop | cast | member
 //               | index | swizzle | construct | ternary | logical_and
 //               | logical_or | sizeof | alignof | addressof | deref | typeref
 //               | ext_node | error
 //   type       := bool|i8..|u8..|f16..|char|byte|void | ptr<T> | ref<T>
 //               | nullable<T> | optional<T> | slice<T> | vec<T,N> | mat<T,R,C>
-//               | arr<T,N> | tuple<T,...> | struct STR {T,...} | union STR {T,...}
+//               | arr<T,N> | tuple<T,...> | "type" INT (a `types` entry)
 //               | fn(T,...) -> T [cc NAME] | ext STR (T,...) [N,...] | invalid
+//               (a STANDALONE type text — `parseTypeFromText` — spells a composite
+//               inline instead: struct STR {T,...} | union STR {T,...} | rec INT)
 //
 // Symbols are positional handles (`%1`) bound to a name in the `symbols` preamble;
 // the handle number IS the rebuilt SymbolId.v, so the body and preamble agree by
-// construction. Types render structurally (CU-ephemeral TypeId.v never appears).
+// construction. Composites are positional handles too (`type 1`), bound to their
+// one definition in the `types` preamble. Every other type renders structurally
+// (CU-ephemeral TypeId.v never appears).
 // Extension kinds/ops/intrinsics are referenced by name and re-registered from the
 // preamble. Side-tables attach inline (`@loc(...)`, `@ffi(...)`, …) before a node;
 // the lone cross-node reference (DiagnosticInfo.origin) is a pre-order node index.
@@ -359,10 +373,17 @@ static_assert([] {
 // (`struct "Node" rec 1 { … }`), but a marker is not a type head and the two
 // positions never collide: the marker is only ever read where a `{`/`packed`/
 // `opaque` may follow a name, the head only ever where a type may begin.
-inline constexpr std::array<std::string_view, 23> kHirTextTypeKeywords{
+// ⓘ `type` is the v5 COMPOSITE REFERENCE, `type <H>`, naming an entry of a
+// module's `types` section. `struct`, `union` and `rec` are accepted in a
+// STANDALONE type text only, and `type` in a MODULE only (the two path-only lists
+// below). Every one of them is a recognized head on BOTH paths, so the refusal on
+// the wrong side is a NAMED one rather than an `unknown type`; and the accepted set
+// a refusal ADVERTISES is the current path's (`typeKeywordsAccepted`), so neither
+// path advertises a keyword it would then refuse.
+inline constexpr std::array<std::string_view, 24> kHirTextTypeKeywords{
     "invalid", "ptr", "ref", "nullable", "optional", "slice", "complex",
     "volatile", "atomic", "aligned", "fnptr", "vec", "mat", "arr", "tuple",
-    "struct", "union", "enum", "fn", "ext", "_BitInt", "unsigned", "rec",
+    "struct", "union", "enum", "fn", "ext", "_BitInt", "unsigned", "rec", "type",
 };
 DSS_CHECK_KEY_VOCABULARY(kHirTextTypeKeywords);
 
@@ -373,7 +394,7 @@ DSS_CHECK_KEY_VOCABULARY(kHirTextTypeKeywords);
 // enumerator, so `-Werror=switch` — on for this whole build — makes it grow an
 // arm with EVERY new code. That is what turns this one string into an
 // "is this ordinal allocated" predicate rather than a second list to maintain,
-// and it is the same source `scripts/check-diagnostic-codes/check-diagnostic-codes.py`
+// and it is the same source `.harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py`
 // reads for the allocation gate: the enum itself
 // (D-MIR-TEXT-DIAG-CODE-CAST-IS-UNVALIDATED).
 inline constexpr std::string_view kUnallocatedDiagnosticCodeName = "Unknown";
@@ -438,13 +459,23 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextPrimTable));
 // ⚠ Reached ONLY from the aggregate literal's per-field core
 // (D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM); a top-level literal's core
 // is recomputed from its type annotation by `literalCoreFor` and never spelled.
-inline constexpr EnumNameTable<TypeKind, 6> kHirTextLiteralCoreTable{{{
+inline constexpr EnumNameTable<TypeKind, 8> kHirTextLiteralCoreTable{{{
     { TypeKind::Struct, "struct" },
     { TypeKind::Union,  "union"  },
     { TypeKind::Array,  "array"  },
     { TypeKind::Ptr,    "ptr"    },
     { TypeKind::Ref,    "ref"    },
     { TypeKind::Enum,   "enum"   },
+    // ★ A `_BitInt` FIELD's core (P68 round 8, lane `ht`, part 1c-b): every
+    // `BitIntValue` carries `core == BitInt`, and without this row an aggregate
+    // holding one was refused by its own writer. The MIR table carries the same row.
+    { TypeKind::BitInt, "bitint" },
+    // ★ A `_Complex` FIELD's core (P68 round 8, lane `ht`, part 1d) — the same gap,
+    // one core over: a complex value in an aggregate carries `core == Complex`, and
+    // without this row its aggregate was refused by its own writer. No version bump,
+    // by the bitint row's precedent: no v5 text can have held one (the writer refused
+    // it). The MIR table carries the same row.
+    { TypeKind::Complex, "complex" },
 }}};
 DSS_CHECK_ENUM_NAME_TABLE(kHirTextLiteralCoreTable);
 DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextLiteralCoreTable));
@@ -471,12 +502,47 @@ DSS_CHECK_KEY_VOCABULARY(allNames(kHirTextLiteralCoreTable));
     return out;
 }
 
-// The accepted set at a type position: the primitive names plus the structural
-// keywords, projected off both owners.
-[[nodiscard]] std::string typeKeywordsAccepted() {
+// v5: the two structural keyword sets that are accepted on ONE path only. `type`
+// is a module's composite reference and nothing else; `struct`, `union` and `rec`
+// are a standalone text's inline composite forms and are refused in a module.
+inline constexpr std::array<std::string_view, 1> kHirTextModuleOnlyTypeKeywords{"type"};
+inline constexpr std::array<std::string_view, 3> kHirTextStandaloneOnlyTypeKeywords{
+    "struct", "union", "rec"};
+// Both lists name rows of `kHirTextTypeKeywords` and nothing else, so filtering
+// one of them out can never advertise a spelling that has no row.
+static_assert([] {
+    auto const inTable = [](std::string_view kw) {
+        for (std::string_view row : kHirTextTypeKeywords)
+            if (row == kw) return true;
+        return false;
+    };
+    for (std::string_view kw : kHirTextModuleOnlyTypeKeywords)
+        if (!inTable(kw)) return false;
+    for (std::string_view kw : kHirTextStandaloneOnlyTypeKeywords)
+        if (!inTable(kw)) return false;
+    return true;
+}(), "a path-only type keyword must be a row of kHirTextTypeKeywords");
+
+// The accepted set at a type position ON THE CURRENT PATH: the primitive names
+// plus the structural keywords that path takes, projected off both owners.
+// ⚠ PATH-SPECIFIC, NOT THE WHOLE TABLE: advertising `type` to an FFI descriptor
+// author, or `struct` to a module author, would send them to write text this very
+// reader then refuses — the advertise-then-reject drift the feed-back pins exist
+// to catch.
+[[nodiscard]] std::string typeKeywordsAccepted(bool module) {
+    std::span<std::string_view const> const excluded =
+        module ? std::span<std::string_view const>{kHirTextStandaloneOnlyTypeKeywords}
+               : std::span<std::string_view const>{kHirTextModuleOnlyTypeKeywords};
+    std::vector<std::string_view> accepted;
+    accepted.reserve(kHirTextTypeKeywords.size());
+    for (std::string_view kw : kHirTextTypeKeywords) {
+        bool skip = false;
+        for (std::string_view x : excluded) skip = skip || (x == kw);
+        if (!skip) accepted.push_back(kw);
+    }
     std::string out{detail::renderAllowedList(allNames(kHirTextPrimTable))};
     out += ", ";
-    out += detail::renderAllowedList(kHirTextTypeKeywords);
+    out += detail::renderAllowedList(accepted);
     return out;
 }
 
@@ -790,6 +856,11 @@ exprKwForKind(HirKind k) noexcept {
     return out;
 }
 
+// The writer's type-spelling work since the last `hirTextTypeNodesSpelledTake`
+// (see the header). `thread_local` so the driver's per-CU pool cannot interleave
+// two emissions' counts.
+thread_local std::uint64_t tlsTypeNodesSpelled = 0;
+
 // ── Emitter ──────────────────────────────────────────────────────────────────
 
 class Emitter {
@@ -811,23 +882,40 @@ public:
         emitExtOps();
         emitIntrinsics();
         emitBuffers();
+        std::string head = takeOut();
         emitSymbols();
+        std::string symbols = takeOut();
 
+        // ★ THE BODY IS RENDERED BEFORE THE `types` SECTION THAT PRECEDES IT IN THE
+        // FILE, because the table is exactly the set of composites the body (and,
+        // transitively, the table itself) mentions, numbered in the order they are
+        // first mentioned. Rendering the body into its own buffer is what lets the
+        // mint happen at the mention while the definitions still land first in the
+        // file, where a single-pass reader wants them.
         HirNodeId const root = hir_.root();
         if (hir_.kind(root) != HirKind::Module) {
             // The grammar's top level is a module; a non-Module root can't be
             // spelled. Fail loud-but-recoverable (a diagnostic, not an abort).
             report("root node is not a Module — cannot serialize", DiagnosticSeverity::Error);
             out_ += "module \"\" {\n}\n";
-            return std::move(out_);
+        } else {
+            out_ += "module";
+            out_ += flagsStr(hir_.flags(root));
+            out_ += ' ';
+            out_ += quote(hir_.sourceLanguage());
+            out_ += " {\n";
+            for (HirNodeId d : hir_.moduleDecls(root)) emitNodeLine(d, 1);
+            out_ += "}\n";
         }
-        out_ += "module";
-        out_ += flagsStr(hir_.flags(root));
-        out_ += ' ';
-        out_ += quote(hir_.sourceLanguage());
-        out_ += " {\n";
-        for (HirNodeId d : hir_.moduleDecls(root)) emitNodeLine(d, 1);
-        out_ += "}\n";
+        std::string body = takeOut();
+        emitTypes();
+        std::string types = takeOut();
+
+        out_.reserve(head.size() + types.size() + symbols.size() + body.size());
+        out_ += head;
+        out_ += types;
+        out_ += symbols;
+        out_ += body;
         return std::move(out_);
     }
 
@@ -858,48 +946,36 @@ private:
     std::set<std::uint32_t>                          bufSeen_;    // every referenced/named BufferId.v
     bool internerWarned_ = false;
 
-    // ★★★ THE COMPOSITES CURRENTLY BEING SPELLED, innermost last — the cycle guard
-    // for `appendType`. `struct S { int v; struct S *next; }` interns a CYCLIC type
-    // graph: the second field is `ptr<struct S>` whose operand is the struct
-    // itself. A structural walk with nothing tracking what it is already inside
-    // re-enters through that field forever. ✔MEASURED 2026-09-02 on exactly that
-    // declaration — the commonest shape in C — `emitHir` died with
-    // STATUS_STACK_OVERFLOW (0xC00000FD), an uncatchable process kill with no
-    // diagnostic at all.
-    // ⚠ NO DEPTH CAP CAN FIX THIS and reaching for one is the trap: the graph has
-    // no bottom, so a cap only chooses how much stack to burn before the same
-    // crash, and it would ALSO refuse legitimately deep acyclic types. The cycle is
-    // the thing to detect. (The operator's standing order against input-
-    // proportional recursion is the general form of this; here the recursion is not
-    // even input-proportional — it is unbounded on a finite input.)
-    // ⓘ A STACK, not a set: a type repeated as a SIBLING (`tuple<T, T>`) is ordinary
-    // sharing and must still spell twice. Only re-entry into an ANCESTOR is a cycle.
-    std::vector<std::uint32_t> compositesOpen_;
-
-    // ★★★ THE RECURSION HANDLE — ARTIFACT-LOCAL, PER-COMPOSITE, NEVER PER-SPELLING.
-    // A composite whose type graph reaches itself is spelled `struct "Node" rec 1
-    // { … }` and the re-entry point spells `rec 1`. The number is assigned the
-    // first time that composite is OPENED, in the order the writer reaches them,
-    // which is the artifact's own textual order — a function of the module alone,
-    // so a re-emission after a round trip reproduces it (the determinism contract
-    // on `emitHir`). It is the same device `symOrder_`/`symHandle_` and
-    // `bufHandle_` already use for the file's other CU-ephemeral identities.
+    // ★★★ v5: THE COMPOSITE TABLE. Every composite this module mentions is DEFINED
+    // ONCE in the `types` preamble section and every mention — in the body and in
+    // other definitions alike — spells `type <H>`.
     //
-    // ⚠⚠ THE ALTERNATIVE — A RELATIVE (De Bruijn `^N`) MARKER — IS WRONG, AND THE
-    // FAILURE IS SILENT. Under `^N`, `struct B`'s spelling depends on where it was
-    // reached from: standing inside a mutually recursive `struct A` it is
-    // `struct "B" {ptr<^2>}`, standing alone it is `struct "B" {ptr<struct "A"
-    // {ptr<^2>}>}`. A parser keying its forward mint on the SPELLING (the textual
-    // extent, the obvious choice) would then rebuild TWO distinct `B`s from one —
-    // splitting a type's identity across a round trip whose BYTES still matched,
-    // because each spelling re-emits to itself. A handle is context-free, so
-    // handle H means one TypeId per artifact and the split cannot happen.
-    std::unordered_map<std::uint32_t, std::uint32_t> recHandle_;   // TypeId.v -> handle (1..N)
-    std::uint32_t                                    nextRecHandle_ = 0;
-    // Memoized `isCyclicComposite`, keyed on the composite's TypeId.v. Only
-    // composites are asked, and each answer is a property of the type graph, which
-    // is immutable for the life of an emission.
-    std::unordered_map<std::uint32_t, bool>          cyclicCache_;
+    // ⚠⚠ THE STRUCTURAL-AT-EVERY-USE SPELLING THIS REPLACES WAS UNBOUNDED ON REAL
+    // C, AND NOT BY A CONSTANT FACTOR. An artifact's type text was (type mentions)
+    // × (the reachable type graph): sqlite's `sqlite3` reaches `Vdbe`, `Parse`,
+    // `Table`, … and every typed node re-expanded all of it. ✔MEASURED (P68 round
+    // 7, lane `cr`, WSL Release `dsscp`): the amalgamation's first 1.18 MB ran
+    // 275.9 G instructions under `--emit-hir` and died `std::bad_alloc`, against
+    // 3.23 G for the whole COMPILE of the same file, and six of six live samples
+    // sat in this printer. The v3 `rec <H>` marker cut only a cycle's BACK edge;
+    // it did nothing about re-expansion, which is the cost.
+    //
+    // ★ THE HANDLE IS MINTED AT FIRST REFERENCE, IN TEXT ORDER — the body is
+    // rendered first, then each definition in handle order, and a definition's own
+    // field references mint the handles after it. That order is a function of the
+    // module alone, so the re-emission of a parsed artifact reproduces it (the
+    // determinism contract on `emitHir`), and it is the device `symHandle_` and
+    // `bufHandle_` already use for the file's other CU-ephemeral identities.
+    // ⓘ THE KEY IS THE MATERIAL COMPOSITE (`stripVolatile`'d). A `volatile struct
+    // S` is a skin over `S` and spells `volatile<type H>`: the qualifier and the
+    // alignment skins stay at the use, the composite lives in the table once.
+    // ⓘ A CYCLE NEEDS NOTHING HERE. Referencing a composite never expands it, so
+    // `ptr<type 1>` inside `type 1`'s own definition is an ordinary reference —
+    // the `compositesOpen_` stack, the reachability walk and the `rec` handle the
+    // v3 writer needed to stop a cyclic graph from expanding forever are gone
+    // because nothing expands at all.
+    std::unordered_map<std::uint32_t, std::uint32_t> typeHandle_;  // material TypeId.v -> handle (1..N)
+    std::vector<TypeId>                              typeOrder_;   // handle - 1 -> material TypeId
 
     // Emitter-side diagnostic. Defaults to Error: the cases that reach here
     // (non-Module root, an Extension/IntrinsicCall payload the registry doesn't
@@ -926,6 +1002,14 @@ private:
         reporter_.report(std::move(d));
     }
 
+    // Hand back everything rendered so far and start an empty buffer. A moved-from
+    // `std::string` is valid but UNSPECIFIED, so the clear is not decoration.
+    [[nodiscard]] std::string takeOut() {
+        std::string s = std::move(out_);
+        out_.clear();
+        return s;
+    }
+
     // Single children-order pre-order DFS: assigns each node a stable pre-order
     // index (for DiagnosticInfo.origin references) and collects referenced
     // SymbolIds in first-encounter order (their handles). Must visit children in
@@ -943,6 +1027,52 @@ private:
     // exactly the order the recursive form visited them in — the pre-order index
     // every `@diag(origin …)` in the artifact refers to is therefore unchanged,
     // and that is what keeps the output byte-identical.
+    void noteSymbol(std::uint32_t sv) {
+        if (!symHandle_.contains(sv)) {
+            symOrder_.push_back(sv);
+            symHandle_.emplace(sv, static_cast<std::uint32_t>(symOrder_.size()));
+        }
+    }
+
+    // ★★ EVERY SYMBOL A POOLED LITERAL VALUE NAMES, CLOSED OVER THE WHOLE VARIANT
+    // (P68 round 8, lane `ht`, part 1c-b). Of `HirLiteralValue`'s arms only
+    // `HirAddressValue` names one (its `base`; `kNullBase` names none), and
+    // `HirAggregateValue` names one exactly when a field does; every other arm is a
+    // number, a string or a bit pattern. The `static_assert` makes that list a
+    // compile-time fact: an arm added to the variant stops the build HERE until it
+    // says whether it names a symbol — which is how the address base went
+    // unnumbered, one arm that named a symbol in a walk that never asked. An
+    // explicit work stack, not host recursion: an aggregate nests as deep as its
+    // initializer. Only a literal the writer renders INLINE is walked (the same
+    // pool-and-index condition `emitExpr` applies), so the table holds exactly the
+    // symbols the text spells.
+    void noteLiteralSymbols(std::uint32_t poolIndex) {
+        if (ctx_.literalPool == nullptr || poolIndex >= ctx_.literalPool->size()) return;
+        std::vector<HirLiteralValue const*> work{&ctx_.literalPool->at(poolIndex)};
+        while (!work.empty()) {
+            HirLiteralValue const* const v = work.back();
+            work.pop_back();
+            std::visit([&](auto const& arm) {
+                using T = std::decay_t<decltype(arm)>;
+                if constexpr (std::is_same_v<T, HirAddressValue>) {
+                    if (arm.base != HirAddressValue::kNullBase) noteSymbol(arm.base);
+                } else if constexpr (std::is_same_v<T, HirAggregateValue>) {
+                    for (std::size_t i = arm.fields.size(); i-- > 0;) work.push_back(&arm.fields[i]);
+                } else {
+                    static_assert(std::is_same_v<T, std::monostate> || std::is_same_v<T, bool>
+                                      || std::is_same_v<T, std::int64_t>
+                                      || std::is_same_v<T, std::uint64_t>
+                                      || std::is_same_v<T, double> || std::is_same_v<T, std::string>
+                                      || std::is_same_v<T, BitIntValue>
+                                      || std::is_same_v<T, WideFloatValue>,
+                                  "a new HirLiteralValue arm must say whether it names a symbol: "
+                                  "number it through noteSymbol above, or add it to this list "
+                                  "of the arms that name none");
+                }
+            }, v->value);
+        }
+    }
+
     void prepass(HirNodeId root) {
         std::vector<HirNodeId> stack;
         stack.push_back(root);
@@ -951,13 +1081,12 @@ private:
             stack.pop_back();
             std::uint32_t const idx = static_cast<std::uint32_t>(preIndex_.size());
             preIndex_.emplace(id.v, idx);
-            if (carriesSymbol(hir_.kind(id))) {
-                std::uint32_t const sv = hir_.payload(id);
-                if (!symHandle_.contains(sv)) {
-                    symOrder_.push_back(sv);
-                    symHandle_.emplace(sv, static_cast<std::uint32_t>(symOrder_.size()));
-                }
-            }
+            if (carriesSymbol(hir_.kind(id))) noteSymbol(hir_.payload(id));
+            // ★ A POOLED LITERAL CAN NAME A SYMBOL TOO, AND IT IS NUMBERED HERE, AT
+            // THE LITERAL'S POSITION IN THE WALK (P68 round 8, lane `ht`, part 1c-b):
+            // `addr %N` spells its base through this table, so a base the walk
+            // skipped would be a handle the `symbols` section never declares.
+            if (hir_.kind(id) == HirKind::Literal) noteLiteralSymbols(hir_.payload(id));
             // Every buffer a `@loc` will name must reach the `buffers` section, or
             // the annotation points at an ordinal the file does not define.
             if (ctx_.sourceMap != nullptr) {
@@ -997,7 +1126,7 @@ private:
         return it == symHandle_.end() ? 0u : it->second;
     }
 
-    // ── type printer (structural; nominal types by interned name) ────────────
+    // ── type printer (structural; a composite by its `types` handle) ─────────
     //
     // ★★★ AN EXPLICIT HEAP WORK STACK, NOT HOST RECURSION
     // (D-COMPILER-INPUT-PROPORTIONAL-RECURSION-RESIDUE-UNCONVERTED-AND-UNCAPPED,
@@ -1006,69 +1135,23 @@ private:
     // the tasks; `appendTypeStep` renders ONE type node and pushes whatever
     // remains — the arms that used to call `appendType` for an operand now
     // push it. Tasks are pushed in REVERSE so they come back out in text
-    // order, and the output is byte-identical to the recursive form. The
-    // cycle guard's pop is a `CloseComposite` task pushed under everything
-    // the composite renders, which is exactly when the recursive form's
-    // scope-bound `PopGuard` ran.
+    // order, and the output is byte-identical to the recursive form.
+    // ⓘ v5: a composite is a LEAF of this walk (`type <H>`), so no task ever opens
+    // one and the v3 `CloseComposite` bookkeeping has nothing left to close.
     struct TypeEmitTask {
-        enum class Kind : std::uint8_t { Type, Text, CloseComposite };
+        enum class Kind : std::uint8_t { Type, Text };
         Kind          kind = Kind::Type;
         TypeId        type{};
         std::string   text;
-        std::uint32_t tag = 0;   // CloseComposite: the composite being closed
     };
 
-    // ── isCyclicComposite ────────────────────────────────────────────────────
-    //
-    // Does `root`'s own type graph reach `root` again? That — not "is it a
-    // struct", not "how deep is it" — is the predicate that decides whether a
-    // composite needs a `rec <H>` marker, because it is exactly the condition
-    // under which the structural walk would otherwise re-enter it.
-    //
-    // ★ REACHABILITY FROM `root`, NOT A GENERIC "IS THIS NODE ON SOME CYCLE".
-    // `struct Outer { struct Node *n; }` is NOT recursive even though `Node` is,
-    // and marking it would put a handle on a composite nothing ever refers back
-    // to — noise in the file and a byte difference for a property that is false.
-    //
-    // ⚠ THE WALK NORMALIZES THROUGH THE QUALIFIER SKIN, and that is not a
-    // nicety: `operands()` is qualifier-TRANSPARENT, so walking
-    // `struct S { volatile struct S *next; }` would step from `volatile S`
-    // straight to S's FIELDS and never observe `S` itself — reporting acyclic
-    // for a graph the writer then re-enters. The writer strips the skin before
-    // it re-enters (`pushType(in.stripVolatile(t))`), so the predicate must
-    // compare the same stripped identity or the two disagree.
-    //
-    // No host recursion (the operator's 2026-09-02 standing order): an explicit
-    // heap work stack, and a `seen` set — without which this walk is exactly the
-    // unbounded loop it exists to detect.
-    [[nodiscard]] bool isCyclicComposite(TypeId root) {
-        if (auto const it = cyclicCache_.find(root.v); it != cyclicCache_.end()) return it->second;
-        TypeInterner const& in = *ctx_.interner;
-        bool found = false;
-        std::set<std::uint32_t> seen;
-        std::vector<TypeId>     work;
-        auto pushOperands = [&](TypeId u) {
-            for (TypeId op : std::span<TypeId const>{in.operands(u)}) {
-                if (op.valid()) work.push_back(op);
-            }
-        };
-        pushOperands(root);
-        while (!work.empty()) {
-            TypeId const u = in.stripVolatile(work.back());
-            work.pop_back();
-            if (u.v == root.v) { found = true; break; }
-            if (!seen.insert(u.v).second) continue;
-            pushOperands(u);
-        }
-        cyclicCache_.emplace(root.v, found);
-        return found;
-    }
-
-    // The handle for a composite already known to be recursive, minted on first
-    // open. 1-based, so 0 stays available as "this composite is not recursive".
-    [[nodiscard]] std::uint32_t mintRecHandle(TypeId t) {
-        auto const [it, minted] = recHandle_.try_emplace(t.v, nextRecHandle_ + 1);
-        if (minted) ++nextRecHandle_;
+    // The `types` handle of the material composite `t`, minted on first reference
+    // (which also queues its one definition — see `emitTypes`). 1-based: `type 0`
+    // is the reader's refusal, never a spelling this writer produces.
+    [[nodiscard]] std::uint32_t typeHandleOf(TypeId t) {
+        auto const [it, minted] = typeHandle_.try_emplace(
+            t.v, static_cast<std::uint32_t>(typeOrder_.size() + 1));
+        if (minted) typeOrder_.push_back(t);
         return it->second;
     }
 
@@ -1081,20 +1164,6 @@ private:
             switch (task.kind) {
                 case TypeEmitTask::Kind::Text:
                     out_ += task.text;
-                    continue;
-                case TypeEmitTask::Kind::CloseComposite:
-                    // The field list is finished; the composite is no longer an
-                    // ancestor of anything still to render.
-                    if (!compositesOpen_.empty() && compositesOpen_.back() == task.tag) {
-                        compositesOpen_.pop_back();
-                    } else {
-                        // Unreachable by construction (a CloseComposite is pushed
-                        // with, and only with, its own open entry). Fail loud
-                        // rather than silently desynchronize the cycle guard.
-                        report("internal: HIR type emitter's composite open-set "
-                               "desynchronized", DiagnosticSeverity::Error);
-                        compositesOpen_.clear();
-                    }
                     continue;
                 case TypeEmitTask::Kind::Type:
                     break;
@@ -1122,20 +1191,10 @@ private:
                 if (i != 0) pushText(", ");
             }
         };
-        // A field list where field `i` is followed by its own marker text, then
-        // `closer` — the struct / union arms' per-field `@off` / `~align` /
-        // ` packed` spellings, kept in text order.
-        auto pushFieldList = [&](std::span<TypeId const> ops,
-                                 auto const& markerFor, std::string closer) {
-            pushText(std::move(closer));
-            for (std::size_t i = ops.size(); i-- > 0;) {
-                std::string marker = markerFor(i);
-                if (!marker.empty()) pushText(std::move(marker));
-                pushType(ops[i]);
-                if (i != 0) pushText(", ");
-            }
-        };
 
+        // Every node this function renders is one unit of type-spelling work — the
+        // quantity the v5 bound is stated in (`hirTextTypeNodesSpelledTake`).
+        ++tlsTypeNodesSpelled;
         if (!t.valid()) { out_ += "invalid"; return; }
         if (ctx_.interner == nullptr) {
             if (!internerWarned_) {
@@ -1182,55 +1241,7 @@ private:
             pushType(in.stripVolatile(t));   // the material type (skin stripped)
             return;
         }
-        // The cycle guard, applied to the NOMINAL composites only. A cycle can only
-        // close through one of these: a type graph becomes cyclic exactly when a
-        // forward-declared composite is completed with a field that reaches back to
-        // it, and structural kinds (ptr/arr/tuple/…) cannot be forward-declared. So
-        // this is where re-entry is both possible and detectable, and the hot
-        // structural arms pay nothing.
-        //
-        // ★★★ v3: RE-ENTRY IS NOW SPELLED, NOT REFUSED. Until v3 this wrote the
-        // poison `?` and an Error, because the grammar had no back-reference form —
-        // which made `struct Node { struct Node *next; }`, and therefore every
-        // linked list, tree, intrusive container and parent pointer in real C,
-        // unrepresentable. The back-reference is `rec <H>`, where H is the handle
-        // the enclosing composite carries on its own name. The two rejected
-        // alternatives are still rejected and for their original reasons: `opaque`
-        // would reintern a COMPLETE struct as INCOMPLETE (a silent ABI drop), and
-        // re-spelling the bare name would reintern as a DIFFERENT type.
         TypeKind const kind = in.kind(t);
-        bool const nominal = (kind == TypeKind::Struct || kind == TypeKind::Union);
-        std::uint32_t recH = 0;   // 0 = this composite is not recursive
-        if (nominal) {
-            for (std::uint32_t open : compositesOpen_) {
-                if (open != t.v) continue;
-                auto const it = recHandle_.find(t.v);
-                if (it == recHandle_.end()) {
-                    // Unreachable by construction: a composite can only be RE-ENTERED
-                    // if it reaches itself, which is precisely `isCyclicComposite`, and
-                    // that is what mints the handle when it is opened. If the two ever
-                    // disagree, say so — a bare name here would reintern as a different
-                    // type, which is the silent miscompile this whole arm exists to
-                    // prevent.
-                    report(std::format(
-                               "internal: {} \"{}\" was re-entered by the type writer "
-                               "with no recursion handle — the cyclicity predicate and "
-                               "the open-composite stack disagree; the type is emitted "
-                               "as '?', which is refused on the way back in",
-                               kind == TypeKind::Struct ? "struct" : "union", in.name(t)),
-                           DiagnosticSeverity::Error);
-                    out_ += '?';
-                    return;
-                }
-                out_ += std::format("rec {}", it->second);
-                return;
-            }
-            if (isCyclicComposite(t)) recH = mintRecHandle(t);
-            compositesOpen_.push_back(t.v);
-            // Runs after everything this composite pushes — the recursive form's
-            // scope-bound `PopGuard`, as a task.
-            stack.push_back(TypeEmitTask{.kind = Kind::CloseComposite, .tag = t.v});
-        }
         switch (kind) {
             case TypeKind::Ptr:      out_ += "ptr<";      pushArgs(in.operands(t).first(1), ">"); return;
             case TypeKind::Ref:      out_ += "ref<";      pushArgs(in.operands(t).first(1), ">"); return;
@@ -1258,98 +1269,16 @@ private:
                 pushArgs(in.operands(t).first(1), std::format(", {}>", in.scalars(t)[0]));
                 return;
             case TypeKind::Tuple:  out_ += "tuple<"; pushArgs(in.operands(t), ">"); return;
-            case TypeKind::Struct: {
-                out_ += "struct "; out_ += quote(in.name(t));
-                // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: an INCOMPLETE composite has no
-                // field list at all, and it must not be spelled `{}` -- that is a
-                // LEGAL COMPLETE zero-field struct (see `isIncompleteComposite`), so
-                // emitting braces here would reintern an opaque tag as a COMPLETE
-                // zero-byte type. Exactly the silent-drop shape the ` packed` marker
-                // below exists to prevent, and the marker follows its precedent: a
-                // bare keyword after the name. No braces follow `opaque`.
-                if (in.isIncompleteComposite(t)) { out_ += " opaque"; return; }
-                // v3: the recursion marker, between the name and every layout
-                // marker, so a reader meets the composite's IDENTITY before its
-                // shape — and so the parser can mint the forward id (which the
-                // field list needs in order to close the cycle) before it reads a
-                // single field. An incomplete composite returned above: it has no
-                // field list, so nothing can reach back through it, so `opaque` and
-                // `rec` are mutually exclusive by construction rather than by rule.
-                if (recH != 0) out_ += std::format(" rec {}", recH);
-                // D-CSUBSET-PACKED: emit a ` packed` marker for a packed struct so the
-                // whole-composite packed flag round-trips (else it would reintern
-                // UNPACKED — a silent ABI drop across the text boundary). May combine
-                // with the `~<align>` per-field markers (a packed struct with an
-                // alignas member); never with `@<off>` (packed excludes explicit offsets).
-                if (in.isPacked(t)) out_ += " packed";
-                out_ += " {";
-                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): emit `@<off>` per field for
-                // an explicit-offset struct so the text round-trips (reintern +
-                // canonicalization depend on the offsets surviving serialization).
-                // D-CSUBSET-MEMBER-ALIGNAS: emit `~<align>` per field for a member-
-                // alignas struct (the two channels are mutually exclusive — a struct
-                // carries offsets XOR aligns). The `~` marker never collides with the
-                // offset `@`; both round-trip through parseType below.
-                if (in.hasExplicitOffsets(t)) {
-                    pushFieldList(in.operands(t), [&](std::size_t i) {
-                        auto const off = in.explicitFieldOffset(t, i);
-                        return std::format(" @{}", off ? *off : 0);
-                    }, "}");
-                } else if (in.hasExplicitAligns(t) || in.hasFieldPacked(t)) {
-                    // D-CSUBSET-PER-MEMBER-PACKED: a PER-FIELD ` packed` marker — the
-                    // SAME keyword the whole-composite flag uses, one grammar position
-                    // further in, mirroring C's own spelling of the same attribute at
-                    // two grains. It shares this arm with `~<align>` rather than taking
-                    // its own because the two legitimately COMBINE (`int z
-                    // __attribute__((packed, aligned(2)))` is field-align 2, MEASURED),
-                    // and it is emitted ONLY on the fields that carry it, so the
-                    // all-or-none span is recovered on the parse side by "did ANY field
-                    // say packed". Without this the flag would reintern absent across
-                    // the text boundary — the silent ABI drop the composite marker
-                    // above exists to prevent, in the channel where it is HARDEST to
-                    // see (same size, same alignment, one moved offset).
-                    bool const hasA = in.hasExplicitAligns(t);
-                    bool const hasP = in.hasFieldPacked(t);
-                    pushFieldList(in.operands(t), [&](std::size_t i) {
-                        std::string marker;
-                        if (hasA) marker += std::format(" ~{}", in.explicitFieldAlign(t, i));
-                        if (hasP && in.isFieldPacked(t, i)) marker += " packed";
-                        return marker;
-                    }, "}");
-                } else {
-                    pushArgs(in.operands(t), "}");
-                }
+            // ★★★ v5: A COMPOSITE IS A REFERENCE, NEVER AN EXPANSION. Its ONE
+            // definition is rendered by `appendCompositeDefinition` into the `types`
+            // section; every mention — here, and inside other definitions — is the
+            // handle. That single decision is what makes the spelling O(mentions +
+            // graph) instead of O(mentions × graph), and it is also what makes a
+            // cycle ordinary: nothing expands, so nothing can expand forever.
+            case TypeKind::Struct:
+            case TypeKind::Union:
+                out_ += std::format("type {}", typeHandleOf(in.stripVolatile(t)));
                 return;
-            }
-            case TypeKind::Union: {
-                out_ += "union ";  out_ += quote(in.name(t));
-                // ⚠ THE `opaque` MARKER IS NOT A STRUCT-ONLY FACT, and its absence
-                // here was a silent ABI drop of exactly the class
-                // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING closed for the struct arm.
-                // `union U;` used as `union U *p;` is ordinary C and interns an
-                // INCOMPLETE composite; this arm wrote `union "U" {}` for it, which
-                // is a LEGAL COMPLETE ZERO-MEMBER union — so a round trip turned an
-                // opaque tag into a size-0 complete type with no diagnostic
-                // anywhere. `isIncompleteComposite` covers Struct AND Union; the
-                // spelling now does too.
-                if (in.isIncompleteComposite(t)) { out_ += " opaque"; return; }
-                if (recH != 0) out_ += std::format(" rec {}", recH);   // v3 (see struct)
-                if (in.isPacked(t)) out_ += " packed";   // D-CSUBSET-PACKED (see struct)
-                out_ += " {";
-                // D-CSUBSET-PER-MEMBER-PACKED: the union half of the per-field marker.
-                // A union member can carry the attribute individually and it lowers the
-                // UNION's own alignment when that member was the max contributor
-                // (MEASURED: `union {char a; int z <pk>;}` is 4/_Alignof 1 vs the
-                // control's 4/4) — size-blind, so a dropped flag is invisible.
-                if (in.hasFieldPacked(t)) {
-                    pushFieldList(in.operands(t), [&](std::size_t i) {
-                        return std::string{in.isFieldPacked(t, i) ? " packed" : ""};
-                    }, "}");
-                } else {
-                    pushArgs(in.operands(t), "}");
-                }
-                return;
-            }
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
             // diverges from the default I32 (`enum "E" : u8`); omit the
@@ -1372,6 +1301,29 @@ private:
             case TypeKind::Enum: {
                 out_ += "enum ";
                 out_ += quote(in.name(t));
+                // ★ A FIXED UNDERLYING TYPE IS SPELLED AS THE TYPE IT IS (v6, P68
+                // round 12, lane `cs`). `enum E : long` and `enum E` are different
+                // types (C23 6.2.7p1), and the enum record keeps the type the
+                // clause NAMED — its vocabulary identity (`long`, not only i64),
+                // which C 6.3.1.1p1 ranks the enumeration by. So the fixed form is
+                // `enum "E" fixed <the declared type>`, printed by the primitive arm
+                // below, tag included: `enum "E" fixed i64 "long"`. The kind is the
+                // declared type's, so no `:` follows. The reader rebuilds the same
+                // record, and a module that spells it reads back the same TypeId.
+                if (TypeId const declared = in.enumDeclaredUnderlying(t); declared.valid()) {
+                    out_ += " fixed ";
+                    pushType(declared);
+                    return;
+                }
+                // ★ …and the compatible type the language CHOSE for an enumeration
+                // without a fixed one (the enumeration P1, same round): `enum "E"
+                // chosen u32 "unsigned int"`. A different record from `fixed` with
+                // the same type (C23 6.2.7p1), so a different word.
+                if (TypeId const chosen = in.enumChosenUnderlying(t); chosen.valid()) {
+                    out_ += " chosen ";
+                    pushType(chosen);
+                    return;
+                }
                 auto sc = in.scalars(t);
                 if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
                     std::string_view const n = primName(static_cast<TypeKind>(sc[0]));
@@ -1863,7 +1815,21 @@ private:
             case HirKind::ReturnStmt:
                 out_ += stmtKw(HirTextStmtKw::Return); out_ += flagsStr(f);
                 pushText(stack, "\n");
+                // ★★ v5: A VALUE-LESS RETURN SAYS SO — `return void`. The value is the
+                // one OPTIONAL child in this grammar that sits at the END of its
+                // statement and can begin with `@`, and so can the NEXT statement
+                // (its `@loc` block), so a bare `return` left the reader guessing.
+                // It guessed "value", on the premise that nothing follows a value-less
+                // return — false for dead code, and false for every `if (c) return;`,
+                // whose then-arm is followed by the statement AFTER the `if`.
+                // ✔MEASURED (P68 round 8): `void g(void); void f(int x) { if (x)
+                // return; g(); }` made `--emit-hir` refuse its own artifact with
+                // `unexpected node kind 'ExprStmt' in expression position`, and so did
+                // sqlite's `test/speedtest1.c`. The ambiguity cannot be settled by
+                // looking ahead either: `error` and `ext_node` open a statement AND
+                // render inline as an expression. So the text carries the answer.
                 if (auto v = hir_.returnValue(id)) { out_ += ' '; pushExpr(stack, *v, depth + 1); }
+                else out_ += " void";
                 return;
             case HirKind::ExprStmt:
                 out_ += stmtKw(HirTextStmtKw::Expr); out_ += flagsStr(f); out_ += ' ';
@@ -2077,6 +2043,12 @@ private:
         if (!op.fixedRegister.empty()) {
             out_ += " pin "; out_ += quote(op.fixedRegister);
         }
+        // ★ P68 round 8: the two GNU local-register-variable facts travel with
+        // the pin, or a round trip turns a bound `__int128` pair back into the
+        // refused letter-pin shape and re-copies an indeterminate value into a
+        // register read as it stands (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED).
+        if (op.pinnedByVariable)   out_ += " by_variable";
+        if (op.registerAsItStands) out_ += " as_it_stands";
         // ── D-HIR-TEXT-INLINE-ASM-OPERAND-KIND-DROPPED-IN-TRANSIT ──
         //
         // ★★★ THE THIRD ARM OF THE RESOLUTION, AND IT MUST TRAVEL OR THE
@@ -2499,9 +2471,25 @@ private:
             out_ += "str "; out_ += quote(*s); return;
         }
         if (auto const* a = std::get_if<HirAddressValue>(&v.value)) {
-            // c43 address constant: `addr <base> <byteOffset>` (pointeeType is
+            // c43 address constant: `addr %N <byteOffset>` — the base through the SAME
+            // handle table as every node payload (`noteLiteralSymbols` numbered it) —
+            // and `addr 0 <byteOffset>` for the null base (`pointeeType` is
             // fold-transient and not round-tripped — invalid on the parsed value).
-            out_ += std::format("addr {} {}", a->base, a->byteOffset); return;
+            // ⚠ It printed the RAW SymbolId (P68 round 8, lane `ht`, part 1c-b): the
+            // reader then resolved it as a HANDLE — a different symbol, or none — and
+            // the round trip was byte-identical all the same.
+            if (a->base == HirAddressValue::kNullBase) {
+                out_ += std::format("addr 0 {}", a->byteOffset);
+            } else if (std::uint32_t const h = handleOf(a->base); h != 0) {
+                out_ += std::format("addr %{} {}", h, a->byteOffset);
+            } else {
+                report(std::format("address constant base SymbolId {} was not numbered by "
+                                   "the prepass, so the `symbols` table does not declare it; "
+                                   "rendered as `%0`, which the reader refuses", a->base),
+                       DiagnosticSeverity::Error);
+                out_ += std::format("addr %0 {}", a->byteOffset);
+            }
+            return;
         }
         if (auto const* bi = std::get_if<BitIntValue>(&v.value)) {
             // C4b (I5) `_BitInt` value: `bitint <width> <signed 0|1> <nLimbs> <limb…>`
@@ -2520,8 +2508,16 @@ private:
             // lossless bit-exact round-trip; pack ∘ fromPacked is identity, pinned in
             // test_wide_float_value).
             WideFloatValue::Packed const p = wf->pack();
-            int const bits = (wf->kind() == TypeKind::F128) ? 128 : 80;
-            out_ += std::format("wfloat {} {} {}", bits, p.hi, p.lo);
+            // The width through its ONE owner (`WideFloatValue::kFormatBitWidths`).
+            std::optional<std::uint32_t> const bits = WideFloatValue::formatBitWidth(wf->kind());
+            if (!bits.has_value()) {
+                report(std::format("a wide-float literal of kind {} has no `wfloat` width "
+                                   "— accepted: {}", static_cast<int>(wf->kind()),
+                                   WideFloatValue::formatBitWidthsAccepted()),
+                       DiagnosticSeverity::Error);
+                return;
+            }
+            out_ += std::format("wfloat {} {} {}", *bits, p.hi, p.lo);
             return;
         }
         // ★★★ THE ARM THAT USED TO FALL OFF THE END. Nine of `HirLiteralValue`'s
@@ -2707,12 +2703,95 @@ private:
         }
         out_ += "}\n";
     }
+
+    // ── `types { … }` — every composite the module mentions, DEFINED ONCE ──────
+    //
+    // Drains `typeOrder_` IN HANDLE ORDER, and the loop re-reads the size on every
+    // turn on purpose: a definition's own fields may reference composites nothing
+    // before them mentioned, which mints the next handles and appends them here —
+    // so the table closes over exactly the composites the module reaches, each
+    // exactly once, and each definition costs its own field list and nothing else.
+    // Empty table ⇒ no section (the preamble's non-empty-sections-only rule).
+    void emitTypes() {
+        if (typeOrder_.empty()) return;
+        out_ += "types {\n";
+        for (std::size_t i = 0; i < typeOrder_.size(); ++i) {
+            // A COPY, not a reference: rendering this definition may append to
+            // `typeOrder_`, which would invalidate a reference into it.
+            TypeId const composite = typeOrder_[i];
+            out_ += std::format("  type {} = ", i + 1);
+            appendCompositeDefinition(composite);
+            out_ += '\n';
+        }
+        out_ += "}\n";
+    }
+
+    // One composite's definition: `struct|union "<name>"`, then `opaque`, or its
+    // whole-composite layout markers and its field list.
+    //
+    // ★★★ EVERY CHANNEL `TypeInterner::completeComposite` TAKES HAS A SPELLING, and
+    // the `static_assert` on that function's signature in the ONE owner of what a
+    // definition carries — `core/types/type_lattice/composite_definition.hpp`, shared
+    // with the MIR text's `types` table since P68 round 8 — is what keeps it so. A
+    // channel this text drops is a layout the reader
+    // rebuilds DIFFERENTLY while the round trip stays byte-identical — the re-
+    // emission spells the stripped type exactly as the first emission did — so the
+    // loss is invisible to every check except a layout comparison. v4 had three
+    // such channels (bit-field widths, whole-composite `aligned(N)`, the `#pragma
+    // pack` cap; `docs/hir-text-format.md` §5.2 listed them) and a fourth nobody had
+    // listed: per-member `_Alignas` on a UNION, which the semantic analyzer
+    // completes (`fieldAligns` on the union arm) and v4's union spelling omitted.
+    //
+    // THE SPELLINGS, each with the reason it is needed:
+    //   * `opaque` (D-FFI-OPAQUE-TAG-HAS-NO-SPELLING) — an INCOMPLETE composite has
+    //     no field list at all, and `{}` would be a LEGAL COMPLETE zero-field one:
+    //     the swap is a silent size change, for a struct and a union alike.
+    //   * ` packed` (D-CSUBSET-PACKED) — the whole-composite flag; else it reinterns
+    //     UNPACKED. Combines with `~N`; never with `@N` (the interner refuses that).
+    //   * ` aligned N` — the whole-composite `__attribute__((aligned(N)))`
+    //     (`explicitCompositeAlign`); it RAISES the aggregate's alignment and so
+    //     its size.
+    //   * ` pack N` — the `#pragma pack(N)` member-alignment cap (`maxFieldAlign`);
+    //     it LOWERS each member's alignment.
+    //   * per field ` @N` (c107, D-FFI-DESCRIPTOR-UNION-OVERLAY) — an explicit
+    //     offset, XOR ` ~N` (D-CSUBSET-MEMBER-ALIGNAS) — a member alignment; both
+    //     are all-or-none, which is why an unaligned field still spells `~0`.
+    //   * per field ` bits N` — a bit-field's declared width (`fieldBitWidth`),
+    //     `bits 0` included (the unnamed packing break).
+    //   * per field ` packed` (D-CSUBSET-PER-MEMBER-PACKED) — ONE member's packed
+    //     attribute, written only on the members that carry it.
+    void appendCompositeDefinition(TypeId t) {
+        CompositeDefinition const def = describeComposite(*ctx_.interner, t);
+        out_ += def.kind == TypeKind::Struct ? "struct " : "union ";
+        out_ += quote(def.name);
+        if (def.opaque) { out_ += " opaque"; return; }
+        if (def.packed) out_ += " packed";
+        if (def.explicitAlign != 0) out_ += std::format(" aligned {}", def.explicitAlign);
+        if (def.maxFieldAlign != 0) out_ += std::format(" pack {}", def.maxFieldAlign);
+        out_ += " {";
+        for (std::size_t i = 0; i < def.fields.size(); ++i) {
+            CompositeFieldDefinition const& f = def.fields[i];
+            if (i != 0) out_ += ", ";
+            appendType(f.type);
+            if (f.offset.has_value())     out_ += std::format(" @{}", *f.offset);
+            else if (f.align.has_value()) out_ += std::format(" ~{}", *f.align);
+            if (f.bitWidth.has_value()) out_ += std::format(" bits {}", *f.bitWidth);
+            if (f.packed) out_ += " packed";
+        }
+        out_ += '}';
+    }
 };
 
 } // namespace
 
 std::string emitHir(Hir const& hir, HirTextContext const& ctx, DiagnosticReporter& reporter) {
     return Emitter{hir, ctx, reporter}.run();
+}
+
+std::uint64_t hirTextTypeNodesSpelledTake() noexcept {
+    std::uint64_t const v = tlsTypeNodesSpelled;
+    tlsTypeNodesSpelled = 0;
+    return v;
 }
 
 std::string renderHirKindInventory(std::string_view producer) {
@@ -2955,10 +3034,15 @@ public:
     // Module path: the Parser OWNS a fresh interner/registry (tagged with `cuId`),
     // and the `interner_`/`typeReg_` references bind to them. `parseHir` later
     // moves the owned interner out of `ownedInterner_` into the HirParseResult.
+    // ★ THE MODULE PATH READS COMPOSITES THROUGH THE `types` TABLE, which is the
+    // one behavioural difference between the two constructors' grammars (see
+    // `moduleTypes_`).
     Parser(std::string_view text, CompilationUnitId cuId, DiagnosticReporter& reporter)
         : ownedInterner_(std::in_place, cuId), ownedTypeReg_(std::in_place),
           interner_(*ownedInterner_), typeReg_(*ownedTypeReg_),
-          lex_(text), reporter_(reporter) {}
+          lex_(text), reporter_(reporter) {
+        moduleTypes_ = true;
+    }
 
     // Type-text path (`parseTypeFromText`): the caller OWNS the interner/registry,
     // so the owned storage stays empty and the references bind to the externals —
@@ -3001,6 +3085,17 @@ public:
     // makes emit(parse(emit(h))) byte-identical without printing the handle.
     HirInlineAsmPool      pInlineAsm_;
 
+    // ★★ HOW MANY TIMES THIS READER REFUSED, COUNTED BY THE READER. `parseHir` and
+    // `parseTypeFromText` used to decide "did the text read" by the REPORTER's
+    // error delta — an instrument that answers an adjacent question ("did the
+    // reporter STORE a new error"). A reporter already at its global cap, at its
+    // per-code cap, or holding an identical diagnostic inside its dedup window
+    // stores nothing, so a refused text read as accepted: a half-built type or
+    // tree handed back as sound, and — for `parseHir` — a recovery tree handed to
+    // the verifier. Every refusal this reader makes passes through `malformed`,
+    // `unknownName` or the version gate, and each one counts here.
+    std::size_t           refusals_ = 0;
+
     // Parse the whole file. Returns the module root (invalid on a fatal header
     // error). Populates the builder, interner, side-table pending lists.
     [[nodiscard]] HirNodeId parse() {
@@ -3018,6 +3113,7 @@ public:
                 "grammar would produce a confident wrong answer rather than an "
                 "error",
                 version, kHirTextFormatVersion);
+            ++refusals_;
             reporter_.report(std::move(d));
             return InvalidHirNode;
         }
@@ -3097,7 +3193,31 @@ private:
     std::span<NamedTypeBinding const> namedTypes_;
     std::uint32_t preCounter_ = 0;
 
-    // ── v3: THE RECURSIVE-COMPOSITE OPEN STACK ───────────────────────────────
+    // ── v5: THE COMPOSITE TABLE (module path only) ───────────────────────────
+    //
+    // ★ `moduleTypes_` IS THE ONE GRAMMAR DIFFERENCE BETWEEN THE TWO PATHS. In a
+    // `.dsshir` MODULE every composite is defined once in `types` and every type
+    // position names it as `type <H>`; an inline `struct "N" {…}`, `union …` or
+    // `rec <H>` there would be a SECOND spelling of a type the file defines
+    // elsewhere, so it is refused by name. A STANDALONE type text (`parseTypeFrom-
+    // Text`, every FFI descriptor signature) has no table, so it keeps the inline
+    // forms unchanged and refuses `type <H>` instead — no accepted standalone
+    // spelling moved when the module grammar did.
+    bool moduleTypes_ = false;
+    // Handle → the forward-minted composite, filled by `scanTypeHeads` before any
+    // field list is read, so a definition may reference a handle defined AFTER it
+    // (a cycle, or merely an order the writer chose) exactly like one defined before.
+    std::unordered_map<std::uint64_t, TypeId> typeHandles_;
+    // Handles whose definition the full pass has already read — a handle defined
+    // twice is refused, never silently resolved to whichever body came first.
+    std::set<std::uint64_t> typeDefined_;
+
+    // ── v3: THE RECURSIVE-COMPOSITE OPEN STACK (standalone type text only) ──────
+    //
+    // ⓘ v5: this is now the STANDALONE path's device. A module references every
+    // composite through its `types` table, where a cycle is an ordinary reference,
+    // and refuses `rec`; a standalone type text has no table, so a cyclic composite
+    // spelled inline there still needs the back-reference below.
     //
     // `struct "Node" rec 1 {i32, ptr<rec 1>}` — the forward id for handle 1 must
     // exist BEFORE the field list is read, because a field IS the thing that
@@ -3117,22 +3237,37 @@ private:
     // inside `A` or standing alone, so a text-keyed reader rebuilds TWO `B`s from
     // one while the round-tripped BYTES still match.
     //
-    // ⓘ CLEARED AT EVERY `parseType` ENTRY, and that is the strict reading: the
-    // writer only ever emits a back-reference to an ANCESTOR within the same type
-    // expression, so a `rec H` that resolves to a composite closed earlier in the
-    // file would be text this writer cannot reproduce — the round trip would
-    // break silently. Refusing it is the fail-loud half.
+    // ⓘ CLEARED AT EVERY `parseType` ENTRY, and that is the strict reading: a
+    // back-reference names an ANCESTOR within the same type expression, which is
+    // the only thing the grammar gives it a meaning for — a `rec H` resolving to a
+    // composite closed earlier would bind a name the text never scoped there.
+    // Refusing it is the fail-loud half.
     struct RecOpen { std::uint64_t handle; TypeId type; };
     std::vector<RecOpen> recOpen_;
 
-    // The `declSiteKey` key space for a recursion handle. Bit 60, beside the
-    // sibling text-tier spaces already in this file (bit 62 whole-composite
-    // packed, bit 61 per-field packed) and clear of `contentDeclSiteKey`'s bit 63
-    // — so a handle-keyed composite can never collide with a content-keyed one,
-    // nor with a semantic decl-site key.
-    [[nodiscard]] static std::uint64_t recDeclSiteKey(std::uint64_t handle) {
+    // The `declSiteKey` key space for an ARTIFACT HANDLE — a standalone text's
+    // `rec <H>` and a module's `type <H>` alike (the two never meet in one parse:
+    // each path refuses the other's form). Bit 60, beside the sibling text-tier
+    // spaces already in this file (bit 62 whole-composite packed, bit 61 per-field
+    // packed) and clear of `contentDeclSiteKey`'s bit 63 — so a handle-keyed
+    // composite can never collide with a content-keyed one, nor with a semantic
+    // decl-site key.
+    // ★ KEYING A MODULE'S COMPOSITES ON THE HANDLE, NOT THE CONTENT, IS WHAT KEEPS
+    // TWO TYPES TWO. The writer gives every distinct composite its own handle, so
+    // two scopes' `struct S {int}` arrive as `type 3` and `type 7` with identical
+    // bodies; a content key would fold them into ONE TypeId, and the re-emission —
+    // which numbers distinct TypeIds — would then write one entry where the
+    // artifact had two.
+    [[nodiscard]] static std::uint64_t handleDeclSiteKey(std::uint64_t handle) {
         return handle | (std::uint64_t{1} << 60);
     }
+    // The largest `type <H>` handle this reader takes. A handle is an ordinal of
+    // the artifact's own composites, so 32 bits is generous by nine orders of
+    // magnitude — and the bound is what keeps `handleDeclSiteKey` INJECTIVE: past
+    // bit 60 two handles would share a key, hence a TypeId, and completing the
+    // second with a different body would reach `completeComposite`'s ABORT rather
+    // than a diagnostic.
+    static constexpr std::uint64_t kMaxTypeHandle = 0xFFFFFFFFu;
 
     // ── P44: THE QUALIFICATION SIDE CHANNEL (type-text path only) ────────────
     //
@@ -3222,15 +3357,34 @@ private:
             malformed(std::format("expected a label ordinal 'L<n>', got '{}'", t));
             return 0;
         }
-        std::uint32_t ord = 0;
+        // ★ READ AS WRITTEN OR REFUSED (P68 round 8, lane `ht`, part 1c): this loop
+        // accumulated in 32 bits and WRAPPED, so `goto L4294967297` jumped to `L1` —
+        // a different label, silently, in `goto`, `label`, `labeladdr` and an
+        // asm-goto label list alike. The ordinal is not an integer TOKEN (it rides
+        // an identifier), so it cannot read through `takeU32`; it says the same
+        // sentence. `wrapped` is what the old loop computed, for that sentence.
+        std::uint64_t ord     = 0;
+        std::uint32_t wrapped = 0;
+        bool          tooWide = false;
         for (std::size_t i = 1; i < t.size(); ++i) {
             if (t[i] < '0' || t[i] > '9') {
                 malformed(std::format("malformed label ordinal '{}'", t));
                 return 0;
             }
-            ord = ord * 10u + static_cast<std::uint32_t>(t[i] - '0');
+            std::uint32_t const d = static_cast<std::uint32_t>(t[i] - '0');
+            wrapped = wrapped * 10u + d;
+            if (!tooWide) {
+                ord = ord * 10u + d;
+                tooWide = ord > std::numeric_limits<std::uint32_t>::max();
+            }
         }
-        return ord;
+        if (tooWide) {
+            malformed(std::format(
+                "label ordinal {} does not fit its 32-bit field — it would have read "
+                "back as L{}", t, wrapped));
+            return 0;
+        }
+        return static_cast<std::uint32_t>(ord);
     }
     [[nodiscard]] std::string takeStr() {
         if (peekIs(Tk::Str)) return lex_.take().text;
@@ -3243,6 +3397,24 @@ private:
             return t.num;
         }
         malformed("expected integer"); return 0;
+    }
+    // ★★ A NUMBER THE TEXT SPELLS IS READ AS THAT NUMBER, OR REFUSED NAMING ITS
+    // FIELD — NEVER NARROWED INTO ANOTHER ONE. Every 32-bit field this reader fills
+    // used to be a bare `static_cast<std::uint32_t>(takeInt())` or a hand-rolled
+    // check, so `%4294967297` read back as `%1` and `buf 4294967297` as buffer 1,
+    // with no diagnostic (P68 round 8, lane `ht`, part 1c). They all read through
+    // this — `tests/hir/test_hir_text_reads_every_number_as_written.cpp` holds one
+    // row per field — except the label ordinal, which rides an identifier and says
+    // the same sentence itself. After a refusal it returns 0; the parse has failed.
+    [[nodiscard]] std::uint32_t takeU32(std::string_view what) {
+        std::uint64_t const v = takeInt();
+        if (v > std::numeric_limits<std::uint32_t>::max()) {
+            malformed(std::format(
+                "{} {} does not fit its 32-bit field — it would have read back as {}",
+                what, v, static_cast<std::uint32_t>(v)));
+            return 0;
+        }
+        return static_cast<std::uint32_t>(v);
     }
     // ★★ THE SIGNED FORM, AND ITS ABSENCE WAS A ROUND TRIP THIS FORMAT COULD NOT
     // CLOSE — ON A SHIPPED CORPUS EXAMPLE, WITH A PROCESS ABORT.
@@ -3267,10 +3439,51 @@ private:
     // ⓘ The negation is done in the UNSIGNED domain (forming -INT64_MIN as a
     // signed operation is UB); the two's-complement cast back is well-defined in
     // C++20 — the same device the `lit int` arm already used.
-    [[nodiscard]] std::int64_t takeSignedInt() {
+    //
+    // ★★ AND THE MAGNITUDE IS RANGE-CHECKED FIRST (P68, lane `ht`, part 1c): an
+    // int64 holds a magnitude up to 2^63 - 1, and 2^63 only when negative. Past
+    // that the two's-complement cast was a silent DIFFERENT value — `arr<i32,
+    // 18446744073709551614>` read back as `arr<i32, -2>`, the VLA sentinel, and
+    // `-9223372036854775809` as a large POSITIVE. Every signed field reads here and
+    // names itself in the refusal (0 after it; the parse has already failed).
+    [[nodiscard]] std::int64_t takeSignedInt(std::string_view what) {
         bool const neg = accept(Tk::Minus);
         std::uint64_t const u = takeInt();
-        return neg ? static_cast<std::int64_t>(0u - u) : static_cast<std::int64_t>(u);
+        std::uint64_t const limit =
+            neg ? std::uint64_t{1} << 63
+                : static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+        std::int64_t const asRead =
+            neg ? static_cast<std::int64_t>(0u - u) : static_cast<std::int64_t>(u);
+        if (u > limit) {
+            malformed(std::format(
+                "{} {}{} does not fit its signed 64-bit field — it would have read "
+                "back as {}", what, neg ? "-" : "", u, asRead));
+            return 0;
+        }
+        return asRead;
+    }
+    // ★ AN ALIGNMENT THE TEXT SPELLS IS ONE THE `Alignment` DOMAIN CAN HOLD, OR IT
+    // IS REFUSED NAMING ITS FIELD (P68 round 8, lane `ht`, part 1c). The composite
+    // markers `aligned N` / `pack N` already were (`takeCompositeAlign`); the
+    // type-level `aligned<T, N>` and the per-field `~N` took any 32-bit value, which
+    // the interner stores as it is and the layout engine then cannot honour — a
+    // text that read CLEAN and failed later as "no layout", naming nothing in it.
+    // `zeroIsNoRequest`: a `~N` list is all-or-none, so a field without an override
+    // spells `~0`, the writer's own filler; `aligned<T, 0>` is never written (a
+    // type without an alignment has no `aligned<>` frame), so there 0 is refused.
+    [[nodiscard]] std::uint32_t takeAlignment(std::string_view what, bool zeroIsNoRequest) {
+        std::size_t const before = refusals_;
+        std::uint32_t const n = takeU32(what);
+        if (refusals_ != before) return 0;
+        if (n == 0 && zeroIsNoRequest) return 0;
+        if (!Alignment::fromBytes(n).has_value()) {
+            malformed(std::format(
+                "{} {} is not an alignment this build can represent — a power of two "
+                "from 1 to {}{}", what, n, Alignment::kMaxBytes,
+                zeroIsNoRequest ? ", or 0 for a field with no override" : ""));
+            return 0;
+        }
+        return n;
     }
     // A float value accepts Float (`3.14`), Int (`42` — a whole-valued double
     // std::format rendered without a point), and the `inf`/`nan` idents
@@ -3395,48 +3608,88 @@ private:
             else if (b == "false") v.value = false;
             else malformed(std::format("expected 'true' or 'false', got '{}'", b));
         }
-        else if (tag == "int")  {
-            bool n = accept(Tk::Minus);
-            std::uint64_t u = takeInt();
-            // Negate in the unsigned domain (forming -INT64_MIN as a signed op
-            // is UB); the two's-complement cast back is well-defined in C++20.
-            v.value = n ? static_cast<std::int64_t>(0u - u) : static_cast<std::int64_t>(u);
-        }
+        else if (tag == "int")  { v.value = takeSignedInt("int literal"); }
         else if (tag == "uint") { v.value = takeInt(); }
         else if (tag == "float"){ bool n = accept(Tk::Minus); double d = takeFloat();
                                   v.value = n ? -d : d; }
         else if (tag == "str")  { v.value = takeStr(); }
         else if (tag == "addr") {
-            // c43 address constant: `addr <base> <byteOffset>` (signed offset).
+            // c43 address constant: `addr %N <byteOffset>` (signed offset) — the base
+            // is a symbol HANDLE, resolved and range-checked by `parseSymHandle` like
+            // every other reference — or `addr 0 <byteOffset>`, the null base. A bare
+            // non-zero integer is refused: it is the old RAW SymbolId spelling, which
+            // named a symbol in a numbering this file does not carry (P68, 1c-b).
             HirAddressValue a;
-            a.base = static_cast<std::uint32_t>(takeInt());
-            bool const n = accept(Tk::Minus);
-            std::uint64_t const off = takeInt();
-            a.byteOffset = n ? static_cast<std::int64_t>(0u - off)
-                             : static_cast<std::int64_t>(off);
+            if (peekIs(Tk::Percent)) {
+                a.base = parseSymHandle();
+            } else {
+                std::size_t const before = refusals_;
+                std::uint32_t const raw = takeU32("address constant base");
+                if (refusals_ == before && raw != HirAddressValue::kNullBase) {
+                    malformed(std::format(
+                        "address constant base {} is neither a symbol `%N` nor the null base "
+                        "0 — a `.dsshir` names every symbol through its `symbols` handle", raw));
+                }
+            }
+            a.byteOffset = takeSignedInt("address constant byte offset");
             v.value = std::move(a);
         }
         else if (tag == "bitint") {
             // C4b (I5): `bitint <width> <signed 0|1> <nLimbs> <limb…>` — the inverse
             // of appendLiteralValue's serialization (the BitIntValue ctor re-wraps).
-            std::uint64_t const width  = takeInt();
+            std::size_t const refusalsBefore = refusals_;
+            std::uint32_t const width  = takeU32("bitint literal width");
             std::uint64_t const sgn    = takeInt();
             std::uint64_t const nLimbs = takeInt();
+            // ★ THE DECLARED COUNT SIZES NOTHING (P68, lane `ht`, part 1c): this used
+            // to `reserve` that many limbs before reading one — `bitint 64 0
+            // 1000000000000 …` asked for 8 TB — and the loop then ran on at the end
+            // of the input, where `takeInt` does not advance. The limbs are the ones
+            // the text HOLDS; a count it does not back is refused.
             std::vector<std::uint64_t> limbs;
-            limbs.reserve(static_cast<std::size_t>(nLimbs));
-            for (std::uint64_t i = 0; i < nLimbs; ++i) limbs.push_back(takeInt());
-            v.value = BitIntValue(std::move(limbs),
-                                  static_cast<std::uint32_t>(width), sgn != 0);
+            for (std::uint64_t i = 0; i < nLimbs; ++i) {
+                if (!peekIs(Tk::Int)) {
+                    malformed(std::format(
+                        "bitint literal declares {} limbs and the text holds {}",
+                        nLimbs, i));
+                    break;
+                }
+                limbs.push_back(takeInt());
+            }
+            // The width is the MODEL's to bound — `kBitIntMaxWidth`, C23's
+            // __BITINT_MAXWIDTH__ — and it must be: `BitIntValue` re-wraps its limbs
+            // to the width, so a width from the text would size that allocation too.
+            if (refusals_ == refusalsBefore && (width == 0 || width > kBitIntMaxWidth)) {
+                malformed(std::format(
+                    "bitint literal width {} is not a _BitInt width — 1 to {} "
+                    "(__BITINT_MAXWIDTH__)", width, kBitIntMaxWidth));
+            }
+            // The writer spells the signedness 0 or 1; any other number used to read
+            // as "signed", which is a number read as something other than itself.
+            if (refusals_ == refusalsBefore && sgn > 1) {
+                malformed(std::format(
+                    "bitint literal signedness {} is not 0 (unsigned) or 1 (signed)", sgn));
+            }
+            if (refusals_ == refusalsBefore) {
+                v.value = BitIntValue(std::move(limbs), width, sgn != 0);
+            }
         }
         else if (tag == "wfloat") {
             // LD-3: `wfloat <bits> <hi> <lo>` — the inverse of appendLiteralValue's
-            // pack() serialization; the bit-width (80|128) selects the F80 vs F128
-            // unpack layout via WideFloatValue::fromPacked.
+            // pack() serialization; the bit-width selects the unpack layout via
+            // WideFloatValue::fromPacked, through `WideFloatValue::kFormatBitWidths` — a width
+            // the model does not define is refused, never read as F80 (P68, 1c).
             std::uint64_t const bits = takeInt();
             std::uint64_t const hi   = takeInt();
             std::uint64_t const lo   = takeInt();
-            TypeKind const k = (bits == 128) ? TypeKind::F128 : TypeKind::F80;
-            v.value = WideFloatValue::fromPacked(lo, hi, k);
+            if (std::optional<TypeKind> const k = WideFloatValue::kindOfFormatBitWidth(bits);
+                k.has_value()) {
+                v.value = WideFloatValue::fromPacked(lo, hi, *k);
+            } else {
+                malformed(std::format(
+                    "wfloat width {} is not a wide-float format this model defines "
+                    "— accepted: {}", bits, WideFloatValue::formatBitWidthsAccepted()));
+            }
         }
         else if (tag == "agg") {
             // D-HIR-TEXT-WRITER-DROPS-THE-AGGREGATE-LITERAL-ARM: the inverse of
@@ -3490,6 +3743,7 @@ private:
         return t.valid() ? interner_.kind(t) : TypeKind::Void;
     }
     void malformed(std::string detail) {
+        ++refusals_;   // counted HERE, whatever the reporter then does with it
         ParseDiagnostic d; d.code = DiagnosticCode::H_TextMalformed;
         d.severity = DiagnosticSeverity::Error;
         d.span = SourceSpan::empty(lex_.peek().off);
@@ -3497,6 +3751,7 @@ private:
         reporter_.report(std::move(d));
     }
     void unknownName(std::string detail) {
+        ++refusals_;
         ParseDiagnostic d; d.code = DiagnosticCode::H_TextUnknownName;
         d.severity = DiagnosticSeverity::Error;
         d.span = SourceSpan::empty(lex_.peek().off);
@@ -3537,9 +3792,193 @@ private:
             else if (acceptKeyword("ext_ops")) parseExtOps();
             else if (acceptKeyword("intrinsics")) parseIntrinsics();
             else if (acceptKeyword("buffers")) parseBuffers();
+            else if (acceptKeyword("types")) parseTypesSection();
             else if (acceptKeyword("symbols")) parseSymbols();
             else break;
         }
+    }
+
+    // ── `types { type <H> = … }` — the composite table (v5) ──────────────────
+    //
+    // TWO PASSES OVER ONE SECTION, and the first one is what makes a cycle — or
+    // any reference to a handle defined LATER — an ordinary case. A definition's
+    // fields may name any handle (`type 1 = struct "A" {ptr<type 2>}` before
+    // `type 2` is defined), and building `ptr<type 2>` needs `type 2`'s TypeId;
+    // `forwardComposite` mints one from a kind and a name, which a reference does
+    // not carry. So `scanTypeHeads` reads every entry's HEAD first — silently,
+    // over a COPY of the lexer — and mints each handle's forward id; then the
+    // lexer is rewound and the section is read for real, completing each forward
+    // id with its fields. Every diagnostic comes from the second pass, so an entry
+    // is reported once however malformed it is.
+    // ⓘ The same shape every reference IR measured takes: an LLVM named type may
+    // be used before its body, and a CodeView pointer names a forward-reference
+    // record.
+    void parseTypesSection() {
+        if (!moduleTypes_) {
+            // Unreachable today (a standalone type text never reaches the preamble),
+            // and kept loud rather than assumed: the table exists only in a module.
+            malformed("a `types` section belongs to a `.dsshir` module");
+        }
+        expect(Tk::LBrace, "'{'");
+        Lexer const firstEntry = lex_;
+        scanTypeHeads();
+        lex_ = firstEntry;
+        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+            std::uint32_t const off = cursorOff();
+            parseTypeEntry();
+            if (cursorOff() == off) lex_.take();  // progress guard
+        }
+        expect(Tk::RBrace, "'}'");
+    }
+
+    // PASS 1: every well-formed `type <H> = struct|union "<name>"` head mints the
+    // forward composite for H. Says NOTHING — a malformed entry is left for pass 2
+    // to refuse, with a position — and stops at the first token it cannot place,
+    // because past that point it cannot tell a head from a field. A handle it does
+    // not reach is then reported by the reference that needs it.
+    void scanTypeHeads() {
+        while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+            if (!acceptKeyword("type") || !peekIs(Tk::Int)) return;
+            Tok const handleTok = lex_.take();
+            if (!accept(Tk::Equal)) return;
+            TypeKind kind = TypeKind::Struct;
+            if (acceptKeyword("struct"))     kind = TypeKind::Struct;
+            else if (acceptKeyword("union")) kind = TypeKind::Union;
+            else return;
+            if (!peekIs(Tk::Str)) return;
+            std::string const name = lex_.take().text;
+            if (handleTok.num != 0 && handleTok.num <= kMaxTypeHandle && !handleTok.overflow
+                && !typeHandles_.contains(handleTok.num)) {
+                typeHandles_.emplace(handleTok.num,
+                                     interner_.forwardComposite(kind, name,
+                                                                handleDeclSiteKey(handleTok.num)));
+            }
+            if (acceptKeyword("opaque")) continue;
+            // Step over the layout markers and the field list to the next head. A
+            // field list holds no brace of its own in a module (a composite is only
+            // ever `type <H>` there), so the depth count is a guard for a malformed
+            // input rather than a grammar case.
+            while (!peekIs(Tk::LBrace) && !peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) lex_.take();
+            if (!accept(Tk::LBrace)) return;
+            std::size_t depth = 1;
+            while (depth != 0 && !peekIs(Tk::Eof)) {
+                if (peekIs(Tk::LBrace)) ++depth;
+                else if (peekIs(Tk::RBrace)) --depth;
+                lex_.take();
+            }
+        }
+    }
+
+    // PASS 2: one entry, for real. `type <H> = struct|union "<name>"` then either
+    // `opaque` or `[packed] [aligned N] [pack N] { <field>, … }`.
+    void parseTypeEntry() {
+        if (!acceptKeyword("type")) {
+            malformed("expected `type <H> = struct|union \"<name>\" …` in the `types` "
+                      "section");
+            return;
+        }
+        std::uint64_t const h = takeInt();
+        expect(Tk::Equal, "'=' after the handle of a `types` entry");
+        TypeKind kind = TypeKind::Struct;
+        if (acceptKeyword("struct"))     kind = TypeKind::Struct;
+        else if (acceptKeyword("union")) kind = TypeKind::Union;
+        else {
+            malformed("a `types` entry defines a `struct` or a `union` — nothing else "
+                      "is a composite in this format");
+            return;
+        }
+        std::string const name = takeStr();
+        bool usable = true;
+        if (h == 0 || h > kMaxTypeHandle) {
+            malformed(std::format(
+                "`type {}` is not a handle — handles are 1-based ordinals of at most "
+                "{}", h, kMaxTypeHandle));
+            usable = false;
+        } else if (!typeDefined_.insert(h).second) {
+            malformed(std::format(
+                "`type {}` is defined twice — a handle names ONE composite per "
+                "artifact, so a second body would describe a different type under "
+                "the same name", h));
+            usable = false;
+        }
+        TypeId fwd = InvalidType;
+        if (usable) {
+            if (auto const it = typeHandles_.find(h); it != typeHandles_.end()) {
+                fwd = it->second;
+            } else {
+                // Pass 1 stopped before this entry (an earlier one was malformed);
+                // it is still minted here so its own references resolve.
+                fwd = interner_.forwardComposite(kind, name, handleDeclSiteKey(h));
+                typeHandles_.emplace(h, fwd);
+            }
+        }
+        if (acceptKeyword("opaque")) return;   // INCOMPLETE: stays forward-only
+        CompositeDefinition def;
+        def.kind = kind;
+        def.name = name;
+        def.packed = acceptKeyword("packed");
+        def.explicitAlign = acceptKeyword("aligned") ? takeCompositeAlign("aligned") : 0u;
+        def.maxFieldAlign = acceptKeyword("pack") ? takeCompositeAlign("pack") : 0u;
+        expect(Tk::LBrace, "'{'");
+        if (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+            for (;;) {
+                std::uint32_t const off = cursorOff();
+                readCompositeField(def);
+                if (!accept(Tk::Comma)) break;
+                if (cursorOff() == off) lex_.take();   // progress guard
+            }
+        }
+        expect(Tk::RBrace, "'}'");
+        if (!usable) return;
+        // The ONE owner refuses, by name, every combination `completeComposite`
+        // would ABORT on or `computeLayout` would decline, then completes the forward
+        // id; a refusal leaves it forward-only, and the parse is already not ok.
+        if (auto const why = refuseCompositeDefinition(def)) {
+            malformed(*why);
+            return;
+        }
+        completeCompositeDefinition(interner_, fwd, def);
+    }
+
+    // `aligned N` / `pack N` — a whole-composite byte alignment. Refused here, by
+    // name, unless it is one the interner can represent: `completeComposite`
+    // ABORTS on an unrepresentable value, which is right for a compiler pass and
+    // wrong for a reader of text it did not write. 0 is refused too — it is the
+    // writer's ABSENT value, so a file spelling it disagrees with this grammar.
+    [[nodiscard]] std::uint32_t takeCompositeAlign(char const* marker) {
+        std::uint64_t const n = takeInt();
+        if (n == 0 || n > std::numeric_limits<std::uint32_t>::max()
+            || !Alignment::fromBytes(static_cast<std::uint32_t>(n)).has_value()) {
+            malformed(std::format(
+                "`{} {}` is not a composite alignment this build can represent — it "
+                "must be a power of two within the Alignment domain (the writer "
+                "omits the marker when there is none)", marker, n));
+            return 0;
+        }
+        return static_cast<std::uint32_t>(n);
+    }
+
+    // `<type> [@N | ~N] [bits N] [packed]` — one field of a definition, every
+    // per-field channel the grammar spells. The number rules (a member alignment the
+    // Alignment domain can represent, a width that fits 32 bits) are refused here, at
+    // the token, with the position; the COMBINATIONS are the ONE owner's
+    // (`refuseCompositeDefinition`), as is the `static_assert` pinning the channel list
+    // to `TypeInterner::completeComposite`'s signature.
+    void readCompositeField(CompositeDefinition& def) {
+        CompositeFieldDefinition f;
+        f.type = parseType();
+        if (accept(Tk::At)) {
+            f.offset = takeInt();
+        } else if (accept(Tk::Tilde)) {
+            f.align = takeAlignment("member alignment", /*zeroIsNoRequest=*/true);
+        }
+        // The width travels VERBATIM — its legality is the layout engine's to decide,
+        // not a text reader's — but it must fit the channel it rides: `fieldBitWidth`
+        // hands it back as 32 bits, and a value past that would not read back as what
+        // was written.
+        if (acceptKeyword("bits")) f.bitWidth = takeU32("bit-field width");
+        if (acceptKeyword("packed")) f.packed = true;
+        def.fields.push_back(f);
     }
     void parseExtKinds() {
         expect(Tk::LBrace, "'{'");
@@ -3592,9 +4031,9 @@ private:
         while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
             std::uint32_t const off = cursorOff();
             if (!acceptKeyword("buf")) malformed("expected 'buf'");
-            std::uint64_t const id = takeInt();
+            std::uint32_t const id = takeU32("buffer id");
             std::string name = takeStr();
-            std::uint64_t origin = 0;
+            std::uint32_t origin = 0;
             if (acceptKeyword("synthesized")) {
                 // The marker's origin is REQUIRED, not optional: a buffer known
                 // to be synthesized but with no origin recorded is exactly the
@@ -3603,27 +4042,55 @@ private:
                 if (!acceptKeyword("from")) {
                     malformed("expected 'from' after 'synthesized'");
                 }
-                origin = takeInt();
+                origin = takeU32("buffer origin");
             }
-            bufferNames_.push_back(
-                HirTextBufferName{static_cast<std::uint32_t>(id), std::move(name),
-                                  static_cast<std::uint32_t>(origin)});
+            bufferNames_.push_back(HirTextBufferName{id, std::move(name), origin});
             if (cursorOff() == off) lex_.take();  // progress guard
         }
         expect(Tk::RBrace, "'}'");
     }
+    // `symbols { %1 "a" %2 "b" … }` — DENSE BY THE WRITER'S CONTRACT, AND HELD TO
+    // IT. The writer hands out handle `symOrder_.size()` at a symbol's first
+    // encounter, so a table is `%1..%N` in order: ✔MEASURED P68 (lane `ht`, part
+    // 1c) over every artifact the round-trip gate's examples produce plus sqlite's
+    // `sqlite3.c`, `shell.c` and `speedtest1.c` — 807 tables, sqlite3.c's 32929
+    // entries among them, each exactly `%1..%N`. This used to size the table BY
+    // THE NUMBER WRITTEN (`resize(handle + 1)`): a 40-byte `%100000000 "x"` asked
+    // for 3.2 GB, `%4000000000` for 128 GB. Now the entries are read first (memory
+    // ∝ the TEXT), each slot must lie in [1, N] and be declared once, and the
+    // table is sized N + 1 — by the entries, never by a slot.
     void parseSymbols() {
         expect(Tk::LBrace, "'{'");
+        std::vector<std::pair<std::uint64_t, std::string>> entries;
         while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
             std::uint32_t const off = cursorOff();
             expect(Tk::Percent, "'%'");
             std::uint64_t const handle = takeInt();
-            std::string name = takeStr();
-            if (handle >= symbolNames_.size()) symbolNames_.resize(handle + 1);
-            symbolNames_[handle] = std::move(name);
+            entries.emplace_back(handle, takeStr());
             if (cursorOff() == off) lex_.take();  // progress guard
         }
         expect(Tk::RBrace, "'}'");
+        if (!symbolNames_.empty()) {
+            malformed("a second `symbols` section — a module declares its symbols once");
+            return;
+        }
+        std::size_t const n = entries.size();
+        symbolNames_.assign(n + 1, std::string{});
+        std::vector<bool> declared(n + 1, false);
+        for (auto& [handle, name] : entries) {
+            if (handle == 0 || handle > n) {
+                malformed(std::format(
+                    "symbol slot %{} is outside the {} declared symbols — a `.dsshir` "
+                    "symbol table is %1..%N", handle, n));
+                continue;
+            }
+            if (declared[handle]) {
+                malformed(std::format("symbol slot %{} is declared twice", handle));
+                continue;
+            }
+            declared[handle] = true;
+            symbolNames_[handle] = std::move(name);
+        }
     }
 
     // ── module ───────────────────────────────────────────────────────────────
@@ -3701,11 +4168,11 @@ private:
 
     [[nodiscard]] HirSourceLoc parseLoc() {
         if (!acceptKeyword("buf")) malformed("expected 'buf'");
-        std::uint32_t buf = static_cast<std::uint32_t>(takeInt());
+        std::uint32_t buf = takeU32("location buffer");
         expect(Tk::Comma, "','");
-        std::uint32_t s = static_cast<std::uint32_t>(takeInt());
+        std::uint32_t s = takeU32("location start offset");
         expect(Tk::DotDot, "'..'");
-        std::uint32_t e = static_cast<std::uint32_t>(takeInt());
+        std::uint32_t e = takeU32("location end offset");
         return HirSourceLoc{BufferId{buf}, SourceSpan::of(s, e)};
     }
     [[nodiscard]] FfiMetadata parseFfi() {
@@ -3728,15 +4195,25 @@ private:
             if (acceptKeyword("stage")) { std::string n = takeIdent(); m.stage = orMalformed(kHirTextShaderStageTable, n, "shader stage", ShaderStage::None); }
             else if (acceptKeyword("builtin")) { std::string n = takeIdent(); m.builtin = orMalformed(kHirTextShaderBuiltinTable, n, "shader builtin", ShaderBuiltin::None); }
             else if (acceptKeyword("wg")) {
-                m.workgroup.x = static_cast<std::uint32_t>(takeInt());
-                m.workgroup.y = static_cast<std::uint32_t>(takeInt());
-                m.workgroup.z = static_cast<std::uint32_t>(takeInt());
+                m.workgroup.x = takeU32("workgroup size x");
+                m.workgroup.y = takeU32("workgroup size y");
+                m.workgroup.z = takeU32("workgroup size z");
             } else if (acceptKeyword("binding")) {
-                m.binding.set = static_cast<std::uint32_t>(takeInt());
+                m.binding.set = takeU32("binding set");
                 expect(Tk::Colon, "':'");
-                m.binding.binding = static_cast<std::uint32_t>(takeInt());
+                m.binding.binding = takeU32("binding index");
             } else if (acceptKeyword("loc")) {
-                m.location = static_cast<std::uint32_t>(takeInt());
+                std::size_t const before = refusals_;
+                m.location = takeU32("shader location");
+                // The writer omits `loc` for a node with no location, so the unset
+                // sentinel is never SPELLED; reading it back as "no location" would
+                // turn a number the text wrote into the absence of one.
+                if (refusals_ == before && m.location == kUnsetShaderLocation) {
+                    malformed(std::format(
+                        "shader location {} is the unset sentinel — the writer omits "
+                        "`loc` when a node has no location, so a spelled one names a "
+                        "real location", m.location));
+                }
             } else break;
             if (!accept(Tk::Comma)) break;
         }
@@ -3766,7 +4243,7 @@ private:
             // is an OPERATOR-VISIBLE published identity — it renders as
             // `error[D0029]`, it appears in docs and in `expected.json` fixtures —
             // which is exactly why it has an allocation gate
-            // (`scripts/check-diagnostic-codes/check-diagnostic-codes.py`). This
+            // (`.harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py`). This
             // cast walked straight past that gate, and the value it minted would
             // render under `diagnosticCodePrefix`'s letter for the high nibble as
             // if it were a real code.
@@ -3797,7 +4274,7 @@ private:
                 }
             }
             else if (acceptKeyword("recovery")) { std::string n = takeIdent(); info.recovery = orMalformed(kHirTextRecoveryTable, n, "diag recovery", HirRecovery::None); }
-            else if (acceptKeyword("origin")) { a.diagHasOrigin = true; a.diagOriginPre = static_cast<std::uint32_t>(takeInt()); }
+            else if (acceptKeyword("origin")) { a.diagHasOrigin = true; a.diagOriginPre = takeU32("diagnostic origin"); }
             else if (acceptKeyword("detail")) info.detail = takeStr();
             else break;
             if (!accept(Tk::Comma)) break;
@@ -3827,6 +4304,50 @@ private:
     // router now asks the same table the dispatch and the refusal read.
     [[nodiscard]] static bool isExprKeyword(std::string_view kw) {
         return kHirTextExprKwTable.fromName(kw).has_value();
+    }
+
+    // Can a node opening with `kw` stand where an EXPRESSION is required? Every
+    // expression keyword, plus the two statement keywords whose nodes also render
+    // INLINE in expression position (`error`, `ext_node` — see `exprKwForKind`).
+    [[nodiscard]] static bool opensExpression(std::string_view kw) {
+        return isExprKeyword(kw) || kw == stmtKw(HirTextStmtKw::Error)
+               || kw == stmtKw(HirTextStmtKw::ExtNode);
+    }
+
+    // The keyword that opens the node starting at the cursor, looking PAST its
+    // inline `@attr(…)` groups on a COPY of the lexer — nothing is consumed. Empty
+    // when the next token is not an identifier at all (`}`, end of input).
+    [[nodiscard]] std::string peekNodeKeyword() const {
+        Lexer probe = lex_;
+        while (probe.peek().kind == Tk::At) {
+            probe.take();                                            // `@`
+            if (probe.peek().kind == Tk::Ident) probe.take();        // the attribute kind
+            if (probe.peek().kind != Tk::LParen) return {};
+            std::size_t depth = 0;
+            do {
+                if (probe.peek().kind == Tk::LParen) ++depth;
+                else if (probe.peek().kind == Tk::RParen) --depth;
+                probe.take();
+            } while (depth != 0 && probe.peek().kind != Tk::Eof);
+        }
+        return probe.peek().kind == Tk::Ident ? probe.peek().text : std::string{};
+    }
+
+    // ★★ THE READER'S HALF OF "WHERE MAY A STATEMENT STAND". Every slot the writer
+    // fills with `pushExpr` — an operand, a condition, a return value, an
+    // initializer, an assignment side, a `yield` — is an EXPRESSION slot, and a
+    // statement node arriving in one is refused here BY NAME. Without this the
+    // reader built whatever the next line spelled into whatever slot was open, and
+    // a statement standing in an expression slot surfaced only when the module was
+    // WRITTEN again (`unexpected node kind 'ExprStmt' in expression position`),
+    // which is how sqlite's `speedtest1.c` found it: a parse that reported `ok` over
+    // a tree the writer could not have produced.
+    void requireExpression(HirNodeId child, std::string_view slot) {
+        HirKind const k = builder_.kind(child);
+        if (isExprKind(k) || k == HirKind::Error || k == HirKind::Extension) return;
+        malformed(std::format(
+            "a `{}` node cannot stand as {} — that slot takes an EXPRESSION, and the "
+            "reader does not read a statement as a value", hirKindName(k), slot));
     }
 
     // ── nodes: THE READER, ON AN EXPLICIT HEAP STACK ──────────────────────────
@@ -4029,9 +4550,13 @@ private:
         return pushFrame(stack, std::move(f));
     }
 
+    // A handle past 32 bits used to be CUT to 32 — `%4294967297` read back as
+    // `%1`, a different symbol, silently (P68, lane `ht`, part 1c).
     [[nodiscard]] std::uint32_t parseSymHandle() {
         expect(Tk::Percent, "'%'");
-        std::uint32_t const h = static_cast<std::uint32_t>(takeInt());
+        std::size_t const refusalsBefore = refusals_;
+        std::uint32_t const h = takeU32("symbol handle");
+        if (refusals_ != refusalsBefore) return 0;
         if (h == 0 || h >= symbolNames_.size())
             unknownName(std::format("symbol handle %{} not declared in 'symbols'", h));
         return h;
@@ -4079,7 +4604,7 @@ private:
         switch (*which) {
             case HirTextExprKw::Lit: {
                 if (accept(Tk::Hash)) {   // bare index form: `lit #N : type` (no pool)
-                    std::uint32_t const i = static_cast<std::uint32_t>(takeInt());
+                    std::uint32_t const i = takeU32("literal pool index");
                     TypeId t = parseTypeAnnot();
                     return completeNode(builder_.makeLiteral(t, i, flags), idx,
                                         std::move(attrs), done);
@@ -4199,7 +4724,8 @@ private:
                 f.nodeKind = (*which == HirTextExprKw::Member) ? HirKind::MemberAccess
                                                                : HirKind::Swizzle;
                 f.flags    = flags;
-                f.payload  = static_cast<std::uint32_t>(takeInt());
+                f.payload  = takeU32(*which == HirTextExprKw::Member ? "member index"
+                                                                    : "swizzle payload");
                 f.type     = parseTypeAnnot();
                 f.preIdx   = idx;
                 f.attrs    = std::move(attrs);
@@ -4377,27 +4903,53 @@ private:
                                     std::move(f.attrs), done);
             }
             case HirTextStmtKw::Break: {
-                std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
+                std::uint32_t d = peekIs(Tk::Int) ? takeU32("break depth") : 0u;
                 return completeNode(builder_.makeBreak(d, flags), idx, std::move(f.attrs), done);
             }
             case HirTextStmtKw::Continue: {
-                std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
+                std::uint32_t d = peekIs(Tk::Int) ? takeU32("continue depth") : 0u;
                 return completeNode(builder_.makeContinue(d, flags), idx, std::move(f.attrs), done);
             }
             // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
             // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
             case HirTextStmtKw::InlineAsm: return parseInlineAsmHead(stack, done, std::move(f));
             case HirTextStmtKw::Return:
-                // A return value may carry inline attributes (`return @loc(...) expr`).
-                // A value-less `return` is always block-terminal (nothing may follow
-                // it — checkBlockTermination), so a leading `@` here unambiguously
-                // introduces an attributed value, never the next statement's attrs.
-                if (peekIs(Tk::At) || startsExpr()) {
-                    f.kind = NodeParseFrame::Kind::Return;
-                    return pushFrame(stack, std::move(f));
+                // v5: `return void` is the value-less form and ANYTHING else is a
+                // value (which may open with its own inline `@loc(...)`).
+                // ⚠⚠ THIS ARM USED TO GUESS, AND THE GUESS REST ON A FALSE PREMISE.
+                // It read a following `@` as the start of an attributed VALUE because
+                // "a value-less `return` is always block-terminal (nothing may follow
+                // it — checkBlockTermination)". `checkBlockTermination` only WARNS —
+                // C permits dead code — and an `if (c) return;` then-arm is not in a
+                // block at all: the statement after the `if` follows it, and its
+                // `@loc` block was swallowed as this return's value. ✔MEASURED (P68
+                // round 8): sqlite's `test/speedtest1.c` and a six-line `if (x)
+                // return; g();` both made `--emit-hir` refuse its own artifact. No
+                // lookahead can fix it — `error`/`ext_node` begin a statement AND an
+                // inline expression — so the writer now spells the absence.
+                if (acceptKeyword("void")) {
+                    return completeNode(builder_.makeReturn(std::nullopt, flags), idx,
+                                        std::move(f.attrs), done);
                 }
-                return completeNode(builder_.makeReturn(std::nullopt, flags), idx,
-                                    std::move(f.attrs), done);
+                // ★ AND A BARE `return` IS REFUSED BY NAME — it is never allowed to
+                // take the NEXT node as its value. That is precisely the v4 misread
+                // (the next statement's `@loc` block and `expr` line became this
+                // return's operand), so the reader looks past any inline attributes
+                // to the head keyword first, and anything that does not open an
+                // expression is refused here and left to be read as what it is.
+                if (std::string const head = peekNodeKeyword(); !opensExpression(head)) {
+                    malformed(std::format(
+                        "`return` must be followed by `void` or by a value — a "
+                        "value-less return is spelled `return void`; {} does not "
+                        "begin an expression, and it is not taken as this return's "
+                        "value",
+                        head.empty() ? std::string{"what follows here"}
+                                     : std::format("the `{}` that follows", head)));
+                    return completeNode(builder_.makeReturn(std::nullopt, flags), idx,
+                                        std::move(f.attrs), done);
+                }
+                f.kind = NodeParseFrame::Kind::Return;
+                return pushFrame(stack, std::move(f));
             case HirTextStmtKw::Expr:
                 f.kind = NodeParseFrame::Kind::ExprStmt;
                 return pushFrame(stack, std::move(f));
@@ -4486,11 +5038,6 @@ private:
         malformed(std::format("unknown statement '{}'", kw));
         return completeNode(builder_.addLeaf(HirKind::Error, InvalidType, 0, flags), idx,
                             std::move(f.attrs), done);
-    }
-
-    [[nodiscard]] bool startsExpr() {
-        if (!peekIs(Tk::Ident)) return false;
-        return isExprKeyword(lex_.peek().text);
     }
 
     // ── the reductions ───────────────────────────────────────────────────────
@@ -4598,8 +5145,12 @@ private:
             if (step == NodeParseStep::Completed) stack.pop_back();
             return step;
         };
+        // ⓘ `requireExpression` guards EXACTLY the slots the writer fills with
+        // `pushExpr`, and no others: a `for` clause, a body, a block member or a
+        // `seq` statement is written as a node LINE and may be either.
         switch (f.kind) {
             case NodeParseFrame::Kind::ParenOperands:
+                requireExpression(child, "an operand");
                 f.kids.push_back(child);
                 if (!accept(Tk::Comma) || peekIs(Tk::RParen) || peekIs(Tk::Eof)) {
                     expect(Tk::RParen, "')'");
@@ -4627,11 +5178,13 @@ private:
                     f.phase = 1;
                     return NodeParseStep::WantChild;            // the yielded value
                 }
+                requireExpression(child, "a `seq`'s yielded value");
                 expect(Tk::RBrace, "'}'");
                 return finish(completeNode(builder_.makeSeqExpr(f.kids, child, f.type, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::If:
                 if (f.phase == 0) {
+                    requireExpression(child, "an `if` condition");
                     expect(Tk::RParen, "')'");
                     f.kids.push_back(child);                    // the condition
                     f.phase = 1;
@@ -4656,6 +5209,7 @@ private:
                     return NodeParseStep::WantChild;
                 }
                 if (f.phase == 1) {
+                    requireExpression(child, "an `seh_except` filter");
                     expect(Tk::RParen, "')'");
                     f.kids.push_back(child);                    // the filter
                     f.phase = 2;
@@ -4666,6 +5220,7 @@ private:
                     f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::While:
                 if (f.phase == 0) {
+                    requireExpression(child, "a `while` condition");
                     expect(Tk::RParen, "')'");
                     f.kids.push_back(child);                    // the condition
                     f.phase = 1;
@@ -4681,6 +5236,7 @@ private:
                     f.phase = 1;
                     return NodeParseStep::WantChild;
                 }
+                requireExpression(child, "a `do … while` condition");
                 expect(Tk::RParen, "')'");
                 return finish(completeNode(builder_.makeDoWhileStmt(f.kids[0], child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
@@ -4713,6 +5269,7 @@ private:
             }
             case NodeParseFrame::Kind::Switch:
                 if (f.phase == 0) {
+                    requireExpression(child, "a `switch` discriminant");
                     expect(Tk::RParen, "')'");
                     expect(Tk::LBrace, "'{'");
                     if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
@@ -4746,6 +5303,7 @@ private:
                 f.loopOff = cursorOff();
                 return NodeParseStep::WantChild;
             case NodeParseFrame::Kind::CaseArm: {
+                requireExpression(child, "a `case` value");
                 std::uint32_t ord = parseLabelOrdinal();
                 return finish(completeNode(builder_.makeCaseArm(child, ord, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
@@ -4754,30 +5312,38 @@ private:
                 return finish(completeNode(builder_.makeLabelStmt(f.payload, child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::Return:
+                requireExpression(child, "a `return` value");
                 return finish(completeNode(builder_.makeReturn(child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::ExprStmt:
+                requireExpression(child, "the operand of an `expr` statement");
                 return finish(completeNode(builder_.makeExprStmt(child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::IndirectGoto:
+                requireExpression(child, "a `goto *` target");
                 return finish(completeNode(builder_.makeIndirectGotoStmt(child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::Assign:
                 if (f.phase == 0) {
+                    requireExpression(child, "an assignment target");
                     f.kids.push_back(child);                    // the target
                     expect(Tk::Equal, "'='");
                     f.phase = 1;
                     return NodeParseStep::WantChild;
                 }
+                requireExpression(child, "an assigned value");
                 return finish(completeNode(builder_.makeAssignStmt(f.kids[0], child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::VarLike:
+                requireExpression(child, "an initializer");
                 return finish(completeNode(builder_.makeVarDecl(f.type, f.sym, child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::Global:
+                requireExpression(child, "a global's initializer");
                 return finish(completeNode(builder_.makeGlobal(f.type, f.sym, child, f.flags),
                                            f.preIdx, std::move(f.attrs), done));
             case NodeParseFrame::Kind::AsmOperands:
+                requireExpression(child, "an inline-asm operand value");
                 f.kids.push_back(child);                        // this operand's value
                 f.asmDesc->operands.push_back(std::move(*f.asmOp));
                 if (accept(Tk::Comma)) {
@@ -4809,9 +5375,9 @@ private:
                                      NodeParseFrame&& f) {
         HirFlags const flags = f.flags;
         if (accept(Tk::Hash)) {
-            auto const raw = takeInt();
+            std::uint32_t const raw = takeU32("inline-asm descriptor index");
             return completeNode(builder_.addLeaf(HirKind::InlineAsm, InvalidType,
-                                                 static_cast<std::uint32_t>(raw), flags),
+                                                 raw, flags),
                                 f.preIdx, std::move(f.attrs), done);
         }
         if (!peekIs(Tk::Str)) {
@@ -4836,7 +5402,7 @@ private:
         if (acceptKeyword("cc"))       f.asmDesc->clobbersConditionCodes = true;
 
         if (acceptKeyword("outputs")) {
-            f.asmDesc->outputCount = static_cast<std::uint32_t>(takeInt());
+            f.asmDesc->outputCount = takeU32("inline-asm output count");
             if (!acceptKeyword("operands")) {
                 malformed("expected 'operands (' after 'outputs <n>'");
                 return completeNode(builder_.addLeaf(HirKind::InlineAsm, InvalidType,
@@ -4915,6 +5481,9 @@ private:
             }
         }
         if (acceptKeyword("pin")) op.fixedRegister = takeStr();
+        // The inverse of the writer's P68 round-8 pair (see there).
+        if (acceptKeyword("by_variable"))  op.pinnedByVariable   = true;
+        if (acceptKeyword("as_it_stands")) op.registerAsItStands = true;
         // The inverse of the writer's `operand_kind` clause. ABSENT means
         // "the letter did not resolve to a form", which is a real state
         // (`binds` names exactly one arm) and NOT the same as a dropped
@@ -5012,6 +5581,10 @@ private:
         // forward id minted for it before the field list was read.
         std::uint64_t       recHandle = 0;
         TypeId              recForward{};
+        // v5: an INLINE composite met in a MODULE. It is refused at its head, then
+        // still read to its closing brace — so the refusal is ONE diagnostic rather
+        // than a cascade over its unread fields — and reduces to InvalidType.
+        bool                refusedInModule = false;
         std::vector<TypeId> ops;
         // Struct: the per-field markers, all-or-none as before.
         std::vector<std::uint64_t> offs;
@@ -5183,8 +5756,10 @@ private:
         // `analysis/semantic/semantic_analyzer.cpp` — so before this arm existed
         // no shipped FFI descriptor could name a bit-precise type at all.
         //
-        // The width goes to `TypeInterner::bitInt`, which owns the legality of the
-        // value; a text reader re-deciding it would be a second owner of one fact.
+        // ⓘ `TypeInterner::bitInt` stores whatever width it is handed — it decides
+        // nothing (✔ by reading, P68 lane `ht` part 1c) — so the width's range is
+        // asked of its ONE owner, `kBitIntMaxWidth` (C23's __BITINT_MAXWIDTH__), the
+        // same constant the `bitint` literal and the assembler's reader ask.
         if (kw == "_BitInt" || kw == "unsigned") {
             bool const isSigned = (kw != "unsigned");
             if (!isSigned && !acceptKeyword("_BitInt")) {
@@ -5203,13 +5778,18 @@ private:
             // NAME here rather than handed to `bitInt`, where it would be a size
             // this tier had invented. Passing through is right for a bound that
             // HAS a sentinel (`arr`); refusing is right for one that does not.
-            auto const width = takeSignedInt();
+            std::size_t const refusalsBefore = refusals_;
+            auto const width = takeSignedInt("_BitInt type width");
             expect(Tk::RParen, "')'");
-            if (width <= 0) {
+            if (refusals_ != refusalsBefore) {   // refused once, by name — no cascade
+                out = InvalidType;
+                return true;
+            }
+            if (width <= 0 || width > static_cast<std::int64_t>(kBitIntMaxWidth)) {
                 malformed(std::format(
-                    "_BitInt width {} is not positive — a width is a count and no "
-                    "interned `_BitInt` spells a non-positive one, so this names no "
-                    "type", width));
+                    "_BitInt width {} is not a _BitInt width — 1 to {} "
+                    "(__BITINT_MAXWIDTH__); a width is a count with no sentinel, so "
+                    "this names no type", width, kBitIntMaxWidth));
                 out = InvalidType;
                 return true;
             }
@@ -5256,8 +5836,15 @@ private:
         // position), so the artifact would round-trip to different bytes with
         // nothing reporting it. Refusing here is what keeps
         // `emitHir(parseHir(emitHir(h)))` an identity rather than a hope.
+        //
+        // ⓘ v5: A STANDALONE-TEXT FORM ONLY. A module references every composite
+        // through its `types` table, where a cycle is an ordinary `type <H>`.
         if (kw == "rec") {
             std::uint64_t const h = takeInt();
+            if (moduleTypes_) {
+                refuseInlineCompositeInModule(std::format("`rec {}`", h));
+                return true;
+            }
             for (std::size_t i = recOpen_.size(); i-- > 0;) {   // innermost first
                 if (recOpen_[i].handle == h) { out = recOpen_[i].type; return true; }
             }
@@ -5273,8 +5860,44 @@ private:
                                 : (" (open: " + open + ")")));
             return true;
         }
+        // ★★ v5: `type <H>` — a composite, named by its ONE definition in the
+        // module's `types` section. The whole point of the table: a mention costs
+        // one token however large the composite's graph is.
+        // ⚠ MODULE-ONLY, AND REFUSED BY NAME IN A STANDALONE TEXT. `parseTypeFrom-
+        // Text` (every FFI descriptor signature) has no table to resolve a handle
+        // against; reading `type` there as an unknown identifier would tell a
+        // descriptor author their word was misspelled when it is in fact the wrong
+        // grammar, so the refusal says which grammar it belongs to.
+        if (kw == "type") {
+            if (!peekIs(Tk::Int)) {
+                malformed("expected a handle after `type` — a composite reference is "
+                          "`type <H>`");
+                return true;
+            }
+            std::uint64_t const h = takeInt();
+            if (!moduleTypes_) {
+                malformed(std::format(
+                    "`type {}` is a `.dsshir` MODULE's composite reference — the handle "
+                    "names an entry of a module's `types` section and is module-only, "
+                    "and a standalone type text has no such table; spell the composite "
+                    "inline here (`struct \"N\" {{…}}`, `struct \"N\" opaque`)", h));
+                return true;
+            }
+            if (auto const it = typeHandles_.find(h); it != typeHandles_.end()) {
+                out = it->second;
+                return true;
+            }
+            malformed(std::format(
+                "`type {}` names no entry of this artifact's `types` section — every "
+                "composite a module mentions is defined there exactly once", h));
+            return true;
+        }
         if (kw == "struct") {
             std::string name = takeStr();
+            // v5: in a MODULE this form is refused at its head and then still read
+            // to its end (see `refusedInModule`); the standalone path is unchanged.
+            bool const refused = moduleTypes_;
+            if (refused) refuseInlineCompositeInModule(std::format("`struct {}`", quote(name)));
             // D-FFI-OPAQUE-TAG-HAS-NO-SPELLING: the appendType twin. `opaque` marks an
             // INCOMPLETE composite and is TERMINAL -- no `{}` follows, because an
             // incomplete type has no field list (as distinct from `{}`, which is a
@@ -5284,10 +5907,16 @@ private:
             // gets by deriving its key from field content. The semantic analyzer's
             // self-referential path still passes a real decl-site key.
             if (acceptKeyword("opaque")) {
-                out = interner_.forwardComposite(TypeKind::Struct, name, 0);
+                out = refused ? InvalidType
+                              : interner_.forwardComposite(TypeKind::Struct, name, 0);
                 return true;
             }
-            std::uint64_t const recH = takeRecMarker();
+            std::uint64_t recH = takeRecMarker();
+            // ⚠ A REFUSED composite opens NO handle scope: `handleDeclSiteKey` is the
+            // key space the module's `types` entries live in, so opening one here
+            // could land on a table entry's TypeId and re-complete it with a
+            // different body — `completeComposite`'s abort, not a diagnostic.
+            if (refused) recH = 0;
             // D-CSUBSET-PACKED: an optional ` packed` marker after the name (before the
             // `{`) round-trips the whole-composite packed flag. Routed through
             // forwardComposite + completeComposite in `finishStructType` (the
@@ -5295,25 +5924,31 @@ private:
             bool const packed = acceptKeyword("packed");
             expect(Tk::LBrace, "'{'");
             TypeParseFrame f{.kind = Kind::Struct, .name = std::move(name),
-                             .packed = packed, .recHandle = recH};
+                             .packed = packed, .recHandle = recH,
+                             .refusedInModule = refused};
             if (recH != 0) f.recForward = openRecComposite(TypeKind::Struct, f.name, recH);
             stack.push_back(std::move(f));
             return false;   // the field list comes next
         }
         if (kw == "union") {
             std::string name = takeStr();
+            bool const refused = moduleTypes_;   // v5 — see the struct arm
+            if (refused) refuseInlineCompositeInModule(std::format("`union {}`", quote(name)));
             // The union half of D-FFI-OPAQUE-TAG-HAS-NO-SPELLING — see the writer's
             // union arm for what its absence was costing (an incomplete `union U;`
             // read back as a COMPLETE zero-member union).
             if (acceptKeyword("opaque")) {
-                out = interner_.forwardComposite(TypeKind::Union, name, 0);
+                out = refused ? InvalidType
+                              : interner_.forwardComposite(TypeKind::Union, name, 0);
                 return true;
             }
-            std::uint64_t const recH = takeRecMarker();
+            std::uint64_t recH = takeRecMarker();
+            if (refused) recH = 0;               // v5 — see the struct arm
             bool const packed = acceptKeyword("packed");   // D-CSUBSET-PACKED
             expect(Tk::LBrace, "'{'");
             TypeParseFrame f{.kind = Kind::Union, .name = std::move(name),
-                             .packed = packed, .recHandle = recH};
+                             .packed = packed, .recHandle = recH,
+                             .refusedInModule = refused};
             if (recH != 0) f.recForward = openRecComposite(TypeKind::Union, f.name, recH);
             stack.push_back(std::move(f));
             return false;   // the member list comes next
@@ -5323,6 +5958,36 @@ private:
         // only the nominal name + underlying TypeKind round-trip here.
         if (kw == "enum") {
             std::string name = takeStr();
+            // ★ `fixed <primitive> ["tag"]` — a FIXED underlying type (v6, P68 round
+            // 12, lane `cs`; the printer's arm says why it is spelled as a type). It
+            // is read by the primitive arm's own rule, so the vocabulary tag rides
+            // exactly as it does anywhere else (`fixed i64 "long"`), and the kind is
+            // the declared type's. A name that is not a primitive is refused with the
+            // accepted set, as the `:` form's is.
+            if (acceptKeyword("fixed")) {
+                std::string const n = takeIdent();
+                TypeKind const k = orMalformed(kHirTextPrimTable, n,
+                                               "fixed enum underlying type", TypeKind::I32);
+                TypeId const declared = peekIs(Tk::Str)
+                                            ? interner_.primitive(k, lex_.take().text)
+                                            : interner_.primitive(k);
+                out = interner_.enumType(name, k, declared);
+                return true;
+            }
+            // ★ `chosen <primitive> ["tag"]` — the compatible type a language CHOSE
+            // for an enumeration without a fixed underlying type (the enumeration
+            // P1, same round), read by the same primitive rule.
+            if (acceptKeyword("chosen")) {
+                std::string const n = takeIdent();
+                TypeKind const k = orMalformed(kHirTextPrimTable, n,
+                                               "chosen enum compatible type", TypeKind::I32);
+                TypeId const chosen = peekIs(Tk::Str)
+                                          ? interner_.primitive(k, lex_.take().text)
+                                          : interner_.primitive(k);
+                out = interner_.enumType(name, k, chosen,
+                                         TypeInterner::EnumUnderlyingOrigin::Chosen);
+                return true;
+            }
             TypeKind underlying = TypeKind::I32;
             if (accept(Tk::Colon)) {
                 // ⚠ FAIL LOUD. This read an ordinal and kept `I32` when it fell
@@ -5393,7 +6058,7 @@ private:
         // strings, where the author reading the message is writing a `.json`
         // descriptor and has no other way to learn what the decoder takes.
         malformed(std::format("unknown type '{}' — accepted: {}", kw,
-                              typeKeywordsAccepted()));
+                              typeKeywordsAccepted(moduleTypes_)));
         return true;
     }
 
@@ -5426,7 +6091,7 @@ private:
             case Kind::Vec: {
                 if (!haveOperand) { needHead = true; return false; }
                 expect(Tk::Comma, "','");
-                std::int64_t n = takeSignedInt();
+                std::int64_t n = takeSignedInt("vector lane count");
                 expect(Tk::RAngle, "'>'");
                 io = interner_.vector(io, n);
                 return true;
@@ -5434,9 +6099,9 @@ private:
             case Kind::Mat: {
                 if (!haveOperand) { needHead = true; return false; }
                 expect(Tk::Comma, "','");
-                std::int64_t r = takeSignedInt();
+                std::int64_t r = takeSignedInt("matrix row count");
                 expect(Tk::Comma, "','");
-                std::int64_t c = takeSignedInt();
+                std::int64_t c = takeSignedInt("matrix column count");
                 expect(Tk::RAngle, "'>'");
                 io = interner_.matrix(io, r, c);
                 return true;
@@ -5450,7 +6115,7 @@ private:
                 // passed THROUGH rather than validated: what the interner holds is
                 // what the artifact must reproduce, and the sentinel is a value
                 // this tier has no business reinterpreting.
-                std::int64_t n = takeSignedInt();
+                std::int64_t n = takeSignedInt("array bound");
                 expect(Tk::RAngle, "'>'");
                 io = interner_.array(io, n);
                 return true;
@@ -5476,9 +6141,10 @@ private:
                 // tier long before it is written. A negative would be a corrupt
                 // artifact, so let the unsigned reader refuse it rather than silently
                 // wrapping it into a huge alignment.
-                std::uint64_t n = takeInt();
+                std::uint32_t const n =
+                    takeAlignment("aligned-type alignment", /*zeroIsNoRequest=*/false);
                 expect(Tk::RAngle, "'>'");
-                io = interner_.typeAligned(io, static_cast<std::uint32_t>(n));
+                io = interner_.typeAligned(io, n);
                 return true;
             }
             case Kind::Tuple:
@@ -5505,7 +6171,8 @@ private:
                     if (accept(Tk::At)) {
                         f.offs.push_back(takeInt()); f.aligns.push_back(0); ++f.nWithOff;
                     } else if (accept(Tk::Tilde)) {
-                        f.aligns.push_back(static_cast<std::uint32_t>(takeInt()));
+                        f.aligns.push_back(
+                            takeAlignment("member alignment", /*zeroIsNoRequest=*/true));
                         f.offs.push_back(0); ++f.nWithAlign;
                     } else {
                         f.offs.push_back(0); f.aligns.push_back(0);
@@ -5520,10 +6187,10 @@ private:
                     } else {
                         f.fieldPacked.push_back(0u);
                     }
-                    if (!accept(Tk::Comma)) return finishStructType(f, io);
+                    if (!accept(Tk::Comma)) return finishInlineComposite(f, io);
                 }
                 if (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) { needHead = true; return false; }
-                return finishStructType(f, io);
+                return finishInlineComposite(f, io);
             case Kind::Union:
                 // D-CSUBSET-PER-MEMBER-PACKED: a member-local loop, so a trailing
                 // ` packed` keyword on a member is consumed HERE — the struct arm's
@@ -5535,10 +6202,10 @@ private:
                     } else {
                         f.fieldPacked.push_back(0u);
                     }
-                    if (!accept(Tk::Comma)) return finishUnionType(f, io);
+                    if (!accept(Tk::Comma)) return finishInlineComposite(f, io);
                 }
                 if (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) { needHead = true; return false; }
-                return finishUnionType(f, io);
+                return finishInlineComposite(f, io);
             case Kind::Fn:
                 if (!f.readingResult) {
                     if (haveOperand) {
@@ -5635,9 +6302,7 @@ private:
         std::vector<std::int64_t> scalars;
         if (accept(Tk::LBrack)) {
             while (!peekIs(Tk::RBrack) && !peekIs(Tk::Eof)) {
-                bool neg = accept(Tk::Minus);
-                std::int64_t v = static_cast<std::int64_t>(takeInt());
-                scalars.push_back(neg ? -v : v);
+                scalars.push_back(takeSignedInt("extension type scalar"));
                 if (!accept(Tk::Comma)) break;
             }
             expect(Tk::RBrack, "']'");
@@ -5677,7 +6342,7 @@ private:
                 "writer produces", h));
             break;
         }
-        TypeId const fwd = interner_.forwardComposite(kind, name, recDeclSiteKey(h));
+        TypeId const fwd = interner_.forwardComposite(kind, name, handleDeclSiteKey(h));
         recOpen_.push_back(RecOpen{h, fwd});   // pushed even on the refusal, so the
         return fwd;                            // frame's own close stays balanced
     }
@@ -5748,6 +6413,27 @@ private:
             return;
         }
         out = f.recForward;
+    }
+
+    // The refusal a MODULE gives every inline composite form (`struct "N" …`,
+    // `union "N" …`, `rec <H>`). One sentence with one owner, because the three
+    // are one rule.
+    void refuseInlineCompositeInModule(std::string_view form) {
+        malformed(std::format(
+            "{} — in a `.dsshir` module a composite is DEFINED ONCE, in the `types` "
+            "section, and every use names it as `type <H>`; an inline spelling would "
+            "be a second definition of a type the file already defines (inline "
+            "composites belong to a standalone type text)", form));
+    }
+
+    // An inline composite's frame is complete: reduce it through its own tail, and
+    // hand back InvalidType instead when a MODULE refused it at its head.
+    [[nodiscard]] bool finishInlineComposite(TypeParseFrame& f, TypeId& out) {
+        bool const done = (f.kind == TypeParseFrame::Kind::Struct)
+                              ? finishStructType(f, out)
+                              : finishUnionType(f, out);
+        if (f.refusedInModule) out = InvalidType;
+        return done;
     }
 
     // The struct arm's tail, verbatim, over the frame's accumulated fields.
@@ -5978,11 +6664,32 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
     }
 
     // Verify-on-load: the round-trip is only clean if the rebuilt module verifies.
-    HirVerifier verifier{res->hir, &res->sourceMap, &res->interner,
-                         &res->inlineAsmPool};
-    (void)verifier.verify(reporter);
+    //
+    // ★★ ONLY A TREE THE READER ACCEPTED IS VERIFIED. A parse that refused has
+    // already refused the artifact, and the tree it hands back is what error
+    // RECOVERY built, not what a builder would. A signature whose `>`, `)` or `->`
+    // never came is interned with an InvalidType result (`fn(ptr<ptr<junk x>>) ->
+    // void` does it in pure v4 grammar), and `HirVerifier`'s rules are written for
+    // a builder-made tree: one of them read that result through
+    // `TypeInterner::kind` and ABORTED the process — `dss::substrate fatal:
+    // TypeInterner::get: TypeId out of range`, a kill instead of a refusal
+    // (✔MEASURED P68, lane `ht`; the red-on-disable mutant that wrote an inline
+    // composite into a module met it first). That rule is fixed too, but
+    // verifying a refused tree can only ever add CASCADE after the diagnostic that
+    // names the cause — the rule `parseTypeFromText` already keeps: fail loud,
+    // never partial. "Accepted" is the reader's OWN count (`refusals_`), never the
+    // reporter's delta, which a capped or deduplicating reporter leaves at zero.
+    bool const accepted = parser.refusals_ == 0 && reporter.errorCount() == errBefore;
+    bool verified = false;
+    if (accepted) {
+        HirVerifier verifier{res->hir, &res->sourceMap, &res->interner,
+                             &res->inlineAsmPool};
+        // The verifier's own verdict, not a second delta: it already refuses to
+        // certify when the reporter hit its cap and so cannot have recorded all.
+        verified = verifier.verify(reporter);
+    }
 
-    res->ok = reporter.errorCount() == errBefore;
+    res->ok = accepted && verified;
     return res;
 }
 
@@ -6005,7 +6712,11 @@ TypeId parseTypeFromText(std::string_view typeText, TypeInterner& interner,
     // truncated `"fn(ptr<"`, an unknown keyword, leftover tokens), the text did
     // not name a well-formed type — return InvalidType rather than let a
     // half-built type escape as if it were valid.
-    if (reporter.errorCount() != errBefore) {
+    // ⚠ "Emitted" is the reader's OWN count. The reporter's delta alone let a
+    // second descriptor carrying the SAME malformed type text through as valid:
+    // its diagnostic is identical to the first's, so the dedup window drops it and
+    // the delta stays at zero (and a capped reporter drops every one).
+    if (parser.refusals_ != 0 || reporter.errorCount() != errBefore) {
         // A half-built type must not escape, and NEITHER must a half-built claim:
         // a spine harvested from text that failed to decode would describe levels
         // the type does not have. Both halves are discarded together.

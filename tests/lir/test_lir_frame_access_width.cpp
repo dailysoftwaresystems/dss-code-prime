@@ -56,13 +56,13 @@
 //       register regardless of ABI; pinned on the emitted encoding.
 //
 // ⚠ EVERY EMISSION ARM ASSERTS A **POSITIVE COUNT** BEFORE IT ASSERTS A SHAPE,
-// and it stays that way now that the row below has closed. An "assert no bad
+// and it stays that way now that the defect below is fixed. An "assert no bad
 // instruction appears" pin reads green over an empty instruction list whatever
 // produced the emptiness, so each arm first proves the saved register it is
 // talking about EXISTS in the layout and that the function assembled to bytes.
-// D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO
-// (closed P49) removed ONE way to reach that state; the discipline is cheap and
-// covers the others.
+// The P49 fix — the front end used to lower a many-arg call to NOTHING, so the
+// pins over it measured zero — removed ONE way to reach that state; the
+// discipline is cheap and covers the others.
 
 #include "asm/asm.hpp"
 #include "core/types/diagnostic_reporter.hpp"
@@ -107,18 +107,18 @@ namespace {
 // `ms_x64` build saves a callee-saved xmm. Driven through THIS fixture the same
 // source lowered to SEVEN LIR instructions with `lowerOk` true, `savedRegs`
 // EMPTY and `spillAreaSize` 0 — so every arm below would have been a claim about
-// saved-register stores in a function that has none, and would have passed. That
-// was D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO.
+// saved-register stores in a function that has none, and would have passed —
+// the front end lowering a many-arg call to NOTHING so the pins measure zero.
 //
-// ⚠⚠ THE "AND ZERO DIAGNOSTICS" HALF OF THAT SENTENCE WAS WRONG, AND THE ROW
-// INHERITED IT. ✔RE-MEASURED (lane `lt`, P49): the fixture's `mirReporter`
-// carried TWO `H_UnsupportedLoweringForKind` errors and `HirToMirResult.ok` was
-// FALSE on that very source. `lowerOk`, `allocOk` and `rewriteOk` — the three
-// flags this file and the row both read — are the LIR and regalloc verdicts, and
-// none of them is the MIR one. The cause was the fixture passing `ffiMap =
-// nullptr`, so the `double k(double);` PROTOTYPE was refused and its four calls
-// were dropped: not argument pressure, not "shapes the front end cannot build",
-// just a prototype. Both are fixed (P49) and the row is CLOSED.
+// ⚠⚠ THE "AND ZERO DIAGNOSTICS" HALF OF THAT SENTENCE WAS WRONG, AND THE FILED
+// FINDING INHERITED IT. ✔RE-MEASURED (lane `lt`, P49): the fixture's
+// `mirReporter` carried TWO `H_UnsupportedLoweringForKind` errors and
+// `HirToMirResult.ok` was FALSE on that very source. `lowerOk`, `allocOk` and
+// `rewriteOk` — the three flags this file and that finding both read — are the
+// LIR and regalloc verdicts, and none of them is the MIR one. The cause was the
+// fixture passing `ffiMap = nullptr`, so the `double k(double);` PROTOTYPE was
+// refused and its four calls were dropped: not argument pressure, not "shapes
+// the front end cannot build", just a prototype. Both are fixed (P49).
 //
 // The arms below still do NOT use that fixture, for the reason stated next — a
 // hand-built `FAdd` across a `Call` makes preservation an ABI REQUIREMENT rather

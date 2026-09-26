@@ -1,0 +1,31 @@
+# PURPOSE: refuse a documented figure a census refutes, or an unpinned quantified claim about the corpus in config prose, and repair figures in place.
+name: check-doc-census
+description: >-
+  The action holds every documented figure to the census that measures it, and every quantified
+  claim about the corpus in config prose to its own measurement, then proves it can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `doc_census_guard + doc_census_selftest_guard`.
+steps:
+  - name: verify
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-doc-census.py
+    successPattern: 'check-doc-census: OK'
+    requireInputsUnmoved: true
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-doc-census.py --selftest
+    successPattern: 'check-doc-census --selftest: PASS'
+    requireInputsUnmoved: true
+  # The REPAIR verb, run only where a run names it -- `dssharness run check-doc-census-write`, the runner that runs
+  # it on ONE leg, this machine's own tree (config.json):
+  # after a fold moves a counted corpus, it rewrites the documented figures in place, never the prose. It
+  # moves tracked files by design, so it cannot carry requireInputsUnmoved; a plain run afterwards verifies.
+  - name: write
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-doc-census.py --write
+    successPattern: '^check-doc-census: (repaired [0-9]+ figure\(s\)\. Re-run to verify\.|OK -- every documented figure matches the census\.)'

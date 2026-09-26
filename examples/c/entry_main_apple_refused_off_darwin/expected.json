@@ -1,0 +1,13 @@
+{
+  "$comment": "D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: Darwin's four-parameter `int main(int, char**, char**, char**)` is refused on the ELF and pe formats with K_ProgramEntryUndefined. The language declares the row (verb `argc-argv-envp-apple`), so the signature passes the semantic tier; the refusal is CANDIDACY -- only the Mach-O formats realize the verb, so no entry candidate survives the intersection here. MEASURED 2026-09-24: clang 18.1.3 rejects the form on x86_64 Linux (`too many parameters (4) for 'main'`), gcc 13.3.0 accepts it with -Wmain and glibc leaves garbage in the fourth parameter, MSVC 19.51 compiles it and passes garbage there too -- no reference makes it work off Darwin. No span, deliberately: \"this program defines no entry\" is a whole-program fact. RED-ON-DISABLE: add \"argc-argv-envp-apple\" to elf64-x86_64-linux-exec's `entryVerbs` -> that target is refused at FORMAT LOAD instead (the stack-vector mechanism produces at most three values).",
+  "language": "c",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" },
+    { "spec": "arm64:elf64-aarch64-linux-exec" },
+    { "spec": "x86_64:pe64-x86_64-windows-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "K_ProgramEntryUndefined", "line": 1, "col": 1, "positioned": false }
+  ]
+}

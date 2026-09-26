@@ -45,11 +45,13 @@
    un-ship `_get_fmode` -> the ORACLE disappears and the TU fails to compile
    rather than silently losing a layer. pe64-ONLY: these are Microsoft spellings
    with no glibc or libSystem export, which is also why both the symbol rows and
-   the macro variants are `availableObjectFormats: [pe]` / `when.format: pe`; the
-   POSIX `environ` spelling is a DIFFERENT row (unistd.json, elf-only, bound
-   got-indirect onto the strong `__environ`) witnessed by shipped_environ and,
-   for object identity across an image boundary,
-   environ_alias_object_identity. */
+   the macro variants are `availableObjectFormats: [pe]` / `when.format: pe`.
+   The POSIX `environ` spelling is realized per format (P68 round 11): on pe as
+   stdlib.json's macro `environ` -> `_environ`, i.e. onto THIS accessor, as both
+   Windows references' <stdlib.h> do; on elf and macho as unistd.json's
+   data-object row, bound got-indirect — witnessed on every pair by
+   environ_declared_by_the_program, and on elf by shipped_environ and, for
+   object identity across an image boundary, environ_alias_object_identity. */
 #include <stdio.h>
 #include <stdlib.h>
 

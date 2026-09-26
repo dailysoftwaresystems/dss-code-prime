@@ -1,5 +1,14 @@
 # The bar applies to the operator, not only the code
 
+## Contents
+- Never cite a line number — cite something the file carries (and the same rule as the cycle's root
+  file stated it)
+- C.-1 The bar applies to the operator, not only the code — 1 label every claim · 1b grep the registry
+  for a matched control · 1c read the assertion values · 2 never state what a loader accepts without
+  reading it · 3 re-validate after every edit · 4 never read state a background job is writing · 5
+  capture exit codes directly · 6 list the variables · 7 a hypothesis in an anchor is a labelled
+  suspect · 8 an agent contradicting the operator is the system working · 9 fix the class
+
 ## ★★★ NEVER CITE A LINE NUMBER — CITE SOMETHING THE FILE CARRIES
 
 **Operator rule, 2026-08-19, verbatim:** *"we must never document line numbers, we must document
@@ -9,7 +18,7 @@ method names, comment ids or defined anchors. everything that changes is unrelia
 ✗ src/mir/lowering.cpp  + a line number   <- moves the moment anything above it changes
 ✓ src/mir/lowering.cpp — lowerCallArgs()
 ✓ tests/CMakeLists.txt — the `no RUN_SERIAL` rationale
-✓ [[D-TEST-INTEGRATED-FIXED-TEMP-PATH-COLLIDES]]
+✓ a defined anchor id, when a registry row is the subject
 ```
 
 **A symbol survives every edit above it; a line number survives none.** And the failure is the bad
@@ -18,20 +27,64 @@ reads as evidence, and now points at unrelated prose.
 
 ⚠ **✔MEASURED twice in one cycle (P17), which is why this is a rule and not advice.** Inserting a
 `# PURPOSE:` line at the top of eighteen scripts moved **16** citations off their subjects —
-one citation into `check-anchor-registry.sh` had pointed at *"…staleness sweep commit message…"*
+one citation into `check-anchor-registry.sh` (the shell guard of the time) had pointed at *"…staleness sweep commit message…"*
 and pointed instead at *"Same pattern the developer-side audit grep uses…"*. Then the rows written to RECORD
 that defect shipped **three more** wrong numbers of their own, each naming the first line of an
 explanatory comment rather than the code it explains. Both were caught by independent audit; no
 gate saw either.
 
 **Enforced** by `plan_citations_guard` (ctest) over `.plans/**` and `.claude/**`, as a ratchet: the
-2376 pre-existing citations sit in a per-document inventory whose ceilings may only come **down**.
+pre-existing citations sit in a per-document inventory whose ceilings may only come **down** — their
+number is re-derived from `check-plan-citations`' inventory, never quoted: this sentence said 2376 when it
+landed in cf27fe8b, 2026-08-23.
 A new one reds immediately. Converting one reds until its ceiling is lowered in the same commit:
 
 ```bash
-python scripts/check-plan-citations/check-plan-citations.py --write
+dssharness run check-plan-citations-write
 ```
 
+
+*The same rule as the cycle's root file stated it — kept whole, because it carries the full quote,
+the scope sentence and the note that the inventory is debt:*
+
+### ★★★ NEVER CITE A LINE NUMBER — CITE SOMETHING THE FILE CARRIES
+
+**Operator rule, 2026-08-19, verbatim:** *"we must never document line numbers, we must document
+method names, comment ids or defined anchors. everything that changes is unreliable. so it's just a
+matter of, when finding the path:line, replace the line number by a fixed reference."*
+
+Applies to **every** artifact a cycle writes — registry rows, the handoff, plans, skill references,
+commit messages, and code comments alike.
+
+```
+✗  src/mir/lowering.cpp  + a line number    <- moves the instant anything above it changes
+✓  src/mir/lowering.cpp — lowerCallArgs()
+✓  tests/CMakeLists.txt — the `no RUN_SERIAL` rationale block
+✓  a defined anchor id, when a registry row is the subject
+```
+
+**A symbol survives every edit above it; a line number survives none** — and the failure mode is the
+bad one: a citation that BREAKS gets noticed, while one that silently becomes WRONG still resolves,
+still reads as evidence, and now points at unrelated prose.
+
+⚠ **✔MEASURED twice inside one cycle (P17), which is why this is a rule and not advice.** Inserting a
+one-line header into eighteen scripts moved **16** plan citations off their subjects. The rows then
+written to RECORD that defect shipped **three more** wrong numbers of their own, each naming the
+first line of an explanatory comment instead of the code it explained. Independent audit caught both;
+no gate saw either.
+
+**Enforced** by `plan_citations_guard` (ctest) over `.plans/**` and `.claude/**` as a **ratchet** —
+the pre-existing citations sit in a per-document inventory whose ceilings may only come
+**DOWN** — their number is re-derived from `check-plan-citations`' inventory, never quoted: this sentence
+said ~2365 when it landed in cf27fe8b, 2026-08-23. A new one reds immediately; converting one reds until its ceiling is lowered in the same
+commit, because unclaimed headroom is where the next one hides.
+
+```bash
+dssharness run check-plan-citations-write
+```
+
+⚠ **Green there means no NEW positional citation landed — never that the plans cite stably.** The
+inventory is DEBT: burn it down in whatever document you are already editing.
 
 ## C.-1 THE BAR APPLIES TO THE OPERATOR, NOT ONLY THE CODE
 
@@ -49,8 +102,8 @@ operator**.
    the test family and the symptom — then CITE what you find, or state explicitly that nothing
    matched. ✔MEASURED 2026-08-06: a 2×2 attribution (compiler × rundir filesystem) was
    commissioned from scratch for 57 sqlite failures; the identical experiment with the identical
-   verdict was **already in the registry** from seven cycles earlier
-   (`D-HARNESS-WSL-LAUNCHED-LEG-RUNDIR-IS-DRVFS`), and the row was findable — the leg name, the
+   verdict was **already in the registry** from seven cycles earlier — a row on the WSL-launched
+   leg's rundir sitting on DrvFS — and the row was findable: the leg name, the
    driver and the word `rundir` all appear in it. ⇒ **the cost was not the duplicated work: the
    un-cited row would have pre-empted THREE FALSE STATEMENTS that reached a commit** ("previously
    green", "the Tcl move is the prime suspect", "the WAL/journal TIMING family"). ★ THE FAILURE
@@ -58,13 +111,13 @@ operator**.
    surfaced a plausible NEIGHBOUR (the WSL2 clock defect — real, but the wrong population); a
    grep would have surfaced the exact CONTROL. **Recall finds what is similar; grep finds what
    is the same.** ⇒ anchoring every issue is worthless if the next cycle does not READ the
-   anchors before investigating (`D-PROCESS-CHECK-THE-REGISTRY-FOR-A-MATCHED-CONTROL-BEFORE-COMMISSIONING-ONE`).
+   anchors before investigating.
    ★★ **AND GREP THE DEFECT'S VOCABULARY, NOT THE NAME YOU WOULD PICK — the rule above was
    FOLLOWED and still missed, by the operator who wrote it.** ✔MEASURED 2026-08-07 (TF-C126): a
    recipe derivation was found harvesting `tool/lemon.c` / `lempar.c` / `mksourceid.c` as target
    TUs. The registry WAS grepped first — for anchor NAMES matching `RECIPE|MAKE-N|DERIV|LEMON|
-   TU-LIST` — and returned nothing, so a fresh row was written. The existing row was
-   [[D-HARNESS-FIXTURE-TU-SCRAPE-ABSORBS-BUILD-HOST-TOOLS]]: same three files, same whole-blob
+   TU-LIST` — and returned nothing, so a fresh row was written. The existing row described the
+   fixture TU scrape absorbing build-host tools: same three files, same whole-blob
    cause, the same fix prescribed — **and it had PRE-REGISTERED the exact firing condition that
    had just fired** ("safe today only because its reference build normally builds `lemon` FIRST …
    if that build fails early, the fixture set absorbs the tools too"). It was missed because it is

@@ -47,15 +47,24 @@
 //    the verb says WHICH arguments the entry needs, the mechanism says HOW this
 //    format obtains them.
 //      * verb `none`                        → nothing to do (a no-arg entry).
-//      * verb `argc-argv` / `argc-wargv`, mechanism `crt-argv-accessors`
+//      * any other verb, mechanism `crt-argv-accessors`
 //                                           → synthesize the pre-main init
 //                                             described below and RETARGET the
-//                                             program entry to it.
-//      * ditto, mechanism `stack-vector`    → nothing here; the entry trampoline
+//                                             program entry to it (an
+//                                             environment verb adds the width's
+//                                             environment pair).
+//      * `argc-argv`, mechanism `stack-vector`
+//                                           → nothing here; the entry trampoline
 //                                             materializes from the entry stack.
-//      * ditto, no mechanism declared       → nothing here; the loader already
+//      * `argc-argv-envp`, mechanism `stack-vector`
+//                                           → synthesize the entry-stack init
+//                                             described below and RETARGET.
+//      * any verb, no mechanism declared    → nothing here; the loader already
 //                                             put them in the argument registers
-//                                             (Mach-O LC_MAIN / dyld).
+//                                             (Mach-O LC_MAIN / dyld: argc, argv,
+//                                             envp, apple).
+//      * a verb the mechanism cannot realize → refused (`validate()` refuses the
+//                                             pairing at format load first).
 //
 // ── THE SYNTHESIZED INIT (mechanism `crt-argv-accessors`) ──────────────────
 //
@@ -66,6 +75,25 @@
 //       if (argv == NULL) return <declared status>;   // see the gate note below
 //       return main(argc, argv);                // the resolved user entry
 //   }
+//
+// For an ENVIRONMENT verb the init follows MSVC's own startup (DOCUMENTED, the
+// toolset's crt/src/vcruntime/exe_common.inl): `_initialize_narrow_environment()`
+// right after the configure call, its result ignored as MSVC ignores it, and
+// `main(argc, argv, _get_initial_narrow_environment())` — the wide pair for the
+// 3-parameter `wmain`. The names are the format's `processArgs`, never spelled
+// here.
+//
+// ── THE ENTRY-STACK INIT (mechanism `stack-vector`, verb `argc-argv-envp`) ─
+//
+//   int _dss_stack_start(int argc, char **argv) {   // the trampoline's two
+//       return main(argc, argv, argv + (argc + 1)); // one slot past argv's NULL
+//   }
+//
+// The environment vector follows argv's terminator on the entry stack, so its
+// address depends on the RUNTIME argc; the format declares the layout
+// (`envpFollowsArgvTerminator`, `vectorSlotBytes`) and this computes it — no
+// per-architecture trampoline code, and the trampoline still hands over exactly
+// (argc, argv).
 //
 // ★ PROBE-0, MEASURED 2026-08-10, AND THE REASON THIS SHAPE IS LEGITIMATE: the
 // accessor triple returns the REAL command line in a STARTUP-LESS DSS pe64

@@ -32,6 +32,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 using namespace dss;
@@ -74,7 +75,7 @@ TEST(LirText, EmitterPreambleCarriesVersionAndTargetName) {
     EXPECT_NE(text.find("dsslir 1\n"), std::string::npos);
     EXPECT_NE(text.find("target x86_64 version \""), std::string::npos)
         << "preamble must carry both the target name AND its semantic version "
-           "(D-ML8-1.2 fold — version pinned so cross-bump load is rejected)";
+           "(D-PLAN12-SCHEMA-VERSION-TAG-DSSLIR-PREAMBLE fold — version pinned so cross-bump load is rejected)";
 }
 
 TEST(LirText, EmitterEmptyModuleProducesValidStructure) {
@@ -482,7 +483,7 @@ TEST(LirText, EmitterRendersLiteralPoolBodyWithCoreTag) {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Parser + round-trip tests (ML8 cycle 2 — D-ML8-1.1 fold).
+// Parser + round-trip tests (ML8 cycle 2 — D-PLAN12-DSSLIR-PARSER-EMITLIR-PARSELIR-EMITLIR-EMITLIR-ROUND-TRIP fold).
 // Contract:
 //   emitLir(parseLir(emitLir(m))->lir) == emitLir(m)   (byte-identical)
 // ═════════════════════════════════════════════════════════════════════
@@ -504,7 +505,7 @@ roundTripOrFail(Lir const& lir, TargetSchema const& sch,
     // Build a NEW ctx for the re-emit using the parsed symbol-name
     // table — same shape the parser surfaces to its consumer.
     LirTextContext ctxRe{};
-    ctxRe.symbolNames = std::span<std::string const>{result->symbolNames};
+    ctxRe.symbolNameMap = &result->symbolNames;
     std::string const text2 = emitLir(result->lir, sch, ctxRe, rep3);
     EXPECT_EQ(text1, text2)
         << "round-trip text drift for " << what
@@ -1056,7 +1057,7 @@ TEST(LirTextRoundTrip, VRegIdGapMintingFillsMissingSlots) {
     // vreg AND not surface the filler (they have no defs/uses).
     DiagnosticReporter rep2;
     LirTextContext ctx2{};
-    ctx2.symbolNames = std::span<std::string const>{result->symbolNames};
+    ctx2.symbolNameMap = &result->symbolNames;
     std::string const text2 = emitLir(result->lir, *sch, ctx2, rep2);
     EXPECT_NE(text2.find("%v.5:gpr"), std::string::npos);
 }
@@ -2026,4 +2027,227 @@ TEST(LirText, AnElidedFallthroughSurvivesTheTextRoundTrip) {
         << "byte-identical re-emit is this format's round-trip contract";
     DiagnosticReporter vrep;
     EXPECT_TRUE(verifyLirText(parsed->lir, *sch, vrep));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P68 round 8, lane `ht`, part 1c — THE SYMBOL TABLE IS SIZED BY THE TEXT, AND A
+// NUMBER IN IT IS READ AS WRITTEN.
+//
+// The reader sized its table by the largest slot the text named (`resize(v + 1)`,
+// twice: the `symbols { }` entry and a function header's inline name). A
+// LEGITIMATE text carries slot 0xFFFFFF01, the writer-reserved PE `_tls_index`
+// singleton (✔MEASURED: 20 of 804 example modules) — a 128 GB table; a hostile
+// `%4294967295` wrapped `v + 1` to 0 and wrote out of bounds. The table holds one
+// entry per declared name now. And `^b<digits>` WRAPPED in a hand-rolled 32-bit
+// loop: a branch to `^b4294967297` landed on `^b1`.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+std::string oneFunctionLir(TargetSchema const& sch, std::string const& symbols,
+                           std::string const& fnHead, std::string const& blocks) {
+    return std::format(
+        "dsslir 1\n"
+        "target {} version \"{}\"\n"
+        "symbols {{\n{}}}\n"
+        "literal_pool {{}}\n"
+        "module {{\n"
+        "  function {} {{\n{}"
+        "  }}\n"
+        "}}\n",
+        sch.name(), sch.version(), symbols, fnHead, blocks);
+}
+
+std::string const kRetBlock =
+    "    block ^b0 [entry] -> [] {\n"
+    "      %v.1:gpr = mov #1 ; payload=0 flags=0\n"
+    "      ret %v.1:gpr ; payload=0 flags=0\n"
+    "    }\n";
+
+std::vector<std::string> actuals(DiagnosticReporter const& r) {
+    std::vector<std::string> out;
+    for (auto const& d : r.all()) out.push_back(d.actual);
+    return out;
+}
+
+bool anyHas(std::vector<std::string> const& v, std::string_view needle) {
+    for (auto const& x : v) if (x.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+std::string listed(std::vector<std::string> const& v) {
+    std::string out;
+    for (auto const& x : v) { out += "\n    "; out += x; }
+    return out;
+}
+
+} // namespace
+
+// The measured shapes and the legitimate reserved slot each read as the ONE
+// entry declared, beside the function's own; the reserved one round-trips.
+TEST(LirTextSymbolTable, AFarSlotIsOneEntryAndTheReservedTlsSlotRoundTrips) {
+    auto const sch = shippedX86();
+    for (std::uint32_t const slot : {100000000u, 4000000000u, 4294967295u, 4294967041u}) {
+        std::string const text = oneFunctionLir(
+            *sch, std::format("  %1 \"main\"\n  %{} \"_tls_index\"\n", slot), "%1 \"main\"",
+            kRetBlock);
+        DiagnosticReporter rep;
+        auto const parsed = parseLir(text, *sch, rep);
+        ASSERT_NE(parsed, nullptr);
+        EXPECT_TRUE(parsed->ok) << "%" << slot << listed(actuals(rep));
+        ASSERT_EQ(parsed->symbolNames.size(), 2u) << "%" << slot << " sized the table by its number";
+        ASSERT_TRUE(parsed->symbolNames.contains(slot));
+        EXPECT_EQ(parsed->symbolNames.at(slot), "_tls_index");
+        if (slot == 4294967041u) {
+            LirTextContext ctx{};
+            ctx.symbolNameMap = &parsed->symbolNames;
+            DiagnosticReporter w;
+            std::string const again = emitLir(parsed->lir, *sch, ctx, w);
+            EXPECT_NE(again.find("%1 \"main\""), std::string::npos) << again;
+        }
+    }
+}
+
+TEST(LirTextSymbolTable, ASlotNamedTwiceIsRefused) {
+    auto const sch = shippedX86();
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(
+        oneFunctionLir(*sch, "  %1 \"main\"\n  %7 \"a\"\n  %7 \"b\"\n", "%1 \"main\"", kRetBlock),
+        *sch, rep);
+    EXPECT_FALSE(parsed->ok);
+    EXPECT_TRUE(anyHas(actuals(rep), "symbol slot %7 is named twice in symbols { }"))
+        << listed(actuals(rep));
+    EXPECT_TRUE(parsed->symbolNames.empty()) << "a refused text handed back a partial table";
+}
+
+// 2^32 + 1 is not slot 1, and it is refused ONCE — not also as "slot 0".
+TEST(LirTextSymbolTable, A33BitSlotIsRefusedOnceNotCut) {
+    auto const sch = shippedX86();
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(
+        oneFunctionLir(*sch, "  %1 \"main\"\n  %4294967297 \"x\"\n", "%1 \"main\"", kRetBlock),
+        *sch, rep);
+    EXPECT_FALSE(parsed->ok);
+    auto const diags = actuals(rep);
+    EXPECT_TRUE(anyHas(diags, "symbol id value '4294967297' does not fit its 32-bit field"))
+        << listed(diags);
+    EXPECT_FALSE(anyHas(diags, "invalid-symbol sentinel"))
+        << "the refused number was ALSO reported as slot 0:" << listed(diags);
+    EXPECT_TRUE(parsed->symbolNames.empty()) << "a refused text handed back a partial table";
+}
+
+TEST(LirTextBlockSlot, ABlockSlotPast32BitsIsRefusedNotWrapped) {
+    auto const sch = shippedX86();
+    std::string const blocks =
+        "    block ^b0 [entry] -> [^b4294967297] {\n"
+        "      br ^b4294967297 ; payload=0 flags=0\n"
+        "    }\n"
+        "    block ^b1 -> [] {\n"
+        "      %v.1:gpr = mov #1 ; payload=0 flags=0\n"
+        "      ret %v.1:gpr ; payload=0 flags=0\n"
+        "    }\n";
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(oneFunctionLir(*sch, "  %1 \"main\"\n", "%1 \"main\"", blocks),
+                                 *sch, rep);
+    EXPECT_FALSE(parsed->ok) << "a branch to ^b4294967297 read as a branch to ^b1";
+    EXPECT_TRUE(anyHas(actuals(rep), "block slot value '4294967297' does not fit its 32-bit field"))
+        << listed(actuals(rep));
+}
+
+// ── P68 round 9, the aarch64 twins: the address operands a `.s` hands the encoder ──
+//
+// `adrp x0, msg` is a `SymbolRef` naming the PAGE of `msg` (`@N:page`); `adr x0,
+// msg+8` a `SymbolAddress` — the (symbol, constant) pair in the pool —
+// (`symaddr#N`); `ldr x1, [x0, :lo12:msg]` a `MemSymbolOffset` naming the PAGE
+// OFFSET (`memsym#N:pageOffset`); `adr x7, .+8` the location counter (`^.`) and
+// the constant beside it. The part of the address is the operand's own byte and
+// the election reads it (`guard.symbolPart`), so a text that dropped it would
+// re-read `adrp x0, msg` as the whole address, which no `adrp` variant encodes.
+TEST(LirTextRoundTrip, AddressPartsSymbolConstantsAndTheLocationCounterSurvive) {
+    auto const loaded = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(loaded.has_value());
+    TargetSchema const& sch = **loaded;
+    auto const adrp = sch.opcodeByMnemonic("adrp");
+    auto const adr  = sch.opcodeByMnemonic("adr");
+    auto const load = sch.opcodeByMnemonic("load");
+    auto const ret  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(adrp && adr && load && ret);
+    LirBuilder b{sch};
+    LirLiteralValue plus8;
+    plus8.value = LirSymbolAddress{SymbolId{7}, 8};
+    plus8.core  = TypeKind::Ptr;
+    std::uint32_t const plus8Idx = b.literalPoolAdd(std::move(plus8));
+    LirLiteralValue at0;
+    at0.value = LirSymbolAddress{SymbolId{7}, 0};
+    at0.core  = TypeKind::Ptr;
+    std::uint32_t const at0Idx = b.literalPoolAdd(std::move(at0));
+    b.addFunction(SymbolId{1});
+    LirBlockId const entry = b.createBlock();
+    b.beginBlock(entry);
+    LirReg const x0 = makePhysicalReg(*sch.registerByName("x0"), LirRegClass::GPR);
+    LirReg const x1 = makePhysicalReg(*sch.registerByName("x1"), LirRegClass::GPR);
+    LirReg const x7 = makePhysicalReg(*sch.registerByName("x7"), LirRegClass::GPR);
+    std::array<LirOperand, 1> pageOps{
+        LirOperand::makeSymbolRef(7, SymbolAddressPart::Page)};
+    b.addInst(*adrp, x0, pageOps);
+    std::array<LirOperand, 1> adrOps{LirOperand::makeSymbolAddress(plus8Idx)};
+    b.addInst(*adr, x1, adrOps);
+    std::array<LirOperand, 3> loadOps{
+        LirOperand::makeReg(x0), LirOperand::makeMemBase(1),
+        LirOperand::makeMemSymbolOffset(at0Idx, SymbolAddressPart::PageOffset)};
+    b.addInst(*load, x1, loadOps);
+    std::array<LirOperand, 2> hereOps{LirOperand::makeLocationCounter(),
+                                      LirOperand::makeImmInt32(8)};
+    b.addInst(*adr, x7, hereOps);
+    b.addReturn(*ret, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+    LirTextContext ctx;
+    std::string const text = roundTripOrFail(lir, sch, ctx, "address parts");
+    EXPECT_NE(text.find("adrp @7:page"), std::string::npos) << text;
+    EXPECT_NE(text.find(std::format("adr symaddr#{}", plus8Idx)), std::string::npos) << text;
+    EXPECT_NE(text.find(std::format("memsym#{}:pageOffset", at0Idx)), std::string::npos)
+        << text;
+    EXPECT_NE(text.find("adr ^., #8"), std::string::npos) << text;
+
+    // Parsed back, the part is the operand's own byte, not text decoration.
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(text, sch, rep);
+    ASSERT_TRUE(parsed->ok);
+    bool sawPage = false, sawPageOffset = false, sawHere = false;
+    Lir const& back = parsed->lir;
+    ASSERT_EQ(back.moduleFuncCount(), 1u);
+    LirFuncId const fn = back.funcAt(0);
+    for (std::uint32_t bi = 0; bi < back.funcBlockCount(fn); ++bi) {
+        LirBlockId const bb = back.funcBlockAt(fn, bi);
+        for (std::uint32_t ii = 0; ii < back.blockInstCount(bb); ++ii) {
+            for (auto const& o : back.instOperands(back.blockInstAt(bb, ii))) {
+                if (o.kind == LirOperandKind::SymbolRef
+                    && o.symbolAddressPart() == SymbolAddressPart::Page) sawPage = true;
+                if (o.kind == LirOperandKind::MemSymbolOffset
+                    && o.symbolAddressPart() == SymbolAddressPart::PageOffset) {
+                    sawPageOffset = true;
+                }
+                if (o.kind == LirOperandKind::LocationCounter) sawHere = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawPage);
+    EXPECT_TRUE(sawPageOffset);
+    EXPECT_TRUE(sawHere);
+}
+
+TEST(LirTextParser, AnUnknownAddressPartIsRefusedNotReadAsTheWholeAddress) {
+    auto const loaded = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(loaded.has_value());
+    std::string const blocks =
+        "    block ^b0 [entry] -> [] {\n"
+        "      %v.1:gpr = adrp @7:pageoff ; payload=0 flags=0\n"
+        "      ret %v.1:gpr ; payload=0 flags=0\n"
+        "    }\n";
+    DiagnosticReporter rep;
+    auto const parsed = parseLir(
+        oneFunctionLir(**loaded, "  %1 \"main\"\n  %7 \"msg\"\n", "%1 \"main\"", blocks),
+        **loaded, rep);
+    EXPECT_FALSE(parsed->ok);
+    EXPECT_TRUE(anyHas(actuals(rep), "'pageoff' is not a part of a symbol's address"))
+        << listed(actuals(rep));
 }

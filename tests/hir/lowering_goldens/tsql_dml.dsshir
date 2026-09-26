@@ -1,4 +1,4 @@
-dsshir 4
+dsshir 6
 producer ""
 ext_kinds {
   "TSQL::Select" lang "TsqlSubset"

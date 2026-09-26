@@ -100,8 +100,7 @@ constexpr std::string_view kPlainHeader = "int pp_once_marker;\n";
 
 // Shared schema fixture — a REFERENCE to a function-local static, because
 // `GrammarSchema`'s accessors hand back references INTO the schema and a
-// by-value return makes `helper()->accessor()` a heap-use-after-free
-// (D-TEST-SCHEMA-TEMPORARY-DANGLING-REFERENCE).
+// by-value return makes `helper()->accessor()` a heap-use-after-free.
 //
 // ⚠ FORCED BEFORE THE CWD MOVES — schema discovery falls back to a walk UP FROM
 // THE CWD when `$DSS_CONFIG_ROOT` is unset, which is the case for a bare `.exe`

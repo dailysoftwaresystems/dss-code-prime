@@ -43,6 +43,11 @@ NodeId SemanticModel::selectedGenericExpr(NodeId id) const {
     return p ? *p : InvalidNode;
 }
 
+SymbolId SemanticModel::typedefNamedAt(NodeId token) const {
+    auto const* p = typedefNamedByToken_.tryGet(token);
+    return p ? *p : InvalidSymbol;
+}
+
 std::optional<std::uint64_t> SemanticModel::foldedConstantAt(NodeId id) const {
     auto const* p = nodeToFoldedConstant_.tryGet(id);
     if (p == nullptr) return std::nullopt;

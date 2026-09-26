@@ -19,7 +19,8 @@
 // four different things. ✔MEASURED 2026-08-23 what happens when they are
 // conflated: routing a program-spawn deadline through `kWaitBudget` would have
 // multiplied ~618 per-example hang ceilings by twelve and described a run as a
-// wait ([[D-TEST-WALL-CLOCK-ROW-REMEDY-SANCTIONS-A-SHAPE-ITS-OWN-GUARD-COUNTS]]).
+// wait — a remedy that sanctions the very shape `check-wall-clock-in-tests`
+// counts is no remedy at all.
 //
 // ⇒ ADDING A BUDGET HERE IS ALLOWED; ADDING ONE WITHOUT ITS MEASUREMENT IS NOT.
 // Each block below states WHAT is being waited for, WHAT sized the number, and
@@ -47,7 +48,7 @@
 //
 // ⇒ The deadline was sized on an idle developer machine and had no margin for the
 // slowest host that runs it. That is the same defect the CI budgets carried one
-// level up (D-CI-BUILD-AND-CTEST-BUDGETS-WERE-ONE-NUMBER-FOR-FIVE-LEGS), and it
+// level up, where build and ctest were ONE number for FIVE legs, and it
 // fails in the worst direction: a red that names an exit code, on a leg where
 // nothing is actually wrong.
 //
@@ -64,8 +65,8 @@
 // ★★ AND A TIMEOUT MUST SAY IT TIMED OUT. `runUntilExit` returns -1 on expiry,
 // which every call site compares against an expected EXIT CODE — so the failure
 // reads `Which is: -1` and sends the reader looking for a wrong exit status. The
-// helper now adds a named failure alongside it. See
-// D-TEST-LSP-WAIT-DEADLINE-IS-SIZED-FOR-AN-IDLE-HOST.
+// helper now adds a named failure alongside it. See `runUntilExit` in
+// `tests/lsp/lsp_test_helpers.hpp`, which is the call this budget bounds.
 
 namespace dss::test_support {
 
@@ -74,8 +75,8 @@ inline constexpr std::chrono::seconds kWaitBudget{60};
 // ── kRunBudget / kAdmissionBudget (TF-C84) ────────────────────────────────────
 // MOVED HERE 2026-08-23 from `run_binary.hpp`, where they were the only two
 // measured budgets living outside this file — so the one place a reader could go
-// to learn what time budgets the suite has did not in fact hold them
-// ([[D-TEST-WALL-CLOCK-LITERAL-INVENTORY-IS-DEBT]]). `runBinary`'s own docblock
+// to learn what time budgets the suite has did not in fact hold them, and a
+// wall-clock literal living outside this inventory is debt. `runBinary`'s own docblock
 // still carries the TWO-PHASE DESIGN; what moved is the SIZING.
 //
 // TWO different things need bounding, and conflating them into one bare `5000`
@@ -167,8 +168,8 @@ inline constexpr std::chrono::milliseconds kAdmissionBudget{30000};
 // KEPT rather than shrunk because a budget must be sized for the slowest host
 // that runs it, never for the box that measured it — python start-up on a cold
 // CI runner under `--parallel 4` is the case this has to survive, and shaving a
-// budget towards an observed local mean is the exact defect
-// [[D-TEST-LSP-WAIT-DEADLINE-IS-SIZED-FOR-AN-IDLE-HOST]] records. What changed is
+// budget towards an observed local mean is the exact defect that sized the LSP
+// wait deadline for an IDLE host. What changed is
 // that the number is now ONE decision with its evidence attached instead of two
 // unexamined copies.
 inline constexpr std::chrono::seconds kHelperScriptBudget{120};

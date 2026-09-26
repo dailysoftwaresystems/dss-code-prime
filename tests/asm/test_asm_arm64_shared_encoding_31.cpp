@@ -414,6 +414,10 @@ TEST(AsmArm64SharedEncoding31, AMultiWordMacroWhoseWordsDisagreeTakesNeither) {
     // spelled — the real CLI over a standalone `.s`, after this fix: `adr xzr,
     // main` and `adr sp, main` are REFUSED, and `adr x0, main` still emits
     // 0x90000000 + 0x91000000 with both relocations.
+    // ⓘ SINCE P68 ROUND 9 THE DIALECT'S `adr` IS NO LONGER THIS MACRO: it names
+    // the one-word ADR both references write (`adr xzr, main` = 0x1000001F,
+    // pinned in `test_asm_arm64_address_forms.cpp`). `lea` keeps the two-word
+    // form for the C front end's `&global`, which is what this arm guards.
     auto const target = shippedTarget();
     auto const lea = target->opcodeByMnemonic("lea");
     ASSERT_TRUE(lea.has_value()) << "the arm64 target declares no `lea`";

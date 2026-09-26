@@ -497,11 +497,11 @@ constexpr char kSynth2SchemaText[] = R"JSON({
   },
   "semantics": {
     "identifierToken": "Word",
+    "constMarker": "Lock",
     "declarations": [
       { "rule": "fnDecl",  "name": 1, "params": 2, "body": 3, "kind": "function" },
       { "rule": "param",   "name": 1, "type": 0, "kind": "variable" },
-      { "rule": "letBind", "name": 2, "type": 1, "init": 4, "kind": "variable",
-        "constMarker": "Lock" },
+      { "rule": "letBind", "name": 2, "type": 1, "init": 4, "kind": "variable" },
       { "rule": "aliasDecl", "name": 1, "type": 3, "kind": "type" }
     ],
     "references": [ { "rule": "useExpr" } ],

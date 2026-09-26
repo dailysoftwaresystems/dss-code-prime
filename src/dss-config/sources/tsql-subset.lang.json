@@ -64,7 +64,7 @@
     "/*": [{
       "kind": "BlockCommentStart", "flags": ["EmptySpace"],
       "modeOp": "pushMode", "modeArg": "block-comment",
-      "stringStyle": { "escapeKind": "none", "endsAt": "*/" }
+      "stringStyle": { "escapeKind": "none", "endsAt": "*/", "multiline": true }
     }],
 
     "(":  [{ "kind": "ParenOpen",  "opensScope": "Paren" }],
@@ -90,17 +90,17 @@
     "'":  [{
       "kind": "StringStart",
       "modeOp": "pushMode", "modeArg": "single-string",
-      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'" }
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'", "multiline": true }
     }],
     "N'": [{
       "kind": "UnicodeStringStart",
       "modeOp": "pushMode", "modeArg": "unicode-string",
-      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'" }
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "'", "multiline": true }
     }],
     "[":  [{
       "kind": "BracketIdStart",
       "modeOp": "pushMode", "modeArg": "bracket-id",
-      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "]" }
+      "stringStyle": { "escapeKind": "doubled-delimiter", "endsAt": "]", "multiline": true }
     }]
   },
 

@@ -2,6 +2,8 @@
 #include "link/format/foreign_section_alignment.hpp"
 #include "link/format/object_atom_coverage.hpp"
 #include "link/format/object_format_backends.hpp"
+#include "link/format/relocation_addend.hpp"
+#include "link/format/section_relative_target.hpp"
 
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/section_kind.hpp"
@@ -385,20 +387,52 @@ rdCoffName(std::span<std::uint8_t const> b, std::size_t o,
     return std::string{reinterpret_cast<char const*>(&b[o]), n};
 }
 
-// Sign-extend the low `width` bytes of `raw` to a signed 64-bit value --
-// the inverse of the writer truncating an int64 addend to `widthBytes` LE
-// in the patched data slot (`pe.cpp`'s `buildDataRelocTable` and the ADDEND
-// paragraph above it; the old positional citation here had drifted onto extern
-// symbol-index assignment). width is 4 or 8 (the non-pcrel
-// Linear kinds a data slot uses -- schema invariant (a)).
-[[nodiscard]] std::int64_t signExtendLE(std::uint64_t raw, std::uint8_t width) noexcept {
-    if (width >= 8u) return static_cast<std::int64_t>(raw);
-    unsigned const bits = static_cast<unsigned>(width) * 8u;
-    std::uint64_t const mask = (static_cast<std::uint64_t>(1) << bits) - 1u;
-    std::uint64_t v = raw & mask;
-    std::uint64_t const signBit = static_cast<std::uint64_t>(1) << (bits - 1u);
-    if ((v & signBit) != 0u) v |= ~mask;  // extend the sign into the high bytes
-    return static_cast<std::int64_t>(v);
+// Decode a SECTION HEADER's 8-byte Name field, which spells a long name
+// differently from a symbol (PE/COFF §4, "Section Table"): a name longer
+// than 8 bytes is a SLASH followed by the ASCII DECIMAL offset of the name in
+// the string table. The symbol form above (zeros, then a binary offset) is not
+// used here. LLVM extends this with "//" and a base-64 offset, for string
+// tables too large for seven decimal digits, and that form is read too.
+// ✔MEASURED 2026-09-23: mingw gas writes `.rdata$tbl` as "/4", and this
+// reader used to take "/4" as the NAME. The section resolved to no kind, so
+// every symbol in it was refused ("lives in section '/4'") where mingw's own
+// link runs the object.
+// Anything else in the field is an inline name, exactly as for a symbol. A
+// DSS-written object puts no long names in its section table, so its sections
+// read back unchanged.
+[[nodiscard]] std::string
+rdCoffSectionName(std::span<std::uint8_t const> b, std::size_t o,
+                  std::uint64_t strTabStart, std::uint64_t strTabEnd) {
+    if (b[o] != static_cast<std::uint8_t>('/')) {
+        return rdCoffName(b, o, strTabStart, strTabEnd);
+    }
+    std::uint64_t offset = 0;
+    if (b[o + 1] == static_cast<std::uint8_t>('/')) {
+        // "//" + up to six base-64 digits (A-Z a-z 0-9 + /), most significant first.
+        for (std::size_t i = 2; i < 8u && b[o + i] != 0u; ++i) {
+            std::uint8_t const c = b[o + i];
+            std::uint64_t digit = 0;
+            if (c >= 'A' && c <= 'Z')      digit = c - 'A';
+            else if (c >= 'a' && c <= 'z') digit = 26u + (c - 'a');
+            else if (c >= '0' && c <= '9') digit = 52u + (c - '0');
+            else if (c == '+')             digit = 62u;
+            else if (c == '/')             digit = 63u;
+            else return {};
+            offset = offset * 64u + digit;
+        }
+    } else {
+        for (std::size_t i = 1; i < 8u && b[o + i] != 0u; ++i) {
+            std::uint8_t const c = b[o + i];
+            if (c < '0' || c > '9') {
+                // Not the long-name form after all: an inline name that happens
+                // to begin with a slash.
+                return rdCoffName(b, o, strTabStart, strTabEnd);
+            }
+            offset = offset * 10u + (c - '0');
+        }
+    }
+    if (offset < 4u || offset > 0xFFFFFFFFu) return {};
+    return rdName(b, strTabStart, strTabEnd, static_cast<std::uint32_t>(offset));
 }
 
 // One parsed IMAGE_SECTION_HEADER (only the fields the reader consumes).
@@ -666,7 +700,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         sec.relocCount = rdU16(bytes, so + kShNumRelocsOff);
         sec.chars      = rdU32(bytes, so + kShCharsOff);
         sec.zeroFill   = (sec.chars & kScnCntUninitializedData) != 0u;
-        sec.name       = rdCoffName(bytes, so + kShNameOff, strTabStart, strTabEnd);
+        sec.name       = rdCoffSectionName(bytes, so + kShNameOff, strTabStart, strTabEnd);
         // A file-backed section's body must lie within the file. A zero-fill
         // (bss) section carries no file bytes (PointerToRawData == 0), so it
         // is exempt -- exactly like the ELF reader exempts SHT_NOBITS and the
@@ -761,7 +795,6 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
         return fail(DiagnosticCode::F_CorruptedBinary,
                     "pe::readRelocatableObject: " + decode.error());
     }
-    auto const& nativeToKind        = decode->nativeToKind;
     auto const& callSignalNativeIds = decode->callSignalNativeIds;
 
     // -- (5) Decode every IMAGE_SYMBOL; assign SymbolId = symtab index ----
@@ -1689,6 +1722,29 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     // an id, so the canonical name must be recorded before any alias of it.
     std::vector<ModuleSymbol> aliasRows;
 
+    // Whether this object's input sections are UNITS of placement: the format's
+    // declared rule (`inputSectionPlacement`), applied to an object that has no
+    // way to declare its sections divisible. When they are, every atom sliced
+    // below names the section it was cut from (`InputSectionSlice`), and a
+    // section-relative reference may bind through any atom of its section
+    // (step 7).
+    auto const placement = objectFormatSchema.inputSectionPlacement();
+    if (!placement.has_value()) {
+        return fail(DiagnosticCode::F_CorruptedBinary,
+            "pe::readRelocatableObject: PE format '"
+            + std::string{objectFormatSchema.name()}
+            + "' declares no 'inputSectionPlacement', so whether this object's "
+              "sections may be split into independently placed atoms is "
+              "unstated.");
+    }
+    bool const sectionsAreUnits = link::format::inputSectionsAreUnits(
+        *placement, /*objectDeclaresSubsections=*/false);
+    auto sliceOf = [&](std::uint16_t ordinal, std::uint64_t offset)
+        -> std::optional<InputSectionSlice> {
+        if (!sectionsAreUnits) return std::nullopt;
+        return InputSectionSlice{ordinal, offset};
+    };
+
     // Slice each section's atoms by SORTED Value. What reached `defsBySection`
     // is every defined symbol that STARTS A BODY, of either linkage: EXTERNAL
     // symbols, class-STATIC symbols declaring DTYPE_FUNCTION, class-STATIC
@@ -1760,6 +1816,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 fn.symbol = SymbolId{defs[k].symIdx};
                 fn.bytes.assign(bytes.begin() + bodyOff,
                                 bytes.begin() + bodyOff + static_cast<std::size_t>(len));
+                fn.inputSection = sliceOf(ordinal, off);
                 funcIntervalsBySec[ordinal].push_back(
                     Interval{off, len, mod.functions.size()});
                 mod.functions.push_back(std::move(fn));
@@ -1785,6 +1842,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             di.symbol    = SymbolId{defs[k].symIdx};
             di.section   = *dk;
             di.alignment = alignFromCharacteristics(sec.chars);  // section-granular
+            di.inputSection = sliceOf(ordinal, off);
             if (isZeroFill(*dk)) {
                 di.reservedSize = len;
             } else {
@@ -1880,6 +1938,9 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                 // same declared alignment as the named atoms around them --
                 // exactly as the ELF gap arm does.
                 di.alignment = alignFromCharacteristics(sec.chars);
+                // ...and the same unit: an anonymous gap sits between named
+                // atoms of the section, so the unit is not contiguous without it.
+                di.inputSection = sliceOf(ordinal, g.start);
                 std::size_t const b0 = static_cast<std::size_t>(sec.rawPtr + g.start);
                 di.bytes.assign(bytes.begin() + b0,
                                 bytes.begin() + b0 + static_cast<std::size_t>(g.len));
@@ -2024,16 +2085,32 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + sec.name + "' names symbol #" + std::to_string(symIdx)
                     + " which is an AUXILIARY record slot, not a symbol.");
             }
-            auto const kindIt = nativeToKind.find(nativeId);
-            if (kindIt == nativeToKind.end()) {
+            // The ONE decode (`RelocationDecodeTable::decode`); a COFF type
+            // names one kind, so the site is read only by a format that
+            // declares a wire type decoded by instruction.
+            std::span<std::uint8_t const> site{};
+            if (sec.rawPtr != 0u && !rangeExceedsBuffer(va, 4, sec.rawSize)
+                && !rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
+                site = std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(sec.rawPtr + va), 4};
+            }
+            auto const decoded = decode->decode(nativeId, site);
+            if (!decoded.has_value()) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
                     "pe::readRelocatableObject: relocation Type "
                     + std::to_string(nativeId) + " in section '" + sec.name
-                    + "' is not declared by PE format '"
-                    + std::string{objectFormatSchema.name()}
-                    + "' -- cannot map it back to a universal RelocationKind.");
+                    + (decoded.error() == RelocationDecodeTable::Miss::Undeclared
+                           ? "' is not declared by PE format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' -- cannot map it back to a universal "
+                                   "RelocationKind."
+                           : "' is decoded by the instruction it patches, and "
+                             "no row of PE format '"
+                                 + std::string{objectFormatSchema.name()}
+                                 + "' decodes the word at offset "
+                                 + std::to_string(va) + "."));
             }
-            RelocationKind const kind = kindIt->second;
+            RelocationKind const kind = *decoded;
             auto const* tri = targetSchema.relocationInfo(kind);
             if (tri == nullptr) {
                 return fail(DiagnosticCode::F_CorruptedBinary,
@@ -2053,47 +2130,117 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + " -- refusing to silently drop it.");
             }
 
-            // Addend. COFF has no addend column:
-            //   * a DATA-section reloc's addend lives IN the patched slot
-            //     bytes (widthBytes LE at VirtualAddress -- the writer's
-            //     in-place convention); the target-schema addendBias is
-            //     un-baked so a re-emission re-adds it once (0 for the
-            //     non-pcrel absolute kinds a data slot uses).
-            //   * a `.text` reloc carries addend 0 (the writer rejects a
-            //     non-zero `.text` addend; link.exe applies the rel32 RIP bias
-            //     intrinsically).
-            std::int64_t addend = 0;
-            if (patchesData) {
-                std::uint8_t const w = tri->widthBytes;
-                if (w == 0u
-                    || rangeExceedsBuffer(va, w, sec.rawSize)
-                    || rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
-                    return fail(DiagnosticCode::F_CorruptedBinary,
-                        "pe::readRelocatableObject: data relocation at section "
-                        "offset " + std::to_string(va) + " in '" + sec.name
-                        + "' has a " + std::to_string(w) + "-byte slot that "
-                        "runs past the section -- cannot read the in-place "
-                        "addend.");
-                }
-                std::uint64_t raw = 0;
-                std::size_t const slot = static_cast<std::size_t>(sec.rawPtr + va);
-                for (std::uint8_t b = 0; b < w; ++b) {
-                    raw |= static_cast<std::uint64_t>(bytes[slot + b]) << (8u * b);
-                }
-                addend = signExtendLE(raw, w)
-                       - static_cast<std::int64_t>(tri->addendBias);
+            // Addend. COFF has no addend column: the format declares
+            // `relocationAddends: inPlace`, and the addend is read out of the
+            // patched field by the ONE owner of that rule
+            // (`link/format/relocation_addend.hpp`) — in `.text` exactly as in
+            // data. ⚠ THIS USED TO READ 0 FOR EVERY `.text` RELOCATION "because
+            // the writer rejects a non-zero `.text` addend", which was true of
+            // DSS's writer alone: ✔MEASURED 2026-09-23, clang 18.1.3 writes
+            // `fc ff ff ff` into `movl $5, counter(%rip)`'s field, and that
+            // object linked by DSS ran to 32 where the mingw link ran to 42.
+            auto const storage = objectFormatSchema.relocationAddendStorage();
+            if (!storage.has_value()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: PE format '"
+                    + std::string{objectFormatSchema.name()}
+                    + "' declares no 'relocationAddends', so where a "
+                      "relocation's addend lives is unstated.");
             }
+            std::size_t const fieldWidth =
+                link::format::relocationFieldHoldsAnAddend(*tri)
+                    ? tri->widthBytes : 0u;
+            if (rangeExceedsBuffer(va, fieldWidth, sec.rawSize)
+                || rangeExceedsBuffer(sec.rawPtr, sec.rawSize, bytes.size())) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: relocation at section offset "
+                    + std::to_string(va) + " in '" + sec.name + "' has a "
+                    + std::to_string(fieldWidth) + "-byte field that runs past "
+                    "the section -- cannot read the in-place addend.");
+            }
+            auto const recovered = link::format::recoverRelocationAddend(
+                *storage, *tri, std::nullopt,
+                std::span<std::uint8_t const>{
+                    bytes.data() + static_cast<std::size_t>(sec.rawPtr + va),
+                    fieldWidth});
+            if (!recovered.has_value()) {
+                return fail(DiagnosticCode::F_CorruptedBinary,
+                    "pe::readRelocatableObject: relocation at section offset "
+                    + std::to_string(va) + " in '" + sec.name + "': "
+                    + recovered.error());
+            }
+            std::int64_t const addend = *recovered;
 
-            Relocation rel;
-            rel.offset = static_cast<std::uint32_t>(va - iv->start);
             // (6.44): a target naming an ALIAS binds to the atom that owns the
             // body, because only the owner is a declared definition -- an id
             // that owns no body is `K_SymbolUndefined` at the linker's compound
             // index. The addend needs no adjustment: an alias shares its owner's
             // offset exactly, so the same S makes the same address.
-            rel.target = SymbolId{ownerOf(symIdx)};
+            SymbolId     relTarget = SymbolId{ownerOf(symIdx)};
+            std::int64_t relAddend = addend;
+
+            // SECTION-RELATIVE: a target that is a SECTION-DEFINITION symbol names
+            // no body; it names an offset in its section. gas writes this shape
+            // for EVERY same-file symbol on PE, globals included. ✔MEASURED
+            // 2026-09-23, mingw gcc 13.2.0 -O2: `counter = 5` with a global
+            // `counter` at `.data+0x10` is `IMAGE_REL_AMD64_REL32 .data` with 0xc
+            // in place. It used to leave the section symbol as the target, which
+            // no atom owns, so the link refused it (`K_SymbolUndefined`) where
+            // mingw's own link runs it to 42. It is rebound to an atom of that
+            // section with a residual, by the rule every reader shares
+            // (`section_relative_target.hpp`). Why any atom of the section is
+            // exact is also there: the section is a unit, so its atoms keep
+            // their offsets.
+            if (isSectionDefinitionSymbol(symIdx)) {
+                Sym const& tsym = syms[symIdx];
+                std::int64_t const bindBase =
+                    static_cast<std::int64_t>(tsym.value) + addend;
+                // A data-section PC-relative SELF-reference (a relative jump
+                // table) is based at its own table, not at the next
+                // instruction, so its target offset is found from there. This
+                // is the ELF reader's search, for the same shape.
+                std::int64_t searchOff = bindBase;
+                if (tri->pcRelative && !patchesText) {
+                    std::int64_t const relInAtom =
+                        static_cast<std::int64_t>(va)
+                        - static_cast<std::int64_t>(iv->start);
+                    searchOff = bindBase
+                              + static_cast<std::int64_t>(tri->addendBias)
+                              - relInAtom;
+                }
+                auto spansOf = [](auto const& bySec, std::uint16_t key) {
+                    std::vector<link::format::SectionAtomSpan> spans;
+                    if (auto it = bySec.find(key); it != bySec.end()) {
+                        for (auto const& v : it->second) {
+                            spans.push_back(link::format::SectionAtomSpan{
+                                v.start, v.len, v.outIdx});
+                        }
+                    }
+                    return spans;
+                };
+                auto const bound = link::format::bindSectionRelativeReference(
+                    spansOf(funcIntervalsBySec, tsym.sectNum),
+                    spansOf(dataIntervalsBySec, tsym.sectNum), bindBase,
+                    searchOff, sectionsAreUnits);
+                if (!bound.has_value()) {
+                    return fail(DiagnosticCode::F_CorruptedBinary,
+                        "pe::readRelocatableObject: relocation at section offset "
+                        + std::to_string(va) + " in '" + sec.name
+                        + "' targets section symbol '" + tsym.name + "' + offset "
+                        + std::to_string(searchOff) + ", which "
+                        + bound.error() + ".");
+                }
+                relTarget = bound->isFunction
+                                ? mod.functions[bound->outIdx].symbol
+                                : mod.dataItems[bound->outIdx].symbol;
+                relAddend = bound->residual;
+            }
+
+            Relocation rel;
+            rel.offset = static_cast<std::uint32_t>(va - iv->start);
+            rel.target = relTarget;
             rel.kind   = kind;
-            rel.addend = addend;
+            rel.addend = relAddend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 

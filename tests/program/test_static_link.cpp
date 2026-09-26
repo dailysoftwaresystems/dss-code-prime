@@ -16,7 +16,7 @@
 // This is an INTEGRATION TEST (not an examples/ corpus entry) for the same
 // reason c162's round-trip is: the examples_runner is single-artifact-per-target
 // and cannot express a two-artifact DEPENDENT build (build the `.a` as artifact
-// 1, then static-link `main` against it) -- the D-EXAMPLES-RUNNER-MULTI-ARTIFACT
+// 1, then static-link `main` against it) -- the runner's one-artifact-per-target
 // limitation, reusing c162's decision.
 //
 // Cross-platform pins (run everywhere) exercise the pull + merge STRUCTURALLY:
@@ -583,7 +583,8 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     // actually removes — the same migration `PullResolvesReferenceAndMergeStripsImport`
     // above already made. (Cited BY TEST NAME, not by line: an earlier draft of
     // this comment said "352-362 and ~620" and the second number had already
-    // drifted to 636 before it was ever committed. D-PLANS-LINE-CITATION-ROT.)
+    // drifted to 636 before it was ever committed. Never cite a line number —
+    // cite a symbol, a file, or an anchor id that exists.)
     //
     // ★ THE OLD EXPECTATION WAS STRICTLY WEAKER AND IS WHY THIS CHANGED: it
     // asserted the build SUCCEEDED and merely that the RUN did not reach 42 —
@@ -603,7 +604,9 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     // `MachODriverStaticLinkBuildsSelfContainedExec` is guarded by
     // `#if defined(__APPLE__) && defined(__aarch64__)`, which NEITHER gate leg
     // compiles — so it could be arbitrarily stale and no leg would say so.
-    // Tracked as D-TEST-PLATFORM-GUARDED-ARM-COMPILES-ON-NO-GATE-LEG.
+    // ⚠ NOTHING TRACKS THAT TODAY: the row that did has no successor, so the
+    // class — a platform-guarded arm that compiles on no gate leg — lives here
+    // and nowhere else until a leg that compiles it is added.
     ScratchDir scratchNo{Location::InsideRepo, "static-link"};
     auto const dirNo = scratchNo.path();
     auto const mainNo = writeSrc(dirNo, "main.c", kMainSrc);
@@ -1528,8 +1531,7 @@ void expectMemberFormatResolvesToTheWriterDocument(Schemas const&   s,
         << familyLabel
         << ": resolving the LINK's own image format is the defect itself — the "
            "member read must never fall back to the artifact being produced "
-           "(D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-"
-           "FORMAT)";
+           "(D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT)";
 }
 
 // The ELF instance, exactly as the anchor recorded it: a member that CALLS A
@@ -1791,8 +1793,7 @@ TEST(ArchiveMemberObjectFormat,
     EXPECT_NE(text.find(archivePath.filename().string()), std::string::npos)
         << text;
     EXPECT_NE(text.find("elf64-x86_64-linux-exec"), std::string::npos) << text;
-    EXPECT_NE(text.find("D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-"
-                        "THE-OBJECT-FORMAT"),
+    EXPECT_NE(text.find("D-LK-ARCHIVE-MEMBER-READ-USES-THE-IMAGE-FORMAT-NOT-THE-OBJECT-FORMAT"),
               std::string::npos) << text;
     // And it must name the caller, not the runtime object cache the shared
     // resolver was first written for.

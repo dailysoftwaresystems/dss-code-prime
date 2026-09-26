@@ -93,10 +93,16 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // tests/analysis/semantic/test_advertised_capability_is_honoured.cpp.
     // ⚠ The COUNT alone would be satisfied by any 8 arrivals; the roster is what
     // makes it say which, so it moves with the number.
-    ASSERT_EQ(model.symbols().size() - 1, 104u)
+    // P68 round 9 (lane `cs`): + the 2 FILE-SCOPE twins of `__func__` /
+    // `__FUNCTION__` (text "", bound once per configured spelling in the builtin
+    // scope, what a use outside every function body resolves to — gcc's and
+    // clang's meaning, S_PredefinedIdentifierOutsideFunction at each use).
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    ASSERT_EQ(model.symbols().size() - 1, 107u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
-           "_ReadWriteBarrier + __sync_synchronize + "
+           "_ReadWriteBarrier + __sync_synchronize + __builtin_unreachable + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
            "atomic_load_explicit + atomic_store_explicit + the 8 atomic RMW "
@@ -105,7 +111,8 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
            "+ the 4 __builtin_complex/"
            "creal/cimag/conj complex builtins + the 6 byte-swap builtins "
            "(_byteswap_ushort/_byteswap_ulong/_byteswap_uint64 + "
-           "__builtin_bswap16/32/64) + __func__ + __FUNCTION__";
+           "__builtin_bswap16/32/64) + __func__ + __FUNCTION__ + their 2 file-scope "
+           "twins";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -649,12 +656,15 @@ TEST(SemanticAnalyzerC, WideStringBmpMultibyteCodeUnitCount) {
     EXPECT_EQ(ti.scalars(ty)[0], 2) << "U+20AC is ONE code unit + NUL";
 }
 
-// wchar_t (`L"…"`) width is FORMAT-keyed (D-FFI-STDDEF-WCHAR-PE-WIDTH): the
-// format-agnostic default (direct-API) resolves to I32 (POSIX); the PE format
-// resolves to U16 (Windows UTF-16 unit). This is CONFIG-DRIVEN — the
-// `elementCoreByFormat` map on the WideStringStart prefix row decides it via a
-// pure `resolveElementCore` lookup, NOT a hardcoded format branch.
+// wchar_t (`L"…"`) width is PAIR-keyed (P68 round 9,
+// D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX; before it, format-keyed by
+// D-FFI-STDDEF-WCHAR-PE-WIDTH): the WideStringStart row names
+// `abiTypedef: wchar_t`, resolved from the TARGET's `abiTypedefs` for the format —
+// U16 (the Windows UTF-16 unit) for x86_64 × PE. A pair-less analysis (the
+// direct API) takes the row's base core, I32. CONFIG-DRIVEN, no format branch.
 TEST(SemanticAnalyzerC, WideCharLiteralWidthIsFormatKeyed) {
+    auto const x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value()) << "the shipped x86_64 target: the pair's processor half";
     // Default (activeFormat=nullopt) → I32.
     {
         auto cu = buildShippedUnit("c", { "void f(){ L\"AB\"; }" });
@@ -668,12 +678,14 @@ TEST(SemanticAnalyzerC, WideCharLiteralWidthIsFormatKeyed) {
         EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32)
             << "wchar_t defaults to the POSIX i32 width";
     }
-    // PE format → U16.
+    // x86_64 × PE → U16.
     {
         auto cu = buildShippedUnit("c", { "void f(){ L\"AB\"; }" });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                             ObjectFormatKind::Pe);
+                             SelectableObjectFormatKind::of(ObjectFormatKind::Pe),
+                             std::string_view{"x86_64"}, LongDoubleFormat::None,
+                             x86->get());
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstStringLiteralType(model, *cu);
@@ -727,11 +739,13 @@ TEST(SemanticAnalyzerC, WideCharLiteralScalarCorePerPrefix) {
     }
 }
 
-// wchar_t (`L'x'`) width is FORMAT-keyed (D-FFI-STDDEF-WCHAR-PE-WIDTH) via the SAME
-// `elementCoreByFormat` axis the wide-STRING row uses — the format-agnostic default
-// resolves to I32 (POSIX), PE to U16. A pure `resolveElementCore` lookup, no
+// wchar_t (`L'x'`) width is PAIR-keyed (P68 round 9) through the SAME
+// `abiTypedef: wchar_t` row form the wide-STRING row uses — a pair-less analysis
+// resolves to the base I32, x86_64 × PE to U16 from the target's `abiTypedefs`. No
 // hardcoded format branch. This is the char analog of the string test above.
 TEST(SemanticAnalyzerC, WideCharConstantWidthIsFormatKeyed) {
+    auto const x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value()) << "the shipped x86_64 target: the pair's processor half";
     // Default (activeFormat=nullopt) → I32.
     {
         auto cu = buildShippedUnit("c", { "void f(){ L'x'; }" });
@@ -743,12 +757,14 @@ TEST(SemanticAnalyzerC, WideCharConstantWidthIsFormatKeyed) {
         ASSERT_TRUE(ty.valid());
         EXPECT_EQ(ti.kind(ty), TypeKind::I32) << "wchar_t defaults to the POSIX i32 width";
     }
-    // PE format → U16.
+    // x86_64 × PE → U16.
     {
         auto cu = buildShippedUnit("c", { "void f(){ L'x'; }" });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                             ObjectFormatKind::Pe);
+                             SelectableObjectFormatKind::of(ObjectFormatKind::Pe),
+                             std::string_view{"x86_64"}, LongDoubleFormat::None,
+                             x86->get());
         ASSERT_FALSE(model.hasErrors());
         auto const& ti = model.lattice().interner();
         TypeId const ty = firstCharLiteralType(model, *cu);
@@ -761,9 +777,11 @@ TEST(SemanticAnalyzerC, WideCharConstantWidthIsFormatKeyed) {
 // The sizeof-safety pin (MUST-FIX #3a): a wide char whose code point does NOT fit
 // its element (`u8'β'`>U+007F, `u'😀'` astral) leaves the body token UNTYPED so a
 // `sizeof`/`_Alignof` of it fails loud (never a guessed size). Here we assert the
-// body token is left with no valid type (the drop) — plus the format-keyed drop:
-// `L'😀'` is representable under the default I32 but NOT under the pe U16.
+// body token is left with no valid type (the drop) — plus the pair-keyed drop:
+// `L'😀'` is representable under the base I32 but NOT under the U16 of x86_64 × PE.
 TEST(SemanticAnalyzerC, BadWideCharConstantLeavesBodyTokenUntyped) {
+    auto const x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value()) << "the shipped x86_64 target: the pair's processor half";
     // u8'β' — U+03B2 exceeds the single-UTF-8-unit range (0x7F).
     {
         auto cu = buildShippedUnit("c", { "void f(){ u8'\xce\xb2'; }" });
@@ -773,12 +791,14 @@ TEST(SemanticAnalyzerC, BadWideCharConstantLeavesBodyTokenUntyped) {
         EXPECT_FALSE(ty.valid())
             << "an out-of-range u8 char must be left untyped so sizeof fails loud";
     }
-    // L'😀' under PE (U16) → astral, unrepresentable → untyped.
+    // L'😀' under x86_64 × PE (U16) → astral, unrepresentable → untyped.
     {
         auto cu = buildShippedUnit("c", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
         assertNoBuilderErrors(*cu);
         auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                             ObjectFormatKind::Pe);
+                             SelectableObjectFormatKind::of(ObjectFormatKind::Pe),
+                             std::string_view{"x86_64"}, LongDoubleFormat::None,
+                             x86->get());
         TypeId const ty = firstCharLiteralType(model, *cu);
         EXPECT_FALSE(ty.valid())
             << "an astral L' char under pe (u16 wchar_t) must be left untyped";
@@ -906,6 +926,8 @@ TEST(SemanticAnalyzerC, CharStarToVoidStarArgImplicit) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "char* → void* must be implicit in c "
            "(implicitToVoidPtr: true)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -949,6 +971,8 @@ TEST(SemanticAnalyzerC, MultiParamCallAddressOfArgsNoStaleParamSpan) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArgCountMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-LANG-POINTER-VOID-CONVERT: the reverse direction (`void*` →
@@ -971,15 +995,21 @@ TEST(SemanticAnalyzerC, VoidStarToCharStarArgImplicit) {
            "(implicitFromVoidPtr: true). When C++ frontend lands, "
            "it would declare implicitFromVoidPtr: false and this "
            "direction would require an explicit cast.";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArgCountMismatch), 0u);
 }
 
-// D-LANG-POINTER-VOID-CONVERT negative pin: distinct typed pointers
-// remain mismatch under c (only `void*` ↔ `T*` is implicit;
-// `int*` → `char*` requires an explicit cast even in C).
+// D-LANG-POINTER-VOID-CONVERT negative pin: distinct typed pointers are
+// NOT the implicit `void*` ↔ `T*` conversion — `int*` ← `char*` is a C
+// constraint violation. ⚠ P68 round 9 (lane `cs`): it is DIAGNOSED, not refused
+// — gcc 13.3.0, mingw-w64 13.2.0 and MSVC 19.51 build it with a warning, so
+// DSS reports S_IncompatiblePointerConversion (a Warning) and converts
+// ([[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]).
+// What this pins is unchanged: the argument site runs the check, exactly once.
 TEST(SemanticAnalyzerC, DistinctTypedPointersRemainMismatch) {
     auto cu = buildShippedUnit("c", {
         "extern int handler(int* p);\n"
@@ -990,16 +1020,15 @@ TEST(SemanticAnalyzerC, DistinctTypedPointersRemainMismatch) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    // Pin EXACTLY ONE S_TypeMismatch (not duplicate cascade) AND
-    // zero adjacent mismatch codes — replaces the loose any-bool
-    // sawMismatch loop that would have admitted unrelated mismatch
-    // codes (S_ReturnTypeMismatch / S_ArgCountMismatch) as satisfying
-    // the assertion.
+    // Pin EXACTLY ONE diagnosed conversion (not a duplicate cascade) AND
+    // zero adjacent mismatch codes.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "char* → int* must NOT be implicit even in c — "
-           "void* is the only universal-pointer special case; "
-           "ordinary typed pointers require an explicit cast";
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "char* → int* is not an implicit conversion even in c — "
+           "void* is the only universal-pointer special case; the "
+           "pair is diagnosed";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(),
@@ -1025,6 +1054,8 @@ TEST(SemanticAnalyzerC, VoidStarReturnFromTypedPtrImplicit) {
                         DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "int* → void* via return must be implicit in c "
            "(implicitToVoidPtr: true)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 TEST(SemanticAnalyzerC, TypedPtrReturnFromVoidStarImplicit) {
@@ -1039,8 +1070,13 @@ TEST(SemanticAnalyzerC, TypedPtrReturnFromVoidStarImplicit) {
                         DiagnosticCode::S_ReturnTypeMismatch), 0u)
         << "void* → int* via return must be implicit in c "
            "(implicitFromVoidPtr: true). C++ would forbid.";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
+// P68 round 9 (lane `cs`): the return site DIAGNOSES the pair (a Warning, as every
+// reference that builds it warns) rather than refusing it — see
+// `DistinctTypedPointersRemainMismatch`.
 TEST(SemanticAnalyzerC, DistinctTypedReturnRemainsMismatch) {
     auto cu = buildShippedUnit("c", {
         "int* f(char* p) { return p; }\n",
@@ -1048,9 +1084,11 @@ TEST(SemanticAnalyzerC, DistinctTypedReturnRemainsMismatch) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "char* → int* via return must NOT be implicit even in "
-           "c (only void* gets the universal-pointer pass).";
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "char* → int* via return is not implicit even in c (only void* "
+           "gets the universal-pointer pass) — it is diagnosed";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
 }
 
 // D-CSUBSET-POINTER-DIFF-ARRAY-DECAY: `pointer - arrayName` (C 6.5.6p9 + 6.3.2.1p3) —
@@ -1078,6 +1116,8 @@ TEST(SemanticAnalyzerC, PointerMinusArrayTypesAsPointerDifferenceInt) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "ptr-array and array-ptr subtraction must type as the ptrdiff int (the array "
            "decays first), not a pointer → S_TypeMismatch, in an uncast int context";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
@@ -1094,6 +1134,10 @@ TEST(SemanticAnalyzerC, PointerMinusArrayTypesAsPointerDifferenceInt) {
 // assignment-statement isAssignable path.)
 // RED-ON-DISABLE: remove the assignment-statement isAssignable arm (restore the
 // bypass) -> the assignment is silently accepted, this count drops to 0.
+// ⚠ P68 round 9 (lane `cs`): the pair is DIAGNOSED (S_IncompatiblePointerConversion,
+// a Warning) at every site rather than refused — every reference that builds it
+// warns ([[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]).
+// The statement still runs the same check as the init; only the class changed.
 TEST(SemanticAnalyzerC, AssignStmtIntFromIncompatiblePointerFailsLoud) {
     auto cu = buildShippedUnit("c", {
         "int sink(char* q) { int* p; p = q; return *p; }\n",
@@ -1101,10 +1145,11 @@ TEST(SemanticAnalyzerC, AssignStmtIntFromIncompatiblePointerFailsLoud) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "an int* <- char* assignment STATEMENT must fail loud with the same "
-           "S_TypeMismatch the init (`int* p = q;`) emits — the "
-           "assignment-statement assignability bypass is closed";
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "an int* <- char* assignment STATEMENT must draw the same diagnostic "
+           "the init (`int* p = q;`) draws — the assignment-statement "
+           "assignability bypass is closed";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // (b) PARITY pin: the init form `int* p = q;` and the statement form `p = q;`
@@ -1120,10 +1165,12 @@ TEST(SemanticAnalyzerC, AssignStmtAndInitRejectIncompatibleIdentically) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    // P68 round 9 (lane `cs`): diagnosed at each site, not refused (see (a)).
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 2u)
-        << "the init site AND the assignment-statement site must each reject the "
-           "int* <- char* pair — two positioned S_TypeMismatch, not one";
+                        DiagnosticCode::S_IncompatiblePointerConversion), 2u)
+        << "the init site AND the assignment-statement site must each diagnose the "
+           "int* <- char* pair — two positioned reports, not one";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // (c) A VALID assignment statement stays byte-identically clean: int <- int,
@@ -1150,6 +1197,8 @@ TEST(SemanticAnalyzerC, ValidAssignStmtsRemainClean) {
            "ptr<-null, ptr<-&lvalue) must stay accepted — the new check admits "
            "exactly what the init/call-arg/return sites admit";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (c2) Valid assignment statements to NON-trivial LVALUES — a DEREF store
@@ -1178,6 +1227,8 @@ TEST(SemanticAnalyzerC, ValidLvalueStoreAssignStmtsRemainClean) {
            "store (s.m=v) of a compatible value must each stay clean — subtreeType "
            "returns the lvalue's value type for the assignability check";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (d) A COMPOUND assignment is NOT routed through the plain-assignment check:
@@ -1247,13 +1298,17 @@ TEST(SemanticAnalyzerC, NonZeroIntegerLiteralRejectsAsPointerArg) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    // Negative pin: ONLY the literal `0` admits as null pointer
+    // Negative pin: ONLY the value `0` admits as null pointer
     // constant — `1` (or any non-zero int) must NOT silently convert.
+    // P68 round 9 (lane `cs`): it is the DIAGNOSED integer→pointer conversion
+    // (S_IntegerPointerConversion, a Warning, as gcc, mingw and MSVC warn), never a
+    // silent null pointer.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
+                        DiagnosticCode::S_IntegerPointerConversion), 1u)
         << "non-zero int literal must NOT be admitted as a null "
            "pointer constant — only value-0 qualifies per C "
            "§6.3.2.3.3";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 TEST(SemanticAnalyzerC, NullPointerConstantAdmitsAsReturn) {
@@ -1300,10 +1355,12 @@ TEST(SemanticAnalyzerC, NullPointerConstantAdmitsAsInit) {
 
 // (a) INCOMPATIBLE object pointee, char* target: `char *p = &a` where `a` is
 // `long`. The pointee `long` is NOT compatible with `char`, so C 6.5.16.1
-// requires a diagnostic. Exactly ONE S_TypeMismatch.
+// requires a diagnostic. Exactly ONE — since P68 round 9 the diagnosed
+// conversion S_IncompatiblePointerConversion (a Warning; gcc, mingw and MSVC
+// build it with one), no longer an S_TypeMismatch refusal.
 // RED-ON-DISABLE: revert the subtreeType-with-scope fallback (stamped-walk only)
-// -> `&a` types as InvalidType, the isAssignable gate is skipped, and this count
-// drops to 0 (the silent-accept bug this anchor closes).
+// -> `&a` types as InvalidType, the check is skipped, and this count drops to 0
+// (the silent-accept bug this anchor closes).
 TEST(SemanticAnalyzerC, PtrInitFromAddressOfIncompatibleCharFailsLoud) {
     auto cu = buildShippedUnit("c", {
         "int main(void) { long a; char *p = &a; return 0; }\n",
@@ -1311,14 +1368,17 @@ TEST(SemanticAnalyzerC, PtrInitFromAddressOfIncompatibleCharFailsLoud) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "char* <- &long (incompatible object pointee) INITIALIZER must fail "
-           "loud — the address-of initializer runs the same C 6.5.16.1 check the "
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "char* <- &long (incompatible object pointee) INITIALIZER must be "
+           "diagnosed — the address-of initializer runs the same C 6.5.16.1 check the "
            "assignment form `p = &a` already runs";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // (b) INCOMPATIBLE object pointee, int* target: `int *p = &a` where `a` is `long`
-// (distinct integer types, distinct pointee). Exactly ONE S_TypeMismatch.
+// (distinct integer types, distinct pointee). Exactly ONE diagnosed conversion —
+// S_IncompatiblePointerConversion on LP64 (two widths), or its narrower
+// S_IncompatiblePointerIntegerPointee where `int` and `long` share a representation.
 // RED-ON-DISABLE: same as (a) — pre-fix this silently accepted.
 TEST(SemanticAnalyzerC, PtrInitFromAddressOfIncompatibleIntFailsLoud) {
     auto cu = buildShippedUnit("c", {
@@ -1327,8 +1387,12 @@ TEST(SemanticAnalyzerC, PtrInitFromAddressOfIncompatibleIntFailsLoud) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "int* <- &long (incompatible object pointee) INITIALIZER must fail loud";
+                        DiagnosticCode::S_IncompatiblePointerConversion)
+                  + countCode(model.diagnostics(),
+                              DiagnosticCode::S_IncompatiblePointerIntegerPointee),
+              1u)
+        << "int* <- &long (incompatible object pointee) INITIALIZER must be diagnosed";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // (c) LEGAL address-of initializers must STAY CLEAN. Each is a conversion the
@@ -1358,6 +1422,8 @@ TEST(SemanticAnalyzerC, PtrInitFromAddressOfLegalFormsStayClean) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "void*<-&obj, and same-pointee &-inits (char/long/int) must ALL stay "
            "accepted — the fix must not over-tighten a legal object-pointer init";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (d) A string-literal initializer of a char* (`char *p = "hi";`) is a legal
@@ -1374,6 +1440,8 @@ TEST(SemanticAnalyzerC, PtrInitFromStringLiteralStaysClean) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "`char *p = \"hi\";` is a legal string-literal pointer init — the "
            "address-of-initializer tightening must not touch it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // (e) PARITY: the address-of INITIALIZER form and the pointer-VARIABLE
@@ -1393,10 +1461,19 @@ TEST(SemanticAnalyzerC, PtrInitAddressOfAndPointerVarRejectIdentically) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    // P68 round 9 (lane `cs`): each site DIAGNOSES the pair (a Warning), see (a).
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 2u)
+                        DiagnosticCode::S_IncompatiblePointerConversion), 2u)
         << "the address-of initializer AND the pointer-variable initializer must "
-           "each reject the char* <- long-pointee pair — two S_TypeMismatch, not one";
+           "each diagnose the char* <- long-pointee pair — two reports, not one";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    // The vacuity sweep: the legal `long *lp = &a;` must draw NO diagnosed conversion
+    // under ANY of the three codes — counting S_IncompatiblePointerConversion alone
+    // could not see it turn into the same-representation one.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerIntegerPointee), 0u)
+        << "`long *lp = &a;` is compatible: no diagnosed conversion of any kind";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IntegerPointerConversion), 0u);
 }
 
 // 2nd-order audit pin (code-reviewer Critical, step 13.3a): the
@@ -1417,12 +1494,16 @@ TEST(SemanticAnalyzerC, InfixArithmeticStillFiresMismatchAtCallArg) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    // P68 round 9 (lane `cs`): an integer that is not a null pointer constant
+    // into a pointer is the DIAGNOSED conversion (a Warning) — the property pinned
+    // here is that the arg's type is SEEN, so it is diagnosed at all.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "int (from `1+1`) → char* must fire mismatch — the "
+                        DiagnosticCode::S_IntegerPointerConversion), 1u)
+        << "int (from `1+1`) → char* must be diagnosed — the "
            "subtreeType operator-stop must NOT match PlusOp on its "
            "INFIX usage at this wrapper (first-position child is "
            "the integer literal, not the operator)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING ✅ CLOSED) — F3 PIN FLIP: `f(-0)`. `-0` is a
@@ -1578,11 +1659,13 @@ TEST(SemanticAnalyzerC, ParenWrappedDistinctTypedPointersStillMismatch) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    // P68 round 9 (lane `cs`): the pair is diagnosed (a Warning), not refused.
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
-        << "paren-wrapped char* → int* must still fire mismatch — "
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "paren-wrapped char* → int* must still be diagnosed — "
            "operator-stop must NOT match ParenOpen (which shares "
            "the postfix-call SchemaTokenId with paren-wrapping)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // D-LANG-POINTER-VOID-CONVERT audit fold (silent-failure 2nd-order H2):
@@ -4067,8 +4150,12 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]
     // — __atomic_load_n/store_n/exchange_n + __atomic_fetch_{add,sub,or,xor,and};
     // 8 new SYMBOLS binding the SAME lowering verbs as the C11 *_explicit rows,
-    // so a second spelling rather than a new operation).
-    EXPECT_EQ(model.symbols().size() - 1, 105u);
+    // so a second spelling rather than a new operation) + the 2 FILE-SCOPE twins of
+    // `__func__` / `__FUNCTION__` (P68 round 9, lane `cs` — text "", bound in the
+    // builtin scope for a use outside every function body).
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    EXPECT_EQ(model.symbols().size() - 1, 108u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -4105,7 +4192,11 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // P66 [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]:
     // +8 for the GNU value-form __atomic_* builtins (a second SPELLING of the
     // C11 *_explicit operations above — same lowering verbs, no new operation).
-    ASSERT_EQ(model.symbols().size() - 1, 104u);
+    // P68 round 9 (lane `cs`): +2 for the FILE-SCOPE twins of `__func__` /
+    // `__FUNCTION__` (text "", bound in the builtin scope).
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    ASSERT_EQ(model.symbols().size() - 1, 107u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4823,10 +4914,11 @@ TEST(SemanticAnalyzerC, CharResultCallReturnedAsIntIsClean) {
 
 // R2 (sizeof char/string fold cycle): a CHARACTER constant has type `int`
 // (C 6.4.4.4 — the reason `sizeof('c')`==4, not 1). Pinned in a context where the
-// int type MATTERS: `f('c')` to an `int*` param fires a mismatch (int 99 is not a
-// pointer, and not the null constant 0). RED-ON-DISABLE: drop the CharLiteral→I32
-// `literalTypes` row → `'c'` is untyped → `isAssignable` short-circuits on
-// InvalidType → 0 mismatch (the literal would silently pass).
+// int type MATTERS: `f('c')` to an `int*` param is an integer→pointer conversion
+// (int 99 is not a pointer, and not the null constant 0) — since P68 round 9 the
+// DIAGNOSED one, S_IntegerPointerConversion (a Warning). RED-ON-DISABLE: drop the
+// CharLiteral→I32 `literalTypes` row → `'c'` is untyped → the check short-circuits
+// on InvalidType → 0 reports (the literal would silently pass).
 TEST(SemanticAnalyzerC, CharLiteralIsTypedIntNotUntyped) {
     auto cu = buildShippedUnit("c", {
         "extern void f(int* p);\n"
@@ -4834,16 +4926,17 @@ TEST(SemanticAnalyzerC, CharLiteralIsTypedIntNotUntyped) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "'c' has type int (C 6.4.4.4) → passing it to an int* param is a mismatch";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IntegerPointerConversion), 1u)
+        << "'c' has type int (C 6.4.4.4) → passing it to an int* param is diagnosed";
 }
 
 // R2: a STRING literal has type `char[N+1]` (C 6.4.5 — the reason `sizeof("abcd")`
 // ==5). Pinned where the ELEMENT type matters: passing "abc" to an `int*` param
-// fires a mismatch (Array<Char>→Ptr<int> fails the same-element-type array-decay
-// rule), while to a `char*` param it decays cleanly (0 — covered by the existing
-// string corpus). RED-ON-DISABLE: drop the StringLiteral `stringArray` row → "abc"
-// is untyped → `isAssignable` short-circuits → 0 mismatch.
+// pairs pointers to incompatible types (the decayed char* against int*) — since P68
+// round 9 the DIAGNOSED S_IncompatiblePointerConversion (a Warning) — while to a
+// `char*` param it decays cleanly (0 — covered by the existing string corpus).
+// RED-ON-DISABLE: drop the StringLiteral `stringArray` row → "abc" is untyped → the
+// check short-circuits → 0 reports.
 TEST(SemanticAnalyzerC, StringLiteralIsTypedCharArrayNotUntyped) {
     auto cu = buildShippedUnit("c", {
         "extern void g(int* p);\n"
@@ -4851,8 +4944,8 @@ TEST(SemanticAnalyzerC, StringLiteralIsTypedCharArrayNotUntyped) {
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DiagnosticBudget::libraryDefault());
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "\"abc\" is Array<Char,4> → an int* arg is an element mismatch (Char != int)";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "\"abc\" is Array<Char,4> → an int* arg pairs incompatible pointees (Char != int)";
 }
 
 // C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals
@@ -4986,7 +5079,7 @@ TEST(SemanticAnalyzerC, ConcatConflictIsTokenKindNotCoreEvenOnPe) {
         auto cu = buildShippedUnit("c", { "void f(){ u\"a\" L\"b\"; }" });
         assertNoBuilderErrors(*cu);
         auto model = pe ? analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64, std::nullopt, std::nullopt,
-                                  ObjectFormatKind::Pe)
+                                  SelectableObjectFormatKind::of(ObjectFormatKind::Pe))
                         : analyze(cu, DiagnosticBudget::libraryDefault());
         EXPECT_TRUE(model.hasErrors()) << (pe ? "pe" : "default");
         EXPECT_EQ(countCode(model.diagnostics(),
@@ -5170,6 +5263,8 @@ TEST(SemanticAnalyzerC, DefinitionParamsRemainBodyVisible) {
     EXPECT_FALSE(model.hasErrors())
         << "definition params must reach the body (cb/cb2 visible) while the "
            "fn-ptr params' inner `e`s stay isolated";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 }
@@ -5278,8 +5373,8 @@ TEST(SemanticAnalyzerC, BreakAfterLoopIsOutsideLoop) {
 // closes GAP F and proves the FC13 splice handles a spaced directive: one
 // tree, zero cross-refs, header text present.
 TEST(SemanticAnalyzerC, SpacedIncludeIsInlined) {
-    // D-TEST-FIXED-SCRATCH-PATH-POPULATION — the one site in this file that had
-    // drifted: the include dir came from a CONSTANT name under
+    // The one scratch site in this file that had drifted from its neighbours:
+    // the include dir came from a CONSTANT name under
     // `temp_directory_path()`, so two concurrent instances of this binary shared
     // it and the first one's `remove_all` deleted `x.h` while the second was
     // preprocessing (MEASURED: "cannot open .../dss_gapF_include_test/x.h" and
@@ -5794,13 +5889,18 @@ TEST(SemanticAnalyzerC, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
 // form no longer fires; a distinct-typed-pointer pair is the stable implicit-
 // rejected / explicit-accepted contrast that still exercises the same FC2
 // explicit-cast-vs-implicit-assignability split.)
+// ⚠ P68 round 9 (lane `cs`): the implicit form is now DIAGNOSED (S_IncompatiblePointerConversion,
+// a Warning, as gcc, mingw and MSVC warn) rather than refused; the contrast this pins
+// — implicit draws a diagnostic, the explicit cast draws none — is unchanged.
 TEST(SemanticAnalyzerC, ExplicitPointerCastAcceptedWhereImplicitRejected) {
     auto implicitModel = analyzeShipped("c", {
         "int* f(char* p) { return p; }\n",
     });
     EXPECT_EQ(countCode(implicitModel.diagnostics(),
-                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "the implicit char* -> int* conversion must stay rejected";
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "the implicit char* -> int* conversion must stay diagnosed";
+    EXPECT_EQ(countCode(implicitModel.diagnostics(),
+                        DiagnosticCode::S_ReturnTypeMismatch), 0u);
 
     auto castModel = analyzeShipped("c", {
         "int* f(char* p) { return (int*)p; }\n",
@@ -5809,6 +5909,8 @@ TEST(SemanticAnalyzerC, ExplicitPointerCastAcceptedWhereImplicitRejected) {
         << (castModel.diagnostics().all().empty()
                 ? ""
                 : castModel.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(castModel.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(castModel.diagnostics(),
                         DiagnosticCode::S_InvalidCast), 0u);
 }
@@ -6121,6 +6223,8 @@ TEST(SemanticAnalyzerC, PointerPlusIntIsCleanPointerTyped) {
         "int main(void){ return 0; }\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 // The key commutative case: `n + p` must type as a pointer, not the integer.
 TEST(SemanticAnalyzerC, IntPlusPointerIsCleanPointerTyped) {
@@ -6129,6 +6233,8 @@ TEST(SemanticAnalyzerC, IntPlusPointerIsCleanPointerTyped) {
         "int main(void){ return 0; }\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 TEST(SemanticAnalyzerC, PointerMinusIntIsCleanPointerTyped) {
     auto model = analyzeShipped("c", {
@@ -6136,6 +6242,8 @@ TEST(SemanticAnalyzerC, PointerMinusIntIsCleanPointerTyped) {
         "int main(void){ return 0; }\n",
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 // GUARD: `int + int` is NOT pointer arithmetic (the Ptr guard is not over-broad).
 TEST(SemanticAnalyzerC, IntPlusIntUnaffectedByPtrArith) {
@@ -6322,6 +6430,8 @@ TEST(SemanticAnalyzerC, PostStarConstCastStripsToPlainPointer) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // `(u32 * volatile)p` — a POST-star volatile is STRIPPED: the cast types as a
@@ -6522,7 +6632,7 @@ TEST(SemanticAnalyzerC, AtomicOnLongDoubleNotRejectedNonLockFree) {
            "not isByValueClass, so the wide-integer reject must NOT reach them";
 }
 
-// ★★ D-CSUBSET-INT128-CONSTFOLD (TF-C94) — a 128-bit INTEGER CONSTANT EXPRESSION.
+// ★★ D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94) — a 128-bit INTEGER CONSTANT EXPRESSION.
 //
 // THE DEFECT THIS PINS. `cst_const_eval.cpp`'s Cast fold gained a 128-bit arm that
 // routes `(__int128)`/`(__uint128_t)` casts through the bignum instead of narrowing
@@ -6772,6 +6882,8 @@ TEST(SemanticAnalyzerC, PointerCastsAccepted) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // Float↔pointer stays ILLEGAL (a C constraint mapCast mirrors: no
@@ -6800,6 +6912,8 @@ TEST(SemanticAnalyzerC, CastOfStringLiteralDecaysAndIsAccepted) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
         << "(char*)\"abc\" and (long)\"xy\" must decay-then-cast, "
            "never S_InvalidCast";
@@ -6828,6 +6942,8 @@ TEST(SemanticAnalyzerC, VoidDiscardCastAcceptsAllOperandTypes) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
         << "(void)x must admit every operand type (C 6.5.4p2)";
 }
@@ -7013,8 +7129,11 @@ TEST(SemanticAnalyzerC, VoidParamListDeclaresZeroParams) {
     EXPECT_EQ(in.kind(in.fnResult(tf)), TypeKind::I32);
 }
 
-// A NAMED void param is ill-formed (C 6.7.6.3p10 admits only the sole
-// UNNAMED `(void)`): S_InvalidVoidParam, positioned ON the param node.
+// A NAMED void param in a function DEFINITION is ill-formed (C 6.7.6.3p4: a
+// definition's parameters are complete, and C 6.7.6.3p10's `(void)` is the sole
+// UNNAMED one): S_InvalidVoidParam, positioned ON the param node. (In a declaration
+// that is NOT a definition, a named void is gcc's ordinary parameter of an
+// incomplete type and is accepted — see `test_function_type_completeness.cpp`.)
 TEST(SemanticAnalyzerC, NamedVoidParamFiresInvalidVoidParamPositioned) {
     auto cu = buildShippedUnit("c", {
         "int g(void x) { return 1; }\n",
@@ -7115,15 +7234,21 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // [[D-C-HAS-EXTENSION-CLAIMS-C-ATOMIC-WHILE-THE-GNU-ATOMIC-BUILTINS-DO-NOT-EXIST]]:
     // + the 8 GNU value-form __atomic_* builtins, which likewise mint symbols
     // without minting an operation (they bind the C11 rows' own lowering verbs).
-    EXPECT_EQ(model.symbols().size() - 1, 105u)
+    // P68 round 9 (lane `cs`): + the 2 FILE-SCOPE twins of `__func__` /
+    // `__FUNCTION__` (text "", bound in the builtin scope).
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    EXPECT_EQ(model.symbols().size() - 1, 108u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
-           "the 6 intrinsic builtins + the 8 GNU value-form __atomic_* builtins + "
+           "the 6 intrinsic builtins + __builtin_unreachable + "
+           "the 8 GNU value-form __atomic_* builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
            "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
            "the 6 byte-swap builtins (_byteswap_ushort/_byteswap_ulong/"
            "_byteswap_uint64 + __builtin_bswap16/32/64) + "
-           "__func__ + __FUNCTION__ — the multiplication mints none";
+           "__func__ + __FUNCTION__ + their 2 file-scope twins — the "
+           "multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -7171,6 +7296,8 @@ TEST(SemanticAnalyzerC, BareFnPtrCallTypesAndChecks) {
     EXPECT_FALSE(clean.hasErrors())
         << "a well-typed indirect call must be CLEAN (the c1 wall is "
            "retired)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(clean.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // Arity: fp(1, 2) against int(*)(int) -> exactly 1 S_ArgCountMismatch.
     auto arity = analyzeShipped("c", {
@@ -7193,9 +7320,13 @@ TEST(SemanticAnalyzerC, BareFnPtrCallTypesAndChecks) {
         "    return fp(p);\n"
         "}\n",
     });
+    // P68 round 9 (lane `cs`): a pointer into an `int` parameter is the DIAGNOSED
+    // pointer→integer conversion (a Warning) — through a function pointer exactly
+    // as through a direct call.
     EXPECT_EQ(countCode(badArg.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
+                        DiagnosticCode::S_IntegerPointerConversion), 1u)
         << "indirect calls must get the SAME per-arg checking as direct";
+    EXPECT_EQ(countCode(badArg.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // Bare function-to-pointer DECAY (C 6.3.2.1p4): a function NAME (no `&`)
@@ -7219,6 +7350,8 @@ TEST(SemanticAnalyzerC, BareFunctionNameDecaysToPointerInEveryPosition) {
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a bare function name assigned to a matching function pointer "
            "(`fp = add`) must decay to its address, not fail S_TypeMismatch";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(assign.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // (b) bare INITIALIZER (no `&`).
     auto init = analyzeShipped("c", {
@@ -7228,6 +7361,8 @@ TEST(SemanticAnalyzerC, BareFunctionNameDecaysToPointerInEveryPosition) {
     EXPECT_EQ(countCode(init.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a bare function name in an initializer must decay";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(init.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // (c) bare CALL-ARGUMENT (the callback position — `fn_fnptr_callback`).
     auto callback = analyzeShipped("c", {
@@ -7238,18 +7373,23 @@ TEST(SemanticAnalyzerC, BareFunctionNameDecaysToPointerInEveryPosition) {
     EXPECT_EQ(countCode(callback.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 0u)
         << "a bare function name as a call argument must decay";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(callback.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
-    // NEGATIVE (fail-loud preserved): an INCOMPATIBLE-signature decay must
-    // STILL be rejected — the decay is pinned to the SAME interned FnSig, so a
-    // different parameter list interns a distinct FnSig and stays a mismatch.
+    // NEGATIVE: an INCOMPATIBLE-signature decay is NOT a clean decay — the decay is
+    // pinned to the SAME interned FnSig, so a different parameter list interns a
+    // distinct FnSig. P68 round 9 (lane `cs`): gcc 13.3.0 and MSVC 19.51 build it
+    // with a warning (clang refuses), so it is the DIAGNOSED incompatible-pointer
+    // conversion, never a silent one.
     auto mismatch = analyzeShipped("c", {
         "int add(int a, int b) { return a + b; }\n"
         "int main() { int (*fp)(int) = add; return 0; }\n",
     });
     EXPECT_EQ(countCode(mismatch.diagnostics(),
-                        DiagnosticCode::S_TypeMismatch), 1u)
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
         << "decay does NOT relax signature compatibility — `int (*)(int) = add` "
-           "(add is int(int,int)) stays a loud mismatch";
+           "(add is int(int,int)) is diagnosed";
+    EXPECT_EQ(countCode(mismatch.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // (b) non-identifier callee whose STAMPED type is Ptr<FnSig> (the cast
@@ -7262,6 +7402,8 @@ TEST(SemanticAnalyzerC, CastFnPtrCalleeTypesAndChecks) {
         "int main() { int (*fp)(int) = &helper; return ((H)fp)(3); }\n",
     });
     EXPECT_FALSE(clean.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(clean.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     auto arity = analyzeShipped("c", {
         "int helper(int v) { return v; }\n"
@@ -7334,6 +7476,8 @@ TEST(SemanticAnalyzerC, DerefFnPtrCalleeTypesAndChecks) {
     });
     EXPECT_FALSE(clean.hasErrors())
         << "(*fp)(3) is a well-typed indirect call — must be clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(clean.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     auto arity = analyzeShipped("c", {
         "int helper(int v) { return v; }\n"
@@ -7639,8 +7783,9 @@ TEST(SemanticAnalyzerC, FnTypedefPointerObjectIsNotAPrototype) {
 // names it. That check also covers the INLINE spelling `int f(int)(int);`, which the
 // accident never reached at all.
 //
-// RED-ON-DISABLE (restated to match): remove the C 6.7.6.3p1 result-type check in
-// `resolveDeclTypes` (semantic_analyzer.cpp) → `f` is upgraded to a Function proto
+// RED-ON-DISABLE (restated to match): remove the C 6.7.6.3p1 return-type check at
+// the function suffix (`applyDeclaratorSuffix`, semantic_analyzer.cpp — its one
+// owner since P68 round 8, lane `ht`, part 2) → `f` is upgraded to a Function proto
 // and SILENTLY ACCEPTED (no diagnostic, hasErrors() false).
 TEST(SemanticAnalyzerC, FnTypedefParenGroupFnSuffixIsNotAPrototype) {
     auto model = analyzeShipped("c", {
@@ -8648,6 +8793,8 @@ TEST(SemanticAnalyzerC, AttributeDeclKindLinkageVocabularyWarnsOnATypedef) {
         SCOPED_TRACE(src);
         auto m = analyzeShipped("c", {src});
         EXPECT_FALSE(m.hasErrors());
+        EXPECT_FALSE(hasDiagnosedPointerConversion(m.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         EXPECT_EQ(ignoredForKindWarnings(m), 0u)
             << "the inert row must NOT fire where the linkage tier really does "
                "consume the name — that would be a false positive on the shape "
@@ -9377,7 +9524,7 @@ TEST(SemanticAnalyzerC, RepeatTypedefFunctionTypeIsAccepted) {
         << "two identical function-type typedefs are ONE interned FnSig";
 }
 
-// ── c33 D-CSUBSET-TENTATIVE-DEFINITION — a file-scope object declaration WITHOUT
+// ── c33 D-CSUBSET-TENTATIVE-DEFINITION-MERGE — a file-scope object declaration WITHOUT
 //    an initializer is a TENTATIVE DEFINITION (C 6.9.2): any number of tentatives
 //    + at most one real (initialized) definition of the same name MERGE into one
 //    object; two REAL definitions still collide. The merge reuses the
@@ -11039,6 +11186,8 @@ TEST(SemanticAnalyzerC, NullptrTernaryTypesAsPointer) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NullptrInvalidOperand), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A bare function designator / array name DECAYS to a pointer, so `nullptr == func`
@@ -11100,10 +11249,18 @@ TEST(SemanticAnalyzerC, EnumExplicitUnderlyingTypeSetsScalars) {
         << "the enum underlying scalar must be U8, not the default I32";
 }
 
+// P68 round 12 (lane `cs`, the enumeration P1): the two ENUMERATED types are read from
+// objects declared with them. This test used to read them from the constants `WA` / `NA`,
+// which rested on a constant being typed as its enumeration — not C's for `WA` (C17
+// 6.4.4.3p2: `int`; only a FIXED-type enumeration's constant is the enumerated type) —
+// and it expected `enum Wide`'s kind to be the "default int": under the SysV convention
+// this analysis runs (the LP64 default, "gnu") an enumeration with no negative value is
+// `unsigned int`, gcc's and clang's documented choice (lane `cs`'s `.temp/probe/ect8`).
 TEST(SemanticAnalyzerC, EnumUnderlyingTypeDistinctFromDefault) {
     auto cu = buildShippedUnit("c", {
-        "enum Wide { WA };\n"                     // default int
+        "enum Wide { WA };\n"                     // no fixed type: the convention chooses
         "enum Narrow : unsigned char { NA };\n"   // explicit u8
+        "enum Wide w; enum Narrow n;\n"
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
@@ -11113,13 +11270,16 @@ TEST(SemanticAnalyzerC, EnumUnderlyingTypeDistinctFromDefault) {
     TypeId wide{}, narrow{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         auto const& n = model.symbols()[i].name;
-        if (n == "WA") wide   = model.symbols()[i].type;
-        if (n == "NA") narrow = model.symbols()[i].type;
+        if (n == "w") wide   = model.symbols()[i].type;
+        if (n == "n") narrow = model.symbols()[i].type;
     }
     ASSERT_TRUE(wide.valid() && narrow.valid());
+    ASSERT_EQ(ti.kind(wide), TypeKind::Enum);
+    ASSERT_EQ(ti.kind(narrow), TypeKind::Enum);
     EXPECT_NE(wide.v, narrow.v)
         << "a different underlying type interns a DISTINCT enum TypeId";
-    EXPECT_EQ(ti.scalars(wide)[0],   static_cast<std::int64_t>(TypeKind::I32));
+    EXPECT_EQ(ti.scalars(wide)[0],   static_cast<std::int64_t>(TypeKind::U32))
+        << "no negative value: `unsigned int` under the gnu convention";
     EXPECT_EQ(ti.scalars(narrow)[0], static_cast<std::int64_t>(TypeKind::U8));
 }
 
@@ -11586,31 +11746,36 @@ TEST(SemanticAnalyzerC, ConstexprPointerCastNullFormsAccepted) {
 // only after `isAssignable` has already FAILED — so widening it there would
 // silently ADMIT incompatible-pointer conversions that both references diagnose.
 // These pins prove the widening did NOT happen at those sites: a `(float*)0`
-// initializer, argument and return still fail loud.
+// initializer, argument and return each still draw the incompatible-pointer
+// diagnostic — since P68 round 9 the DIAGNOSED conversion
+// (S_IncompatiblePointerConversion, a Warning, as gcc, mingw and MSVC warn) at all
+// three sites, never a silent null pointer.
 TEST(SemanticAnalyzerC, PointerCastNullWideningDidNotLeakToTheSharedSites) {
     auto initModel = analyzeShipped("c", {
         "int *p = (float *)0;\n"
         "int main(void) { return 0; }\n",
     });
-    EXPECT_EQ(countCode(initModel.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+    EXPECT_EQ(countCode(initModel.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
         << "decl-init keeps the incompatible-pointer diagnostic";
     auto argModel = analyzeShipped("c", {
         "int f(int *p);\n"
         "int main(void) { return f((float *)0); }\n",
     });
-    EXPECT_EQ(countCode(argModel.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+    EXPECT_EQ(countCode(argModel.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
         << "checkCall keeps the incompatible-pointer diagnostic";
-    // ⚠ The return site spells its refusal S_ReturnTypeMismatch, NOT S_TypeMismatch
-    // — ✔MEASURED: this assertion was written against the wrong code and the suite
-    // caught it. `checkReturn` calls `admitsNullPointerConstant` and then
-    // `emitMismatch`, which is the return-specific code.
     auto retModel = analyzeShipped("c", {
         "int *f(void) { return (float *)0; }\n"
         "int main(void) { return f() == 0 ? 0 : 1; }\n",
     });
     EXPECT_EQ(countCode(retModel.diagnostics(),
-                        DiagnosticCode::S_ReturnTypeMismatch), 1u)
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
         << "checkReturn keeps the incompatible-pointer diagnostic";
+    for (auto const* m : {&initModel, &argModel, &retModel}) {
+        EXPECT_EQ(countCode(m->diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+        EXPECT_EQ(countCode(m->diagnostics(), DiagnosticCode::S_ReturnTypeMismatch), 0u);
+    }
 }
 
 // P33 (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE, C23 6.7.1): a constexpr ARRAY / STRUCT
@@ -11859,19 +12024,28 @@ TEST(SemanticAnalyzerC, ParamNamedFuncNameRedeclares) {
            "bind (N4: bind-before-params)";
 }
 
-// The binding is FUNCTION-scoped (C99 6.4.2.2 declares __func__ inside each
-// function definition): at FILE scope there is no enclosing function and the
-// name resolves to NOTHING — a use fails loud as an ordinary undeclared
-// identifier, never a guessed global.
-TEST(SemanticAnalyzerC, FuncNameOutsideFunctionIsUndeclared) {
+// The per-function binding is FUNCTION-scoped (C99 6.4.2.2 declares __func__
+// inside each function definition). ★ P68 round 9 (lane `cs`): THIS PIN USED TO
+// ASSERT that a file-scope use is therefore UNDECLARED (S_UndeclaredIdentifier),
+// and that reading put DSS below the union: ✔MEASURED 2026-09-23, gcc 13.3.0
+// (-std=c2x) and clang 18.1.3 accept a file-scope `__func__` with a warning and
+// agree it names the EMPTY string (MSVC 19.51 refuses C2065). A use outside every
+// body now resolves to the builtin-scope twin — "", the warning at each use. The
+// full pin set is `PredefinedIdentifierAtFileScope`
+// (test_predefined_identifier_at_file_scope.cpp).
+TEST(SemanticAnalyzerC, FuncNameOutsideFunctionIsTheEmptyStringWithAWarning) {
     auto model = analyzeShipped("c", {
-        "int x = __func__[0];\n"
-        "int main(void) { return x; }\n",
+        "static const char *g = __func__;\n"
+        "int main(void) { return g[0]; }\n",
     });
-    EXPECT_GE(countCode(model.diagnostics(),
-                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
-        << "__func__ at file scope must be undeclared (the binding is "
-           "per-function-definition)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "__func__ at file scope names the file-scope twin, not nothing";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PredefinedIdentifierOutsideFunction), 1u);
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): standard-attribute
@@ -12971,6 +13145,8 @@ TEST(SemanticAnalyzerC, AutoStringLiteralDecaysToCharPointer) {
         "int main(void) { auto s = \"str\"; return s[0] == 's' ? 0 : 1; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* s = findSymbolNamed(model, "s");
     ASSERT_NE(s, nullptr);
     ASSERT_TRUE(s->type.valid());
@@ -12990,6 +13166,8 @@ TEST(SemanticAnalyzerC, AutoArrayVariableDecaysToElementPointer) {
         "}\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* p = findSymbolNamed(model, "p");
     ASSERT_NE(p, nullptr);
     ASSERT_TRUE(p->type.valid());
@@ -13006,6 +13184,8 @@ TEST(SemanticAnalyzerC, AutoFunctionNameDecaysToFunctionPointer) {
         "int main(void) { auto f = twice; return f(21); }\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* f = findSymbolNamed(model, "f");
     ASSERT_NE(f, nullptr);
     ASSERT_TRUE(f->type.valid());
@@ -13447,9 +13627,13 @@ TEST(SemanticAnalyzerC, AutoInfersExactKindsAcrossValueClasses) {
     };
     EXPECT_EQ(kindOf("s2"), TypeKind::Struct)
         << "a struct variable infers the struct type BY VALUE (no decay)";
-    EXPECT_EQ(kindOf("e"), TypeKind::Enum)
-        << "an enumerator infers the ENUM type (enumConvertsToArith covers "
-           "its uses; the type itself stays Enum)";
+    // P68 round 12 (lane `cs`, the enumeration P1): this pinned the ENUM type, which
+    // is not C's — an enumeration constant of an enumeration whose values fit `int` IS
+    // `int` (C17 6.4.4.3p2, C23 6.7.3.3p15), so `auto` infers `int`. ✔MEASURED
+    // 2026-09-24 (lane `cs`'s `.temp/probe/ectA`): `auto e = GREEN;` selects `int:` in
+    // `_Generic` under gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51.
+    EXPECT_EQ(kindOf("e"), TypeKind::I32)
+        << "an enumeration constant is `int`, so `auto` infers `int`";
     EXPECT_EQ(kindOf("b"), TypeKind::I32)
         << "a comparison infers int (C 6.5.8p6: the RESULT type of a relational "
            "operator is int, sourced config-drivenly — "
@@ -13678,6 +13862,8 @@ TEST(SemanticAnalyzerC, PtrToVlaFixedPointeeFromVlaObjectAccepts) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "`int (*p)[5] = b;` where b is `int[2][n]` is VALID C (6.7.6.2p6 — only two ICE "
            "bounds must agree) and both references compile and run it silently";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work
@@ -13702,6 +13888,8 @@ TEST(SemanticAnalyzerC, LocalAggregateBraceInitStaysCleanNoFalseTypeMismatch) {
            "S_TypeMismatch";
     EXPECT_FALSE(model.hasErrors())
         << "the brace-init control program must compile clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4b (D-CSUBSET-VLA): `typedef int R[n]; R a;` — a VLA TYPEDEF object — ACCEPTS at
@@ -13837,6 +14025,8 @@ TEST(SemanticAnalyzerC, ParamPtrToVlaAcceptsAndVlaArgDecays) {
     EXPECT_FALSE(model.hasErrors())
         << "the parameter pointer-to-VLA program analyzes clean at the semantic tier (the "
            "non-leaf VLA-object caller is a separate MIR-tier deferral, not a semantic error)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param FIX-5(a) (D-CSUBSET-VLA): a param pointer to a FIXED-length array
@@ -13857,6 +14047,8 @@ TEST(SemanticAnalyzerC, ParamPtrToFixedArrayStillAccepts) {
         << "a fixed-pointee `int (*p)[5]` param accepts a fixed `int b[2][5]` arg";
     EXPECT_FALSE(model.hasErrors())
         << "the fixed-pointee ptr param program must analyze clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param FIX-5(b) (D-CSUBSET-VLA): the ADJUSTED form `int a[][n]` — the outer `[]`
@@ -13877,6 +14069,8 @@ TEST(SemanticAnalyzerC, ParamAdjustedArrayOfVlaAccepts) {
         << "`int a[][n]` (the adjusted form) must accept a VLA-object arg";
     EXPECT_FALSE(model.hasErrors())
         << "the int a[][n] program must analyze clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param (D-CSUBSET-VLA) regression control: a PLAIN `int a[n]` param must STILL
@@ -13893,6 +14087,8 @@ TEST(SemanticAnalyzerC, PlainVlaArrayParamStillDecaysToPointer) {
     EXPECT_FALSE(model.hasErrors())
         << "a plain `int a[n]` param must DECAY to `int*` (a POINTER is reassignable); the "
            "paramDecay path must strip the outermost VLA, never leave a VLA-array object";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // VLA C4a-param THE KEY OPTION-B GUARD (D-CSUBSET-VLA): a struct field `int a[n]` (variable
@@ -13937,6 +14133,8 @@ TEST(SemanticAnalyzerC, ParamPtrToVlaFixedArgAccepts) {
            "COMPATIBLE with the param's `int (*)[n]` (the VLA bound is not an ICE)";
     EXPECT_FALSE(model.hasErrors())
         << "the fixed-array-argument program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — THE OTHER TWO SHAPES, which the row named none
@@ -13964,6 +14162,8 @@ TEST(SemanticAnalyzerC, PtrToVlaRowAndFixedRowAssignInBothDirections) {
            "VLA row and a constant row differ in no ICE bound";
     EXPECT_FALSE(model.hasErrors())
         << "the two-direction ptr-row assignment program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — THE BOUNDARY, and it is what keeps the fix a
@@ -13974,6 +14174,8 @@ TEST(SemanticAnalyzerC, PtrToVlaRowAndFixedRowAssignInBothDirections) {
 // all about the three admitted shapes (✔MEASURED 2026-09-03), so the diagnostic boundary is
 // the references' own. RED-ON-DISABLE: weaken `vlaCompatibleArrayTypes` to ignore lengths
 // (rather than to admit a sentinel level) and this stops firing.
+// P68 round 9 (lane `cs`): INCOMPATIBLE is now DIAGNOSED (S_IncompatiblePointerConversion,
+// a Warning — the references' own -Wincompatible-pointer-types) rather than refused.
 TEST(SemanticAnalyzerC, PtrToVlaFixedRowDifferentConstantsStillRejects) {
     auto model = analyzeShipped("c", {
         "int main(void) {\n"
@@ -13982,9 +14184,11 @@ TEST(SemanticAnalyzerC, PtrToVlaFixedRowDifferentConstantsStillRejects) {
         "  return p[0][0];\n"
         "}\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
         << "two DIFFERENT integer-constant array bounds stay INCOMPATIBLE (C 6.7.6.2p6) — "
            "the VLA relaxation admits a sentinel level, never a constant disagreement";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT ✅ — the ELEMENT type below the spine is still
@@ -14001,9 +14205,13 @@ TEST(SemanticAnalyzerC, PtrToVlaRowDifferentElementTypeStillRejects) {
         "  return f(2, b);\n"
         "}\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
-        << "a `float (*)[n]` parameter must still REJECT an `int[2][2]` argument — the "
-           "bounds straddle but the ELEMENT types are compared by identity";
+    // P68 round 9 (lane `cs`): diagnosed (a Warning), not refused — see above.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "a `float (*)[n]` parameter must still find an `int[2][2]` argument "
+           "INCOMPATIBLE — the bounds straddle but the ELEMENT types are compared by "
+           "identity";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
 }
 
 // ── VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): array-PARAMETER `static` / cv-qualifier
@@ -14022,6 +14230,8 @@ TEST(SemanticAnalyzerC, ArrayParamStaticDecaysToPointer) {
     EXPECT_FALSE(model.hasErrors())
         << "`int a[static 3]` is a legal parameter decoration (C 6.7.6.3p7) — accept + decay "
            "to `int*` (a reassignable pointer)";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "a PARAMETER `[static 3]` is legal — the non-parameter gate must NOT fire";
@@ -14045,6 +14255,8 @@ TEST(SemanticAnalyzerC, ArrayParamDecorationsAllDecayClean) {
     EXPECT_FALSE(model.hasErrors())
         << "every array-parameter decoration (static / const / volatile / restrict and "
            "combos) is legal in a parameter and decays to `int*`";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "no decoration on a PARAMETER may trip the non-parameter gate";
@@ -14072,6 +14284,8 @@ TEST(SemanticAnalyzerC, ArrayParamStarFormDecaysCleanNonParamFailsLoud) {
     });
     EXPECT_FALSE(param.hasErrors())
         << "a PARAMETER `int a[*]` must decay to a bare pointer + compile clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(param.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(param.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "a `[*]` on a PARAMETER must NOT trip the non-parameter gate";
@@ -14159,6 +14373,8 @@ TEST(SemanticAnalyzerC, ArrayParamStarInAPrototypeStaysLegal) {
            "beside it spells the real bound and must not be blamed for the prototype";
     EXPECT_FALSE(model.hasErrors())
         << "the prototype-plus-definition program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ★★ D-CSUBSET-VLA-PARAM-STAR ✅ — THE BOUNDARY, AND IT IS THE HALF A SUBTREE SCAN GETS
@@ -14185,6 +14401,8 @@ TEST(SemanticAnalyzerC, AbstractStarInNestedPrototypeInsideDefinitionStaysLegal)
            "inside a definition — both references compile AND run it";
     EXPECT_FALSE(model.hasErrors())
         << "the nested-prototype program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-PARAM-STAR-ABSTRACT ✅ CLOSED: the UNNAMED ABSTRACT `[*]` — `int f(int,
@@ -14219,6 +14437,8 @@ TEST(SemanticAnalyzerC, AbstractUnnamedStarArrayParamParsesAndDecays) {
            "directDeclarator's BASE alt, which now lists arrayStarSuffix";
     EXPECT_FALSE(abstractForm.hasErrors())
         << "the abstract `[*]` prototype + its bound-spelling definition analyze clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(abstractForm.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // The NAMED form in the SAME position is the control: it reached the suffix REPEAT and
     // worked before this change, so a red here would mean the repeat regressed instead.
@@ -14229,6 +14449,8 @@ TEST(SemanticAnalyzerC, AbstractUnnamedStarArrayParamParsesAndDecays) {
     });
     EXPECT_FALSE(namedForm.hasErrors())
         << "the NAMED `[*]` control must stay clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(namedForm.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // D-CSUBSET-VLA-PARAM-STAR-ABSTRACT ✅ — THE ROLLBACK the new base-alt candidate must not
@@ -14250,6 +14472,8 @@ TEST(SemanticAnalyzerC, AbstractArrayParamBoundsStillRollBackPastTheStarSuffix) 
            "arrayDeclSuffix";
     EXPECT_FALSE(constantBound.hasErrors())
         << "the abstract constant-bound prototype analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(constantBound.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // `int a[*p]` — the bound is the EXPRESSION `*p`, which begins with the same `*` the
     // star-modifier does and is exactly where a greedy `[ * ]` probe would mis-commit.
@@ -14263,6 +14487,8 @@ TEST(SemanticAnalyzerC, AbstractArrayParamBoundsStillRollBackPastTheStarSuffix) 
            "— the star-modifier rule is a fixed 3-token `[ * ]` and must not swallow it";
     EXPECT_FALSE(derefBound.hasErrors())
         << "the deref-sized-bound program analyzes clean";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(derefBound.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A `[static N]` on a NON-parameter (a LOCAL) is a constraint violation — these decorations
@@ -14341,6 +14567,8 @@ TEST(SemanticAnalyzerC, DerefSizedVlaStillCompiles) {
     EXPECT_FALSE(model.hasErrors())
         << "`int a[*p]` (a deref-sized VLA) must STILL compile — the `[*]`-vs-`[*expr]` "
            "speculation must parse `*p` as the bound, not the `*` decoration";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
         << "a deref bound `*p` is an expression, NOT the `[*]` decoration — no 0xE054";
@@ -14387,13 +14615,19 @@ TEST(SemanticAnalyzerC, ArrayStarOuterDecaysInnerStarFailsLoud) {
 }
 
 // VLA C4c (D-CSUBSET-VLA, audit IMPORTANT 3): a multi-dim VLA parameter whose INNER dim
-// carries a lenient `static` (`int a[n][static m]`) must locate the REAL inner bound `m` (the
-// shared bound-locator skips the `static`), never mis-size or spuriously reject. The inner
-// `static` is leniently accepted on a parameter (both dims carry paramDecay=true, so the gate
-// does not fire), and `m` still types the inner dimension. RED-ON-DISABLE: a mis-located bound
-// (reading `static` instead of `m`) would query the wrong node's type -> a spurious
-// S_VlaSizeNotInteger.
-TEST(SemanticAnalyzerC, MultiDimParamInnerStaticSizesCorrectly) {
+// carries a `static` (`int a[n][static m]`) must still locate the REAL inner bound `m` (the
+// shared bound-locator skips the `static`) — never a spurious S_VlaSizeNotInteger from reading
+// the keyword as the bound. RED-ON-DISABLE: a mis-located bound (reading `static` instead of
+// `m`) would query the wrong node's type -> a spurious S_VlaSizeNotInteger.
+// ★ P68 round 10 (lane `cs`): the inner `static` is REFUSED now, and this pin used to assert
+// the opposite. C 6.7.6.2p1 allows the keyword "only in the outermost array type derivation";
+// gcc 13.3.0 ("static or type qualifiers in non-parameter array declarator"), clang 18.1.3
+// ("'static' used in non-outermost array type derivation") and mingw-w64 13.2.0 refuse this
+// spelling, its definition twin and a fixed-dimension `int a[2][static 3]` in every mode, and
+// all three accept `int a[static n][m]` (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/bvs`).
+// The refusal is exactly ONE S_ArrayParamQualifierNonParameter, with the bound locator's point
+// kept beside it; the legal outermost spelling analyzes clean.
+TEST(SemanticAnalyzerC, MultiDimParamInnerStaticIsRefusedWithItsBoundLocated) {
     auto model = analyzeShipped("c", {
         "int f(int n, int m, int a[n][static m]);\n"
         "int main(void) { return 0; }\n",
@@ -14403,12 +14637,15 @@ TEST(SemanticAnalyzerC, MultiDimParamInnerStaticSizesCorrectly) {
         << "the inner `[static m]` bound must resolve to `m` (integer), never the `static` "
            "token -> no spurious S_VlaSizeNotInteger";
     EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
-        << "a lenient inner `[static m]` on a PARAMETER (paramDecay=true both dims) must NOT "
-           "trip the non-parameter gate";
-    EXPECT_FALSE(model.hasErrors())
-        << "`int a[n][static m]` (a multi-dim VLA param with a lenient inner `static`) "
-           "analyzes clean — the decoration is skipped, `m` sizes the inner dim";
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 1u)
+        << "a `static` in a parameter's INNER bracket is refused once (C 6.7.6.2p1: the "
+           "outermost array type derivation only)";
+    auto outer = analyzeShipped("c", {
+        "int f(int n, int m, int a[static n][m]);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_FALSE(outer.hasErrors())
+        << "`int a[static n][m]` — the `static` on the OUTERMOST bracket — analyzes clean";
 }
 
 // D-CSUBSET-VLA-PTR-INIT-FORM-TYPING — ✅ CLOSED IN P34, AND THE DEFERRAL'S OWN
@@ -14452,6 +14689,8 @@ TEST(SemanticAnalyzerC, PtrToVlaInitFormIsAcceptedAndKeepsItsVlaPointee) {
     EXPECT_FALSE(model.hasErrors())
         << "the pointer-to-VLA INIT form `int (*p)[n] = b` is the natural spelling and "
            "both references accept it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* p = findSymbolNamed(model, "p");
     ASSERT_NE(p, nullptr);
     ASSERT_TRUE(p->type.valid());
@@ -14488,6 +14727,151 @@ namespace {
                    std::nullopt, std::nullopt, axis);
 }
 } // namespace
+
+// P68 round 12 (lane `cs`, the enumeration P1): the integer type an enumeration without a
+// fixed underlying type is compatible with follows the ACTIVE FORMAT's convention
+// (`analyze()`'s trailing `EnumCompatibleTypeRule`): the Microsoft x64 ABI's `int` while
+// `int` holds every value, the SysV / AAPCS / Darwin `unsigned int` when no value is
+// negative — each the SAME TypeId the language gives that spelled type, so `_Generic`
+// and redeclarations can match it. `int` and `unsigned int` are their kinds' canonical
+// types (C's `typeSpecifiers` name only the types that SHARE a kind — `long`, `unsigned
+// long`, `long long` …), so the check that the vocabulary identity is carried is the
+// enumeration whose values need 64 bits: `unsigned long` under gnu (LP64), `unsigned long
+// long` under msvc — two U64 types C keeps distinct. An undeclared convention (wasm /
+// spirv) refuses such an enumeration — never a silent pick — while a FIXED underlying
+// type needs none.
+namespace {
+[[nodiscard]] SemanticModel analyzeWithEnumRule(std::initializer_list<std::string> sources,
+                                                EnumCompatibleTypeRule rule) {
+    auto cu = buildShippedUnit("c", sources);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, std::nullopt,
+                   std::nullopt, std::nullopt, std::nullopt, LongDoubleFormat::None,
+                   /*target=*/nullptr, /*deepRecursionReserveBytes=*/0,
+                   /*roleResolver=*/nullptr, rule);
+}
+} // namespace
+
+TEST(SemanticAnalyzerC, AnEnumerationsCompatibleTypeFollowsTheFormatsConvention) {
+    struct Row { EnumCompatibleTypeRule rule; TypeKind pos; char const* bigName; };
+    for (Row const row : {Row{EnumCompatibleTypeRule::Msvc, TypeKind::I32, "unsigned long long"},
+                          Row{EnumCompatibleTypeRule::Gnu, TypeKind::U32, "unsigned long"}}) {
+        auto model = analyzeWithEnumRule({"enum Pos { PA = 1 };\n"
+                                          "enum Neg { NA = -1 };\n"
+                                          "enum Big { BA = 0x100000000 };\n"
+                                          "enum Pos p; enum Neg n; enum Big b;\n"
+                                          "int main(void) { return 0; }\n"}, row.rule);
+        ASSERT_FALSE(model.hasErrors()) << enumCompatibleTypeRuleName(row.rule);
+        auto& in = model.lattice().interner();
+        auto const* p = findSymbolNamed(model, "p");
+        auto const* n = findSymbolNamed(model, "n");
+        auto const* b = findSymbolNamed(model, "b");
+        ASSERT_NE(p, nullptr);
+        ASSERT_NE(n, nullptr);
+        ASSERT_NE(b, nullptr);
+        TypeId const pu = in.enumUnderlyingType(p->type);
+        TypeId const nu = in.enumUnderlyingType(n->type);
+        TypeId const bu = in.enumUnderlyingType(b->type);
+        ASSERT_TRUE(pu.valid() && nu.valid() && bu.valid())
+            << enumCompatibleTypeRuleName(row.rule)
+            << ": the enumeration records no compatible type";
+        EXPECT_EQ(pu, in.primitive(row.pos))
+            << enumCompatibleTypeRuleName(row.rule)
+            << ": a non-negative enumeration is compatible with the canonical `"
+            << (row.pos == TypeKind::U32 ? "unsigned int" : "int") << "`";
+        EXPECT_EQ(nu, in.primitive(TypeKind::I32))
+            << "a negative value makes it `int` under both conventions";
+        EXPECT_EQ(in.kind(bu), TypeKind::U64) << enumCompatibleTypeRuleName(row.rule);
+        EXPECT_EQ(std::string{in.vocabularyName(bu)}, row.bigName)
+            << "the chosen type keeps its VOCABULARY identity — two U64 types C keeps apart";
+        EXPECT_FALSE(in.enumDeclaredUnderlying(p->type).valid())
+            << "a CHOSEN compatible type is not a FIXED underlying type";
+    }
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1): a constant wider than `int` has ITS OWN
+// type while the list is processed (C23 6.7.3.3p12) — its constant expression's (`A =
+// 0x100000000` is `long` on LP64, `0xFFFFFFFFFFFFFFFF` is `unsigned long`) — and a later
+// enumerator's constant expression folds it at that type. Two defects of the P1's first
+// trial build made it wrong, each silent (✔MEASURED, `.temp/probe/ectE`; gcc 13.3.0 and
+// clang 18.1.3 give the values below): the value's literal was typed nowhere at Pass 1.5
+// (0xFFFF… read as -1, `FB` was 0), and the shared constant builder folded an
+// integer-typed enumerator at I32 (`B` wrapped to 1).
+TEST(SemanticAnalyzerC, AConstantWiderThanIntFoldsAtItsOwnTypeDuringTheList) {
+    auto model = analyzeWithEnumRule({"enum E { A = 0x100000000, B = A + 1, C = A * 2 };\n"
+                                      "enum F { FA = 0xFFFFFFFFFFFFFFFF, FB = FA > 0 };\n"
+                                      "int main(void) { return 0; }\n"},
+                                     EnumCompatibleTypeRule::Gnu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const* b = findSymbolNamed(model, "B");
+    auto const* c = findSymbolNamed(model, "C");
+    auto const* fb = findSymbolNamed(model, "FB");
+    ASSERT_NE(b, nullptr);
+    ASSERT_NE(c, nullptr);
+    ASSERT_NE(fb, nullptr);
+    EXPECT_EQ(b->enumValue, std::int64_t{0x100000001}) << "`A + 1` at `long`, not 32 bits";
+    EXPECT_EQ(c->enumValue, std::int64_t{0x200000000}) << "`A * 2` at `long`, not 32 bits";
+    EXPECT_EQ(fb->enumValue, 1) << "0xFFFFFFFFFFFFFFFF is an `unsigned long` above zero";
+}
+
+// …and a fixed UNSIGNED type's value above INT64_MAX is simply a value of that type:
+// no conversion, no diagnostic (the conversion warning is for a NEGATIVE value only).
+TEST(SemanticAnalyzerC, AnUnsignedFixedTypesValueAboveInt64MaxDrawsNoDiagnostic) {
+    auto model = analyzeWithEnumRule(
+        {"enum AllOnes : unsigned long long { X = 0xFFFFFFFFFFFFFFFFULL };\n"
+         "enum TopBit : unsigned long long { T = 0x8000000000000000ULL };\n"
+         "int main(void) { return 0; }\n"},
+        EnumCompatibleTypeRule::Gnu);
+    EXPECT_TRUE(model.diagnostics().all().empty())
+        << "first: " << (model.diagnostics().all().empty()
+                             ? std::string{}
+                             : std::string{diagnosticCodeName(model.diagnostics().all()[0].code)});
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1): a NEGATIVE value for an UNSIGNED fixed type that
+// the SIGNED type of the same width holds is converted modulo 2^N, with the warning C23
+// 6.7.3.3p3's constraint asks for — clang 18.1.3's measured extent (lane `cs`'s
+// `.temp/probe/ect7d`, `ectC`); a value beyond that range stays refused, as all four references
+// refuse `-200` for `unsigned char`
+// ([[D-C-A-NEGATIVE-VALUE-FOR-AN-UNSIGNED-FIXED-ENUMERATION-IS-REFUSED-WHERE-CLANG-CONVERTS-IT]]).
+TEST(SemanticAnalyzerC, ANegativeValueForAnUnsignedFixedTypeIsConvertedWithAWarning) {
+    auto converted = analyzeWithEnumRule({"enum E : unsigned char { A = -1, B = -128 };\n"
+                                          "int main(void) { return 0; }\n"},
+                                         EnumCompatibleTypeRule::Gnu);
+    EXPECT_FALSE(converted.hasErrors());
+    EXPECT_EQ(countCode(converted.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueConvertedToUnderlyingType), 2u)
+        << "one warning per converted enumerator";
+    auto const* a = findSymbolNamed(converted, "A");
+    auto const* b = findSymbolNamed(converted, "B");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(a->enumValue, 255) << "-1 converts to UCHAR_MAX, as a conversion to the type does";
+    EXPECT_EQ(b->enumValue, 128);
+    auto beyond = analyzeWithEnumRule({"enum E : unsigned char { A = -200 };\n"
+                                       "int main(void) { return 0; }\n"},
+                                      EnumCompatibleTypeRule::Gnu);
+    EXPECT_EQ(countCode(beyond.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueConvertedToUnderlyingType), 0u);
+    EXPECT_EQ(countCode(beyond.diagnostics(), DiagnosticCode::S_EnumeratorValueOutOfRange), 1u)
+        << "beyond the same-width signed range: refused";
+}
+
+TEST(SemanticAnalyzerC, AnEnumerationUnderAnUndeclaredConventionIsRefusedAFixedOneIsNot) {
+    auto undeclared = analyzeWithEnumRule({"enum E { A = 1 };\n"
+                                           "int main(void) { return A; }\n"},
+                                          EnumCompatibleTypeRule::None);
+    EXPECT_EQ(countCode(undeclared.diagnostics(),
+                        DiagnosticCode::S_EnumCompatibleTypeRuleUndeclared), 1u)
+        << "no convention, no compatible type: refused, never guessed";
+    auto fixed = analyzeWithEnumRule({"enum F : long { A = 1 };\n"
+                                      "int main(void) { return (int)A; }\n"},
+                                     EnumCompatibleTypeRule::None);
+    EXPECT_EQ(countCode(fixed.diagnostics(),
+                        DiagnosticCode::S_EnumCompatibleTypeRuleUndeclared), 0u)
+        << "a FIXED underlying type is its own compatible type (C23 6.7.3.3p16)";
+    EXPECT_FALSE(fixed.hasErrors());
+}
 
 TEST(SemanticAnalyzerC, LongDoubleResolvesPerAxis) {
     struct Row { LongDoubleFormat axis; TypeKind expected; };
@@ -14714,7 +15098,8 @@ namespace fs = std::filesystem;
     builder.addInMemory(std::move(mainSrc), "main.c");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
-    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt, format, "x86_64");
+    return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt, std::nullopt,
+                   SelectableObjectFormatKind::of(format), "x86_64");
 }
 
 // The 17-function × {float,double,int} matrix. Every float-column result is
@@ -15077,14 +15462,18 @@ TEST(SemanticAnalyzerC, CharConvertsToAndFromFloatInAssignmentAndArgument) {
 // "Char is now a rank". A `char` is admitted to a FLOAT slot; it is NOT admitted
 // to a POINTER one, and neither gate says otherwise. Without this the pin above
 // would pass equally well over an arm that returned `true` for everything.
+// ⚠ P68 round 9 (lane `cs`): a `char` into a pointer is the integer→pointer
+// conversion C diagnoses, and it is now DIAGNOSED (S_IntegerPointerConversion, a
+// Warning, as gcc, mingw and MSVC warn) rather than refused — what this control
+// pins is that it is NOT the silent admission the float arm gives.
 TEST(SemanticAnalyzerC, CharToFloatAdmissionDoesNotLeakIntoPointerTargets) {
     auto model = analyzeRealTgmath(
         "#include <tgmath.h>\n"
         "int main(void) { char c; double *p; c = 7; p = c; return (int)*p; }\n",
         ObjectFormatKind::Elf, DataModel::Lp64);
-    EXPECT_TRUE(model.hasErrors())
-        << "`double *p = aChar;` must still be refused — the P46 clause admits "
-           "Char to a FLOAT slot, not to every slot";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IntegerPointerConversion), 1u)
+        << "`double *p = aChar;` must still be diagnosed — the P46 clause admits "
+           "Char to a FLOAT slot silently, not to every slot";
 }
 
 // ── D-CSUBSET-COMPLEX-TO-REAL-IMPLICIT-CONVERSION-REFUSED — the conversion
@@ -17136,6 +17525,8 @@ TEST(SemanticAnalyzerC, FunctionTypedefParamPrototypeAndDefinitionAgree) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // FORM (4) — an ABSTRACT (type-only) parameter, `int apply(Fn, int);`. C
@@ -17159,6 +17550,8 @@ TEST(SemanticAnalyzerC, AbstractFunctionTypedefParamAdjustsAndMergesWithNamedDef
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     // And the harvested FnSig itself carries the ADJUSTED parameter type.
     auto const* apply = findSym(model, "apply");
     ASSERT_NE(apply, nullptr);
@@ -17192,6 +17585,8 @@ TEST(SemanticAnalyzerC, NestedFnPtrDeclaratorFunctionTypedefParamAdjusts) {
         << "`ep = enumerate` type-checks ONLY if the fn-pointer's harvested "
            "params and the function's own params adjusted identically";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     // Structural pin on the fn-POINTER's pointee signature (the harvest path).
     auto const* ep = findSym(model, "ep");
     ASSERT_NE(ep, nullptr);
@@ -17230,6 +17625,8 @@ TEST(SemanticAnalyzerC, CallAndAddressOfAdjustedFunctionTypeParamAreWellTyped) {
                         DiagnosticCode::S_InvalidFunctionDeclarator), 0u);
     EXPECT_FALSE(model.hasErrors())
         << "the call THROUGH the adjusted parameter must dispatch cleanly";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ★ THE ANTI-VACUITY CONTROL. p8 is a PARAMETER rule and nothing else. A
@@ -17266,6 +17663,8 @@ TEST(SemanticAnalyzerC, InlineFunctionTypedParamIsNotClassifiedAPrototype) {
         "int main(void) { return apply(twice, 21); }\n",
     });
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* g = findSym(model, "g");
     ASSERT_NE(g, nullptr);
     EXPECT_FALSE(g->isProtoDeclaration)
@@ -17296,6 +17695,8 @@ TEST(SemanticAnalyzerC, SameNamedInlineFunctionTypedParamsDoNotCollide) {
         << "two functions' parameters merely SHARE a name — a parameter has no "
            "linkage (C 6.2.1p4) and must never merge across functions";
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     // TWO symbols named `g`, in DIFFERENT scopes, with DIFFERENT pointees. A
     // re-homed pair collapses to one symbol, which fails the count first.
     std::vector<SymbolRecord const*> gs;
@@ -17884,7 +18285,7 @@ namespace {
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
                    AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
-                   std::nullopt, format, arch);
+                   std::nullopt, SelectableObjectFormatKind::of(format), arch);
 }
 
 // The symbol a SOURCE declaration minted (a valid `tree`), vs the one descriptor
@@ -17950,6 +18351,8 @@ TEST(SemanticAnalyzerC, SourceTagUnifiesWithDescriptorMember) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     // The IDENTITY itself, asserted directly and in BOTH directions so a green
     // result cannot come from a weakened assignment check.
@@ -17993,6 +18396,8 @@ TEST(SemanticAnalyzerC, DescriptorOnlyTimespecIsAlreadyOneType) {
     EXPECT_FALSE(model.hasErrors())
         << (model.diagnostics().all().empty()
                 ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 
     SymbolRecord const* member = findInjectedSym(model, "st_mtimespec");
     SymbolRecord const* tag    = findInjectedSym(model, "timespec");
@@ -18357,16 +18762,22 @@ namespace {
     }
     FormatRuntimeLibraryRoleResolver const roles{**formatSchema};
     return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel, std::nullopt,
-                   std::nullopt, format, arch, LongDoubleFormat::None, nullptr, 0,
+                   std::nullopt, SelectableObjectFormatKind::of(format), arch, LongDoubleFormat::None, nullptr, 0,
                    &roles);
 }
 
-// The reproducer, verbatim: legal C that clang and GCC both accept, and the
-// single most-redeclared identifier in the language.
+// The reproducer: legal C that clang and GCC both accept, and the single
+// most-redeclared identifier in the language.
+// ⚠ THE `\\n` IS THE C ESCAPE, AND IT USED TO BE A REAL NEW-LINE. This literal
+// once read `printf(\"hi\n\")`, which puts an actual line break INSIDE the C
+// string — ✔MEASURED 2026-09-22, gcc 13.3.0 and clang 18.1.3 both REFUSE that
+// text ("missing terminating \" character"), while this escaped form compiles.
+// It stayed green only because DSS's lexer let a string literal run across
+// lines ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]).
 constexpr char const* kPrintfRedeclSrc =
     "#include <stdio.h>\n"
     "int printf(const char *fmt, ...);\n"
-    "int main(void) { return printf(\"hi\n\"); }\n";
+    "int main(void) { return printf(\"hi\\n\"); }\n";
 
 } // namespace
 
@@ -18377,6 +18788,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedPeStdioRowCarriesItsSynthesizeRecipe) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
                                   DataModel::Llp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr)
         << "goal-2 suppressed the descriptor's printf — the row must be recorded";
@@ -18401,6 +18814,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedRowSignatureMatchesTheUserPrototype) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Pe,
                                   DataModel::Llp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr);
     ASSERT_TRUE(sup->signature.valid())
@@ -18429,6 +18844,8 @@ TEST(SemanticAnalyzerC, TFC112SuppressedElfStdioRowCarriesNoRecipe) {
     auto model = analyzeRealStdio(kPrintfRedeclSrc, ObjectFormatKind::Elf,
                                   DataModel::Lp64, "x86_64");
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     auto const* sup = model.suppressedShippedSymbolFor("printf");
     ASSERT_NE(sup, nullptr);
     EXPECT_TRUE(sup->recipeId.empty())
@@ -18507,6 +18924,8 @@ TEST(SemanticAnalyzerC, TFC121SuppressedDarwinRowCarriesItsPerTargetLinkName) {
         EXPECT_FALSE(model.hasErrors())
             << (model.diagnostics().all().empty()
                     ? "" : model.diagnostics().all()[0].actual);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
         auto const* sup = model.suppressedShippedSymbolFor("fstat");
         if (sup == nullptr) {
             ADD_FAILURE()
@@ -19902,6 +20321,8 @@ TEST(SemanticAnalyzerC, TypeofLiteralOperandResolvesInEverySpecifierPosition) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
         << "the pointer position with an initializer used to fail S0003 — it "
            "resolved the head to nothing and compared the initializer against it";
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     for (char const* name : {"tGlobal", "TTypedef", "tMember", "tParam",
                              "tLocal"}) {
         SymbolRecord const* s = findSym(model, name);
@@ -20507,6 +20928,8 @@ TEST(SemanticAnalyzerC, TheDiscardingContextsForAVoidExpressionStillCompile) {
         << "a void expression is admissible wherever its value is DISCARDED — "
            "comma, the (void) cast, a bare statement, and sizeof";
     EXPECT_FALSE(model.diagnostics().hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN ─────────────
@@ -20770,6 +21193,8 @@ TEST(SemanticAnalyzerC, WritesToNonConstFieldsDrawNoConstViolation) {
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // A const-declared member READ, and INITIALIZED through the aggregate
@@ -21004,6 +21429,8 @@ TEST(SemanticAnalyzerC, ConditionalWithArrayArmAndVoidPointerIsAccepted) {
                         DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // The pointer form of the same pairing, both arm orders.
@@ -21016,6 +21443,8 @@ TEST(SemanticAnalyzerC, ConditionalWithObjectPointerAndVoidPointerIsAccepted) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ConditionalOperandTypeMismatch), 0u);
     EXPECT_FALSE(model.hasErrors());
+    EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+        << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
 }
 
 // ── P50: D-CSUBSET-LINKAGE-INTERNAL-EXTERNAL-MISMATCH ──────────────────────
@@ -22878,6 +23307,8 @@ TEST(SemanticAnalyzerC, AnArrayInTheGenericAccessorBindingPositionDecays) {
                             DiagnosticCode::S_TypeMismatch), 0u)
             << a.expr << ": the binding must SPECIALIZE, not fall back to the "
                          "i32 exemplar and mismatch against it";
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 
@@ -22914,5 +23345,356 @@ TEST(SemanticAnalyzerC, AnAtomicPointerRmwOperandIsPtrdiffNotThePointee) {
         EXPECT_EQ(countCode(model.diagnostics(),
                             DiagnosticCode::S_TypeMismatch), 0u)
             << a.call << ": " << a.why;
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
+}
+
+// ══ [[D-SEMANTIC-ANALYZE-ACTIVE-FORMAT-ADMITS-THE-UNKNOWN-SENTINEL]] ═══════════
+//
+// `dss::analyze`'s active format has ONE spelling of "no format". It was typed
+// `std::optional<ObjectFormatKind>`, so a direct caller could hand it an ENGAGED
+// `ObjectFormatKind::Unknown`: a value the literal-prefix resolver's bridge then
+// refused by aborting the process (C's wide openers resolve at analysis start),
+// the role-resolver agreement check compared by the sentinel's name, and the
+// shipped-header availability gates read as a REAL format on which nothing is
+// available. It is now `std::optional<SelectableObjectFormatKind>`, a type the
+// sentinel cannot inhabit, so that call does not compile.
+//
+// Asked of the CALL at run time, on purpose: a `static_assert` would turn a
+// regression into a build failure, which leaves ctest running the previous binary
+// green. And asked of the call EXPRESSION, so a convenience overload re-admitting
+// the wide type — the likeliest way it comes back — reds here instead of making
+// the call ambiguous.
+namespace {
+template <class Fmt>
+concept AnalyzeAcceptsFormat =
+    requires(std::shared_ptr<CompilationUnit const> cu, Fmt fmt) {
+        dss::analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                     std::nullopt, std::nullopt, fmt);
+    };
+} // namespace
+
+TEST(SemanticAnalyzerActiveFormat, TheSentinelCannotBeHandedToAnalyze) {
+    EXPECT_FALSE(AnalyzeAcceptsFormat<ObjectFormatKind>)
+        << "a bare ObjectFormatKind — `Unknown` among its values — must not reach "
+           "the analysis";
+    EXPECT_FALSE(AnalyzeAcceptsFormat<std::optional<ObjectFormatKind>>)
+        << "an optional<ObjectFormatKind> spells \"no format\" twice";
+    EXPECT_TRUE(AnalyzeAcceptsFormat<std::optional<SelectableObjectFormatKind>>);
+    EXPECT_TRUE(AnalyzeAcceptsFormat<std::nullopt_t>)
+        << "nullopt is THE spelling of \"no format\"";
+}
+
+// ONE SPELLING, observed through the analysis: the kind `of()` refuses is "no
+// format", and it analyses EXACTLY as `nullopt` does — while a real format still
+// reaches the per-pair resolution (`wchar_t` is 16 bits for x86_64 × PE, read
+// from the target's `abiTypedefs`; with no format there is no pair and the row's
+// base core, 32 bits, answers), so the type carries the kind it is given. The
+// target is the same in all three analyses, so only the format varies.
+TEST(SemanticAnalyzerActiveFormat, TheRefusedKindAnalysesAsNoFormatAndARealKindIsCarried) {
+    auto const x86 = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(x86.has_value()) << "the shipped x86_64 target: the pair's processor half";
+    auto const wideCharKind = [&](std::optional<SelectableObjectFormatKind> fmt) {
+        auto cu = buildShippedUnit("c", { "void f(){ L'x'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Llp64,
+                             std::nullopt, std::nullopt, fmt,
+                             std::string_view{"x86_64"}, LongDoubleFormat::None,
+                             x86->get());
+        EXPECT_FALSE(model.hasErrors());
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        EXPECT_TRUE(ty.valid());
+        return ty.valid() ? model.lattice().interner().kind(ty) : TypeKind::Void;
+    };
+    ASSERT_FALSE(SelectableObjectFormatKind::of(ObjectFormatKind::Unknown).has_value());
+    EXPECT_EQ(wideCharKind(std::nullopt), TypeKind::I32)
+        << "no format: the base wchar_t core";
+    EXPECT_EQ(wideCharKind(SelectableObjectFormatKind::of(ObjectFormatKind::Unknown)),
+              TypeKind::I32)
+        << "the kind `of()` refuses IS \"no format\" — there is no second reading";
+    EXPECT_EQ(wideCharKind(SelectableObjectFormatKind::of(ObjectFormatKind::Pe)),
+              TypeKind::U16)
+        << "a real kind reaches the per-pair resolution (wchar_t is u16 for x86_64 × PE)";
+}
+
+// ══ [[D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED]] ═══════════════════════════════
+//
+// A parameter may DEFINE its struct, union or enum type, and C 6.2.1p4 scopes what
+// the list declares: visible to the rest of the list and, in a definition, to the
+// body — ONE scope with the body's outermost block — and to nothing after the
+// function. ✔MEASURED 2026-09-23, each reference separately: gcc 13.3.0 and clang
+// 18.1.3 (-std=c2x, -std=c17), MinGW gcc and MSVC 19.51 build and RUN every accepted
+// shape below and refuse every refused one; DSS refused them all P_UnexpectedToken
+// (`declHeadForParam` offered only the ref-only specifiers). The RUN witnesses are
+// examples/c/param_list_tag_definition and the two examples/c/param_scope_body_*
+// programs; these pins name the scope facts behind them, one arm per shape.
+//
+// RED-ON-DISABLE, per mechanism: (1) the ref-only arms back in `declHeadForParam`
+// → every accepted arm reds on its front-end error; (2) the parameter-list stop out
+// of `floatToNamespaceScope` → a definition's tag and enumerators leak to the file
+// scope and the after-the-function refusals are ACCEPTED; (3) the pair-aware
+// one-scope check off → the body-redeclaration refusals red and the two MSVC
+// exemptions stay green.
+namespace {
+struct ParamListProbe {
+    std::shared_ptr<CompilationUnit const> cu;
+    SemanticModel model;
+    [[nodiscard]] std::size_t frontEndErrors() const {
+        std::size_t n = 0;
+        for (auto const& t : cu->trees())
+            for (auto const& d : t.diagnostics().all())
+                if (d.severity == DiagnosticSeverity::Error) ++n;
+        return n;
+    }
+    [[nodiscard]] std::size_t count(DiagnosticCode c) const {
+        return countCode(model.diagnostics(), c);
+    }
+};
+
+[[nodiscard]] ParamListProbe analyseParamListShape(std::string const& src) {
+    auto cu = buildShippedUnit("c", {src});
+    auto model = analyze(cu, DiagnosticBudget::libraryDefault());
+    return ParamListProbe{std::move(cu), std::move(model)};
+}
+
+struct ParamListArm {
+    char const* src;
+    std::size_t tagWarnings;   // S_TagDeclaredInParameterList expected
+    char const* why;
+};
+} // namespace
+
+// The census site `declHeadForParam`, switched to the unified specifiers: every
+// accepted shape analyses clean and draws ONE S_TagDeclaredInParameterList per tag
+// the list defines (gcc warns at the same positions), and a later `struct Cell`
+// REFERENCE draws none.
+TEST(SemanticAnalyzerCParamListTag, EveryAcceptedShapeIsCleanAndWarnsOncePerTag) {
+    std::array<ParamListArm, 10> const arms{{
+        {"int f(struct S { int a; int b; } *p) { struct S local = { 40, 2 };"
+         " if (p == 0) p = &local; return p->a + p->b; }\n",
+         1, "a struct defined in a definition's list, named again in the body"},
+        {"int f(union U { int i; char c; } *w) { union U local; local.i = 7;"
+         " if (w == 0) w = &local; return w->i; }\n",
+         1, "a union"},
+        {"int f(enum E { A = 40, B } e) { return e + (B - A) + 1; }\n",
+         1, "an enum whose enumerators the body uses"},
+        {"int f(struct { int a; int b; } *p) { return p ? p->a + p->b : 42; }\n",
+         1, "an anonymous struct"},
+        {"int f(struct A { struct B { int x; } b; } *p) { struct B q = { 42 };"
+         " (void)p; return q.x; }\n",
+         2, "a tag nested in a tag the list defines reaches the body too"},
+        {"int f(struct S { int a; } *p, struct S *q) { struct S t = { 42 };"
+         " if (p == 0) p = &t; if (q == 0) q = p; return q->a; }\n",
+         1, "a later parameter's `struct S` is a REFERENCE to the earlier definition"},
+        {"int g(struct T { int b; } *t);\n",
+         1, "a prototype's list: function-prototype scope"},
+        {"int apply(int (*cb)(struct T { int b; } *t)) { return cb ? 0 : 42; }\n",
+         1, "a function-pointer parameter's own list"},
+        {"int f(int a[sizeof(struct S { char x[10]; })]) { (void)a;"
+         " return (int)sizeof(struct S); }\n",
+         1, "a type name inside a parameter's declarator (the type-name base) "
+            "binds where the list's parameters bind"},
+        {"int main(void) { int g(struct T { int b; } *t); return 42; }\n",
+         1, "a block-scope prototype"},
+    }};
+    for (auto const& a : arms) {
+        auto const p = analyseParamListShape(a.src);
+        EXPECT_EQ(p.frontEndErrors(), 0u) << a.why << "\n" << a.src;
+        EXPECT_FALSE(p.model.hasErrors()) << a.why << "\n" << a.src;
+        EXPECT_FALSE(hasDiagnosedPointerConversion(p.model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
+        EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), a.tagWarnings)
+            << a.why << "\n" << a.src;
+    }
+}
+
+// Refused by name: what a definition's list declares ends with the body. Before
+// the parameter-list stop the enumerator and the tag leaked to the FILE scope, so
+// the first two arms were ACCEPTED (✔MEASURED on the grammar swap alone).
+TEST(SemanticAnalyzerCParamListTag, AnEnumeratorOfTheListIsUndeclaredAfterTheFunction) {
+    auto const p = analyseParamListShape(
+        "int f(enum E { A = 40, B } e) { return e + 2; }\n"
+        "int main(void) { return f(A); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "`A` has the body's block scope (C 6.2.1p4); all four references refuse it "
+           "in main";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ATagOfADefinitionsListIsNotVisibleAfterIt) {
+    auto const p = analyseParamListShape(
+        "int f(struct S { int a; } *p) { return p ? p->a : 42; }\n"
+        "struct S y;\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "the file-scope `struct S` is a NEW tag, never completed";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ATagOfAPrototypesListIsNotVisibleAfterIt) {
+    auto const p = analyseParamListShape(
+        "void g(struct T { int b; } t);\n"
+        "struct T x;\n"
+        "int main(void) { return 42; }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "function-prototype scope ends with the declarator";
+}
+
+// A file-scope `struct S` whose members come in ANOTHER order is not the
+// parameter's type in any C (C23 6.2.7p1 requires the same order), so the call is
+// refused for the argument's type — not, as the swap alone reported it, as a
+// redeclaration of the tag.
+TEST(SemanticAnalyzerCParamListTag, AFileScopeTwinWithReorderedMembersIsAnotherType) {
+    auto const p = analyseParamListShape(
+        "struct S { int b; int a; };\n"
+        "int f(struct S { int a; int b; } s) { return s.a + s.b; }\n"
+        "int main(void) { struct S x = { 2, 40 }; return f(x); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_TypeMismatch), 1u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "the list's tag is not declared where the file's lives";
+}
+
+// The ONE scope a definition's list shares with its body's outermost block. All
+// four references refuse every arm; DSS accepted the four parameter arms before
+// (the body shadowed the parameter), and the list-declared arms are new with the
+// grammar swap.
+TEST(SemanticAnalyzerCParamListTag, ABodyRedeclarationOfWhatTheListDeclaredIsRefused) {
+    std::array<std::pair<char const*, char const*>, 8> const arms{{
+        {"int f(int x) { int x = 42; return x; }\n", "an object vs a parameter"},
+        {"int f(int x) { static int x = 42; return x; }\n", "a static object vs a parameter"},
+        {"int f(int T) { typedef int T; T v = 42; return v; }\n", "a typedef vs a parameter"},
+        {"int g(void) { return 42; }\n"
+         "int f(int g) { extern int g(void); return g(); }\n",
+         "an extern function vs a parameter"},
+        {"int f(enum E { A = 1 } e) { int A = 42; (void)e; return A; }\n",
+         "an object vs an enumerator the list declared"},
+        {"int f(enum E { A = 1 } e) { typedef int A; A v = 42; (void)e; return v; }\n",
+         "a typedef vs an enumerator the list declared"},
+        {"int f(struct S { int a; } *p) { struct S { int b; } t = { 42 }; (void)p;"
+         " return t.b; }\n",
+         "a tag vs a tag the list defined"},
+        {"int f(struct S { int a; } *p) { union S { int a; } t = { 42 }; (void)p;"
+         " return t.a; }\n",
+         "a union tag vs a struct tag the list defined"},
+    }};
+    for (auto const& [src, why] : arms) {
+        auto const p = analyseParamListShape(src);
+        EXPECT_EQ(p.frontEndErrors(), 0u) << why;
+        EXPECT_EQ(p.count(DiagnosticCode::S_RedeclaredSymbol), 1u) << why << "\n" << src;
+    }
+}
+
+// The control: a NESTED block is a new scope, where every one of those names may
+// be declared again — legal in all four references.
+TEST(SemanticAnalyzerCParamListTag, ANestedBlockMayRedeclareWhatTheListDeclared) {
+    std::array<char const*, 3> const arms{{
+        "int f(int x) { { int x = 42; return x; } }\n",
+        "int f(enum E { A = 1 } e) { { int A = 42; (void)e; return A; } }\n",
+        "int f(struct S { int a; } *p) { { struct S { int b; } t = { 42 }; (void)p;"
+        " return t.b; } }\n",
+    }};
+    for (char const* src : arms) {
+        auto const p = analyseParamListShape(src);
+        EXPECT_EQ(p.frontEndErrors(), 0u) << src;
+        EXPECT_FALSE(p.model.hasErrors()) << src;
+    }
+}
+
+// The two body redeclarations a reference BUILDS AND RUNS (MSVC 19.51; gcc and
+// clang refuse), kept accepted with MSVC's meaning — the body's own entity. Their
+// RUN witnesses are the two examples/c/param_scope_body_* programs.
+TEST(SemanticAnalyzerCParamListTag, ABodyEnumeratorMayRepeatAParameterName) {
+    auto const p = analyseParamListShape(
+        "int f(int A) { enum E { A = 42 }; return A; }\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "MSVC builds it and runs it to 42 — the enumerator hides the parameter";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ABodyEnumeratorMayRepeatAnEnumeratorOfTheList) {
+    auto const p = analyseParamListShape(
+        "int f(enum E { A = 1 } e) { enum F { A = 42 }; (void)e; return A; }\n"
+        "int main(void) { return f(1); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors()) << "MSVC builds it and runs it to 42";
+}
+
+TEST(SemanticAnalyzerCParamListTag, ABodyMayDeclareItsOwnFuncName) {
+    auto const p = analyseParamListShape(
+        "int f(void) { static const char __func__[] = \"g\";"
+        " return __func__[0] == 'g' ? 42 : 0; }\n"
+        "int main(void) { return f(); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "MSVC builds it and runs it to 42 — the body's array is the one named";
+}
+
+// A BARE tag reference in a DEFINITION's list takes C's reading — the body's block
+// scope (C 6.2.1p4), gcc's and clang's — since P68 round 9 (lane `cs`). It kept
+// MSVC's file-scope reading until then ONLY because C's reading makes `g(p)` below
+// pass a pointer of ANOTHER type, which DSS refused while every reference builds it
+// ([[D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS]]);
+// that conversion is now admitted with its warning, so the two definitions' `struct
+// Q` are two types, each warns that it is declared inside a parameter list (gcc
+// 13.3.0 and clang 18.1.3 both do), and the program still builds and runs 42.
+TEST(SemanticAnalyzerCParamListTag, ABareTagReferenceInADefinitionsListTakesTheBodysScope) {
+    auto const p = analyseParamListShape(
+        "int g(struct Q *p) { return p == 0 ? 40 : 0; }\n"
+        "int f(struct Q *p) { return g(p) + 2; }\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "gcc 13.3, clang 18.1.3 and MSVC 19.51 all build and run it to 42";
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 2u)
+        << "each definition's list declares its own `struct Q`";
+    EXPECT_EQ(p.count(DiagnosticCode::S_IncompatiblePointerConversion), 1u)
+        << "`g(p)` hands g's `struct Q *` a pointer to f's `struct Q`";
+}
+
+// … and what C's reading gives a MEANING to: the list and the body's outermost block
+// are ONE scope (C 6.2.1p4), so the body's definition of `struct Q` COMPLETES the
+// list's. ✔MEASURED 2026-09-23: gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 build it
+// and run 42 (with the parameter-list warning); MSVC 19.51 refuses it (C2037, its
+// file-scope `Q` stays incomplete); DSS refused it S_NotAComposite.
+TEST(SemanticAnalyzerCParamListTag, ABodyDefinitionCompletesABareTagOfTheList) {
+    auto const p = analyseParamListShape(
+        "int f(struct Q *p) { struct Q { int a; } q = { 42 }; return p ? p->a : q.a; }\n"
+        "int main(void) { return f(0); }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors())
+        << "`p->a` names a member of the COMPLETED `struct Q`";
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 1u);
+    EXPECT_EQ(p.count(DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "completing the list's forward tag is not a redeclaration";
+}
+
+// The census site `enumUnderlyingBase`, KEPT ref-only: C23 6.7.3.3p5 requires an
+// integer type there, so no composite of any form is valid and all four references
+// refuse a definition in the clause. It stays refused (at parse: the enum keeps its
+// own `{`), and nothing about it is a parameter list. The reference form's one
+// precise diagnostic is SemanticAnalyzerC.EnumUnderlyingStructFailsLoud's pin.
+TEST(SemanticAnalyzerCParamListTag, CensusTheEnumUnderlyingClauseStillRefusesADefinition) {
+    auto const p = analyseParamListShape(
+        "enum E : struct S { int a; } { X };\n"
+        "int main(void) { return 42; }\n");
+    EXPECT_GT(p.frontEndErrors() + (p.model.hasErrors() ? 1u : 0u), 0u)
+        << "a composite definition is never an enum's underlying type";
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 0u);
+}
+
+// The census site `castTypeBase`, unified since TF-C101: a tag DEFINED in a type
+// name binds in the enclosing BLOCK, so a later declaration of that block names it
+// (✔MEASURED, all four references build and run this to 42).
+TEST(SemanticAnalyzerCParamListTag, CensusATypeNameDefinitionBindsInTheEnclosingBlock) {
+    auto const p = analyseParamListShape(
+        "int main(void) { int n = (int)sizeof(struct S { int a; });"
+        " struct S s = { 42 }; return s.a + n - 4; }\n");
+    EXPECT_EQ(p.frontEndErrors(), 0u);
+    EXPECT_FALSE(p.model.hasErrors());
+    EXPECT_EQ(p.count(DiagnosticCode::S_TagDeclaredInParameterList), 0u)
+        << "no parameter list is involved";
 }

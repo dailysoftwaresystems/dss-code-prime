@@ -79,7 +79,7 @@ Two load-bearing properties:
 
 Declares WAT's opcode vocabulary + types + section structure as bucket-1 data. Same shape as `*.target.json` for native targets — the walker (bucket 2) reads opcode rows from JSON and emits WAT text. Lives at `src/dss-config/targets/wasm.target.json` (the `targets/` family covers anything-MIR-downstream, native or structured-bytecode — see plan 13 §0).
 
-**Declares `abiModel: "operand-stack"`** (per plan 12 §3.1 D-ML5-X.1 — `TargetAbiModel` is the canonical schema-shape discriminator). The schema's per-shape validate() rules require `valueTypes[]` + `sections[]` for operand-stack targets; they do NOT require `registers[]` or `callingConventions[]` (which are register-machine-only). Without the discriminated validate(), the loader would either reject WASM target schemas for missing register sections, or stop enforcing register-section invariants for native — see the linked deferred item.
+**Declares `abiModel: "operand-stack"`** (per plan 12 §3.1 D-PLAN12-TARGETSCHEMA-MULTI-SHAPE-DISCRIMINATOR-WIRING-TARGETABIMODEL-ENUM-REGISTERMACHINE — `TargetAbiModel` is the canonical schema-shape discriminator). The schema's per-shape validate() rules require `valueTypes[]` + `sections[]` for operand-stack targets; they do NOT require `registers[]` or `callingConventions[]` (which are register-machine-only). Without the discriminated validate(), the loader would either reject WASM target schemas for missing register sections, or stop enforcing register-section invariants for native — see the linked deferred item.
 
 ```jsonc
 {

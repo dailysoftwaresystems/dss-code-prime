@@ -1,0 +1,15 @@
+# PURPOSE: read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor.
+name: anchors
+description: >-
+  The action proves the registry row reader, its vocabulary and the door's launcher
+  can fail, and drives every refusal of the door itself in git fixture trees.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `anchors_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./anchors.py --self-test
+    successPattern: 'anchors self-test: 0 failed'
+    requireInputsUnmoved: true

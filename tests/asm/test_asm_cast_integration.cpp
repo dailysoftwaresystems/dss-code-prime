@@ -97,13 +97,15 @@ TEST(CastIntegration, SourceLevelFloatToIntCastEncodesCvttsdsi) {
     if (hirReporter.errorCount() != 0u) dumpDiagnostics(hirReporter);
 
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat =
-        (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // The language's policy through the pipeline's ONE assembly, and the mutability map the
+    // constrained static-initializer fold reads a const object's value through (P68 round 13
+    // fold F7: the constraint was threaded here without it).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg,
-                                    /*ffiMap=*/nullptr, &hir->linkageMap);
+                                    /*ffiMap=*/nullptr, &hir->linkageMap,
+                                    &hir->mutabilityMap);
     ASSERT_TRUE(mir.ok);
     EXPECT_EQ(mirReporter.errorCount(), 0u);
     if (mirReporter.errorCount() != 0u) dumpDiagnostics(mirReporter);

@@ -13,6 +13,18 @@ cmake_minimum_required(VERSION 4.0)
 # drift on every release.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" DSS_VERSION_RAW)
 string(STRIP "${DSS_VERSION_RAW}" DSS_VERSION)
+# ★ A VERSION BUMP MUST RE-RUN CONFIGURE, AND WITHOUT THIS LINE IT DOES NOT.
+# The version is read HERE, at configure time, and baked into the binary as
+# DSS_STAMP_VERSION; the shipped config tree is stamped from the same file but
+# staged per RUN. So after a bump, an INCREMENTAL build keeps a compiler stamped
+# with the old version beside a config tree stamped with the new one, and the
+# version-skew check refuses every compile.
+# ✔MEASURED 2026-09-16 on the merge that bumped 0.0.2 -> 0.5.0: 1868 of 2207 tests
+# failed, every one of them reporting `C_InvalidLanguageName` + `D_SchemaLoadFailed`
+# — a diagnostic that reads like a defect in `c.lang.json` and is nothing of the
+# kind. The build that produced it reported success.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
 project(dss-code-prime VERSION ${DSS_VERSION} LANGUAGES CXX)
 
@@ -51,7 +63,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # ── Options ──
 option(DSS_BUILD_TESTS "Build unit tests" ON)
 
-# D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT — strict arm verdicts.
+# Strict arm verdicts: a cross-arch arm that is SKIPPED must still yield a verdict.
 #
 # WHAT IT DOES. Both corpus harnesses ledger a verdict for every declared target
 # arm. An ENVIRONMENTAL skip — the manifest declared an `emulator` and this
@@ -74,7 +86,7 @@ option(DSS_BUILD_TESTS "Build unit tests" ON)
 #
 # ⚠ DELIBERATELY NOT TURNED ON IN `.github/workflows/pipeline-pr.yml`. Those legs
 # install no qemu at all, so strict mode there would red ~449 arms x 2 legs on
-# the first PR. D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT sequences the LEDGER
+# the first PR. The LEDGER was deliberately sequenced
 # before any qemu-in-CI work precisely so that adding an emulator later is a
 # measurable delta rather than an unverifiable claim. Flip CI on in the same
 # change that installs qemu, not before.
@@ -146,7 +158,7 @@ if(MSVC)
 endif()
 
 # ── GNU-on-Windows (MinGW/binutils): -Wa,-mbig-obj (COFF section limit) ──
-# D-BUILD-GNU-WINDOWS-BIGOBJ-SCOPE. The SAME COFF object-section-count cap the
+# The SAME COFF object-section-count cap the
 # MSVC /bigobj above raises also hits the GNU-on-Windows assembler (binutils
 # `as`) on large TUs — and NOW on large TEST TUs too (`tests/lir/test_mir_to_lir.cpp`,
 # ~6.7k lines, overflows in Debug: "can't write … 'file too big'"). The MSVC
@@ -165,7 +177,7 @@ endif()
 add_compile_options("$<$<AND:$<CXX_COMPILER_ID:GNU>,$<PLATFORM_ID:Windows>>:-Wa,-mbig-obj>")
 
 # ── Exhaustive-switch enforcement, PROJECT-WIDE ──
-# D-BUILD-CLANG-ONLY-WARNINGS-INVISIBLE-TO-THE-MSVC-AND-GCC-LEGS, closing half.
+# The closing half of the finding "clang-only warnings are invisible to the MSVC and GCC legs".
 #
 # ★ WHAT THE MEASUREMENT ACTUALLY SHOWED, because the anchor row got it wrong.
 # The row recorded the macOS-only `-Wswitch` finding as a CLANG-ONLY warning —
@@ -226,7 +238,7 @@ elseif(MSVC)
     add_compile_options(/we4062)
 endif()
 
-# ── Precompiled headers (build-time only — D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING) ──
+# ── Precompiled headers (build-time only — the windows-msvc build-time ceiling) ──
 # The windows-msvc-release CI leg re-parses the same heavy, templated STL
 # headers (<format>, <unordered_map>, <vector>, …) in every one of the ~280
 # translation units. On the 2-core CI runner that repeated parse dominates the
@@ -311,6 +323,44 @@ function(dss_pch_reproducible target)
     endif()
 endfunction()
 
+# ── The host compiler every PCH is built by — a DECLARED dependency since 2026-09-23 ──
+# A precompiled header is valid only for the compiler that produced it, and nothing told the build
+# so: ✔MEASURED 2026-09-23, Visual Studio updated MSVC IN PLACE (same `14.51.36231` directory,
+# `cl` 19.51.36257 → 19.51.36260), so the compiler PATH — all CMake and ninja compare — did not
+# move, and every MSVC tree configured before the update failed C1853 on EVERY PCH consumer until
+# it was configured afresh. `cmake/DssHostCompilerStamp.cmake` says why and how in full.
+# ⇒ A generated header naming the compiler binary's identity, regenerated whenever that binary is
+#   newer than its last run (`DEPENDS "${CMAKE_CXX_COMPILER}"`), and APPENDED TO `DSS_PCH_HEADERS`
+#   so every PCH includes it: an in-place update re-runs the stamp, its content changes, every PCH
+#   and so every consumer rebuilds. Rewritten only when the identity changed, and the rule restats,
+#   so an unchanged compiler costs one digest and rebuilds nothing.
+# ⓘ Still one STL-only list for the purpose that list states: this header is the build tree's, not
+#   the project's, so editing project code never touches it.
+# ★ Every target whose PCH lists it depends on `dss_host_compiler_stamp` (wired once, at the end of
+#   this file, for every such target in every directory), so it exists before the first PCH
+#   compiles. The pin is the ctest entry `build/pch_host_compiler_stamp`.
+# ⚠ It is listed as a QUOTED INCLUDE LITERAL, never as a bare path. CMake gives a cmake_pch.hxx it
+#   regenerates the modification time of the first BARE-PATH header of the list that exists, and
+#   after the first build the stamp exists. ✔MEASURED 2026-09-23 (CMake 4.3.2, Ninja, MinGW g++ and
+#   MSVC alike): with the stamp as a bare path, a list that gained `<map>` left cmake_pch.hxx at the
+#   stamp's exact time and the PCH was NOT rebuilt; as a literal, it was. Every later change of this
+#   list would have left every PCH stale. The walk at the end of this file refuses a bare path in
+#   any list that carries the stamp.
+set(DSS_HOST_COMPILER_STAMP_HEADER "${CMAKE_BINARY_DIR}/generated/dss_host_compiler_stamp.h")
+add_custom_command(
+    OUTPUT "${DSS_HOST_COMPILER_STAMP_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+            "-DDSS_HCS_COMPILER=${CMAKE_CXX_COMPILER}"
+            "-DDSS_HCS_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}"
+            "-DDSS_HCS_OUTPUT=${DSS_HOST_COMPILER_STAMP_HEADER}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/DssHostCompilerStamp.cmake"
+    DEPENDS "${CMAKE_CXX_COMPILER}"
+            "${CMAKE_SOURCE_DIR}/cmake/DssHostCompilerStamp.cmake"
+    COMMENT "dss: stamping the host compiler every precompiled header is built by"
+    VERBATIM)
+add_custom_target(dss_host_compiler_stamp DEPENDS "${DSS_HOST_COMPILER_STAMP_HEADER}")
+list(APPEND DSS_PCH_HEADERS "\"${DSS_HOST_COMPILER_STAMP_HEADER}\"")
+
 # ── THE COMPILER'S BUILD STAMP (the runtime object cache's compiler identity) ──
 #
 # `cmake/DssBuildStamp.cmake` computes the value and documents WHY it exists and
@@ -386,11 +436,11 @@ if(DSS_BUILD_TESTS)
     # build the binary but never invoke it through ctest. This gate
     # IS the fix; no separate anchor is tracked.
     # ★★★ ONE MANIFEST GLOB, READ BY BOTH CORPUS HARNESSES.
-    # D-TEST-INTEGRATED-RUNNER-WALKS-EVERY-EXAMPLE-IN-ONE-THREAD gave
+    # The fix for the integrated runner walking every example in ONE thread gave
     # `integrated_tests` per-example ctest entries, which means BOTH harnesses now
     # derive their entry set from the corpus. Hoisted here rather than globbed
     # twice so the two cannot disagree about WHICH examples exist —
-    # [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] is about capability parity, and
+    # the rule that the two runners must agree is about capability parity, and
     # a harness that silently enumerates a different corpus than its sibling is
     # that divergence in its most basic form.
     # ⚠ `CONFIGURE_DEPENDS` so a NEW example re-runs cmake instead of being
@@ -409,8 +459,84 @@ if(DSS_BUILD_TESTS)
             "a collapsed result silently empties the corpus suite. Refusing.")
     endif()
 
+    # ── DssHarness: the tool that now owns the repository verbs these guards ──
+    #    used to spell as hand-written shell scripts
+    #
+    # ⛔⛔ RESOLVED TO AN ABSOLUTE PATH HERE, AND NEVER SPELLED AS A BARE NAME IN A
+    # `COMMAND`. ✔MEASURED on the WSL x86_64 leg, driven in the exact shape this
+    # repository drives it (`wsl.exe -e bash <file>`):
+    #   * the tool file's CASE follows the RELEASE, and a Linux filesystem is
+    #     case-sensitive. The shim is named after the package's `ToolCommandName`,
+    #     `DssHarness` through 0.5.5 and `dssharness` from 0.5.6: 2026-09-17 found
+    #     `<home>/.dotnet/tools/DssHarness` with no lowercase sibling, and 2026-09-19,
+    #     under 0.5.7, `<home>/.dotnet/tools/dssharness` with no capitalised one.
+    #     `NAMES` lists both spellings, so either release resolves;
+    #   * that directory is on the LOGIN PATH only, so a non-login shell resolves
+    #     NEITHER spelling (re-measured 2026-09-19: non-login `which dssharness`
+    #     exits 1, and only the login PATH carries `<home>/.dotnet/tools`).
+    # ⇒ a bare `COMMAND <name> <verb>` runs on a Windows host — where PATH carries the
+    # directory and the filesystem folds case — and fails on the WSL leg twice over:
+    # the non-login shell that leg runs misses the directory, and a spelling right for
+    # one release is wrong for the other. Either failure alone would have hidden the
+    # other. `find_program` answers ONCE, at configure time, with a path ctest invokes
+    # directly and that no shell's PATH can steer. The HINTS are the tool installer's
+    # own location, so the answer does not depend on which shell class started the
+    # configure.
+    # ★ A HOST WITHOUT THE TOOL REFUSES, IT DOES NOT VANISH — the rule every guard
+    # registered here keeps: a guard that silently does not run publishes a gate
+    # figure about the host and not about the tree.
+    # ★★ THE SET OF VERDICTS IS OPEN, AND EVERYTHING BUT 0 IS A FAILURE HERE.
+    # `rc == 0` is the whole pass condition, which is the one shape a new code cannot
+    # fall through as "unknown". Two that already exist or are landing:
+    #   21 (Incomplete, shipped 0.5.5) — the work ran, nothing failed, but not every
+    #      leg reached a verdict. NOT a pass.
+    #   4  (contended) — a build's process-table sample saw work that voids its result.
+    #      `build` could previously only pass or fail; a consumer enumerating those two
+    #      would read this as neither. NOT a pass.
+    # ⛔ DELIBERATELY NOT AN ENUMERATION. Listing acceptable codes is how the NEXT code
+    # becomes a silent pass the first time it is emitted — the same shape as the defect
+    # 21 was added to fix, one level out.
+    # ⚠ Anything added later that READS the JSON ledger instead must read `complete` as
+    # well as `passed`; `passed` alone repeats that defect, and an interrupted run (130)
+    # also reports `complete: false`.
+    # ⓘ ✔MEASURED 2026-09-17 that nothing can build two legs into one directory from
+    # here: every entry below is a repository READ, none names a build directory, and
+    # `dssharness build` keys its own directory by leg variant.
+    find_program(DSS_HARNESS_EXE
+        NAMES DssHarness dssharness
+        HINTS "$ENV{HOME}/.dotnet/tools" "$ENV{USERPROFILE}/.dotnet/tools"
+        DOC "the DssHarness tool that owns this repository's harness verbs")
+    if(DSS_HARNESS_EXE)
+        message(STATUS "DssHarness resolved for the harness-verb guards: ${DSS_HARNESS_EXE}")
+    else()
+        message(STATUS "DssHarness NOT FOUND — every harness-verb guard is registered as a REFUSAL")
+    endif()
+
+    # `dss_add_harness_guard(<name> <verb> [args...])` — register <name> driving the
+    # resolved DssHarness, or, where it was not found, register <name> as a REFUSAL
+    # that names the verb nobody ran. One owner for both arms, so the arm that
+    # REGISTERS a guard and the arm that REFUSES one cannot come to disagree about
+    # which subject was left unchecked.
+    function(dss_add_harness_guard _dss_hg_name)
+        if(DSS_HARNESS_EXE)
+            add_test(
+                NAME ${_dss_hg_name}
+                COMMAND "${DSS_HARNESS_EXE}" ${ARGN}
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        else()
+            string(JOIN " " _dss_hg_cmd ${ARGN})
+            set(_dss_hg_script
+                "${CMAKE_CURRENT_BINARY_DIR}/${_dss_hg_name}_refusal.cmake")
+            file(WRITE "${_dss_hg_script}"
+                 "message(FATAL_ERROR \"${_dss_hg_name} CANNOT RUN: no DssHarness was found on this host, so `DssHarness ${_dss_hg_cmd}` never ran and this tree was never checked for what it refuses. Searched for the names DssHarness and dssharness on PATH and under <home>/.dotnet/tools. ⚠ On Linux the installed file's case follows the release (DssHarness through 0.5.5, dssharness from 0.5.6) and its directory is on the LOGIN PATH only, so a working tool can still be invisible to a non-login configure — install it with `dotnet tool install --global DssHarness`, or point -DDSS_HARNESS_EXE at the file. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the host and not about the tree.\")\n")
+            add_test(
+                NAME ${_dss_hg_name}
+                COMMAND ${CMAKE_COMMAND} -P "${_dss_hg_script}")
+            message(STATUS "${_dss_hg_name} registered as a REFUSAL: no DssHarness on this host")
+        endif()
+    endfunction()
+
     # ── THE RUN'S SHIPPED-CONFIG SNAPSHOT ────────────────────────────────
-    # D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
     #
     # Registers the `config/snapshot` ctest entry — the `FIXTURES_SETUP` that
     # copies `src/dss-config` ONCE per ctest run — and defines the
@@ -430,124 +556,190 @@ if(DSS_BUILD_TESTS)
     add_subdirectory(integrated_tests)
     add_subdirectory(tests)
 
-    # Anchor-registry CI guard (2026-06-03 — per the cross-plan
-    # staleness sweep + the standing discipline that "make the
-    # system enforce it" is the right move for recurring leaks).
-    # Every `D-*` anchor cited in src/ must resolve to a row /
-    # citation in any .plans/*.md file. Same shape as the
-    # agnosticism veto + the CallConv static_assert — system-
-    # enforced rather than convention-enforced.
-    #
-    # Dispatches to the platform-appropriate script. The bash
-    # variant runs on Linux/macOS CI; the PowerShell variant runs
-    # on Windows CI. Both share the same contract + registry file.
-    # Tracked-blob line-ending guard (2026-08-06 —
-    # D-REPO-GITATTRIBUTES-PINS-EOL-FOR-CONFIGS-BUT-NOT-FOR-SOURCES).
-    # No tracked TEXT blob may carry a line-terminating CR unless it
-    # DECLARES `eol=crlf`. Wired here, beside the anchor guard,
-    # deliberately: `.gitattributes` now pins `eol=lf` for the source
-    # tree, but a pin is only as good as its GLOB COVERAGE — the pin
-    # that existed before covered configs/goldens/drivers and still
-    # let six CRLF blobs land in src/ and tests/ because no `.cpp` was
-    # ever named. The pin is the mechanism; THIS is the invariant, and
-    # an invariant nothing executes is a convention.
-    #
-    # Orphan-test-source guard (2026-08-10 —
-    # D-TEST-UNIT-TIER-HAS-NO-ORPHAN-SOURCE-GUARD).
-    # Every `tests/**/*.cpp` must be registered by a STRUCTURAL
-    # `dss_add_test(... SOURCES ...)` call or be on the guard's
-    # machine-checked allowlist. An unregistered test source compiles
-    # NOWHERE and no ctest entry runs it — absent coverage that looks
-    # exactly like coverage from every direction (the file is there, it
-    # reads like a test, the diff adding it looked like added coverage,
-    # and the suite is green because it never had anything to say about
-    # it). ✔MEASURED 2026-08-10: nothing in this repository checked for
-    # it, and no CI job asserts an expected ctest entry count.
-    #
-    # ★ RIDES CTEST rather than being a CI step, which is why it is here
-    # and not in a workflow: every leg then runs it for free, on the
-    # host it is about, and the invariant is EXECUTED rather than
-    # documented — the same reasoning the line-endings comment above
-    # states in its last sentence.
-    #
-    # ★★ IT SELF-TESTS ON EVERY RUN. Given no argument (the form used
-    # here) each twin mirrors tests/ into a per-run temp tree, mutates
-    # it 12 ways, and asserts it reds with the right exit code and the
-    # right message each time — so this entry cannot pass without also
-    # proving the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS,
-    # D-CENSUS-INSTRUMENT-UNGUARDED-BY-CTEST). Cost,
-    # MEASURED on this Windows workstation: ~18 s (.sh) / ~11 s (.ps1),
-    # which ctest -j overlaps with the other ~810 entries and is in
-    # family with the anchor guard's own 9.6–14.7 s.
-    #
-    # Same HOST dispatch, same contract, same exit codes as the
-    # anchor guard above; both scripts drive identical `git`
-    # subcommands so the two shells only marshal arguments.
-    #
-    # ⛔⛔ IT USED TO ASK `if(WIN32)`, WHICH IS A QUESTION ABOUT THE **TARGET**, AND
-    # EVERY SUBJECT IN THIS BLOCK IS A PROPERTY OF THE **HOST**.
-    # [[D-GATE-HOST-SIDE-GUARDS-VANISH-WHERE-A-TARGET-CONDITION-ANSWERS-A-HOST-QUESTION]]
-    # Nothing here is compiled and nothing here executes on the target: each entry starts
-    # an INTERPRETER on the machine running ctest and hands it a script that reads this
-    # source tree through `git`. Which interpreter exists is a property of the host, so
-    # `CMAKE_HOST_WIN32` is the only variable that can answer it. `WIN32` and
-    # `CMAKE_HOST_WIN32` are EQUAL in every configure whose host and target are the same
-    # system, which is why the wrong one was invisible for as long as it was; they part
-    # only when cross-compiling, and they part in both directions.
-    # ✔MEASURED 2026-09-08 (P65), WSL x86_64 targeting Windows through
-    # `x86_64-w64-mingw32-g++-posix`, with `/usr/bin` and `/bin` removed from every
-    # `find_*` search so the configure met the arm64 VPS's actual software inventory --
-    # no pwsh, no bash, no git: the PRE-FIX tree DID NOT CONFIGURE AT ALL. It stopped on
-    # the `find_program(POWERSHELL_EXE ... REQUIRED)` below with *Could not find
-    # POWERSHELL_EXE using the following names: pwsh, powershell*, because `WIN32` was
-    # true and demanded a Windows interpreter of a Linux host. ★★ THAT IS WORSE THAN THE
-    # VANISH THIS CYCLE IS CLOSING: a guard that disappears still leaves a build to
-    # publish a figure about; this left no build at all, and the failure names an
-    # interpreter rather than the target it actually came from.
-    if(CMAKE_HOST_WIN32)
-        find_program(POWERSHELL_EXE NAMES pwsh powershell REQUIRED)
-        add_test(
-            NAME anchor_registry_guard
-            COMMAND ${POWERSHELL_EXE}
-                    -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/scripts/check-anchor-registry/check-anchor-registry.ps1"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        add_test(
-            NAME line_endings_guard
-            COMMAND ${POWERSHELL_EXE}
-                    -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.ps1"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        add_test(
-            NAME orphan_tests_guard
-            COMMAND ${POWERSHELL_EXE}
-                    -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/scripts/check-orphan-tests/check-orphan-tests.ps1"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    else()
-        add_test(
-            NAME anchor_registry_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-anchor-registry/check-anchor-registry.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        add_test(
-            NAME line_endings_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        add_test(
-            NAME orphan_tests_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-orphan-tests/check-orphan-tests.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    endif()
+    # ── Three repository guards, ONE Python program each (2026-09-21, lane mig, part 4) ──
+    # `anchor_registry_guard`: every `D-*` anchor cited in a scanned root resolves to a registry
+    # row, and no markdown table row's unescaped pipes silently drop cells.
+    # `line_endings_guard`: no tracked text blob carries a line-terminating CR (HEAD, the index,
+    # the working tree), and no CR instrument that cannot see a CR is left for someone to run.
+    # `orphan_tests_guard`: every `tests/**/*.cpp` is registered by a STRUCTURAL
+    # `dss_add_test(... SOURCES ...)` call or sits on the guard's machine-checked allowlist; an
+    # unregistered test source compiles nowhere and reads exactly like coverage.
+    # ★ EACH SELF-TESTS ON EVERY RUN: the form used here verifies the tree and drives its arms,
+    # every red arm synthesizing its own negative, so the entry cannot pass without proving the
+    # guard can fail.
+    # ★★ THEY WERE `.sh`/`.ps1` TWINS UNTIL 2026-09-21, dispatched here by `CMAKE_HOST_WIN32`,
+    # and the operator's order ended that: no `.sh`/`.ps1` under `.harness-config/runner/actions`.
+    # Each pair collapsed into one `.py` carrying the UNION of both twins' checks and arms;
+    # `cmake/DssHarnessDeletionInventory.md` records what retired and what covers it. One
+    # interpreter on every host means one entry on every host: the host dispatch -- and the
+    # `find_program(POWERSHELL_EXE ... REQUIRED)` that once refused to configure a Linux host
+    # cross-building for Windows -- left with the twins.
+    # ⓘ `line_endings_guard` is the entry that timed out under ctest 3 runs of 3 on 2026-09-21 in
+    # its PowerShell form while passing by hand in 3.9 s. The Python guard bounds every wait
+    # (90 s, naming what it waited on) and starts every child with no inherited handle.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME anchor_registry_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME line_endings_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME orphan_tests_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-orphan-tests/check-orphan-tests.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Script-index guard (2026-08-19 — D-SCRIPTS-NO-INDEX-OF-THE-REPOSITORYS-OWN-TOOLING).
-    # Every directory under `scripts/` must be documented in BOTH indexes
-    # (`scripts/README.md` and the `/dss-cycle` skill's `references/scripts.md`),
-    # with a purpose byte-identical to the script's own `PURPOSE:` declaration.
-    # ✔MEASURED 2026-08-19: this repository had eighteen scripts and no index of
-    # any kind, so a cycle could not be told to prefer an existing tool over
-    # writing a new one — nothing listed the existing tools. The operator's rule
-    # the guard makes reachable: "if a tool has a problem, fix before using
-    # again, not workaround an own tool."
+    # ── The sqlite harness driver checks its own logic (2026-09-21, lane mig, part 4) ──
+    # `harness/sqlite_driver_selftest` runs `build_and_test.py --self-test`: the driver's Step 0
+    # ALONE -- its two Python suites, every module's `--self-test`, the leg plan's self-test and
+    # lint -- the SAME list and the SAME judgement a real run applies before it starts, so this
+    # entry and the driver cannot come to disagree about what is checked.
+    # ★ NEW. The shell drivers ran their suites only at their own Step 0, hours away from any
+    # gate, and the helpers' self-tests ran nowhere; when those twins collapsed into one Python
+    # driver, its checks became cheap enough for every gate run.
+    # ★ NOT `repo-guard`, ON PURPOSE -- hence no `guard` suffix for the label scan below to
+    # match. What these programs do depends on the HOST: how its processes are enumerated,
+    # whether the POSIX half runs in this process or inside WSL. So every leg runs them, rather
+    # than only the host the tree happened to be checked on.
+    add_test(
+        NAME harness/sqlite_driver_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/real-examples/c/sqlite/build_and_test.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # The speedtest1 benchmark's driver: every check of the shell and PowerShell drivers it
+    # replaced, its measurement core's own self-test, and the new arms -- none of which any gate
+    # ran before.
+    add_test(
+        NAME harness/sqlite_benchmark_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/real-examples/c/sqlite/benchmark_speedtest1.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # ── `cmake-import`: its own arms, and the path base proved with a real compiler ──
+    # `harness/cmake_import_selftest` runs the program's synthesized arms (the refusals, the
+    # scratch rules, the generator ladder through a stand-in cmake, the path base).
+    # `harness/cmake_import_any_cwd` is the PIN on that path base (2026-09-21): a manifest the
+    # program writes OUTSIDE the project root must build the same files, with THIS build's
+    # dsscp, from the root, from a directory of `#error` look-alikes and from an empty one --
+    # and the root-relative manifest it wrote until then must fail from the last two. Every
+    # path a manifest holds resolves against the manifest's own directory, so a path written
+    # relative to the project root named nothing wherever the manifest was not at the root.
+    # ⓘ Both NEW: until 2026-09-21 no gate ran this program at all. Not `repo-guard` names,
+    # for the same reason as the entry above: the second compiles and links with dsscp.
+    add_test(
+        NAME harness/cmake_import_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/cmake-import/cmake-import.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME harness/cmake_import_any_cwd
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/cmake-import/cmake-import.py"
+                --prove-any-cwd $<TARGET_FILE:dsscp>
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # dsscp resolves its shipped config through `$DSS_CONFIG_ROOT`, pointed at the run's
+    # snapshot; the proof's builds start in temporary directories no cwd walk can climb out of.
+    dss_use_config_snapshot(harness/cmake_import_any_cwd)
+
+    # ── The two remote-leg readers check their own arms (2026-09-24, lane mig) ──
+    # `probe-reference-cc` measures a reference compiler on a leg's own host and `read-leg-path` reads a
+    # file back from one; both print what they measure through ONE redactor (read-leg-path owns it,
+    # probe-reference-cc inherits it). Their `--selftest`s hold the refusals, the redaction in both
+    # directions (a name inside `13.3.0-6ubuntu2` or `dsscp` survives; `<name>@h`, `/home/<name>/`
+    # and every other shape the old substring rule caught is still redacted), the empty-TU probe and
+    # the linked-image dump. ⓘ NEW: until now no gate ran either self-test.
+    # ★ NOT `repo-guard`, ON PURPOSE, like their neighbours above: the probe's arms compile, link,
+    # run and dump with the HOST's own compiler and dump tool, which differ per leg, so every leg
+    # runs them -- and a leg without a reference compiler or a dump tool is a named FAILURE there,
+    # never a skip.
+    add_test(
+        NAME harness/probe_reference_cc_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/probe-reference-cc/probe-reference-cc.py"
+                --selftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME harness/read_leg_path_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/read-leg-path/read-leg-path.py"
+                --selftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # ── The anchor CITATION question, asked by the tool ───────────────────────
+    # ⛔⛔ THIS IS AN ADDITION, NOT A REPLACEMENT, AND THAT IS A MEASURED DECISION
+    # RATHER THAN CAUTION. `DssHarness check-anchor-citations` answers *"does every
+    # cited anchor id resolve to a ROW?"* — which is ONE of the things the guard above
+    # does, and the one it does WORSE. ✔MEASURED 2026-09-17 on this tree, both sides:
+    #   the guard : `OK (1352 src anchors all resolve to plans, 2 retired id(s) uncited)`
+    #   the tool  : `OK - every cited anchor resolves: 12835 citation(s) over 2378
+    #               file(s) …, against 2041 registry row(s)`
+    # The tool is strictly better AT THIS ONE SUBJECT, twice over: it reads the two root
+    # FILES the guard's directory-only `_ROOT_SPECS` structurally cannot reach
+    # (`README.md`, `.gitattributes`), and it resolves against a registry ROW instead of
+    # a substring anywhere under `.plans/` — which closes the hole where an id resolved
+    # via its own bug report.
+    # ⛔ BUT THE GUARD ALSO OWNS TWO SUBJECTS THE TOOL HAS NO VERB FOR, so retiring it
+    # here would be a silent loss, not a retarget: the markdown CELL-WIDTH / unescaped
+    # pipe property over all of `.plans/` (✔MEASURED 340 tables, 4264 rows, 42 files —
+    # `read-anchors --lint` sees the two registry files only), and the RETIRED-ID
+    # matcher. Its per-root collapse floors and its 21-arm self-test have no counterpart
+    # either. ⇒ both entries run, the overlap is deliberate, and the guard retires when
+    # those subjects have an owner. Recorded in `.temp/lane-m2-findings.md`.
+    # ⓘ `--current-tree`, not the default `--current-commit`: a ctest entry judges the
+    # tree it was configured from, including work not committed yet. The default reads
+    # HEAD, which would pass a working tree citing an id nobody has added.
+    dss_add_harness_guard(anchor_citations_guard check-anchor-citations --current-tree)
+
+    # ── Root litter, now asked of the tool ────────────────────────────────────
+    # A RETARGET of the entry, not a rename: same name, same subject, same verdict.
+    # ✔MEASURED 2026-09-17 with the negative SYNTHESIZED — one loose untracked file
+    # planted at this tree's root and removed again — the retired
+    # `scripts/check-root-litter/check-root-litter.sh` and `DssHarness
+    # check-root-litter` agree on both arms, and the tool also covers the two the
+    # script paid for by measurement: ignored litter at depth 1, and an entry whose
+    # NAME carries a path from another machine.
+    # ★ UNSTEERABLE, AND THE NEGATIVE WAS SYNTHESIZED RATHER THAN ASSUMED.
+    # ✔MEASURED with `GIT_DIR` + `GIT_WORK_TREE` + `GIT_INDEX_FILE` exported at a decoy
+    # repository holding a loose file: a bare `git status` in that environment listed
+    # the decoy's litter, and the tool ignored it and named THIS root. That is the
+    # property `leg_tree_git_unsteered` gave the script, and a git hook exporting
+    # `GIT_INDEX_FILE` is why it is not hypothetical.
+    # ★★ IT LEAVES THE BASH BLOCK ENTIRELY. This entry used to be registered beside
+    # `lane_worktree_guard` because it needed a bash proven able to open a `C:/` path —
+    # and it was the entry that block once lost SILENTLY when no such bash was found.
+    # It now needs no shell at all, so the one host question left is whether the tool is
+    # present, which `dss_add_harness_guard` refuses loudly about.
+    # ⚠ ONE PROPERTY IS NOT YET PROVEN FOR THE TOOL: the script refused, rather than
+    # reporting an empty list, when `git status` itself failed (the measured
+    # `index file smaller than expected` false green). The probe for it was
+    # inconclusive — a scratch repository with a deliberately corrupt index was
+    # refused earlier, for having no harness configuration (exit 11) — so this
+    # paragraph records an OPEN question rather than a covered one.
+    dss_add_harness_guard(root_litter_guard check-root-litter)
+
+    # Action-index guard (born 2026-08-19 as the script index, when this repository had
+    # eighteen scripts and no index of any kind).
+    # Every ACTION under `.harness-config/runner/actions/` -- a directory holding its own
+    # `<name>.yml`, grouped at any depth -- must be documented in BOTH indexes
+    # (`.harness-config/runner/actions/README.md` and the `/dss-cycle` skill's
+    # `references/actions.md`), with a purpose byte-identical to the action's own
+    # `PURPOSE:` declaration, and must be REACHABLE: a `predefinedRunners` entry in
+    # `.harness-config/config.json` names it, and every runner names an action that exists.
+    # ⓘ Retargeted 2026-09-18, when `scripts/` and `real-examples/` stopped existing and
+    # every program moved into the actions directory; the entry keeps its name because
+    # the program keeps its name.
+    # ✔MEASURED 2026-08-19: with no index, a cycle could not be told to prefer an
+    # existing tool over writing a new one — nothing listed the existing tools. The
+    # operator's rule the guard makes reachable: "if a tool has a problem, fix before
+    # using again, not workaround an own tool."
     #
     # ★ NOT DISPATCHED BY PLATFORM, unlike the three guards above: this one is a
     # single Python implementation rather than a `.sh`/`.ps1` twin pair. The
@@ -559,12 +751,13 @@ if(DSS_BUILD_TESTS)
     # Python, including `check-anchor-balance`, which every cycle must run — so
     # the interpreter is REQUIRED rather than optional: a guard that silently
     # skips when a tool is missing is the vacuous pass this entry exists to
-    # refuse (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # refuse.
     #
     # ★★ AND IT SELF-TESTS ON EVERY RUN. The no-argument form used here verifies
-    # the real tree and then runs 28 arms against a MIRROR — every refusal the
-    # guard has, each asserting the MESSAGE and not merely a non-zero exit — so
-    # this entry cannot pass without also proving the guard can fail.
+    # the real tree and then runs its arms against a MIRROR — every refusal the
+    # guard has, each asserting the MESSAGE and not merely a non-zero exit, counted
+    # against the program's own `EXPECTED_ARMS` — so this entry cannot pass without
+    # also proving the guard can fail.
     # ⚠ The message assertions are load-bearing: an independent audit found the
     # first draft's floor arm passing with the floor DELETED, because it
     # collapsed on a different refusal that happened to share the exit code.
@@ -572,7 +765,7 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME scripts_index_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-scripts-index/check-scripts-index.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-scripts-index/check-scripts-index.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # D-LSP-POSITIONS-RESOLVED-IN-SYNTHESIZED-PREPROCESSOR-COORDINATES — the
@@ -590,31 +783,19 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME lsp_coordinate_ownership_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-lsp-coordinates/check-lsp-coordinates.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-lsp-coordinates/check-lsp-coordinates.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Multi-host carriage gate (2026-08-24 -
-    # D-GATE-NO-CTEST-ENTRY-SEES-THE-MULTI-HOST-CARRIAGE-SCRIPTS).
-    # ★★ THE THING THIS ENTRY EXISTS FOR IS THAT NOTHING ELSE IN THIS SUITE READS
-    # A CARRIAGE SCRIPT AT ALL. Every script that reaches another host carries a
-    # hard-coded repository directory name, and a global rename rewrote thirteen
-    # of them at once while ctest reported 1603/1603 PASS -- so the WSL leg, both
-    # remote legs and the sqlite harness were all pointed at directories that
-    # exist on no host, silently, behind a green suite.
-    # ⚠ The check is deliberately NOT "does the path resolve": that would need
-    # the host it names, which is the whole reason nothing checked it. It asserts
-    # AGREEMENT with `project()` in this file instead, which is decidable offline
-    # on every leg.
-    # ★★ AND IT SELF-TESTS ON EVERY RUN, against a mirror, with each of the seven
-    # arms asserting the MESSAGE rather than merely a non-zero exit -- including
-    # two arms that pin what it must NOT red on (an interpolated path tail is not
-    # a claim; a relative `src/...` is not a checkout), because a guard that
-    # cries wolf is a guard somebody disables.
-    add_test(
-        NAME carriage_paths_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-carriage-paths/check-carriage-paths.py"
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⓘ `carriage_paths_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT.
+    # It refused a carriage script whose hard-coded repository directory name
+    # disagreed with `project()` — a real defect (a global rename rewrote
+    # thirteen of them at once while ctest reported 1603/1603 PASS). The
+    # DssHarness migration deleted every carriage script: the repository path on
+    # each host is now ONE value in `.harness-config/config.json`, read by one
+    # tool, so there is no second spelling left for a guard to hold to the first.
+    # ⚠ The durable property it stood for survives without it, and is worth
+    # keeping in words: a path that exists on another host is not checkable from
+    # here, so it must be DECLARED ONCE rather than agreed on by inspection.
 
     # Closed-vocabulary well-formedness gate (2026-08-21 -
     # D-CORE-ENUM-NAME-TABLE-HAS-NO-WELL-FORMEDNESS-PREDICATE).
@@ -633,417 +814,43 @@ if(DSS_BUILD_TESTS)
     #   ✔MEASURED 2026-08-22: `main()` ran the self-test only under `--self-test`,
     #   and this entry passes no flag — so the ctest form verified the tree and
     #   proved nothing. `check-shell-portability` found it while being written
-    #   against the same convention (D-GATE-ENUM-NAME-TABLE-CTEST-FORM-NEVER-SELF-TESTED).
+    #   against the same convention.
     add_test(
         NAME enum_name_table_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-enum-name-table-guards/check-enum-name-table-guards.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-enum-name-table-guards/check-enum-name-table-guards.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Shell-portability guard (2026-08-22 —
-    # D-SCRIPT-CASE-IN-COMMAND-SUBSTITUTION-BREAKS-BASH-3-2).
-    # macOS is a supported host and its `/bin/bash` is 3.2.57 — there is no newer
-    # one, and this repository drives its guards through `bash <script>` on every
-    # non-Windows leg. Two shapes are fatal there and invisible everywhere else:
-    #   · a `case` inside `$( … )` whose patterns are not `(`-prefixed. bash 3.2
-    #     scans for the matching `)` instead of parsing, so the pattern's own `)`
-    #     ends the substitution and the arm expands to LITERAL TEXT.
-    #   · a bash-4+ construct (`mapfile`, `declare -A`, `${v^^}`, …) in a file that
-    #     never says it needs bash 4 — six of the twelve leave the exit status at
-    #     ZERO, so the script runs on with a wrong answer.
-    #
-    # ★★ THE COST OF NOT HAVING THIS WAS MEASURED, NOT IMAGINED. On 2026-08-22 the
-    # `macos-clang-release` leg failed with `anchor_registry_guard` dying inside its
-    # OWN self-test — so the anchor registry had never actually been checked on that
-    # host. ⚠ And `bash -n` cannot see the first shape at all (✔the probe file
-    # parses clean under 3.2 and fails only when the substitution is EXPANDED), which
-    # is why this is a static guard and not a syntax pre-check.
-    #
-    # ★ RIDES CTEST rather than being a CI step, for the reason the guards above
-    # give: every leg then runs it, on the host it is about.
-    # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies the
-    # tree and then drives 35 arms against synthetic fixtures, each red arm asserting
-    # the MESSAGE of the refusal it names, so this entry cannot pass without proving
-    # the guard can fail (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # ⓘ `shell_portability_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-21, lane mig,
+    # part 4). It refused bash-3.2-fatal shapes in this repository's `.sh` programs. No `.sh`
+    # remains under the actions directory -- `scripts_index_guard` now refuses one by name -- and
+    # the one `.sh` left in the tree is an example's product test data, exercised by that
+    # example's own run on the POSIX legs.
+
+    # Lane-worktree gate (2026-09-01, P50 -- `remove` discarded an unpreserved scratchpad).
+    # `lane-worktree remove` used to delete a lane's ignored evidence without asking, and the
+    # preserve step was a convention living in the orchestrator's head. ✔MEASURED the day the gate
+    # landed: a `cp … && lane-worktree remove` one-liner lost a lane's whole evidence tree because
+    # the destination's parent did not exist and the silence read as success. The gate moved the
+    # rule into the tool; this entry is what keeps it there.
+    # ★ INTEGRATION ARMS BY NECESSITY: the defect was in what the verb DOES to a real tree, so each
+    # arm drives the real program against a real worktree in a fenced temp fixture and asserts the
+    # exit code, the MESSAGE, and -- wherever the verb claims a removal -- that the directory is
+    # independently gone.
+    # ★★ ONE PYTHON PROGRAM SINCE 2026-09-21. It was a `.sh`/`.ps1` pair plus a bash self-test
+    # launched through a bash PROBE (a bare `bash` on Windows resolves to the WSL shim, which
+    # cannot open a `C:/` path), with a refusal arm for a host no bash passed. The probe, its
+    # refusal, `leg_tree_guard` (the shell tree helper's self-test, whose properties now live in
+    # `owning_tree_selftest_guard`) and every other consumer of that bash left with the twins; the
+    # subject is now driven in-process, with no interpreter to find.
     add_test(
-        NAME shell_portability_guard
+        NAME lane_worktree_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-shell-portability/check-shell-portability.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/lane-worktree/lane-worktree.py"
+                --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Lane-worktree scratchpad gate (2026-09-01, P50 —
-    # D-CYCLE-LANE-WORKTREE-REMOVE-DISCARDS-AN-UNPRESERVED-SCRATCHPAD).
-    # `lane-worktree.sh remove` used to delete a lane's ignored scratchpad without
-    # asking, and the preserve step was a convention living in the orchestrator's head.
-    # ✔MEASURED the day this landed: a `cp … && lane-worktree remove` one-liner lost a
-    # lane's whole evidence tree because the destination's parent did not exist, `cp`
-    # failed, and the absence of output read as success. The gate moved the rule into
-    # the tool; this entry is what keeps it there.
-    # ★ INTEGRATION ARMS BY NECESSITY — the defect was in what the verb DOES to a real
-    # tree, not in a predicate that could be unit-tested, so each arm drives the real
-    # script against a real worktree and asserts the MESSAGE of the refusal it names.
-    # ⚠ It creates and removes its own `$$`-suffixed lanes and cleans up on both paths,
-    # so a parallel `ctest -j` cannot collide with itself or with a live lane.
-    #
-    # ⛔⛔ 2026-09-01 (P51, lane `gw`) — THIS ENTRY'S GREEN WAS A PROPERTY OF THE
-    # SHELL THE OPERATOR HAPPENED TO LAUNCH ctest FROM, NOT OF THE TREE, AND P50'S
-    # CYCLE REPORT PUBLISHED IT AS A TREE MEASUREMENT ("Windows 1884/1884,
-    # including all 21 repo guards"). It is the ONLY bash-launched ctest entry in
-    # this file, so nothing else was exposed and nothing else caught it.
-    # ✔MEASURED, four arms, each with the child's own tool census taken:
-    #   PATH as ctest hands it today, cwd = the tree      git yes, dirname NO,
-    #     mktemp NO   -> rc=1  "CANNOT RUN -- .../lane-worktree.sh is missing"
-    #   PATH + the bash's own directory PREPENDED         all three present
-    #                                                     -> rc=0  "OK - 9 assertions"
-    #   PATH REPLACED by bashdir + system32               git NO
-    #                                                     -> rc=1  "CANNOT RUN -- add failed"
-    #   PATH + bashdir, cwd = a DIFFERENT checkout        all three present
-    #                                                     -> rc=1  "FAILED - the
-    #                                                     scratchpad gate is not
-    #                                                     doing what it says"
-    # ★ `dirname`, `mktemp`, `rm`, `cp` and `md5sum` are EXTERNAL binaries in
-    # Git-for-Windows' `usr/bin`, not shell builtins, and ctest launches bash
-    # NON-LOGIN with its own inherited PATH — so the profile that normally puts
-    # `usr/bin` on PATH never runs. Patching `dirname` out of the script would be a
-    # workaround that moves the death two lines down onto `mktemp`.
-    # ★★ HENCE `path_list_prepend` AND NOT `ENVIRONMENT "PATH=..."`: the third arm
-    # above is what a REPLACING form produces — `usr/bin` present, `git` gone,
-    # and a DIFFERENT refusal. The inherited environment must be MODIFIED, never
-    # rebuilt, and the value is derived from the bash CMake actually found rather
-    # than hardcoded. (`ENVIRONMENT_MODIFICATION` needs CMake >= 3.22; this project
-    # requires 4.0.)
-    # ★★★ AND THE BASH IS PROVED, NOT TRUSTED TO SEARCH ORDER. On this host bare
-    # `bash` also resolves to `C:/WINDOWS/system32/bash.exe`, the WSL shim, which
-    # cannot open a `C:/...` path at all — a host ordering PATH differently would
-    # get a `bash` for which this whole entry is meaningless. `find_program` picked
-    # Git's on both configures here, which is luck, not a guarantee. The probe below
-    # runs the found bash, WITH the prepended PATH, against the two facts the script
-    # actually needs: that it can see the repository through the native-form path it
-    # will be handed, and that the external toolchain resolves.
-    # ⚠ A FAILED PROBE REGISTERS A FAILING TEST RATHER THAN SKIPPING. A guard that
-    # quietly does not exist is precisely how P50 published a figure that was not
-    # about the tree; `if(bash)` alone would repeat that in a new spelling.
-    # ── WHAT "A USABLE BASH" MEANS, DEFINED ONCE FOR EVERY ENTRY THAT NEEDS ONE ──
-    # ⚠ HOISTED OUT OF THE BLOCK BELOW ON PURPOSE. Three ctest entries are driven by
-    # bash — `lane_worktree_guard`, `root_litter_guard` and `run_gate_guard` (plus
-    # `line_endings_watchdog_sh_guard` on a Windows host) — and only the first two used to ask
-    # this question. The `run_gate_guard` block at the end of this file said *"THE BASH IS
-    # THE ONE ALREADY PROVED, not a fresh search"*, which is true only when the probe
-    # SUCCEEDED: when it refused, `DSS_BASH_FOR_LANE_GUARD` is empty and its `else()`
-    # silently substituted a bare `find_program(bash)` — the WSL shim on this host, the
-    # very bash the block above had just rejected. ✔MEASURED 2026-09-08 (P65) by
-    # configuring with a PATH holding neither git nor Git-for-Windows: `lane_worktree_guard`
-    # refused by name while `run_gate_guard` and `line_endings_watchdog_sh_guard` were
-    # registered against `C:/Windows/System32/bash.exe`, which cannot open a `C:/` path at
-    # all — a red that would have named `scripts/run-gate/test-run-gate.sh` for a property
-    # of the interpreter. ⇒ ONE probe text, one path separator, one answer, in scope for
-    # every consumer. ⓘ THIS HOISTING NO LONGER BUYS SCOPE, IT BUYS ONE OWNER: it was
-    # written while the block below sat behind a target condition that skipped it for a
-    # Windows target on a non-Windows host, so `run_gate_guard` could reach this text when
-    # the block could not. That condition is gone — the block below now runs on every
-    # configure — and the hoist stays because the arm that CHOOSES a bash and the arms
-    # that REFUSE one must not be able to come to disagree.
-    set(_dss_lane_probe
-        "test -f '${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh' && command -v dirname >/dev/null && command -v mktemp >/dev/null && command -v git >/dev/null")
-    if(CMAKE_HOST_WIN32)
-        string(ASCII 59 _dss_lane_path_sep)
-    else()
-        set(_dss_lane_path_sep ":")
-    endif()
-    # ── The lane-worktree and root-litter guards ─────────────────────────────
-    # ⛔⛔ THERE IS NO TARGET CONDITION HERE, AND ITS ABSENCE IS THE FIX.
-    # [[D-GATE-HOST-SIDE-GUARDS-VANISH-WHERE-A-TARGET-CONDITION-ANSWERS-A-HOST-QUESTION]]
-    # This block used to be wrapped in `if(NOT WIN32 OR CMAKE_HOST_WIN32)`. That
-    # expression is a TAUTOLOGY wherever host and target are the same system -- `WIN32`
-    # and `CMAKE_HOST_WIN32` are equal there, so `NOT X OR X` is unconditionally true --
-    # and it is FALSE in exactly one configuration: a build TARGETING Windows from a host
-    # that is not Windows. Deleting these two entries there was its ONLY effect anywhere.
-    #
-    # ★★★ AND NEITHER GUARD IS ABOUT THE TARGET. `lane_worktree_guard` drives
-    # `scripts/lane-worktree/test-lane-worktree.sh`, which makes and removes real `git
-    # worktree` lanes in THIS source tree and asserts that `remove` cannot discard an
-    # unpreserved scratchpad. `root_litter_guard` drives
-    # `scripts/check-root-litter/check-root-litter.sh`, which asks `git status
-    # --porcelain` whether a lane left a probe artifact loose at a repository root.
-    # Neither compiles anything, neither runs anything on the target, neither reads
-    # `CMAKE_SYSTEM_NAME`, and the defect each exists to catch is produced by the lanes
-    # working on the machine that is configuring.
-    # ⇒ THE PROPERTY BOTH ASSERT EXISTS ON EVERY HOST THAT CAN CONFIGURE THIS PROJECT,
-    #   so the honest registration is UNCONDITIONAL, and a NOT-APPLICABLE arm would be a
-    #   lie: these two subjects cannot fail to apply. The only question worth asking is
-    #   the host one -- is there a bash that can drive them -- and the probe below already
-    #   answers it BY EXECUTION and REFUSES, by name, when the answer is no. Contrast
-    #   `repo_tree_guard`, which DOES earn a not-applicable arm because the property it
-    #   asserts is a property OF POWERSHELL and cannot hold or fail without one.
-    #
-    # ✔MEASURED 2026-09-08 (P65) on WSL x86_64: two configures of the same tree from the
-    # same shell, differing ONLY in `CMAKE_SYSTEM_NAME`. Targeting Linux, `ctest -N`
-    # reported 2131 with both entries present. Targeting Windows through
-    # `x86_64-w64-mingw32-g++-posix`, `ctest -N` reported 2130, `-R
-    # '^lane_worktree_guard$'` and `-R '^root_litter_guard$'` each reported *Total Tests:
-    # 0*, and the configure's own `repo-guard label applied to N test(s)` line read 25
-    # instead of 27 -- two guards gone, nothing said, and a SMALLER total reading as a
-    # clean bill of health.
-    # ⛔⛔ AND SEARCH ORDER ALONE IS NOT ENOUGH EITHER — the "luck" above RAN OUT
-    # the same day it was written. ✔MEASURED 2026-09-01 (P51, lanes `ei` and `fa`
-    # independently): in a FRESH build directory on this host `find_program(NAMES
-    # bash)` resolves to `C:/WINDOWS/system32/bash.exe`, the WSL shim, and the
-    # probe below then correctly refuses — so EVERY newly-configured Windows build
-    # reddened this entry. The earlier configures only passed because
-    # DSS_BASH_FOR_LANE_GUARD was already CACHED from a shell that had Git first.
-    # ⇒ A refusal that is right about a host that HAS a working bash is still a
-    # gate figure keyed on the operator's PATH, which is the very thing the probe
-    # exists to stop. So the candidates are ENUMERATED and each is PROVED, and the
-    # first that passes wins; the refusal is reserved for a host where NONE does.
-    # ★ THE EXTRA CANDIDATE IS DERIVED, NEVER HARDCODED: Git for Windows ships
-    # bash beside its own `git`, so `git`'s location yields `<root>/bin/bash` and
-    # `<root>/usr/bin/bash`. A host without Git contributes nothing here and falls
-    # back to PATH exactly as before.
-    # ⓘ `_dss_lane_probe` and `_dss_lane_path_sep` are derived ONCE just above this
-    #   block, so every bash-driven entry in this file asks the same question.
-    set(_dss_lane_candidates "")
-    # An explicit -DDSS_BASH_FOR_LANE_GUARD is honoured FIRST: an operator who
-    # names a bash is answering this question deliberately.
-    if(DSS_BASH_FOR_LANE_GUARD)
-        list(APPEND _dss_lane_candidates "${DSS_BASH_FOR_LANE_GUARD}")
-    endif()
-    # ⚠ ANCESTORS, NOT "THE PARENT" — ✔MEASURED, and the first draft got this wrong in
-    # a way its own red-on-disable arm caught: `git` is at `<root>/cmd/git.exe` when
-    # PATH comes from PowerShell, but at `<root>/mingw64/bin/git.exe` when it comes
-    # from Git Bash. Taking one level up yields `<root>/mingw64`, which holds no
-    # bash, so the derivation silently produced NOTHING and the entry refused — the
-    # CONTROL arm went red beside the mutant, which is how the defect surfaced.
-    find_program(_dss_lane_git NAMES git NO_CACHE)
-    if(_dss_lane_git)
-        get_filename_component(_dss_lane_anc "${_dss_lane_git}" DIRECTORY)
-        foreach(_dss_lane_up RANGE 3)
-            get_filename_component(_dss_lane_anc "${_dss_lane_anc}" DIRECTORY)
-            foreach(_dss_lane_rel "bin/bash.exe" "usr/bin/bash.exe" "bin/bash" "usr/bin/bash")
-                if(EXISTS "${_dss_lane_anc}/${_dss_lane_rel}")
-                    list(APPEND _dss_lane_candidates "${_dss_lane_anc}/${_dss_lane_rel}")
-                endif()
-            endforeach()
-        endforeach()
-    endif()
-    find_program(_dss_lane_path_bash NAMES bash NO_CACHE)
-    if(_dss_lane_path_bash)
-        list(APPEND _dss_lane_candidates "${_dss_lane_path_bash}")
-    endif()
-    list(REMOVE_DUPLICATES _dss_lane_candidates)
-    set(_dss_lane_tried "")
-    foreach(_dss_lane_cand IN LISTS _dss_lane_candidates)
-        get_filename_component(_dss_lane_cand_dir "${_dss_lane_cand}" DIRECTORY)
-        set(_dss_lane_saved_path "$ENV{PATH}")
-        set(ENV{PATH} "${_dss_lane_cand_dir}${_dss_lane_path_sep}${_dss_lane_saved_path}")
-        execute_process(
-            COMMAND "${_dss_lane_cand}" -c "${_dss_lane_probe}"
-            RESULT_VARIABLE _dss_lane_cand_rc
-            OUTPUT_VARIABLE _dss_lane_cand_out
-            ERROR_VARIABLE  _dss_lane_cand_err)
-        set(ENV{PATH} "${_dss_lane_saved_path}")
-        string(APPEND _dss_lane_tried " [${_dss_lane_cand} -> exit ${_dss_lane_cand_rc}]")
-        if(_dss_lane_cand_rc EQUAL 0)
-            set(DSS_BASH_FOR_LANE_GUARD "${_dss_lane_cand}" CACHE FILEPATH
-                "bash proved able to run the lane-worktree scratchpad guard" FORCE)
-            break()
-        endif()
-    endforeach()
-    set(_dss_lane_refusal "")
-    if(DSS_BASH_FOR_LANE_GUARD)
-        get_filename_component(_dss_lane_bash_dir "${DSS_BASH_FOR_LANE_GUARD}" DIRECTORY)
-        # `_dss_lane_path_sep` is derived ONCE above, with `string(ASCII 59 ...)`
-        # rather than a literal `;` — which CMake would read as a list separator
-        # in the middle of the PATH being built.
-        set(_dss_lane_saved_path "$ENV{PATH}")
-        set(ENV{PATH} "${_dss_lane_bash_dir}${_dss_lane_path_sep}${_dss_lane_saved_path}")
-        # The SAME probe text the selection loop used — one owner, so the arm that
-        # CHOOSES a bash and the arm that REFUSES one cannot come to disagree.
-        execute_process(
-            COMMAND "${DSS_BASH_FOR_LANE_GUARD}" -c "${_dss_lane_probe}"
-            RESULT_VARIABLE _dss_lane_bash_rc
-            OUTPUT_VARIABLE _dss_lane_bash_out
-            ERROR_VARIABLE  _dss_lane_bash_err)
-        set(ENV{PATH} "${_dss_lane_saved_path}")
-        if(NOT _dss_lane_bash_rc EQUAL 0)
-            set(_dss_lane_refusal
-                "lane_worktree_guard CANNOT RUN: the bash CMake found (${DSS_BASH_FOR_LANE_GUARD}) could not, with its own directory prepended to PATH, both open ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh and resolve dirname, mktemp and git (probe exit ${_dss_lane_bash_rc}). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path at all. Point DSS_BASH_FOR_LANE_GUARD at a bash that can, or install Git for Windows. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the operator's PATH and not about the tree.")
-        endif()
-    else()
-        set(_dss_lane_refusal
-            "lane_worktree_guard CANNOT RUN: no bash on this host could both open ${CMAKE_SOURCE_DIR}/scripts/lane-worktree/lane-worktree.sh and resolve dirname, mktemp and git, so the scratchpad gate for lane-worktree.sh was never exercised. Candidates tried, each with its own directory prepended to PATH:${_dss_lane_tried} (empty means no bash was found at all). On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path; Git for Windows' bin/bash.exe or usr/bin/bash.exe can. Point -DDSS_BASH_FOR_LANE_GUARD at one that works. This test FAILS rather than disappearing, because a guard that silently does not run publishes a gate figure that is about the host and not about the tree.")
-    endif()
-    if(_dss_lane_refusal STREQUAL "")
-        add_test(
-            NAME lane_worktree_guard
-            COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
-                    "${CMAKE_SOURCE_DIR}/scripts/lane-worktree/test-lane-worktree.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        # ⚠ MODIFIES the inherited environment; see the measured note above for
-        # what a REPLACING `ENVIRONMENT` property costs.
-        set_tests_properties(lane_worktree_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
-
-        # ── Root-litter guard (2026-09-07, P64) ────────────────────────────
-        # Refuses any untracked file sitting directly in a repository root —
-        # the probe artifacts a lane leaves when a bare filename lands in its
-        # cwd. ✔MEASURED twice in two cycles: a 0-byte `256` from a `> 256`
-        # that reached a shell as a redirect, then FIFTEEN reference-probe
-        # files (`pa.c`, `g.s`, four binaries, six captured `.txt`s).
-        # ★ REGISTERED HERE, not with its bash siblings above, and that is the
-        # point of putting it in this block: those are inside an `else()` that
-        # only runs on NON-Windows hosts, and this defect is produced by lanes
-        # on THIS host. `DSS_BASH_FOR_LANE_GUARD` is the bash already proven
-        # able to open a `C:/` path — a bare `bash` on Windows can be the WSL
-        # shim, which cannot, and would make the guard silently absent.
-        # ⓘ Runs the GUARD, not its self-test: the self-test plants a file in
-        # the root and would race a parallel `ctest -j` against this entry.
-        add_test(
-            NAME root_litter_guard
-            COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
-                    "${CMAKE_SOURCE_DIR}/scripts/check-root-litter/check-root-litter.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        set_tests_properties(root_litter_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
-
-        # ── macos-leg drives the tree IT lives in (2026-09-15, P66 lane rr) ──────
-        # Both twins took their default source from the caller's working directory,
-        # beside a cwd-relative carriage, so a leg run by path from another checkout's
-        # root pushed and tested THAT checkout. Nothing here could see it: the leg has
-        # no other test, and a real run needs a Mac. `test-macos-leg.py` COPIES each twin
-        # into a fixture whose carriage is a recording STUB, then drives it from a foreign
-        # repository, from no repository, and with an explicit source.
-        # ★ Registered HERE for the reason `root_litter_guard` is: the `.sh` twin needs
-        # the bash this block already proved can open a `C:/` path. The `.ps1` twin is
-        # the Windows driver, so it is exercised where the host is Windows.
-        set(_dss_macos_leg_test_args --bash "${DSS_BASH_FOR_LANE_GUARD}")
-        if(CMAKE_HOST_WIN32)
-            list(APPEND _dss_macos_leg_test_args --pwsh "${POWERSHELL_EXE}")
-        endif()
-        add_test(
-            NAME macos_leg_source_tree_guard
-            COMMAND ${Python3_EXECUTABLE}
-                    "${CMAKE_SOURCE_DIR}/scripts/macos-leg/test-macos-leg.py"
-                    ${_dss_macos_leg_test_args}
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        set_tests_properties(macos_leg_source_tree_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
-
-        # ── leg-tree refuses an empty repository, and ignores the caller's git environment ──
-        # (2026-09-15, P66 lane rr.) `leg_tree_restore ""` -- or with no argument, or
-        # `leg-tree.sh restore` -- ran `cd ""`, a silent no-op on WSL bash 5.2 and dash, and then
-        # `reset --hard` + `clean -fd` over WHATEVER REPOSITORY THE CALLER STOOD IN (✔MEASURED on
-        # fixtures: "2 dirty path(s) discarded", rc=0). With another repository's GIT_DIR +
-        # GIT_WORK_TREE exported, a restore of a NAMED clone discarded the other repository's
-        # paths instead, and `check-root-litter.sh`, which asks git through the same helper,
-        # called a littered root clean. `test-leg-tree.sh` builds every repository it touches
-        # under `mktemp -d`, proven outside this checkout before anything runs.
-        # ★ Registered HERE for the reason `root_litter_guard` is: it needs the bash this block
-        # already proved can open a `C:/` path.
-        add_test(
-            NAME leg_tree_guard
-            COMMAND "${DSS_BASH_FOR_LANE_GUARD}"
-                    "${CMAKE_SOURCE_DIR}/scripts/leg-tree/test-leg-tree.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        set_tests_properties(leg_tree_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
-
-        # ── check-ci-legs asks git AND gh about the tree it lives in (2026-09-15, P66 lane ge) ──
-        # With another repository's GIT_DIR, or GIT_DIR + GIT_WORK_TREE, exported, both twins read
-        # THAT repository's branch, and gh -- which finds `:owner/:repo` by running git -- saw THAT
-        # repository's origin even when told the branch (✔MEASURED: the real gh 2.89.0 answered
-        # HTTP 404 there). The test is HERMETIC: copies of both twins, a stub gh leading PATH, no
-        # network, no gh authentication.
-        # ★ Registered HERE for the reason `macos_leg_source_tree_guard` is: the `.sh` twin needs
-        # this block's proven bash; the `.ps1` twin runs where the host is Windows.
-        set(_dss_ci_legs_test_args --bash "${DSS_BASH_FOR_LANE_GUARD}")
-        if(CMAKE_HOST_WIN32)
-            list(APPEND _dss_ci_legs_test_args --pwsh "${POWERSHELL_EXE}")
-        endif()
-        add_test(
-            NAME check_ci_legs_git_environment_guard
-            COMMAND ${Python3_EXECUTABLE}
-                    "${CMAKE_SOURCE_DIR}/scripts/check-ci-legs/test-check-ci-legs.py"
-                    ${_dss_ci_legs_test_args}
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        set_tests_properties(check_ci_legs_git_environment_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
-
-        # ── remote-leg sends leg-tree.sh on the carriage's STDIN (2026-09-15, P66 lane ge) ──
-        # It passed the helper's whole text as ONE carriage argument, so a leg worked only while that
-        # file stayed under the smallest ceiling its path crossed (✔MEASURED inside WSL, where it
-        # runs: one argument of 131,072 bytes fails at execve). `test-remote-leg.py` copies the driver
-        # into a fixture whose arm64-vps carriage is a recording STUB; prepare, and the restore its
-        # EXIT trap runs, must arrive as the owner's small command with the helper's exact bytes on
-        # stdin, and still do with the helper padded past 140 KB of code.
-        add_test(
-            NAME remote_leg_helper_transport_guard
-            COMMAND ${Python3_EXECUTABLE}
-                    "${CMAKE_SOURCE_DIR}/scripts/remote-leg/test-remote-leg.py"
-                    --bash "${DSS_BASH_FOR_LANE_GUARD}"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        set_tests_properties(remote_leg_helper_transport_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_lane_bash_dir}")
-    else()
-        set(_dss_lane_refusal_script
-            "${CMAKE_CURRENT_BINARY_DIR}/lane_worktree_guard_refusal.cmake")
-        file(WRITE "${_dss_lane_refusal_script}"
-             "message(FATAL_ERROR \"${_dss_lane_refusal}\")\n")
-        add_test(
-            NAME lane_worktree_guard
-            COMMAND ${CMAKE_COMMAND} -P "${_dss_lane_refusal_script}")
-        message(STATUS "lane_worktree_guard registered as a REFUSAL: ${_dss_lane_refusal}")
-
-        # ⛔ AND ITS NEIGHBOUR USED TO VANISH ON THIS PATH.
-        # [[D-GATE-REPO-TREE-GUARD-SILENTLY-VANISHES-WHERE-NO-POWERSHELL-IS-FOUND]]
-        # `root_litter_guard` is registered in the branch above and had NO counterpart
-        # here, so a host where the bash probe refused lost it ENTIRELY: one entry
-        # refused loudly while a second disappeared from the total beside it, in the
-        # very block whose sibling comment says a guard must FAIL rather than
-        # disappear. It refuses for the SAME fact, in its own words, so the two
-        # neighbours now state one rule instead of one rule and one silence.
-        set(_dss_litter_refusal_script
-            "${CMAKE_CURRENT_BINARY_DIR}/root_litter_guard_refusal.cmake")
-        file(WRITE "${_dss_litter_refusal_script}"
-             "message(FATAL_ERROR \"root_litter_guard CANNOT RUN: it is driven by the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
-        add_test(
-            NAME root_litter_guard
-            COMMAND ${CMAKE_COMMAND} -P "${_dss_litter_refusal_script}")
-        message(STATUS "root_litter_guard registered as a REFUSAL: no bash proved able to drive scripts/check-root-litter/check-root-litter.sh")
-
-        # The same rule for the third neighbour: `macos_leg_source_tree_guard` needs this
-        # bash too, so where it was refused the entry REFUSES rather than disappearing.
-        set(_dss_macos_leg_refusal_script
-            "${CMAKE_CURRENT_BINARY_DIR}/macos_leg_source_tree_guard_refusal.cmake")
-        file(WRITE "${_dss_macos_leg_refusal_script}"
-             "message(FATAL_ERROR \"macos_leg_source_tree_guard CANNOT RUN: it drives macos-leg.sh with the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
-        add_test(
-            NAME macos_leg_source_tree_guard
-            COMMAND ${CMAKE_COMMAND} -P "${_dss_macos_leg_refusal_script}")
-        message(STATUS "macos_leg_source_tree_guard registered as a REFUSAL: no bash proved able to drive scripts/macos-leg/macos-leg.sh")
-
-        # And the fourth neighbour: `leg_tree_guard` drives test-leg-tree.sh with that bash too.
-        set(_dss_leg_tree_refusal_script
-            "${CMAKE_CURRENT_BINARY_DIR}/leg_tree_guard_refusal.cmake")
-        file(WRITE "${_dss_leg_tree_refusal_script}"
-             "message(FATAL_ERROR \"leg_tree_guard CANNOT RUN: it drives scripts/leg-tree/test-leg-tree.sh with the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
-        add_test(
-            NAME leg_tree_guard
-            COMMAND ${CMAKE_COMMAND} -P "${_dss_leg_tree_refusal_script}")
-        message(STATUS "leg_tree_guard registered as a REFUSAL: no bash proved able to drive scripts/leg-tree/test-leg-tree.sh")
-
-        # And the P66 lane ge neighbours, which drive their `.sh` subjects with that bash too.
-        foreach(_dss_ge_guard IN ITEMS check_ci_legs_git_environment_guard remote_leg_helper_transport_guard)
-            set(_dss_ge_refusal_script "${CMAKE_CURRENT_BINARY_DIR}/${_dss_ge_guard}_refusal.cmake")
-            file(WRITE "${_dss_ge_refusal_script}"
-                 "message(FATAL_ERROR \"${_dss_ge_guard} CANNOT RUN: it drives a .sh script with the same bash as lane_worktree_guard, and that bash was refused — ${_dss_lane_refusal}\")\n")
-            add_test(
-                NAME ${_dss_ge_guard}
-                COMMAND ${CMAKE_COMMAND} -P "${_dss_ge_refusal_script}")
-            message(STATUS "${_dss_ge_guard} registered as a REFUSAL: no bash proved able to drive its .sh subject")
-        endforeach()
-    endif()
-
-    # Citation-stability guard (2026-08-19 — D-PLANS-CITATION-LINE-NUMBERS-SILENTLY-INVALIDATED).
+    # Citation-stability guard (2026-08-19 — line-number citations were silently invalidated).
     # A `path:line` citation is a claim about a file that nothing rechecks: insert
     # one line above it and it silently points at unrelated prose while still
     # reading as evidence. Operator rule, 2026-08-19: cite a method name, a
@@ -1062,11 +869,11 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME plan_citations_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-plan-citations/check-plan-citations.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-plan-citations/check-plan-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Wall-clock-literal guard (2026-08-23 —
-    # D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED).
+    # Wall-clock-literal guard (2026-08-23 — a new wall-clock literal in a test was
+    # unguarded).
     # A duration number written into a test is sized on the machine that wrote it:
     # it passes there and reds on the slowest leg, NAMING THE WRONG EVENT, because
     # a timeout usually surfaces as a sentinel return value the assertion then
@@ -1086,16 +893,15 @@ if(DSS_BUILD_TESTS)
     # gets turned off within a week.
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
     # the tree and then drives 23 matcher arms against synthetic fixtures, so this
-    # entry cannot pass without also proving the guard can fail
-    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # entry cannot pass without also proving the guard can fail.
     add_test(
         NAME wall_clock_in_tests_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-wall-clock-in-tests/check-wall-clock-in-tests.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-wall-clock-in-tests/check-wall-clock-in-tests.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Diagnostic-code allocation gate (2026-08-23 —
-    # D-GATE-DIAGNOSTIC-CODE-ALLOCATOR-HAS-NO-CTEST-ENTRY).
+    # Diagnostic-code allocation gate (2026-08-23 — the allocator had no ctest
+    # entry).
     # ★ THE ASYMMETRY IS THE POINT: this is the gate written BECAUSE "a lane
     # allocates an ordinal and nothing mechanical notices" — and ✔MEASURED
     # 2026-08-23 it was itself noticed only when a human remembered to run it: no
@@ -1108,11 +914,10 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME diagnostic_codes_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-diagnostic-codes/check-diagnostic-codes.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-diagnostic-codes/check-diagnostic-codes.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # ── THE REST OF THE GUARDS NOTHING MECHANICAL RAN ───────────────────────
-    # D-GATE-FOUR-GUARD-SCRIPTS-STILL-HAVE-NO-CTEST-ENTRY.
     #
     # ★★★ REGISTERING `diagnostic_codes_guard` above closed ONE instance of
     # "a guard written because nothing mechanical notices, which nothing
@@ -1135,7 +940,20 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME no_abort_in_tests_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-no-abort-in-tests/check-no-abort-in-tests.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-no-abort-in-tests/check-no-abort-in-tests.py"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ★ THE EMITTED-ANCHOR-ID RATCHET. An anchor id inside a C++ string literal
+    # under src/ is operator OUTPUT, and the row it names can close while the
+    # text keeps telling the operator "a known deferral, wait for it". The id is
+    # bookkeeping: it belongs in a comment at the emit site, and the message
+    # states the condition and the action. Per-file inventory, only ever
+    # lowered; the literals come from `check-no-abort-in-tests`' scanner and the
+    # id shape from `check-anchor-balance`, never from a copy here. Like its
+    # siblings, the no-argument form verifies the tree AND runs the self-test.
+    add_test(
+        NAME emitted_anchor_ids_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-emitted-anchor-ids/check-emitted-anchor-ids.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # ⚠ THESE TWO RAN ZERO SELF-TEST ARMS UNTIL 2026-08-24 (cycle P29,
     # independent step-10 audit), AND THE ENTRIES BELOW ARE UNCHANGED — the
@@ -1143,30 +961,30 @@ if(DSS_BUILD_TESTS)
     # self-test behind a flag (`--selftest` / `--self-test`) that nothing passed,
     # so each entry exercised its tree check and proved nothing about its own
     # ability to fail — the identical shape measured live in
-    # `no_abort_in_tests_guard` (D-GATE-NO-ABORT-IN-TESTS-CTEST-FORM-NEVER-SELF-TESTED).
+    # `no_abort_in_tests_guard`.
     # ⛔ THE OBVIOUS FIX — ADDING THE FLAG HERE — IS WRONG AND MUST NOT BE MADE:
     # ✔MEASURED, in BOTH scripts that flag RETURNS from the self-test without
     # scanning the tree, so it would have TRADED the check for the proof instead
     # of adding the proof to the check. The no-argument form now does both, and
     # a red-on-disable drove the mutant through each registered form to prove the
-    # failure actually propagates (D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES).
+    # failure actually propagates.
     add_test(
         NAME path_identity_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-path-identity/check-path-identity.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-path-identity/check-path-identity.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(
         NAME retyped_closed_sets_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-retyped-closed-sets/check-retyped-closed-sets.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-retyped-closed-sets/check-retyped-closed-sets.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # ── `check-doc-census` — registered 2026-09-04 (P59), and it closes
-    # D-DOCS-STATUS-CLAIMS-DRIFT-UNCHECKED, whose closing work asked for "the
+    # ── `check-doc-census` — registered 2026-09-04 (P59) to close unchecked drift in
+    # the docs' status claims; that closing work asked for "the
     # cheapest durable check" for prose that goes false while nobody re-reads it.
     #
     # ⚠⚠ THE INSTRUMENT IT COMPLETES ALREADY EXISTED, WHICH IS THE WHOLE POINT.
-    # `scripts/examples-census/examples-census.py` was written on 2026-08-24 to
+    # `.harness-config/runner/actions/examples-census/examples-census.py` was written on 2026-08-24 to
     # stop the corpus figures being hand-counted, and its PURPOSE line says it
     # re-derives "every corpus-manifest figure examples/README.md states". It
     # worked; the numbers rotted anyway. ✔MEASURED 2026-09-04 the first time this
@@ -1184,11 +1002,10 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME doc_census_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-doc-census/check-doc-census.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-doc-census/check-doc-census.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # ★ And its self-test, for the reason the three entries below carry: a
-    # self-test behind a flag nobody types is not a test
-    # (D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES). Every arm is a
+    # self-test behind a flag nobody types is not a test. Every arm is a
     # REFUSAL plus a CONTROL that must stay green, and each was proven able to
     # fail by deleting the refusal it aims at — including both directions of the
     # `.worktrees/` exclusion, which would otherwise be free to widen until it
@@ -1196,7 +1013,7 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME doc_census_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-doc-census/check-doc-census.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-doc-census/check-doc-census.py"
                 --selftest
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
@@ -1209,20 +1026,19 @@ if(DSS_BUILD_TESTS)
     # true at HEAD and made FALSE BY THIS CYCLE'S OWN EDITS to the same guard
     # (✔MEASURED at the fold: 78). A count in a comment is a measurement with no
     # instrument attached — the reader cannot re-derive it and no guard can check
-    # it — so it decays silently in the direction of looking authoritative
-    # (D-TEST-CMAKE-COMMENT-QUOTES-A-CORPUS-COUNT-THE-TEST-IT-REGISTERS-FORBIDS).
+    # it — so it decays silently in the direction of looking authoritative.
     # Registering the self-test is what stops the instrument that judges every
     # cycle from being the one thing no cycle checks.
     add_test(
         NAME anchor_balance_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-anchor-balance/check-anchor-balance.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # `lane-fold.py --self-test` — registered 2026-09-02 (P53) for exactly the
-    # reason the entry above exists, and it is the SAME defect class as
-    # D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES.
+    # reason the entry above exists, and it is the SAME defect class: a self-test
+    # behind a flag nobody passes.
     #
     # ⚠ ✔MEASURED at the P53 fold by lane `lw`, which could not fix it because
     # this file is outside a lane's set: `lane_worktree_guard` was registered and
@@ -1237,40 +1053,53 @@ if(DSS_BUILD_TESTS)
     # is right by construction and proves nothing — so this entry cannot pass
     # without the instrument demonstrating it can fail. P53 added arms (i) and
     # (j): driven from ANOTHER repository's cwd the root still names the tree the
-    # FILE lives in, and `--repo` still reaches elsewhere deliberately
-    # (D-SCRIPT-LANE-WORKTREE-REPO-ROOT-IS-CWD-KEYED).
+    # FILE lives in, and `--repo` still reaches elsewhere deliberately.
     add_test(
         NAME lane_fold_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/lane-fold/lane-fold.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/lane-fold/lane-fold.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # `anchors.py --self-test` — registered 2026-09-02 (P54), and it is the THIRD
-    # instance of D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES found by
+    # self-test behind a flag nobody passes found by
     # the same question: which self-test does nothing unless a human types it?
     #
-    # ★★ THIS ONE IS THE HIGHEST-VALUE OMISSION OF THE THREE. `anchors.py` is the
-    # ONLY sanctioned door to all three registries — it is what makes a wrapped
-    # anchor id, an unescaped pipe and a wrong cell count inexpressible, and it
-    # performs the archive MOVE that a closed row depends on. Its 26 arms were the
-    # only thing standing behind every one of those invariants, and they ran on
-    # request.
+    # ★★ WHAT IT PROVES SINCE THE DOOR MOVED TO DSSHARNESS. A registry row is
+    # written by `dssharness write-anchor` / `set-anchor` and by nothing else;
+    # `anchors.py` keeps the registry READER, the status vocabulary, and the ONE
+    # launcher the row callers reach the door through. Its self-test drives every
+    # refusal the retired writer made into the REAL door, in git fixture trees —
+    # a pre-escaped pipe, an empty Trigger, an id no guard resolves, a duplicate,
+    # the archive MOVE a closed row depends on — plus the launcher's own
+    # refusals, and it FAILS on a host without DssHarness: a door nobody ran is
+    # not a door that refused.
     #
     # ⚠ ✔MEASURED 2026-09-02, and it is why this entry is here rather than on a
     # list: 35 pipes across 14 rows had been stored with a DOUBLED backslash, so
     # they rendered a stray `\` where their author wrote `|` — a C `||`, a shell
-    # `||`, a regex alternation, `awk -F"|"`. `make_cell`'s own docstring had
-    # considered and dismissed that input as one "that never arrives". It arrives
-    # from two directions, neither detectable downstream: an author pre-escaping a
-    # pipe, and a lane reading the RAW TABLE LINE instead of `read-anchor --json`
-    # and handing the escaped form back — which COMPOUNDS, one backslash per
-    # re-close. The writer now refuses it (arms 6b–6d), and this entry is what
-    # makes that refusal a property of the tree rather than of a habit.
+    # `||`, a regex alternation, `awk -F"|"`. It arrives from two directions,
+    # neither detectable downstream: an author pre-escaping a pipe, and a lane
+    # reading the RAW TABLE LINE instead of `read-anchor --json` and handing the
+    # escaped form back — which COMPOUNDS, one backslash per re-close. The door
+    # refuses it, and this entry is what makes that refusal a property of the
+    # tree rather than of a habit.
     add_test(
         NAME anchors_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/anchors/anchors.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchors/anchors.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    # `anchor-rows.py --self-test` (2026-09-25, P68 round 13, lane mig): a fold's rows, applied as ONE
+    # batch through the door -- staged, rehearsed in a throwaway repository, all or nothing, every row
+    # read back. It replaced five toolkit scripts whose loop once stopped with SOME rows applied, and
+    # whose `--dry-run` was once not an option and APPLIED. Like the entry above it drives the REAL
+    # door in git fixture trees, so a host without DssHarness fails it rather than skipping it.
+    add_test(
+        NAME anchor_rows_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchor-rows/anchor-rows.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
@@ -1279,13 +1108,13 @@ if(DSS_BUILD_TESTS)
     # bare `git rev-parse --show-toplevel`, or a cwd-relative path -- and no entry in
     # this file could see it, because every entry pins WORKING_DIRECTORY to the source
     # tree. ✔MEASURED before the fix: run by path from inside another repository they
-    # reported on THAT repository, some of them OK. `scripts/owning-tree/owning-tree.py`
+    # reported on THAT repository, some of them OK. `.harness-config/runner/actions/owning-tree/owning-tree.py`
     # now owns the answer; every consumer's own self-test carries the cwd arms, and this
     # first entry proves those arms can FAIL.
     add_test(
         NAME owning_tree_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/owning-tree/owning-tree.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/owning-tree/owning-tree.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # Two more tools that read their subject THROUGH git, and handed git the caller's git
@@ -1298,34 +1127,32 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME corpus_census_git_environment_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/corpus-census/test-corpus-census.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/corpus-census/test-corpus-census.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(
         NAME landing_log_git_environment_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/refresh_landing_log/refresh_landing_log.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/refresh_landing_log/refresh_landing_log.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # ⚠ Two of those consumers had a self-test and NO entry: a self-test behind a flag
-    # nobody passes, the D-GATE-TWO-GUARDS-SELF-TEST-BEHIND-A-FLAG-NOBODY-PASSES shape.
+    # nobody passes, the shape of the entries above.
     # One of them WRITES registry rows under the root it resolves.
     add_test(
         NAME apply_registry_row_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/apply-registry-row/apply-registry-row.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/apply-registry-row/apply-registry-row.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    add_test(
-        NAME carriage_excludes_selftest_guard
-        COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/carriage-excludes/carriage-excludes.py"
-                --self-test
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # ⓘ `carriage_excludes_selftest_guard` stood here. `carriage-excludes.py`
+    # derived a transport exclude list from what git ignores, so no carriage
+    # re-typed one; DssHarness's `sync` owns that question now, from the same
+    # source of truth, for every host at once.
 
-    # Wrapped-anchor-id guard (2026-08-23 —
-    # D-ANCHOR-ID-WRAPPED-ACROSS-A-LINE-BREAK-IS-INVISIBLE-TO-EVERY-GREP).
-    # An anchor id split across a line break — the line ends `…D-SOME-ANCHOR-`
-    # and the next opens `PART-OF-THE-ID` — still READS as a citation, but no
+    # Wrapped-anchor-id guard (2026-08-23 — an id wrapped across a line break is
+    # invisible to every grep).
+    # An anchor id split across a line break — the line ends `…D-SOME-`
+    # and the next opens `ANCHOR-PART-OF-THE-ID` — still READS as a citation, but no
     # grep for the whole id will ever return it. ★★★ IT DOES NOT FAIL, IT
     # DISAPPEARS, which is the one failure mode a fail-loud project cannot catch
     # by watching for a failure: the row simply loses an inbound link and starts
@@ -1351,8 +1178,7 @@ if(DSS_BUILD_TESTS)
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
     # the tree and then drives EVERY arm its own `EXPECTED_ARMS` pin declares, each
     # red arm asserting the MESSAGE of the refusal it names, so this entry cannot
-    # pass without also proving the guard can fail
-    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # pass without also proving the guard can fail.
     # ⚠ THE ARM COUNT USED TO BE WRITTEN HERE AS A NUMBER AND WENT STALE (it said
     # 35; the guard drives 40 as of 2026-08-24). A count in a comment is a
     # measurement with no instrument attached, so it decays silently in the
@@ -1365,11 +1191,11 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME wrapped_anchor_ids_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-wrapped-anchor-ids/check-wrapped-anchor-ids.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Ninja dependency-record probe, SELF-TEST arm (2026-08-23 —
-    # D-GATE-NINJA-DEPS-EXITS-ZERO-ON-A-DIRECTORY-THAT-DOES-NOT-EXIST).
+    # Ninja dependency-record probe, SELF-TEST arm (2026-08-23 — it exited ZERO on
+    # a directory that does not exist).
     # ⚠ THE `ⓘ` NOTE IN THE BLOCK ABOVE — `check-ninja-deps` "has no argument-free
     # form to register" — IS TRUE ONLY OF ITS PROBE FORM, AND IS STALE AS WRITTEN;
     # correcting it in place is left to the owner of that block. Its `--self-test`
@@ -1391,13 +1217,13 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME ninja_deps_selftest_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-ninja-deps/check-ninja-deps.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py"
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # ── THE PROBE FORM, ENFORCED: IS THIS BUILD DIRECTORY FRESH ENOUGH TO BE
-    #    BELIEVED? (P62 lane `ax` —
-    #    D-BUILD-NINJA-RECORDS-ZERO-HEADER-DEPS-UNDER-CONCURRENT-BUILDS) ──
+    #    BELIEVED? (P62 lane `ax` — ninja recorded ZERO header deps under
+    #    concurrent builds) ──
     #
     # ★★★ WHAT IT COST TO LEAVE THIS UNREGISTERED, ✔MEASURED IN THE CYCLE THAT
     # ADDED IT. Cycle P62's wave-2 gate came back with two `SemanticAnalyzerC`
@@ -1432,8 +1258,8 @@ if(DSS_BUILD_TESTS)
     # ★ THE `--allow-non-ninja` ESCAPE IS DIRECTIONAL AND CANNOT BE REACHED FROM A
     # NINJA TREE — an escape every caller triggers is an escape that disarms the
     # guard. It is decided HERE, at configure time, from `CMAKE_GENERATOR`, which
-    # the build cannot fake; on Ninja (the generator `scripts/local-build` pins for
-    # every leg) the flag is not passed AT ALL, so the SKIP arm is unreachable and
+    # the build cannot fake; on Ninja (the generator `.harness-config/config.json`
+    # declares for every leg) the flag is not passed AT ALL, so the SKIP arm is unreachable and
     # a missing `build.ninja` would be FATAL rather than a pass. On a genuinely
     # non-Ninja tree the entry passes while printing `NOTHING WAS VERIFIED here`,
     # which is a visible skip rather than a silent one.
@@ -1449,7 +1275,7 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME build/ninja-deps-freshness
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-ninja-deps/check-ninja-deps.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py"
                 ${_dss_ninja_deps_args}
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     get_filename_component(_dss_ninja_dir "${CMAKE_MAKE_PROGRAM}" DIRECTORY)
@@ -1489,16 +1315,15 @@ if(DSS_BUILD_TESTS)
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
     # the tree and then drives every refuse-arm AND every accept-arm, so this
     # entry cannot pass without also proving the guard can fail, nor without
-    # proving it does not over-reach onto the nine legitimate nested types
-    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # proving it does not over-reach onto the nine legitimate nested types.
     add_test(
         NAME export_macro_placement_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-export-macro-placement/check-export-macro-placement.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-export-macro-placement/check-export-macro-placement.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Guard-output-encoding ratchet (2026-08-23 —
-    # D-GATE-NOTHING-RATCHETS-A-NEW-GUARD-INTO-RECONFIGURING-ITS-STREAMS).
+    # Guard-output-encoding ratchet (2026-08-23 — nothing ratcheted a new guard into
+    # reconfiguring its streams).
     # On Windows a Python child whose stdout is a PIPE — which is how ctest runs
     # every guard above — comes up cp1252/surrogateescape, and `surrogateescape`
     # does nothing for an ordinary unencodable character. So a guard printing tree
@@ -1528,8 +1353,7 @@ if(DSS_BUILD_TESTS)
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
     # the tree and then drives EVERY arm its own `EXPECTED_ARMS` pin declares, each
     # red arm asserting the MESSAGE of the refusal it names, so this entry cannot
-    # pass without also proving the guard can fail
-    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # pass without also proving the guard can fail.
     # ⚠ THE ARM COUNT USED TO BE WRITTEN HERE AS A NUMBER AND WENT STALE (it said
     # 17; the guard drives 21 as of 2026-08-24), and this guard had NO
     # `EXPECTED_ARMS` pin at all until P30 -- it reported its own arm count and
@@ -1538,12 +1362,12 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME guard_output_encoding_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-guard-output-encoding/check-guard-output-encoding.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-guard-output-encoding/check-guard-output-encoding.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Stale-refusal-citation ratchet (2026-08-24 —
-    # D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
-    # An author writes "X therefore stays refused fail-loud (D-SOME-ROW)" while
+    # Stale-refusal-citation ratchet (2026-08-24 — a claim true when typed and false
+    # when the commit landed).
+    # An author writes "X therefore stays refused fail-loud (<row id>)" while
     # that row is OPEN; a sibling lane closes the row IN THE SAME COMMIT. The
     # sentence was TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED, and
     # it still READS as evidence — so the next author is sent to fix an engine
@@ -1606,182 +1430,23 @@ if(DSS_BUILD_TESTS)
     # ★★ AND IT SELF-TESTS ON EVERY RUN — the no-argument form used here verifies
     # the tree and then drives its arms against fixtures SYNTHESIZED into a temp
     # tree at run time, every red arm asserting the MESSAGE of the refusal it
-    # names, so this entry cannot pass without also proving the guard can fail
-    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS). An on-disk fixture is
+    # names, so this entry cannot pass without also proving the guard can fail.
+    # An on-disk fixture is
     # impossible by construction: it would BE an instance of the defect, would
     # sit in this guard's own inventory forever, and the first person to repair
     # it would silently break the self-test.
     add_test(
         NAME stale_refusal_citations_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-stale-refusal-citations/check-stale-refusal-citations.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-stale-refusal-citations/check-stale-refusal-citations.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-    # Repo-tree guard (2026-09-01 — D-SCRIPT-GUARDS-ASK-GIT-FROM-THE-LANE-WORKTREE).
-    # `scripts/repo-tree/repo-tree.ps1` is the PowerShell owner of "which tree am I
-    # standing in?", the third and last of the three one-per-language resolvers
-    # (`leg_tree_driver_identity` for .sh, `_git_prefix` for .py). This entry runs
-    # its arms.
-    #
-    # ★★ WHAT IT PINS, AND WHY NOTHING ELSE COULD. `Set-Location` moves the
-    # PowerShell provider location — which native children (git) inherit — and does
-    # NOT move `[Environment]::CurrentDirectory`, which is what every `[IO.File]`
-    # relative read follows. A guard built from both ENUMERATES FROM ONE TREE AND
-    # READS FROM ANOTHER, and when both roots hold the path — which is all of them,
-    # for a lane that only EDITS files — nothing throws: the verdict is simply about
-    # the wrong tree. ✔MEASURED 2026-09-01 on `check-line-endings.ps1`, which died
-    # on a lane-only file and would otherwise have passed silently.
-    # ⇒ The arms build a REAL `git worktree add` fixture (so the lane's `.git` is a
-    # FILE), put DIFFERENT bytes at the SAME relative path in the two roots, and run
-    # a CHILD process standing in the wrong one. A CONTROL arm reproduces the defect
-    # on demand, so the positive arm cannot pass vacuously.
-    # ⚠ A self-test run only from the main checkout would be vacuous BY CONSTRUCTION
-    # here — the defect exists only where two roots hold the same path — which is
-    # why the fixture manufactures both roots instead of hoping to be run inside one.
-    # ✔RED-ON-DISABLE 2026-09-01: removing the one `[Environment]::CurrentDirectory`
-    # assignment from `Enter-RepoTree` reds arms 3 and 6 BY NAME (rc 0 -> 1, md5
-    # moved and returned); the unmutated control is green on both sides of it.
-    #
-    # ⛔⛔ AND IT USED TO VANISH OFF WINDOWS, WHICH IS WORSE THAN REDDING.
-    # [[D-GATE-REPO-TREE-GUARD-SILENTLY-VANISHES-WHERE-NO-POWERSHELL-IS-FOUND]]
-    # The registration was `find_program(... NAMES pwsh)` — NOT `REQUIRED` — wrapped in
-    # `if(DSS_PWSH_FOR_REPO_TREE_GUARD)`. On a host with no pwsh the `add_test` never
-    # happened: the suite reported a SMALLER TOTAL and a clean bill of health, and nothing
-    # anywhere said a guard had not run. ★★ A vacuous skip is the one failure mode a
-    # fail-loud project cannot detect by watching for a failure. ⚠ THE SAME FILE ALREADY
-    # KNEW BETTER: `lane_worktree_guard`'s registration above carries the sentence *"This
-    # test FAILS rather than disappearing, because a guard that silently does not run
-    # publishes a gate figure that is about the operator's PATH and not about the tree."*
-    #
-    # ★★★ THE ANSWER IS NOT-APPLICABLE-BY-NAME OFF WINDOWS AND A REFUSAL ON IT, AND THAT
-    # SPLIT IS MEASURED RATHER THAN ASSUMED. The question the two siblings' missing-`bash`
-    # rule cannot answer for this entry is whether the property can hold at all where the
-    # interpreter is absent:
-    #   * IT IS A PROPERTY *OF POWERSHELL*. `Set-Location` moves the provider location and
-    #     leaves `[Environment]::CurrentDirectory` behind — see the block above. A host
-    #     with no PowerShell can neither exhibit that split nor run any `.ps1` consumer of
-    #     the resolver, so the claim is not merely unverified there, it is inapplicable.
-    #     `bash`, by contrast, is the driver of every leg script in this repository, so a
-    #     host without one is BROKEN — which is why those two entries refuse.
-    #   * IT IS NOT A WINDOWS-ONLY PROPERTY, so wherever an interpreter exists this entry
-    #     MUST RUN. ✔MEASURED: `Resolve-RepoTreeRealPath`'s own comment records arms 3 and
-    #     6 reddening on macOS 26.6.2 and on every POSIX CI host — i.e. the guard runs and
-    #     asserts there. ✔MEASURED 2026-09-08 on this Windows host, BY EXECUTION: Windows
-    #     PowerShell 5.1 runs `repo-tree.ps1 --selftest` to green (9 arms, 9.9 s), so the
-    #     `powershell` fallback below is real coverage and not a spelling that would be
-    #     rejected anyway.
-    #   * ✔MEASURED 2026-09-08 (P65, lane `rg`, four hosts, by execution): a working pwsh
-    #     exists on Windows, WSL x86_64 and macOS arm64; ONLY the arm64 VPS has neither
-    #     spelling, and nothing in this tree installs one there. A FATAL refusal off
-    #     Windows would therefore red that carriage permanently for its software
-    #     inventory — the misattributing-instrument class, in a new place.
-    # ⇒ registered ALWAYS. Where the interpreter works it RUNS; on Windows, or where an
-    #   operator NAMED an interpreter that does not work, it REFUSES; elsewhere it reports
-    #   NOT APPLICABLE and ctest marks it `***Skipped`, which is listed by name under *The
-    #   following tests did not run* and stays IN the `out of N` denominator (✔MEASURED
-    #   with a synthetic CTestTestfile: `100% tests passed, 0 tests failed out of 3` with
-    #   the skipped entry counted). The entry count therefore no longer moves with the
-    #   operator's PATH, and the run says out loud what it did not prove.
-    # ⓘ The same shape this file already uses one block down for
-    #   `build/ninja-deps-freshness`, which "passes while printing NOTHING WAS VERIFIED
-    #   here, which is a visible skip rather than a silent one".
-    #
-    # ★★ THE PROBE IS BY EXECUTION AND RUNS THE SUBJECT ITSELF, never `find_program` alone:
-    # a lookup fails in the direction that hurts — naming an interpreter that cannot start,
-    # so the guard reds for a reason that is not the subject's. Each candidate is RUN
-    # against `repo-tree.ps1` and must hand back that script's OWN library line, so an
-    # interpreter that starts but cannot open or parse the subject counts as absent. The
-    # same ruling, and the same shape, as the bash probe loop for `lane_worktree_guard`
-    # above and as `lane_worktree_powershell` in `scripts/lane-worktree/test-lane-worktree.sh`.
-    # ★ THE CANDIDATE ORDER `pwsh powershell` IS `find_program(POWERSHELL_EXE NAMES pwsh
-    # powershell REQUIRED)`'s, deliberately: a second answer spelled here is one that drifts.
-    # ★★ THE ESCAPE CANNOT BE SPELLED. There is no override that reaches the
-    # not-applicable branch: `DSS_PWSH_FOR_REPO_TREE_GUARD` is an operator's explicit
-    # ANSWER, and an explicit answer that fails the probe REFUSES rather than escaping.
-    # ⚠ It is deliberately never written back to the cache — a probed winner cached under
-    # the operator's own variable would, on the NEXT configure, make this file believe an
-    # operator had named it, and turn a legitimate absence into a refusal.
-    set(_dss_rt_script "${CMAKE_SOURCE_DIR}/scripts/repo-tree/repo-tree.ps1")
-    set(_dss_rt_verdict "repo-tree: this file is a library")
-    set(_dss_rt_candidates "")
-    set(_dss_rt_named FALSE)
-    if(DSS_PWSH_FOR_REPO_TREE_GUARD)
-        list(APPEND _dss_rt_candidates "${DSS_PWSH_FOR_REPO_TREE_GUARD}")
-        set(_dss_rt_named TRUE)
-    endif()
-    foreach(_dss_rt_name IN ITEMS pwsh powershell)
-        unset(_dss_rt_found)
-        find_program(_dss_rt_found NAMES "${_dss_rt_name}" NO_CACHE)
-        if(_dss_rt_found)
-            list(APPEND _dss_rt_candidates "${_dss_rt_found}")
-        endif()
-    endforeach()
-    if(_dss_rt_candidates)
-        list(REMOVE_DUPLICATES _dss_rt_candidates)
-    endif()
-    set(_dss_rt_exe "")
-    set(_dss_rt_tried "")
-    foreach(_dss_rt_cand IN LISTS _dss_rt_candidates)
-        execute_process(
-            COMMAND "${_dss_rt_cand}" -NoProfile -ExecutionPolicy Bypass -File "${_dss_rt_script}"
-            RESULT_VARIABLE _dss_rt_rc
-            OUTPUT_VARIABLE _dss_rt_out
-            ERROR_VARIABLE  _dss_rt_err)
-        string(APPEND _dss_rt_tried " [${_dss_rt_cand} -> exit ${_dss_rt_rc}]")
-        string(FIND "${_dss_rt_out}${_dss_rt_err}" "${_dss_rt_verdict}" _dss_rt_hit)
-        if(NOT _dss_rt_hit EQUAL -1)
-            set(_dss_rt_exe "${_dss_rt_cand}")
-            break()
-        endif()
-    endforeach()
-    if(_dss_rt_tried STREQUAL "")
-        set(_dss_rt_tried " (none: no pwsh and no powershell was found at all)")
-    endif()
-    if(_dss_rt_exe)
-        add_test(
-            NAME repo_tree_guard
-            COMMAND "${_dss_rt_exe}"
-                    -NoProfile -ExecutionPolicy Bypass
-                    -File "${_dss_rt_script}"
-                    --selftest
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    # ⚠ `CMAKE_HOST_WIN32`, NOT `WIN32`, AND THE REFUSAL TEXT BELOW IS WHY: it says
-    # *this is Windows*, *PowerShell ships with this OS* and *this is the one host
-    # category where a lane worktree is created* -- three claims about the HOST, decided
-    # until now by a variable that describes the TARGET.
-    # [[D-GATE-HOST-SIDE-GUARDS-VANISH-WHERE-A-TARGET-CONDITION-ANSWERS-A-HOST-QUESTION]]
-    # A PowerShell-less Linux host that cross-compiles to Windows would have been handed
-    # that refusal verbatim, which is the misattributing-instrument shape this entry's own
-    # row was closed to remove -- the arm64 VPS reddened for its software inventory, in a
-    # new spelling. Host-keyed, it correctly reports NOT APPLICABLE there.
-    elseif(CMAKE_HOST_WIN32 OR _dss_rt_named)
-        if(_dss_rt_named)
-            set(_dss_rt_refusal
-                "repo_tree_guard CANNOT RUN: DSS_PWSH_FOR_REPO_TREE_GUARD names ${DSS_PWSH_FOR_REPO_TREE_GUARD}, and running it against ${_dss_rt_script} did not return that script's own '${_dss_rt_verdict}' line, so the PowerShell owner of 'which tree am I standing in?' was never exercised. Candidates tried, the named one first:${_dss_rt_tried}. An interpreter named on purpose is an answer, not an escape: point -DDSS_PWSH_FOR_REPO_TREE_GUARD at one that works, or unset it and let the probe decide.")
-        else()
-            set(_dss_rt_refusal
-                "repo_tree_guard CANNOT RUN: this is Windows and none of the PowerShells this host offers returned '${_dss_rt_verdict}' when run against ${_dss_rt_script}, so the PowerShell owner of 'which tree am I standing in?' was never exercised. Candidates tried:${_dss_rt_tried}. PowerShell ships with this OS and CMake already requires one for the anchor, line-ending and orphan-test guards, so this is a broken PATH and not a host without PowerShell. There is deliberately NO not-applicable escape on Windows: this is the one host category where a lane worktree is created and where every .ps1 owner in this repository is actually driven.")
-        endif()
-        set(_dss_rt_refusal_script "${CMAKE_CURRENT_BINARY_DIR}/repo_tree_guard_refusal.cmake")
-        file(WRITE "${_dss_rt_refusal_script}" "message(FATAL_ERROR \"${_dss_rt_refusal}\")\n")
-        add_test(NAME repo_tree_guard COMMAND ${CMAKE_COMMAND} -P "${_dss_rt_refusal_script}")
-        message(STATUS "repo_tree_guard registered as a REFUSAL: ${_dss_rt_refusal}")
-    else()
-        set(_dss_rt_na_script "${CMAKE_CURRENT_BINARY_DIR}/repo_tree_guard_not_applicable.cmake")
-        file(WRITE "${_dss_rt_na_script}"
-             "message(\"repo_tree_guard NOT APPLICABLE ON THIS HOST: no working PowerShell. Each candidate was RUN against ${_dss_rt_script} and none returned that script's own '${_dss_rt_verdict}' line. Candidates tried:${_dss_rt_tried}.\")\n"
-             "message(\"  ! NOT PROVED HERE: that Enter-RepoTree moves BOTH working directories PowerShell keeps, and that a script enumerating from git and reading with [IO.File] cannot end up straddling two trees. That is a property OF POWERSHELL, so on a host with none it can neither hold nor fail, and no .ps1 consumer of the resolver runs here either.\")\n"
-             "message(\"  ! This entry is REGISTERED and REPORTED rather than omitted: an entry that vanishes publishes a smaller total and a clean bill of health, which is the one failure mode watching for failures cannot catch. Not applicable is not a pass.\")\n")
-        add_test(NAME repo_tree_guard COMMAND ${CMAKE_COMMAND} -P "${_dss_rt_na_script}")
-        # ⓘ ctest's own vocabulary for "did not run": the entry reports `***Skipped`, is
-        # listed by NAME under "The following tests did not run", and still counts in the
-        # `out of N` denominator — so the total is the same on every host.
-        # ⚠ Set ONLY on this branch, so the real guard above can never be skipped by
-        # printing a phrase; the escape is unreachable from the arm that does the work.
-        set_tests_properties(repo_tree_guard PROPERTIES
-            SKIP_REGULAR_EXPRESSION "NOT APPLICABLE ON THIS HOST")
-        message(STATUS "repo_tree_guard registered as NOT APPLICABLE: no working PowerShell on this host; candidates tried:${_dss_rt_tried}")
-    endif()
+    # ⓘ `repo_tree_guard` STOOD HERE AND IS GONE WITH ITS SUBJECT (2026-09-21, lane mig, part 4).
+    # `repo-tree.ps1`, the PowerShell owner of "which tree am I standing in?", and its bash sibling
+    # `leg-tree.sh` became ONE Python owner, `owning-tree.py`, whose self-test
+    # (`owning_tree_selftest_guard`) carries every arm both proved -- the identity of a worktree git
+    # cannot follow, git asked through that identity, the one-root rule, the owning root of a
+    # nested copy -- on every host, with no interpreter probe and no not-applicable arm.
 endif()
 
 # ── `repo-guard`: the label that lets an indirect leg skip what it cannot learn ──
@@ -1794,7 +1459,7 @@ endif()
 # PRINTS it at configure time (`repo-guard label applied to N test(s)`), which is the figure
 # to read, and `ctest -N -L repo-guard` is how to check it. A count typed into a comment is a
 # measurement with no instrument attached, and this one had already gone stale by eight
-# entries before anyone noticed -- the same rot `scripts/check-doc-census/` now refuses for
+# entries before anyone noticed -- the same rot `.harness-config/runner/actions/check-doc-census/` now refuses for
 # every corpus figure `examples/README.md` states.
 #
 # ⚠ THE SCAN IS OVER TESTS THAT ACTUALLY EXIST, not a hand-kept list. `set_tests_properties`
@@ -1819,7 +1484,7 @@ if(_dss_guard_tests)
     message(STATUS "repo-guard label applied to ${_dss_guard_count} test(s)")
 endif()
 
-# ── The install set (D-PKG-NO-PACKAGING-PATH-SHIPS-THE-CONFIG-TREE) ──
+# ── The install set ──
 # Kept whole in its own module rather than interleaved here: it owns what a
 # package ships (the CLI, its shared library, and `src/dss-config/`), it forwards
 # the installed layout to the resolver that has to find it again at runtime, and
@@ -1839,156 +1504,24 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssInstall.cmake")
 #   leg — so the failure direction is "too much testing", but the indirect legs
 #   would be paying for a tree they cannot learn anything new about.
 if(DSS_BUILD_TESTS)
-    # ── run_gate_guard ────────────────────────────────────────────────────
-    # `scripts/run-gate/test-run-gate.sh` has existed since P62 and NOTHING RAN
-    # IT. It proves both run-gate twins refuse a run whose evidence is spoiled —
-    # a moving source tree (exit 3) and a build directory shared with another
-    # live run (exit 4) — with a passing CONTROL on each twin for each subject.
-    # ✔MEASURED at the commit that added this: 12 arms, 33 assertions, 0
-    # failures, ~40 s.
-    # ⓘ It drives BOTH twins from one bash fixture, so this single entry is the
-    # anti-drift instrument for the pair; there is deliberately no `.ps1` copy of
-    # the fixture, which would be the divergence it exists to catch.
-    # ⚠ THE BASH IS THE ONE ALREADY PROVED, not a fresh search:
-    # `DSS_BASH_FOR_LANE_GUARD` is selected and PROBED above (a bare `bash` on
-    # Windows resolves to the WSL shim, which cannot open a `C:/` path at all).
-    # Re-deriving it here would be a second answer that drifts from the first.
-    # ⛔ AND THE `else()` BELOW USED TO TAKE A BASH THE BLOCK ABOVE HAD JUST REJECTED.
-    # `DSS_BASH_FOR_LANE_GUARD` is empty in exactly two situations: the probe REFUSED
-    # every candidate, or the block never ran (a cross build targeting Windows from a
-    # non-Windows host). In the first, a bare `find_program(bash)` returns the same
-    # unusable bash the refusal names — ✔MEASURED 2026-09-08 (P65) with a PATH holding
-    # neither git nor Git-for-Windows: `lane_worktree_guard` refused naming
-    # `C:/Windows/System32/bash.exe`, and `run_gate_guard` was registered against that
-    # very path, so its red would have named the run-gate fixture for a property of the
-    # interpreter. ⇒ the fallback is PROBED with the SAME `_dss_lane_probe` text, never a
-    # second answer, and a fallback that fails leaves `_dss_rg_bash` empty so the refusal
-    # below fires. ⓘ The cross case still works: an unprobed bash there is now a probed
-    # one, and a POSIX host that has bash passes the probe.
-    set(_dss_rg_bash "")
-    if(DSS_BASH_FOR_LANE_GUARD)
-        set(_dss_rg_bash "${DSS_BASH_FOR_LANE_GUARD}")
-    else()
-        find_program(_dss_rg_found_bash NAMES bash NO_CACHE)
-        if(_dss_rg_found_bash)
-            get_filename_component(_dss_rg_found_dir "${_dss_rg_found_bash}" DIRECTORY)
-            set(_dss_rg_saved_path "$ENV{PATH}")
-            set(ENV{PATH} "${_dss_rg_found_dir}${_dss_lane_path_sep}${_dss_rg_saved_path}")
-            execute_process(
-                COMMAND "${_dss_rg_found_bash}" -c "${_dss_lane_probe}"
-                RESULT_VARIABLE _dss_rg_probe_rc
-                OUTPUT_VARIABLE _dss_rg_probe_out
-                ERROR_VARIABLE  _dss_rg_probe_err)
-            set(ENV{PATH} "${_dss_rg_saved_path}")
-            if(_dss_rg_probe_rc EQUAL 0)
-                set(_dss_rg_bash "${_dss_rg_found_bash}")
-            else()
-                message(STATUS "run_gate_guard: the only bash found (${_dss_rg_found_bash}) failed the same probe lane_worktree_guard uses (exit ${_dss_rg_probe_rc}); refusing rather than registering against it")
-            endif()
-        endif()
-    endif()
-    if(_dss_rg_bash)
-        get_filename_component(_dss_rg_bash_dir  "${_dss_rg_bash}" DIRECTORY)
-        get_filename_component(_dss_rg_ctest_dir "${CMAKE_CTEST_COMMAND}" DIRECTORY)
-        add_test(
-            NAME run_gate_guard
-            COMMAND "${_dss_rg_bash}"
-                    "${CMAKE_SOURCE_DIR}/scripts/run-gate/test-run-gate.sh"
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        # ⚠ MODIFIES the inherited environment, never replaces it — the same
-        # measurement `lane_worktree_guard` carries above. The fixture needs
-        # Git-for-Windows' `usr/bin` tools AND `ctest` itself, and ctest launches
-        # a test with the inherited PATH, so neither is guaranteed to be there.
-        set_tests_properties(run_gate_guard PROPERTIES
-            ENVIRONMENT_MODIFICATION
-                "PATH=path_list_prepend:${_dss_rg_bash_dir};PATH=path_list_prepend:${_dss_rg_ctest_dir}")
-    else()
-        # A guard that cannot run FAILS rather than disappearing: a gate figure
-        # that silently omits an entry is about the host, not about the tree.
-        set(_dss_rg_refusal_script "${CMAKE_CURRENT_BINARY_DIR}/run_gate_guard_refusal.cmake")
-        file(WRITE "${_dss_rg_refusal_script}"
-             "message(FATAL_ERROR \"run_gate_guard CANNOT RUN: no bash on this host was both FOUND and able to pass the probe lane_worktree_guard uses, so neither run-gate twin's refusals were exercised. On Windows a bare 'bash' can resolve to the WSL shim, which cannot open a C:/ path at all, and this entry now refuses rather than registering against it. Point -DDSS_BASH_FOR_LANE_GUARD at a working bash.\")\n")
-        add_test(NAME run_gate_guard COMMAND ${CMAKE_COMMAND} -P "${_dss_rg_refusal_script}")
-        message(STATUS "run_gate_guard registered as a REFUSAL: no usable bash")
-    endif()
-
     # ── line_endings_watchdog_guard ───────────────────────────────────────
-    # Proves the 600 s bound this cycle put on `check-line-endings`: a probe that
-    # genuinely hangs must be CUT SHORT inside its budget, the refusal must name
-    # BOTH the timeout and the query it was waiting on, and a named CONTROL run
-    # must still pass. ✔MEASURED: ~7 s (.sh) / ~8 s (.ps1), 5 arms each.
-    # ⓘ SEPARATE FROM `line_endings_guard` because the proof necessarily costs a
-    # real timeout, and that guard's own `--selftest` runs on every invocation on
-    # every leg.
-    # ★ BOTH TWINS ARE REGISTERED ON A WINDOWS HOST, unlike `line_endings_guard`, which
-    # runs only the platform's primary twin. The indirect legs skip `repo-guard`
-    # entirely, so the `.sh` twin's bound would otherwise be proved on NO leg —
-    # and a property held in one twin and not the other is how every pairing
-    # defect in this repository has started.
-    # ⚠ ON A WINDOWS **HOST**, NOT FOR A WINDOWS **TARGET**, and this used to ask
-    # `if(WIN32)`.
-    # [[D-GATE-HOST-SIDE-GUARDS-VANISH-WHERE-A-TARGET-CONDITION-ANSWERS-A-HOST-QUESTION]]
-    # `${POWERSHELL_EXE}` and `${_dss_rg_bash}` are interpreters ON THE MACHINE RUNNING
-    # CTEST, and "which legs skip repo-guard" is a statement about hosts. ✔MEASURED
-    # 2026-09-08 (P65): a WSL x86_64 configure TARGETING Windows took this branch and
-    # registered `line_endings_watchdog_guard` against `/usr/bin/pwsh` plus a second
-    # entry, `line_endings_watchdog_sh_guard`, that a native Linux configure of the same
-    # tree does not have -- so the ctest TOTAL was a function of the target rather than of
-    # the host. Host-keyed, the two configures agree.
-    if(CMAKE_HOST_WIN32)
-        add_test(
-            NAME line_endings_watchdog_guard
-            COMMAND ${POWERSHELL_EXE}
-                    -NoProfile -ExecutionPolicy Bypass
-                    -File "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.ps1"
-                    --selftest-watchdog
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        if(_dss_rg_bash)
-            add_test(
-                NAME line_endings_watchdog_sh_guard
-                COMMAND "${_dss_rg_bash}"
-                        "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
-                        --selftest-watchdog
-                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-            set_tests_properties(line_endings_watchdog_sh_guard PROPERTIES
-                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dss_rg_bash_dir}")
-        else()
-            # ⛔ AND THIS ONE USED TO VANISH. Registered only `if(_dss_rg_bash)` with no
-            # counterpart, so a Windows host with no usable bash lost the `.sh` twin's
-            # watchdog silently — and the comment above says why that matters: the
-            # indirect legs skip `repo-guard` entirely, so this is the ONLY leg that ever
-            # proves the `.sh` bound. Its sibling `run_gate_guard` refuses on the same
-            # fact three lines up; a vanished neighbour beside a loud refusal is the shape
-            # this cycle exists to remove.
-            set(_dss_lew_refusal_script
-                "${CMAKE_CURRENT_BINARY_DIR}/line_endings_watchdog_sh_guard_refusal.cmake")
-            file(WRITE "${_dss_lew_refusal_script}"
-                 "message(FATAL_ERROR \"line_endings_watchdog_sh_guard CANNOT RUN: no bash on this host passed the probe lane_worktree_guard uses, so the 600 s bound on check-line-endings.sh was never proved. The indirect legs skip repo-guard, which makes this Windows entry the only one that ever proves the .sh twin's bound. Point -DDSS_BASH_FOR_LANE_GUARD at a working bash.\")\n")
-            add_test(NAME line_endings_watchdog_sh_guard
-                     COMMAND ${CMAKE_COMMAND} -P "${_dss_lew_refusal_script}")
-            message(STATUS "line_endings_watchdog_sh_guard registered as a REFUSAL: no usable bash")
-        endif()
-    else()
-        add_test(
-            NAME line_endings_watchdog_guard
-            COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-line-endings/check-line-endings.sh"
-                    --selftest-watchdog
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-    endif()
-
+    # Proves the bound on `check-line-endings`: 90 s, the budget P64 set. A probe that genuinely
+    # hangs must be CUT SHORT inside its budget, the refusal must name BOTH the timeout and what it
+    # was waiting on, a named CONTROL run must still pass, and a probe blocked on a GRANDCHILD must
+    # die with nothing left holding its pipe.
+    # ⓘ SEPARATE FROM `line_endings_guard` because the proof necessarily costs a real timeout.
+    # ⓘ ONE entry on every host since 2026-09-21: the `.sh`/`.ps1` twins it proved -- and the
+    # Windows-only `line_endings_watchdog_sh_guard`, which existed only so the bash twin's bound
+    # was proved on SOME leg, with the bash derivation it rode -- collapsed into one program.
+    add_test(
+        NAME line_endings_watchdog_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-line-endings/check-line-endings.py"
+                --selftest-watchdog
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # The label the scan above could no longer apply, applied by name.
-    # ⓘ `line_endings_watchdog_sh_guard` now EXISTS on every Windows configure — as the
-    #   real entry or as a refusal — so the label no longer depends on the bash search.
-    # ⚠ THE SAME CONDITION AS THE REGISTRATION ABOVE, AND IT MUST STAY THAT WAY:
-    # `set_tests_properties` on a name no branch defined is a hard CMake error, so this
-    # list and that `if` are one decision written twice. Both are host-keyed.
-    set(_dss_p63_guard_tests run_gate_guard line_endings_watchdog_guard)
-    if(CMAKE_HOST_WIN32)
-        list(APPEND _dss_p63_guard_tests line_endings_watchdog_sh_guard)
-    endif()
-    set_tests_properties(${_dss_p63_guard_tests} PROPERTIES LABELS "repo-guard")
-    list(LENGTH _dss_p63_guard_tests _dss_p63_guard_count)
-    message(STATUS "repo-guard label applied to ${_dss_p63_guard_count} additional test(s) registered after the scan")
+    set_tests_properties(line_endings_watchdog_guard PROPERTIES LABELS "repo-guard")
+    message(STATUS "repo-guard label applied to 1 additional test (line_endings_watchdog_guard) registered after the scan")
 endif()
 
 # ── P66: the package pipeline's release path, and the only thing that can see it ──
@@ -2023,9 +1556,9 @@ if(DSS_BUILD_TESTS)
     # is what makes a reading stick.
     #
     # ⛔ AND IT REFUSES THE FORK. The cheapest way to add a mode to a workflow is
-    # to copy the packaging steps into a second job; the sibling pipeline already
-    # carries an open row for that exact class
-    # (D-CI-PR-PIPELINE-IS-VENDORED-AND-ITS-SYNC-IS-UNCHECKED). `cmake --install`
+    # to copy the packaging steps into a second job; the sibling pipeline was already
+    # filed as that exact class (a vendored copy whose sync nothing checks).
+    # `cmake --install`
     # and `tar -czf` are refused here by COUNT, not by review.
     #
     # ★ Python, not a `.sh`/`.ps1` pair, for the reason `scripts_index_guard`
@@ -2038,8 +1571,7 @@ if(DSS_BUILD_TESTS)
     # real file, each asserting ITS OWN message id rather than a non-zero exit, so
     # this entry cannot pass without also proving every clause can fail. ⚠ THE ARM
     # COUNT IS NOT WRITTEN HERE ON PURPOSE — the guard PRINTS it every run, and a
-    # count typed into a comment is a measurement with no instrument attached
-    # (D-TEST-NONFATAL-GUARD-DEGRADES-TO-A-VACUOUS-PASS).
+    # count typed into a comment is a measurement with no instrument attached.
     #
     # ★★ AND A CLAUSE WITH NO ARM IS ITSELF A REFUSAL. The guard reads its own
     # source, collects every message id it can emit, and reds if any of them has
@@ -2055,7 +1587,7 @@ if(DSS_BUILD_TESTS)
     add_test(
         NAME pkg_pipeline_modes_guard
         COMMAND ${Python3_EXECUTABLE}
-                "${CMAKE_SOURCE_DIR}/scripts/check-pkg-pipeline/check-pkg-pipeline.py"
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/check-pkg-pipeline/check-pkg-pipeline.py"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     # The label the scan above could no longer apply, applied by name — same
@@ -2063,5 +1595,60 @@ if(DSS_BUILD_TESTS)
     # simply runs on every leg, so the failure direction is "too much testing".
     set_tests_properties(pkg_pipeline_modes_guard PROPERTIES LABELS "repo-guard")
     message(STATUS "repo-guard label applied to 1 additional test (pkg_pipeline_modes_guard)")
+endif()
+
+# ── The host compiler stamp, wired to every PCH that lists it (see `dss_host_compiler_stamp`) ──
+# ⚠ APPENDED AT THE END, for the reason the P63 block states, and because it must run after every
+#   directory has defined its targets. One walk over every directory's targets, so a PCH producer
+#   added anywhere later is covered without being named here: whatever lists the stamp in its
+#   PRECOMPILE_HEADERS depends on the target that makes it. (A REUSE_FROM consumer needs nothing:
+#   it already depends on its producer.)
+# ⛔ Such a list names every header as an include literal (`<...>` or `"..."`), and a bare path is
+#   REFUSED here, the stamp's own included: CMake would give each regenerated cmake_pch.hxx that
+#   header's time, and a changed list would then rebuild no PCH (measured, see the stamp's block).
+function(_dss_host_compiler_stamp_dependencies dir)
+    get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_t IN LISTS _targets)
+        get_target_property(_pch ${_t} PRECOMPILE_HEADERS)
+        if(NOT _pch)
+            continue()
+        endif()
+        if(NOT "\"${DSS_HOST_COMPILER_STAMP_HEADER}\"" IN_LIST _pch
+           AND NOT "${DSS_HOST_COMPILER_STAMP_HEADER}" IN_LIST _pch)
+            continue()
+        endif()
+        foreach(_h IN LISTS _pch)
+            if(NOT _h MATCHES "^[<\"]")
+                message(FATAL_ERROR "The precompiled-header list of target '${_t}' names '${_h}' as a "
+                    "bare path. List it as an include literal (<...> or \"...\"): CMake gives a "
+                    "regenerated cmake_pch.hxx the time of the first bare-path header that exists, so "
+                    "a later change of the list would leave this target's PCH stale.")
+            endif()
+        endforeach()
+        add_dependencies(${_t} dss_host_compiler_stamp)
+    endforeach()
+    get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(_d IN LISTS _subdirs)
+        _dss_host_compiler_stamp_dependencies("${_d}")
+    endforeach()
+endfunction()
+_dss_host_compiler_stamp_dependencies("${CMAKE_SOURCE_DIR}")
+
+if(DSS_BUILD_TESTS)
+    # The structural pin: (a) the build graph's stamp edge lists the compiler BINARY as an input,
+    # (b) every PCH's generated header list includes the stamp -- or, in the PCH-free Debug canary,
+    # no PCH exists at all (checked, not assumed) -- and (c) every target building a PCH is ordered
+    # after the stamp's target. Registered on every tree, so every leg lists the same ctest names.
+    add_test(
+        NAME build/pch_host_compiler_stamp
+        COMMAND ${CMAKE_COMMAND}
+                -DDSS_HCS_MODE=check
+                "-DDSS_HCS_BUILD_DIR=${CMAKE_BINARY_DIR}"
+                "-DDSS_HCS_COMPILER=${CMAKE_CXX_COMPILER}"
+                "-DDSS_HCS_STAMP=${DSS_HOST_COMPILER_STAMP_HEADER}"
+                -DDSS_HCS_TARGET=dss_host_compiler_stamp
+                "-DDSS_HCS_GENERATOR=${CMAKE_GENERATOR}"
+                "-DDSS_HCS_PCH_DISABLED=${CMAKE_DISABLE_PRECOMPILE_HEADERS}"
+                -P "${CMAKE_SOURCE_DIR}/cmake/DssHostCompilerStamp.cmake")
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/DssTestBudgets.cmake")  # every ctest entry's TIMEOUT — keep this LAST

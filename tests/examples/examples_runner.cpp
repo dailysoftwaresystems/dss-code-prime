@@ -7,7 +7,7 @@
 // artifact, spawn-failure, timeout, or wrong-exit-code all break
 // the test loud.
 //
-// PROJECT MODE (D-EXAMPLES-RUNNER-PROJECT-MANIFEST): a manifest may name a
+// PROJECT MODE — THE RUNNER'S PROJECT-MANIFEST PATH: a manifest may name a
 // `.dss-project.json` via the top-level `"project"` key INSTEAD of
 // `source`/`sources`, and the build then goes through
 // `Program::compileProject` — the only driver entry point that expands the
@@ -15,9 +15,11 @@
 // hooks. Three consequences are handled explicitly and are documented at their
 // sites: the project manifest's own `targets[]` is the build authority (a
 // corpus target's `spec` is a MIRROR, cross-checked); the artifact lands under
-// a per-format subdirectory; and the compile must run with the mirrored scratch
-// dir as the PROCESS working directory, because that is what a generated source
-// resolves against. The CLI-subprocess sibling implements the same three.
+// a per-format subdirectory; and the compile runs with the mirrored scratch dir
+// as the process working directory — no longer because anything resolves
+// against it (a manifest's paths and hooks resolve against the manifest's own
+// directory), but so that both runners compile in the same environment. The
+// CLI-subprocess sibling implements the same three.
 //
 // User invariant (verbatim, 2026-06-02): "please don't forget to
 // perform strict asserts on the example harness run results....
@@ -34,7 +36,8 @@
 //
 // ★★★ AND THAT POLICY MAKES THIS RUNNER THE SOLE WITNESS FOR EVERY CROSS-HOST
 // SPEC, WHICH IS NOW A CHECKED FACT RATHER THAN A HABIT.
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+// THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+// SEES A CAPABILITY THE OTHER CANNOT.
 // The CLI-subprocess sibling binds ONE target per manifest and compiles only
 // that one, by a user invariant of 2026-06-02 stated in its own header. So the
 // sentence above is not merely this runner's policy — it is the ONLY reason a
@@ -47,7 +50,7 @@
 // cannot, and the `integrated_tests/coverage-boundary` entry runs BOTH
 // harnesses on one example and judges them against it.
 //
-// A SKIP IS NOT A PASS (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT). Every
+// A SKIP IS NOT A PASS — A CROSS-ARCH SKIP YIELDS NO VERDICT. Every
 // declared arm — every target x every optimizedPipelines arm — lands in an
 // `ArmVerdictLedger` with a named reason, and the entry prints the accounting
 // on stdout. Skips whose cause is the MACHINE rather than the manifest (a
@@ -57,9 +60,21 @@
 // (`integrated_tests/runner.cpp`) via `tests/test_support/arm_verdict_ledger.hpp`
 // — a capability in one corpus harness and not the other is a silent harness
 // bug, which is how this defect survived in both for as long as it did.
+//
+// A DECLARED ARM IS RUN, ATTEMPTED OR REFUSED — NEVER DROPPED. An optimized arm
+// is compiled and run where its baseline RUNS; on a target NO host runs
+// (`runOn: []`) it is still COMPILED, on every host, and its images judged
+// against the baseline's (`compileBuildOnlyOptimizedArms`); and a manifest key
+// that could never act — `optimizedPipelines` beside `expectDiagnostics`, a
+// `loaderSearchPathVariable` no spawn would read — is REFUSED at load. A target
+// whose executable imports from a library the arm just built may declare
+// `loaderSearchPathVariable` so its host's loader can find that library
+// (`loader_search_path.hpp`); both runners honour it at their spawn sites.
 
 #include "arm_verdict_ledger.hpp"
-// D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+#include "host_translations.hpp"
+// THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+// SEES A CAPABILITY THE OTHER CANNOT.
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. This runner is the SUPERSET half: it compiles
 // every declared target, including the ones this host can never spawn, and its
@@ -68,12 +83,20 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
+#include "host_native_target.hpp"  // the loader-search-path spawn pin BUILDS AND
+                                   // SPAWNS its own output, so it builds for this
+                                   // machine (do not rely on a transitive include)
+// Where a spawned arm's loader looks for the libraries it was built against —
+// the value both runners compute, from ONE definition (see its header note).
+#include "loader_search_path.hpp"
 #include "opt/optimizer.hpp"
 #include "program/program.hpp"
 #include "program/compile_pipeline.hpp"  // resolveCompileConfigFromPipelineName (P10 real-channel arm)
 #include "repo_root.hpp"   // the single-definition-site lint reads BOTH runners
                            // and the shared header off disk
 #include "run_binary.hpp"
+#include "scoped_env.hpp"  // the declared loader variable is set for ONE spawn
+                           // and restored — never left in the runner's env
 #include "scratch_dir.hpp"
 #include "stage_tree.hpp"  // recursive corpus staging — ONE copy, shared with
                            // integrated_tests/runner.cpp
@@ -114,7 +137,7 @@ using namespace dss::test_support;
 
 namespace {
 
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: `currentHostOs`, `currentHostArch`,
+// A CROSS-ARCH SKIP YIELDS NO VERDICT: `currentHostOs`, `currentHostArch`,
 // `specTargetArch` and `findOnPath` used to live here AND, byte-identically, in
 // `integrated_tests/runner.cpp`. They now come from the shared
 // `arm_verdict_ledger.hpp`, so the two corpus harnesses cannot disagree about
@@ -127,7 +150,7 @@ using ::dss::test_support::findOnPath;
 using ::dss::test_support::qemuSysrootHint;
 using ::dss::test_support::specTargetArch;
 
-// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): one PREREQUISITE artifact a
+// THE RUNNER'S MULTI-ARTIFACT MODE (c171): one PREREQUISITE artifact a
 // target build depends on — a LIBRARY the runner builds FIRST, then threads
 // into the dependent build's `--resolve-library` (the c162 reader-consumer
 // surface). PER-TARGET (on `ExampleTarget`) so one example can express the
@@ -167,8 +190,8 @@ struct DependsOnArtifact {
     // library half ONLY while every `main.c` in the corpus happens to be
     // trivial — an incidental property of two source files, which the next
     // person to add a loop to a `main.c` silently repeals. This key makes the
-    // library its own subject, which is what
-    // [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]] is actually about.
+    // library its own subject, which is what a `dependsOn` entry with no
+    // release-optimizer arm of its own is actually about.
     // Per-DEPENDENCY rather than per-target because a fat archive and the
     // input archive it merges are different subjects: the input may be a
     // trivial `return 42;` with nothing to fold while the fat one carries real
@@ -266,7 +289,7 @@ struct ExampleTarget {
     std::string                  spec;
     std::string                  artifact;
     std::vector<std::string>     runOn;  // host OS names allowed to spawn
-    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): prerequisite LIBRARY artifacts
+    // THE RUNNER'S MULTI-ARTIFACT MODE (c171): prerequisite LIBRARY artifacts
     // this target links against. The runner builds each FIRST (into the same
     // scratch out dir) and passes their output paths to the dependent build's
     // `--resolve-library` (`Program::setResolveLibraries`). Empty (the
@@ -295,6 +318,22 @@ struct ExampleTarget {
     // `exitCode` applies (existing behavior). The differential (optimized) arm still
     // compares to the baseline, so it follows this per-target choice for free.
     std::optional<std::int64_t>  exitCodeOverride;
+    // THE LOADER'S SEARCH PATH (`loader_search_path.hpp`): the NAME of the
+    // environment variable through which the loader of this target's host
+    // accepts extra library directories. Non-empty ⇒ `compileAndRunArm` sets it,
+    // for the spawn alone, to the directory of every library the build resolved
+    // against, ahead of any value it already had. Empty (the default) ⇒ the
+    // child's environment is the runner's, exactly as before the key existed.
+    // A declaration that could never act is refused at LOAD (`readManifest`).
+    std::string                  loaderSearchPathVariable;
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the directories this target's image
+    // records for its loader (`Program::setRunpaths` here, one `--rpath` per
+    // entry in the CLI-subprocess sibling), in order. Unlike
+    // `loaderSearchPathVariable` above — which the RUNNER sets for one spawn —
+    // this is a property of the IMAGE: an example that declares it runs with no
+    // loader variable at all, which is the whole witness. Empty (the default) ⇒
+    // the build records none, exactly as before the key existed.
+    std::vector<std::string>     runpaths;
 };
 
 // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): a per-manifest
@@ -318,7 +357,7 @@ struct OptimizedArm {
     std::vector<std::string>     passes;  // PassId names (inline-array form)
     bool                         hasPasses = false;          // `passes` key present
     std::optional<std::string>   shippedPipeline;            // shipped-config form
-    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: the
+    // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING: the
     // ESCALATION LEVER. False (the default) ⇒ a byte-identical optimized image
     // is REPORTED; true ⇒ it is a hard RED. Opt-in PER ARM rather than per
     // manifest because the two live side by side in one file: a
@@ -403,8 +442,8 @@ struct ExpectedDiagnostic {
 struct ExampleManifest {
     std::string                  language;
     std::string                  source;
-    // D-EXAMPLES-RUNNER-PROJECT-MANIFEST: PROJECT MODE. Present ⇒ this example is
-    // built by `Program::compileProject` from the named `.dss-project.json` (a
+    // PROJECT MODE. Present ⇒ this example is built by
+    // `Program::compileProject` from the named `.dss-project.json` (a
     // path relative to the example dir) instead of by `compileFiles`/
     // `compileUnits` over `source`/`sources`. MUTUALLY EXCLUSIVE with both of
     // those (readManifest fails loud on the ambiguity) because the two spellings
@@ -481,7 +520,7 @@ struct ExampleManifest {
     std::vector<ExpectedDiagnostic> expectWarnings;
 };
 
-// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: parse ONE
+// THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: parse ONE
 // `dependsOn` entry. RECURSIVE — an entry may itself carry a nested
 // `dependsOn` (e.g. a fat `-staticlib` that resolves an input `-staticlib` to
 // MERGE it). This SAME helper serves both the target-level parse AND the
@@ -590,7 +629,7 @@ parseDependsOnEntry(nlohmann::json const& d, fs::path const& manifestPath) {
 // CLI-subprocess sibling's `parsePrebuiltLibraryEntry`
 // (integrated_tests/runner.cpp), because a manifest one runner accepts and the
 // other rejects is the silent-harness-bug class
-// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] exists to catch. Returns nullopt
+// the TWO RUNNERS MUST AGREE rule exists to catch. Returns nullopt
 // (ADD_FAILURE already fired) on any malformed field.
 //
 // ⚠ BOTH FIELDS ARE REQUIRED, and neither requirement is ceremony: a missing
@@ -1029,6 +1068,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             if (k == "spec" || k == "artifact" || k == "runOn"
                 || k == "emulator" || k == "expectedStdout" || k == "exitCode"
                 || k == "dependsOn" || k == "prebuiltLibraries"
+                || k == "loaderSearchPathVariable" || k == "runpaths"
                 || k.starts_with("$")) {
                 continue;
             }
@@ -1037,9 +1077,11 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                           << "' declares unknown key '" << k
                           << "' — the runner reads spec / artifact / runOn /"
                              " emulator / expectedStdout / exitCode /"
-                             " dependsOn / prebuiltLibraries (plus $comment"
-                             " keys). An expectation the runner does not read"
-                             " is an assertion that never fires.";
+                             " dependsOn / prebuiltLibraries /"
+                             " loaderSearchPathVariable / runpaths (plus"
+                             " $comment keys)."
+                             " An expectation the runner does not read is an"
+                             " assertion that never fires.";
             return m;
         }
         if (t.contains("runOn") && t.at("runOn").is_array()) {
@@ -1067,7 +1109,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
             }
             et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
-        // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): optional prerequisite
+        // THE RUNNER'S MULTI-ARTIFACT MODE (c171): optional prerequisite
         // library artifacts this target links against (built FIRST, threaded
         // into `--resolve-library`). Each entry is parsed by the SHARED
         // recursive helper, so a dep may carry its OWN nested `dependsOn`
@@ -1103,7 +1145,143 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 et.prebuiltLibraries.push_back(std::move(*parsed));
             }
         }
+        // THE LOADER'S SEARCH PATH: a NAME, and a portable one — a name the host
+        // cannot set (a space, an `=`, a leading digit) is either rejected by
+        // its setenv or set under another name, and either way the child never
+        // sees it. WHETHER the declaration can act at all is decided below, once
+        // every target and the manifest's own verdict are known.
+        if (t.contains("loaderSearchPathVariable")) {
+            auto const& v = t.at("loaderSearchPathVariable");
+            if (!v.is_string()
+                || !isPortableEnvironmentVariableName(v.get<std::string>())) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target '" << et.spec
+                              << "' 'loaderSearchPathVariable' must be a string"
+                                 " naming an environment variable"
+                                 " ([A-Za-z_][A-Za-z0-9_]*) — a name the host"
+                                 " cannot set is one the child never sees";
+                return m;
+            }
+            et.loaderSearchPathVariable = v.get<std::string>();
+        }
+        // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the image's own runpaths — a
+        // NON-EMPTY array of NON-EMPTY strings, passed through verbatim (the
+        // CLI's literal semantics; a leading `${ORIGIN}` is the portable token
+        // the format's document spells). Empty entries are refused HERE rather
+        // than handed to the build: the CLI-subprocess sibling cannot pass one
+        // at all (`--rpath ""` is refused by the CLI's generic non-empty rule),
+        // so an empty entry would make the two runners build different things
+        // from one manifest.
+        if (t.contains("runpaths")) {
+            auto const& v = t.at("runpaths");
+            bool ok = v.is_array() && !v.empty();
+            if (ok) {
+                for (auto const& e : v) {
+                    if (!e.is_string() || e.get<std::string>().empty()) {
+                        ok = false;
+                        break;
+                    }
+                    et.runpaths.push_back(e.get<std::string>());
+                }
+            }
+            if (!ok) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target '" << et.spec
+                              << "' 'runpaths' must be a NON-EMPTY array of"
+                                 " non-empty strings — an empty array declares a"
+                                 " request the build never makes, and an empty"
+                                 " entry is one the CLI runner cannot pass";
+                return m;
+            }
+        }
         m.targets.push_back(std::move(et));
+    }
+    // ── A LOADER SEARCH PATH THAT COULD NEVER REACH A LOADER, REFUSED BY NAME ──
+    //
+    // The rule every closed key in this parser keeps: an expectation the runner
+    // cannot act on is an assertion that never fires. The variable is set for a
+    // SPAWN, to the directories of the libraries the build RESOLVED AGAINST — so
+    // on a target no host spawns (`runOn: []`, or any target of a refusal
+    // manifest) or one that resolves against nothing, it would be declared and
+    // then do nothing, in silence. Refused here, refusal for refusal the same
+    // as the CLI-subprocess sibling's parser, so the two accept one vocabulary.
+    for (auto const& t : m.targets) {
+        if (t.loaderSearchPathVariable.empty()) continue;
+        char const* why = nullptr;
+        if (!m.expectDiagnostics.empty()) {
+            why = "the manifest declares `expectDiagnostics`, and a refusal"
+                  " never spawns anything";
+        } else if (t.runOn.empty()) {
+            why = "its `runOn` is empty, so no host ever spawns it";
+        } else if (t.dependsOn.empty() && t.prebuiltLibraries.empty()) {
+            why = "it resolves against no library — it declares neither"
+                  " `dependsOn` nor `prebuiltLibraries`";
+        }
+        if (why == nullptr) continue;
+        ADD_FAILURE() << "manifest " << path.generic_string() << " target '"
+                      << t.spec << "' declares 'loaderSearchPathVariable' ('"
+                      << t.loaderSearchPathVariable << "') but " << why
+                      << " — the variable would be set for no spawn, or to no"
+                         " directory, and the declaration would assert nothing.";
+        return m;
+    }
+    // ── THE TWO KEYS A REFUSAL ARM CANNOT HONOUR, REFUSED BY NAME ───────────
+    //
+    // ★★★ THEY WERE ACCEPTED AND SILENTLY DISCARDED, which is the shape this
+    // file refuses everywhere else (see the closed per-target key set above:
+    // *"an expectation the runner does not read is an assertion that never
+    // fires"*). `optimizedPipelines` was already named as such in the CLI
+    // sibling's own comment, which called a load-time refusal of the pair THE
+    // RIGHT FIX and said it had to land in both runners in one change. This is
+    // that change, widened by one key for the same reason.
+    //
+    // `dependsOn` is a BUILD — recursive, carrying an arm's optimizer
+    // configuration, asserting `mustDifferFromBaseline` over images it
+    // produces. None of that has meaning on an arm whose whole claim is that
+    // the compile FAILS, so there is nothing to implement here and the pair is
+    // a manifest defect rather than a missing capability. `prebuiltLibraries`
+    // is the opposite case and is deliberately NOT in this refusal: it names a
+    // file already on disk, the refusal arm now stages it, and a whole family
+    // of import-disagreement refusals is inexpressible without it.
+    //
+    // ✔MEASURED at this tree: 841 manifests, 34 of them `expectDiagnostics`,
+    // and ZERO declare either of these keys beside it — so this refuses a shape
+    // nothing uses, which is the only moment a refusal is free to add.
+    if (!m.expectDiagnostics.empty()) {
+        if (j.contains("optimizedPipelines")) {
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " declares BOTH 'expectDiagnostics' and"
+                             " 'optimizedPipelines'. A refusal arm never builds"
+                             " an artifact, so there is no baseline image for an"
+                             " optimized arm to differ from — the arm would be"
+                             " parsed and then silently dropped.";
+            return m;
+        }
+        for (auto const& t : m.targets) {
+            // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: a refusal arm links no image,
+            // so an image's runpaths would be read by nothing — the same
+            // "parsed and then silently dropped" shape as the two keys here.
+            if (!t.runpaths.empty()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target '" << t.spec
+                              << "' declares 'runpaths' beside"
+                                 " 'expectDiagnostics'. A refusal arm links no"
+                                 " image, so the runpaths would be parsed and"
+                                 " then silently dropped.";
+                return m;
+            }
+            if (t.dependsOn.empty()) continue;
+            ADD_FAILURE() << "manifest " << path.generic_string()
+                          << " target '" << t.spec
+                          << "' declares 'dependsOn' beside 'expectDiagnostics'."
+                             " A prerequisite is BUILT, under the arm's own"
+                             " optimizer configuration, and compared against the"
+                             " images it produces; a refusal arm produces none."
+                             " Declare a library input this refusal needs as"
+                             " 'prebuiltLibraries', which the refusal arm"
+                             " resolves and threads into --resolve-library.";
+            return m;
+        }
     }
     // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER. Manifest shape — each arm
     // declares EXACTLY ONE OF `passes` (inline array) or `shippedPipeline`
@@ -1156,7 +1334,7 @@ parseExpectedDiagnosticArray(nlohmann::json const& arr, char const* keyName,
                 }
                 oa.shippedPipeline = arm.at("shippedPipeline").get<std::string>();
             }
-            // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING:
+            // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING:
             // optional per-arm escalation. Absent ⇒ false ⇒ report-only.
             if (arm.contains("mustDifferFromBaseline")) {
                 if (!arm.at("mustDifferFromBaseline").is_boolean()) {
@@ -1534,7 +1712,7 @@ buildPipeline(OptimizedArm const& arm, fs::path const& manifestPath) {
 // (the original `skipped: bool` shape) would let a baseline that secretly
 // failed to compile produce a silently-bypassed differential-verify assertion.
 //
-// D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the single `SkippedCrossHost` that
+// A CROSS-ARCH SKIP YIELDS NO VERDICT: the single `SkippedCrossHost` that
 // used to cover all three skip reasons is GONE. It was the defect: a
 // `runOn`-excluded arm (structural, expected), an arm whose manifest declares
 // no emulator (a manifest defect) and an arm whose declared emulator is absent
@@ -1549,7 +1727,7 @@ struct ArmResult {
     // summary can name the runOn list / the missing emulator rather than
     // reprint a bare status.
     std::string detail;
-    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: the
+    // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING: the
     // WHOLE produced artifact, read off disk before this arm returns.
     //
     // ⚠ CAPTURED HERE, NOT COMPARED-BY-PATH LATER, and that is forced rather
@@ -1560,7 +1738,8 @@ struct ArmResult {
     // SILENT MISS — exactly the class of defect this exists to end — and corpus
     // artifacts are single-digit KB, so the exact comparison costs nothing.
     std::string artifactBytes;
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+    // SEES A CAPABILITY THE OTHER CANNOT.
     // The ATTEMPT to exec, not its outcome. `verdict == Ran` cannot stand in for
     // it — a spawn that FAILED is `Poisoned` — and the coverage-boundary clause
     // that forbids exec'ing a foreign-host artifact must catch the attempt
@@ -1576,7 +1755,7 @@ struct ArmResult {
     std::map<std::string, std::string> dependencyBytes;
 };
 
-// ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ─────────
+// ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ─────────────
 //
 // THE DEFECT. An `optimizedPipelines` arm compiles the example a SECOND time
 // under a named pipeline and asserts the binary still produces the baseline's
@@ -1791,6 +1970,13 @@ struct ArtifactIdentityTally {
     std::size_t              depImagesExpected  = 0;
     std::size_t              depImagesCompared  = 0;
     std::size_t              depImagesIdentical = 0;
+    // Optimized arms of a BUILD-ONLY target (`runOn: []`) that were COMPILED and
+    // handed to the judgement without being spawned — see
+    // `compileBuildOnlyOptimizedArms`. Counted at the arm's verdict, like
+    // `armsThatRan`, and reconciled with it: every identity judgement performed
+    // must come from an arm that either ran or was compiled build-only, so a
+    // judgement that silently stopped happening on EITHER path is a mismatch.
+    std::size_t              buildOnlyArmsCompiled = 0;
 };
 
 // D-FF1-AR-BSD-CORPUS-EXAMPLE-NEEDS-A-PREBUILT-ARCHIVE-KEY-IN-BOTH-RUNNERS:
@@ -1871,7 +2057,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
     return resolved;
 }
 
-// D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build ONE
+// THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: build ONE
 // prerequisite LIBRARY artifact into `outDir`, RECURSIVELY building its own
 // nested `dependsOn` FIRST (into the same `outDir`) and threading their output
 // paths into THIS dep's `--resolve-library`. So a `-staticlib` dep listing a
@@ -1895,7 +2081,7 @@ resolvePrebuiltLibrary(PrebuiltLibrary const& lib, fs::path const& exampleDir) {
 // purpose: a defaulted parameter is exactly how a future call site would omit
 // them again in silence.
 //
-// [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]] — this used to take
+// A `dependsOn` ENTRY HAD NO RELEASE-OPTIMIZER ARM — this used to take
 // NEITHER, so every prerequisite was built at the default configuration no
 // matter which arm asked for it. A `release` arm on a `dependsOn` example would
 // then optimize the EXECUTABLE and leave every static library it links on the
@@ -2105,7 +2291,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // manifest typo fails loud here, not as a confusing driver error.
     //
     // ★★ THESE PATHS ARE ABSOLUTE, AND THAT IS ONE OF THE FOUR SHAPES A USER CAN
-    // TYPE (`D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH`).
+    // TYPE: BOTH EXAMPLE RUNNERS ALWAYS COMPILE AN ABSOLUTE SOURCE PATH.
     // `main.c`, `sub/main.c` and `./main.c` are the other three, and a corpus
     // that spells only one of them could not see
     // `D-PP-BARE-RELATIVE-MAIN-PATH-DEFEATS-THE-INCLUDER-DIRECTORY-SEARCH` — a
@@ -2138,14 +2324,16 @@ compileAndRunArm(fs::path const& exampleDir,
 
     // ── PROJECT MODE: resolve + validate the `.dss-project.json` ────────────
     //
-    // The scratch dir is ALREADY the process cwd (the `useAsCwd()` above), and
-    // that is load-bearing for a project build rather than incidental: the
-    // manifest's `sources[]` globs expand against the PROCESS working directory
-    // (Program::compileProject, D-AP2-SOURCES-GLOB), and a `preBuildScripts`
-    // hook that GENERATES a source writes it into the directory the driver
-    // spawns it in. Both must be this scratch dir, or the generator writes into
-    // one tree and the glob searches another. The CLI-subprocess sibling had to
-    // GROW this (its CwdGuard wrapped only the RUN) — see the note there.
+    // The scratch dir is ALREADY the process cwd (the `useAsCwd()` above). That
+    // used to be load-bearing for a project build: the manifest's `sources[]`
+    // globs expanded against the PROCESS working directory, and a
+    // `preBuildScripts` hook that GENERATES a source wrote it into the directory
+    // the driver spawned it in, so both had to be this scratch dir. Since
+    // [[D-PROJECT-ROOT-MANIFEST-PATHS-RESOLVE-AGAINST-THE-INVOCATION-DIRECTORY]]
+    // both resolve against the MANIFEST's own directory — which lies in this
+    // scratch mirror because the manifest is staged in it, whatever the cwd is.
+    // The cwd is kept for parity with the CLI-subprocess sibling (see the note
+    // there).
     fs::path projectPath;
     if (m.project.has_value()) {
         projectPath = scratch.path() / *m.project;
@@ -2222,7 +2410,7 @@ compileAndRunArm(fs::path const& exampleDir,
         }
     }
 
-    // D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171) + nested extension: build each
+    // THE RUNNER'S MULTI-ARTIFACT MODE (c171) + nested extension: build each
     // prerequisite LIBRARY artifact FIRST (into the same out dir), recursively
     // building any nested `dependsOn` before it, then thread their paths into
     // the dependent build's `--resolve-library`. A dep (or nested-dep) build
@@ -2264,6 +2452,11 @@ compileAndRunArm(fs::path const& exampleDir,
     prog.setOutputDir(outDir);
     if (!resolveLibs.empty()) {
         prog.setResolveLibraries(resolveLibs);
+    }
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: the image's own runpaths — the
+    // in-process spelling of the CLI sibling's `--rpath` per entry.
+    if (!t.runpaths.empty()) {
+        prog.setRunpaths(t.runpaths);
     }
     if (pipelineOverride != nullptr) {
         prog.setOptimizerPipelineOverride(*pipelineOverride);
@@ -2442,15 +2635,15 @@ compileAndRunArm(fs::path const& exampleDir,
         return armResult;
     }
 
-    // D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING: take the
+    // A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING: take the
     // image NOW. `scratch` is destroyed when this function returns, so this is
     // the last moment the artifact exists. Deliberately BEFORE the `runOn` and
     // emulator gates below: whether an image was TRANSFORMED is a question
     // about the COMPILE, and a machine that cannot spawn the binary can still
-    // answer it. (The comparison itself still only happens when both arms ran —
-    // an optimized arm is not even compiled when the baseline did not run, which
-    // is D-TEST-EXAMPLES-CROSS-HOST-RELEASE-ARM-NEVER-COMPILED's business, not
-    // this row's.)
+    // answer it. That is exactly what a BUILD-ONLY target's optimized arm relies
+    // on (`compileBuildOnlyOptimizedArms`): it is compiled and judged from these
+    // bytes without ever reaching the spawn. A cross-host target's arm is judged
+    // where it RUNS instead, by the host its `runOn` names.
     auto captured = readArtifactBytes(artifactPath);
     // ★ CROSS-CHECKED AGAINST `file_size`, not merely non-empty. A SHORT READ is
     // the capture failure this mechanism is least able to survive: it produces a
@@ -2501,7 +2694,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // emulator (e.g. qemu-aarch64 for an AArch64 ELF on x86_64). The
     // emulator is declared per-target in the manifest.
     //
-    // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the two outcomes below used to
+    // A CROSS-ARCH SKIP YIELDS NO VERDICT: the two outcomes below used to
     // share one status and one shrug. They do not share a meaning. NO EMULATOR
     // DECLARED is a property of the MANIFEST — no machine can fix it, and
     // `lintDeclaredEmulators` reds it host-independently rather than leaving it
@@ -2510,43 +2703,35 @@ compileAndRunArm(fs::path const& exampleDir,
     // the gate sets DSS_STRICT_ARM_VERDICTS=1 and the same skip becomes a RED.
     // Both are ledgered either way; neither can be read as a pass again.
     std::vector<std::string> launcherPrefix;
+    bool launcherExecsImage = false;   // runBinary's admission warm-up follows it
     if (std::string const targetArch = specTargetArch(t.spec);
         !targetArch.empty() && targetArch != currentHostArch()) {
-        if (t.emulator.empty()) {
-            std::ostringstream why;
-            why << "target arch '" << targetArch << "' != host arch '"
-                << currentHostArch() << "' and the manifest declares no"
-                   " 'emulator'";
+        // ONE decision for both runners (host_translations.hpp): the host's own
+        // translation first (D-TEST-EXAMPLES-X8664-MACHO-ARMS-NEVER-RUN-ON-THE-DARWIN-LEG),
+        // then the manifest's `emulator`, exactly as before.
+        auto const gate = crossArchDecisionForThisHost(targetArch, t.emulator);
+        if (!gate.runs) {
             GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
-                             << ' ' << why.str() << " — skipping run";
-            armResult.verdict = ArmVerdict::SkippedNoEmulatorDeclared;
-            armResult.detail  = why.str();
+                             << ' ' << gate.why << " — skipping run";
+            armResult.verdict = gate.skip;
+            armResult.detail  = gate.why;
             return armResult;
         }
-        auto const emuPath = findOnPath(t.emulator);
-        if (emuPath.empty()) {
-            std::ostringstream why;
-            why << "declared emulator '" << t.emulator
-                << "' is not on PATH (target arch '" << targetArch
-                << "' != host arch '" << currentHostArch() << "')";
-            GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
-                             << ' ' << why.str() << " — skipping cross-arch run";
-            armResult.verdict = ArmVerdict::SkippedEmulatorMissing;
-            armResult.detail  = why.str();
-            return armResult;
-        }
-        launcherPrefix.push_back(emuPath);
+        GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel << ' ' << gate.why;
+        launcherPrefix = gate.launcherPrefix;
+        launcherExecsImage = gate.launcherExecsImage;
     }
 
-    // ── D-TEST-QEMU_LD_PREFIX-AMBIENT-ONLY, closing-work item (2), first half ──
+    // ── QEMU_LD_PREFIX IS AMBIENT-ONLY: closing-work item (2), first half ────
     //
-    // ⚠ This is a PARTIAL discharge of an OPEN row, not its closure. That row
-    // asks for two things: (1) the harness DERIVES the guest sysroot instead of
-    // inheriting it ambiently, and (2) an exit-255 under an emulator is
+    // ⚠ This is a PARTIAL discharge, not a closure. TWO things are wanted:
+    // (1) the harness DERIVES the guest sysroot instead of inheriting it
+    // ambiently, and (2) an exit-255 under an emulator is
     // CLASSIFIED as an environment failure and quotes the loader line rather
     // than being presented as an exit-code mismatch. What follows is the cheap,
     // no-masking half of (2): the mismatch is still reported as a mismatch, but
-    // it now carries the remedy. Full classification still owes the row.
+    // it now carries the remedy. (1) and the classification half of (2) are
+    // still owed, and no registry row tracks them.
     //
     // Being on PATH is not the same as being ABLE TO RUN, and the gap between
     // those two facts costs an operator an afternoon. `qemu-aarch64` resolves
@@ -2560,12 +2745,11 @@ compileAndRunArm(fs::path const& exampleDir,
     // ✔MEASURED 2026-08-12 on this project's WSL leg: a raw `ctest` with
     // QEMU_LD_PREFIX unset reported 468 of 826 failing; with
     // `QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` exported, 826 of 826 passed. The
-    // repo already knew — `real-examples/c/sqlite/build-and-test.sh` sets it
-    // per-leg and its own comment says "without it qemu cannot find the guest
-    // loader and EVERY exec dies at exit 255, which would read as 14 DSS
-    // failures on a binary that is completely fine", and notes the variable
-    // "lived for months as an operational workaround rather than as a checked
-    // prerequisite". The ctest corpus runner never got that treatment.
+    // sqlite harness already treats it as a DECLARED per-leg setting: its leg
+    // table (`real-examples/c/sqlite/legs.json`) gives each qemu launcher the
+    // guest sysroot in `launchers[].env`, and `harness_legs.py` hands that
+    // environment to the launcher and checks the directory exists before a run.
+    // The ctest corpus runner never got that treatment.
     //
     // ★ THIS DELIBERATELY DOES NOT SKIP, SUPPRESS OR AUTO-SET ANYTHING. The
     // arm still runs and still reds — masking a cross-arch failure is exactly
@@ -2573,7 +2757,7 @@ compileAndRunArm(fs::path const& exampleDir,
     // host-identity assumption in a harness that has none. It only makes the
     // red SAY what is most likely wrong. Turning this into a proper
     // `SkippedLauncherPrerequisiteMissing` verdict needs the guest's PT_INTERP
-    // read out of the artifact and probed; that is the registry row's work.
+    // read out of the artifact and probed; that is the work still owed.
     // The remedy text this condition earns is attached where the mismatch is
     // ASSERTED, in `runOneTarget` — see `qemuSysrootHint` below.
 
@@ -2588,10 +2772,31 @@ compileAndRunArm(fs::path const& exampleDir,
     // OS half — a Gatekeeper notarization round trip that serializes across
     // concurrent execs — pushed 35/737 tests over it under `ctest -j8`.
     armResult.spawnAttempted = true;  // the ATTEMPT, recorded BEFORE the outcome
-    auto const result = runBinary(artifactPath,
-                                  kRunBudget,
-                                  captureStdout,
-                                  launcherPrefix);
+    RunResult result;
+    {
+        // THE LOADER'S SEARCH PATH, for this ONE spawn (`loader_search_path.hpp`):
+        // the variable the TARGET declared, set to the directory of every library
+        // this arm's build resolved against — `resolveLibs`, the exact set handed
+        // to `setResolveLibraries` above — ahead of any value it already had, and
+        // restored the moment the spawn returns. Nothing here knows what a loader,
+        // a variable or a host is; the manifest said which name, the build said
+        // which directories. Mirrored at the CLI-subprocess sibling's spawn site.
+        std::optional<ScopedEnv> loaderSearchPath;
+        if (!t.loaderSearchPathVariable.empty()) {
+            char const* const prior =
+                std::getenv(t.loaderSearchPathVariable.c_str());
+            loaderSearchPath.emplace(
+                t.loaderSearchPathVariable.c_str(),
+                loaderSearchPathValue(resolveLibs,
+                                      prior != nullptr ? prior : ""));
+        }
+        result = runBinary(artifactPath,
+                           kRunBudget,
+                           captureStdout,
+                           launcherPrefix,
+                           /*programArgs=*/{},
+                           launcherExecsImage);
+    }
     EXPECT_TRUE(result.spawned)
         << "spawn failed for " << artifactPath.generic_string()
         << " (arm=" << armLabel << ") diag=" << result.diagnostic;
@@ -2613,6 +2818,199 @@ compileAndRunArm(fs::path const& exampleDir,
     armResult.exitCode       = result.exitCode;
     armResult.capturedStdout = result.capturedStdout;
     return armResult;
+}
+
+// ── ONE OPTIMIZED ARM'S IMAGES, JUDGED AGAINST ITS BASELINE'S ────────────────
+//
+// The executable, then every prerequisite the arm built, each through the SAME
+// comparator (`judgeOptimizedArtifactIdentity`): report by default, RED where
+// the manifest declared `mustDifferFromBaseline` at that level. Shared by the
+// arm that RAN and by the build-only arm that was compiled and never spawned —
+// whether a pipeline transformed an image is a question about the COMPILE, so
+// both answer it through one piece of code rather than two that could drift.
+void judgeOptimizedArmImages(std::string const&     exampleId,
+                             ExampleTarget const&   t,
+                             OptimizedArm const&    arm,
+                             ArmResult const&       baseline,
+                             ArmResult const&       optResult,
+                             ArtifactIdentityTally& identity) {
+    // ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ──────────
+    //
+    // Both arms produced images, so both exist as bytes. Ask whether the
+    // pipeline changed anything at all BEFORE anything is asserted about the
+    // program's behaviour: if it did not, a behaviour comparison is comparing
+    // an artifact with itself and the arm is coverage in name only. Report by
+    // default; RED when the arm declared it must differ.
+    {
+        auto const j = judgeOptimizedArtifactIdentity(
+            baseline.artifactBytes, optResult.artifactBytes,
+            arm.mustDifferFromBaseline);
+        ++identity.compared;
+        if (j.outcome == ArtifactIdentity::Identical) ++identity.identical;
+        if (!j.note.empty()) {
+            identity.notes.push_back("spec=" + t.spec + " arm=" + arm.label
+                                     + ": " + j.note);
+        }
+        if (j.red) {
+            ADD_FAILURE()
+                << "ARTIFACT IDENTITY: " << exampleId << " spec=" << t.spec
+                << " arm='" << arm.label << "' — " << j.note;
+        }
+    }
+
+    // ── THE DEPENDENCY HALF OF THE SAME QUESTION ────────────────────────────
+    //
+    // A `dependsOn` ENTRY AND ITS OWN OPTIMIZER ARM. The judgement
+    // above asked whether the pipeline changed the EXECUTABLE. On a
+    // `dependsOn` example that is only part of the program: the
+    // prerequisite libraries were compiled too, and an arm that optimized
+    // the exec while leaving them at the baseline is exactly the defect
+    // the threading in `buildDependencyArtifact` fixed. Asking the
+    // question per dependency is what keeps that fix WITNESSED instead of
+    // resting on the incidental thinness of any example's `main.c`.
+    //
+    // Same rule, same comparator, one level down: report by default, RED
+    // when THAT dependency declared it must differ.
+    std::vector<DependsOnArtifact const*> flatDeps;
+    flattenDependencies(t.dependsOn, flatDeps);
+    for (auto const* dep : flatDeps) {
+        auto const key = dependencyImageKey(*dep);
+        ++identity.depImagesExpected;
+        auto const baseIt = baseline.dependencyBytes.find(key);
+        auto const armIt  = optResult.dependencyBytes.find(key);
+        // BOTH ARMS BUILD THE SAME MANIFEST, so a key present in one
+        // and absent in the other is a HARNESS defect, never a
+        // manifest one — and it must not degrade into a silent skip,
+        // because a skipped comparison is indistinguishable from a
+        // passing one in the summary. Reported and NOT counted as
+        // compared, so the reconciliation in `RunFromManifest` reds too.
+        if (baseIt == baseline.dependencyBytes.end()
+            || armIt == optResult.dependencyBytes.end()) {
+            ADD_FAILURE()
+                << "DEPENDENCY IDENTITY: " << exampleId
+                << " spec=" << t.spec << " arm='" << arm.label
+                << "' — no captured image for dependency '" << key
+                << "' on the "
+                << (baseIt == baseline.dependencyBytes.end()
+                        ? "BASELINE" : "OPTIMIZED")
+                << " side. Both arms build the same declared"
+                   " dependencies, so this is a capture defect in the"
+                   " harness, and an uncompared dependency must never"
+                   " read as a compared one";
+            continue;
+        }
+        auto const j = judgeOptimizedArtifactIdentity(
+            baseIt->second, armIt->second, dep->mustDifferFromBaseline);
+        ++identity.depImagesCompared;
+        if (j.outcome == ArtifactIdentity::Identical) {
+            ++identity.depImagesIdentical;
+        }
+        if (!j.note.empty()) {
+            identity.notes.push_back("spec=" + t.spec + " arm=" + arm.label
+                                     + " dependency=" + key + ": " + j.note);
+        }
+        if (j.red) {
+            ADD_FAILURE()
+                << "DEPENDENCY IDENTITY: " << exampleId
+                << " spec=" << t.spec << " arm='" << arm.label
+                << "' dependency='" << dep->artifact
+                << "' (spec=" << dep->spec << ") — " << j.note;
+        }
+    }
+}
+
+// ── THE OPTIMIZED ARM OF A TARGET NO HOST RUNS ──────────────────────────────
+//
+// ★★★ THE DEFECT THIS ENDS. `runOneTarget` compiles an optimized arm only where
+// its baseline RAN — right for a cross-host arm, which the host its `runOn`
+// names compiles AND runs — and a target whose `runOn` is EMPTY runs on no host
+// at all. So every arm a manifest declared on such a target was built NOWHERE
+// and asserted NOTHING, while its ledger row (`compile not attempted: baseline
+// arm did not run`) read like the ordinary cross-host skip every other arm has.
+// ✔MEASURED at the base of this change by PARSING every manifest (2026-09-18,
+// 844 of them): 6 declared `optimizedPipelines` beside a build-only target,
+// 14 (target × arm) pairs in all, every one `release` — declared, never
+// compiled, reported as nothing.
+//
+// ⇒ A BUILD-ONLY TARGET'S ARM IS COMPILED WHEREVER ITS BASELINE IS — on every
+// host, which is where this runner already compiles the baseline — and asserts
+// what a compile can: the build succeeds under the arm's pipeline, the image is
+// captured, and the executable and every prerequisite image are JUDGED against
+// the baseline's, so a declared `mustDifferFromBaseline`, at either level, bites
+// where it used to be decorative. Nothing is spawned: an empty `runOn` is the
+// manifest saying no host can run it, and this does not second-guess that.
+//
+// ★ WHY ONLY `runOn: []` AND NOT EVERY ARM WHOSE BASELINE DID NOT RUN HERE. A
+// cross-host arm is compiled and run by the host it names, so compiling it here
+// too would buy ~450 release images per host per leg to re-witness what that
+// leg already witnesses. An ENVIRONMENTAL skip (an emulator missing) is the
+// machine's shortfall, which strict mode already reds on the gate. A build-only
+// target has neither: this is the only place its arm can exist at all.
+//
+// The CLI-subprocess sibling compiles only the target its host binds (the
+// coverage boundary, `coverage_boundary.hpp`), and a build-only target is never
+// bound — so THIS runner is the sole compiler of these arms by construction.
+// The sibling's ledger says so by name, and its runner-vocabulary pin checks
+// that this function is still here to make the sentence true.
+[[nodiscard]] bool isBuildOnlyTarget(ExampleTarget const& t) noexcept {
+    return t.runOn.empty();
+}
+
+// The ledger note an attempted build-only arm carries — ONE spelling, so the
+// ledger line and the pin that reads it cannot drift apart.
+constexpr std::string_view kBuildOnlyArmNote =
+    "BUILD-ONLY target: no host runs it, so this optimized arm was COMPILED on"
+    " this host and its images judged against the baseline's — nothing is"
+    " spawned";
+
+void compileBuildOnlyOptimizedArms(fs::path const&        exampleDir,
+                                   ExampleManifest const& m,
+                                   ExampleTarget const&   t,
+                                   std::string const&     exampleId,
+                                   ArmResult const&       baseline,
+                                   ArmVerdictLedger&      ledger,
+                                   ArtifactIdentityTally& identity) {
+    for (auto const& arm : m.optimizedPipelines) {
+        SCOPED_TRACE("optimizedPipeline=" + arm.label + " (build-only target)");
+        auto const pipeline = buildPipeline(arm, exampleDir / "expected.json");
+        if (!pipeline.has_value()) {
+            // ADD_FAILURE already fired; the arm still gets a verdict so the
+            // ledger's total matches the manifest's declared arm count.
+            ledger.record(exampleId, t.spec, arm.label, ArmVerdict::Poisoned,
+                          "optimizedPipelines arm could not be resolved");
+            continue;
+        }
+        auto const optResult = compileAndRunArm(
+            exampleDir, m, t,
+            pipeline->overridePipeline ? &*pipeline->overridePipeline : nullptr,
+            arm.label.c_str(),
+            pipeline->config ? &*pipeline->config : nullptr);
+        // The arm must reach the outcome its baseline reached — compiled, image
+        // captured, declined a spawn by the same empty `runOn`. Anything else is
+        // this arm's own failure: a compile its pipeline broke has already fired
+        // its EXPECT inside `compileAndRunArm`, and this names the arm it was.
+        if (optResult.verdict != baseline.verdict
+            || optResult.artifactBytes.empty()) {
+            ledger.record(exampleId, t.spec, arm.label, optResult.verdict,
+                          optResult.detail);
+            ADD_FAILURE() << "build-only target " << t.spec << " arm '"
+                          << arm.label << "': its baseline compiled and was"
+                             " declined a spawn by an empty runOn, but this arm"
+                             " ended " << armVerdictName(optResult.verdict)
+                          << (optResult.detail.empty()
+                                  ? std::string{}
+                                  : " — " + optResult.detail);
+            continue;
+        }
+        ledger.record(exampleId, t.spec, arm.label, optResult.verdict,
+                      optResult.detail + " (" + std::string{kBuildOnlyArmNote}
+                          + ")");
+        // Counted HERE, at the verdict — the `armsThatRan` discipline — so a
+        // judgement that stopped happening shows up as a count mismatch in the
+        // entry summary rather than as a check that quietly stopped looking.
+        ++identity.buildOnlyArmsCompiled;
+        judgeOptimizedArmImages(exampleId, t, arm, baseline, optResult, identity);
+    }
 }
 
 void runOneTarget(fs::path const&        exampleDir,
@@ -2637,7 +3035,8 @@ void runOneTarget(fs::path const&        exampleDir,
                                            "baseline");
     ledger.record(exampleId, t.spec, "baseline", baseline.verdict,
                   baseline.detail);
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+    // SEES A CAPABILITY THE OTHER CANNOT.
     // ★★★ THE OBSERVATION THIS RUNNER IS THE ONLY ONE ABLE TO MAKE, AND WHICH
     // THE ARM VERDICT ERASES. A `runOn`-excluded target lands in the ledger as
     // `SkippedByRunOn` here AND in the CLI-subprocess sibling — but here it means
@@ -2650,12 +3049,26 @@ void runOneTarget(fs::path const&        exampleDir,
     if (baseline.spawnAttempted) coverage.spawned.push_back(t.spec);
     if (baseline.verdict == ArmVerdict::Ran) coverage.ran.push_back(t.spec);
     if (baseline.verdict != ArmVerdict::Ran) {
-        // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the declared optimized arms
-        // are NOT compiled when the baseline does not run (the early return is
-        // also what D-TEST-EXAMPLES-CROSS-HOST-RELEASE-ARM-NEVER-COMPILED owns).
-        // They are DECLARED work, so they get a verdict too rather than
-        // vanishing from the accounting — carrying the baseline's reason, and
-        // saying plainly that not even the compile was attempted.
+        // THE OPTIMIZED ARM OF A TARGET NO HOST RUNS — compiled here, on every
+        // host, and judged; see `compileBuildOnlyOptimizedArms` for why this and
+        // only this non-running baseline takes its arms along. Keyed on the
+        // baseline having COMPILED (`artifactBytes`, taken before the `runOn`
+        // gate) as well as on the verdict, so a baseline that never built
+        // cannot route its arms here.
+        if (isBuildOnlyTarget(t)
+            && baseline.verdict == ArmVerdict::SkippedByRunOn
+            && !baseline.artifactBytes.empty()) {
+            compileBuildOnlyOptimizedArms(exampleDir, m, t, exampleId, baseline,
+                                          ledger, identity);
+            return;
+        }
+        // A CROSS-ARCH SKIP YIELDS NO VERDICT: for every OTHER baseline that did
+        // not run — a cross-host target, which the host its `runOn` names
+        // compiles and runs; a machine missing an emulator; a failed compile —
+        // the declared optimized arms are NOT compiled here. They are DECLARED
+        // work, so they get a verdict too rather than vanishing from the
+        // accounting — carrying the baseline's reason, and saying plainly that
+        // not even the compile was attempted.
         for (auto const& arm : m.optimizedPipelines) {
             ledger.record(exampleId, t.spec, arm.label, baseline.verdict,
                           baseline.detail
@@ -2724,93 +3137,13 @@ void runOneTarget(fs::path const&        exampleDir,
         // the entry summary instead of as a check that quietly stopped looking.
         ++identity.armsThatRan;
 
-        // ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ──
-        //
-        // Both arms ran, so both images exist as bytes. Ask whether the
-        // pipeline changed anything at all BEFORE asserting that the program's
-        // behaviour is unchanged: if it did not, the two assertions below are
-        // comparing an artifact with itself and the arm is coverage in name
-        // only. Report by default; RED when the arm declared it must differ.
-        {
-            auto const j = judgeOptimizedArtifactIdentity(
-                baseline.artifactBytes, optResult.artifactBytes,
-                arm.mustDifferFromBaseline);
-            ++identity.compared;
-            if (j.outcome == ArtifactIdentity::Identical) ++identity.identical;
-            if (!j.note.empty()) {
-                identity.notes.push_back("spec=" + t.spec + " arm=" + arm.label
-                                         + ": " + j.note);
-            }
-            if (j.red) {
-                ADD_FAILURE()
-                    << "ARTIFACT IDENTITY: " << exampleId << " spec=" << t.spec
-                    << " arm='" << arm.label << "' — " << j.note;
-            }
-        }
-
-        // ── THE DEPENDENCY HALF OF THE SAME QUESTION ────────────────────────
-        //
-        // [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]. The judgement
-        // above asked whether the pipeline changed the EXECUTABLE. On a
-        // `dependsOn` example that is only part of the program: the
-        // prerequisite libraries were compiled too, and an arm that optimized
-        // the exec while leaving them at the baseline is exactly the defect
-        // the threading in `buildDependencyArtifact` fixed. Asking the
-        // question per dependency is what keeps that fix WITNESSED instead of
-        // resting on the incidental thinness of any example's `main.c`.
-        //
-        // Same rule, same comparator, one level down: report by default, RED
-        // when THAT dependency declared it must differ.
-        {
-            std::vector<DependsOnArtifact const*> flatDeps;
-            flattenDependencies(t.dependsOn, flatDeps);
-            for (auto const* dep : flatDeps) {
-                auto const key = dependencyImageKey(*dep);
-                ++identity.depImagesExpected;
-                auto const baseIt = baseline.dependencyBytes.find(key);
-                auto const armIt  = optResult.dependencyBytes.find(key);
-                // BOTH ARMS BUILD THE SAME MANIFEST, so a key present in one
-                // and absent in the other is a HARNESS defect, never a
-                // manifest one — and it must not degrade into a silent skip,
-                // because a skipped comparison is indistinguishable from a
-                // passing one in the summary. Reported and NOT counted as
-                // compared, so the reconciliation below reds too.
-                if (baseIt == baseline.dependencyBytes.end()
-                    || armIt == optResult.dependencyBytes.end()) {
-                    ADD_FAILURE()
-                        << "DEPENDENCY IDENTITY: " << exampleId
-                        << " spec=" << t.spec << " arm='" << arm.label
-                        << "' — no captured image for dependency '" << key
-                        << "' on the "
-                        << (baseIt == baseline.dependencyBytes.end()
-                                ? "BASELINE" : "OPTIMIZED")
-                        << " side. Both arms build the same declared"
-                           " dependencies, so this is a capture defect in the"
-                           " harness, and an uncompared dependency must never"
-                           " read as a compared one";
-                    continue;
-                }
-                auto const j = judgeOptimizedArtifactIdentity(
-                    baseIt->second, armIt->second,
-                    dep->mustDifferFromBaseline);
-                ++identity.depImagesCompared;
-                if (j.outcome == ArtifactIdentity::Identical) {
-                    ++identity.depImagesIdentical;
-                }
-                if (!j.note.empty()) {
-                    identity.notes.push_back("spec=" + t.spec + " arm="
-                                             + arm.label + " dependency=" + key
-                                             + ": " + j.note);
-                }
-                if (j.red) {
-                    ADD_FAILURE()
-                        << "DEPENDENCY IDENTITY: " << exampleId
-                        << " spec=" << t.spec << " arm='" << arm.label
-                        << "' dependency='" << dep->artifact
-                        << "' (spec=" << dep->spec << ") — " << j.note;
-                }
-            }
-        }
+        // Both arms ran, so both images exist as bytes: judge the executable and
+        // every prerequisite BEFORE asserting that the program's behaviour is
+        // unchanged — if the pipeline transformed nothing, the two assertions
+        // below compare an artifact with itself and the arm is coverage in name
+        // only. `judgeOptimizedArmImages` carries the rule and its reasons; the
+        // build-only path above judges through the same function.
+        judgeOptimizedArmImages(exampleId, t, arm, baseline, optResult, identity);
         // D-CSUBSET-INLINE-FUNCTION-NO-EXTERNAL-DEFINITION-EMITTED: an arm inside
         // an `optimizationObservable` example may pin its OWN exit code; every
         // other arm must equal the baseline. Note this is still a STRICT
@@ -2849,7 +3182,7 @@ void runErrorTarget(fs::path const&        exampleDir,
                     ExampleTarget const&   t,
                     std::string const&     exampleId,
                     ArmVerdictLedger&      ledger) {
-    // D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: an expect-error arm is VERIFIED
+    // A CROSS-ARCH SKIP YIELDS NO VERDICT: an expect-error arm is VERIFIED
     // without ever being spawned — its assertion is the exact diagnostic set
     // below, which is host-independent. Recorded up-front (rather than after
     // the asserts) so that an ASSERT_ returning early still leaves the arm
@@ -2894,10 +3227,54 @@ void runErrorTarget(fs::path const&        exampleDir,
     auto const srcPath = scratch.path() / srcRel;
     scratch.useAsCwd();
 
+    // ── LIBRARY INPUTS ON A REFUSAL ARM ─────────────────────────────────────
+    //
+    // ★★★ THE REFUSALS THAT NEED A LIBRARY WERE INEXPRESSIBLE, AND THE MANIFEST
+    // KEY THAT WOULD HAVE SAID SO WAS ACCEPTED AND DISCARDED. `prebuiltLibraries`
+    // parses on every target of every manifest, including an `expectDiagnostics`
+    // one; this arm never read it, so a manifest that declared a library input
+    // compiled WITHOUT it and asserted a diagnostic set produced by a build that
+    // had never seen the library. An expectation the runner does not read is an
+    // assertion that never fires, and a SILENT one is the worst shape of it.
+    //
+    // A whole family of refusals lives behind this door and none of it could be
+    // witnessed end to end: every disagreement between what a C declaration says
+    // about an imported name and what the LIBRARY'S OWN export table says about
+    // it — storage duration, object format, architecture — is knowable only when
+    // a real library is on the command line.
+    //
+    // ⚠ `dependsOn` IS REFUSED RATHER THAN STAGED, and the asymmetry is the
+    // honest one. A `prebuiltLibraries` entry is a file already on disk: staging
+    // it is a path resolution and three integrity checks, all of which already
+    // exist here. A `dependsOn` entry is a BUILD — recursive, carrying this arm's
+    // optimizer configuration, asserting `mustDifferFromBaseline` against images
+    // it produces — and none of that has any meaning on an arm whose whole claim
+    // is that the compile fails. The parser refuses the pair by name (see
+    // `readManifest`), so nothing reaches here holding one.
+    std::vector<fs::path> errorResolveLibs;
+    errorResolveLibs.reserve(t.prebuiltLibraries.size());
+    for (auto const& lib : t.prebuiltLibraries) {
+        auto resolved = resolvePrebuiltLibrary(lib, exampleDir);
+        // `resolvePrebuiltLibrary` has already fired ADD_FAILURE naming which of
+        // the three integrity checks failed. Returning here rather than
+        // compiling without the library is what keeps a missing fixture from
+        // reading as "the compiler refused this program", which is the exact
+        // false green an expect-error arm is most exposed to.
+        ASSERT_TRUE(resolved.has_value())
+            << "expect-error example " << exampleDir.generic_string()
+            << " declares a prebuilt library its tree could not supply — "
+               "compiling without it would assert a refusal the library was "
+               "supposed to cause";
+        errorResolveLibs.push_back(std::move(*resolved));
+    }
+
     Program            prog;
     DiagnosticReporter rep;
     auto const         outDir = scratch.path() / "out";
     prog.setOutputDir(outDir);
+    if (!errorResolveLibs.empty()) {
+        prog.setResolveLibraries(errorResolveLibs);
+    }
     // Same entry-point choice the SUCCESS arm makes: a `sources` array is the
     // CU6 multi-CU model (`compileUnits`, one CU per file, merged at link), a
     // single `source` is the CU5 one-unit model (`compileFiles`). Routing the
@@ -3014,7 +3391,7 @@ void runErrorTarget(fs::path const&        exampleDir,
 }
 
 // ── THE CORPUS SCRATCH TREE MUST BE PER BUILD TREE ──────────────────────────
-//   D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE
+//   IT USED TO BE SHARED BY EVERY BUILD TREE.
 //
 // Every arm below opens `ScratchDir{Location::InsideRepo, "examples"}`, and
 // that location is literally `<cwd>/test-scratch/examples/<pid>-<n>` — so the
@@ -3026,7 +3403,7 @@ void runErrorTarget(fs::path const&        exampleDir,
 // ⚠ WHAT THIS IS *NOT*. It is not a collision guard. `ScratchDir` claims its
 // slot with the SINGULAR `create_directory`, which is atomic in the OS, so two
 // processes cannot share a slot however many of them run at once
-// (`D-TEST-EXAMPLES-RUNNER-PARALLEL-CONTENTION-FLAKE`, closed). The defect this
+// (the runner's parallel-contention flake, closed). The defect this
 // refuses is a shared WRITE LOCATION, and the distinction matters because a
 // reader who thinks it is about collisions will conclude the parallel gate was
 // unsafe, which was measured to be false: two full 1347-entry corpus runs at
@@ -3098,7 +3475,8 @@ TEST(Examples, RunFromManifest) {
 
     ArmVerdictLedger      ledger;
     ArtifactIdentityTally identity;
-    // D-TEST-INTEGRATED-RUNNER-BUILDS-ONLY-THE-HOST-RUNNABLE-SPEC-SO-ONE-RUNNER-SEES-A-CAPABILITY
+    // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
+    // SEES A CAPABILITY THE OTHER CANNOT.
     // `declared` is filled from the manifest BEFORE the loop, so a target whose
     // build dies mid-way still appears as declared-and-uncompiled rather than
     // disappearing from the boundary judgement altogether.
@@ -3127,7 +3505,7 @@ TEST(Examples, RunFromManifest) {
     // what it did.
     std::cout << renderCoverageLine(coverage) << '\n';
 
-    // ── D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT: the ledger ───────────────
+    // ── A CROSS-ARCH SKIP YIELDS NO VERDICT: the ledger ───────────────────
     //
     // EVERY declared arm is now in `ledger`, and it is printed unconditionally.
     // ctest hides a passing test's stdout by default, which is precisely why
@@ -3175,7 +3553,7 @@ TEST(Examples, RunFromManifest) {
         }
     }
 
-    // ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ─────
+    // ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ─────────
     //
     // LAST in the body, deliberately: the assertion below is fatal, and the arm
     // ledger and the strict-verdict gate above are what a reader triages a red
@@ -3194,6 +3572,10 @@ TEST(Examples, RunFromManifest) {
               << " dep-images-expected=" << identity.depImagesExpected
               << " dep-images-compared=" << identity.depImagesCompared
               << " dep-images-byte-identical=" << identity.depImagesIdentical
+              // APPENDED, not inserted: manifests quote the fields before it
+              // (`optimized-arms-ran=1 compared=1 ...`) as measured evidence,
+              // and an insertion would break every one of those quotes.
+              << " build-only-arms-compiled=" << identity.buildOnlyArmsCompiled
               << '\n';
     for (auto const& n : identity.notes) {
         std::cout << "[artifact-identity]   " << exampleId << ' ' << n << '\n';
@@ -3206,11 +3588,15 @@ TEST(Examples, RunFromManifest) {
     // and every entry keeps printing a cheerful zero. So the two counts are
     // taken at DIFFERENT SITES (`armsThatRan` at the arm's verdict,
     // `compared` inside the comparison) and reconciled here: an optimized arm
-    // that RAN and was not COMPARED is a harness defect, not a quiet day.
-    ASSERT_EQ(identity.compared, identity.armsThatRan)
+    // that RAN and was not COMPARED is a harness defect, not a quiet day. A
+    // BUILD-ONLY target's arm is counted the same way on its own path
+    // (`buildOnlyArmsCompiled`), so the equality holds across both.
+    ASSERT_EQ(identity.compared,
+              identity.armsThatRan + identity.buildOnlyArmsCompiled)
         << "artifact-identity accounting mismatch for " << exampleId << ": "
-        << identity.armsThatRan
-        << " optimized arm(s) ran but only " << identity.compared
+        << identity.armsThatRan << " optimized arm(s) ran and "
+        << identity.buildOnlyArmsCompiled
+        << " were compiled build-only, but only " << identity.compared
         << " were compared against their baseline image. The optimized-vs-"
            "baseline byte comparison is what keeps a declared arm from counting"
            " as coverage while witnessing nothing; a comparison that stopped"
@@ -3269,7 +3655,7 @@ TEST(RunHarnessStack, GenerousSpawnStackBumpIsWired) {
 #endif
 }
 
-// ── D-TEST-MANIFEST-ARM64-ARM-WITHOUT-EMULATOR: the corpus emulator lint ───
+// ── AN ARM64 ARM IN A MANIFEST WITH NO EMULATOR: the corpus lint ──────────
 //
 // Registered inside the ONE extra ctest entry (`examples/corpus-lints`, which
 // was named `examples/manifest-emulator-lint` until AP6 renamed it for the
@@ -3374,7 +3760,7 @@ TEST(ExamplesCorpusLint, StagesNestedSubdirectoriesWithContentIntact) {
     EXPECT_TRUE(findings.empty()) << findings;
 }
 
-// ── D-TEST-A-RELEASE-ARM-BYTE-IDENTICAL-TO-BASELINE-ASSERTS-NOTHING ────────
+// ── A RELEASE ARM BYTE-IDENTICAL TO THE BASELINE ASSERTS NOTHING ────────────
 //
 // The two-direction pin for the optimized-vs-baseline identity check. Filed in
 // `ExamplesCorpusLint` (the one suite the per-example entries exclude and the
@@ -3593,7 +3979,7 @@ TEST(ExamplesCorpusLint, ByteIdenticalOptimizedArtifactIsDetectedBothWays) {
 
 // ── THE DEPENDENCY HALF OF THE SAME LEVER ──────────────────────────────────
 //
-// [[D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM]]. The arm-level lever above
+// A `dependsOn` ENTRY AND ITS OWN OPTIMIZER ARM. The arm-level lever above
 // compares the EXECUTABLE. That is enough to witness the prerequisite's
 // pipeline ONLY while every `main.c` in the corpus is trivial enough to give
 // the optimizer nothing of its own to do — because then the exec's only source
@@ -3935,7 +4321,7 @@ TEST(ExamplesCorpusLint, DependsOnEntryRefusesAnUnknownKeyAtEveryDepth) {
 //
 // Mirrored, refusal for refusal, by the CLI-subprocess sibling's
 // `runPrebuiltLibraryParserPin` — a manifest one runner accepts and the other
-// rejects is [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]].
+// rejects is exactly what the TWO RUNNERS MUST AGREE rule forbids.
 TEST(ExamplesCorpusLint, PrebuiltLibraryEntryIsRefusedUnlessItIsWitnessed) {
     ScratchDir sandbox{Location::Temp, "prebuilt-library-keys"};
     auto const dir = sandbox.path();
@@ -4152,9 +4538,9 @@ TEST(ExamplesCorpusLint, ManifestRefusesAnUnknownKeyAtTopLevelAndPerTarget) {
 //
 // WHAT CAN STILL REGRESS, and is therefore what this pins: a copy coming BACK.
 // That is not hypothetical here — this repo has paid for exactly that drift
-// twice (D-TEST-CROSS-ARCH-SKIP-YIELDS-NO-VERDICT,
-// D-TEST-SCOPED-ENV-DUPLICATED-THREE-WAYS), both times by someone adding a
-// local copy rather than reaching for the shared header. The three clauses are
+// twice (a cross-arch skip that yielded no verdict, and a scoped-env helper
+// duplicated three ways), both times by someone adding a local copy rather
+// than reaching for the shared header. The three clauses are
 // the three ways the single-definition property dies: the header stops
 // defining it, a runner starts defining it, or a runner stops including it.
 //
@@ -4243,7 +4629,7 @@ TEST(ExamplesCorpusLint, StagingPrimitiveLivesOnlyInTheSharedHeader) {
     }
 }
 
-// ── D-TEST-EXAMPLES-CORPUS-SCRATCH-IS-SHARED-BY-EVERY-BUILD-TREE ────────────
+// ── THE CORPUS SCRATCH TREE WAS SHARED BY EVERY BUILD TREE ──────────────────
 //
 // TWO CLAUSES, because the property has a runtime half and a structural half
 // and neither one implies the other.
@@ -4370,4 +4756,323 @@ TEST(ExamplesCorpusLint, OnlyDeclaredExamplesMayDivergeFromTheirBaseline) {
            " this list is every example excused from that, and it is pinned by"
            " NAME so a new excuse cannot arrive silently. If you added one,"
            " update kExpected in the same change and justify the clause.";
+}
+
+// ── AN ARM ON A TARGET NO HOST RUNS IS COMPILED AND JUDGED, NEVER DROPPED ────
+//
+// ★★★ THE PHANTOM THIS PINS AWAY. Before `compileBuildOnlyOptimizedArms`, an
+// optimized arm on a `runOn: []` target was ledgered "compile not attempted" on
+// every host and built on none, so a manifest could declare one and have it
+// assert nothing anywhere. The fixture SYNTHESIZES exactly that manifest — one
+// build-only target, two optimized arms — rather than leaning on the corpus
+// examples that carried the shape: an example can be edited away, and a pin
+// that only passes while some other file keeps a shape is not a pin.
+//
+// ★ WHY `passes: ["Identity"]`, AND WHY THIS DOES NOT DEPEND ON THE OPTIMIZER.
+// The baseline pipeline is `Identity` alone, so an arm that also runs only
+// `Identity` must reproduce the baseline's image byte-for-byte — that is the
+// determinism precondition every identity verdict already rests on, not a
+// choice the optimizer makes. The outcome is therefore FIXED BY CONSTRUCTION on
+// every leg: both arms judge IDENTICAL, the report-only arm narrates it, and the
+// arm declaring `mustDifferFromBaseline` must RED. A fixture whose source
+// "really optimizes" would invert on any leg where it stopped doing so, and a
+// pin that can invert is worse than none.
+//
+// ⇒ TWO DIRECTIONS IN ONE CALL. The red proves the attempted arm ASSERTS
+// something — a compiled-but-unjudged arm would be the phantom again, only
+// noisier — and the counts and ledger rows prove it was compiled here and
+// spawned nowhere.
+TEST(ExamplesCorpusLint, BuildOnlyTargetsOptimizedArmIsCompiledAndJudged) {
+    ScratchDir sandbox{Location::Temp, "build-only-arm-pin"};
+    auto const dir = sandbox.path();
+    std::string const spec{hostNativeTarget().execTarget};
+    std::string const artifact = hostExeArtifact("main");
+    {
+        std::ofstream src(dir / "main.c", std::ios::binary);
+        src << "int main(void) { return 42; }\n";
+        src.close();
+        ASSERT_TRUE(src.good()) << "could not plant the fixture source";
+        std::ofstream mf(dir / "expected.json", std::ios::binary);
+        mf << R"({
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [{"spec": ")" << spec << R"(", "artifact": ")" << artifact
+           << R"(", "runOn": []}],
+  "optimizedPipelines": [
+    {"label": "identity-reported", "passes": ["Identity"]},
+    {"label": "identity-must-differ", "passes": ["Identity"],
+     "mustDifferFromBaseline": true}
+  ]
+})";
+        mf.close();
+        ASSERT_TRUE(mf.good()) << "could not plant the fixture manifest";
+    }
+    auto const m = readManifest(dir / "expected.json");
+    ASSERT_EQ(m.targets.size(), 1u) << "the fixture manifest did not parse";
+    ASSERT_TRUE(m.targets[0].runOn.empty())
+        << "the fixture's whole subject is a target no host runs";
+    ASSERT_EQ(m.optimizedPipelines.size(), 2u);
+
+    ArmVerdictLedger      ledger;
+    ArtifactIdentityTally identity;
+    CoverageReport        coverage;
+    // EXACTLY ONE non-fatal failure, and it is the declared-differ arm's: a
+    // compile failure, a missing capture or an unexpected verdict would each
+    // add their own and fail this expectation for the reason that happened.
+    EXPECT_NONFATAL_FAILURE(
+        runOneTarget(dir, m, m.targets[0], "c/build-only-arm-pin", ledger,
+                     identity, coverage),
+        "ARTIFACT IDENTITY");
+
+    EXPECT_EQ(identity.buildOnlyArmsCompiled, 2u)
+        << "both declared arms of a build-only target must be COMPILED here —"
+           " zero is the phantom this pin exists to keep dead";
+    EXPECT_EQ(identity.compared, 2u)
+        << "a compiled build-only arm must be JUDGED, or it asserts nothing";
+    EXPECT_EQ(identity.identical, 2u)
+        << "an arm that runs only `Identity` must reproduce the baseline image"
+           " — the determinism precondition every identity verdict rests on";
+    EXPECT_EQ(identity.armsThatRan, 0u) << "nothing may be spawned here";
+    EXPECT_TRUE(coverage.spawned.empty())
+        << "a build-only target must never be spawned, by either arm";
+
+    std::size_t armRows = 0;
+    for (auto const& r : ledger.records()) {
+        EXPECT_EQ(static_cast<int>(r.verdict),
+                  static_cast<int>(ArmVerdict::SkippedByRunOn))
+            << r.arm << ": " << r.detail;
+        if (r.arm == "baseline") continue;
+        ++armRows;
+        EXPECT_NE(r.detail.find(kBuildOnlyArmNote), std::string::npos)
+            << "the ledger must SAY the arm was compiled and judged. Got: "
+            << r.detail;
+        EXPECT_EQ(r.detail.find("compile not attempted"), std::string::npos)
+            << "the phantom's own words are back in the ledger: " << r.detail;
+    }
+    EXPECT_EQ(armRows, 2u) << "every declared arm owes a ledger row";
+}
+
+// ── THE LOADER'S SEARCH PATH: THE VALUE, THE PARSE, AND THE SPAWN ───────────
+//
+// Three pins for one capability, one per altitude it lives at, because each can
+// break while the other two stay green: the VALUE is a pure function both
+// runners share (`loader_search_path.hpp`), the PARSE is each runner's own (the
+// CLI-subprocess sibling mirrors it in its `cli-surface` self-test), and the
+// SPAWN is the one scoped block per runner that hands the value to a child.
+
+// THE VALUE — pure, so it is pinned exactly and identically on every host.
+TEST(ExamplesCorpusLint, LoaderSearchPathValueIsTheResolvedLibraryDirectories) {
+    ScratchDir sandbox{Location::Temp, "loader-search-path-value"};
+    auto const a = sandbox.path() / "a";
+    auto const b = sandbox.path() / "b";
+    auto const spelled = [](fs::path const& p) {
+        return fs::absolute(p).lexically_normal().make_preferred().string();
+    };
+    std::string const sep(1, kLoaderSearchPathListSeparator);
+
+    // Two libraries in ONE directory and one in another: each directory ONCE,
+    // in resolve order, and the prior value LAST, so the example's own
+    // libraries are found before anything the operator's value points at.
+    std::vector<fs::path> const libs = {a / "one.lib", a / "two.lib",
+                                        b / "three.lib"};
+    EXPECT_EQ(loaderSearchPathValue(libs, "PRIOR"),
+              spelled(a) + sep + spelled(b) + sep + "PRIOR");
+    // No prior value ⇒ no dangling separator: an EMPTY list entry means "the
+    // working directory" to a POSIX loader, which nobody asked for.
+    EXPECT_EQ(loaderSearchPathValue(libs, ""), spelled(a) + sep + spelled(b));
+    // One directory reached by two spellings is still ONE entry.
+    EXPECT_EQ(loaderSearchPathValue({a / "one.lib", a / "sub" / ".." / "x.lib"},
+                                    ""),
+              spelled(a));
+    // Nothing resolved ⇒ the prior value, untouched.
+    EXPECT_EQ(loaderSearchPathValue({}, "PRIOR"), "PRIOR");
+
+    // The name grammar both parsers enforce.
+    EXPECT_TRUE(isPortableEnvironmentVariableName("DSS_PROBE_1"));
+    EXPECT_TRUE(isPortableEnvironmentVariableName("_x"));
+    EXPECT_FALSE(isPortableEnvironmentVariableName(""));
+    EXPECT_FALSE(isPortableEnvironmentVariableName("1DSS"));
+    EXPECT_FALSE(isPortableEnvironmentVariableName("DSS PROBE"));
+    EXPECT_FALSE(isPortableEnvironmentVariableName("DSS=PROBE"));
+    EXPECT_FALSE(isPortableEnvironmentVariableName("DSS-PROBE"));
+}
+
+// THE PARSE — the key is read, and every declaration that could never act is
+// REFUSED BY NAME rather than accepted in silence. Placeholder specs, for the
+// reason the sibling closed-key pins give: `readManifest` stores them as
+// opaque strings, and nothing here compiles.
+TEST(ExamplesCorpusLint, LoaderSearchPathVariableIsReadAndInertDeclarationsAreRefused) {
+    ScratchDir sandbox{Location::Temp, "loader-search-path-parse"};
+    auto const dir = sandbox.path();
+    auto const plantAndRead = [&dir](std::string const& top,
+                                     std::string const& target) {
+        fs::path const mp = dir / "expected.json";
+        std::ofstream mf(mp, std::ios::binary);
+        mf << R"({
+  "language": "<fixture-language>",
+  "source": "<fixture-source>",
+  )" << top << R"(
+  "targets": [{"spec": "<fixture-arch>:<fixture-format>",
+               "artifact": "<fixture-artifact>")" << target << R"(}]
+})";
+        mf.close();
+        EXPECT_TRUE(mf.good()) << "could not plant " << mp.generic_string();
+        return readManifest(mp);
+    };
+    std::string const exitZero = R"("exitCode": 0,)";
+    std::string const dep =
+        R"(, "dependsOn": [{"sources": ["l.c"], "spec": "<fixture-libspec>",
+                            "artifact": "l.lib"}])";
+
+    // READ: a well-formed declaration on a spawned target with a library input
+    // reaches the struct, spelled exactly as declared.
+    {
+        auto const parsed = plantAndRead(
+            exitZero, R"(, "runOn": ["<fixture-host>"],
+                         "loaderSearchPathVariable": "DSS_PROBE_DIRS")" + dep);
+        ASSERT_EQ(parsed.targets.size(), 1u)
+            << "the well-formed fixture was refused";
+        EXPECT_EQ(parsed.targets[0].loaderSearchPathVariable, "DSS_PROBE_DIRS");
+    }
+    // A name the host cannot set, and a value that is not a name at all.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                exitZero, R"(, "runOn": ["<fixture-host>"],
+                             "loaderSearchPathVariable": "DSS PROBE")" + dep);
+        },
+        "loaderSearchPathVariable");
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                exitZero, R"(, "runOn": ["<fixture-host>"],
+                             "loaderSearchPathVariable": 7)" + dep);
+        },
+        "loaderSearchPathVariable");
+    // INERT: never spawned — `runOn` is empty.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                exitZero, R"(, "runOn": [],
+                             "loaderSearchPathVariable": "DSS_PROBE_DIRS")" + dep);
+        },
+        "no host ever spawns it");
+    // INERT: nothing resolved, so the variable would name no directory.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                exitZero, R"(, "runOn": ["<fixture-host>"],
+                             "loaderSearchPathVariable": "DSS_PROBE_DIRS")");
+        },
+        "resolves against no library");
+    // INERT: a refusal manifest spawns nothing at all.
+    EXPECT_NONFATAL_FAILURE(
+        {
+            (void)plantAndRead(
+                R"("expectDiagnostics": [{"code": "S_X", "line": 1, "col": 1}],)",
+                R"(, "runOn": ["<fixture-host>"],
+                   "loaderSearchPathVariable": "DSS_PROBE_DIRS",
+                   "prebuiltLibraries": [{"path": "tests/x.lib",
+                                          "containerWitness": "x"}])");
+        },
+        "never spawns anything");
+}
+
+// THE SPAWN — the declared variable reaches the child, carrying the directory
+// the build resolved its library from. HOST-INDEPENDENT BY CONSTRUCTION: the
+// variable is a probe name no loader reads, the library is one the program
+// never calls (✔MEASURED 2026-09-18, WSL: DSS records no DT_NEEDED for a
+// resolved library nothing references, so the child loads on every host), and
+// the program checks the value itself. So this runs, and can red, on Windows,
+// Linux and macOS alike — which the corpus's own dynamic-library arms cannot:
+// they run only where their loader needs the variable.
+//
+// ★ THE NAMED CONTROL IS THE SAME PROGRAM WITHOUT THE DECLARATION, which must
+// exit 11 ("no variable"). It is what makes the declared case's 42 mean "the
+// runner set it" rather than "something in the environment happened to".
+TEST(ExamplesCorpusLint, LoaderSearchPathVariableReachesTheSpawnedChild) {
+    constexpr char const* kProbe = "DSS_LOADER_SEARCH_PATH_PROBE";
+    // The probe must not already be in this process's environment, or the
+    // control below would inherit it and prove nothing.
+    ScopedEnv const unset{kProbe};
+    auto const native  = hostNativeTarget();
+    auto const libFile = hostLibArtifact("probe_lib");
+    auto const exeFile = hostExeArtifact("main");
+    // Qualified: `using namespace dss` also reaches the driver's own
+    // `dss::currentHostOs()`, and the harness spelling is the one wanted.
+    auto const host    = ::dss::test_support::currentHostOs();
+
+    auto const runCase = [&](bool declared, int expectedExit) {
+        ScratchDir sandbox{Location::Temp, "loader-search-path-spawn"};
+        auto const dir = sandbox.path();
+        {
+            std::ofstream lib(dir / "probe_lib.c", std::ios::binary);
+            lib << "int dss_probe_unused(void) { return 7; }\n";
+            lib.close();
+            ASSERT_TRUE(lib.good());
+            std::ofstream src(dir / "main.c", std::ios::binary);
+            src << "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+                   "int main(void) {\n"
+                   "    char const *dirs = getenv(\"" << kProbe << "\");\n"
+                   "    char path[4096];\n"
+                   "    FILE *f;\n"
+                   "    if (dirs == 0) return 11;\n"
+                   "    if (dirs[0] == 0) return 12;\n"
+                   "    if (strlen(dirs) + 64 >= sizeof path) return 13;\n"
+                   "    strcpy(path, dirs);\n"
+                   "    strcat(path, \"/" << libFile << "\");\n"
+                   "    f = fopen(path, \"rb\");\n"
+                   "    if (f == 0) return 14;\n"
+                   "    fclose(f);\n"
+                   "    return 42;\n"
+                   "}\n";
+            src.close();
+            ASSERT_TRUE(src.good());
+            std::ofstream mf(dir / "expected.json", std::ios::binary);
+            mf << R"({
+  "language": "c",
+  "source": "main.c",
+  "exitCode": )" << expectedExit << R"(,
+  "targets": [{"spec": ")" << native.execTarget << R"(",
+               "artifact": ")" << exeFile << R"(",
+               "runOn": [")" << host << R"("],)"
+               << (declared ? std::string{R"( "loaderSearchPathVariable": ")"}
+                                  + kProbe + R"(",)"
+                            : std::string{})
+               << R"(
+               "dependsOn": [{"sources": ["probe_lib.c"],
+                              "spec": ")" << native.libTarget << R"(",
+                              "artifact": ")" << libFile << R"("}]}]
+})";
+            mf.close();
+            ASSERT_TRUE(mf.good());
+        }
+        auto const m = readManifest(dir / "expected.json");
+        ASSERT_EQ(m.targets.size(), 1u) << "the spawn fixture did not parse";
+        ASSERT_EQ(m.targets[0].loaderSearchPathVariable.empty(), !declared);
+        ArmVerdictLedger      ledger;
+        ArtifactIdentityTally identity;
+        CoverageReport        coverage;
+        // `runOneTarget` asserts the child's exit code against the fixture's own
+        // `exitCode`, so 11 on the declared case (the runner never set it) or 14
+        // (it named a directory that does not hold the library) reds right here.
+        runOneTarget(dir, m, m.targets[0], "c/loader-search-path-spawn", ledger,
+                     identity, coverage);
+        ASSERT_EQ(ledger.total(), 1u);
+        EXPECT_EQ(static_cast<int>(ledger.records()[0].verdict),
+                  static_cast<int>(ArmVerdict::Ran))
+            << ledger.records()[0].detail;
+    };
+    {
+        SCOPED_TRACE("control: no loaderSearchPathVariable declared — exits 11");
+        runCase(/*declared*/ false, /*expectedExit*/ 11);
+    }
+    {
+        SCOPED_TRACE("subject: loaderSearchPathVariable declared — exits 42");
+        runCase(/*declared*/ true, /*expectedExit*/ 42);
+    }
+    // And the runner RESTORED it: the variable is set for the spawn alone.
+    EXPECT_EQ(std::getenv(kProbe), nullptr)
+        << "the declared variable leaked out of the spawn into the runner";
 }

@@ -1,5 +1,6 @@
 // ★★★ THE SOURCE-ARGUMENT SHAPE IS AN INPUT, AND THE CORPUS CAN ONLY SPELL ONE
-// OF THE FOUR (D-HARNESS-EXAMPLE-RUNNERS-ALWAYS-COMPILE-AN-ABSOLUTE-SOURCE-PATH).
+// OF THE FOUR, BECAUSE BOTH EXAMPLE RUNNERS ALWAYS COMPILE AN ABSOLUTE SOURCE
+// PATH.
 //
 // ── WHAT THIS FILE IS FOR ───────────────────────────────────────────────────
 // A user hands the driver a source path in one of exactly four shapes:
@@ -59,7 +60,7 @@
 // CLI-subprocess counterpart is the `--only=cli` surface pin in
 // `integrated_tests/runner.cpp` (`runSourceArgumentShapePin`): the two halves
 // cover the in-process and the argv tier respectively, which is the divergence
-// [[D-EXAMPLES-RUNNER-TWO-RUNNERS-MUST-AGREE]] is about.
+// the TWO RUNNERS MUST AGREE rule is about.
 //
 // ── WHAT EACH CASE ASSERTS, AND WHY IT IS NOT "IT COMPILED" ─────────────────
 //   * the compile succeeds with ZERO error diagnostics — a bare rc check would

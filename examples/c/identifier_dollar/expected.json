@@ -1,0 +1,16 @@
+{
+  "$comment": "[[D-C-DOLLAR-IN-IDENTIFIERS-REFUSED]] runtime witness: `$` starts and continues a C identifier (C23 6.4.2.1 implementation-defined characters). ✔MEASURED 2026-09-22: gcc 13.3.0 and clang 18.1.3 (WSL, -std=c2x, -O0 and -O2), MinGW gcc (-std=c2x, -O0 and -O2) and MSVC VS 18 (/std:clatest, /Od and /O2) all BUILD this file and RUN it to 42. Before C's document declared `identifierClass { extraStart \"$\", extraContinue \"$\" }`, DSS refused every `$` name with P_IllegalChar.",
+  "$commentWhyNotVacuous": "Every `$` name is a separate object with its own value and the sum reaches 42 only if each one resolves to itself: a lexer that split `in$ide` into `in` + `$` + `ide`, read `$1` as a number, lost the `#if ON$` arm, or stringized `a$b` as anything but those three bytes changes the exit value or refuses the file. `f$` and the pasted `x$y` have EXTERNAL linkage, so every target's object writer and linker must carry a `$` in a symbol name. ✔MEASURED through dsscp: pe64 runs to 42 natively, elf64-x86_64 in WSL and elf64-aarch64 under qemu, debug and release; macho64-arm64 builds.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

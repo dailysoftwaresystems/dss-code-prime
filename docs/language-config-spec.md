@@ -465,7 +465,7 @@ Delimited string literals — `"hello"`, `@"verbatim ""quotes"""`, `R"DELIM(raw)
 | `endsAtLongestMatch` | bool | no (default `false`) | For triple-quotes — consume the longest run matching `endsAt` from the end. |
 | `delimiterTag` | string `"matched"` | no | Enables dynamically-captured delimiter tags (C++ `R"DELIM(...)DELIM"`). Only `"matched"` is a valid value. |
 | `tagPattern` | regex string | no (default `[A-Za-z0-9_]{0,16}` when `delimiterTag` is set) | Constraint on what characters are valid in the captured tag. Compiled at load time — invalid regexes are rejected with `C_InvalidStringStyle`. Must be paired with `delimiterTag: "matched"`. |
-| `multiline` | bool | no (default `false`) | Whether newlines are allowed in the body. |
+| `multiline` | bool | no (default `false`) | Whether newlines are allowed in the body. **`false`: the first new-line the escape rule did not consume ENDS the body, unterminated** — the body token is emitted with no closer, `P_UnterminatedString` (or `P_UnterminatedComment`, per the mode's `unterminatedAs`) is reported at the OPENER, and the new-line is left in the stream, so the next line lexes exactly as if the literal had been closed at the end of its own. A missing closer therefore costs one line, never the rest of the file. An escaped new-line (`escapeKind: "char"`, the escape character before it) continues the body. A style whose `endsAt` IS the new-line (a line comment) closes on it before this rule applies. **`true`**: the body may span lines — a block comment, a SQL string, a triple-quoted string. ⚠ Until 2026-09-22 the tokenizer ignored this field and every body spanned lines whatever it declared ([[D-TOK-STRING-STYLE-MULTILINE-IS-NEVER-READ]]): a C character constant opened by a stray `'` in prose ran to the next `'` lines later and swallowed every directive between them. |
 
 **Keywords cannot carry `stringStyle`** — word-shaped tokens can't open delimited strings. Use a `tokens` entry instead.
 
@@ -707,6 +707,51 @@ Three coupled surfaces let a language declare a C-style cast `(type)expr` whose 
 - **`hirLowering.castRule`**: the HIR lowering arm — the stamped target type + the lowered operand become an explicit `Cast` node (the compound-literal stamped-type-probe precedent).
 
 c declares `castExpr` = `[ParenOpen, castTypeRef, ParenClose, castOperand]` as a speculative `operand` alternative, with `castOperand` a second `expr`-entry rule at `minPrecedence` 90 so the cast binds at unary tier (`(int)a + b` casts only `a`; postfix binds inside the operand).
+
+### 11.8 `identifierClass` — which characters make a name
+
+An **optional** top-level block that widens the identifier rule for one language. Without it a language gets the **universal rule**: a name STARTS with an ASCII letter, `_` or a UTF-8 lead byte (0xC2–0xF4), and CONTINUES with those, the ASCII digits and every byte ≥ 0x80 (so a multi-byte character never ends a name part-way through). A digit never starts a name — it starts a number.
+
+```jsonc
+"identifierClass": {
+  "extraStart":    "$",   // may also START a name
+  "extraContinue": "$"    // may also CONTINUE a name
+}
+```
+
+- Both values are character classes in the syntax of `numberStyle`'s `digits` (literal characters and `a-z` ranges), matched by the same helper the tokenizer runs, so a range is judged at load exactly as it is used.
+- **Additive only.** The universal rule cannot be narrowed: a language that could remove `_` would break every lookup in its own `tokens` map with no diagnostic.
+- **The two keys are separate questions.** A character that may start a name does not thereby continue one. A language that wants both declares it in both keys, as C does for `$`.
+- At least one key is required. An empty block is refused (`C_MissingField`); to mean "the universal rule", leave the block out.
+
+Every refusal fails the load and names the character and the reason:
+
+| Key | Refused | Why |
+|---|---|---|
+| `extraContinue` | a character that already continues a name (a letter, a digit, `_`) | declaring it changes nothing, and a key that reads as a capability but delivers none sends the reader looking for a bug elsewhere |
+| either | whitespace or a control byte (≤ 0x20) | a name that could contain one swallows the gap beside it: a wrong parse, not a parse error |
+| `extraStart` | a character that already starts a name (a letter, `_`) | declaring it changes nothing |
+| `extraStart` | a digit | a digit starts a number, and `1abc` belongs to the numeric scanner |
+| `extraStart` | a byte that **begins any lexeme this document declares** — its `tokens` map or any lexer mode's table. The message names the lexeme. | a leading byte that opens a token is owned by that token. Two mechanisms for one byte cannot agree about which construct it opens |
+
+The last row is why gas's `.` may continue a name (`b.eq`, `v1.8b`, `DW.ref.foo`) but may not start one: a leading `.` is that dialect's `DirectiveDot` token, which is how `.text` becomes a directive and `.L3:` a label. C's `$` begins no C lexeme, so C may declare it in both keys.
+
+**Shipped declarations:** `asm-arm64-gas` declares `extraContinue: "."`. `c` declares `extraStart: "$"` and `extraContinue: "$"`. Every other shipped language omits the block. The block belongs to its own document, so C's `$` does not reach an assembly dialect: an AT&T `$` immediate, and an inline-asm template lexed by that dialect's document, are untouched.
+
+**C's `$`, as measured.** C23 6.4.2.1 lets an implementation add "other implementation-defined characters" to identifiers, and every reference compiler adds `$`. Before this block existed, DSS refused every shape below with `P_IllegalChar`. The references were measured on 2026-09-22: gcc 13.3.0 and clang 18.1.3 (WSL, `-std=c2x`), MinGW-w64 gcc (`-std=c2x`) and MSVC VS 18 (`/std:clatest`). Each DSS program was compiled and then RUN, and returns 0 only when the value is right.
+
+| Shape | gcc | clang | MinGW gcc | MSVC | DSS |
+|---|---|---|---|---|---|
+| leading: `int $a = 1;` … `$a - 1` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| inside: `a$b` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| trailing: `ab$` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| alone: `int $ = 2;` … `$ - 2` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| before a digit: `$1` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| a function name: `f$()` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| a macro name: `#define M$ 5` | ✔ | ✔ | ✔ | ✔ | runs, 0 |
+| tested by `#if`: `#define F$ 1` / `#if F$` | ✔ | ✔ | ✔ | ✔ | runs, 0 (the `#if` arm is taken) |
+| stringized: `S(a$b)` | ✔ | ✔ | ✔ | ✔ | runs, 0 (the string is `"a$b"`) |
+| pasted: `CAT(x, $y)` | ✔ | ✔ | ✔ | ✔ | runs, 0 (the name is `x$y`) |
 
 ---
 

@@ -27,12 +27,16 @@
 //   * SummaryDecodeRejects{Magic,Version,Truncation,TrailingBytes,Binding} —
 //     fail-loud on every malformed input, because a misread summary is a
 //     miscompile and guessing is never the safe option.
+//   * MirSummaryDominanceComplexity.* — the loop-depth walk's dominator trees
+//     cost each function its own blocks, never the whole module (a COUNT, not
+//     a stopwatch), and every looping call site still reports depth 1.
 
 #include "core/types/extern_import.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_dom.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "mir/summary/mir_summary.hpp"
@@ -42,6 +46,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -462,4 +467,120 @@ TEST(MirSummary, SummaryDecodeRejectsOutOfRangeBinding) {
     // link-time miscompile, not a display bug.
     b[at] = 9;
     EXPECT_FALSE(decodeModuleSummary(b).has_value());
+}
+
+// ─── THE LOOP-DEPTH WALK'S DOMINATOR TREES ARE LINEAR IN THE MODULE ─────────
+//
+// The sibling of D-OPT-MEM2REG-WHOLE-MODULE-DOMINANCE-PER-FUNCTION, found by
+// searching for its shape: `computeLoopDepths` asked the FRESH
+// `computeMirDomTree` for one function's tree, once per function, and the fresh
+// overload allocates and sweeps FIVE whole-module arrays. A COUNT of the swept
+// block slots (`mirDomSlotsSweptTake`), never a stopwatch — see
+// test_mem2reg_dominance_complexity.cpp for why.
+namespace {
+
+// A callee (symbol 50) and `n` looping callers (symbols 100..): each caller is
+// entry -> header <-> body(call callee) ; header -> exit(return), so every
+// caller's one call site sits at loop depth 1 — the answer the dominator tree
+// exists to produce here.
+Mir buildLoopingCallers(TypeInterner& in, std::uint32_t n) {
+    TypeId const i32   = in.primitive(TypeKind::I32);
+    TypeId const boolT = in.primitive(TypeKind::Bool);
+    TypeId const fnSig = in.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const calleeEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(calleeEntry);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    for (std::uint32_t k = 0; k < n; ++k) {
+        mb.addFunction(fnSig, SymbolId{100u + k});
+        MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+        MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+        mb.beginBlock(entry);
+        mb.addBr(header);
+        mb.beginBlock(header);
+        MirLiteralValue t; t.value = std::int64_t{1}; t.core = TypeKind::Bool;
+        mb.addCondBr(mb.addConst(t, boolT), body, exitB);
+        mb.beginBlock(body);
+        MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+        MirInstId const ops[]      = {calleeAddr};
+        (void)mb.addInst(MirOpcode::Call, ops, i32);
+        mb.addBr(header);
+        mb.beginBlock(exitB);
+        mb.addReturn(mb.addConst(i32Lit(0), i32));
+    }
+    return std::move(mb).finish();
+}
+
+struct SummaryWork {
+    ModuleSummary summary;
+    std::uint64_t slotsSwept = 0;
+    std::size_t   blockCount = 0;
+};
+
+SummaryWork summarizeLoopingCallers(std::uint32_t n) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir const mir = buildLoopingCallers(in, n);
+    std::unordered_map<std::uint32_t, std::string> names{{50, "callee"}};
+    for (std::uint32_t k = 0; k < n; ++k) names[100u + k] = "g" + std::to_string(k);
+    SummaryWork w;
+    w.blockCount = mir.blockCount();
+    (void)mirDomSlotsSweptTake();   // zero THIS thread's counter
+    w.summary    = buildModuleSummary(inputFor(mir, std::move(names)));
+    w.slotsSwept = mirDomSlotsSweptTake();
+    return w;
+}
+
+constexpr std::uint32_t kLoopingCallers = 64;
+
+} // namespace
+
+// PREMISE + CONTROL in one: every caller's call site is recorded at loop depth
+// 1. That is the answer the per-function dominator tree exists to produce, so
+// it stays green under the cost mutant (reverting to the fresh overload changes
+// nothing a caller can see) and it proves the work arms below are measuring a
+// walk that actually ran over every function.
+TEST(MirSummaryDominanceComplexity, EveryLoopingCallSiteIsAtDepthOneControl) {
+    SummaryWork const w = summarizeLoopingCallers(kLoopingCallers);
+    ASSERT_EQ(w.blockCount, std::size_t{4} * kLoopingCallers + 2)
+        << "4 blocks per caller + the callee's 1 + the arena's reserved slot 0";
+    std::size_t looped = 0;
+    for (std::uint32_t k = 0; k < kLoopingCallers; ++k) {
+        SummaryFunction const* f = findFn(w.summary, "g" + std::to_string(k));
+        ASSERT_NE(f, nullptr) << "g" << k;
+        ASSERT_EQ(f->calls.size(), 1u) << "g" << k;
+        EXPECT_EQ(f->calls[0].calleeName, "callee");
+        EXPECT_EQ(f->calls[0].loopDepth, 1u) << "g" << k << "'s call is inside its loop";
+        if (f->calls[0].loopDepth == 1u) ++looped;
+    }
+    EXPECT_EQ(looped, std::size_t{kLoopingCallers});
+    EXPECT_GT(w.slotsSwept, 0u)
+        << "the dominance helpers reported no work: the counter is not wired";
+}
+
+TEST(MirSummaryDominanceComplexity, LoopDepthWalkSweepIsBoundedByTheModule) {
+    SummaryWork const w = summarizeLoopingCallers(kLoopingCallers);
+    std::cout << "[summary-dominance] functions=" << kLoopingCallers + 1
+              << " moduleBlocks=" << w.blockCount
+              << " slotsSwept=" << w.slotsSwept << "\n";
+    // With one scratch: the hoisted predecessor map and the scratch's one
+    // allocation sweep the module twice; each function then costs its own
+    // write set (~10 slots here). The fresh-per-function shape sweeps the
+    // module once PER FUNCTION — 65 per block at this size.
+    EXPECT_LE(w.slotsSwept, std::uint64_t{16} * w.blockCount)
+        << "some function's dominator tree was computed over the WHOLE module";
+}
+
+TEST(MirSummaryDominanceComplexity, LoopDepthWalkSweepGrowsLinearlyWhenTheModuleDoubles) {
+    SummaryWork const small = summarizeLoopingCallers(kLoopingCallers);
+    SummaryWork const big   = summarizeLoopingCallers(2 * kLoopingCallers);
+    ASSERT_GT(small.slotsSwept, 0u);
+    std::cout << "[summary-dominance] slotsSwept " << kLoopingCallers << " callers="
+              << small.slotsSwept << ", " << 2 * kLoopingCallers << " callers="
+              << big.slotsSwept << "\n";
+    EXPECT_LE(big.slotsSwept * 4, small.slotsSwept * 9)
+        << "doubling the module took the sweep from " << small.slotsSwept
+        << " to " << big.slotsSwept << " slots (linear doubles it, quadratic quadruples it)";
 }

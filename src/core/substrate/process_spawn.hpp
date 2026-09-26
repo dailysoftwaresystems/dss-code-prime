@@ -39,7 +39,10 @@
 // below is that day arriving for exactly ONE of the proposed arms: dependency
 // acquisition has to READ what `git rev-parse` printed, and the inheriting
 // spawn deliberately cannot tell it. The handle lifecycle, the kill, the
-// timeout and the `Discard` arm still have no caller and are still absent.
+// timeout and the `Discard` arm still have no caller and are still absent. The
+// ENVIRONMENT arm (`withheldVariables`, below `SpawnResult`) arrived the same
+// way, with its caller: the cache's `git` must not inherit git's own
+// repository variables.
 //
 // ★ AND THE CAPTURE ARM IS A FILE, NOT THE `CapturePipe` THAT WAS PROPOSED.
 // That is the one place the new arm departs from the old sketch, and it departs
@@ -108,9 +111,10 @@
 //   kill a child that overruns it, and a killed child must still yield whatever
 //   it managed to print; a pipe is the only thing that can be read out of a
 //   process you are about to terminate. Paying for that means paying for the
-//   concurrent drain thread its `D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS`
-//   note measures. This facility enforces no deadline and kills nothing, so it
-//   captures into a FILE and the whole class of buffer-limit deadlocks is
+//   concurrent drain thread `run_binary.hpp`'s own note measures — draining
+//   only AFTER the child has exited deadlocks. This facility enforces no
+//   deadline and kills nothing, so it captures into a FILE and the whole class
+//   of buffer-limit deadlocks is
 //   absent rather than managed. Sharing the capture would mean importing the
 //   drain, and the drain exists only to survive the timeout this facility does
 //   not have.
@@ -123,8 +127,8 @@
 // `tryBuildWindowsCommandLine`) and `run_binary.hpp`'s Windows arm call it.
 // There is exactly ONE implementation of the algorithm in the repository.
 // `run_binary.hpp` used to carry a second, half-correct copy that escaped
-// neither embedded quotes nor trailing backslashes and said so in a comment
-// (D-TEST-RUN-BINARY-ARGV-QUOTING-UNESCAPED); that copy is gone.
+// neither embedded quotes nor trailing backslashes and said so in a comment;
+// that copy is gone.
 //
 // HOW IT IS SHARED WITHOUT A LINK — and why it is NOT shared by linking. The
 // obvious wiring fails: `integrated_tests` (`integrated_tests/runner.cpp`)
@@ -207,6 +211,53 @@ struct SpawnResult {
     std::string diagnostic;        // non-empty on every failure; OS text
 };
 
+// ── The environment arm: variables the child must NOT inherit ─────────────
+//
+// Both entry points below take `withheldVariables`, the NAMES of environment
+// variables of this process that the child must not receive. Every other
+// variable reaches the child unchanged. An EMPTY list (the default) is exactly
+// the inheritance both spawns always had, so a caller that says nothing gets
+// nothing new.
+//
+// ★ WHY IT EXISTS: ITS CALLER, AND A MEASURED CORRUPTION. The dependency cache
+// runs `git` against a DEPENDENCY's repository from inside a compiler that git
+// itself may have started — a `pre-commit` hook, a `rebase --exec`. git exports
+// its OWN repository to such a child; in a linked worktree that is an ABSOLUTE
+// `GIT_INDEX_FILE` (and `GIT_DIR`). Inherited by the cache's `git checkout`
+// and `git clone`, it made them write the DEPENDENCY's index into the USER's
+// worktree index: the staged work gone, the user's commit failing, and
+// `git status` refusing the repository (measured end to end —
+// [[D-DEPS-GIT-RUNNER-INHERITS-GITS-REPOSITORY-VARIABLES-AND-WRITES-THE-USERS-INDEX]]).
+// `GIT_INDEX_FILE` has no command-line override, so the one correct fix is not
+// to hand it on, which is what git does when IT runs git inside another
+// repository (`sanitize_repo_env`) and what cargo does (`env_remove`). Without
+// this arm, the only other way would be a process-global `unsetenv`, which
+// races every other thread's `getenv`.
+//
+// It WITHHOLDS rather than builds an environment from scratch on purpose: the
+// child still needs everything the user's shell set up for it (`PATH`,
+// `HOME`, proxy and credential settings), and a caller that had to re-list
+// those would drop one.
+//
+// NAMES ARE MATCHED THE WAY THE HOST MATCHES THEM. Windows environment names
+// are case-insensitive (`Path` and `PATH` are one variable), so a withheld name
+// removes every entry that differs from it only in case, compared with
+// `CompareStringOrdinal(…, TRUE)`: the OS's ordinal rule, never a locale's.
+// POSIX names are case-sensitive and compare byte for byte. Windows' hidden
+// per-drive entries (`=C:=C:\dir`) can never be withheld, because a name may
+// not contain '='.
+//
+// A MALFORMED NAME IS A CALLER BUG, REPORTED AS ONE (`spawned == false`, like
+// an empty argv). An empty name, or one containing '=' or NUL, names no
+// variable, and quietly ignoring it would let a typo re-open exactly the
+// hazard the caller asked to close.
+//
+// ★ AND THERE IS NO SILENT FALLBACK TO INHERITING. If this process's own
+// environment cannot be read (Windows' `GetEnvironmentStringsW` failing), the
+// call fails with `spawned == false` rather than running the child with
+// everything: the variable the caller named is precisely the one the child
+// must not see.
+
 // Spawn `argv[0]` DIRECTLY (see the NO SHELL note above), passing `argv` as
 // the child's argument vector, and BLOCK until it exits.
 //
@@ -248,7 +299,8 @@ struct SpawnResult {
 // them would be a surprise.
 [[nodiscard]] DSS_EXPORT SpawnResult
 spawnAndWaitInherit(std::vector<std::string> const& argv,
-                    std::filesystem::path const&    cwd = {});
+                    std::filesystem::path const&    cwd               = {},
+                    std::vector<std::string> const& withheldVariables = {});
 
 // The same spawn, with the child's STDOUT going to `stdoutFile` instead of the
 // compiler's own. STDERR AND STDIN STILL INHERIT — only stdout moves.
@@ -272,8 +324,8 @@ spawnAndWaitInherit(std::vector<std::string> const& argv,
 // AFTERWARDS deadlocks the moment the child writes past that buffer: the child
 // blocks in `write`, the parent blocks in the wait, and neither moves. That is
 // not a hypothesis — `tests/test_support/run_binary.hpp` shipped exactly that
-// shape and MEASURED it (D-TEST-RUN-HARNESS-DRAIN-AFTER-EXIT-DEADLOCKS, ~7 KB
-// of JSON, two spawns consuming 240 s of a 240.7 s run before the harness
+// shape and MEASURED it (~7 KB of JSON, two spawns consuming 240 s of a
+// 240.7 s run before the harness
 // killed a child that was working correctly). Its fix was a drain thread
 // running CONCURRENTLY with the wait, which is correct THERE and would be a
 // poor trade here: this facility has NO TIMEOUT (see the two-implementations
@@ -308,7 +360,8 @@ spawnAndWaitInherit(std::vector<std::string> const& argv,
 [[nodiscard]] DSS_EXPORT SpawnResult
 spawnAndWaitRedirectStdout(std::vector<std::string> const& argv,
                            std::filesystem::path const&    cwd,
-                           std::filesystem::path const&    stdoutFile);
+                           std::filesystem::path const&    stdoutFile,
+                           std::vector<std::string> const& withheldVariables = {});
 
 // ── The exec-status handshake, decided as a value (POSIX only) ─────────────
 //

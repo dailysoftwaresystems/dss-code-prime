@@ -1,0 +1,45 @@
+{
+  "$comment": "P68 round 13 (lane `cs`, fold F7, D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED): a VOLATILE MEMBER of a const, non-volatile object does not make the object volatile — a static initializer reads it as a constant: the member, an element of a volatile array member, the member of an array's element, a member two levels down, a non-volatile sibling, and the whole object copied. An object that IS volatile — its type, looked through its array spine, volatile-qualified — is refused by every reference and by DSS (the diagnostics corpus pair static_initializer_volatile_array_element). MEASURED 2026-09-26 through `dssharness run probe-reference-cc` (lane `cs`'s batch gen_f7d.py: runs 20260926-165535-9bef9b74 on windows-x86_64-debug — mingw-w64 13.2.0 — 20260926-165538-69ac2b24 on windows-x86_64-release — MSVC 19.51.36260 — and 20260926-165534-fce17da2 on linux-x86_64-debug — gcc 13.3.0, clang 18.1.3), this file at -std=c17 -pedantic-errors and at -std=c2x: gcc 13.3.0 and mingw-w64 13.2.0 exit 42 in both modes; clang 18.1.3 and MSVC 19.51 refuse it (a volatile read in a constant expression) — one working reference makes the form required. exit 42 = every value is the one C gives.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

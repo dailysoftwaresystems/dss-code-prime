@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1148,18 +1149,42 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const&           f,
             }
         }
 
-        // Every other placeholder form in an EXTENDED template. gcc says
-        // "operand number missing after %-letter" and clang "invalid % escape" —
-        // so refusing matches the reference rather than being stricter than it.
-        // GNU's per-instance unique number (`%=`) lands here too: it is a real
-        // GNU feature this build does not expand, and emitting it verbatim would
-        // hand the assembler a form it reads as a register spelling.
+        // ★★★ A PLACEHOLDER FOLLOWED BY PUNCTUATION IS A TEMPLATE TEXT FORM, AND
+        // WHICH ONES EXIST IS THE DIALECT'S QUESTION — ANSWERED WHERE THE
+        // DIALECT IS RESOLVED (P68 round 8,
+        // D-ASM-TEMPLATE-FORMS-A-REFERENCE-EXPANDS-REFUSED). ✔MEASURED 2026-09-23
+        // (gcc 13.3.0 and clang 18.1.3, each form inside `.ascii "X<form>Y"`):
+        // `%=` is expanded by all four ports; `%{` `%}` by gcc x86, clang x86
+        // and clang aarch64; `%|` `%*` `%;` `%+` `%^` `%!` `%~` by gcc's x86 port
+        // alone; `%&` by none. The x86 and aarch64 sets DIFFER, and this tier
+        // legitimately has no dialect in scope (the LSP, the FFI header parser
+        // and every direct-API caller scan templates with no target) — the same
+        // boundary the width-view letters draw above. So the form is left for
+        // the MIR→LIR expansion, which reads the dialect's
+        // `assembly.templateTextForms`, expands the ones it declares and REFUSES
+        // every other one by name (`%&` included). ⓘ This arm used to refuse
+        // every such form here, with a message that said which side the
+        // references were on; the refusal now lives with the declaration.
+        // ASCII punctuation: printable, not a letter, not a digit, not a space
+        // (a locale-free test, so the scan reads a template identically on
+        // every host).
+        if (c > ' ' && c <= '~' && !isAlpha(c) && !isDigit(c)) {
+            i = afterSigil + 1;
+            continue;
+        }
+        // What is left is the placeholder before a space, a control byte or a
+        // non-ASCII byte — no form, no reference. ✔MEASURED 2026-09-23 (gcc
+        // 13.3.0 and clang 18.1.3, x86_64 and aarch64, `.ascii "X<form>Y"`):
+        // `%` + space, `%` + TAB and `%` + 0xC3 are refused by all four ("invalid
+        // %-code" / "invalid % escape in inline assembly string"), so this
+        // refusal is the references' own.
         report(DiagnosticCode::S_InlineAsmOperandModifierUnsupported, at,
                "the inline-asm template contains "
-               + quote(L.placeholder + std::string{c})
+               + quote(L.placeholder) + " followed by byte 0x"
+               + std::format("{:02X}", static_cast<unsigned char>(c))
                + " at byte offset " + std::to_string(formStart)
-               + ", which is not an operand reference this build can expand. In "
-                 "an EXTENDED template (any `:` makes it extended) "
+               + ", which begins neither an operand reference nor a template "
+                 "form. In an EXTENDED template (any `:` makes it extended) "
                + quote(L.placeholder) + " introduces an operand — "
                + quote(L.operandRef("0"))
                + (hasNamed ? ", " + quote(L.namedOperandRef("name"))
@@ -1169,8 +1194,7 @@ inline void scanInlineAsmTemplate(InlineAsmFacts const&           f,
                       : ", " + quote(L.labelRef("0"))
                             + " for an `asm goto` label")
                + clause(L.escape, " — and ", " is the literal percent")
-               + ". gcc and clang reject an unrecognised placeholder form here "
-                 "too");
+               + ". gcc and clang refuse it too");
         i = afterSigil + 1;
     }
 }

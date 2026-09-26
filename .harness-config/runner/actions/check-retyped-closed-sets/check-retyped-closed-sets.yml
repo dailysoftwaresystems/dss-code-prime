@@ -1,0 +1,14 @@
+# PURPOSE: census the diagnostics that RETYPE a closed vocabulary instead of projecting it.
+name: check-retyped-closed-sets
+description: >-
+  The action censuses the diagnostics that retype a closed vocabulary, then proves the census can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `retyped_closed_sets_guard`.
+steps:
+  - name: census-then-self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./check-retyped-closed-sets.py
+    successPattern: '# self-test: (\d+)/\1 checks passed'
+    requireInputsUnmoved: true

@@ -67,11 +67,11 @@ using ::dss::test_support::quotedTokens;
 // ★ `quotedTokens` used to be a file-local FOURTH copy here — byte-identical to
 // the one three sibling files had already merged into
 // `vocabulary_projection_probe.hpp`, and therefore invisible to the mutant that
-// closed D-TEST-VOCABULARY-PROJECTION-PROBE-HELPERS-ARE-COPIED-PER-FILE: that
+// ended the per-file copying of these probe helpers: that
 // mutant reddened 3 of 4 and this file stayed GREEN over a helper that no longer
 // worked. It has ONE owner now, so a change to what counts as a QUOTED TOKEN
-// reaches every pin that reads a refusal back — see
-// D-TEST-VOCABULARY-PROBE-HELPER-FOURTH-COPY-OUTSIDE-THE-EXTRACTED-HEADER.
+// reaches every pin that reads a refusal back — this file was the FOURTH copy,
+// the one that sat outside the extracted header.
 
 // A spelling no vocabulary in this tree claims.
 constexpr char const* kBadSpelling = "zzNotAnyVocabularySpelling";
@@ -198,8 +198,9 @@ void expectNamesExactly(DescriptorRejection const&        r,
 }
 
 constexpr auto kDataModelNames = allNames(kDataModelTable);
-constexpr char const* kIgnoreDataModelKey[] = {"signatureByDataModel",
-                                               "dataModel"};
+constexpr char const* kIgnoreDataModelKey[] = {"dataModel"};
+constexpr auto kLongDoubleFormatNames = allNames(kLongDoubleFormatTable);
+constexpr char const* kIgnoreLongDoubleFormatKey[] = {"longDoubleFormat"};
 constexpr char const* kIgnoreFormatKey[]    = {"availableObjectFormats",
                                                "library", "format",
                                                "sourceRealization", "when"};
@@ -213,18 +214,39 @@ constexpr char const* kIgnoreFormatKey[]    = {"availableObjectFormats",
 // accepted set". It named one — `(expected one of "LP64"/"LLP64"/"ILP32")` —
 // as a RETYPED literal. The defect was the retyping, not an absence.
 //
-// `tests/analysis/semantic/test_fc3_width_semantics.cpp` pins this message's
-// PREFIX (`'signatureByDataModel' has unknown data-model key`), which the
-// projection preserves — verified by that test still passing.
-TEST(FfiDescriptorVocabularyProjection, SignatureByDataModelNamesEveryDataModel) {
+// ★ THE SITE MOVED (P68 round 12, S2a-1 of
+// D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). The `signatureByDataModel` map this
+// pinned is retired — a per-pair prototype is a `signature` `variants` arm, and
+// a data model is named in its `when` — so the refusal a typo'd model meets is
+// the ONE `when` decoder's (core/types/variant_when.hpp), the same sentence for a
+// signature arm and for every other variant surface. Same class, same pin: the
+// list must be the table's. `test_fc3_width_semantics.cpp` pins the message's
+// PREFIX (`'dataModel' has unknown data-model name`).
+TEST(FfiDescriptorVocabularyProjection, WhenDataModelNamesEveryDataModel) {
     auto const r = rejectDescriptor(
-        "vocab-sigbydm",
+        "vocab-whendm",
         R"({"header":"x.h","symbols":[
-          {"name":"f","signature":"fn(i32) -> i32",
-           "signatureByDataModel":{"zzNotAnyVocabularySpelling":"fn(i32) -> i32"}}]})",
-        "'signatureByDataModel' has unknown data-model key");
+          {"name":"f","signature":{"variants":[
+            {"when":{"dataModel":"zzNotAnyVocabularySpelling"},"value":"fn(i32) -> i32"},
+            {"default":true,"value":"fn(i32) -> i32"}]}}]})",
+        "'dataModel' has unknown data-model name");
     expectNamesExactly(r, kDataModelNames, kIgnoreDataModelKey,
-                       "signatureByDataModel key");
+                       "when.dataModel");
+}
+
+// The vocabulary S2a-1 added to the `when` selector, pinned at birth: a
+// `longDoubleFormat` a format document does not declare can select nothing, and
+// the refusal must list exactly the spellings the documents may declare.
+TEST(FfiDescriptorVocabularyProjection, WhenLongDoubleFormatNamesEveryFormat) {
+    auto const r = rejectDescriptor(
+        "vocab-whenldf",
+        R"({"header":"x.h","symbols":[
+          {"name":"f","signature":{"variants":[
+            {"when":{"longDoubleFormat":"zzNotAnyVocabularySpelling"},"value":"fn(i32) -> i32"},
+            {"default":true,"value":"fn(i32) -> i32"}]}}]})",
+        "'longDoubleFormat' has unknown long-double format name");
+    expectNamesExactly(r, kLongDoubleFormatNames, kIgnoreLongDoubleFormatKey,
+                       "when.longDoubleFormat");
 }
 
 // The FOUR object-format refusals, and the direction they were wrong on.

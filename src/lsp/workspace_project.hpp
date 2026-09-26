@@ -1,15 +1,25 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/path_identity.hpp"   // PathIdentity — which files a manifest names
+#include "core/types/parse_diagnostic.hpp"    // DiagnosticCode — a refusal's code, as the build reports it
 #include "lsp/schema_cache.hpp"
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace dss {
+class TargetSchema;              // core/types/target_schema.hpp
+class ObjectFormatSchema;        // link/object_format_schema.hpp
+struct TargetCallingConvention;  // core/types/target_schema.hpp
+} // namespace dss
 
 // ── THE EDITOR'S TARGET CHANNEL (D-LSP-ASSEMBLY-DIALECT-UNSERVABLE) ──────────
 //
@@ -68,6 +78,16 @@ namespace dss::lsp {
 // `ProjectFileLoadFailed` carries the parser's message, which NAMES the
 // `targets` field. Pinned by
 // `WorkspaceProject.ManifestNamingNoTargetIsRejectedByTheSharedParser`.
+//
+// Three more are reachable only from `resolveWorkspaceBuild` (below), which
+// reads what the preference never needed — each is a manifest the BUILD itself
+// refuses, reported under the build's own code:
+//   * FormatConfigLoadFailed — a target spec names a format with no loadable
+//                              `<name>.format.json`.
+//   * CallingConventionUnresolved — the pair names no calling convention the
+//                              target declares for that format (`resolveAbi`).
+//   * SourcesUnresolved      — a `sources[]` entry expands to nothing, or the
+//                              walk failed (the build's own expansion's refusal).
 enum class WorkspaceProjectErrorKind : std::uint8_t {
     NoWorkspaceRoot,
     ProjectFileNotFound,
@@ -75,6 +95,9 @@ enum class WorkspaceProjectErrorKind : std::uint8_t {
     TargetSpecMalformed,
     TargetConfigLoadFailed,
     TargetDeclaresNoAssemblyLanguage,
+    FormatConfigLoadFailed,
+    CallingConventionUnresolved,
+    SourcesUnresolved,
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view
@@ -83,6 +106,12 @@ enum class WorkspaceProjectErrorKind : std::uint8_t {
 struct DSS_EXPORT WorkspaceProjectError {
     WorkspaceProjectErrorKind kind;
     std::string               detail;
+    // The diagnostic CODE the build reports for the same refusal, when the
+    // editor publishes it on a document (`resolveWorkspaceBuild` fills it; the
+    // preference path leaves it `D_UnknownFileExtension`, the code its reason
+    // has always travelled under). One code for one condition in both halves
+    // of the program.
+    DiagnosticCode            code = DiagnosticCode::D_UnknownFileExtension;
 
     // Value equality over the WHOLE struct, `detail` included. The liveness
     // refresh (`LspServer::refreshWorkspacePreference_`) republishes open
@@ -205,5 +234,131 @@ inline constexpr std::string_view kProjectFileSuffix = ".dss-project.json";
     std::string_view                 fileExtension,
     SchemaResolveError const&        schemaError,
     WorkspacePreferenceResult const& preference);
+
+// ══ THE BUILD'S CONFIGURATIONS, READ BY THE EDITOR ═══════════════════════════
+// [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]
+//
+// The property the reference editor holds, and the one this section gives DSS:
+// THE EDITOR ANSWERS WITH THE BUILD'S CONFIGURATION. clangd reads the build's
+// own `compile_commands.json` and even asks the build's compiler for its target
+// and system include path (📄 llvm-project `clangd/GlobalCompilationDatabase.cpp`,
+// `SystemIncludeExtractor.cpp`). A DSS build's configuration is its project
+// manifests — the same `*.dss-project.json` files the preference above already
+// reads — so the editor reads them for the rest of what they say: every
+// `<target>:<format>` pair in `targets[]`, the `language`, `includes`,
+// `defines`, and which files `sources[]` names.
+//
+// ★ ONE DEPARTURE FROM clangd, AND IT IS DELIBERATE. clangd compiles a file under
+// ONE command even when the database holds several (`Candidates.front()`). A DSS
+// manifest lists several pairs as a matter of course — 6 of the 9 tracked
+// manifests mix pe64 with elf — and the build's verdict is the UNION of its
+// pairs' verdicts. First-wins would let the editor accept `#include <Windows.h>`
+// under the pe64 pair while the elf build refuses it: the silent wrong accept.
+// So a document is analyzed under EVERY configuration that builds it.
+
+// One `targets[]` entry of one manifest, loaded: the pair's two documents and
+// the calling convention the build resolves for it.
+struct DSS_EXPORT WorkspaceBuildTarget {
+    std::string                               spec;     // verbatim `targets[]` entry
+    std::shared_ptr<TargetSchema const>       target;
+    std::shared_ptr<ObjectFormatSchema const> format;
+    // `ffi::resolveAbi(*target, *format)`'s answer — an entry of `*target`, or
+    // null for an ABI model that names none (operand-stack / result-id).
+    TargetCallingConvention const*            callingConvention = nullptr;
+};
+
+// One manifest, read the way the build reads it.
+struct DSS_EXPORT WorkspaceBuildManifest {
+    std::filesystem::path              path;          // the manifest file itself
+    std::string                        language;      // `language`
+    // `includes`, each RELATIVE entry resolved against the manifest's own
+    // directory — THE rule for every path a manifest holds, root or dependency,
+    // from whatever directory the build runs (docs/project-config-spec.md), and
+    // resolved through the build's own function, so the editor and the build
+    // agree by construction. Absolute, with a UNC root kept.
+    std::vector<std::filesystem::path> includeDirs;
+    std::vector<std::string>           defines;       // `defines`, verbatim
+    // Every file `sources[]` names, from the BUILD's own expansion
+    // (`expandAndDedupProjectSources`, the same base rule as `includeDirs`), as
+    // identities — which is what decides membership, never a spelling.
+    std::vector<core::PathIdentity>    sources;
+    std::vector<WorkspaceBuildTarget>  targets;       // in `targets[]` order
+};
+
+struct DSS_EXPORT WorkspaceBuild {
+    std::vector<WorkspaceBuildManifest> manifests;    // in sorted manifest order
+};
+
+using WorkspaceBuildResult = std::expected<WorkspaceBuild, WorkspaceProjectError>;
+
+// Read every `*.dss-project.json` directly inside each workspace root (the
+// preference's set, in the same sorted order) and load everything the build
+// would: each manifest through the shared parser, each `targets[]` entry's
+// target AND format documents, the calling convention of each pair, and the
+// expansion of `sources[]`.
+//
+// FAIL-CLOSED, as the preference is: a manifest the build would refuse makes
+// the whole result an error naming it, under the build's own diagnostic code.
+// `NoWorkspaceRoot` / `ProjectFileNotFound` are the two "there is no build"
+// answers, and they are not refusals — a workspace with no manifest has no
+// configuration to agree with, and its documents are analyzed under their
+// language alone, exactly as before this section existed.
+[[nodiscard]] DSS_EXPORT WorkspaceBuildResult
+    resolveWorkspaceBuild(std::span<std::filesystem::path const> workspaceRoots);
+
+// Do two resolutions describe the same configurations? The refresh republishes
+// open documents only when they do not. Compares everything a configuration
+// is made of — manifest paths, languages, pair specs, include directories,
+// defines, source identities, and the error when there is one — and NOT the
+// loaded schema objects, which are fresh on every load.
+[[nodiscard]] DSS_EXPORT bool sameConfigurations(WorkspaceBuildResult const& a,
+                                                 WorkspaceBuildResult const& b);
+
+// One configuration a document is analyzed under: one manifest's one pair.
+struct DSS_EXPORT DocumentBuildConfiguration {
+    // What a diagnostic that not every configuration reported is tagged with:
+    // the pair's spec, plus the manifest's file name when two surviving
+    // configurations share a spec.
+    std::string                               label;
+    std::string                               spec;     // the `targets[]` entry
+    std::filesystem::path                     manifest;
+    std::string                               language;
+    std::shared_ptr<TargetSchema const>       target;
+    std::shared_ptr<ObjectFormatSchema const> format;
+    TargetCallingConvention const*            callingConvention = nullptr;
+    std::vector<std::filesystem::path>        includeDirs;
+    std::vector<std::string>                  defines;
+};
+
+// Which configurations build a document, and why.
+//
+// ★ THE RULE (decided with the coordinator, 2026-09-21):
+//   * a document that some manifest's `sources[]` NAMES is analyzed under
+//     exactly those manifests' pairs — the build's own membership, decided by
+//     the build's own expansion;
+//   * a document no manifest names (a header, typically) is analyzed under the
+//     pairs of every manifest whose `language` is the document's own. The rule
+//     that holds for such a file is "the manifests whose listed sources include
+//     it, directly or transitively"; which of them that is, the editor can know
+//     only from preprocessing it has done, and this is the union until an
+//     incremental per-source include index exists
+//     ([[D-LSP-UNLISTED-HEADER-CHECKED-UNDER-EVERY-MANIFEST-NOT-ITS-INCLUDERS]]) —
+//     every configuration it is analyzed under is TAGGED on the diagnostics that
+//     not all of them report, so the over-check is visible rather than silent
+//     (`listed == false` says which case applied).
+//   * identical configurations (same language, spec, include directories and
+//     defines) collapse to one.
+// `documentLanguage` is the configuration name of the document's own resolved
+// grammar (empty when it has none); `documentPath` is empty for a document
+// that is not a file.
+struct DSS_EXPORT DocumentBuildSelection {
+    std::vector<DocumentBuildConfiguration> configurations;
+    bool                                    listed = false;
+};
+
+[[nodiscard]] DSS_EXPORT DocumentBuildSelection selectDocumentConfigurations(
+    WorkspaceBuild const&                       build,
+    std::optional<std::filesystem::path> const& documentPath,
+    std::string_view                            documentLanguage);
 
 } // namespace dss::lsp

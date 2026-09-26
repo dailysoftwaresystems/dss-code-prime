@@ -32,7 +32,9 @@ the bar → `dss-audit`. Reconciling plan drift → `dss-plan-sweep`.
 **Authority order:** [`docs/tree-model.md`](../../../docs/tree-model.md) and
 [`docs/language-config-spec.md`](../../../docs/language-config-spec.md) and
 [`.plans/`](../../../.plans/) all outrank this skill. When they disagree, the doc and the plan win.
-[`real-examples/`](../../../real-examples/) outranks every claim here — it is the registry of real
+The real-example corpus harnesses —
+[`.harness-config/runner/actions/real-examples/`](../../../.harness-config/runner/actions/real-examples/),
+DssHarness actions grouped by language — outrank every claim here: they are the registry of real
 repositories DSS compiles from unmodified upstream source and whose own suites it then runs.
 
 ## What exists today
@@ -45,96 +47,8 @@ hardening (SH1–SH4) are the substrate underneath it, not the whole product.
 
 **Stack:** C++23, CMake 4.0+, FetchContent for `nlohmann/json` 3.12.0 and GoogleTest 1.17.0. Local
 Windows dev uses MinGW GCC 13.2 (ucrt); CI exercises Linux/GCC-13, Linux/Clang-19+ASan,
-Windows/MSVC and macOS/AppleClang on every PR.
-
-## ★★★ THREE ANCHOR REGISTRIES — TWO WORKING LISTS AND AN ARCHIVE
-
-Deferrals live in **three** files under `.plans/`. Production/harness split on 2026-08-25 (*"the
-priority is real errors, not cosmetics"*); the archive was carved out on 2026-09-01 (*"split what's
-done from what's to be done. this way we adjust our skills to only read what's yet to be done"*):
-
-| file | holds |
-|---|---|
-| `_deferred-anchor-registry-production.md` | a **still-open** defect **a user of the compiler could hit** — in the shipped binary, or in the config it reads |
-| `_deferred-anchor-registry-harness.md` | a **still-open** defect **only we can hit** — tests, gates, guards, cycle machinery, plans, scripts, carriages, CI |
-| `_deferred-anchor-registry-done.md` | every **CLOSED** row, in two tables preserving which working list it came from. **Nothing here is work.** |
-
-⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
-`D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
-IS the compiler's behaviour, and a diagnostic IS its output to a user.
-
-### The row shape is SIX cells, and two of them are declarations
-
-    | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
-
-`Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED`. The status cell keeps its
-glyph because the project's one definition of closed is *"the cell OPENS with ✅"* — a column holding
-the bare word would make that test false for every closed row at once.
-
-### Move on close, and never hand-write a row
-
-- **Closing a row MOVES it** out of its working registry into the archive; reopening moves it back.
-  `check-anchor-balance` fails the tree for a closed row left behind, for an open row filed in the
-  archive, and for a `Status` column that contradicts its own `Trigger` prose.
-- **`scripts/anchors/`** is the door — `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`,
-  each with a `.sh` and a `.ps1` launcher over one implementation. The writer takes the FIELDS, so a
-  wrapped anchor id (invisible to every grep, and it mints a false id), an unescaped `|` and a wrong
-  cell count are inexpressible.
-- ★ **RESOLUTION reads all three files; ORIENTATION reads only the two working ones.** A `D-*` cited
-  in `src/` must resolve wherever its row lives, so resolvers glob `_deferred-anchor-registry*.md`.
-  Anything asking *what is left* reads production and harness and stops there.
-
-**★★★ THE RULE (operator, 2026-08-25):** *"the priority is always production anchors. ALWAYS.
-harness we fix as we need when we face the problem (NEVER LATER)."*
-
-- **Production is the only queue.** A harness row is never worked *because it is next*.
-- **A harness defect is fixed AT THE MOMENT IT IS FACED** — in that cycle, in that lane. "NEVER
-  LATER" is the whole instruction: a gate that lies, a guard blind to its subject, a script that
-  blocks the work in front of you, gets fixed NOW. Filing it and routing around it is the failure
-  the ruling names.
-- **So the harness registry is a RECORD, not a backlog** — drained by encounter, not by scheduling.
-  A harness row is normally written already ✅ CLOSED, naming a fix that landed the same cycle.
-- ⚠ **This does not repeal "anchor every issue found".** Still file the row: a harness defect fixed
-  silently teaches nobody. The ruling governs what gets **SCHEDULED**, not what gets **RECORDED**.
-- ★ **The measure of a cycle is its production movement.** One whose closures are all harness rows
-  has hardened the workshop and shipped nothing.
-
-Every RESOLVER globs `_deferred-anchor-registry*.md`, so `check-anchor-balance` and the registry
-guard read all three with no flag — but **a human reading one file is reading part of the
-registry**, and the production half is the one that ranks. ⚠ `burndown-queue` deliberately does NOT
-band a row from the archive: it exits loudly instead, because a live row filed there is invisible to
-every queue in the project and quietly coping is how an invariant stops being one. ⚠ **Never quote a per-bucket count
-from prose; re-derive it** (`check-anchor-balance.py --breakdown --denominator registry`, whose
-registry total the two buckets must sum to) — the P34 handoff's own production figure was wrong by
-20, and that sum is what caught it.
-
-## ★★★★ NO FOLLOW-UPS — A ROW YOU OPEN, YOU CLOSE (operator ruling 2026-08-26)
-
-> *"THIS MUST STOP NOW."* — *"opened anchors that are not closed in the immediate cycle or the
-> next are brutally rare exceptions now, not the rule. found something new that must be done? DO
-> IT."* — *"If I keep seeing anchors rising after implementations or fixes I'll be really
-> pissed!"*
-
-**The full ruling, the gate command, and the shipped-but-unmarked failure class live in
-`dss-cycle` SKILL.md — this is the same rule, restated where a reader of THIS skill will meet it.**
-It was a standing operator ruling from 2026-08-24 (*"every time opens more anchors than closes"*)
-that had never been written into either skill; ✔MEASURED 2026-08-26. That omission is why it kept
-eroding.
-
-- **Close it this cycle, or the next.** Anything longer is a rare exception that must NAME itself
-  as one, with the predicate that will close it.
-- **Found new work? DO IT.** A new row is the LAST RESORT, not the first response to a finding.
-- **Production first, then harness — and a harness defect that BLOCKS you is fixed the moment you
-  face it,** in the lane that hit it, never later.
-- **"Refused but not fixed" is not closed.** Nor is "measured", nor "the row now states the real
-  scope". A row closes when the BEHAVIOUR changed.
-- **NET OPEN must be ≤ 0 for the cycle**, measured — not asserted — against the cycle's own start
-  commit, and reported as closed / opened / net rather than one flattering total:
-  `python scripts/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown`
-- ⚠ **Mark a shipped row ✅ THE MOMENT IT SHIPS.** The gate counts a row OPEN unless its status
-  cell explicitly says closed — correct polarity, never to be softened — so a 🟢 "DESIGN RECORD —
-  SHIPPED" row inflates the OPEN count for free. Three `D-OPT*` rows were doing exactly that on
-  2026-08-26.
+Windows/MSVC and macOS/AppleClang when the operator adds the `Run Pipes` label to a PR — a cycle never
+triggers it, and reads it with `dssharness check-ci-legs`.
 
 ## The rules that actually break things when ignored
 
@@ -152,43 +66,23 @@ Everything else — strongly-typed IDs, immutable post-build `Tree`, `DSS_EXPORT
 `[[nodiscard]]`, comment policy, move semantics, no abbreviations — is in
 `references/testing-and-conventions.md` and is equally mandatory, just less explosive.
 
-### Script conventions (`scripts/`)
+## Standing rules kept in the references — one line each
 
-**Layout.** One directory per script, named for the script, every sibling implementation inside it:
-`scripts/<name>/<name>.{sh,ps1,py}`, assets alongside. Nothing loose at the top of `scripts/`, nothing
-buried a level deeper. Each script declares its purpose once in a `PURPOSE:` line; both indexes
-(`scripts/README.md`, `dss-cycle/references/scripts.md`) are generated from it and held to the tree by
-`scripts_index_guard`.
-
-**`.sh`/`.ps1` pairing — a judgement the author makes and writes down, never a gate.**
-Operator ruling 2026-08-19: *"some scripts are posix executed only, and don't have a .ps1 pair. so we
-must just enforce the dss cycle and dss code prime skills to always create the pair, except when the
-execution is posix only."*
-
-- **Create the `.ps1` twin whenever the capability must reach the Windows leg** — that is where this
-  project's primary ctest runs, so a bash-only capability is one the main gate cannot use.
-- **Omit it, and say so in the header, when either holds:** the script is already cross-platform (a
-  `.py` runs on both hosts; a twin would be a second implementation of something never split), or its
-  execution is POSIX-ONLY BY NATURE (`wsl-leg` runs inside a WSL distro where PowerShell is not the
-  shell; `profile-compile` drives a POSIX toolchain over a carriage).
-- **Where a pair exists, the two must not drift — and that is checked IN THE REVIEW, at the moment the
-  script is written or changed.** Operator ruling 2026-08-19: *"the parity must be checked in the
-  review, before the commit, when the script is being created or modified. Not after and not a script
-  to it. After committed it must be already working."*
-  ⚠ **Not automatable, and the reason is not laziness:** a script can do literally anything, so
-  equivalence of two arbitrary programs is not a property a detector can decide. What a gate CAN see is
-  existence and metadata — which is why `scripts_index_guard` refuses a sibling whose `PURPOSE:`
-  contradicts its primary, and stops exactly there.
-  **What the reviewer owes when a `.sh`/`.ps1` pair is touched:** the two scan the same inputs, check
-  the same properties, accept the same flags, and return the same exit codes for the same conditions —
-  and a change to one landed in the other in the SAME commit. Pairing by EXISTENCE is not pairing by
-  BEHAVIOUR.
-
-⚠ **Deliberately not gated, and the reason is measured:** ✔11 of 21 script directories carry no `.ps1`
-and every one is correct. A guard cannot tell a deliberate POSIX-only script from a forgotten twin, so
-it would need an allowlist of eleven exceptions — the convention written twice, in the place least
-likely to be read, reddening honest work by default. The anchor that demanded such a guard was
-WITHDRAWN on that ruling.
+- ★★★ **Two anchor registries** — `_deferred-anchor-registry-production.md` holds every still-open row
+  and is the only one read to see what is left; `_deferred-anchor-registry-done.md` is the archive of
+  CLOSED rows. A row is six cells; closing a row MOVES it; `dssharness` (`write-anchor`, `set-anchor`,
+  `read-anchor`, `read-anchors`) is the door, and a row is never hand-written →
+  [references/anchor-registries.md](references/anchor-registries.md).
+- ★★★ **Production anchors are the priority, ALWAYS** (operator, 2026-08-25); a harness defect is fixed
+  at the moment it is faced, and a defect in `DssHarness` itself is reported to repo-harness → same file.
+- ★★★★ **No follow-ups** (operator ruling 2026-08-26) — a row you open, you close, this cycle or the
+  next; NET OPEN ≤ 0 per cycle; mark a shipped row ✅ the moment it ships → same file.
+- **Every program is a DssHarness action** — one directory per action holding its `<name>.yml` and the
+  files it runs; no `.sh` and no `.ps1` under `.harness-config/runner/actions` (operator ruling
+  2026-09-21); both indexes are generated from each action's `PURPOSE:` line →
+  [references/program-conventions.md](references/program-conventions.md).
+- **Status is never written into this skill** — ask `dss-state`, `.plans/_handoff.md`, or the row
+  itself → [references/workflows-and-status.md](references/workflows-and-status.md) §11.
 
 ## Workflow
 
@@ -221,11 +115,17 @@ The full checklist, including the per-pattern recipes, is in `references/workflo
 - Read `references/testing-and-conventions.md` before writing any test or any new code. It holds
   the strict-assert rules, known-good test patterns, Windows/MinGW death tests, and all eight
   mandatory coding conventions.
-- Read `references/repo-map.md` when you need the directory layout, `real-examples/`, the build
+- Read `references/repo-map.md` when you need the directory layout, the real-example corpus, the build
   system and toolchain, the SSH-reachable non-x86 hardware, canonical examples, or the header map.
 - Read `references/workflows-and-status.md` for the step-by-step recipes (adding a type, a typed
   view, a grammar, a diagnostic code, driving `TreeBuilder` from tests), the `.plans/` system, the
   honest done/not-done status, and the contribution checklist.
+- Read `references/anchor-registries.md` before touching a registry row or judging what is left — the
+  two registry files, the six-cell row, move-on-close, the production-first priority, and the
+  no-follow-ups rule.
+- Read `references/program-conventions.md` before adding or changing a program under
+  `.harness-config/runner/actions/` — the one-directory-per-action layout, the `PURPOSE:` line that
+  feeds both indexes, and the no-`.sh`/`.ps1` ruling.
 
 ## Failure modes this skill exists to prevent
 
@@ -233,5 +133,5 @@ The full checklist, including the per-pattern recipes, is in `references/workflo
   of config — the slow break that no grep catches until a second target arrives.
 - **Writing a test that passes both ways.** Verify red-on-disable directly.
 - **Reaching for `<cassert>`** instead of the local `*Fatal` helpers.
-- **Trusting this skill over the docs, the plans, or `real-examples/`** when they disagree.
+- **Trusting this skill over the docs, the plans, or the real-example corpus** when they disagree.
 - **Inventing a pattern** the repo already has a canonical example for.

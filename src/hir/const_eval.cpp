@@ -47,6 +47,361 @@ using detail::floatToWideIntTarget;
     return ceOk(std::move(v));
 }
 
+// ══ P68 round 13 (lane `cs`, the static-initializer item): ADDRESS VALUES ═══════════════════
+//
+// With `EvalOptions::foldAddressConstants` a value may be an ADDRESS — a `HirAddressValue`
+// {base symbol | NULL, byte offset}, which is exactly the relocation (symbol + addend) the
+// static-data producer emits. Two cores carry one:
+//   * `Ptr` — an address constant (C 6.6p9);
+//   * an INTEGER kind — an address converted to an integer EXACTLY as wide as a pointer
+//     (the `AddressAsInteger` form), whose arithmetic is byte arithmetic.
+// A NULL base is a pure compile-time integer — 6.6p9's integer constant cast to a pointer,
+// `&((T *)0)->m`, sqlite's `SQLITE_INT_TO_PTR(X)` — so converted to an integer it IS that
+// integer (no address survives), and a pointer global holding one is written as its bytes.
+//
+// Before this, the engine had no address at all, and the static-data producer recognized
+// address constants SHAPE BY SHAPE in five private classifiers — which is why ✔MEASURED at
+// the fold-8 build of P68 round 12 (lane `cs`'s `.temp/probe/sti7`, pe64) DSS refused
+// `int *p = 1 + a;`, `&*a`, `(char *)&a + sizeof(int)`, `1 ? &a[0] : &a[1]`, `(int *)0 == 0`
+// and a static local's `&s[2] - 1` — ISO forms gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0
+// and MSVC 19.51 all build and run — as "runtime initializers". ONE fold now owns the value,
+// and the forms COMPOSE (a cast of a difference, the truth value of an element's address),
+// which a shape classifier cannot.
+//
+// ★ THE ALGEBRA IS A CLOSED, MEASURED SET — `.temp/probe/sti4` … `sti9`, every reference
+// separately, both modes, every build RUN. Outside it a fold is `NotAConstantExpression`,
+// because outside it is what EVERY reference refuses, not merely what this file lacks:
+//   ISO, always            `&` of an lvalue path; array / function designators; `*f`;
+//                          pointer casts; an integer constant cast to a pointer;
+//                          address ± integer·stride and integer + address; `?:` selecting.
+//   AddressAsInteger       (all four) the pointer-width integer ± an integer, and back.
+//   AddressTruthValue      (gcc, clang, mingw-w64) `!a`, `a && …`, `a ? … : …`, `(_Bool)a`,
+//                          `a == 0` — never a weak declaration's (`AddressableSymbol`).
+//   AddressComparison      (gcc, clang, mingw-w64) one object: by offset, `<` … `>=` too;
+//                          two objects: `==` / `!=` only, and UNEQUAL even one past the end
+//                          (gcc folds `&a[2] == &b[0]` to 0; clang and MSVC refuse it).
+//   AddressDifference      (gcc, clang, mingw-w64) one object, in elements.
+//   AddressIntegerAlgebra  (gcc, mingw-w64) the pointer-width integer's identity and
+//                          absorbing elements, comparisons into one object or with 0, and
+//                          the difference of two into one object.
+//   refused by all four    a NARROWER integer (`(int)&a` on LP64, `(long)&a` on LLP64);
+//                          `-(ull)&a`; `100 - (ull)&a`; `(ull)&a * 2`; `(ull)&a & 0xFF`;
+//                          a difference or `<` across objects.
+
+[[nodiscard]] inline HirAddressValue const* addressArm(HirLiteralValue const& v) noexcept {
+    return std::get_if<HirAddressValue>(&v.value);
+}
+
+[[nodiscard]] inline bool admits(EvalOptions const& o, ConstantForm f) noexcept {
+    return o.admittedForms.admits(f);
+}
+
+[[nodiscard]] HirLiteralValue addressLiteral(HirAddressValue a, TypeKind core) {
+    HirLiteralValue v;
+    v.core  = core;
+    v.value = a;
+    return v;
+}
+
+// The truth value of an address (C 6.5.9p6 / 6.3.2.3p3: a pointer to an object or function
+// compares unequal to a null pointer). A NULL base is its integer's. A weak declaration's
+// address may be null, so it has none — nullopt.
+[[nodiscard]] std::optional<bool> addressTruth(HirAddressValue const& a) noexcept {
+    if (a.base == HirAddressValue::kNullBase) return a.byteOffset != 0;
+    if (a.baseMayBeNull) return std::nullopt;
+    return true;
+}
+
+// A condition's truth value: `detail::asBool` for a number, and an address's own for an
+// address — `AddressTruthValue` for a symbol's, none needed for a NULL base (an integer).
+// Without `foldAddressConstants` an address has none, exactly as before (asBool refuses it).
+[[nodiscard]] std::optional<bool> truthOf(HirLiteralValue const& v, EvalOptions const& o) {
+    if (auto const* a = addressArm(v)) {
+        if (!o.foldAddressConstants) return std::nullopt;
+        if (a->base != HirAddressValue::kNullBase
+            && !admits(o, ConstantForm::AddressTruthValue)) {
+            return std::nullopt;
+        }
+        return addressTruth(*a);
+    }
+    return asBool(v, o.allowFloat);
+}
+
+// A plain INTEGER operand's bits — never an address, never a float.
+[[nodiscard]] std::optional<std::int64_t> plainIntBits(HirLiteralValue const& v) noexcept {
+    if (addressArm(v) != nullptr || isFloatValue(v)) return std::nullopt;
+    return asIntBits(v);
+}
+
+// An integer value of `core`, stored in the arm its signedness reads from.
+[[nodiscard]] HirLiteralValue integerLiteral(std::int64_t bits, TypeKind core,
+                                             EvalOptions const& options) {
+    HirLiteralValue v;
+    v.core = core;
+    auto const info = intKindInfo(core, options.charIsUnsigned);
+    if (info.has_value() && !info->isSigned) v.value = static_cast<std::uint64_t>(bits);
+    else                                     v.value = bits;
+    return v;
+}
+
+// The pointer width, from the SAME layout resolver `sizeof` folds through.
+[[nodiscard]] std::optional<std::uint64_t>
+pointerBytes(TypeInterner& interner, EvalEnvironment const& env) {
+    if (!env.resolveTypeSize) return std::nullopt;
+    return env.resolveTypeSize(interner.pointer(interner.primitive(TypeKind::Void)));
+}
+
+// The pointee of a pointer type (invalid for anything else).
+[[nodiscard]] TypeId pointeeOf(TypeInterner& interner, TypeId ptrTy) {
+    if (!ptrTy.valid() || interner.kind(ptrTy) != TypeKind::Ptr) return TypeId{};
+    auto const ops = interner.operands(ptrTy);
+    return ops.empty() ? TypeId{} : ops[0];
+}
+
+// An element stride — the runtime `Gep`'s, through the caller's resolver.
+[[nodiscard]] std::optional<std::int64_t>
+strideOf(EvalEnvironment const& env, TypeId elem) {
+    if (!env.resolveElementStride || !elem.valid()) return std::nullopt;
+    auto const s = env.resolveElementStride(elem);
+    if (!s.has_value() || *s > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        return std::nullopt;
+    return static_cast<std::int64_t>(*s);
+}
+
+// An address CONVERSION (6.3.2.3): an address to a pointer, to `_Bool`, to an integer; an
+// integer constant to a pointer (6.6p9). nullopt ⇒ not an address conversion (the numeric
+// arms own it). `targetTy` / `toK` are the cast's (an enumerated target already mapped to
+// its integer).
+[[nodiscard]] std::optional<ConstEvalResult>
+combineAddressCast(TypeInterner& interner, EvalEnvironment const& env, HirNodeId expr,
+                   TypeId targetTy, TypeKind toK, EvalOptions const& options,
+                   HirLiteralValue const& in) {
+    auto const* a = addressArm(in);
+    if (toK == TypeKind::Ptr) {
+        TypeId const pointee = pointeeOf(interner, targetTy);
+        if (a != nullptr) {
+            // A pointer-to-pointer conversion keeps the address (6.3.2.3p7); an address
+            // INTEGER converted back is `AddressAsInteger` (`(int *)((ull)&a + 4)`, all four).
+            if (in.core != TypeKind::Ptr && !admits(options, ConstantForm::AddressAsInteger))
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            HirAddressValue out = *a;
+            out.pointeeType = pointee;
+            return ok(addressLiteral(out, TypeKind::Ptr));
+        }
+        // 6.6p9: an integer constant cast to a pointer — a NULL-base address (`(void *)0x5`).
+        auto const bits = plainIntBits(in);
+        if (!bits.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        return ok(addressLiteral(HirAddressValue{HirAddressValue::kNullBase, *bits, pointee},
+                                 TypeKind::Ptr));
+    }
+    if (a == nullptr) return std::nullopt;
+    if (toK == TypeKind::Bool) {
+        if (a->base != HirAddressValue::kNullBase
+            && !admits(options, ConstantForm::AddressTruthValue)) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const t = addressTruth(*a);
+        if (!t.has_value()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        return ok(makeBoolLiteral(*t ? 1 : 0));
+    }
+    auto const target = intKindInfo(toK, options.charIsUnsigned);
+    if (!target.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    if (a->base == HirAddressValue::kNullBase) {
+        // A pure compile-time integer (`(size_t)&((T *)0)->m`): the integer's own conversion.
+        return ok(integerLiteral(wrapToIntTarget(a->byteOffset, *target), toK, options));
+    }
+    // A symbol's address survives only in an integer EXACTLY as wide as a pointer — all four
+    // references refuse a narrower one (`.temp/probe/sti7` 06/07), and a wider one would
+    // need an extension no relocation carries.
+    auto const pb = pointerBytes(interner, env);
+    if (!pb.has_value() || static_cast<std::uint64_t>(target->bits) != *pb * 8u
+        || !admits(options, ConstantForm::AddressAsInteger)) {
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    }
+    HirAddressValue out = *a;
+    out.pointeeType = TypeId{};
+    return ok(addressLiteral(out, toK));
+}
+
+// `!` of an address (AddressTruthValue); `-` and `~` of one are refused by all four.
+[[nodiscard]] ConstEvalResult
+combineAddressUnary(HirOpKind op, HirNodeId expr, EvalOptions const& options,
+                    HirAddressValue const& a) {
+    if (op != HirOpKind::Not) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    if (a.base != HirAddressValue::kNullBase && !admits(options, ConstantForm::AddressTruthValue))
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    auto const t = addressTruth(a);
+    if (!t.has_value()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    return ok(makeBoolLiteral(*t ? 0 : 1));
+}
+
+// A binary operator with an ADDRESS operand. nullopt ⇒ neither operand is an address.
+[[nodiscard]] std::optional<ConstEvalResult>
+combineAddressBinary(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
+                     HirNodeId expr, EvalOptions const& options,
+                     HirLiteralValue const& A, HirLiteralValue const& B) {
+    auto const* la = addressArm(A);
+    auto const* ra = addressArm(B);
+    if (la == nullptr && ra == nullptr) return std::nullopt;
+    auto const refuse = [&] { return fail(ConstEvalFailure::NotAConstantExpression, expr); };
+    HirOpKind const op = decodeCoreOp(hir.payload(expr));
+    auto kids = hir.children(expr);
+    TypeId const resultTy = hir.typeId(expr);
+    TypeKind const resultK = resultTy.valid() ? interner.kind(resultTy) : TypeKind::Count_;
+    bool const lPtr = la != nullptr && A.core == TypeKind::Ptr;
+    bool const rPtr = ra != nullptr && B.core == TypeKind::Ptr;
+    bool const lInt = la != nullptr && !lPtr;   // an address INTEGER (pointer width)
+    bool const rInt = ra != nullptr && !rPtr;
+    auto const lk = plainIntBits(A);
+    auto const rk = plainIntBits(B);
+    auto const withOffset = [](HirAddressValue a, std::int64_t off) {
+        a.byteOffset = off;
+        return a;
+    };
+    // Wrapping offset arithmetic (a relocation addend is a 64-bit two's-complement value).
+    auto const add = [](std::int64_t x, std::int64_t y) {
+        return static_cast<std::int64_t>(static_cast<std::uint64_t>(x) + static_cast<std::uint64_t>(y));
+    };
+    auto const mul = [](std::int64_t x, std::int64_t y) {
+        return static_cast<std::int64_t>(static_cast<std::uint64_t>(x) * static_cast<std::uint64_t>(y));
+    };
+
+    // ── address ± integer (6.6p7) ─────────────────────────────────────────────────────
+    if (op == HirOpKind::Add || op == HirOpKind::Sub) {
+        bool const sub = (op == HirOpKind::Sub);
+        if ((lPtr && rk.has_value()) || (!sub && lk.has_value() && rPtr)) {
+            HirAddressValue const& p = lPtr ? *la : *ra;
+            std::int64_t const k = lPtr ? *rk : *lk;
+            auto const stride = strideOf(env, pointeeOf(interner, resultTy));
+            if (!stride.has_value()) return refuse();
+            std::int64_t const delta = mul(k, *stride);
+            HirAddressValue out = withOffset(p, sub ? add(p.byteOffset, mul(delta, -1))
+                                                    : add(p.byteOffset, delta));
+            out.pointeeType = pointeeOf(interner, resultTy);
+            return ok(addressLiteral(out, TypeKind::Ptr));
+        }
+        if ((lInt && rk.has_value()) || (!sub && lk.has_value() && rInt)) {
+            if (!admits(options, ConstantForm::AddressAsInteger)) return refuse();
+            HirAddressValue const& p = lInt ? *la : *ra;
+            std::int64_t const k = lInt ? *rk : *lk;
+            return ok(addressLiteral(withOffset(p, sub ? add(p.byteOffset, mul(k, -1))
+                                                       : add(p.byteOffset, k)),
+                                     resultK));
+        }
+        if (sub && ((lPtr && rPtr) || (lInt && rInt))) {
+            // The difference of two addresses INTO ONE OBJECT — in elements for pointers
+            // (6.5.6p9), in bytes for address integers. Two NULL bases are two integers
+            // (the offsetof idiom's `- (char *)0`) and need no form.
+            if (la->base != ra->base) return refuse();
+            bool const nullPair = (la->base == HirAddressValue::kNullBase);
+            if (!nullPair && !admits(options, lPtr ? ConstantForm::AddressDifference
+                                                   : ConstantForm::AddressIntegerAlgebra)) {
+                return refuse();
+            }
+            std::int64_t bytes = add(la->byteOffset, mul(ra->byteOffset, -1));
+            if (lPtr) {
+                auto const stride = strideOf(env, pointeeOf(interner, hir.typeId(kids[0])));
+                if (!stride.has_value() || *stride == 0 || bytes % *stride != 0) return refuse();
+                bytes /= *stride;
+            }
+            if (!intKindInfo(resultK, options.charIsUnsigned).has_value()) return refuse();
+            return ok(integerLiteral(bytes, resultK, options));
+        }
+        return refuse();   // `k - a`, `a + a`, `-a`: no relocation expresses them
+    }
+
+    // ── comparisons ────────────────────────────────────────────────────────────────────
+    if (isComparison(op)) {
+        bool const relational = !(op == HirOpKind::Eq || op == HirOpKind::Ne);
+        auto const result = [&](bool equalOrTrue) { return ok(makeBoolLiteral(equalOrTrue ? 1 : 0)); };
+        // An address against the INTEGER 0 — a null pointer constant a tier left unconverted,
+        // or an address integer's `== 0`: the address's truth value.
+        if (((la != nullptr) && rk.has_value()) || (lk.has_value() && (ra != nullptr))) {
+            bool const leftIsAddress = (la != nullptr);
+            std::int64_t const k = leftIsAddress ? *rk : *lk;
+            HirAddressValue const& p = leftIsAddress ? *la : *ra;
+            bool const isInt = leftIsAddress ? lInt : rInt;
+            if (relational || k != 0) return refuse();
+            if (p.base != HirAddressValue::kNullBase
+                && !admits(options, isInt ? ConstantForm::AddressIntegerAlgebra
+                                          : ConstantForm::AddressTruthValue)) {
+                return refuse();
+            }
+            auto const t = addressTruth(p);
+            if (!t.has_value()) return refuse();
+            return result(op == HirOpKind::Eq ? !*t : *t);
+        }
+        if (!((lPtr && rPtr) || (lInt && rInt))) return refuse();
+        ConstantForm const form = lPtr ? ConstantForm::AddressComparison
+                                       : ConstantForm::AddressIntegerAlgebra;
+        std::int64_t const lo = la->byteOffset;
+        std::int64_t const ro = ra->byteOffset;
+        auto const byOffset = [&]() -> ConstEvalResult {
+            switch (op) {
+            case HirOpKind::Eq: return result(lo == ro);
+            case HirOpKind::Ne: return result(lo != ro);
+            case HirOpKind::Lt: return result(lo < ro);
+            case HirOpKind::Le: return result(lo <= ro);
+            case HirOpKind::Gt: return result(lo > ro);
+            case HirOpKind::Ge: return result(lo >= ro);
+            default:            return refuse();
+            }
+        };
+        if (la->base == ra->base) {
+            // One object (or two integers cast to pointers, which need no form).
+            if (la->base != HirAddressValue::kNullBase && !admits(options, form)) return refuse();
+            return byOffset();
+        }
+        if (relational) return refuse();   // `<` across objects: refused by all four
+        // Two different bases, `==` / `!=`: a null pointer against a symbol is the symbol's
+        // truth value; two symbols are two objects, unequal (gcc's fold, even one past the
+        // end). A NULL base with a non-zero offset is an arbitrary integer address — unknown.
+        HirAddressValue const* sym = nullptr;
+        if (la->base == HirAddressValue::kNullBase) {
+            if (la->byteOffset != 0) return refuse();
+            sym = ra;
+        } else if (ra->base == HirAddressValue::kNullBase) {
+            if (ra->byteOffset != 0) return refuse();
+            sym = la;
+        }
+        if (sym != nullptr) {
+            if (!admits(options, lPtr ? ConstantForm::AddressTruthValue
+                                      : ConstantForm::AddressIntegerAlgebra)) {
+                return refuse();
+            }
+            if (sym->baseMayBeNull) return refuse();
+            return result(op == HirOpKind::Ne);
+        }
+        if (!admits(options, form) || la->baseMayBeNull || ra->baseMayBeNull) return refuse();
+        return result(op == HirOpKind::Ne);
+    }
+
+    // ── the identity and absorbing elements on an address integer (gcc, mingw-w64) ──────
+    if (!((lInt && rk.has_value()) || (lk.has_value() && rInt))) return refuse();
+    if (!admits(options, ConstantForm::AddressIntegerAlgebra)) return refuse();
+    HirAddressValue const& p = lInt ? *la : *ra;
+    std::int64_t const k = lInt ? *rk : *lk;
+    auto const info = intKindInfo(resultK, options.charIsUnsigned);
+    if (!info.has_value()) return refuse();
+    std::int64_t const allOnes = (info->bits >= 64)
+        ? std::int64_t{-1}
+        : static_cast<std::int64_t>((std::uint64_t{1} << info->bits) - 1u);
+    auto const identity = [&] { return ok(addressLiteral(p, resultK)); };
+    auto const zero = [&] { return ok(integerLiteral(0, resultK, options)); };
+    switch (op) {
+    case HirOpKind::Mul:    if (k == 0) return zero(); if (k == 1) return identity(); break;
+    case HirOpKind::BitAnd: if (k == 0) return zero(); if (k == allOnes) return identity(); break;
+    case HirOpKind::BitOr:
+    case HirOpKind::BitXor: if (k == 0) return identity(); break;
+    case HirOpKind::Div:    if (lInt && k == 1) return identity(); break;
+    case HirOpKind::Rem:    if (lInt && k == 1) return zero(); break;
+    case HirOpKind::Shl:
+    case HirOpKind::Shr:    if (lInt && k == 0) return identity(); break;
+    default: break;
+    }
+    return refuse();
+}
+
 
 // ── THE FOLD COSTS HEAP, NOT HOST CALL FRAMES ──────────────────────────────
 //
@@ -86,6 +441,11 @@ combineUnary(Hir const& hir, HirNodeId expr, EvalOptions const& options,
              ConstEvalResult inner) {
     if (!inner.value.has_value()) return inner;
     HirOpKind const op = decodeCoreOp(hir.payload(expr));
+    // P68 round 13: an ADDRESS operand (only `!` has a meaning — its truth value).
+    if (options.foldAddressConstants) {
+        if (auto const* a = addressArm(*inner.value))
+            return combineAddressUnary(op, expr, options, *a);
+    }
     // C4b (I2 go-live gate): a unary op on a `_BitInt` operand (`-5wb`, `~x`) folds
     // via the bignum — BEFORE the `asInt64`+`applyUnaryInt` path below, which would
     // negate a NARROW `_BitInt` via un-wrapped int64 arithmetic (a silent miscompile).
@@ -132,10 +492,16 @@ combineUnary(Hir const& hir, HirNodeId expr, EvalOptions const& options,
 // statements, left-to-right and platform-independent). Either child's failure
 // short-circuits with that child's verbatim result (a first, then b).
 [[nodiscard]] ConstEvalResult
-combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
-              EvalOptions const& options, ConstEvalResult a, ConstEvalResult b) {
+combineBinary(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
+              HirNodeId expr, EvalOptions const& options, ConstEvalResult a,
+              ConstEvalResult b) {
     if (!a.value.has_value()) return a;
     if (!b.value.has_value()) return b;
+    // P68 round 13: an ADDRESS operand — the closed algebra above, before any numeric arm.
+    if (options.foldAddressConstants) {
+        if (auto r = combineAddressBinary(hir, interner, env, expr, options, *a.value, *b.value))
+            return std::move(*r);
+    }
     HirOpKind const op = decodeCoreOp(hir.payload(expr));
     auto kids = hir.children(expr);
     // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `_BitInt`-involving binary op folds
@@ -150,7 +516,7 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // CRIT-3 belt-and-suspenders: a BitInt-typed RESULT whose operand values did NOT
     // fold to bit-precise (a shape C's typing rules never produce) must NEVER take the
     // un-wrapped int64 path — fail loud rather than silently mis-fold.
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): I128/U128 join the belt for the SAME
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): I128/U128 join the belt for the SAME
     // reason and it is the load-bearing half of this cycle's const-fold closure.
     // The int64 path below wraps at 64 bits; a 128-bit-typed result reaching it
     // would be silently mod-2^64 — green in every existing test, wrong in the
@@ -219,8 +585,8 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
         //     regardless of operand types (force-override; applyBinaryInt
         //     inherited LHS's core which is wrong for the cmp case).
         //   - Shift ops (Shl/Shr): the result type is the config-driven
-        //     shift-result rule (D-UAC-SHIFT-RESULT-RULE-CONFIG) — already
-        //     resolved and stamped on THIS node's authoritative typeId by
+        //     shift-result rule — already resolved and stamped on THIS node's
+        //     authoritative typeId by
         //     cst_to_hir's `shiftResultType` funnel. Read it directly so
         //     the folded mirror agrees with the verb for EVERY language
         //     (never re-derive C's promoted-left discipline here — that
@@ -260,12 +626,33 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
 // byte-identical to the recursive arm (all four (source,target) quadrants +
 // the bool special-cases). A non-foldable operand short-circuits verbatim.
 [[nodiscard]] ConstEvalResult
-combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
-            EvalOptions const& options, ConstEvalResult inner) {
+combineCast(Hir const& hir, TypeInterner& interner, EvalEnvironment const& env,
+            HirNodeId expr, EvalOptions const& options, ConstEvalResult inner) {
     if (!inner.value.has_value()) return inner;
     TypeId const targetTy = hir.typeId(expr);
     if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-    TypeKind const toK = interner.kind(targetTy);
+    // ★ P68 round 12 (lane `cs`, the enumeration P1): a cast TO an ENUMERATED type
+    // converts as a cast to the integer type it is compatible with — C23 6.7.3.3p16:
+    // "Conversion to the enumerated type has the same semantics as conversion to the
+    // underlying type"; C 6.7.2.2p4 for one without a fixed type. The record's
+    // scalars[0] is that integer's kind for a fixed, a chosen and a kind-only record
+    // alike (the same projection the static-data producer's `materialScalarKind`
+    // makes). Without it every `enum E g = A;` (a constant is `int` now, so the
+    // initializer carries this Cast) became a runtime initializer the producer refuses
+    // — and `enum E g = 2;` already did before the P1 (✔MEASURED on the fold-7 build,
+    // `.temp/probe/ectG`, K_NoMatchingObjectFormat), where every reference folds it.
+    TypeKind toK = interner.kind(targetTy);
+    if (toK == TypeKind::Enum) {
+        auto const sc = interner.scalars(targetTy);
+        if (sc.empty() || sc[0] < 0 || sc[0] >= static_cast<std::int64_t>(TypeKind::Count_))
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        toK = static_cast<TypeKind>(sc[0]);
+    }
+    // P68 round 13: an ADDRESS conversion, or an integer constant to a pointer (6.6p9).
+    if (options.foldAddressConstants) {
+        if (auto r = combineAddressCast(interner, env, expr, targetTy, toK, options, *inner.value))
+            return std::move(*r);
+    }
     // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a cast TO `_BitInt(N)` folds via the
     // wrap-aware bignum `convertTo(N, signed)` (mod-2^N) — narrow AND wide — so
     // `_Static_assert((_BitInt(4))15 + 1 == 0)` and `(_BitInt(40))2000000 * …` fold
@@ -295,7 +682,7 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
         v.value = std::move(*bv);
         return ok(std::move(v));
     }
-    // D-CSUBSET-INT128-CONSTFOLD (TF-C94): a cast TO a 128-bit integer routes
+    // D-CSUBSET-INT128-CONSTFOLD-WIDE (TF-C94): a cast TO a 128-bit integer routes
     // through the SAME wrap-aware bignum. Without this arm `(__uint128_t)X`
     // produced a plain u64/i64 literal merely TAGGED `core = U128`: the value had
     // already been truncated to 64 bits, so every later fold read a wrapped
@@ -676,13 +1063,20 @@ evalTerminal(Hir const& hir, HirLiteralPool const& literals, HirNodeId expr,
 // arms' short-circuit, the Ternary's single-arm selection, and the aggregate's
 // positional accumulation.
 struct FoldFrame {
+    // P68 round 13 (lane `cs`, the static-initializer item) — the ADDRESS arms, reached only
+    // with `EvalOptions::foldAddressConstants`. The `L*` kinds fold an lvalue to WHERE it is
+    // (an address): the operand of `&`, and an array or function designator's decay; the
+    // `V*` kinds fold a VALUE read — an element or member of a constant object (the
+    // `constObjectRead` form reaches it through `resolveConstSymbol`), and `*f` of a
+    // function. `Seq` is the comma operator (`commaOperator`).
     enum class Kind : std::uint8_t {
-        Unary, Binary, Cast, Ref, Logical, Ternary, Aggregate
+        Unary, Binary, Cast, Ref, Logical, Ternary, Aggregate,
+        AddrOf, LIndex, LMember, LDeref, VIndex, VMember, VDeref, Seq
     } kind;
     HirNodeId       node;
     std::uint32_t   phase;
     HirNodeId       child;   // Ref: the resolved DEFINING expression (see `enter`)
-    ConstEvalResult c0;      // Binary: the folded LHS (stashed between phase 1 and 2)
+    ConstEvalResult c0;      // Binary / LIndex / VIndex: the folded first operand
     std::vector<HirLiteralValue> parts;   // Aggregate: elements folded so far
 };
 
@@ -710,7 +1104,92 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
     // sentinel never leaks.
     ConstEvalResult result = fail(ConstEvalFailure::NotAConstantExpression, expr);
 
+    // P68 round 13: fold an LVALUE to its ADDRESS — a symbol with a link-time address (the
+    // caller's `resolveAddressableSymbol` says which), a string literal's array object, or a
+    // `[]` / `.` / `*` path over one. Anything else has no constant address.
+    auto const enterLvalue = [&](HirNodeId n) {
+        if (!n.valid()) {
+            result = fail(ConstEvalFailure::NotAConstantExpression, n);
+            return;
+        }
+        HirKind const nk = hir.kind(n);
+        std::size_t const arity = hir.children(n).size();
+        if (nk == HirKind::Ref) {
+            SymbolId const sym{hir.payload(n)};
+            std::optional<AddressableSymbol> const as =
+                env.resolveAddressableSymbol ? env.resolveAddressableSymbol(sym)
+                                             : std::nullopt;
+            if (!as.has_value()) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, n);
+                return;
+            }
+            result = ok(addressLiteral(
+                HirAddressValue{sym.v, 0, hir.typeId(n), as->mayBeNull}, TypeKind::Ptr));
+            return;
+        }
+        if (nk == HirKind::Literal) {
+            std::uint32_t const idx = hir.payload(n);
+            std::optional<SymbolId> const s =
+                (std::holds_alternative<std::string>(literals.at(idx).value)
+                 && env.resolveStringLiteralSymbol)
+                    ? env.resolveStringLiteralSymbol(n) : std::nullopt;
+            if (!s.has_value() || !s->valid()) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, n);
+                return;
+            }
+            result = ok(addressLiteral(HirAddressValue{s->v, 0, hir.typeId(n), false},
+                                       TypeKind::Ptr));
+            return;
+        }
+        if (nk == HirKind::Index && arity == 2) {
+            work.push_back({.kind = FoldFrame::Kind::LIndex, .node = n, .phase = 0});
+            return;
+        }
+        if (nk == HirKind::MemberAccess && arity == 1) {
+            work.push_back({.kind = FoldFrame::Kind::LMember, .node = n, .phase = 0});
+            return;
+        }
+        if (nk == HirKind::Deref && arity == 1) {
+            work.push_back({.kind = FoldFrame::Kind::LDeref, .node = n, .phase = 0});
+            return;
+        }
+        result = fail(ConstEvalFailure::NotAConstantExpression, n);
+    };
+
     auto const enter = [&](HirNodeId n) {
+        if (n.valid() && options.foldAddressConstants) {
+            // P68 round 13: the address arms (see `FoldFrame`).
+            HirKind const nk = hir.kind(n);
+            std::size_t const arity = hir.children(n).size();
+            if (nk == HirKind::AddressOf && arity == 1) {
+                work.push_back({.kind = FoldFrame::Kind::AddrOf, .node = n, .phase = 0});
+                return;
+            }
+            if (nk == HirKind::Index && arity == 2) {
+                work.push_back({.kind = FoldFrame::Kind::VIndex, .node = n, .phase = 0});
+                return;
+            }
+            if (nk == HirKind::MemberAccess && arity == 1) {
+                work.push_back({.kind = FoldFrame::Kind::VMember, .node = n, .phase = 0});
+                return;
+            }
+            if (nk == HirKind::Deref && arity == 1) {
+                work.push_back({.kind = FoldFrame::Kind::VDeref, .node = n, .phase = 0});
+                return;
+            }
+            if (nk == HirKind::SeqExpr && arity >= 1) {
+                work.push_back({.kind = FoldFrame::Kind::Seq, .node = n, .phase = 0});
+                return;
+            }
+            if (nk == HirKind::Ref) {
+                // A function designator's value IS its address (6.3.2.1p4).
+                TypeId const rt = hir.typeId(n);
+                if (rt.valid() && interner.kind(rt) == TypeKind::FnSig) {
+                    enterLvalue(n);
+                    return;
+                }
+            }
+        }
         if (n.valid()) {
             HirKind const nk = hir.kind(n);
             if (nk == HirKind::UnaryOp) {
@@ -814,7 +1293,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                 ConstEvalResult lhs = std::move(f.c0);
                 ConstEvalResult rhs = std::move(result);
                 work.pop_back();
-                result = combineBinary(hir, interner, node2, options,
+                result = combineBinary(hir, interner, env, node2, options,
                                        std::move(lhs), std::move(rhs));
             }
             break;
@@ -822,12 +1301,22 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             if (f.phase == 0) {
                 f.phase = 1;
                 HirNodeId const operandN = hir.children(f.node)[0];
+                // P68 round 13: an ARRAY or FUNCTION designator being converted — the
+                // decay (6.3.2.1p3-p4) — converts its ADDRESS, never its value.
+                if (options.foldAddressConstants) {
+                    TypeId const ot = hir.typeId(operandN);
+                    TypeKind const okind = ot.valid() ? interner.kind(ot) : TypeKind::Count_;
+                    if (okind == TypeKind::Array || okind == TypeKind::FnSig) {
+                        enterLvalue(operandN);   // may invalidate `f`
+                        break;
+                    }
+                }
                 enter(operandN);            // build operand — may invalidate `f`
             } else {
                 HirNodeId const node2 = f.node;
                 ConstEvalResult operand = std::move(result);
                 work.pop_back();
-                result = combineCast(hir, interner, node2, options, std::move(operand));
+                result = combineCast(hir, interner, env, node2, options, std::move(operand));
             }
             break;
         case FoldFrame::Kind::Ref:
@@ -872,7 +1361,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                 // `asBool` handles both integer and float operands (the latter
                 // only when `allowFloat` is on); NaN / ±inf evaluate to true per
                 // C semantics; ±0.0 evaluates to false.
-                auto aIsTrueOpt = asBool(*result.value, options.allowFloat);
+                auto aIsTrueOpt = truthOf(*result.value, options);
                 if (!aIsTrueOpt.has_value()) {
                     work.pop_back();
                     result = fail(ConstEvalFailure::UnsupportedTypeKind, node2);
@@ -894,7 +1383,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             }
             work.pop_back();
             if (!result.value.has_value()) break;   // propagate `b`'s failure verbatim
-            auto bIsTrueOpt = asBool(*result.value, options.allowFloat);
+            auto bIsTrueOpt = truthOf(*result.value, options);
             if (!bIsTrueOpt.has_value()) {
                 result = fail(ConstEvalFailure::UnsupportedTypeKind, node2);
                 break;
@@ -925,7 +1414,7 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
                 // Cond truthiness via the shared `asBool` (CE5): accepts float
                 // operands when `allowFloat` is on, applying the same NaN/inf →
                 // true semantics as LogicalAnd/Or.
-                auto condIsTrueOpt = asBool(*result.value, options.allowFloat);
+                auto condIsTrueOpt = truthOf(*result.value, options);
                 if (!condIsTrueOpt.has_value()) {
                     work.pop_back();
                     result = fail(ConstEvalFailure::UnsupportedTypeKind, node2);
@@ -986,6 +1475,277 @@ evalImpl(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
             HirNodeId const child = kids[static_cast<std::size_t>(f.phase)];
             f.phase += 1;
             enter(child);                   // may invalidate `f`
+            break;
+        }
+        // ── P68 round 13 (lane `cs`, the static-initializer item): the ADDRESS arms ──────
+        case FoldFrame::Kind::AddrOf: {
+            // `&x`: where `x` is (6.5.3.2p3) — its lvalue fold.
+            HirNodeId const node2 = f.node;
+            if (f.phase == 0) {
+                f.phase = 1;
+                HirNodeId const operandN = hir.children(node2)[0];
+                enterLvalue(operandN);      // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            if (!result.value.has_value()) break;
+            if (auto const* a = addressArm(*result.value)) {
+                HirAddressValue out = *a;
+                out.pointeeType = hir.typeId(hir.children(node2)[0]);
+                result = ok(addressLiteral(out, TypeKind::Ptr));
+            } else {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+            }
+            break;
+        }
+        case FoldFrame::Kind::LIndex: {
+            // `a[i]` as an lvalue: an ARRAY base is itself an lvalue (its address); a POINTER
+            // base is a value that must fold to an address. Plus `i` elements of the Index
+            // node's own type, at the runtime `Gep`'s stride.
+            HirNodeId const node2 = f.node;
+            auto const kids = hir.children(node2);
+            if (f.phase == 0) {
+                f.phase = 1;
+                HirNodeId const baseN = kids[0];
+                TypeId const bt = hir.typeId(baseN);
+                if (bt.valid() && interner.kind(bt) == TypeKind::Array) enterLvalue(baseN);
+                else                                                   enter(baseN);
+                break;                      // `f` may be invalid past here
+            }
+            if (f.phase == 1) {
+                if (!result.value.has_value()) {
+                    work.pop_back();
+                    break;
+                }
+                f.c0 = std::move(result);
+                f.phase = 2;
+                HirNodeId const idxN = kids[1];
+                enter(idxN);                // may invalidate `f`
+                break;
+            }
+            ConstEvalResult const base = std::move(f.c0);
+            work.pop_back();
+            if (!result.value.has_value()) break;
+            auto const* a = addressArm(*base.value);
+            auto const k = plainIntBits(*result.value);
+            auto const stride = strideOf(env, hir.typeId(node2));
+            if (a == nullptr || base.value->core != TypeKind::Ptr || !k.has_value()
+                || !stride.has_value()) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                break;
+            }
+            HirAddressValue out = *a;
+            out.byteOffset = static_cast<std::int64_t>(
+                static_cast<std::uint64_t>(out.byteOffset)
+                + static_cast<std::uint64_t>(*k) * static_cast<std::uint64_t>(*stride));
+            out.pointeeType = hir.typeId(node2);
+            result = ok(addressLiteral(out, TypeKind::Ptr));
+            break;
+        }
+        case FoldFrame::Kind::LMember: {
+            // `s.m` as an lvalue: `s`'s address plus the member's offset in `s`'s layout.
+            HirNodeId const node2 = f.node;
+            HirNodeId const baseN = hir.children(node2)[0];
+            if (f.phase == 0) {
+                f.phase = 1;
+                enterLvalue(baseN);         // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            if (!result.value.has_value()) break;
+            auto const* a = addressArm(*result.value);
+            std::optional<std::uint64_t> const off =
+                env.resolveFieldOffset ? env.resolveFieldOffset(hir.typeId(baseN), hir.payload(node2))
+                                       : std::nullopt;
+            if (a == nullptr || !off.has_value()
+                || *off > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                break;
+            }
+            HirAddressValue out = *a;
+            out.byteOffset = static_cast<std::int64_t>(static_cast<std::uint64_t>(out.byteOffset)
+                                                       + *off);
+            out.pointeeType = hir.typeId(node2);
+            result = ok(addressLiteral(out, TypeKind::Ptr));
+            break;
+        }
+        case FoldFrame::Kind::LDeref: {
+            // `*p` as an lvalue IS `p`'s value, which must be an address (`&*a`, `->`).
+            HirNodeId const node2 = f.node;
+            if (f.phase == 0) {
+                f.phase = 1;
+                HirNodeId const operandN = hir.children(node2)[0];
+                enter(operandN);            // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            if (!result.value.has_value()) break;
+            auto const* a = addressArm(*result.value);
+            if (a == nullptr || result.value->core != TypeKind::Ptr) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                break;
+            }
+            HirAddressValue out = *a;
+            out.pointeeType = hir.typeId(node2);
+            result = ok(addressLiteral(out, TypeKind::Ptr));
+            break;
+        }
+        case FoldFrame::Kind::VIndex: {
+            // `a[i]` READ: an element of a constant ARRAY value — a const object's initializer
+            // (`resolveConstSymbol` answers only the objects `constObjectRead` admits: const, and
+            // not volatile through their array spine), a string literal (`"*abc"[0]`: gcc, clang,
+            // mingw-w64 — `.temp/probe/sti9` 24), or a compound literal's value, whose const-ness
+            // HIR does not carry: whether reading one is a constant (const, and no volatile lvalue
+            // on the path) is the semantic tier's S_StaticInitializerNotConstant alone (P68 round 13
+            // fold F7). An element read THROUGH A POINTER reads memory, and is not a constant.
+            HirNodeId const node2 = f.node;
+            auto const kids = hir.children(node2);
+            if (f.phase == 0) {
+                TypeId const bt = hir.typeId(kids[0]);
+                if (!bt.valid() || interner.kind(bt) != TypeKind::Array) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                    break;
+                }
+                f.phase = 1;
+                HirNodeId const baseN = kids[0];
+                enter(baseN);               // may invalidate `f`
+                break;
+            }
+            if (f.phase == 1) {
+                if (!result.value.has_value()) {
+                    work.pop_back();
+                    break;
+                }
+                f.c0 = std::move(result);
+                f.phase = 2;
+                HirNodeId const idxN = kids[1];
+                enter(idxN);                // may invalidate `f`
+                break;
+            }
+            ConstEvalResult const base = std::move(f.c0);
+            work.pop_back();
+            if (!result.value.has_value()) break;
+            auto const k = plainIntBits(*result.value);
+            if (!k.has_value() || *k < 0) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                break;
+            }
+            auto const i = static_cast<std::uint64_t>(*k);
+            if (auto const* agg = std::get_if<HirAggregateValue>(&base.value->value)) {
+                if (i >= agg->fields.size()) {
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                } else {
+                    result = ok(agg->fields[static_cast<std::size_t>(i)]);
+                }
+                break;
+            }
+            if (auto const* s = std::get_if<std::string>(&base.value->value)) {
+                TypeKind const ek = interner.kind(hir.typeId(node2));
+                auto const info = intKindInfo(ek, options.charIsUnsigned);
+                // One-byte elements only: a wide literal's pool text is not its elements.
+                if (!admits(options, ConstantForm::ConstObjectRead) || !info.has_value()
+                    || info->bits != 8 || i > s->size()) {
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                    break;
+                }
+                std::int64_t const byte = (i == s->size())
+                    ? 0 : static_cast<std::int64_t>(static_cast<unsigned char>((*s)[static_cast<std::size_t>(i)]));
+                result = ok(integerLiteral(wrapToIntTarget(byte, *info), ek, options));
+                break;
+            }
+            result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+            break;
+        }
+        case FoldFrame::Kind::VMember: {
+            // `s.m` READ: a member of a constant STRUCTURE value (positional fields) — a volatile
+            // member included: the object's volatility is what decides, and gcc folds `cs.v` of a
+            // const, non-volatile `cs` (P68 round 13 fold F7). A union's value names no member here
+            // — its one field is the initialized member, identified by type only, so reading it would
+            // also answer an inactive member's read, which every reference refuses
+            // ([[D-C-A-CONST-UNION-MEMBER-READ-IN-A-STATIC-INITIALIZER-IS-REFUSED]]) — and `p->m` reads
+            // memory (its base is a `*p` read).
+            HirNodeId const node2 = f.node;
+            HirNodeId const baseN = hir.children(node2)[0];
+            if (f.phase == 0) {
+                f.phase = 1;
+                enter(baseN);               // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            if (!result.value.has_value()) break;
+            TypeId const bt = hir.typeId(baseN);
+            auto const* agg = std::get_if<HirAggregateValue>(&result.value->value);
+            std::uint32_t const fi = hir.payload(node2);
+            if (agg == nullptr || !bt.valid() || interner.kind(bt) != TypeKind::Struct
+                || fi >= agg->fields.size()) {
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                break;
+            }
+            result = ok(agg->fields[fi]);
+            break;
+        }
+        case FoldFrame::Kind::VDeref: {
+            // `*f` of a FUNCTION is the designator again (6.5.3.2p4), whose value is its
+            // address — all four build `int (*fp)(void) = *f;`. Any other `*p` reads memory.
+            HirNodeId const node2 = f.node;
+            if (f.phase == 0) {
+                TypeId const t = hir.typeId(node2);
+                if (!t.valid() || interner.kind(t) != TypeKind::FnSig) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                    break;
+                }
+                f.phase = 1;
+                HirNodeId const operandN = hir.children(node2)[0];
+                enter(operandN);            // may invalidate `f`
+                break;
+            }
+            work.pop_back();
+            if (result.value.has_value() && addressArm(*result.value) == nullptr)
+                result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+            break;
+        }
+        case FoldFrame::Kind::Seq: {
+            // A SEQUENCE's value is its last child's. `(e1, e2)` lowers to SeqExpr([ExprStmt
+            // e1], e2), and a GNU statement expression `({ s…; v; })` to SeqExpr([s…], v) — so
+            // `({ 1; 42; })` has the comma's very shape. What decides is whether operands are
+            // DISCARDED: one that discards any is the `commaOperator` form (clang and MSVC fold
+            // `(1, 42)`; clang c2x alone folds `({ 1; 42; })`), and every discarded operand must
+            // itself be an expression statement of a constant (all refuse `(y, 42)` for a
+            // non-const `y`, and `({ int t = 42; t; })`); one of its value ALONE, `({ 42; })`,
+            // discards nothing and needs no form (gcc, clang and mingw-w64 at -std=c2x fold it)
+            // — lane `cs`'s `.temp/probe/sti9`, `sti11`.
+            HirNodeId const node2 = f.node;
+            auto const kids = hir.children(node2);
+            if (f.phase == 0) {
+                if (kids.size() > 1 && !admits(options, ConstantForm::CommaOperator)) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::NotAConstantExpression, node2);
+                    break;
+                }
+            } else if (!result.value.has_value()) {
+                work.pop_back();
+                break;
+            }
+            std::size_t const i = f.phase;
+            if (i == kids.size()) {
+                work.pop_back();            // `result` is the last operand's value
+                break;
+            }
+            f.phase += 1;
+            HirNodeId const c = kids[i];
+            if (i + 1 < kids.size()) {
+                if (hir.kind(c) != HirKind::ExprStmt || hir.children(c).size() != 1) {
+                    work.pop_back();
+                    result = fail(ConstEvalFailure::NotAConstantExpression, c);
+                    break;
+                }
+                HirNodeId const e = hir.children(c)[0];
+                enter(e);                   // may invalidate `f`
+            } else {
+                enter(c);                   // may invalidate `f`
+            }
             break;
         }
         }

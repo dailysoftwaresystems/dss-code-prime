@@ -1,0 +1,42 @@
+{
+  "$comment": "<limits.h> realized per (target, format) pair from the lattice (P68 round 9, D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS): LONG_MAX, LONG_MIN, ULONG_MAX, LLONG_*, ULLONG_MAX, CHAR_MIN/CHAR_MAX, USHRT_MAX, UINT_MAX, the C23 *_WIDTH macros, BOOL_MAX, BITINT_MAXWIDTH and <stdint.h>'s INT64_MAX, used in EXPRESSIONS and in `#if`. Each value is the PAIR's — `long` 32 bits on Windows and 64 on Linux and macOS, plain `char` unsigned on aarch64 Linux only — so every check compares a macro with the target's own types at run time (sizeof(long), (char)-1 < 0) through volatiles the optimizer cannot fold; six groups set six bits and the exit is 42 only when all hold (else the bitmask, which names the failing group — main.c lists them). ✔MEASURED 2026-09-23, each reference separately at -O0 and -O2: gcc 13.3.0 and clang 18.1.3 on x86_64 Linux and on aarch64 Linux (cross, qemu) and mingw-w64 gcc 13.2.0 on Windows all exit 42, and so does Apple clang 21.0.0 on arm64 and on x86_64 (the coordinator's Mac runs). Apple clang defines no BOOL_MAX — which C23 5.2.5.3.2p2 requires (bool has a _WIDTH macro, so it has a _MAX) — so main.c checks BOOL_MAX where it is defined; DSS defines it everywhere (pinned by test_limits_h_lattice). MSVC 14.51 (/std:clatest) cannot compile it — it defines only the 19 C89/C99 names (no *_WIDTH, no BOOL_MAX), which the union rule does not narrow DSS to. ✔MEASURED at HEAD 4d9a24c4: DSS refused the file on every target (LONG_MAX an undeclared identifier; its <limits.h> defined 9 of the 32 names). ★ RED-ON-DISABLE, ✔MEASURED 2026-09-23 (each mutant built, this program compiled and run by it on pe64, ELF x86_64 and ELF aarch64 under qemu, debug and release): a FIXED 64-bit LONG_MAX row REFUSES the pe build at the #include — no literal of the language types to that row's `long` under LLP64 — and leaves the LP64 legs at 42; ignoring plain char's signedness exits 55 on aarch64 Linux (bit 8 off) and 42 elsewhere; the splice reverted to signedness-only REFUSES every pair (ULLONG_MAX spelled as the unsuffixed 18446744073709551615, which no decimal literal type holds). The `release` arm runs the shipped optimizer pipeline over the same checks.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    },
+    {
+      "spec": "x86_64:macho64-x86_64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

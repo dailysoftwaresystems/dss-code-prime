@@ -1,0 +1,30 @@
+{
+  "$comment": "[[D-C-TAG-DEFINED-IN-A-PARAMETER-LIST-REFUSED]] runtime witness: a struct, union or enum DEFINED in a parameter list — in a definition, a prototype, a block-scope prototype, a function-pointer parameter's own list, and a type name inside a parameter's declarator. ✔MEASURED 2026-09-23: gcc 13.3.0 and clang 18.1.3 (WSL, -std=c2x and -std=c17), MinGW gcc (-std=c2x) and MSVC 19.51 (/std:clatest) all BUILD this file and RUN it to 42. Before `declHeadForParam` took the unified specifiers, DSS refused every one of these shapes with P_UnexpectedToken; and before the parameter-list stop in the tag float, the swap alone leaked a definition's tags and enumerators to the FILE scope (an enumerator of the list resolved in `main`, which all four references refuse).",
+  "$commentWhyNotVacuous": "Each function computes with the type its own list defines — a member read through a pointer to it, a local of it named again in the body, an enumerator's value, a nested tag named in the body, a later parameter naming the earlier one's tag, and `sizeof` of a tag a parameter's declarator defines — and main subtracts the value each must return, so a wrong layout, a lost member or an enumerator bound to the wrong value moves the exit code. The prototype-only and block-scope-prototype shapes need only compile, and do.",
+  "$commentExpectWarnings": "S_TagDeclaredInParameterList, one per tag the lists define (11), at the tag's name — or at the `struct` keyword for the anonymous one. ✔MEASURED: gcc 13.3.0 warns at exactly these 11 positions (its order puts Inner before Outer); clang 18.1.3 warns at the 10 named ones and not the anonymous struct; MSVC warns only C4116 on the anonymous one. The set is EXACT: a twelfth warning of this code, or a missing one, is a red.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectWarnings": [
+    {"code": "S_TagDeclaredInParameterList", "line": 16, "col": 28, "$comment": "struct Pair — a definition's list"},
+    {"code": "S_TagDeclaredInParameterList", "line": 23, "col": 29, "$comment": "union Word"},
+    {"code": "S_TagDeclaredInParameterList", "line": 31, "col": 27, "$comment": "enum Step"},
+    {"code": "S_TagDeclaredInParameterList", "line": 36, "col": 21, "$comment": "the anonymous struct, at its keyword"},
+    {"code": "S_TagDeclaredInParameterList", "line": 41, "col": 32, "$comment": "struct Outer"},
+    {"code": "S_TagDeclaredInParameterList", "line": 41, "col": 47, "$comment": "struct Inner — nested in Outer, still the list's"},
+    {"code": "S_TagDeclaredInParameterList", "line": 48, "col": 34, "$comment": "struct Cell — the later parameter's `struct Cell` is a reference and draws nothing"},
+    {"code": "S_TagDeclaredInParameterList", "line": 56, "col": 35, "$comment": "struct Probe — a function-pointer parameter's own list"},
+    {"code": "S_TagDeclaredInParameterList", "line": 61, "col": 38, "$comment": "struct Ten — a type name inside a parameter's declarator"},
+    {"code": "S_TagDeclaredInParameterList", "line": 67, "col": 26, "$comment": "struct Only — a prototype's list"},
+    {"code": "S_TagDeclaredInParameterList", "line": 70, "col": 28, "$comment": "struct Local — a block-scope prototype's list"}
+  ],
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

@@ -4,7 +4,6 @@ add_library(program OBJECT
     compile_pipeline.cpp
     cli_args.cpp
     input_resolver.cpp
-    project_sources.cpp
     cross_validate_target_format.cpp
     cross_validate_language_target.cpp
     build_scripts.cpp

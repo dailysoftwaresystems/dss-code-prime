@@ -228,7 +228,7 @@ struct ExampleCase {
 // class — a spelling the writer produced and the reader's lexer could not even
 // tokenize — and exists so this gate can prove its own instrument still fires.
 constexpr std::string_view kUnreadableArtifact =
-    "dsshir 4\n"
+    "dsshir 6\n"
     "producer \"negative-control\"\n"
     "module \"C\" {\n"
     "  \x01\x02 not a production this grammar has\n"

@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -81,6 +82,20 @@ struct DSS_EXPORT HirAsmConstraint {
     bool earlyClobber = false;
     // `%` — this operand and the next one commute.
     bool commutative = false;
+    // ★★ A GNU **MATCHING** CONSTRAINT (P68,
+    // D-ASM-MATCHING-CONSTRAINT-DIGIT-READ-AS-A-MACHINE-LETTER): the spelling
+    // is the decimal NUMBER of the operand whose location this one must share
+    // (`"0"`, `"1"`, …). It is GRAMMAR, exactly like the four modifiers — a
+    // digit means "the same location as operand N" on every processor, and
+    // GNU's own `"+r"` IS `"=r"` plus a `"0"` input — so no target is asked
+    // about it and `letter` stays EMPTY. Set ⇔ the whole spelling is decimal
+    // digits. The semantic tier decides whether the match is legal (an INPUT
+    // naming a register-form, write-only OUTPUT); the lowering ties the input
+    // to that output's location. ✔MEASURED 2026-09-19: the GCC manual's own
+    // local-register-variable example and musl's aarch64 syscall wrappers both
+    // pass an argument through `"0"`, and gcc 13.3.0 and clang 18.1.3 run every
+    // legal shape to its value.
+    std::optional<std::uint32_t> matchedOperand;
 };
 
 // Why a constraint string was refused. Every member except `None` maps to
@@ -225,6 +240,12 @@ struct DSS_EXPORT HirInlineAsmOperand {
     // Non-empty ⇔ the letter PINS one physical register (`"=a"` → `rax`). The
     // NAME as the target declares it, so no consumer re-resolves an ordinal.
     std::string   fixedRegister;
+    // ★★ `fixedRegister` came from a GNU LOCAL REGISTER VARIABLE, not a letter,
+    // and this INPUT reads that register as it stands (the variable is never
+    // written) — the two P68 facts `MirAsmOperand` carries under the same names,
+    // documented there (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED).
+    bool          pinnedByVariable   = false;
+    bool          registerAsItStands = false;
 
     // ── the OPERAND-FORM half of the SAME resolution ──
     //

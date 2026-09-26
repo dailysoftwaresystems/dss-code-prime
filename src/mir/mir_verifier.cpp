@@ -15,6 +15,8 @@
 #include "mir/mir_opcode.hpp"
 #include "mir/mir_struct_markers.hpp"  // deriveStructCfMarkers + structCfMarkerName
 
+#include <algorithm>
+#include <cstddef>
 #include <format>
 #include <string>
 #include <string_view>
@@ -24,35 +26,6 @@
 namespace dss {
 
 namespace {
-
-// Centralized diagnostic emission. The node-kind-typed overloads
-// format the "mir inst/block/func #N" prefix once so callsites don't
-// re-format the same "actual" prefix every time. Future-proof for the
-// pending MirSourceMap injection (the optional `MirSourceMap const*`
-// can be added here without touching the rules).
-void report(DiagnosticReporter& reporter, DiagnosticCode code,
-            std::string actual) {
-    ParseDiagnostic d;
-    d.code     = code;
-    d.severity = DiagnosticSeverity::Error;
-    d.actual   = std::move(actual);
-    reporter.report(std::move(d));
-}
-
-void reportInst(DiagnosticReporter& reporter, DiagnosticCode code,
-                MirInstId id, std::string detail) {
-    report(reporter, code, std::format("mir inst #{}: {}", id.v, detail));
-}
-
-void reportBlock(DiagnosticReporter& reporter, DiagnosticCode code,
-                 MirBlockId id, std::string detail) {
-    report(reporter, code, std::format("mir block #{}: {}", id.v, detail));
-}
-
-void reportFunc(DiagnosticReporter& reporter, DiagnosticCode code,
-                MirFuncId id, std::string detail) {
-    report(reporter, code, std::format("mir func #{}: {}", id.v, detail));
-}
 
 // Iterate over real instruction slots (slot 0 is the sentinel).
 // Strong-id constructor is `(value, arenaTag)` — value first.
@@ -308,8 +281,51 @@ constexpr int kDescribeMaxDepth = 3;
 
 } // namespace
 
+// Centralized diagnostic emission. The node-kind-typed overloads
+// format the "mir inst/block/func #N" prefix once so callsites don't
+// re-format the same "actual" prefix every time. Future-proof for the
+// pending MirSourceMap injection (the optional `MirSourceMap const*`
+// can be added here without touching the rules).
+//
+// ★★ AND IT COUNTS, BEFORE THE REPORTER STORES ANYTHING (P68, lane `ht`, the
+// `HirVerifier` template). Whether `report` keeps the diagnostic — or drops it as
+// a recent duplicate, or past a cap — is the reporter's business, and it must
+// not become the verdict's: the count taken HERE is what `verify()` answers
+// with. What counts is the POLICY's answer (`effectiveSeverity`, the one owner
+// the reporter's own `report` asks), so a finding the operator suppressed does
+// not count — and every Error code this verifier emits is unsuppressable, so
+// none can be.
+void MirVerifier::report(DiagnosticReporter& reporter, DiagnosticCode code,
+                         std::string actual) const {
+    if (reporter.effectiveSeverity(code, DiagnosticSeverity::Error)
+        == DiagnosticSeverity::Error) {
+        ++errorsFound_;
+    }
+    ParseDiagnostic d;
+    d.code     = code;
+    d.severity = DiagnosticSeverity::Error;
+    d.actual   = std::move(actual);
+    reporter.report(std::move(d));
+}
+
+void MirVerifier::reportInst(DiagnosticReporter& reporter, DiagnosticCode code,
+                             MirInstId id, std::string detail) const {
+    report(reporter, code, std::format("mir inst #{}: {}", id.v, detail));
+}
+
+void MirVerifier::reportBlock(DiagnosticReporter& reporter, DiagnosticCode code,
+                              MirBlockId id, std::string detail) const {
+    report(reporter, code, std::format("mir block #{}: {}", id.v, detail));
+}
+
+void MirVerifier::reportFunc(DiagnosticReporter& reporter, DiagnosticCode code,
+                             MirFuncId id, std::string detail) const {
+    report(reporter, code, std::format("mir func #{}: {}", id.v, detail));
+}
+
 bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     std::size_t const errorsBefore = reporter.errorCount();
+    errorsFound_ = 0;
     checkStructuralInvariants(reporter);
     checkEntryBlocks(reporter);
     checkBlockTermination(reporter);
@@ -325,7 +341,15 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkAtomicAccessLowered(reporter);
     checkStoreValueTypes(reporter);
     if (reporter.hitCap()) return false;
-    return reporter.errorCount() == errorsBefore;
+    // ★★ THE VERDICT IS THE VERIFIER'S OWN COUNT, AND-ed with the reporter's
+    // delta. The delta alone was not a verdict: ✔MEASURED P68 (lane `ht`), a
+    // module refused for `I_AllocaAlignmentNotPowerOfTwo` or
+    // `I_LayoutUseBeforeDef`, verified twice into ONE reporter, PASSED the second
+    // time (the repeat dropped as a recent duplicate), and a suppress list naming
+    // the code passed it outright. Every code this verifier emits is
+    // unsuppressable now, and members bypass those gates — the own count is what
+    // keeps the verdict right for the next code added without joining that table.
+    return errorsFound_ == 0 && reporter.errorCount() == errorsBefore;
 }
 
 void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const {
@@ -977,8 +1001,21 @@ void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
                     continue;
                 }
                 auto operands = mir_.instOperands(use);
-                for (MirInstId const op : operands) {
+                for (std::size_t k = 0; k < operands.size(); ++k) {
+                    MirInstId const op = operands[k];
                     if (!op.valid()) continue;
+                    // ★ ONE FINDING PER USE–DEF PAIR (P68, lane `ht`, part 1b). An
+                    // operand REPEATED in one instruction (`add %v, %v`) is the same
+                    // relation twice, and was reported twice with identical text —
+                    // which the reporter's dedup window used to hide for the codes
+                    // outside `kUnsuppressableCodes`. Every code here is a member now,
+                    // and members bypass that window, so the rule dedupes its own
+                    // findings instead of leaning on the reporter to.
+                    if (std::find(operands.begin(), operands.begin()
+                                      + static_cast<std::ptrdiff_t>(k), op)
+                        != operands.begin() + static_cast<std::ptrdiff_t>(k)) {
+                        continue;
+                    }
                     MirBlockId const defBlock = mir_.instBlock(op);
                     if (defBlock.v == useBlock.v) {
                         std::uint32_t const defIdx =
@@ -1119,6 +1156,13 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                 auto const ops = mir_.instOperands(id);
                 for (std::size_t i = 0; i < ops.size(); ++i) {
                     if (isShift && i == 1) continue;   // shift count — width-free (6.5.7)
+                    // One finding per operand VALUE — a repeated operand
+                    // (`add %x, %x`) is one mismatch (see the use–def note in
+                    // `checkDomination`).
+                    if (std::find(ops.begin(), ops.begin() + static_cast<std::ptrdiff_t>(i),
+                                  ops[i]) != ops.begin() + static_cast<std::ptrdiff_t>(i)) {
+                        continue;
+                    }
                     TypeId const ot = mir_.instType(ops[i]);
                     if (ot.valid() && interner_->kind(ot) == TypeKind::BitInt
                         && interner_->bitIntWidth(ot) != n) {
@@ -1205,10 +1249,9 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                         reportInst(reporter, DiagnosticCode::I_ArgPositionDuplicate, id,
                             std::format("two Args share flat call-operand "
                                         "position {} in func #{} — a payload "
-                                        "wipe at a rebuild/merge site "
-                                        "(D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-"
-                                        "ARG-DROP)",
+                                        "wipe at a rebuild/merge site",
                                 pos, f.v));
+                        // Anchored: D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
                     }
                 } else if (op == MirOpcode::CondBr) {
                     auto condOps = mir_.instOperands(id);
@@ -1366,9 +1409,13 @@ void MirVerifier::checkCallSignatures(DiagnosticReporter& reporter) const {
         }
         if (interner_->kind(sig) != TypeKind::FnSig) return;
 
-        auto const   params   = interner_->fnParams(sig);
+        // P68 round 8 (lane `ht`, part 2): the parameters the argument OPERANDS
+        // bind to — the lattice's one answer (`fnArgumentParams` /
+        // `fnArgumentsVariadic`), which a parameter of unqualified void ends; the
+        // semantic call check and the HIR verifier read the same helper.
+        auto const   params   = interner_->fnArgumentParams(sig);
         TypeId const retTy    = interner_->fnResult(sig);
-        bool const   variadic = interner_->fnIsVariadic(sig);
+        bool const   variadic = interner_->fnArgumentsVariadic(sig);
         std::uint32_t const symV = mir_.globalAddrSymbol(callee).v;
 
         // ── (2) THE RESULT TYPE ──────────────────────────────────────────────

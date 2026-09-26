@@ -1,0 +1,36 @@
+{
+  "$comment": "★★ A FOREIGN MEMBER READS A LIBRARY DATUM THROUGH THE GOT (P68 round 11, lane `xa`: the import half of D-LK-ELF-READER-REFUSES-GOTPCREL-BLOCKS-REAL-GLIBC-MEMBERS and D-LK-ELF-AARCH64-EXEC-REFUSES-GOT-RELOCATIONS). The prebuilt archives hold one member each (source and flags in main.c) whose code reaches libc's `stdout` through its GOT slot. The link mints ONE slot for `stdout` and rewrites every reference into a direct one to it; `stdout` being a library DATUM, the slot is filled by the loader through a row against the symbol, so the member loads the datum's address from it. ✔MEASURED 2026-09-24: gcc -no-pie and -pie run this main.c with each archive to 42, and so does this link; on main's build before this change the x86_64 archive was refused at READ (relocation type 42) and the aarch64 one at the link's kind unifier. Exit codes: 2 — the member's `&stdout` is not the program's; 1 — its value is not; 42 — both are. The `release` arm links the same archives under the shipped release pipeline. The same source in gcc's DEFAULT x86_64 code names `stdout` directly and is refused: examples/c/foreign_member_reads_a_library_datum_directly_refused.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "prebuiltLibraries": [
+        {
+          "$comment": "gcc 13.3.0 `-O2 -fPIC -c` of the member quoted in main.c + GNU ar `rcsD`: two R_X86_64_REX_GOTPCRELX against `stdout`. The witness is the member's own definition.",
+          "path": "tests/link/data/libforeign_library_datum_got_x86_64_elf.a",
+          "containerWitness": "member_stdout"
+        }
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "prebuiltLibraries": [
+        {
+          "$comment": "aarch64-linux-gnu-gcc 13.3.0 `-O2 -c` (default codegen) of the same member + aarch64-linux-gnu-ar `rcsD`: two R_AARCH64_ADR_GOT_PAGE + R_AARCH64_LD64_GOT_LO12_NC pairs against `stdout`. The witness is the member's own definition.",
+          "path": "tests/link/data/libforeign_library_datum_got_aarch64_elf.a",
+          "containerWitness": "member_stdout"
+        }
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

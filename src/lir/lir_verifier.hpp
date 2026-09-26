@@ -184,4 +184,16 @@ verifyLirText(Lir const& lir, TargetSchema const& schema,
 verifyLirRebuild(Lir const& before, Lir const& after,
                  std::string_view passName, DiagnosticReporter& reporter);
 
+// P68 round 8 part 4 — the paired check for `expandAsmRegions`, the ONE pass
+// that consumes a side structure. Every other side structure is held to
+// exactly what `verifyLirRebuild` holds any rebuild to; the asm-region pool is
+// held to the opposite: `after` holds no bundle, references no region and
+// carries an EMPTY pool. (`verifyLirRebuild` on this pair would call the
+// consumption a shrink — which is why this is its own entry point rather than
+// an exemption flag every other pass could pass.)
+[[nodiscard]] DSS_EXPORT bool
+verifyLirAsmRegionExpansion(Lir const& before, Lir const& after,
+                            TargetSchema const& schema,
+                            DiagnosticReporter& reporter);
+
 } // namespace dss

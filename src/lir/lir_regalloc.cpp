@@ -7,6 +7,7 @@
 // pre-coloring hint rather than re-derived. A .cpp-level dependency only:
 // `lir_callconv.hpp` includes `lir_regalloc.hpp` (for `LirAllocation`), so the
 // edge runs one way and no header cycle is created.
+#include "lir/lir_asm_region.hpp"
 #include "lir/lir_callconv.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
@@ -332,16 +333,29 @@ computeReloadReserve(Lir const& lir, TargetSchema const& schema,
             // already dominate it. The `store_outgoing_arg` carriers the wide-call
             // pass emits are NON-call single-operand insts, still counted below.
             if (info != nullptr && info->isCall) continue;
+            // ★ P68 round 8 part 4 — AN INLINE-ASM BUNDLE IS EXCLUDED TOO, and
+            // for the calls' reason: its demand is not this reserve's to meet.
+            // A bundle names EVERY operand of its statement at once (fifteen on
+            // an x86_64 statement gcc and clang both accept), so counting it
+            // here would hold that many registers out of the allocatable pool
+            // for the WHOLE function, for one program point. Its operands are
+            // short ranges the linear scan places by eviction; one that still
+            // spills is reloaded by the rewriter into a register nothing in the
+            // function was given — this reserve's own registers among them —
+            // and the rewriter refuses by name when none is left
+            // (`L_AsmRegionOperandUnallocatable`).
+            if (lir.instAsmRegion(inst) != nullptr) continue;
             std::array<std::uint16_t, kLirRegClassCount> demand{};
             auto const bump = [&](LirReg r) {
                 if (!r.valid() || r.isPhysical != 0) return;
                 std::size_t const c = static_cast<std::size_t>(r.regClass());
                 if (c < demand.size()) ++demand[c];
             };
-            for (auto const& o : lir.instOperands(inst)) {
-                if (o.kind == LirOperandKind::Reg) bump(o.reg);
-            }
-            bump(lir.instResult(inst));
+            // Every register OCCURRENCE the rewriter resolves: each read, then
+            // each write (the one helper's two questions — a register named as
+            // both, like a 2-address op's tied operand, is resolved twice).
+            lirForEachInstUse(lir, inst, bump);
+            lirForEachInstDef(lir, inst, [&](LirReg r, bool) { bump(r); });
             for (std::size_t c = 0; c < reserve.size(); ++c) {
                 if (demand[c] > reserve[c]) reserve[c] = demand[c];
             }
@@ -452,7 +466,7 @@ collectIndirectCalleePositions(Lir const& lir, TargetSchema const& schema,
 // (MnemonicSlot::Arg = "arg") and lir_callconv materializes (h.arg). A
 // target without an `arg` op (no register-machine param passing) yields
 // an empty list — zero new behavior. `payload` is the per-class arg
-// index (D-ML7-2.10: HIR→MIR emits a monotonic per-class counter). The
+// index (D-PLAN12-CLOSED-2026-FC7-C1B-COMMIT-B7F547D-FIXED-VIA: HIR→MIR emits a monotonic per-class counter). The
 // arg register NAME→ordinal resolves via the cc; a name that fails to
 // resolve is left unrecorded (the callconv pass fails loud on it later —
 // this collector never weakens allocation on a bad schema by inventing
@@ -477,7 +491,10 @@ collectArgRegisterOccupied(Lir const& lir, TargetSchema const& schema,
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const inst = lir.blockInstAt(b, i);
             if (lir.instOpcode(inst) == *argOp) {
-                LirReg const res = lir.instResult(inst);
+                // The register this `arg` DEFINES — asked of the one helper,
+                // which for an `arg` names exactly its result.
+                LirReg res = InvalidLirReg;
+                lirForEachInstDef(lir, inst, [&](LirReg r, bool) { res = r; });
                 if (res.valid() && res.isPhysical == 0) {
                     LirRegClass const cls = res.regClass();
                     // Shared with the rewriter's spill-scratch forbid
@@ -831,7 +848,7 @@ tryAllocateExcluding(FreeListsByClass& free,
 // stops being minted at all (`lir_callconv.cpp`'s `maybeMov` emits nothing when
 // `dest.id == src.id`).
 //
-// This closes the long-standing `D-ML7-2.5` (plan 12) — "regalloc pre-coloring
+// This closes the long-standing `D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG` (plan 12) — "regalloc pre-coloring
 // hint for `arg`/`call` arg-position vregs" — whose own trigger names this
 // cycle: *"when the redundant-mov count becomes a measurable perf issue … or
 // the codegen-quality/peephole arc (plan 22) opens"*. Plan 22 OPT8 is that arc.
@@ -1143,12 +1160,28 @@ lirMaxStatedAccessWidthBits(Lir const& lir, LirFuncLiveness const& flow) {
         std::uint32_t const n = lir.blockInstCount(blk);
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const  inst = lir.blockInstAt(blk, i);
-            std::uint8_t const bits = lirInstWidthBits(lir.instFlags(inst));
-            note(lir.instResult(inst), bits);
-            for (auto const& o : lir.instOperands(inst)) {
-                if (o.kind != LirOperandKind::Reg) continue;
-                note(o.reg, bits);
+            // ★ P68 round 8 part 4 — A BUNDLE STATES NO WIDTH OF ITS OWN; ITS
+            // TEMPLATE DOES. The statement's widths live in its body, one per
+            // template instruction, and the flat lowering this bundle replaced
+            // showed each of them to this census. Crediting a bundle operand
+            // with the bundle's own (default, 64-bit) flags would UNDER-state a
+            // 128-bit template access to an `"x"` operand, and this census is
+            // the coalescer's only defence against merging a 64-bit copy into a
+            // value the template then reads whole — the admit direction, which
+            // is the unsafe one.
+            if (LirAsmRegion const* region = lir.instAsmRegion(inst);
+                region != nullptr) {
+                auto const widths = lirAsmRegionSlotAccessWidthBits(*region);
+                auto const ops = lir.instOperands(inst);
+                for (std::size_t k = 0; k < ops.size() && k < widths.size(); ++k) {
+                    if (ops[k].kind != LirOperandKind::Reg) continue;
+                    note(ops[k].reg, widths[k]);
+                }
+                continue;
             }
+            std::uint8_t const bits = lirInstWidthBits(lir.instFlags(inst));
+            lirForEachInstDef(lir, inst, [&](LirReg r, bool) { note(r, bits); });
+            lirForEachInstUse(lir, inst, [&](LirReg r) { note(r, bits); });
         }
     }
     return widest;
@@ -1207,7 +1240,7 @@ struct AntiAffinityPair {
 // (`tryAllocatePreferred`) rather than as a union-find edge — get the vreg into
 // that register and the copy becomes a move onto itself, which R1 deletes.
 //
-// ⓘ This is the shape `D-ML7-2.5`'s SECOND consumer names: the div/mod family
+// ⓘ This is the shape `D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG`'s SECOND consumer names: the div/mod family
 // captures its implicit-output register with `result = mov <rax>`, so the
 // capture disappears exactly when the result vreg is allocated there. Nothing
 // about the rule is div-specific — it reads the operand's `isPhysical` bit, so
@@ -1279,7 +1312,7 @@ struct MoveOpcodeCache {
     }
 };
 
-// ── THE OUTGOING-ARGUMENT HINT (D-ML7-2.5, the half that was withheld) ───────
+// ── THE OUTGOING-ARGUMENT HINT (D-PLAN12-REGALLOC-PRE-COLORING-HINT-FOR-ARG-CALL-ARG, the half that was withheld) ───────
 //
 // The DEF-side hints cover where a value is BORN: an incoming parameter
 // arrives in its ABI register, a call result arrives in the return register.
@@ -1293,7 +1326,7 @@ struct MoveOpcodeCache {
 // producing the move-graph cycle `L_MoveCycleUnsupported` used to refuse. Two
 // independent measurements say otherwise:
 //
-//   * THE REFUSAL IS GONE. `D-ML7-2.3`'s parallel-copy resolution shipped in
+//   * THE REFUSAL IS GONE. `D-PLAN12-CLOSED-2026-P40-LANE-AND-THE-ROW-WAS`'s parallel-copy resolution shipped in
 //     c76: `emitParallelRegMoves` emits the acyclic part in dependency order
 //     and breaks each remaining cycle with a scratch drawn from
 //     `cc.callerSaved`. The v1 O(N^2) detector it superseded was deleted.
@@ -1405,6 +1438,12 @@ collectCoalesceInput(Lir const& lir, TargetSchema const& schema,
             auto const  opcode = lir.instOpcode(inst);
             auto const* info   = schema.opcodeInfo(opcode);
             if (info == nullptr) continue;
+            // ★ P68 round 8 part 4: an inline-asm bundle is none of the shapes
+            // below (2-address op, call, return, copy) — its definitions are
+            // its operand ROLES (`lirForEachInstDef`), not the result field the
+            // arms below read, and the statement's operands are copied in and
+            // out by moves that carry its constraint and are never coalesced.
+            if (lir.instAsmRegion(inst) != nullptr) continue;
             LirReg const result = lir.instResult(inst);
             auto const   ops    = lir.instOperands(inst);
 
@@ -1581,6 +1620,24 @@ struct CoalescePartition {
     std::vector<LirLiveRange>               hull;
     std::vector<std::vector<std::uint32_t>> members;
     std::uint32_t                           unions = 0;
+    // D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC: forbidden-pair
+    // inspections performed by the anti-affinity veto. It is the ALGORITHM'S
+    // OWN WORK, not a clock, which is what makes it a usable complexity pin: it
+    // is deterministic, host-independent, and identical under load. ⓘ An
+    // OBSERVATION, never an input to a decision — nothing reads it to choose
+    // anything, so a drifted counter cannot change what is emitted.
+    //
+    // ⚠ TWO COUNTERS, BECAUSE ONE CANNOT SAY WHAT A PIN NEEDS TO HEAR.
+    // `antiAffinityQueries` is how many times the veto was ASKED; `probes` is
+    // how many forbidden pairs it INSPECTED to answer. The old flat scan made
+    // `probes == queries x |forbidden|`. The index routinely answers a query by
+    // inspecting NOTHING — a straddling pair is incident to BOTH classes, so an
+    // empty incidence list on either side settles it — which makes a legitimate
+    // `probes == 0`. With only `probes`, a pin could not tell "the index made
+    // this free" from "the veto is no longer on the path at all", and the second
+    // reading is a correctness regression wearing a performance win's clothes.
+    std::uint64_t                           antiAffinityQueries = 0;
+    std::uint64_t                           antiAffinityProbes  = 0;
 
     [[nodiscard]] std::uint32_t find(std::uint32_t x) noexcept {
         while (parent[x] != x) {
@@ -1713,13 +1770,78 @@ buildCoalescePartition(CoalesceInput const&             in,
     // Anti-affinity is checked against the CLASSES being merged, so it must be
     // asked as "does any forbidden pair straddle these two roots" — a pair
     // whose two ends have already been pulled into one class by an unrelated
-    // chain would otherwise slip through. Kept as a flat list and re-resolved
-    // through `find` on every query: the lists are short (one entry per untied
-    // register operand of a 2-address instruction) and re-resolution is what
-    // keeps the answer true as the partition evolves.
+    // chain would otherwise slip through. Re-resolution through `find` at query
+    // time is what keeps the answer true as the partition evolves.
+    //
+    // ── D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC ─────────────────────
+    //
+    // ★★★ THIS QUERY USED TO RE-SCAN THE WHOLE `in.forbidden` LIST, ON THE
+    // WRITTEN PREMISE THAT "the lists are short (one entry per untied register
+    // operand of a 2-address instruction)". ✔MEASURED: that premise is a SIZE
+    // claim and it is false. "One entry per untied register operand of a
+    // 2-address instruction" is Θ(instructions) — one per 2-address
+    // instruction — not a constant. A single function of N straight-line
+    // `s += k;` statements lowers on x86-64 to N two-address `add`s, so it
+    // mints N forbidden pairs AND N copy edges, and the query runs once per
+    // edge: `|edges| x |forbidden|` = **N-squared** inner iterations, measured
+    // EXACTLY at 400 000 000 / 1 600 000 000 / 6 400 000 000 for N = 20 000 /
+    // 40 000 / 80 000. At N = 80 000 that was 5.2 s of an 8.3 s compile — 63%
+    // of the whole pipeline in a veto that returned false every single time,
+    // while gcc compiled the same file in 0.63 s and scaled at n^0.9.
+    //
+    // ★★ WHAT CHANGED IS THE INDEX, NOT THE PREDICATE. `incident[root]` holds
+    // the INDEX into `in.forbidden` of every pair one of whose ends currently
+    // resolves to `root`. Pair INDICES are stored rather than partner roots, so
+    // a merge never has to rewrite anybody's stored partner: the partner is
+    // re-resolved through `find` at query time, exactly as the flat scan did.
+    // The query therefore answers the IDENTICAL question — ∃ f : {find(f.a),
+    // find(f.b)} = {ra, rb} — and returns the identical bool. Only the ORDER in
+    // which candidate pairs are examined differs, and the result is a bool that
+    // does not depend on it.
+    //
+    // ⚠ THE VETO IS NOT WEAKENED, REMOVED OR CAPPED, AND THAT IS DELIBERATE.
+    // The block comment at its call site records a P40 red-on-disable arm
+    // proving it DORMANT on the corpus, with the structural argument that veto
+    // 1 implies it. That argument's premise lives in another file
+    // (`lir_liveness.cpp`'s use recording) and its failure mode is a SILENT
+    // miscompile (D-CSUBSET-BINOP-RIGHT-CLOBBER). Making a dormant correctness
+    // veto CHEAP is the fix; deleting it because it is dormant is the trade
+    // this project does not take, and a bail-out after k probes would turn a
+    // slow compile into a wrong one.
+    // ⚠ BUILT ONLY WHEN THERE IS SOMETHING TO INDEX, AND THAT IS NOT A
+    // MICRO-OPTIMIZATION. `incident` is one vector PER VREG, so sizing it
+    // unconditionally would cost ~24 bytes x the vreg count on every function —
+    // including every function that declares no two-address tie at all, which is
+    // the whole of arm64's `add` family. ✔MEASURED at this tree: the AArch64
+    // branch-island subject reaches 8.2 MILLION vregs in ONE function at 128 000
+    // statements, so an unconditional index would have added ~200 MB of empty
+    // vectors to precisely the compile this row's neighbourhood is already
+    // memory-stressed by. An empty `forbidden` cannot produce a straddle, so the
+    // absent index IS the answer rather than a shortcut around it.
+    std::vector<std::vector<std::uint32_t>> incident;
+    if (!in.forbidden.empty()) {
+        incident.resize(n);
+        for (std::uint32_t fi = 0;
+             fi < static_cast<std::uint32_t>(in.forbidden.size()); ++fi) {
+            auto const& f = in.forbidden[fi];
+            if (f.a >= n || f.b >= n) continue;  // the bounds test the scan made
+            if (f.a == f.b) continue;            // never straddles two roots
+            incident[f.a].push_back(fi);
+            incident[f.b].push_back(fi);
+        }
+    }
     auto const straddles = [&](std::uint32_t ra, std::uint32_t rb) {
-        for (auto const& f : in.forbidden) {
-            if (f.a >= n || f.b >= n) continue;
+        ++p.antiAffinityQueries;
+        if (incident.empty()) return false;  // no forbidden pair exists at all
+        // Scan the SHORTER incidence list. A pair that straddles `ra` and `rb`
+        // is incident to BOTH, so it appears in both lists and either one finds
+        // it; taking the shorter bounds a query by the SMALLER of the two
+        // classes rather than by the whole function.
+        auto const& side = incident[ra].size() <= incident[rb].size()
+                               ? incident[ra] : incident[rb];
+        for (std::uint32_t const fi : side) {
+            ++p.antiAffinityProbes;
+            auto const& f = in.forbidden[fi];
             auto const fa = p.find(f.a);
             auto const fb = p.find(f.b);
             if ((fa == ra && fb == rb) || (fa == rb && fb == ra)) return true;
@@ -1759,7 +1881,7 @@ buildCoalescePartition(CoalesceInput const&             in,
         // any merge that would put them together. Veto 1 therefore implies
         // veto 2 for any liveness analysis in which a use is live at the
         // position it is used, which is every correct one, split intervals
-        // (D-ML6-1.1) included.
+        // (D-PLAN12-SPLIT-AWARE-SUB-INTERVAL-LIRLIVERANGE-LIST-CURRENTLY-FLAT) included.
         //
         // ⇒ IT STAYS, DELIBERATELY, AS DEFENCE IN DEPTH WITH ITS PROOF
         // ATTACHED. What it guards — legalize's `mov result, operands[tied]`
@@ -1797,6 +1919,27 @@ buildCoalescePartition(CoalesceInput const&             in,
         p.members[keep].insert(p.members[keep].end(),
                                p.members[drop].begin(), p.members[drop].end());
         p.members[drop].clear();
+        // D-LIR-COALESCE-ANTI-AFFINITY-QUERY-IS-QUADRATIC: keep the incidence
+        // index true across the merge — the class that disappears hands its
+        // pairs to the survivor.
+        //
+        // ★ SMALL-TO-LARGE, AND THE SWAP IS WHAT MAKES IT SO. Which root
+        // SURVIVES is fixed above by the determinism rule (the lower id), so it
+        // cannot be chosen by list length; when the DROPPED class holds the
+        // longer list the two vectors are SWAPPED first and the shorter is
+        // appended into it. A pair index therefore only ever moves into a list
+        // at least as long as the one it left, so it moves at most log2(F)
+        // times and the whole partition costs O(F log F) — where appending the
+        // survivor's list into the dropped one unconditionally would reproduce
+        // the very O(N^2) this row removes, just one level down.
+        if (!incident.empty()) {
+            if (incident[keep].size() < incident[drop].size())
+                incident[keep].swap(incident[drop]);
+            incident[keep].insert(incident[keep].end(),
+                                  incident[drop].begin(), incident[drop].end());
+            incident[drop].clear();
+            incident[drop].shrink_to_fit();
+        }
         ++p.unions;
     }
     return p;
@@ -1831,7 +1974,7 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return out;
     }
 
-    // D-FF3-3 post-fold #5: callingConventionIndex now comes from
+    // D-FF3-3-RESOLVED-CC-INDEX-THREADED post-fold #5: callingConventionIndex now comes from
     // `resolveAbi(target, format)` resolution at compileOneTarget,
     // threaded through compileSingleUnit. The previous hardcoded
     // `0` silently dispatched non-ELF targets (e.g. PE64+x86_64)
@@ -1994,6 +2137,8 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     CoalescePartition part = buildCoalescePartition(
         coalesceIn, rangeOf, buildPressureMap(flow, classCapacity));
     out.coalescedCopies = part.unions;
+    out.coalesceAntiAffinityQueries = part.antiAffinityQueries;
+    out.coalesceAntiAffinityProbes  = part.antiAffinityProbes;
     // The PROOF travels with the allocation, not the outcome — see the field's
     // docblock. Sorted so the rewrite's membership test is a binary search over
     // a contract this line establishes rather than over the walk's happening to
@@ -2256,6 +2401,28 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                 appendEffectiveForbiddenOrdinals(lir, schema,
                                                  producingInst,
                                                  excludedScratch);
+            }
+            // ★★ P68 round 8 part 4 — AN INLINE-ASM STATEMENT'S OUTPUT AVOIDS
+            // THE STATEMENT'S CLOBBERED SET. The bundle defines an output at its
+            // LATE slot (an earlyclobber one at its EARLY slot), and the
+            // covering-range rule below consults the clobber entry at the EARLY
+            // slot — so a plain output's range, which starts one slot later,
+            // is never reached by it: the same gap the FC3.5 note above records
+            // for a 2-address result. GCC forbids an operand in a clobbered
+            // register outright, because the template may overwrite that
+            // register after it wrote the output. The flat lowering this
+            // replaced got the rule by accident, from whichever template line
+            // came after the defining one; the last line's output got nothing.
+            // Asked of the one helper: does THIS bundle define THIS vreg?
+            if (lir.instAsmRegion(producingInst) != nullptr) {
+                bool definesMember = false;
+                lirForEachInstDef(lir, producingInst, [&](LirReg d, bool) {
+                    if (d == mr.vreg) definesMember = true;
+                });
+                if (definesMember) {
+                    appendClobberedOrdinals(lir, schema, producingInst,
+                                            excludedScratch);
+                }
             }
         }
         }  // end per-member exclusion walk

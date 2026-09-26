@@ -134,7 +134,7 @@ linkNameFor(std::string_view canonicalName, std::string_view asmLabel,
 // fabricating semantics — operators usually ship clean libraries
 // and a missing prefix is rarely the user's bug. (Strict-mode
 // variant that errors on missing-prefix is anchored at
-// D-FF4-3 — pairs with FF5 ingest where the format-kind is
+// D-FF4-3-STRICT-MANGLE-PREFIX-CHECK — pairs with FF5 ingest where the format-kind is
 // known authoritative.)
 //
 // Empty input → empty output (mirrors `applyCMangling`).
@@ -173,7 +173,7 @@ struct DSS_EXPORT MangleError {
 //
 // Under the `none` scheme, strict mode is structurally a no-op: input passes
 // through unchanged and success is returned. The strict check only fires under
-// a decorating scheme (`leading-underscore` today; PE32 cdecl post-D-FF4-1).
+// a decorating scheme (`leading-underscore` today; PE32 cdecl post-D-FF4-1-PE32-STDCALL-DECORATION).
 //
 // Empty input → empty output success (mirrors `applyCMangling`
 // empty-input contract; an empty name is never "decorated" so there's

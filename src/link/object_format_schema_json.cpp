@@ -357,12 +357,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // (absence is "makes no claim", the deleted table's own behaviour for an
     // unlisted target), so the asymmetry applies in its harmless direction.
     // 32 + 1 = 33.
-    static constexpr std::array<std::string_view, 39> kFormatDocumentKeys{
+    // RE-DERIVED in P68 round 8 (D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH): two new
+    // root keys — `runpath` (WHERE an image of this format records the
+    // directories its loader searches for its libraries) and its remedy axis
+    // `runpathUnsupportedReason` (where the loader of an image format that
+    // records none looks instead). Both OPTIONAL, so the asymmetry applies in
+    // its harmless direction for every document that declares neither; the
+    // ten `runpath` documents and the two `runpathUnsupportedReason` ones land
+    // in the same change. 39 + 2 = 41 — the array's declared extent, checked
+    // by `DSS_CHECK_KEY_VOCABULARY`, not by this sentence.
+    // 41 -> 42 (P68 round 9): `relocationAddends`, where a relocatable object of
+    // this format keeps a relocation's addend (`RelocationAddendStorage`).
+    // 42 -> 43 (P68 round 9): `inputSectionPlacement`, whether the link may split
+    // a relocatable object's input section into independently placed atoms
+    // (`InputSectionPlacement`).
+    // 43 -> 44 (P68 round 12, lane `cs`): `enumCompatibleTypeRule`, the integer
+    // type an enumeration without a fixed underlying type is compatible with
+    // (`EnumCompatibleTypeRule`).
+    static constexpr std::array<std::string_view, 44> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
         "dataModel", "bitFieldStrategy", "longDoubleFormat",
-        "unnamedBitFieldAlignment",
+        "unnamedBitFieldAlignment", "enumCompatibleTypeRule",
         // the per-OS `#include` header-NAME case rule — a silent WRONG-ACCEPT
         // in one direction and a wrong REJECT in the other if it typos
         "headerNameMatching",
@@ -429,6 +446,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         "runtimeLibraries", "sehPersonality", "atomicsRuntime",
         // stack-reserve capability + its remedy axis
         "stackReserveControl", "stackReserveUnsupportedReason",
+        // where an image records its library search path (DT_RUNPATH /
+        // LC_RPATH), and its remedy axis. A typo in the first would leave the
+        // ten image documents that declare it recording NOTHING while the gate
+        // accepted every request.
+        "runpath", "runpathUnsupportedReason",
         // the weak-DEFINITION spelling (D-CONFIG-WEAK-DEFINITION-DIALECT-NOT-DECLARED).
         // A typo here does NOT silently default: the walker refuses
         // an unanswered schema the moment it meets a weak definition, so the
@@ -437,7 +459,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         // it at all.
         "weakDefinition",
         // section / relocation description
-        "sections", "relocations", "supportedDataSections",
+        "sections", "relocations", "relocationAddends", "inputSectionPlacement",
+        "supportedDataSections",
         // WHO RUNS THE STATIC-INITIALIZER SCHEDULE
         // (D-C-GNU-CONSTRUCTOR-ATTRIBUTE-IS-WARNED-AND-IGNORED-NOT-RUN). It sits
         // with the program-entry cluster in spirit — it answers a question about
@@ -514,7 +537,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         return std::unexpected(std::move(coll).release());
     }
     data.name = format.at("name").get<std::string>();
-    // Cross-tier symmetry with `target.name` (D-LK6-8.2 post-fold #2
+    // Cross-tier symmetry with `target.name` (D-PLAN14-CLOSED-2026-POST-FOLD-DRIVER-TIER-CROSSVALIDATETARGETFORMAT-TARGET post-fold #2
     // architect Q3): `format.name` is the label every walker
     // diagnostic message uses. An empty or whitespace-only name
     // would produce unintelligible diagnostics silently. The same
@@ -1231,6 +1254,35 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                           ", ")));
             } else {
                 data.longDoubleFormat = *lf;
+            }
+        }
+    }
+
+    // ── P68 round 12 (lane `cs`): OPTIONAL `enumCompatibleTypeRule` ──
+    //
+    // The per-format rule for the integer type an enumeration without a fixed
+    // underlying type is compatible with ("msvc" / "gnu"; see
+    // `EnumCompatibleTypeRule`). OPTIONAL: absent ⇒ None — an enumeration without a
+    // fixed type is then S_EnumCompatibleTypeRuleUndeclared at semantic bind, never
+    // a silent pick. A wrong spelling is a HARD error; `None` has no spelling.
+    if (doc.contains("enumCompatibleTypeRule")) {
+        if (!doc.at("enumCompatibleTypeRule").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/enumCompatibleTypeRule",
+                      std::format("'enumCompatibleTypeRule' must be a string ({})",
+                                  allowedList(allNames(kEnumCompatibleTypeRuleTable),
+                                              ", ")));
+        } else {
+            auto const s = doc.at("enumCompatibleTypeRule").get<std::string>();
+            auto const rule = enumCompatibleTypeRuleFromName(s);
+            if (!rule) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/enumCompatibleTypeRule",
+                          std::format("unknown enumCompatibleTypeRule '{}' — expected "
+                                      "{}", s,
+                                      allowedList(
+                                          allNames(kEnumCompatibleTypeRuleTable),
+                                          ", ")));
+            } else {
+                data.enumCompatibleTypeRule = *rule;
             }
         }
     }
@@ -2480,8 +2532,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             "schema declares kind '{}'. The '{}' walker "
                             "would silently DROP a stack-reserve request "
                             "routed to it. Fix the vehicle or the "
-                            "format.kind. D-SQLITE-PE64-FULL-TIER-STACK-"
-                            "DEPTH.",
+                            "format.kind. "
+                            "D-SQLITE-PE64-FULL-TIER-STACK-DEPTH.",
                             stackReserveVehicleName(info.vehicle),
                             implementer != nullptr
                                 ? std::string{implementer->configName()}
@@ -2542,6 +2594,200 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             } else {
                 data.stackReserveUnsupportedReason = *r;
             }
+        }
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `runpath` block — WHETHER an image
+    // of this format records the directories its loader searches for its
+    // libraries, and in WHICH structure. PRESENCE is the capability: the gate
+    // and both writers ask `runpath().has_value()`, never a format identity,
+    // and a request against a format that declares nothing is ACCEPTED with a
+    // warning (both PE references accept it and emit nothing — measured).
+    //
+    // This tier reads the KEYS, and they are closed PER CARRIER: `dynamicTag`
+    // and `separator` belong to `elf-dynamic-entry`, `loadCommand` to
+    // `macho-load-command`, and a key of the other arm would load clean and be
+    // read by nothing, so it is refused by name. The VALUES are judged by
+    // `validate()`, through the one rule set the writers run too
+    // (`runpathDeclarationProblems`) plus the two rules that need the backend.
+    if (doc.contains("runpath")) {
+        auto const& rp = doc.at("runpath");
+        if (!rp.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/runpath",
+                      std::format("'runpath' must be an object {{ \"carrier\": "
+                                  "{}, \"origin\": \"<this format's spelling of "
+                                  "the image's own directory>\", <the carrier's "
+                                  "own keys> }}",
+                                  allowedList(allNames(kRunpathCarrierTable),
+                                              " | ")));
+        } else {
+            static constexpr std::array<std::string_view, 2> kCommonKeys{
+                "carrier", "origin"};
+            static constexpr std::array<std::string_view, 2> kElfArmKeys{
+                "dynamicTag", "separator"};
+            static constexpr std::array<std::string_view, 1> kMachOArmKeys{
+                "loadCommand"};
+            DSS_CHECK_KEY_VOCABULARY(kCommonKeys);
+            DSS_CHECK_KEY_VOCABULARY(kElfArmKeys);
+            DSS_CHECK_KEY_VOCABULARY(kMachOArmKeys);
+            auto const armKeys = [](RunpathCarrier c)
+                -> std::span<std::string_view const> {
+                switch (c) {
+                    case RunpathCarrier::ElfDynamicEntry:  return kElfArmKeys;
+                    case RunpathCarrier::MachoLoadCommand: return kMachOArmKeys;
+                    case RunpathCarrier::Unspecified:      break;
+                }
+                return {};
+            };
+            auto const armOwning = [&](std::string_view key) -> std::string_view {
+                for (auto const& row : kRunpathCarrierTable.rows) {
+                    for (std::string_view k : armKeys(row.first)) {
+                        if (k == key) return row.second;
+                    }
+                }
+                return {};
+            };
+
+            RunpathDeclaration decl{};
+            bool ok = true;
+            if (!rp.contains("carrier") || !rp.at("carrier").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/runpath/carrier",
+                          std::format("'runpath.carrier' is required and must "
+                                      "be a string — accepted: {}",
+                                      allowedList(
+                                          allNames(kRunpathCarrierTable), ", ")));
+                ok = false;
+            } else {
+                auto const s = rp.at("carrier").get<std::string>();
+                auto const c = runpathCarrierFromName(s);
+                if (!c.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/runpath/carrier",
+                              std::format("unknown runpath carrier '{}' — "
+                                          "accepted: {}. A carrier names a "
+                                          "structure some walker records; a "
+                                          "spelling none records would accept "
+                                          "every request and write nothing.",
+                                          s,
+                                          allowedList(
+                                              allNames(kRunpathCarrierTable),
+                                              ", ")));
+                    ok = false;
+                } else {
+                    decl.carrier = *c;
+                }
+            }
+            if (ok) {
+                // `common + the declared arm's own`: a key of the OTHER arm is
+                // named as such, not as a typo.
+                std::vector<std::string_view> allowed{kCommonKeys.begin(),
+                                                      kCommonKeys.end()};
+                for (std::string_view k : armKeys(decl.carrier)) {
+                    allowed.push_back(k);
+                }
+                rejectUnknownArmKeys(rp, allowed, "/runpath",
+                                     "the 'runpath' block",
+                                     runpathCarrierName(decl.carrier),
+                                     armOwning, coll);
+            } else {
+                // No arm could be resolved: still refuse what belongs to NO
+                // arm, so a typo is not hidden behind the carrier diagnostic.
+                std::vector<std::string_view> anyArm{kCommonKeys.begin(),
+                                                     kCommonKeys.end()};
+                anyArm.insert(anyArm.end(), kElfArmKeys.begin(), kElfArmKeys.end());
+                anyArm.insert(anyArm.end(), kMachOArmKeys.begin(),
+                              kMachOArmKeys.end());
+                rejectUnknownKeys(rp, anyArm, "/runpath", "the 'runpath' block",
+                                  coll);
+            }
+
+            auto const readString = [&](char const* key, std::string& out) {
+                auto const ptr = std::string{"/runpath/"} + key;
+                if (!rp.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, ptr,
+                              std::format("'runpath.{}' is required for carrier "
+                                          "'{}'", key,
+                                          runpathCarrierName(decl.carrier)));
+                    ok = false;
+                    return;
+                }
+                if (!rp.at(key).is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, ptr,
+                              std::format("'runpath.{}' must be a string", key));
+                    ok = false;
+                    return;
+                }
+                out = rp.at(key).get<std::string>();
+            };
+            auto const readUnsigned = [&](char const* key, std::uint64_t max,
+                                          std::uint64_t& out) {
+                auto const ptr = std::string{"/runpath/"} + key;
+                if (!rp.contains(key)) {
+                    coll.emit(DiagnosticCode::C_MissingField, ptr,
+                              std::format("'runpath.{}' is required for carrier "
+                                          "'{}'", key,
+                                          runpathCarrierName(decl.carrier)));
+                    ok = false;
+                    return;
+                }
+                // `is_number_unsigned` refuses a negative and a float in one
+                // check, so a `-1` can never wrap into a huge value.
+                if (!rp.at(key).is_number_unsigned()
+                    || rp.at(key).get<std::uint64_t>() > max) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, ptr,
+                              std::format("'runpath.{}' must be a non-negative "
+                                          "integer no greater than {}", key, max));
+                    ok = false;
+                    return;
+                }
+                out = rp.at(key).get<std::uint64_t>();
+            };
+
+            if (ok) {
+                readString("origin", decl.origin);
+                switch (decl.carrier) {
+                    case RunpathCarrier::ElfDynamicEntry:
+                        readUnsigned("dynamicTag",
+                                     std::numeric_limits<std::uint64_t>::max(),
+                                     decl.dynamicTag);
+                        readString("separator", decl.separator);
+                        break;
+                    case RunpathCarrier::MachoLoadCommand: {
+                        std::uint64_t cmd = 0;
+                        readUnsigned("loadCommand",
+                                     std::numeric_limits<std::uint32_t>::max(),
+                                     cmd);
+                        decl.loadCommand = static_cast<std::uint32_t>(cmd);
+                        break;
+                    }
+                    case RunpathCarrier::Unspecified:
+                        break;
+                }
+            }
+            if (ok) data.runpath = std::move(decl);
+        }
+    }
+
+    // D-LK-IMAGE-CANNOT-DECLARE-A-RUNPATH: `runpathUnsupportedReason` — the
+    // REMEDY axis, the `stackReserveUnsupportedReason` shape. Not a second
+    // capability: it declares WHERE this image format's loader finds a library
+    // when the format records no runpath, so the warning can say so. The
+    // exclusivity with `runpath` and the image-flavor rule are `validate()`'s.
+    if (doc.contains("runpathUnsupportedReason")) {
+        auto const& rr = doc.at("runpathUnsupportedReason");
+        std::optional<RunpathUnsupportedReason> reason;
+        if (rr.is_string()) {
+            reason = runpathUnsupportedReasonFromName(rr.get<std::string>());
+        }
+        if (!reason.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/runpathUnsupportedReason",
+                      std::format("'runpathUnsupportedReason' must be one of: "
+                                  "{}",
+                                  allowedList(
+                                      allNames(kRunpathUnsupportedReasonTable),
+                                      ", ")));
+        } else {
+            data.runpathUnsupportedReason = *reason;
         }
     }
 
@@ -2653,8 +2899,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                             "after the config that broke it was written. Fix "
                             "the dialect or the format.kind. Dialects '{}' "
                             "writes: {}. "
-                            "D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-"
-                            "AND-MACHO-WRITERS.",
+                            "D-LK-WEAK-DEFINITION-DIALECT-UNCONSULTED-BY-ELF-AND-MACHO-WRITERS.",
                             weakDefinitionDialectName(*dv), spelledBy,
                             backend->configName(), backend->configName(),
                             backend->configName(),
@@ -2887,23 +3132,29 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     // ── PER-ARM typo discriminator ──────────────────────
                     //
                     // Same rule as `processExit`: `mechanism` is the only key
-                    // both arms read, and the stack-vector arm's two offsets
-                    // are meaningless to the CRT arm (and its eight fields
-                    // meaningless to stack-vector). `ArgsMechanism` has
+                    // both arms read, and the stack-vector arm's layout fields
+                    // are meaningless to the CRT arm (and the CRT arm's export
+                    // names meaningless to stack-vector). `ArgsMechanism` has
                     // exactly three enumerators and `none` is refused above,
                     // so these two arms are exhaustive.
                     static constexpr std::array<std::string_view, 1>
                         kProcessArgsCommonKeys{"mechanism"};
-                    static constexpr std::array<std::string_view, 2>
+                    static constexpr std::array<std::string_view, 4>
                         kProcessArgsStackVectorKeys{"argcStackOffset",
-                                                    "argvStackOffset"};
-                    static constexpr std::array<std::string_view, 8>
+                                                    "argvStackOffset",
+                                                    "envpFollowsArgvTerminator",
+                                                    "vectorSlotBytes"};
+                    static constexpr std::array<std::string_view, 12>
                         kProcessArgsCrtKeys{"role", "configureNarrowArgvFn",
                                             "configureWideArgvFn",
                                             "argcAccessorFn",
                                             "narrowArgvAccessorFn",
                                             "wideArgvAccessorFn", "argvMode",
-                                            "argvUnavailableExitStatus"};
+                                            "argvUnavailableExitStatus",
+                                            "initializeNarrowEnvironmentFn",
+                                            "narrowEnvironmentAccessorFn",
+                                            "initializeWideEnvironmentFn",
+                                            "wideEnvironmentAccessorFn"};
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCommonKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsStackVectorKeys);
                     DSS_CHECK_KEY_VOCABULARY(kProcessArgsCrtKeys);
@@ -2976,6 +3227,58 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         }
                         if (!requireOffset("argvStackOffset",
                                            out.argvStackOffset)) {
+                            armOk = false;
+                        }
+                        // D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: where the
+                        // environment vector sits in the same layout. OPTIONAL
+                        // here (only a format realizing an environment verb
+                        // declares it — `validate()` holds the two together),
+                        // but WHOLE when present: a vector position with no
+                        // slot width, or a width for no vector, is refused.
+                        bool const hasEnvpKey =
+                            pa.contains("envpFollowsArgvTerminator");
+                        bool const hasSlotKey = pa.contains("vectorSlotBytes");
+                        if (hasEnvpKey
+                         && !pa.at("envpFollowsArgvTerminator").is_boolean()) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processArgs/envpFollowsArgvTerminator",
+                                      "'envpFollowsArgvTerminator' must be a "
+                                      "boolean (the environment vector starts one "
+                                      "slot past argv's NULL terminator)");
+                            armOk = false;
+                        } else if (hasEnvpKey) {
+                            out.envpFollowsArgvTerminator =
+                                pa.at("envpFollowsArgvTerminator").get<bool>();
+                        }
+                        if (hasSlotKey) {
+                            auto const& slot = pa.at("vectorSlotBytes");
+                            if (!slot.is_number_unsigned()
+                             || slot.get<std::uint64_t>() == 0
+                             || slot.get<std::uint64_t>() > 64) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          "/processArgs/vectorSlotBytes",
+                                          "'vectorSlotBytes' must be an unsigned "
+                                          "slot width in bytes, 1..64 (the width "
+                                          "of one entry-stack vector slot)");
+                                armOk = false;
+                            } else {
+                                out.vectorSlotBytes = static_cast<std::uint32_t>(
+                                    slot.get<std::uint64_t>());
+                            }
+                        }
+                        if (armOk
+                         && out.envpFollowsArgvTerminator != hasSlotKey) {
+                            coll.emit(DiagnosticCode::C_MalformedJson,
+                                      "/processArgs",
+                                      out.envpFollowsArgvTerminator
+                                          ? "'envpFollowsArgvTerminator' is true "
+                                            "but 'vectorSlotBytes' is absent — "
+                                            "the environment vector's position "
+                                            "needs the slot width to be computed"
+                                          : "'vectorSlotBytes' is declared but "
+                                            "'envpFollowsArgvTerminator' is not "
+                                            "true — a slot width for no "
+                                            "environment vector is dead config");
                             armOk = false;
                         }
                     } else {
@@ -3109,6 +3412,45 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                         static_cast<std::int32_t>(v);
                                 }
                             }
+                            // D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE: the ENVIRONMENT
+                            // pair per width — OPTIONAL here (only a format
+                            // realizing that width's environment verb declares
+                            // it; `validate()` holds verbs and pairs together),
+                            // but a PAIR: an initialize call with no accessor, or
+                            // an accessor with no initialize call, is refused.
+                            auto optionalPair =
+                                [&](char const* initField, std::string& initDst,
+                                    char const* accField, std::string& accDst) {
+                                    bool const hasInit = pa.contains(initField);
+                                    bool const hasAcc  = pa.contains(accField);
+                                    if (hasInit && !requireStr(initField, initDst)) {
+                                        armOk = false;
+                                    }
+                                    if (hasAcc && !requireStr(accField, accDst)) {
+                                        armOk = false;
+                                    }
+                                    if (hasInit != hasAcc) {
+                                        coll.emit(
+                                            DiagnosticCode::C_MalformedJson,
+                                            std::string{"/processArgs/"}
+                                                + (hasInit ? accField : initField),
+                                            std::format(
+                                                "'{}' and '{}' are a PAIR (the "
+                                                "initialize call, then the "
+                                                "accessor whose result is the "
+                                                "vector) — declare both or "
+                                                "neither", initField, accField));
+                                        armOk = false;
+                                    }
+                                };
+                            optionalPair("initializeNarrowEnvironmentFn",
+                                         out.initializeNarrowEnvironmentFn,
+                                         "narrowEnvironmentAccessorFn",
+                                         out.narrowEnvironmentAccessorFn);
+                            optionalPair("initializeWideEnvironmentFn",
+                                         out.initializeWideEnvironmentFn,
+                                         "wideEnvironmentAccessorFn",
+                                         out.wideEnvironmentAccessorFn);
                         } else {
                             // Closed-enum discipline: a new ArgsMechanism member
                             // must add its own field-set arm HERE. Falling through
@@ -3430,6 +3772,112 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 }
                 info.emitOnly = r.at("emitOnly").get<bool>();
             }
+            // P68 round 9: the wire type by the bytes that follow the patched
+            // field (Mach-O X86_64_RELOC_SIGNED_1/_2/_4) — see
+            // `ObjectFormatRelocationInfo::nativeIdByBytesAfterField`. What the
+            // entries must BE is `validate()`'s; this reads their shape.
+            if (r.contains("nativeIdByBytesAfterField")) {
+                auto const& arr = r.at("nativeIdByBytesAfterField");
+                auto const base =
+                    std::format("/relocations/{}/nativeIdByBytesAfterField", i);
+                if (!arr.is_array()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, base,
+                           "'nativeIdByBytesAfterField' must be an array of "
+                           "{ bytesAfterField, nativeId }");
+                    return false;
+                }
+                for (std::size_t j = 0; j < arr.size(); ++j) {
+                    auto const& e = arr[j];
+                    auto const path = std::format("{}/{}", base, j);
+                    static constexpr std::array<std::string_view, 2>
+                        kBytesAfterKeys{"bytesAfterField", "nativeId"};
+                    DSS_CHECK_KEY_VOCABULARY(kBytesAfterKeys);
+                    if (!e.is_object()
+                        || !e.contains("bytesAfterField")
+                        || !e.at("bytesAfterField").is_number_integer()
+                        || !e.contains("nativeId")
+                        || !e.at("nativeId").is_number_integer()) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               "each entry is { \"bytesAfterField\": <1..255>, "
+                               "\"nativeId\": <wire type> }");
+                        return false;
+                    }
+                    bool entryClean = true;
+                    detail::rejectUnknownKeys(e, kBytesAfterKeys,
+                        "a nativeIdByBytesAfterField entry",
+                        [&](std::string_view key, std::string message) {
+                            c.emit(DiagnosticCode::C_MalformedJson,
+                                   std::format("{}/{}", path, key),
+                                   std::move(message));
+                            entryClean = false;
+                        });
+                    if (!entryClean) return false;
+                    std::int64_t const n = e.at("bytesAfterField").get<std::int64_t>();
+                    std::int64_t const v = e.at("nativeId").get<std::int64_t>();
+                    if (n < 0 || n > 0xFF || v < 0 || v > 0xFFFFFFFFLL) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               std::format("bytesAfterField ({}) must be in "
+                                           "[0, 255] and nativeId ({}) in "
+                                           "[0, 2^32)", n, v));
+                        return false;
+                    }
+                    info.nativeIdByBytesAfterField.push_back(
+                        ObjectFormatRelocationInfo::BytesAfterFieldNativeId{
+                            static_cast<std::uint8_t>(n),
+                            static_cast<std::uint32_t>(v)});
+                }
+            }
+            // P68 round 9: the instruction words a SHARED wire type decodes to
+            // this row for (Mach-O arm64 ARM64_RELOC_PAGEOFF12) — see
+            // `ObjectFormatRelocationInfo::decodeWhenInstruction`. What the
+            // family must BE is `validate()`'s; this reads the shape.
+            if (r.contains("decodeWhenInstruction")) {
+                auto const& arr = r.at("decodeWhenInstruction");
+                auto const base =
+                    std::format("/relocations/{}/decodeWhenInstruction", i);
+                if (!arr.is_array() || arr.empty()) {
+                    c.emit(DiagnosticCode::C_MalformedJson, base,
+                           "'decodeWhenInstruction' must be a non-empty array "
+                           "of { mask, value }");
+                    return false;
+                }
+                for (std::size_t j = 0; j < arr.size(); ++j) {
+                    auto const& e = arr[j];
+                    auto const path = std::format("{}/{}", base, j);
+                    static constexpr std::array<std::string_view, 2>
+                        kPatternKeys{"mask", "value"};
+                    DSS_CHECK_KEY_VOCABULARY(kPatternKeys);
+                    if (!e.is_object()
+                        || !e.contains("mask") || !e.at("mask").is_number_integer()
+                        || !e.contains("value") || !e.at("value").is_number_integer()) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               "each entry is { \"mask\": <u32>, \"value\": <u32> }");
+                        return false;
+                    }
+                    bool entryClean = true;
+                    detail::rejectUnknownKeys(e, kPatternKeys,
+                        "a decodeWhenInstruction entry",
+                        [&](std::string_view key, std::string message) {
+                            c.emit(DiagnosticCode::C_MalformedJson,
+                                   std::format("{}/{}", path, key),
+                                   std::move(message));
+                            entryClean = false;
+                        });
+                    if (!entryClean) return false;
+                    std::int64_t const m = e.at("mask").get<std::int64_t>();
+                    std::int64_t const v = e.at("value").get<std::int64_t>();
+                    if (m < 0 || m > 0xFFFFFFFFLL || v < 0 || v > 0xFFFFFFFFLL) {
+                        c.emit(DiagnosticCode::C_MalformedJson, path,
+                               std::format("mask ({}) and value ({}) must each "
+                                           "be in [0, 2^32)", m, v));
+                        return false;
+                    }
+                    info.decodeWhenInstruction.push_back(
+                        ObjectFormatRelocationInfo::InstructionPattern{
+                            static_cast<std::uint32_t>(m),
+                            static_cast<std::uint32_t>(v)});
+                }
+            }
             // ── TYPO DISCRIMINATOR FOR THE RELOCATION ROW ────────────────
             //
             // Every field above is read with `r.contains(...)`, so an
@@ -3460,8 +3908,9 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // (`opt/optimizer_json.cpp`, `ffi/shipped_lib_descriptor.cpp`)
             // missing the `$`-prose carve-out outright. The TABLE stays here,
             // with the fields it describes — only the loop moved.
-            static constexpr std::array<std::string_view, 6> kRelocationRowKeys{
-                "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly"};
+            static constexpr std::array<std::string_view, 8> kRelocationRowKeys{
+                "name", "kind", "nativeId", "pltNativeId", "isCall", "emitOnly",
+                "nativeIdByBytesAfterField", "decodeWhenInstruction"};
             DSS_CHECK_KEY_VOCABULARY(kRelocationRowKeys);
             bool rowClean = true;
             detail::rejectUnknownKeys(r, kRelocationRowKeys, "a relocation row",
@@ -3480,6 +3929,48 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 });
             return rowClean;
         });
+
+    // relocationAddends — WHERE a relocatable object of this format keeps a
+    // relocation's addend (`RelocationAddendStorage`, P68 round 9). Required
+    // alongside a non-empty `relocations` (`validate()`); read here by name
+    // through the closed table, so a typo is refused naming the values.
+    if (doc.contains("relocationAddends")) {
+        auto const& v = doc.at("relocationAddends");
+        auto const storage =
+            v.is_string()
+                ? kRelocationAddendStorageTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!storage.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/relocationAddends",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kRelocationAddendStorageTable),
+                                      ", ")));
+        } else {
+            data.relocationAddendStorage = *storage;
+        }
+    }
+
+    // inputSectionPlacement — whether the link may split a relocatable object's
+    // input section into independently placed atoms (`InputSectionPlacement`,
+    // P68 round 9). Required alongside a non-empty `relocations` (`validate()`);
+    // read by name through the closed table.
+    if (doc.contains("inputSectionPlacement")) {
+        auto const& v = doc.at("inputSectionPlacement");
+        auto const placement =
+            v.is_string()
+                ? kInputSectionPlacementTable.fromName(v.get<std::string>())
+                : std::nullopt;
+        if (!placement.has_value()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/inputSectionPlacement",
+                      std::format("expected one of: {}",
+                                  allowedList(
+                                      allNames(kInputSectionPlacementTable),
+                                      ", ")));
+        } else {
+            data.inputSectionPlacement = *placement;
+        }
+    }
 
     // sections[] — D-LK4-2 schema row. Each entry maps a universal
     // SectionKind to format-native name + structural fields.

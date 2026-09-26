@@ -243,7 +243,7 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
         return std::nullopt;
     }
 
-    // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE) — never inline a callee the SOURCE
+    // Rule 2b: TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK) — never inline a callee the SOURCE
     // declared `__attribute__((noinline))`. Unlike every other rule here this
     // one is not the optimizer protecting itself from an unsound splice; it is
     // the optimizer OBEYING an explicit directive, so it is unconditional and
@@ -686,8 +686,9 @@ mapCallerOperand(MirInstId callerOp,
             "dss::opt::passes::Inlining fatal: caller Call v=%u "
             "operand v=%u has no rewrite entry during splice — "
             "operands must be emitted before the Call in block/RPO "
-            "order (D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
+            "order.\n",
             oldCall.v, callerOp.v);
+        // Anchored: D-OPT2-REWRITE-MAP-COMPLETENESS (unreachable: the abort below).
         std::abort();
     }
     return *mapped;
@@ -758,8 +759,9 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
             "reached emitCalleeInst — spliceMultiBlock handles callee Phis "
             "BEFORE dispatching here (deferred placeholder + flush), and a "
             "single-block leaf is Return-terminated so it has no Phi; a Phi "
-            "here is a structural violation (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n",
+            "here is a structural violation.\n",
             callee.v);
+        // Anchored: D-OPT7-MULTIBLOCK-SPLICE-PHI (unreachable: the abort below).
         std::abort();
     }
     auto const cops = src.instOperands(cid);
@@ -908,9 +910,9 @@ private:
                         "dss::opt::passes::Inlining fatal: single-block "
                         "callee funcId v=%u terminates with non-Return "
                         "opcode %d — the legality gate admitted a body "
-                        "the splice can't thread a return value through "
-                        "(D-OPT7-INLINE-LEGALITY-GATE).\n",
+                        "the splice can't thread a return value through.\n",
                         callee.v, static_cast<int>(cop));
+                    // Anchored: D-OPT7-INLINE-LEGALITY-GATE (unreachable: the abort below).
                     std::abort();
                 }
                 break;  // terminator is the last inst
@@ -1022,7 +1024,7 @@ public:
             std::chrono::steady_clock::time_point t0;
             ~Acc() { if (optRebuildTraceEnabled()) optRebuildNsAdd(t0); }
         } const rebuildAcc_{rebuildT0};
-        // TF-C78 (D-CSUBSET-NOINLINE): the inliner's OWN rebuild must carry the
+        // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the inliner's OWN rebuild must carry the
         // flag too. A `noinline` function is still a CALLER (it may inline other
         // functions INTO itself — the attribute constrains splicing it OUT, not
         // in), so its rebuilt copy has to keep the bit or the refusal survives
@@ -1191,9 +1193,9 @@ private:
             std::fprintf(stderr,
                 "dss::opt::passes::Inlining fatal: caller inst v=%u "
                 "operand v=%u has no rewrite entry during multi-block "
-                "rebuild — RPO/scan-order violation "
-                "(D-OPT2-REWRITE-MAP-COMPLETENESS).\n",
+                "rebuild — RPO/scan-order violation.\n",
                 user.v, callerOld.v);
+            // Anchored: D-OPT2-REWRITE-MAP-COMPLETENESS (unreachable: the abort below).
             std::abort();
         }
         return it->second;
@@ -1258,9 +1260,9 @@ private:
                 std::fprintf(stderr,
                     "dss::opt::passes::Inlining fatal: caller BlockAddress v=%u "
                     "targets block v=%u, which is not in blockMap_ — every caller "
-                    "block is pre-created in phase 1 "
-                    "(D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST).\n",
+                    "block is pre-created in phase 1.\n",
                     id.v, oldTarget.v);
+                // Anchored: D-CG-INLINE-MULTIBLOCK-INTO-COMPUTED-GOTO-HOST (unreachable: the abort below).
                 std::abort();
             }
             rewrite_.emplace(id.v,
@@ -1572,8 +1574,9 @@ private:
                         "dss::opt::passes::Inlining fatal: cloned callee "
                         "funcId v=%u phi v=%u incoming pred block v=%u not "
                         "in clone map — every callee block is pre-created in "
-                        "phase 1 (D-OPT7-MULTIBLOCK-SPLICE-PHI).\n",
+                        "phase 1.\n",
                         callee.v, oldPhi.v, inc.pred.v);
+                    // Anchored: D-OPT7-MULTIBLOCK-SPLICE-PHI (unreachable: the abort below).
                     std::abort();
                 }
                 dst_.addPhiIncoming(newPhi,
@@ -1653,8 +1656,9 @@ private:
                     std::fprintf(stderr,
                         "dss::inlining fatal: callee %u has a multi-piece struct "
                         "Return (%zu pieces); inlining by-value-struct-returning "
-                        "functions is unsupported (D-FC7-INLINE-MULTI-PIECE-RETURN).\n",
+                        "functions is unsupported: the legality gate must refuse the site.\n",
                         callee.v, static_cast<std::size_t>(cops.size()));
+                    // Anchored: D-FC7-INLINE-MULTI-PIECE-RETURN (unreachable: the abort below).
                     std::abort();
                 }
                 MirInstId rv{};
@@ -1954,8 +1958,8 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
         d.actual   = "opt::Inlining: a call site selected for inlining had "
                      "an argument count that did not match the callee's "
                      "parameter count — structural MIR violation; refusing "
-                     "to splice a wrong-arity body "
-                     "(D-OPT7-INLINE-LEGALITY-GATE).";
+                     "to splice a wrong-arity body.";
+        // Anchored: D-OPT7-INLINE-LEGALITY-GATE.
         reporter.report(std::move(d));
         // Do NOT install the partially-rebuilt module — return without
         // moving `builder` into `mir`. ok=false signals the engine.

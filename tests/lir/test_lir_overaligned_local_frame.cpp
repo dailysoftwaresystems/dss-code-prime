@@ -31,8 +31,9 @@
 //
 // ⚠ THIS FILE DELIBERATELY DOES NOT DRIVE THE UNIT-TIER FRONT END — and the
 // reason has CHANGED, so read this rather than inheriting the old one.
-// [[D-LIR-TEST-FRONT-END-LOWERS-A-MANY-ARG-CALL-TO-NOTHING-SO-PINS-MEASURE-ZERO]]
-// is CLOSED (P49): `lowerCToLir` no longer discards a refusal, and the reason it
+// The vacuity defect this used to cite — a front end lowering a many-arg call
+// to nothing, so the pins measured zero — was FIXED in P49: `lowerCToLir` no
+// longer discards a refusal, and the reason it
 // used to return `lowerOk` true over a mutilated module was a NULL `ffiMap` that
 // refused every source carrying a prototype — now threaded. So the old sentence
 // here ("any `tests/lir` pin whose subject is a frame, a spill or a saved

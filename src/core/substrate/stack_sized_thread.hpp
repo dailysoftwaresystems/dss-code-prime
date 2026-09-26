@@ -24,9 +24,9 @@
 // SIGBUS/SIGSEGV inside the compiler's own stack probe, with no diagnostic
 // and no failing assertion. That is the least fail-loud failure available.
 //
-// ⚠ ✔MEASURED 2026-08-25 (cycle P34,
-// D-TEST-LSP-HARNESS-RAN-THE-SERVER-LOOP-ON-A-HOST-DEFAULT-STACK): four LSP
-// tests died `Bus error` on macOS and nowhere else. The crash report named it
+// ⚠ ✔MEASURED 2026-08-25 (cycle P34), on an LSP harness that ran the server
+// loop on a host-DEFAULT stack: four LSP tests died `Bus error` on macOS and
+// nowhere else. The crash report named it
 // exactly — `EXC_BAD_ACCESS (SIGBUS)`, "Thread stack size exceeded", innermost
 // frame `___chkstk_darwin` — on a thread whose outermost frames were
 // `__thread_proxy` / `_pthread_start`, i.e. a plain `std::thread`. The
@@ -51,6 +51,21 @@
 // and a fallback would make the failure reappear as a crash on one host.
 
 namespace dss::substrate {
+
+// ── THE STACK OF A THREAD THAT DOES MAIN-THREAD WORK ────────────────────────
+// A thread that parses, analyzes, lowers to MIR or BUILDS A CONFIG SCHEMA is
+// doing what the driver otherwise does on its MAIN thread, so it gets the main
+// thread's stack: 8 MiB, the DOCUMENTED main-thread default on both POSIX hosts
+// this project gates on (glibc and macOS). Not a generous number — the number
+// the work already assumes. ✔MEASURED 2026-08-25 (P34): `buildSchemaFromJsonText`
+// alone is a 415,360-byte frame under clang -O0; ✔MEASURED 2026-09-25 (P68 round
+// 12, D-SUBSTRATE-WORKER-THREADS-TAKE-THE-HOST-DEFAULT-STACK): a COLD schema build
+// on a plain `std::thread` dies `Bus error` on macos-arm64-debug every run, where
+// the secondary-thread default is 512 KiB. Every thread that can reach such work
+// states THIS constant — the executor's workers and the tests that stand in for
+// them — so the amount has one owner. Reserved, not committed: a shallow job
+// touches about one page of it.
+inline constexpr std::size_t kMainThreadClassStackBytes = std::size_t{8} * 1024 * 1024;
 
 // Defined entirely inside stack_sized_thread.cpp: it holds the platform thread
 // handle, so naming it here would drag <pthread.h> / <windows.h> into every

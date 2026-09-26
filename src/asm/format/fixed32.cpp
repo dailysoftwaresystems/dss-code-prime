@@ -31,6 +31,12 @@ using walker_util::operandsMatchGuard;
 // vocabulary and a wider constant here.
 constexpr std::uint8_t kFixed32RegFieldBits = 5;
 
+// The width of ONE emitted word, in bytes — the defining property of this
+// encoding shape (it is the `32` in `fixed32`). Named because
+// D-CSUBSET-LONG-BRANCH derives an instruction-internal branch hop from
+// word POSITIONS, and `4` spelled inline there would read as an x86-ism.
+constexpr std::uint32_t kFixed32WordBytes = 4;
+
 // Per-slot bit-window descriptor. `lsb` is the bit position of the
 // slot's least-significant bit inside the 32-bit fixed word. `width`
 // is the slot's bit width.
@@ -38,6 +44,145 @@ struct SlotBitWindow {
     std::uint8_t lsb;
     std::uint8_t width;
 };
+
+// D-AS3-BLOCK-REL-IMM19-26 + D-CSUBSET-LONG-BRANCH: the block-relative
+// patch kind a slot denotes on this walker, or nullopt when the slot
+// carries no intra-function displacement at all. FACTORED OUT of the
+// `BlockRef` wire arm because the LONG-BRANCH escape election needs the
+// same question answered about wires it is not currently encoding —
+// two copies of this mapping could disagree about which slot is a
+// branch field, and the escape would then be elected onto a slot the
+// encoder refuses to patch.
+//
+// (Imm26 is DUAL-USE: a SymbolRef operand on Imm26 emits a `call26`
+// linker relocation [BL]; a BlockRef operand on it is the intra-function
+// `B`. This function answers only "could this slot carry a block-relative
+// displacement"; the OPERAND KIND decides whether it actually does.)
+[[nodiscard]] constexpr std::optional<walker_util::BlockRelPatchKind>
+blockRelKindForSlot(EncodingSlotKind k) noexcept {
+    if (k == EncodingSlotKind::Imm19)
+        return walker_util::BlockRelPatchKind::Arm64Imm19;
+    if (k == EncodingSlotKind::Imm26)
+        return walker_util::BlockRelPatchKind::Arm64Imm26;
+    if (k == EncodingSlotKind::Imm14)
+        return walker_util::BlockRelPatchKind::Arm64Imm14;
+    // P68 round 9: the one-word ADR naming a block of its own function.
+    if (k == EncodingSlotKind::AdrImm21)
+        return walker_util::BlockRelPatchKind::Arm64Adr21;
+    return std::nullopt;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// D-CSUBSET-LONG-BRANCH — ELECTING AN ESCAPE, FROM THE CONFIG ALONE
+// ─────────────────────────────────────────────────────────────────────
+//
+// ★★★ THE ESCAPE'S INSTRUCTION IS NOT SYNTHESIZED, IT IS QUOTED. A long-
+// branch thunk needs an unconditional branch with a wider displacement
+// field than the branch it rescues. Writing `0x14000000` into this walker
+// would hardcode one ISA's `B` into the shape-generic encoder — exactly the
+// agnosticism break `BlockRelPatchKind` was introduced to avoid. Instead the
+// escape word is COPIED from a word this opcode ALREADY DECLARES: the jcc
+// row's own 2-word macro is `B.cond <ifTrue>; B <ifFalse>`, so word 1 is
+// already a bare unconditional branch carrying the wider Imm26 field. The
+// escape is that word, aimed somewhere else.
+//
+// ⚠ THE SEARCH SPANS EVERY VARIANT OF THE OPCODE, NOT ONLY THE SELECTED
+// ONE, and that is what makes the FALLTHROUGH form escapable. The variant
+// that anchor names:
+//   D-OPT-JCC-FALLTHROUGH
+// drops the trailing `B` word entirely, so its own template holds no wide
+// field — but its sibling variant does, and they are the same instruction.
+//
+// ⚠ A WORD IS ONLY QUOTABLE IF IT IS SELF-CONTAINED. Copying a word that
+// also carries a register field, a result placement, or the cond nibble
+// would emit that word with those fields ZEROED — a valid encoding of a
+// DIFFERENT instruction, which is the silent-miscompile shape this project
+// names over and over. The election therefore requires the candidate word to
+// carry EXACTLY ONE wire (the block-relative one) and no result placement.
+//
+// ★★★ WORD 0 IS ADMISSIBLE EXACTLY WHEN THE OPCODE SAYS IT IS UNCONDITIONAL,
+// AND THAT REPLACES A BLANKET EXCLUSION WITH A CONFIG FACT.
+// [[D-CSUBSET-LONG-BRANCH]] round 5: the previous rule was "never word 0",
+// justified as "resultSlot + the cond nibble live here". Both halves of that
+// justification are things the config STATES — `resultSlot` is a field on the
+// variant and `condCodeFromPayload` a knob on its template — so the blanket
+// exclusion was answering a question it could have asked. Asking it matters,
+// because word 0 of an UNCONDITIONAL branch opcode is the only self-contained
+// branch word a single-word `jmp` row has, and that word is what a BRANCH
+// ISLAND is made of.
+//
+// ⚠ AND THE OPCODE'S OWN `terminatorKind` IS THE THIRD CONDITION, NOT AN
+// AFTERTHOUGHT. A quoted word is re-emitted at a place control can reach ONLY
+// by a branch aimed at it; if that word were CONDITIONAL, control could fall
+// out of the bottom of it into whatever follows — valid bytes, wrong
+// destination, no diagnostic. `condCodeFromPayload` catches the conditional
+// whose nibble the walker writes, but not one baked into a `fixedWord`
+// constant. `terminatorKind == Br` is the config's own sentence for "this
+// opcode transfers control unconditionally", so word 0 of a `Br` opcode is
+// unconditional BY DECLARATION. For a `CondBr` opcode word 0 is its
+// conditional half and stays excluded — which is the old rule, now derived
+// rather than assumed — while a LATER word of its macro is the unconditional
+// half by the same construction that made it the escape.
+struct EscapePlan {
+    std::uint32_t                  baseWord;   // the quoted, self-contained word
+    walker_util::BlockRelPatchKind kind;       // its block-relative field
+    std::int64_t                   byteReach;  // how far that field reaches
+};
+
+[[nodiscard]] inline std::optional<EscapePlan>
+electEscapeWord(TargetOpcodeInfo const& info) {
+    bool const opcodeIsUnconditionalBranch =
+        info.terminatorKind == TargetTerminatorKind::Br;
+    std::optional<EscapePlan> best;
+    for (auto const& variant : info.encoding.variants) {
+        for (auto const& wire : variant.wires) {
+            auto const kind = blockRelKindForSlot(wire.slotKind);
+            if (!kind.has_value()) continue;
+            std::size_t const w = wire.wordIndex;
+            if (w == 0) {
+                // resultSlot and the cond nibble implicitly live in word 0 —
+                // ask the config whether THIS variant puts them there.
+                if (!opcodeIsUnconditionalBranch) continue;
+                if (variant.resultSlot.has_value()) continue;
+                if (variant.tmpl.condCodeFromPayload) continue;
+            }
+            if (w >= variant.tmpl.wordCount()) continue;  // validate() bounds this
+            // Self-containment: this word may carry no other wire...
+            std::size_t wiresInWord = 0;
+            for (auto const& other : variant.wires)
+                if (other.wordIndex == w) ++wiresInWord;
+            if (wiresInWord != 1) continue;
+            // ...and no additional placement of the result register.
+            bool resultInWord = false;
+            for (auto const& extra : variant.extraResultSlots)
+                if (extra.wordIndex == w) resultInWord = true;
+            if (resultInWord) continue;
+            auto const reach = walker_util::blockRelByteReach(*kind);
+            if (!best.has_value() || reach > best->byteReach)
+                best = EscapePlan{variant.tmpl.wordAt(w), *kind, reach};
+        }
+    }
+    return best;
+}
+
+// [[D-CSUBSET-LONG-BRANCH]]: the elected word, as the ISLAND BODY the shared
+// resolver materializes. A `fixed32` word is four little-endian bytes and its
+// block-relative field is a window inside them, so the field begins at byte 0
+// of the body — the bit position comes from the geometry row, as everywhere
+// else. The conversion lives here rather than in the resolver because the
+// WORD-ness of the body is this walker's fact, not the resolver's.
+[[nodiscard]] inline walker_util::BranchIslandBody
+islandBodyOf(EscapePlan const& plan) noexcept {
+    walker_util::BranchIslandBody body;
+    body.bytes[0] = static_cast<std::uint8_t>(plan.baseWord & 0xFFu);
+    body.bytes[1] = static_cast<std::uint8_t>((plan.baseWord >> 8) & 0xFFu);
+    body.bytes[2] = static_cast<std::uint8_t>((plan.baseWord >> 16) & 0xFFu);
+    body.bytes[3] = static_cast<std::uint8_t>((plan.baseWord >> 24) & 0xFFu);
+    body.byteCount   = kFixed32WordBytes;
+    body.fieldOffset = 0;
+    body.kind        = plan.kind;
+    return body;
+}
 
 // (`PendingRelocSlot` hoisted to walker_util.hpp; alias kept minimal.)
 using walker_util::PendingRelocSlot;
@@ -69,7 +214,7 @@ windowFor(EncodingSlotKind s) noexcept {
         // byte offset at bits 12..20. The wire-loop range-checks signed
         // -256..255 and writes the low 9 bits (two's-complement).
         case EncodingSlotKind::Imm9:  return SlotBitWindow{ 12, 9 };
-        // Imm19 (D-AS3-BLOCK-REL-IMM19/26): AArch64 B.cond signed 19-bit
+        // Imm19 (D-AS3-BLOCK-REL-IMM19-26): AArch64 B.cond signed 19-bit
         // PC-relative branch offset at bits 5..23 (the cond nibble sits
         // at bits 0..3). BLOCK-RELATIVE — the walker writes ZERO bits
         // here (a BlockRef operand pushes a BlockRelPatch instead; the
@@ -78,6 +223,12 @@ windowFor(EncodingSlotKind s) noexcept {
         // resolver-side lsb/width derivation symmetry; the encoder's
         // BlockRef arm bypasses orInto (no immediate written upfront).
         case EncodingSlotKind::Imm19: return SlotBitWindow{ 5,  19 };
+        // Imm14 ([[D-CSUBSET-LONG-BRANCH]]): AArch64 TBZ/TBNZ signed 14-bit
+        // PC-relative branch offset at bits 5..18. BLOCK-RELATIVE, exactly like
+        // Imm19 — the walker writes ZERO bits here (a BlockRef operand pushes a
+        // BlockRelPatch instead) except when the branch takes an island hop,
+        // which is an ordinary write through this window.
+        case EncodingSlotKind::Imm14: return SlotBitWindow{ 5,  14 };
         // MemBaseNoScale (D-LK10-ENTRY-ARM64): width-0 marker for a
         // memory-base operand on an ISA with no scale field (AArch64
         // unscaled). orInto with width 0 writes nothing but marks the
@@ -124,6 +275,17 @@ windowFor(EncodingSlotKind s) noexcept {
         // operand's bitwise COMPLEMENT `~V` rather than `V`, which is the
         // Imm12 vs Imm12Scaled relationship one field over.
         case EncodingSlotKind::Imm16Inverted: return SlotBitWindow{ 5, 16 };
+        // ElementIndex (P68 round 8): the AdvSIMD copy class's `imm5` at bits
+        // 16..20 — the whole field; the wire arm computes its content (the
+        // element's size bit and index) from the paired element field.
+        case EncodingSlotKind::ElementIndex:  return SlotBitWindow{ 16, 5 };
+        // AdrImm21 (P68 round 9): the one-word ADR's immhi at bits 5..23; its
+        // immlo [30:29] is written by the block-relative patch with it
+        // (`blockRelFieldGeometry(Arm64Adr21)`). The walker writes no bits.
+        case EncodingSlotKind::AdrImm21:      return SlotBitWindow{ 5, 19 };
+        // BlockAddend (P68 round 9): a width-0 marker, like MemBaseNoScale —
+        // its operand rides the block patch, not a field.
+        case EncodingSlotKind::BlockAddend:   return SlotBitWindow{ 0, 0 };
         // SymbolPatchMarker (D-AS4-3): width-0 symbol-patch marker, like
         // MemBaseNoScale. The walker writes NO bits (the linker patches
         // the whole field via the wire's relocationKind); the slot only
@@ -175,6 +337,22 @@ windowFor(EncodingSlotKind s) noexcept {
     return std::nullopt;
 }
 
+// D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE (the frame-offset arm): the displacement
+// fields this walker range-checks are DESCRIBED in `target_schema.hpp`
+// (`memoryDisplacementField`), because the LIR frame chokepoint has to know a
+// form's reach before it emits the access. The bit WINDOW is this walker's; the
+// WIDTH is one number, and these pins make it impossible for the two to differ.
+static_assert(windowFor(EncodingSlotKind::Imm9)->width
+              == memoryDisplacementField(EncodingSlotKind::Imm9)->bits);
+static_assert(windowFor(EncodingSlotKind::Imm12)->width
+              == memoryDisplacementField(EncodingSlotKind::Imm12)->bits);
+static_assert(windowFor(EncodingSlotKind::Imm12Scaled)->width
+              == memoryDisplacementField(EncodingSlotKind::Imm12Scaled)->bits);
+static_assert(memoryDisplacementField(EncodingSlotKind::Imm9)->isSigned
+              && !memoryDisplacementField(EncodingSlotKind::Imm12Scaled)->isSigned
+              && memoryDisplacementField(EncodingSlotKind::Imm12Scaled)
+                     ->scaledByAccess);
+
 // (LE byte emission moved to `asm/format/byte_emit.hpp` — shared with
 // the x86_variable walker.)
 
@@ -190,7 +368,7 @@ bool encode(Lir const&                  lir,
             std::vector<std::uint8_t>&  out,
             std::vector<Relocation>&    relocs,
             std::vector<SourceMapEntry>& /*srcMap*/,
-            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 control-flow): fixed32
+            // D-AS3-BLOCK-REL-IMM19-26 (ARM64 control-flow): fixed32
             // now USES blockPatches — a `BlockRef` operand on the Imm19
             // (B.cond) or Imm26 (B) slot is an intra-function branch
             // resolved at assemble time. The walker pushes a
@@ -199,6 +377,9 @@ bool encode(Lir const&                  lir,
             // arithmetic from x86's BlockRel32 — no +4 bias, /4 scale).
             std::vector<walker_util::BlockRelPatch>& blockPatches,
             std::vector<walker_util::BlockSymPatch>& blockSymPatches,
+            // D-CSUBSET-LONG-BRANCH: the promoted-to-escape instruction set
+            // (sorted `LirInstId.v`). See the header for why it is an INPUT.
+            std::span<std::uint32_t const> relaxedInsts,
             DiagnosticReporter&         reporter) {
     assert(info != nullptr && "fixed32::encode requires non-null info");
 
@@ -271,6 +452,128 @@ bool encode(Lir const&                  lir,
         words[i] = selected->tmpl.wordAt(i);
     }
 
+    // ── D-CSUBSET-LONG-BRANCH: the escape, decided before a byte is wired ──
+    //
+    // Which of this variant's block-relative wires is the NARROW one (the
+    // field that can run out of reach), and does the opcode declare a
+    // strictly-wider field to escape into? Both answers come from config —
+    // the slots the wires name and the words the variants declare — so a
+    // target that never declares two block-relative field widths simply
+    // never gets an escape, and keeps its loud refusal.
+    std::optional<std::size_t> narrowWireIdx;
+    std::int64_t narrowReach = 0;
+    for (std::size_t wi = 0; wi < selected->wires.size(); ++wi) {
+        auto const& wire = selected->wires[wi];
+        if (wire.index >= instOps.size()) continue;   // reported in the wire loop
+        if (instOps[wire.index].kind != LirOperandKind::BlockRef) continue;
+        auto const kind = blockRelKindForSlot(wire.slotKind);
+        if (!kind.has_value()) continue;
+        auto const reach = walker_util::blockRelByteReach(*kind);
+        if (!narrowWireIdx.has_value() || reach < narrowReach) {
+            narrowWireIdx = wi;
+            narrowReach   = reach;
+        }
+    }
+    // The widest self-contained escape word this OPCODE declares ANYWHERE in
+    // its variants, unfiltered. Two different questions read it: whether THIS
+    // instruction escapes (below, after the strictly-wider test), and whether
+    // a wider field was declared at all — which each patch carries to the
+    // resolver so an out-of-range refusal can prescribe a remedy that exists.
+    // ⚠ Guarded by `narrowWireIdx`, because the election scans every variant
+    // of the opcode and the overwhelming majority of instructions carry no
+    // block-relative wire at all. This stays off their path.
+    std::optional<EscapePlan> declaredEscape;
+    if (narrowWireIdx.has_value()) declaredEscape = electEscapeWord(*info);
+    std::optional<EscapePlan> escape;
+    if (declaredEscape.has_value()) {
+        // An escape must reach STRICTLY further than the field it rescues.
+        // The widest block-relative slot rescuing ITSELF is not an escape —
+        // that is the arm64 `B` (Imm26) case and the x86 rel32 case, and
+        // both correctly keep the refusal.
+        if (declaredEscape->byteReach > narrowReach)
+            escape = declaredEscape;
+    }
+    // Does the opcode declare a word out-reaching the field `kind` names?
+    auto const widerDeclaredThan =
+        [&](walker_util::BlockRelPatchKind kind) {
+            return declaredEscape.has_value()
+                && declaredEscape->byteReach
+                       > walker_util::blockRelByteReach(kind);
+        };
+    // [[D-CSUBSET-LONG-BRANCH]]: the ISLAND BODY for a patch on `kind` — the
+    // same elected word, admitted on `>=` rather than `>`. That one character
+    // is the reframe: an ESCAPE must reach STRICTLY further (it rescues the
+    // branch by widening the field), while an ISLAND reaches exactly as far
+    // and rescues it by standing nearer. The widest field is therefore its own
+    // island body, which is why the arm the row called unescapable has one.
+    auto const islandBodyFor =
+        [&](walker_util::BlockRelPatchKind kind)
+        -> walker_util::BranchIslandBody {
+            if (!declaredEscape.has_value()) return {};
+            if (declaredEscape->byteReach
+                    < walker_util::blockRelByteReach(kind))
+                return {};
+            return islandBodyOf(*declaredEscape);
+        };
+    // Is THIS instruction promoted? `relaxedInsts` is sorted and almost
+    // always empty, so the common path is one comparison against `.empty()`
+    // inside `binary_search`.
+    bool const relaxed =
+        escape.has_value()
+        && std::binary_search(relaxedInsts.begin(), relaxedInsts.end(), inst.v);
+    // The escape word is APPENDED, so it lands at the old word count. Two
+    // structurally distinct shapes follow, and the template — not an ISA
+    // name — decides which:
+    //
+    //   (a) the narrow branch is NOT the template's last word, so a word of
+    //       the original macro still sits between it and the appended
+    //       escape. The narrow branch KEEPS ITS CONDITION and jumps TO the
+    //       escape; falling through reaches the original trailing word.
+    //         B.cond ->+2 ; B <ifFalse> ; B <ifTrue>
+    //
+    //   (b) the narrow branch IS the last word (the `D-OPT-JCC-FALLTHROUGH`
+    //       one-word form), so the escape lands immediately after it and
+    //       falling through would run it. The condition is INVERTED and the
+    //       branch jumps PAST the escape, into the fallthrough it already
+    //       had.
+    //         B.!cond ->+2 ; B <ifTrue>
+    //
+    // Both leave the original wires' `wordIndex` values valid, because the
+    // escape is appended rather than inserted — which is why relaxation
+    // needs no remapping of relocations or of the other block patches.
+    std::size_t const escapeWordIdx = words.size();
+    bool const escapeFollowsNarrow =
+        relaxed && selected->wires[*narrowWireIdx].wordIndex + 1u == escapeWordIdx;
+    // ⚠ SHAPE (b) IS ONLY SOUND WHERE THERE IS A CONDITION TO INVERT, AND
+    // WHERE IT LIVES IN THE WORD THE INVERSION WRITES. Today the only
+    // relaxable branch is an arm64 `B.cond`, which satisfies both — but a
+    // future target could wire a narrow block-relative slot onto a branch
+    // whose condition is implicit (a `CBZ`-style compare-and-branch) or onto
+    // a later word of a macro, and shape (b) would then emit a branch that
+    // falls through into its own escape: VALID BYTES, INVERTED MEANING, no
+    // diagnostic. That is the silent-miscompile class this project keeps
+    // naming, so it is refused rather than assumed away. The cond nibble is
+    // OR'd into word 0 below, which is why word 0 is the condition here.
+    if (escapeFollowsNarrow
+     && (!selected->tmpl.condCodeFromPayload
+         || selected->wires[*narrowWireIdx].wordIndex != 0)) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': the long-branch escape for this "
+                           "variant would land immediately after the "
+                           "branch it rescues, which requires INVERTING "
+                           "that branch's condition — but the variant "
+                           "declares no `condCodeFromPayload` condition in "
+                           "word 0 to invert. Declare a trailing wide-slot "
+                           "word on the variant so the escape can be jumped "
+                           "TO instead (D-CSUBSET-LONG-BRANCH)",
+                           info->mnemonic));
+        return false;
+    }
+    if (relaxed) {
+        words.push_back(escape->baseWord);
+    }
+
     // D-AS3-COND-CODE-ARM64 (mirror of x86_variable's condCodeFromPayload):
     // when the selected variant's template declares `condCodeFromPayload`,
     // read the inst's payload as a `TargetCondCode`, look up the schema's
@@ -325,6 +628,17 @@ bool encode(Lir const&                  lir,
         // bits zero, so the OR is non-destructive.
         std::uint32_t condNib = static_cast<std::uint32_t>(*condNibble);
         if (selected->tmpl.condInvert) {
+            condNib ^= 1u;
+        }
+        // D-CSUBSET-LONG-BRANCH shape (b): the escape word lands immediately
+        // after the conditional, so the conditional must branch PAST it and
+        // fall THROUGH into it — the inverse of what it meant before. This
+        // reuses the walker's ALREADY-DECLARED inversion primitive (the
+        // `condInvert` template knob `CSET` drives) rather than introducing
+        // a second notion of what inverting a condition means; the two
+        // compose by XOR, so a variant that already declares `condInvert`
+        // and is then relaxed inverts exactly once more, which is right.
+        if (escapeFollowsNarrow) {
             condNib ^= 1u;
         }
         words[0] |= (condNib & 0x0Fu) << selected->tmpl.condBitPos;
@@ -422,18 +736,28 @@ bool encode(Lir const&                  lir,
     // Both halves OR through `orInto`, so the per-word wroteSlot collision
     // guard fires if a malformed schema double-writes either word.
     constexpr std::uint32_t kImm12HiLo24Max = 0xFFFFFFu;  // 16 MiB - 1
+    static_assert(memoryDisplacementRange(
+                      *memoryDisplacementField(EncodingSlotKind::Imm12HiLo24), 1u)
+                      .max == kImm12HiLo24Max,
+                  "the word-pair's reach is the 24-bit field target_schema.hpp "
+                  "describes — one number, not two");
     auto const writeHiLo24 = [&](std::int64_t value,
                                  std::uint8_t wordIndex,
                                  std::string_view valueDesc) -> bool {
         if (value < 0 || value > static_cast<std::int64_t>(kImm12HiLo24Max)) {
+            // ⚠ THIS USED TO SAY THE LARGER FORM WAS "not yet supported" — it
+            // is supported: the MOVZ/MOVK three-word variant carries every
+            // non-negative int32. Reaching this refusal means the value was
+            // wired to the word-pair slot anyway, i.e. the opcode declares no
+            // magnitude-routed variant past it (or a negative value reached it).
             report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                    DiagnosticSeverity::Error,
                    std::format("opcode '{}': {} {} is out of range for the "
                                "shifted 'imm12.hilo24' word-pair (valid "
-                               "0..{}, i.e. 24 bits / 16 MiB) — a larger "
-                               "frame needs a third word or a MOVZ/MOVK "
-                               "scratch materialization (not yet supported, "
-                               "D-ASM-AARCH64-FRAME-OFFSET-BEYOND-16MIB)",
+                               "0..{}, i.e. 24 bits / 16 MiB) — a value past "
+                               "it is carried by a MOVZ/MOVK materialization, "
+                               "which this opcode's variants must declare for "
+                               "the selector to route it there",
                                info->mnemonic, valueDesc, value,
                                kImm12HiLo24Max));
             return false;
@@ -473,6 +797,11 @@ bool encode(Lir const&                  lir,
     // halves OR through `orInto`, so the per-word wroteSlot collision guard
     // fires if a malformed schema double-writes either MOVZ/MOVK word.
     constexpr std::int64_t kMovzMovkMax = 0x7FFFFFFF;  // int32 frame ceiling
+    static_assert(memoryDisplacementRange(
+                      *memoryDisplacementField(EncodingSlotKind::Imm32MovzMovk), 1u)
+                      .max == kMovzMovkMax,
+                  "the MOVZ/MOVK form's reach is the field target_schema.hpp "
+                  "describes — one number, not two");
     auto const writeMovzMovk = [&](std::int64_t value,
                                    std::uint8_t wordIndex,
                                    std::string_view valueDesc) -> bool {
@@ -528,7 +857,7 @@ bool encode(Lir const&                  lir,
     // lo12-reloc on word 1), accumulated here and stamped per-word in
     // the emit loop below.
     std::vector<PendingRelocSlot> pendingRelocs;
-    // D-AS3-BLOCK-REL-IMM19/26: a `BlockRef` operand wired to an Imm19
+    // D-AS3-BLOCK-REL-IMM19-26: a `BlockRef` operand wired to an Imm19
     // (B.cond) or Imm26 (B) slot is an INTRA-FUNCTION branch — resolved
     // at assemble time (NOT a linker relocation). Accumulated here, the
     // patch stamped at the START of the wire's word in the emit loop
@@ -542,8 +871,37 @@ bool encode(Lir const&                  lir,
         std::uint32_t                     targetBlock;
         walker_util::BlockRelPatchKind    kind;
         std::uint8_t                      wordIndex;
+        // D-CSUBSET-LONG-BRANCH: does this patch have somewhere to go when
+        // its field runs out of reach? Carried to the resolver on the
+        // `BlockRelPatch` so the fixed point never has to re-derive it.
+        bool                              relaxable;
+        // D-CSUBSET-LONG-BRANCH: and, separately, did the opcode declare a
+        // wider field AT ALL — the fact the out-of-range refusal needs to
+        // prescribe a remedy that exists. See `BlockRelPatch` for why the two
+        // are not the same question.
+        bool                              widerFieldDeclared;
+        // [[D-CSUBSET-LONG-BRANCH]]: the self-contained unconditional branch
+        // word this opcode declares, as the body the resolver copies when it
+        // needs a NEARER TARGET rather than a wider field. Undeclared when the
+        // opcode has no such word, or when the widest one it has cannot reach
+        // as far as this patch's own field — an island that reaches less far
+        // than the branch that jumps to it is not an escape from anything.
+        walker_util::BranchIslandBody     island;
     };
     std::vector<PendingBlockPatch> pendingBlockPatches;
+    // P68 round 9: a constant added to a block's ADDRESS (`adr x7, .+8`), from
+    // a `block.addend` wire; it rides this instruction's block patch.
+    std::int32_t blockAddend = 0;
+    // P68 round 9: a block-relative field aimed at THIS instruction (the
+    // location counter, `adr x7, .+8`). It becomes a self-relative patch the
+    // resolver writes (`BlockRelPatch::selfRelative`): the resolver is the one
+    // place that knows the laid-out function, and so the one place that can
+    // tell whether `. + addend` lands where the reference assembler's would.
+    struct PendingSelfField {
+        walker_util::BlockRelPatchKind kind;
+        std::uint8_t                   wordIndex;
+    };
+    std::vector<PendingSelfField> pendingSelfFields;
     for (auto const& wire : selected->wires) {
         if (wire.index >= instOps.size()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -565,7 +923,43 @@ bool encode(Lir const&                  lir,
                                           reporter);
             if (!hw.has_value()) return false;
             if (!orInto(wire.slotKind, *hw, wire.wordIndex)) return false;
-        } else if (srcOp.kind == LirOperandKind::SymbolRef) {
+        } else if (srcOp.kind == LirOperandKind::SymbolRef
+                   || srcOp.kind == LirOperandKind::SymbolAddress
+                   || (srcOp.kind == LirOperandKind::MemSymbolOffset
+                       && isSymbolBearingSlot(wire.slotKind))) {
+            // ★ THE SYMBOL AND THE PROGRAM'S CONSTANT (P68 round 9): a plain
+            // `SymbolRef` names the symbol alone; `adrp x0, msg+8` (a
+            // `SymbolAddress`) and `ldr x1, [x0, :lo12:msg+8]` (a
+            // `MemSymbolOffset` whose field the variant wires as a relocation)
+            // carry theirs in the pool. Which PART of the address the field
+            // takes was settled by election (`guard.symbolPart`), so the wire's
+            // relocation is already the right one.
+            SymbolId      relocTarget{srcOp.symbolV};
+            std::int64_t  relocAddend = 0;
+            if (srcOp.kind != LirOperandKind::SymbolRef) {
+                if (srcOp.litIndex >= lir.literalPool().size()) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': symbol operand names literal "
+                                       "pool entry {} of {} — the index outlived "
+                                       "the pool it names",
+                                       info->mnemonic, srcOp.litIndex,
+                                       lir.literalPool().size()));
+                    return false;
+                }
+                auto const* addr = std::get_if<LirSymbolAddress>(
+                    &lir.literalValue(srcOp.litIndex).value);
+                if (addr == nullptr) {
+                    report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': symbol operand names literal "
+                                       "pool entry {}, which is not a symbol "
+                                       "address", info->mnemonic, srcOp.litIndex));
+                    return false;
+                }
+                relocTarget = addr->symbol;
+                relocAddend = addr->addend;
+            }
             // D-AS4-3: a SymbolRef may be wired to ANY symbol-bearing
             // slot (Imm26 for BL, or the generic SymbolPatchMarker for
             // ADRP/ADD-lo12). The walker emits a Relocation + writes no
@@ -635,11 +1029,12 @@ bool encode(Lir const&                  lir,
             wroteSlot[wire.wordIndex][slotIdx] = true;
             pendingRelocs.push_back(PendingRelocSlot{
                 *wire.relocationKind,
-                SymbolId{srcOp.symbolV},
-                wire.wordIndex
+                relocTarget,
+                wire.wordIndex,
+                relocAddend
             });
         } else if (srcOp.kind == LirOperandKind::BlockRef) {
-            // D-AS3-BLOCK-REL-IMM19/26 (ARM64 intra-function branch):
+            // D-AS3-BLOCK-REL-IMM19-26 (ARM64 intra-function branch):
             // the BlockRef names a target basic block resolved at
             // assemble time. The slot MUST be Imm19 (B.cond) or Imm26
             // (B) — the two ARM64 block-relative branch displacement
@@ -652,22 +1047,24 @@ bool encode(Lir const&                  lir,
             // emits a `call26` linker relocation [BL]; a BlockRef
             // operand on Imm26 here is the intra-function `B`. The
             // encoder distinguishes by OPERAND KIND, not by slot.)
-            walker_util::BlockRelPatchKind patchKind;
-            if (wire.slotKind == EncodingSlotKind::Imm19) {
-                patchKind = walker_util::BlockRelPatchKind::Arm64Imm19;
-            } else if (wire.slotKind == EncodingSlotKind::Imm26) {
-                patchKind = walker_util::BlockRelPatchKind::Arm64Imm26;
-            } else {
+            // ⚠ THE MAPPING IS ASKED OF `blockRelKindForSlot`, NOT RESTATED.
+            // This arm used to carry its own `if (Imm19) … else if (Imm26)`
+            // beside the factored-out predicate the escape election already
+            // used — two copies of one mapping, which is how an escape gets
+            // elected onto a slot the encoder then refuses to patch.
+            auto const patchKindOpt = blockRelKindForSlot(wire.slotKind);
+            if (!patchKindOpt.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': BlockRef operand wired to "
                                    "slot '{}' — fixed32 supports intra-"
-                                   "function branch targets only on the "
-                                   "Imm19 (B.cond) or Imm26 (B) slots",
+                                   "function branch targets only on slots "
+                                   "that declare a block-relative field",
                                    info->mnemonic,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
             }
+            walker_util::BlockRelPatchKind const patchKind = *patchKindOpt;
             if (wire.wordIndex >= words.size()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
@@ -702,10 +1099,148 @@ bool encode(Lir const&                  lir,
                                    wire.wordIndex));
                 return false;
             }
+            // D-CSUBSET-LONG-BRANCH: is THIS the wire the escape rescues?
+            // The index is recovered from the wire's address rather than
+            // threaded through a counter so the loop above stays a plain
+            // range-for — `selected->wires` is a contiguous vector, so the
+            // subtraction is exact.
+            std::size_t const wireIdx =
+                static_cast<std::size_t>(&wire - selected->wires.data());
+            bool const isNarrowWire =
+                narrowWireIdx.has_value() && wireIdx == *narrowWireIdx;
+            if (relaxed && isNarrowWire) {
+                // THE ESCAPE FORM. This field no longer holds a displacement
+                // to the target block at all: it holds a LITERAL, INSTRUCTION-
+                // INTERNAL hop — to the appended escape word (shape a) or past
+                // it (shape b) — and the appended word carries the real target
+                // in its wider field. The hop is derived from the template's
+                // word positions and the slot's own scale, never from a baked
+                // constant, so a scale or word count that changes in config
+                // moves it without an edit here.
+                auto const g = walker_util::blockRelFieldGeometry(patchKind);
+                std::size_t const landingWord =
+                    escapeFollowsNarrow ? escapeWordIdx + 1u : escapeWordIdx;
+                std::int64_t const hopBytes =
+                    static_cast<std::int64_t>(landingWord - wire.wordIndex)
+                    * static_cast<std::int64_t>(kFixed32WordBytes);
+                std::int64_t const hopScaled = hopBytes >> g.scaleLog2;
+                if (!orInto(wire.slotKind,
+                            static_cast<std::uint32_t>(hopScaled),
+                            wire.wordIndex))
+                    return false;
+                pendingBlockPatches.push_back(PendingBlockPatch{
+                    srcOp.blockSlot, escape->kind,
+                    static_cast<std::uint8_t>(escapeWordIdx),
+                    /*relaxable=*/false,
+                    /*widerFieldDeclared=*/widerDeclaredThan(escape->kind),
+                    /*island=*/islandBodyFor(escape->kind)});
+                continue;
+            }
             wroteSlot[wire.wordIndex][slotIdx] = true;
             pendingBlockPatches.push_back(PendingBlockPatch{
-                srcOp.blockSlot, patchKind, wire.wordIndex});
+                srcOp.blockSlot, patchKind, wire.wordIndex,
+                // Only the narrowest block-relative field of an opcode that
+                // declares a wider one can escape. Every other patch keeps
+                // the loud out-of-range refusal — including the wide field
+                // itself, whose own overflow has nowhere further to go.
+                /*relaxable=*/isNarrowWire && escape.has_value(),
+                /*widerFieldDeclared=*/widerDeclaredThan(patchKind),
+                /*island=*/islandBodyFor(patchKind)});
+        } else if (srcOp.kind == LirOperandKind::LocationCounter) {
+            // P68 round 9: the location counter — the address of this very
+            // instruction (`adr x7, .`, `adr x7, .+8`). A location of this
+            // function, as a block is, so only a block-relative field takes it,
+            // and the resolver writes it (`pendingSelfFields`).
+            auto const patchKindOpt = blockRelKindForSlot(wire.slotKind);
+            if (!patchKindOpt.has_value()) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': the location counter is wired "
+                                   "to slot '{}', which declares no "
+                                   "block-relative field",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind)));
+                return false;
+            }
+            auto const slotIdx = static_cast<std::size_t>(wire.slotKind);
+            if (wire.wordIndex >= words.size() || slotIdx >= kEncodingSlotKindCount
+                || wroteSlot[wire.wordIndex][slotIdx]) {
+                report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                       DiagnosticSeverity::Error,
+                       std::format("opcode '{}': the location counter's wire "
+                                   "(slot '{}', word {}) is out of the "
+                                   "template or already written",
+                                   info->mnemonic,
+                                   encodingSlotKindName(wire.slotKind),
+                                   wire.wordIndex));
+                return false;
+            }
+            wroteSlot[wire.wordIndex][slotIdx] = true;
+            pendingSelfFields.push_back(
+                PendingSelfField{*patchKindOpt, wire.wordIndex});
+        } else if (srcOp.kind == LirOperandKind::ImmInt
+                   && wire.slotKind == EncodingSlotKind::BlockAddend) {
+            // P68 round 9: the constant added to a block's address. No bits:
+            // the value rides the instruction's block-relative patch.
+            blockAddend = srcOp.immInt32;
+            if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
         } else if (srcOp.kind == LirOperandKind::ImmInt) {
+            // P68 round 8 (D-ASM-DIALECT-GAPS-A-REFERENCE-ASSEMBLER-ACCEPTS):
+            // an ELEMENT's index. The field is the whole AdvSIMD `imm5`, and
+            // it holds the element's SIZE as its lowest set bit with the index
+            // above it — so the size is read off the variant's `elementBits`
+            // field on the operand just before this one (`validate()` pairs
+            // them), and the index range is what the field has left: 4, 3, 2
+            // or 1 bits for an 8-, 16-, 32- or 64-bit element. ✔MEASURED
+            // against GNU as 2.42 and clang 18.1.3: `umov w0, v1.b[3]` imm5 =
+            // 00111, `umov x0, v1.d[1]` imm5 = 11000, and both refuse
+            // `v1.b[16]`.
+            if (wire.slotKind == EncodingSlotKind::ElementIndex) {
+                std::uint8_t elementBits = 0;
+                for (auto const& other : selected->wires) {
+                    if (other.elementBits != 0 && wire.index > 0
+                        && other.index == wire.index - 1u) {
+                        elementBits = other.elementBits;
+                    }
+                }
+                std::uint32_t sizeBit = 0;  // log2 of the element's bytes
+                switch (elementBits) {
+                    case 8:  sizeBit = 0; break;
+                    case 16: sizeBit = 1; break;
+                    case 32: sizeBit = 2; break;
+                    case 64: sizeBit = 3; break;
+                    default:
+                        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                               DiagnosticSeverity::Error,
+                               std::format("opcode '{}': the 'imm5.element' "
+                                           "field on operand {} has no element "
+                                           "field before it to read a size "
+                                           "from (validate() should have "
+                                           "rejected the schema)",
+                                           info->mnemonic, wire.index));
+                        return false;
+                }
+                std::int64_t const index = srcOp.immInt32;
+                std::int64_t const maxIndex =
+                    (std::int64_t{1} << (4u - sizeBit)) - 1;
+                if (index < 0 || index > maxIndex) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': element index {} is out of "
+                                       "range for an element of {} bits — the "
+                                       "'imm5.element' field leaves {} index "
+                                       "bit(s) beside that size, so the index "
+                                       "runs 0..{}",
+                                       info->mnemonic, index, elementBits,
+                                       4u - sizeBit, maxIndex));
+                    return false;
+                }
+                std::uint32_t const imm5 =
+                    (static_cast<std::uint32_t>(index) << (sizeBit + 1u))
+                    | (1u << sizeBit);
+                if (!orInto(wire.slotKind, imm5, wire.wordIndex)) return false;
+                continue;
+            }
             // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12: the shifted-imm12
             // word-pair slot. The callconv's prologue/epilogue `sub/add
             // sp,#frame` (an [reg, ImmInt] form) wires its frame size here
@@ -796,10 +1331,11 @@ bool encode(Lir const&                  lir,
                            std::format("opcode '{}': immediate {} is out of range "
                                        "for the {}-bit '{}' slot — its complement "
                                        "{} exceeds the field's 0..{}, so only "
-                                       "values in {}..-1 are encodable here; a "
-                                       "more negative constant needs a shifted "
-                                       "(hw!=0) or multi-instruction "
-                                       "materialization, not yet supported",
+                                       "values in {}..-1 are encodable in this "
+                                       "one instruction; a more negative "
+                                       "constant is materialized as a MOVZ/MOVK "
+                                       "sequence, which the lowering emits as "
+                                       "separate instructions",
                                        info->mnemonic, raw, w->width,
                                        encodingSlotKindName(wire.slotKind),
                                        inverted, maxVal, -(maxVal + 1)));
@@ -903,10 +1439,12 @@ bool encode(Lir const&                  lir,
                 report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': immediate {} is out of range "
-                                   "for the {}-bit '{}' slot (valid 0..{}) — a "
-                                   "wider constant needs a multi-instruction "
-                                   "or shifted materialization, not yet "
-                                   "supported",
+                                   "for the {}-bit '{}' slot (valid 0..{}) — "
+                                   "this one instruction cannot carry it; a "
+                                   "wider constant is materialized as a "
+                                   "multi-instruction sequence by the lowering, "
+                                   "or routed to a shifted variant the opcode "
+                                   "declares",
                                    info->mnemonic, imm, w->width,
                                    encodingSlotKindName(wire.slotKind), maxVal));
                 return false;
@@ -963,8 +1501,8 @@ bool encode(Lir const&                  lir,
             //             D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SUB
             //             negative-disp lea also wires |disp| here for
             //             |disp| ≤ 4095.
-            // A future scaled LDR/STR form adds its own slot when that
-            // consumer lands. Mirrors the ImmInt arm's dual-slot shape.
+            // The scaled LDR/STR form has its own slot (`Imm12Scaled`, handled
+            // in its own arm below). Mirrors the ImmInt arm's dual-slot shape.
             //
             // D-AS4-ARM64-BASE-INDEX-LEA: the THIRD slot is the width-0
             // MemOffsetZero marker (the base+index `lea` = `ADD Xd,Xn,Xm`
@@ -1004,13 +1542,12 @@ bool encode(Lir const&                  lir,
             // multiple has no representation; an unaligned LDR is
             // architecturally undefined), and the scaled field MUST fit 12
             // bits (0..4095 ⇒ a 64-bit reach of 32760). Each is a distinct
-            // fail-loud A_ImmediateOperandOutOfRange (a frame offset that
-            // is negative-and-out-of-imm9, OR aligned-but >32760, OR non-
-            // aligned-and-out-of-imm9 stays fail-loud — the residual
-            // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12; the shifted
-            // imm12<<12 form / scratch-register address materialization is
-            // the future closing work). Handled in its own arm BEFORE the
-            // Imm9/Imm12 reject so the scaled slot never leaks into the
+            // fail-loud A_ImmediateOperandOutOfRange. ⓘ A FRAME access never
+            // reaches one of them any more: an offset neither this form nor the
+            // unscaled one carries is emitted by the frame chokepoint as an
+            // address materialized in a register, then an access at offset 0
+            // (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE). Handled in its own arm BEFORE
+            // the Imm9/Imm12 reject so the scaled slot never leaks into the
             // unscaled range logic.
             if (wire.slotKind == EncodingSlotKind::Imm12Scaled) {
                 auto const w = windowFor(wire.slotKind);
@@ -1040,16 +1577,26 @@ bool encode(Lir const&                  lir,
                 std::uint32_t const accessSizeBytes =
                     std::max(1u, static_cast<std::uint32_t>(instWidth) / 8u);
                 std::int32_t const disp = srcOp.offset;
+                // ⚠ THE THREE REFUSALS BELOW USED TO END "(not yet supported)",
+                // and for a FRAME access that stopped being true: the frame
+                // chokepoint (`lir_callconv.cpp` `selectFrameMemOp`) now emits
+                // an offset past both forms as an address materialized in a
+                // register (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE), so it never hands
+                // this form one it cannot carry. What still reaches these lines
+                // is an instruction someone wrote in THIS form — hand-built LIR,
+                // or inline assembly — and the true sentence about it is that
+                // this one instruction cannot encode the offset.
                 if (disp < 0) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} is negative "
                                        "but the scaled unsigned-offset LDR/STR "
                                        "'{}' slot encodes only non-negative "
-                                       "displacements — a negative frame offset "
-                                       "needs the signed unscaled imm9 form or a "
-                                       "scratch-register address (not yet "
-                                       "supported)",
+                                       "displacements — this form cannot carry "
+                                       "it; a small negative offset takes the "
+                                       "signed unscaled form, and a larger one "
+                                       "needs its address materialized in a "
+                                       "register first",
                                        info->mnemonic, disp,
                                        encodingSlotKindName(wire.slotKind)));
                     return false;
@@ -1071,19 +1618,28 @@ bool encode(Lir const&                  lir,
                 }
                 std::uint32_t const scaled =
                     static_cast<std::uint32_t>(disp) / accessSizeBytes;
-                std::uint32_t const maxVal = (1u << w->width) - 1u;
+                // The field's reach, read from the ONE description of it the
+                // frame chokepoint also reads (the static_asserts beside
+                // `windowFor` pin that width to this window).
+                auto const reach = memoryDisplacementRange(
+                    *memoryDisplacementField(wire.slotKind), accessSizeBytes);
+                std::uint32_t const maxVal =
+                    static_cast<std::uint32_t>(reach.max / accessSizeBytes);
                 if (scaled > maxVal) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} scales to "
                                        "{} which exceeds the unsigned {}-bit "
                                        "'{}' field (valid 0..{}, i.e. a byte "
-                                       "reach of {}) — a larger frame needs the "
-                                       "shifted imm12<<12 LDR form or a scratch-"
-                                       "register address (not yet supported)",
+                                       "reach of {}) — no single instruction of "
+                                       "this form reaches it; the displacement "
+                                       "has to be carried by an address "
+                                       "materialized in a register (the form the "
+                                       "frame chokepoint emits for a frame access "
+                                       "this far)",
                                        info->mnemonic, disp, scaled, w->width,
                                        encodingSlotKindName(wire.slotKind),
-                                       maxVal, maxVal * accessSizeBytes));
+                                       maxVal, reach.max));
                     return false;
                 }
                 if (!orInto(wire.slotKind, scaled, wire.wordIndex))
@@ -1165,48 +1721,64 @@ bool encode(Lir const&                  lir,
             // signed Imm9 slot negValue is always false, so effectiveDisp
             // == srcOp.offset — the two's-complement range/write is unchanged.
             std::int32_t const disp = static_cast<std::int32_t>(effectiveDisp);
+            // The field's range, from the ONE description of it the frame
+            // chokepoint also reads (`memoryDisplacementField`, pinned to this
+            // walker's window width by the static_asserts beside `windowFor`).
+            // Neither slot here is scaled, so the access size does not enter.
+            auto const range = memoryDisplacementRange(
+                *memoryDisplacementField(wire.slotKind), /*accessBytes=*/1u);
             if (isSignedSlot) {
-                // SIGNED range derived from the slot WIDTH (two's-
-                // complement): [-(2^(w-1)), 2^(w-1)-1] — for Imm9 that is
-                // -256..255. Deriving from width (not a baked literal)
-                // keeps the signed path as generic as the unsigned arm;
-                // fail loud rather than silently truncate to a WRONG
-                // stack slot. A larger frame needs the scaled LDR/STR
-                // imm12 form (future).
-                std::int32_t const lo = -(1 << (w->width - 1));
-                std::int32_t const hi = (1 << (w->width - 1)) - 1;
-                if (disp < lo || disp > hi) {
+                // SIGNED, two's complement: for Imm9 that is -256..255. Fail
+                // loud rather than silently truncate to a WRONG stack slot.
+                // ⚠ THIS USED TO SAY "a larger frame needs the scaled LDR/STR
+                // imm12 form, not yet supported" — a FALSE DIAGNOSTIC twice
+                // over: the scaled form WAS supported, and a frame offset this
+                // refusal quoted (32768, a spill store) was one the scaled form
+                // had ALREADY been asked about and could not carry either. The
+                // frame chokepoint now emits such an offset as an address
+                // materialized in a register (D-LK10-ENTRY-ARM64-WIDE-IMMEDIATE),
+                // so a frame access never reaches this line; what does is an
+                // instruction written in THIS form, which cannot encode it.
+                if (disp < range.min || disp > range.max) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} is out "
                                        "of range for the signed {}-bit '{}' "
-                                       "slot (valid {}..{}) — a larger frame "
-                                       "needs the scaled LDR/STR imm12 form, "
-                                       "not yet supported",
+                                       "slot (valid {}..{}) — this unscaled "
+                                       "form cannot carry it; a larger "
+                                       "displacement takes the scaled "
+                                       "unsigned-offset form, where the target "
+                                       "declares one and the offset is a "
+                                       "multiple of the access size within its "
+                                       "reach, or an address materialized in a "
+                                       "register",
                                        info->mnemonic, disp, w->width,
                                        encodingSlotKindName(wire.slotKind),
-                                       lo, hi));
+                                       range.min, range.max));
                     return false;
                 }
             } else {
-                // UNSIGNED range derived from the slot WIDTH: 0..2^w-1 —
-                // for Imm12 that is 0..4095. A negative frame offset is a
-                // lowering bug (locals sit at non-negative SP offsets
-                // post-prologue), and a larger frame needs the shifted
-                // imm12<<12 form (future); fail loud rather than silently
-                // wrap a negative into a huge positive offset.
-                std::int64_t const maxVal = (std::int64_t{1} << w->width) - 1;
-                if (disp < 0 || disp > maxVal) {
+                // UNSIGNED: for Imm12 that is 0..4095. A negative frame offset
+                // is a lowering bug (locals sit at non-negative SP offsets
+                // post-prologue); fail loud rather than silently wrap it into a
+                // huge positive offset. ⚠ The larger form this used to call
+                // "not yet supported" is the opcode's shifted-imm12 word-pair
+                // (and past 16 MiB its MOVZ/MOVK form), which the variant
+                // selector routes by magnitude — reaching here means the opcode
+                // declares no such variant for this value.
+                if (disp < range.min || disp > range.max) {
                     report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
                            DiagnosticSeverity::Error,
                            std::format("opcode '{}': memory offset {} is out "
                                        "of range for the unsigned {}-bit '{}' "
-                                       "slot (valid 0..{}) — a larger frame "
-                                       "needs the shifted ADD imm12<<12 form, "
-                                       "not yet supported",
+                                       "slot (valid 0..{}) — a larger "
+                                       "displacement is carried by the shifted "
+                                       "ADD imm12<<12 or MOVZ/MOVK variant, which "
+                                       "this opcode must declare for the selector "
+                                       "to route it there",
                                        info->mnemonic, disp, w->width,
                                        encodingSlotKindName(wire.slotKind),
-                                       maxVal));
+                                       range.max));
                     return false;
                 }
             }
@@ -1245,6 +1817,20 @@ bool encode(Lir const&                  lir,
             // orInto with the width-0 slot writes no bits but marks
             // wroteSlot[MemBaseNoScale] (collision/consumed tracking).
             if (!orInto(wire.slotKind, 0u, wire.wordIndex)) return false;
+        } else if (srcOp.kind == LirOperandKind::MemSymbolOffset) {
+            // A symbolic displacement names a LINK-TIME address, and a fixed32
+            // memory field holds a few bits of one: which bits (the low 12 of
+            // the page offset, scaled by the access size) is a relocation
+            // operator the program states, never one this encoder may pick.
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': operand {} is a symbolic memory "
+                               "displacement, and field '{}' has no "
+                               "relocation declared for one — a fixed-width "
+                               "memory field carries only part of an address",
+                               info->mnemonic, wire.index,
+                               encodingSlotKindName(wire.slotKind)));
+            return false;
         } else {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
@@ -1309,13 +1895,33 @@ bool encode(Lir const&                  lir,
     // DERIVED from the emit cursor, never a separately computed
     // `base + i*4`. Single-word opcodes (words.size()==1, all relocs at
     // wordIndex 0) behave exactly as the prior single-trailing-slot model.
+    // The location counter's address: where this instruction's first word
+    // lands (P68 round 9, `pendingSelfFields`).
+    auto const instructionStart = static_cast<std::uint32_t>(out.size());
     for (std::size_t i = 0; i < words.size(); ++i) {
+        // A field aimed at this instruction, `. + addend`: a self-relative
+        // patch at the start of its word, resolved with every other one.
+        for (auto const& sf : pendingSelfFields) {
+            if (sf.wordIndex != i) continue;
+            walker_util::BlockRelPatch self{
+                static_cast<std::uint32_t>(out.size()),
+                /*targetBlock=*/0,  // the owning block, stamped by asm.cpp
+                sf.kind,
+                /*relaxable=*/false,
+                /*widerFieldDeclared=*/false,
+                /*instV=*/0,        // stamped centrally by asm.cpp
+                /*island=*/{},
+                blockAddend};
+            self.selfRelative = true;
+            self.instStart    = instructionStart;
+            blockPatches.push_back(self);
+        }
         for (auto const& pr : pendingRelocs) {
             if (pr.wordIndex == i) {
                 walker_util::appendPendingReloc(relocs, out, pr);
             }
         }
-        // D-AS3-BLOCK-REL-IMM19/26: stamp each intra-function branch
+        // D-AS3-BLOCK-REL-IMM19-26: stamp each intra-function branch
         // patch at the START of its word — `out.size()` here is exactly
         // word i's first byte (its 4 bytes are appended immediately
         // after), the offset the asm.cpp resolver read-modify-writes.
@@ -1327,12 +1933,24 @@ bool encode(Lir const&                  lir,
                 blockPatches.push_back(walker_util::BlockRelPatch{
                     static_cast<std::uint32_t>(out.size()),
                     bp.targetBlock,
-                    bp.kind});
+                    bp.kind,
+                    bp.relaxable,
+                    bp.widerFieldDeclared,
+                    /*instV=*/0,  // stamped centrally by asm.cpp
+                    bp.island,
+                    blockAddend});
             }
         }
         asm_byte_emit::appendU32LE(out, words[i]);
     }
     return true;
+}
+
+walker_util::BranchIslandBody
+islandBody(TargetOpcodeInfo const& info) {
+    auto const plan = electEscapeWord(info);
+    if (!plan.has_value()) return {};
+    return islandBodyOf(*plan);
 }
 
 } // namespace dss::fixed32

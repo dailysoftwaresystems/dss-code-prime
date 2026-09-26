@@ -115,11 +115,16 @@ inline constexpr std::string_view kNoDiagnosticDetailRecorded =
 // compilation unit and applied inside DiagnosticReporter::report().
 struct DSS_EXPORT DiagnosticPolicy {
     // Override the severity of specific codes (demote P_DeprecatedSyntax to Info,
-    // promote P_AmbiguousToken to Error, etc.). Applied before suppress.
+    // promote P_AmbiguousToken to Error, etc.). Applied AFTER suppress (the order
+    // is suppress → override → warningsAsErrors; see `effectiveSeverity`).
     std::unordered_map<DiagnosticCode, DiagnosticSeverity> overrides;
 
-    // Drop these codes silently. Useful for codebases that legitimately
-    // exercise a "warning" pattern the language config flags.
+    // Drop these codes silently — WARNINGS AND NOTES ONLY, judged by each
+    // emission's own severity. An ERROR is never dropped: it stops its stage
+    // whether or not it is reported, so silencing it could only hide or misname
+    // why the build failed; it is reported, and the refused request is announced
+    // once per code (`D_SuppressRequestIgnored`). Useful for codebases that
+    // legitimately exercise a "warning" pattern the language config flags.
     std::unordered_set<DiagnosticCode> suppress;
 
     // Strict mode: every remaining Warning is promoted to Error after
@@ -175,7 +180,7 @@ public:
     DiagnosticReporter() noexcept = default;
     explicit DiagnosticReporter(Config cfg) noexcept;
 
-    // Append a diagnostic. May be dropped (suppress), demoted/promoted
+    // Append a diagnostic. May be dropped (suppress — never an Error), demoted/promoted
     // (overrides + warningsAsErrors), deduped against the recent window, or
     // coalesced beyond maxPerCode. Once maxDiagnostics is hit the reporter is
     // "capped": further Capped-delivery reports do not land, but they are
@@ -184,6 +189,19 @@ public:
     // size. `DiagnosticDelivery::Guaranteed` diagnostics — and members of
     // `kUnsuppressableCodes` — bypass the cap/dedup gates entirely.
     void report(ParseDiagnostic d);
+
+    // ★ THE POLICY'S VERDICT ON ONE FINDING, AND THE ONLY PLACE IT IS DECIDED:
+    // the severity a diagnostic of `code`, reported at `severity`, carries once
+    // this reporter's policy has run — or nullopt when the policy SUPPRESSES it.
+    // `report` asks this very function (through `applyPolicy`), so what it
+    // answers IS what `report` does with the diagnostic, before any volume gate
+    // (dedup, caps) decides whether to STORE it. A caller that must judge a
+    // finding by what the policy makes of it — `HirVerifier`'s verdict, which
+    // must count a `--warnings-as-errors` promotion even when the reporter then
+    // drops the promoted diagnostic as a recent duplicate — reads it here
+    // instead of re-deriving the rules, so the policy keeps ONE owner.
+    [[nodiscard]] std::optional<DiagnosticSeverity>
+    effectiveSeverity(DiagnosticCode code, DiagnosticSeverity severity) const;
 
     [[nodiscard]] std::span<ParseDiagnostic const> all() const noexcept;
     [[nodiscard]] std::size_t errorCount()   const noexcept;
@@ -205,7 +223,7 @@ public:
     // MACHINE-READABLE, NOT ONLY HUMAN-READABLE.
     //
     // The arc's failure was never that a human missed a marker. It was that a
-    // SCRIPT counted `50` and reported `50`. `scripts/corpus-census` hard-coded
+    // SCRIPT counted `50` and reported `50`. `.harness-config/runner/actions/corpus-census` hard-coded
     // `PER_CODE_CAP = 50` as a hand-copy of this class's default and asked "is
     // this number suspiciously round?" — a detection method with no
     // false-negative bound, and a mirror that silently mis-labels floors as
@@ -421,8 +439,14 @@ public:
 
 private:
     // Apply policy in this order: suppress → override → warningsAsErrors.
-    // Returns std::nullopt if the diagnostic should be dropped.
+    // Returns std::nullopt if the diagnostic should be dropped. The verdict is
+    // `effectiveSeverity`'s; this only applies it to the diagnostic.
     [[nodiscard]] std::optional<ParseDiagnostic> applyPolicy(ParseDiagnostic d) const;
+
+    // `--suppress=<code>` named a code that has just been reported as an ERROR,
+    // which suppression never silences: say so, once per code (the record of
+    // "once" is the stored notice itself, so rollback needs nothing extra).
+    void announceRefusedErrorSuppression_(DiagnosticCode code);
 
     [[nodiscard]] bool isRecentDuplicate(ParseDiagnostic const& d) const noexcept;
 

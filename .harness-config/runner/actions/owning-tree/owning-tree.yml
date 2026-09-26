@@ -1,0 +1,14 @@
+# PURPOSE: name the DSS tree a script's own file lives in -- walked up from that file, never taken from the caller's working directory or git environment.
+name: owning-tree
+description: >-
+  The action proves the tree-identity walk, git's agreement and the root arms can fail.
+  The program documents itself in its own header; this file declares only how a
+  runner starts it and what witnesses that it ran.
+  Gated by ctest as `owning_tree_selftest_guard`.
+steps:
+  - name: self-test
+    workingDirectoryRoot: action
+    run: |
+      python3 ./owning-tree.py --self-test
+    successPattern: 'owning-tree self-test: OK'
+    requireInputsUnmoved: true

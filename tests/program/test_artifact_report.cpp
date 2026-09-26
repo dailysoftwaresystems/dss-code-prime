@@ -1,4 +1,4 @@
-// D-HARNESS-FIXTURE-PATH-ASSUMES-THE-POSIX-ARTIFACT-SPELLING (TF-C118) —
+// THE FIXTURE PATH ASSUMED THE POSIX ARTIFACT SPELLING (TF-C118) —
 // THE BUILD'S STATEMENT OF RECORD ABOUT WHAT IT PRODUCED.
 //
 // THE DEFECT THIS CLOSES, MEASURED. On a WSL x86_64 host the sqlite harness
@@ -10,7 +10,7 @@
 // nothing in the build had ever TOLD it what the artifact was called — so the
 // driver had to reconstruct the name, and to reconstruct it, it needed a copy
 // of DSS's artifact-extension table. A false negative on the project's headline
-// capability (`D-HARNESS-CROSS-HOST-ANY-TARGET`), produced by the instrument.
+// capability — build ANY target inside ANY host — produced by the instrument.
 //
 // WHAT IS PINNED HERE, and why each pin is the one that would have caught it:
 //

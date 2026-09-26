@@ -175,7 +175,7 @@ TEST(FfiCMangle, ApplyUnapplyRoundTripPreservesCanonicalForm) {
     }
 }
 
-// ── D-FF4-3: strict unapply mode ──────────────────────────────
+// ── D-FF4-3-STRICT-MANGLE-PREFIX-CHECK: strict unapply mode ──────────────────────────────
 //
 // No-decoration formats (Elf/Pe/Wasm/Spirv/Unknown) get
 // strict-mode no-op coverage via `ApplyThenStrictUnapplyRoundTrip`
@@ -193,7 +193,7 @@ TEST(FfiCMangleStrict, MachOStripsLeadingUnderscoreCleanly) {
 }
 
 TEST(FfiCMangleStrict, MachOMissingPrefixFailsLoud) {
-    // The core D-FF4-3 contract: a MachO input without leading `_`
+    // The core D-FF4-3-STRICT-MANGLE-PREFIX-CHECK contract: a MachO input without leading `_`
     // is a structural anomaly. Strict mode rejects it loudly
     // instead of silently passing through (which is what
     // `unapplyCMangling` does).

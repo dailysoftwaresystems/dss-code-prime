@@ -7,19 +7,85 @@
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/target_schema.hpp"
+#include "ffi/abi/abi_catalog.hpp"
 #include "ffi/c_header_parser.hpp"
+#include "link/object_format_schema.hpp"
+#include "program/program.hpp"   // the BUILD's verdict on the same text, under the same pair
 #include "diagnostic_count.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
+#include <memory>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 using namespace dss;
 using namespace dss::ffi;
 using dss::test_support::countCode;
 namespace fs = std::filesystem;
 
-// ── D-TEST-SHIPPED-CONFIG-READ-FROM-A-TREE-ANOTHER-PROCESS-IS-WRITING ─────────
+namespace {
+
+// ── THE PAIRS HEADERS HERE ARE READ UNDER ────────────────────────────────────
+// D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE: a header is read under a
+// `<target>:<format>` pair now (`HeaderReadPair`), and a reader cannot be called
+// without one. The fixtures written against the pair-less reader keep x86_64 ELF,
+// whose LP64 data model and POSIX case rule are what that reader's defaults
+// amounted to. Each pair is loaded ONCE per process and kept alive for it,
+// because a `HeaderReadPair` holds references; a document that does not load
+// throws out of the test that asked, NAMING the document, rather than letting a
+// header be read under nothing.
+[[nodiscard]] dss::ffi::HeaderReadPair pairOf(std::string const& targetName,
+                                              std::string const& formatName) {
+    struct Loaded {
+        std::shared_ptr<dss::TargetSchema const>       target;
+        std::shared_ptr<dss::ObjectFormatSchema const> format;
+        dss::TargetCallingConvention const*            cc = nullptr;
+    };
+    static std::map<std::string, Loaded> loaded;
+    auto const key = targetName + ":" + formatName;
+    auto it = loaded.find(key);
+    if (it == loaded.end()) {
+        auto target = dss::TargetSchema::loadShipped(targetName);
+        if (!target.has_value()) {
+            throw std::runtime_error("target document `" + targetName
+                                     + "` did not load");
+        }
+        auto format = dss::ObjectFormatSchema::loadShipped(formatName);
+        if (!format.has_value()) {
+            throw std::runtime_error("format document `" + formatName
+                                     + "` did not load");
+        }
+        Loaded l;
+        l.target = std::move(*target);
+        l.format = std::move(*format);
+        dss::DiagnosticReporter scratch;
+        auto abi = dss::ffi::resolveAbi(*l.target, *l.format, scratch);
+        l.cc = abi.has_value() ? abi->cc : nullptr;
+        it = loaded.emplace(key, std::move(l)).first;
+    }
+    return dss::ffi::HeaderReadPair{*it->second.target, *it->second.format,
+                                    it->second.cc};
+}
+
+[[nodiscard]] dss::ffi::HeaderReadPair elfPair() {
+    return pairOf("x86_64", "elf64-x86_64-linux-exec");
+}
+
+[[nodiscard]] dss::ffi::HeaderReadPair pe64Pair() {
+    return pairOf("x86_64", "pe64-x86_64-windows-exec");
+}
+
+} // namespace
+
+// ── READING A SHIPPED CONFIG FROM A TREE ANOTHER PROCESS IS WRITING ──────────
 //
 // ★★★ EVERY `readCHeaderFromText` CALL BELOW RE-OPENS THE SHIPPED `c` GRAMMAR
 // FROM DISK. `readCHeaderFromText` starts with `GrammarSchema::loadShipped("c")`,
@@ -29,11 +95,14 @@ namespace fs = std::filesystem;
 // time. That made this the single most exposed reader of that file in the tree,
 // and it is why a neighbouring lane's in-place rewrite of it (truncate, then
 // write) turned this suite — and only this suite — red once at 8-way parallelism
-// and green on the immediate re-run.
+// and green on the immediate re-run. The torn-read half of that exposure is
+// closed at D-CORE-SHIPPED-CONFIG-LOADERS-DRAIN-A-STREAM-WITHOUT-CHECKING-IT,
+// which names this field condition: an in-place rewrite of a shipped `.json`
+// now yields a NAMED torn read rather than a parse error against a prefix.
 //
 // ★★★ THE OPT-IN THAT USED TO SIT HERE IS GONE, AND ITS ABSENCE IS THE FIX
 // LANDING RATHER THAN BEING WITHDRAWN.
-// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED measured
+// A census of the whole population of live-tree readers measured
 // that this suite — the one that flaked — was not even the worst reader in the
 // tree: `analysis/semantic/test_semantic_analyzer_c` held that handle for ~42 s
 // per run against this suite's ~0.9 s, and 150 test sources reached the live
@@ -61,14 +130,14 @@ TEST(FfiCHeaderParser, ExternFunctionLandsAsImportSurfaceRow) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     auto const& rows = *rowsOrErr;
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0].mangledName, "puts");
     EXPECT_EQ(rows[0].libraryPath, "libc.so.6");
     EXPECT_EQ(rows[0].kind, SymbolKind::Function);
-    EXPECT_EQ(rows[0].visibility, SymbolVisibility::Default);
+    EXPECT_EQ(rows[0].visibility, ffi::SymbolVisibility::Default);
     EXPECT_EQ(rows[0].linkage, SymbolLinkage::External);
 }
 
@@ -76,7 +145,7 @@ TEST(FfiCHeaderParser, ExternGlobalLandsAsImportSurfaceRow) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int errno;\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     auto const& rows = *rowsOrErr;
     ASSERT_EQ(rows.size(), 1u);
@@ -91,7 +160,7 @@ TEST(FfiCHeaderParser, MixedExternsLandInDeclarationOrder) {
         "extern int puts(const char* s);\n"
         "extern int errno;\n"
         "extern int putchar(int c);\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     auto const& rows = *rowsOrErr;
     ASSERT_EQ(rows.size(), 3u);
@@ -106,7 +175,7 @@ TEST(FfiCHeaderParser, MixedExternsLandInDeclarationOrder) {
     // the test, not slip past on the size+name check alone.
     for (auto const& row : rows) {
         EXPECT_EQ(row.libraryPath, "libc.so.6");
-        EXPECT_EQ(row.visibility, SymbolVisibility::Default);
+        EXPECT_EQ(row.visibility, ffi::SymbolVisibility::Default);
         EXPECT_EQ(row.linkage, SymbolLinkage::External);
     }
 }
@@ -114,7 +183,7 @@ TEST(FfiCHeaderParser, MixedExternsLandInDeclarationOrder) {
 TEST(FfiCHeaderParser, EmptyHeaderProducesEmptySurfaceAndNoDiagnostic) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
-        "", "<test>", "libc.so.6", rep);
+        "", "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     EXPECT_EQ(rowsOrErr->size(), 0u);
     // No-input must produce no diagnostic — pins the "informational
@@ -133,7 +202,7 @@ TEST(FfiCHeaderParser, TypedefAcceptedProducesNoRow) {
     auto rowsOrErr = readCHeaderFromText(
         "typedef int byte_t;\n"
         "extern int puts(const char* s);\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value()) << headerReadErrorKindName(rowsOrErr.error().kind);
     ASSERT_EQ(rowsOrErr->size(), 1u);
     EXPECT_EQ((*rowsOrErr)[0].mangledName, "puts");
@@ -145,7 +214,7 @@ TEST(FfiCHeaderParser, FunctionBodyRejectedLoud) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int f(int x) { return x; }\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasFunctionBody);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderHasFunctionBody), 1u);
@@ -155,7 +224,7 @@ TEST(FfiCHeaderParser, NonExternGlobalRejectedLoud) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int counter;\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasNonExternDecl);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderHasNonExternDecl), 1u);
@@ -168,7 +237,7 @@ TEST(FfiCHeaderParser, EmptyImportLibraryRejectedAtEntry) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n",
-        "<test>", "", rep);
+        "<test>", "", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderEmptyImportLibrary), 1u);
@@ -179,7 +248,7 @@ TEST(FfiCHeaderParser, ParseFailurePropagatesUnderlyingDiagnostics) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "@@@ this is not c @@@\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 1u);
@@ -205,7 +274,7 @@ TEST(FfiCHeaderParser, IncompatibleExternRedeclarationRejectedByFrontend) {
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n"
         "extern long puts(const char* s);\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_HeaderParseFailed), 1u);
@@ -221,7 +290,7 @@ TEST(FfiCHeaderParser, IdenticalExternRedeclarationMergesCleanly) {
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n"
         "extern int puts(const char* s);\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_TRUE(rowsOrErr.has_value())
         << "an identical compatible extern redeclaration is legal C — it must "
            "merge, not reject";
@@ -234,7 +303,7 @@ TEST(FfiCHeaderParser, FileNotFoundReportsFileOpenFailed) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeader(
         fs::path{"this/path/definitely/does/not/exist/nope.h"},
-        "libc.so.6", rep);
+        "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::FileOpenFailed);
     EXPECT_GE(countCode(rep, DiagnosticCode::F_FileOpenFailed), 1u);
@@ -251,7 +320,7 @@ TEST(FfiCHeaderParser, RejectDiagnosticCarriesSourceSpan) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int f(int x) { return x; }\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     bool foundWithSpan = false;
     for (auto const& d : rep.all()) {
@@ -268,7 +337,7 @@ TEST(FfiCHeaderParser, RejectDiagnosticCarriesSourceSpan) {
 }
 
 TEST(FfiCHeaderParser, ErrorStructCarriesLocationOnRejection) {
-    // D-FF2-2: HeaderReadError::at carries (buffer, span) of the
+    // D-FF2-2-HEADERREADERROR-SOURCE-LOCATION: HeaderReadError::at carries (buffer, span) of the
     // offending decl so programmatic consumers (LSP, test pins,
     // future introspection) can locate the error without re-parsing
     // reporter prose. Mirrors the (buffer, span) that emitAndReturn
@@ -278,7 +347,7 @@ TEST(FfiCHeaderParser, ErrorStructCarriesLocationOnRejection) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int f(int x) { return x; }\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     auto const& err = rowsOrErr.error();
     EXPECT_EQ(err.kind, HeaderReadErrorKind::HeaderHasFunctionBody);
@@ -295,7 +364,7 @@ TEST(FfiCHeaderParser, ErrorStructAtSetForHeaderHasNonExternDecl) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int counter;\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderHasNonExternDecl);
     EXPECT_TRUE(rowsOrErr.error().at.isPresent());
@@ -332,7 +401,7 @@ TEST(FfiCHeaderParser, ErrorStructAtSetOnLoweringFailure) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int f(void) { extern int x = 5; return x; }\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::HeaderParseFailed)
         << "the LOWERING wrap, not the decl walk's HeaderHasFunctionBody — a "
@@ -372,7 +441,7 @@ TEST(FfiCHeaderParser, FirstReportedErrorSpanBoundedToCurrentCall) {
 
     auto first = readCHeaderFromText(
         "int f(void) { extern int x = 5; return x; }\n",
-        "<call1>", "libc.so.6", rep);
+        "<call1>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(first.has_value());
     ASSERT_TRUE(first.error().at.isPresent())
         << "test setup: call 1 must produce a span-bearing error";
@@ -382,7 +451,7 @@ TEST(FfiCHeaderParser, FirstReportedErrorSpanBoundedToCurrentCall) {
     // but in a DIFFERENT buffer.
     auto second = readCHeaderFromText(
         "int g(void) { extern int y = 7; return y; }\n",
-        "<call2>", "libc.so.6", rep);
+        "<call2>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error().kind, HeaderReadErrorKind::HeaderParseFailed);
     ASSERT_TRUE(second.error().at.isPresent())
@@ -403,13 +472,13 @@ TEST(FfiCHeaderParser, ErrorStructLocationAbsentEvenWithPriorCallError) {
 
     auto first = readCHeaderFromText(
         "extern int x = 5;\n",
-        "<call1>", "libc.so.6", rep);
+        "<call1>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(first.has_value());
     ASSERT_TRUE(first.error().at.isPresent());
 
     auto second = readCHeaderFromText(
         "extern int puts(const char* s);\n",
-        "<call2>", "", rep);
+        "<call2>", "", elfPair(), rep);
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
     EXPECT_FALSE(second.error().at.isPresent())
@@ -418,7 +487,7 @@ TEST(FfiCHeaderParser, ErrorStructLocationAbsentEvenWithPriorCallError) {
 }
 
 TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
-    // D-FF2-2 negative: entry-point errors (EmptyImportLibrary /
+    // D-FF2-2-HEADERREADERROR-SOURCE-LOCATION negative: entry-point errors (EmptyImportLibrary /
     // FileOpenFailed / GrammarLoadFailed) have
     // no single decl locus — `at` stays default-constructed
     // (buffer.valid() == false). Programmatic consumers must check
@@ -426,7 +495,7 @@ TEST(FfiCHeaderParser, ErrorStructLocationAbsentForEntryPointFailures) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "extern int puts(const char* s);\n",
-        "<test>", "", rep);
+        "<test>", "", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     EXPECT_EQ(rowsOrErr.error().kind, HeaderReadErrorKind::EmptyImportLibrary);
     EXPECT_FALSE(rowsOrErr.error().at.isPresent())
@@ -496,7 +565,7 @@ TEST(FfiCHeaderParser, NonExternGlobalRejectionCarriesSourceSpan) {
     DiagnosticReporter rep;
     auto rowsOrErr = readCHeaderFromText(
         "int counter;\n",
-        "<test>", "libc.so.6", rep);
+        "<test>", "libc.so.6", elfPair(), rep);
     ASSERT_FALSE(rowsOrErr.has_value());
     bool foundWithSpan = false;
     for (auto const& d : rep.all()) {
@@ -542,7 +611,7 @@ TEST(CHeaderParser, MalformedHeaderDiagnosticRendersTheOffendingLine) {
     // A deliberately malformed declaration. The exact diagnostic code is not the
     // subject and is deliberately not asserted — the RENDER is.
     auto const r = readCHeaderFromText("int f(@@@);\n", "<malformed-header.h>",
-                                       "libtest", reporter);
+                                       "libtest", elfPair(), reporter);
     ASSERT_FALSE(r.has_value()) << "the fixture must actually fail to parse";
     ASSERT_FALSE(reporter.all().empty()) << "a failure must emit a diagnostic";
 
@@ -557,4 +626,120 @@ TEST(CHeaderParser, MalformedHeaderDiagnosticRendersTheOffendingLine) {
     EXPECT_NE(rendered.find("int f(@@@);"), std::string::npos)
         << "the rendered diagnostic must echo the offending header line; got:\n"
         << rendered;
+}
+
+// ── A HEADER MEANS WHAT IT MEANS FOR ITS PAIR — AS THE BUILD READS IT ─────────
+// [[D-LSP-HEADER-CASE-RULE-NOT-WORKSPACE-AWARE]]. The reader used to state no
+// pair at all: language predefines only, the POSIX header-name rule, no system
+// include path, and an `analyze()` with every default. Each case below asks one
+// header text two questions under one pair — the READER's rows, and the BUILD's
+// verdict on the same text compiled as a translation unit (`Program`) — and
+// requires the answers to agree under pe64 AND under elf, so neither a reader
+// that ignores the pair nor one that guesses a single pair can pass.
+namespace {
+
+// The BUILD's verdict on `text` compiled for `spec`, and its diagnostics.
+struct BuildVerdict {
+    int                rc = -1;
+    DiagnosticReporter rep;
+};
+
+[[nodiscard]] BuildVerdict buildTranslationUnit(std::string const& tag,
+                                                std::string_view   text,
+                                                std::string const& spec) {
+    BuildVerdict v;
+    dss::test_support::ScratchDir scratch{dss::test_support::Location::InsideRepo,
+                                          tag};
+    auto const src = scratch.path() / "tu.c";
+    {
+        std::ofstream f(src, std::ios::binary);
+        f << text;
+    }
+    dss::Program p;
+    p.setOutputDir(scratch.path() / "out");
+    v.rc = p.compileFiles(std::vector<std::string>{src.string()}, "c",
+                          std::vector<std::string>{spec}, v.rep);
+    return v;
+}
+
+[[nodiscard]] std::vector<std::string> rowNames(
+    std::vector<ImportSurface> const& rows) {
+    std::vector<std::string> names;
+    for (auto const& r : rows) names.push_back(r.mangledName);
+    return names;
+}
+
+constexpr char const* kPe64Spec = "x86_64:pe64-x86_64-windows-exec";
+constexpr char const* kElfSpec  = "x86_64:elf64-x86_64-linux-exec";
+
+} // namespace
+
+// The format's header-name case rule, through `__has_include`: the declaration
+// gated on `<Windows.h>` exists for pe64 (case-insensitive, and the header is
+// available there) and not for elf — and the build's preprocessor answers the
+// SAME question the same way under each pair.
+TEST(CHeaderParserPair, AHeaderGatedOnWindowsHIsReadAsTheBuildReadsIt) {
+    constexpr std::string_view kHeader =
+        "#if __has_include(<Windows.h>)\n"
+        "extern int win_only(void);\n"
+        "#endif\n"
+        "extern int everywhere(void);\n";
+
+    DiagnosticReporter peRep;
+    auto const pe = readCHeaderFromText(kHeader, "<gated.h>", "libtest",
+                                        pe64Pair(), peRep);
+    ASSERT_TRUE(pe.has_value()) << headerReadErrorKindName(pe.error().kind);
+    EXPECT_EQ(rowNames(*pe), (std::vector<std::string>{"win_only", "everywhere"}))
+        << "under pe64 the reader must see <Windows.h>, as the pe64 build does";
+
+    DiagnosticReporter elfRep;
+    auto const elf = readCHeaderFromText(kHeader, "<gated.h>", "libtest",
+                                         elfPair(), elfRep);
+    ASSERT_TRUE(elf.has_value()) << headerReadErrorKindName(elf.error().kind);
+    EXPECT_EQ(rowNames(*elf), (std::vector<std::string>{"everywhere"}))
+        << "under elf `<Windows.h>` is neither the right spelling nor available";
+
+    constexpr std::string_view kTu =
+        "#if !__has_include(<Windows.h>)\n"
+        "#error \"the build does not see <Windows.h>\"\n"
+        "#endif\n"
+        "int main(void) { return 0; }\n";
+    auto const bpe = buildTranslationUnit("ffi-pair-gated-pe", kTu, kPe64Spec);
+    EXPECT_EQ(bpe.rc, 0) << "the pe64 build must see <Windows.h>, as the reader does";
+    auto const belf = buildTranslationUnit("ffi-pair-gated-elf", kTu, kElfSpec);
+    EXPECT_NE(belf.rc, 0);
+    EXPECT_GT(countCode(belf.rep, DiagnosticCode::P_PreprocessorErrorDirective), 0u)
+        << "the elf build must NOT see <Windows.h>, as the reader does not";
+}
+
+// The format's data model, through `sizeof`: a width the header asserts holds
+// under pe64 (LLP64) and fails under elf (LP64), for the reader AND the build.
+// With no pair the reader could not fold `sizeof` at all.
+TEST(CHeaderParserPair, ATypeWidthIsThePairsWidthForTheReaderAndTheBuild) {
+    constexpr std::string_view kHeader =
+        "_Static_assert(sizeof(long) == 4, \"LLP64\");\n"
+        "extern int f(void);\n";
+
+    DiagnosticReporter peRep;
+    auto const pe = readCHeaderFromText(kHeader, "<llp64.h>", "libtest",
+                                        pe64Pair(), peRep);
+    ASSERT_TRUE(pe.has_value())
+        << "under pe64 `long` is 4 bytes: " << headerReadErrorKindName(pe.error().kind);
+    EXPECT_EQ(rowNames(*pe), (std::vector<std::string>{"f"}));
+
+    DiagnosticReporter elfRep;
+    auto const elf = readCHeaderFromText(kHeader, "<llp64.h>", "libtest",
+                                         elfPair(), elfRep);
+    ASSERT_FALSE(elf.has_value()) << "under elf `long` is 8 bytes";
+    EXPECT_EQ(elf.error().kind, HeaderReadErrorKind::HeaderParseFailed);
+    EXPECT_GT(countCode(elfRep, DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the reader must refuse for the width, as the build does";
+
+    std::string const tu = std::string{kHeader} + "int main(void) { return f(); }\n";
+    auto const bpe = buildTranslationUnit("ffi-pair-width-pe", tu, kPe64Spec);
+    EXPECT_EQ(countCode(bpe.rep, DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the pe64 build accepts the width the pe64 reader accepts";
+    auto const belf = buildTranslationUnit("ffi-pair-width-elf", tu, kElfSpec);
+    EXPECT_GT(countCode(belf.rep, DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "the elf build refuses the width the elf reader refuses";
 }

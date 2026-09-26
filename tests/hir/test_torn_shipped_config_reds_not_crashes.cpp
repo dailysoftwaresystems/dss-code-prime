@@ -1,7 +1,5 @@
 // A TORN SHIPPED CONFIG MUST RED A SUITE, NOT KILL IT.
 //
-// D-TEST-A-TORN-SHIPPED-CONFIG-CRASHES-A-SUITE-INSTEAD-OF-REDDING-IT
-//
 // ★★ WHY THIS IS A SUBPROCESS PIN AND CANNOT BE ANYTHING ELSE. The property is
 // about how a test BINARY terminates — exit 1 with GoogleTest's own report,
 // versus `0xC0000409` (STATUS_STACK_BUFFER_OVERRUN, what Windows reports for the
@@ -33,8 +31,8 @@
 // identical from the outside. (The clause was lifted from the since-superseded
 // `tests/test_support/private_config_root.hpp`; it now lives in
 // `tests/test_support/test_config_snapshot.cpp`, which asserts the same thing
-// about the per-run snapshot every ctest entry reads —
-// D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED.)
+// about the per-run snapshot every ctest entry reads — the exposure was never
+// confined to the one suite that flaked on it.)
 //
 // ⚠ IT WRITES ONLY INSIDE ITS OWN `ScratchDir`. The live `src/dss-config/` is
 // shared by every concurrent workstream in this tree; a pin that tore the real
@@ -111,8 +109,7 @@ void expectRedNotCrash(fs::path const& subject, std::string_view label) {
     // ★ `kRunBudget`, the suite's ONE measured "how long may the compiled
     // program take to terminate" budget -- never a literal here. A wall-clock
     // number written into a test is sized on the machine that wrote it and reds
-    // on the slowest leg that runs it, NAMING THE WRONG EVENT
-    // (D-TEST-A-NEW-WALL-CLOCK-LITERAL-IN-A-TEST-IS-UNGUARDED). ✔MEASURED on
+    // on the slowest leg that runs it, NAMING THE WRONG EVENT. ✔MEASURED on
     // this host with the config torn: tokenizer 208 ms, hir 33 ms -- every case
     // fails at its first load, so the subjects are FAST in this arm. A timeout
     // here therefore means the staging did not take and the child read the real

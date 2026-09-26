@@ -24,7 +24,7 @@
  *       fires -> red.
  * gcc/clang agree (build the same 3-step chain -> exit 42).
  *
- * D-EXAMPLES-DEPENDSON-NO-RELEASE-OPTIMIZER-ARM -- KEEP THIS FILE THIN. It has
+ * THE `dependsOn` RELEASE ARM -- KEEP THIS FILE THIN. It has
  * no locals, no arithmetic and no inlinable callee, so the shipped release
  * pipeline has nothing HERE to transform. That is deliberate: it is what lets
  * `expected.json`'s `release` arm attribute the whole baseline-vs-release image

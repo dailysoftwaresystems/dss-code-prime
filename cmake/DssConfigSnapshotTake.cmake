@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 # ── TAKE THE RUN'S SHIPPED-CONFIG SNAPSHOT ───────────────────────────────────
-#   D-TEST-SHIPPED-CONFIG-EXPOSURE-UNFIXED-OUTSIDE-THE-SUITE-THAT-FLAKED
+#   The shipped-config exposure stayed unfixed outside the one suite that flaked.
 #
 # Invoked ONCE per `ctest` invocation as the `config/snapshot` entry, which is
 # the `FIXTURES_SETUP` of the `DssConfigSnapshot` fixture. Every ctest entry that

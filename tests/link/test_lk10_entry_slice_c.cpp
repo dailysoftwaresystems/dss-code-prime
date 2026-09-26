@@ -1198,6 +1198,12 @@ makeElfExecFormatData(bool withProcessExit) {
     pc32.nativeId = 2;
     data.relocations.push_back(std::move(pc32));
     data.relocationKindIndex[RelocationKind{1}] = 0;
+    // A format that declares relocations must state the two facts every
+    // shipped ELF document states (P68 round 9): where an addend lives, and
+    // that an input section is never split. Without them this fixture would
+    // carry two complaints besides the one the matched pair is about.
+    data.relocationAddendStorage = RelocationAddendStorage::Explicit;
+    data.inputSectionPlacement   = InputSectionPlacement::Unit;
     data.relocationNameIndex["R_X86_64_PC32"]   = 0;
 
     // UCRT-P4 (D-RUNTIME-MAIN-ENVP-ENTRY-SHAPE): an exec-flavored format must

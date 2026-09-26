@@ -33,8 +33,8 @@
 // This is an INTEGRATION TEST (not an examples/ corpus entry) because the
 // examples_runner is single-artifact-per-target and cannot express a
 // two-artifact DEPENDENT build (build the library as artifact 1, then build
-// main resolving against artifact 1). The runner multi-artifact extension is
-// the named follow-up D-EXAMPLES-RUNNER-MULTI-ARTIFACT.
+// main resolving against artifact 1). Extending the runner to more than one
+// artifact per target is the follow-up that would let this move into the corpus.
 //
 // Per-platform NATIVE round-trips (coordinator steer): Linux writes+reads a
 // `.so` and RUNS it (ubuntu CI + local WSL); Windows writes+reads a `.dll`
@@ -150,7 +150,7 @@ int buildOne(fs::path const& outDir,
 }
 
 // Same as `buildOne`, but each `--resolve-library` entry also STATES the
-// runtime identity to record (D-FFI-DECLARED-IMPORT-NAME, the
+// runtime identity to record (a declared import name, the
 // `<path>=<import-name>` form). Needed wherever two stand-in libraries must
 // stay distinguishable in the emitted dependency table.
 int buildOneWithSpecs(fs::path const& outDir,
@@ -419,8 +419,8 @@ TEST(FfiResolveLibraryRoundTrip, PerFormatRowsUnionKeepsSymbolKnownEverywhere) {
         // in *"the macho format file"*, citing D-CSUBSET-C11-THREADS-MACHO.
         // ⚠⚠ THE REFUSAL IS REAL BUT THAT ATTRIBUTION IS FALSE, WHICH IS THE
         // NASTIER HALF OF THE SPECIES: a true observation keeps a dead citation
-        // alive, and the citation is what the next author acts on
-        // (D-COMMENT-A-CLAIM-TRUE-WHEN-TYPED-AND-FALSE-WHEN-THE-COMMIT-LANDED).
+        // alive, and the citation is what the next author acts on. A claim can
+        // be true when it is typed and false by the time the commit lands.
         // ✔RE-MEASURED at the CLI 2026-08-24, both halves, `extern int
         // mtx_lock(void*);` compiled straight through the driver:
         //   * x86_64:macho64-x86_64-darwin-exec — the leg THIS test drives —
@@ -661,12 +661,12 @@ TEST(FfiResolveLibraryRoundTrip, GenuinelyUnknownExternFailsLoud) {
 // this 2770 times); the link tier resolves the reference against the sibling
 // definition and the program RUNS. RED-ON-DISABLE: restore the per-CU
 // fail-loud arm and this build errors spuriously.
-// D-TEST-HOST-SPAWNS-FOREIGN-BINARY: this test BUILDS then SPAWNS the artifact,
-// so the target must match the HOST. RETARGET rather than skip — a GTEST_SKIP
-// would quietly stop testing --resolve-library on whichever host it excluded,
-// which is exactly the coverage the first macOS run needed. The per-host ladder
-// that used to live here (and whose missing arm64 arm reddened the native arm64
-// CI leg with `posix_spawn ... rc=8`) now lives in ONE place.
+// THE HOST MUST NOT SPAWN A FOREIGN BINARY: this test BUILDS then SPAWNS the
+// artifact, so the target must match the HOST. RETARGET rather than skip — a
+// GTEST_SKIP would quietly stop testing --resolve-library on whichever host it
+// excluded, which is exactly the coverage the first macOS run needed. The
+// per-host ladder that used to live here (and whose missing arm64 arm reddened
+// the native arm64 CI leg with `posix_spawn ... rc=8`) now lives in ONE place.
 TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary) {
     auto const host = hostNativeTarget();
     std::string const libTarget   = std::string{host.libTarget};
@@ -740,8 +740,8 @@ TEST(FfiResolveLibraryRoundTrip, SiblingTuDefinitionResolvesUnderResolveLibrary)
 // exemption: an unbound data extern is sibling-resolved at link (row stripped),
 // or rejected LOUD if unresolved. RED-ON-DISABLE: revert the ExternGlobal
 // exemption and this build fails H0009 on `dss_data_answer`.
-// D-TEST-HOST-SPAWNS-FOREIGN-BINARY: builds then SPAWNS, so the target must
-// match the HOST — see `tests/test_support/host_native_target.hpp`.
+// THE HOST MUST NOT SPAWN A FOREIGN BINARY: this builds then SPAWNS, so the
+// target must match the HOST — see `tests/test_support/host_native_target.hpp`.
 TEST(FfiResolveLibraryRoundTrip, SiblingTuDataDefinitionResolvesUnderResolveLibrary) {
     auto const host = hostNativeTarget();
     std::string const libTarget   = std::string{host.libTarget};
@@ -855,7 +855,7 @@ TEST(FfiResolveLibraryRoundTrip, MissingResolveLibraryPathFailsLoudEvenWithNoExt
 // `kFormatLegs`.
 //
 // The library identity is STATED via `--resolve-library <path>=<name>`
-// (D-FFI-DECLARED-IMPORT-NAME), which exercises PRECEDENCE LEVEL 1 — a
+// (a declared import name), which exercises PRECEDENCE LEVEL 1 — a
 // declared name beats a binary's embedded identity — and that is the level
 // this case is for. It deliberately does NOT reach level 2 (the embedded
 // identity), and the reason is worth the sentence:
@@ -870,7 +870,7 @@ TEST(FfiResolveLibraryRoundTrip, MissingResolveLibraryPathFailsLoudEvenWithNoExt
 // pin — the driver-tier one meant to catch exactly that class — SAW it, NAMED
 // it, and stepped one precedence level up to stay green. A pin that documents
 // its own blindness and ships is worse than a narrow one: it proves someone
-// looked. See D-HARNESS-A-PIN-MAY-NOT-ROUTE-AROUND-THE-DEFECT-IT-DOCUMENTS.
+// looked. A pin may not route around the defect it documents.
 // ⇒ No shipped document declares a constant identity any more, and level 2 is
 //   now pinned on its own by `program/test_macho_install_name_identity`, which
 //   drives this same driver with BARE PATHS and asserts each dylib's own
@@ -1990,7 +1990,7 @@ TEST(FfiResolveLibraryDeclaredImportName, RelocatableObjectInputReportsTheIgnore
 // A DYNAMIC library with a legitimate stated identity must stay SILENT **and**
 // must still RECORD the name. Without this arm, "warn on every
 // `--resolve-library` that states a name" would satisfy every assertion in (1)
-// and (2) while breaking the feature D-FFI-DECLARED-IMPORT-NAME exists for.
+// and (2) while breaking the very thing a declared import name exists for.
 TEST(FfiResolveLibraryDeclaredImportName, DynamicLibraryStaysSilentAndStillRecordsTheName) {
     for (auto const& leg : kMergedInputLegs) {
         SCOPED_TRACE(leg.label);

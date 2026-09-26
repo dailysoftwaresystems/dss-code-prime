@@ -93,7 +93,7 @@ compat(TypeInterner const& in, TypeId a, TypeId b,
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
     assertNoBuilderErrors(*cu);
     return analyze(cu, DiagnosticBudget::libraryDefault(), dataModel,
-                   std::nullopt, std::nullopt, format, "x86_64");
+                   std::nullopt, std::nullopt, SelectableObjectFormatKind::of(format), "x86_64");
 }
 
 // The elf x86_64 leg (LP64) — the leg both Linux references model.
@@ -382,6 +382,8 @@ TEST(RedeclarationCompat, LegalRedeclarationsStayAccepted) {
         EXPECT_FALSE(model.hasErrors())
             << "refused a redeclaration BOTH gcc and clang accept:\n"
             << src << "  first error: " << firstMessage(model);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 
@@ -393,7 +395,8 @@ TEST(RedeclarationCompat, LegalRedeclarationsStayAccepted) {
 // calling convention, no codegen DSS performs) nor, before this cycle, declarable
 // in any shipped language config, so the spine could make no claim about it and
 // the oracle could not judge the axis at all. It now rides `QualifierSpine`
-// beside `const`, driven by a per-declaration `restrictMarker` role.
+// beside `const`, driven by the language's `restrictMarker` (declared once in the
+// semantics block since P68 round 9; every typed declaration row derives it).
 //
 // THE THREE CASES ARE ASSERTED TOGETHER because any two of them alone would pass
 // for a mistake:
@@ -407,9 +410,10 @@ TEST(RedeclarationCompat, LegalRedeclarationsStayAccepted) {
 // last two.
 //
 // RED-ON-DISABLE (REMOVE direction): delete `"restrictMarker": "RestrictKeyword"`
-// from `param`'s declaration row in `c.lang.json` and the first case goes green
-// into silence — the refusal disappears while every other assertion here still
-// passes, which is exactly why it is asserted by NAME and not by a count.
+// from `c.lang.json`'s semantics block (until P68 round 9, from `param`'s row) and
+// the first case goes green into silence — the refusal disappears while every
+// other assertion here still passes, which is exactly why it is asserted by NAME
+// and not by a count.
 TEST(RedeclarationCompat, RestrictIsJudgedOnPointeesAndDroppedAtAParameterTopLevel) {
     auto const refused = [](char const* src) {
         auto model = analyzeC(src);
@@ -497,6 +501,8 @@ TEST(RedeclarationCompat, MatchingUserDeclarationOfAShippedNameStaysAccepted) {
         EXPECT_FALSE(model.hasErrors())
             << "refused a legal declaration of a shipped name:\n"
             << src << "  first error: " << firstMessage(model);
+        EXPECT_FALSE(hasDiagnosedPointerConversion(model.diagnostics()))
+            << "a compatible pointer pair must not be DIAGNOSED (the vacuity sweep)";
     }
 }
 

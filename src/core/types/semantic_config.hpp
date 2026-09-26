@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/constant_form.hpp"   // ConstantForms (StaticInitializerRule)
+#include "core/types/variant_when.hpp"   // WhenSpec — a builtin signature arm's `when`
 #include "core/types/data_model.hpp"
 #include "core/types/entry_shape.hpp"     // EntryFunctionShape (program-entry vocabulary)
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (kDeclarationKindTable)
@@ -516,6 +518,26 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // both directions, because a half-declared pair reads as an accident.
     // Empty ⇒ this specifier is compatible with no other member of its group.
     std::vector<std::string>        compatibleWith;
+    // ★★ P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the ASM-LABEL
+    // axis — the 6th ORTHOGONAL one. On a BLOCK-scope declaration carrying a
+    // specifier with this facet, an asm label names a MACHINE REGISTER rather
+    // than a symbol: GNU's local register variable (📄 GCC manual, "Local
+    // Register Variables": *The `register` keyword is required* … *The only
+    // supported use for this feature is to specify registers for input and
+    // output operands when calling Extended `asm`*). The semantic Pass-1 scan
+    // folds it onto `SymbolRecord::asmRegister`, after resolving the name
+    // against the TARGET's register table; without it a label on an automatic
+    // keeps the warn-and-ignore meaning both references give a non-`register`
+    // automatic. OR-only across a prefix, like the storage axes.
+    bool                            asmLabelNamesRegister = false;
+    // ★★ P68 (D-C-LOCAL-REGISTER-VARIABLE-ASM-LABEL-IGNORED): the ADDRESS axis
+    // — C 6.5.3.2p1, "The operand of the unary & operator shall be … an lvalue
+    // that designates an object that is not a bit-field and is not declared
+    // with the register storage-class specifier." Folded onto
+    // `SymbolRecord::addressNotTakeable`; consumed by the `&` operand check and
+    // by the memory-form asm operand check (GNU: *address of register variable
+    // requested*). OR-only across a prefix.
+    bool                            addressNotTakeable = false;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
@@ -916,6 +938,15 @@ struct DSS_EXPORT DeclaratorConfig {
     // array-parameter decorations (the helpers degrade to the plain
     // first-non-bracket-child view — the prior behavior, unchanged).
     std::vector<SchemaTokenId> arraySuffixModifierTokens;
+    // P68 round 10 (lane `cs`): the decorations the language allows ONLY on a
+    // parameter's OUTERMOST array derivation — C 6.7.6.2p1: "The optional type
+    // qualifiers and the keyword static shall appear only in a declaration of a
+    // function parameter with an array type, and then only in the outermost array
+    // type derivation." A parameter's other brackets (a second dimension, an array a
+    // pointer points at) carrying one is refused S_ArrayParamQualifierNonParameter.
+    // A SUBSET of `arraySuffixModifierTokens` (the `*` of `[*]` is not one: C allows
+    // it in any derivation of a prototype's parameter). EMPTY ⇒ no such restriction.
+    std::vector<SchemaTokenId> arraySuffixOutermostOnlyTokens;
     // Source spellings, retained for diagnostics (mirrors the
     // rule+ruleName pairing convention of the other facets).
     std::string   declaratorRuleName;
@@ -939,6 +970,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
     std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA
+    std::vector<std::string> arraySuffixOutermostOnlyTokenNames;   // P68 round 10
     std::string   arrayStarSuffixRuleName;                    // VLA C4c D-CSUBSET-VLA-PARAM-STAR
 };
 
@@ -1012,6 +1044,17 @@ struct DSS_EXPORT DeclarationRule {
     // engine never names a keyword). `nullopt` ⇒ no presence gate (a language
     // whose inference form is structurally unambiguous).
     std::optional<SchemaTokenId> requiredSpecifierToken;
+    // ⚠ P68 round 9 (lane `cs`): `constMarker` AND `restrictMarker` BELOW ARE
+    // DERIVED, NEVER READ FROM THE ROW. The loader copies
+    // `SemanticConfig::{const,restrict}Marker` into every TYPED row (declarator
+    // mode, or a `type` child) and leaves every other row without them; a row
+    // that still spells `constMarker` / `restrictMarker` / `volatileMarker` is
+    // refused at load. They stay per-row fields because "does THIS row declare
+    // something a qualifier qualifies" is a per-row fact — the TOKEN is the
+    // language's, declared once. The per-row `volatileMarker` this struct used to
+    // carry is GONE: no code read it (a declaration's volatility is read off its
+    // TYPE, the resolver's `VolatileQual`, driven by `semantics.volatileMarker`).
+    //
     // SE4 const-correctness: a token kind that, when found anywhere in the
     // `typeChild` subtree (or the whole declaration subtree when no
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the
@@ -1038,20 +1081,7 @@ struct DSS_EXPORT DeclarationRule {
     // "unrestricted", which would refuse the legal `int f(char *restrict *);`
     // against a descriptor that simply cannot spell it.
     std::optional<SchemaTokenId> restrictMarker;
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a token kind that, when found in the
-    // `typeChild` subtree (or the whole declaration subtree when no `typeChild`),
-    // marks the minted symbol VOLATILE — mirrors `constMarker` exactly (an
-    // independent scan, so `const volatile` sets BOTH bits). Read at HIR-access
-    // lowering to thread `MirInstFlags::Volatile` onto the symbol's Load/Store so
-    // the optimizer (DCE/CSE/Mem2Reg/LICM, all already Volatile-aware) cannot
-    // elide or reorder a volatile access. `nullopt` ⇒ the language has no volatile
-    // marker for this declaration form. c27 (D-CSUBSET-VOLATILE-POINTEE): this
-    // token ALSO drives the resolver's VolatileQual construction — a head volatile
-    // wraps the base (`volatile int *` => Ptr<VolatileQual(int)>) and an east
-    // ptrQualifier volatile wraps the pointer; the former pointee-volatile reject is
-    // retired (volatile is now a type qualifier). Config-driven, no hardcoded keyword.
-    std::optional<SchemaTokenId> volatileMarker;
-    // D-LANG-VARIADIC (step 13.4, 2026-06-02): a token kind that, when
+    // D-LANG-VARIADIC-CALL-SUBSTRATE (step 13.4, 2026-06-02): a token kind that, when
     // found anywhere in this declaration's params subtree (the subtree
     // rooted at the `paramsChild` visible child), marks the declared
     // FnSig as C-style variadic. The semantic analyzer scans for this
@@ -1618,6 +1648,12 @@ enum class BuiltinLowering : std::uint16_t {
     // (the weak form is permitted, never required, to fail spuriously), so both
     // spellings share this verb.
     AtomicCompareExchange,
+    // P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE): GNU
+    // `__builtin_unreachable()` — no operands, no value. It ENDS the open block with
+    // MIR's own `Unreachable` terminator (a trap at the target: `ud2` / `brk #0`),
+    // never a fall-through; code the expression still emits lowers into a fresh
+    // dead block the unreachable-prune drops.
+    Unreachable,
 };
 
 // ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
@@ -1628,7 +1664,7 @@ enum class BuiltinLowering : std::uint16_t {
 // level up: the grammar loader's refusal for an unrecognized `lowering`
 // (`unknown builtin lowering '<x>'`) NAMED NO ACCEPTED SET AT ALL. A config
 // author who wrote `popcnt` was told their name was wrong and never told what
-// the loader would have taken — for a closed set of THIRTY-SEVEN verbs, most of them
+// the loader would have taken — for a closed set of THIRTY-EIGHT verbs, most of them
 // `stdc_*` names that differ by one word. Nothing could render the set, because
 // an if-chain is not enumerable.
 //
@@ -1642,7 +1678,7 @@ enum class BuiltinLowering : std::uint16_t {
 // `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
 // uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
 // 0's spelling (`"umulh"`), which is what `name()` would have done.
-inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
+inline constexpr EnumNameTable<BuiltinLowering, 38> kBuiltinLoweringTable{{{
     { BuiltinLowering::UMulHigh,              "umulh"                    },
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
     { BuiltinLowering::AtomicCas,             "atomic_cas"               },
@@ -1657,6 +1693,8 @@ inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
     { BuiltinLowering::ComplexImag,           "complex_imag"             },
     { BuiltinLowering::ComplexConj,           "complex_conj"             },
     { BuiltinLowering::Barrier,               "barrier"                  },
+    // P68 round 12: GNU `__builtin_unreachable` — the block-ending trap.
+    { BuiltinLowering::Unreachable,           "unreachable"              },
     { BuiltinLowering::SehExceptionCode,      "seh_exception_code"       },
     { BuiltinLowering::SehExceptionInfo,      "seh_exception_info"       },
     // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 width-blind bit-count
@@ -1697,9 +1735,9 @@ inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
     { BuiltinLowering::AtomicExchange,        "atomic_exchange"          },
     { BuiltinLowering::AtomicCompareExchange, "atomic_compare_exchange"  },
 }}};
-// ★ THE UNDER-FILL GUARD, and for a 37-row hand-written table it is not
-// ceremony: `EnumNameTable<BuiltinLowering, 37>` with 36 initializers is legal
-// C++ — it value-initializes the tail, so row 36 becomes
+// ★ THE UNDER-FILL GUARD, and for a hand-written table this long it is not
+// ceremony: `EnumNameTable<BuiltinLowering, N>` with N-1 initializers is legal
+// C++ — it value-initializes the tail, so the last row becomes
 // `{ BuiltinLowering(0), "" }` and `builtinLoweringFromName("")` starts
 // RESOLVING, to `None`, which is the sentinel meaning "this knob does nothing".
 // A dropped row would therefore not break the build; it would make an empty
@@ -1825,18 +1863,27 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // signatures decode. Mutually exclusive with params/result (fail-loud at
     // decode if both are present); must decode to an FnSig (fail-loud else).
     std::string           signatureText;
-    // D-LANG-TYPE-IDENTITY-VOCABULARY: OPTIONAL per-data-model REPLACEMENT for
-    // `signatureText` — the exact shape (and JSON key name) the shipped-lib
-    // reader's `signatureByDataModel` already uses. A platform intrinsic can
-    // carry a parameter C spells with a NAMED type whose vocabulary entry is
-    // data-model-dependent: `_InterlockedCompareExchange` takes a `LONG*`, i.e.
-    // `long*`, which is a 32-bit `long` on the LLP64 platform the intrinsic
-    // belongs to. A single FIXED signature cannot say that without lying on the
-    // other model, so the base text stays the model-agnostic one and each
-    // declared model overrides it. EAGER: every declared override is decoded at
-    // the injection site regardless of which model is active, so a malformed
-    // INACTIVE override fails on EVERY target (anti-lurking).
-    std::unordered_map<DataModel, std::string> signatureTextByDataModel;
+    // P68 round 12 (S2a-1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): the
+    // OPTIONAL per-pair form of `signatureText` — the SAME shape and the SAME
+    // `when` selector (core/types/variant_when.hpp) as a shipped descriptor
+    // symbol's `signature`: `"signature": { "variants": [ { "when": {…},
+    // "value": "fn(…)" }, …, { "default": true, "value": "fn(…)" } ] }`. A
+    // platform intrinsic can carry a parameter C spells with a NAMED type whose
+    // vocabulary entry is per-pair: `_InterlockedCompareExchange` takes a
+    // `LONG*`, i.e. `long*`, a 32-bit `long` on the LLP64 platform the intrinsic
+    // belongs to. Under this form `signatureText` holds the DEFAULT arm's text
+    // (empty when the row declares none) and the analyzer SELECTS at injection
+    // with the pair it has: exactly one arm matches, or none and the default
+    // serves; otherwise the builtin is refused for that pair — no silent
+    // fallback. EAGER: every arm is decoded at injection, selected or not, so a
+    // malformed arm fails on EVERY pair (anti-lurking). It replaced the
+    // data-model-only `signatureByDataModel` map.
+    struct SignatureArm {
+        WhenSpec    when;
+        std::string text;
+    };
+    std::vector<SignatureArm> signatureArms;
+    bool                      signatureIsPerPair = false;   // the `variants` form
     // D-CSUBSET-ATOMIC-MONOMORPH-I32: OPTIONAL. Present ⇒ `signatureText` is the
     // EXEMPLAR and the real signature is derived per call site by the rule the
     // struct above documents. Absent (the default) ⇒ the declared signature binds
@@ -2050,7 +2097,11 @@ struct DSS_EXPORT TypeSpecifierRule {
     // 0 = undeclared, which is also the rank of every anonymous primitive; a
     // named entry therefore always out-ranks the anonymous representative of
     // its own kind. Only meaningful with a `name` (loader rejects rank alone).
-    // Used ONLY as the tie-break between two operands of the SAME kind.
+    // Read by the usual arithmetic conversions in exactly two places: the
+    // tie-break between two operands of the SAME kind, and — P68 round 10 —
+    // the mixed-signedness decision between two operands of the SAME WIDTH
+    // (C 6.3.1.8's fifth conversion), which also pairs a signed entry with its
+    // unsigned counterpart of equal rank (`deriveUnsignedCounterparts` below).
     int                        rank = 0;
     TypeKind                   core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
@@ -2096,6 +2147,82 @@ struct DSS_EXPORT TypeSpecifierRule {
         return resolveCore(dm);
     }
 };
+
+// ── C 6.3.1.8's FIFTH CONVERSION: THE UNSIGNED COUNTERPART OF A SIGNED ENTRY ──
+//
+// When the operand of signed integer type has the greater conversion rank but cannot
+// represent every value of the unsigned operand's type — which, over power-of-two
+// widths, happens exactly when the two have the SAME width — both convert to "the
+// unsigned integer type corresponding to the type of the operand with signed integer
+// type": the unsigned type of the SAME conversion rank (C 6.3.1.1). The language
+// already declares that rank on each named entry (`rank`), so the counterpart of a
+// NAMED signed entry is the named entry of EQUAL rank whose core, under a data model,
+// is the unsigned twin of the signed entry's core — `long` -> `unsigned long`, `long
+// long` -> `unsigned long long`, `__int128` -> `unsigned __int128`. No config key:
+// the relation IS the equal rank. ONE derivation, read by the loader (which refuses a
+// named signed entry that SURVIVES integer promotion with no counterpart, or with two,
+// under any data model — a promoted operand is the anonymous promoted type before any
+// conversion decision, so it needs none) and by the arithmetic-rules resolver (which
+// builds the map the conversions consult).
+// P68 round 10, lane `cs` (D-LANG-UAC-UNSIGNED-COUNTERPART-OF-SIGNED).
+
+// The unsigned integer kind of a SIGNED integer kind's width; nullopt for every other.
+[[nodiscard]] constexpr std::optional<TypeKind> unsignedIntegerTwin(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::I8:   return TypeKind::U8;
+        case TypeKind::I16:  return TypeKind::U16;
+        case TypeKind::I32:  return TypeKind::U32;
+        case TypeKind::I64:  return TypeKind::U64;
+        case TypeKind::I128: return TypeKind::U128;
+        default:             return std::nullopt;
+    }
+}
+
+struct UnsignedCounterparts {
+    struct Entry {
+        std::string name;
+        TypeKind    core = TypeKind::Void;   // its signed core under the data model
+    };
+    std::unordered_map<std::string, std::string> counterpartOf;   // signed name -> unsigned name
+    // Named signed entries with NO counterpart, and with MORE than one. A pure pairing:
+    // whether an entry NEEDS one — it does not when integer promotion turns it into the
+    // anonymous promoted type before any conversion decision — is the caller's question
+    // (the loader asks it; the conversions never consult a promoted operand's name).
+    std::vector<Entry> missing;
+    std::vector<Entry> ambiguous;
+};
+
+[[nodiscard]] inline UnsignedCounterparts
+deriveUnsignedCounterparts(std::vector<TypeSpecifierRule> const& rows, DataModel dm) {
+    UnsignedCounterparts out;
+    auto const listed = [](std::vector<UnsignedCounterparts::Entry> const& v, std::string const& s) {
+        for (auto const& x : v)
+            if (x.name == s) return true;
+        return false;
+    };
+    for (auto const& s : rows) {
+        // A `complex` row's name rides its ELEMENT, and a long-double row is a float;
+        // neither is an integer entry.
+        if (s.name.empty() || s.complex || !s.coreByLongDoubleFormat.empty()) continue;
+        TypeKind const sCore = s.resolveCore(dm);
+        auto const twin = unsignedIntegerTwin(sCore);
+        if (!twin.has_value() || out.counterpartOf.contains(s.name)
+            || listed(out.missing, s.name) || listed(out.ambiguous, s.name))
+            continue;
+        std::string found;
+        bool twoNames = false;
+        for (auto const& u : rows) {
+            if (u.name.empty() || u.complex || !u.coreByLongDoubleFormat.empty()) continue;
+            if (u.rank != s.rank || u.resolveCore(dm) != *twin) continue;
+            if (found.empty()) found = u.name;
+            else if (u.name != found) twoNames = true;
+        }
+        if (twoNames)           out.ambiguous.push_back({s.name, sCore});
+        else if (found.empty()) out.missing.push_back({s.name, sCore});
+        else                    out.counterpartOf.emplace(s.name, found);
+    }
+    return out;
+}
 
 // ── FC3 c1: a LOAD-RESOLVED dataModel-aware type-name reference ──
 //
@@ -2182,6 +2309,73 @@ struct DSS_EXPORT SynthesizedTypeRule {
     }
 };
 
+// ── P68 round 12 (lane `cs`): the type an enumeration without a fixed underlying
+//    type is COMPATIBLE with (`semantics.enumerationCompatibleTypes`) ──
+//
+// C 6.7.2.2p4 / C23 6.7.3.3p13: each enumerated type without a fixed underlying
+// type is compatible with an integer type the IMPLEMENTATION chooses, able to
+// represent every value (C23 6.7.3.3p2 calls it the enumeration's underlying type),
+// and a PLATFORM ABI fixes that choice — so the OBJECT FORMAT names the convention
+// (`EnumCompatibleTypeRule`, core/types/data_model.hpp) and the LANGUAGE declares,
+// per convention, two ORDERED ladders of its own types (the shape
+// `integerLiteralTyping` has, resolved through the same `DataModelTypeRef`
+// machinery at load, so each rung's representation follows the data model):
+//   * `unsignedLadder` — when no value is negative;
+//   * `signedLadder`   — otherwise (every rung SIGNED: an unsigned one could never
+//                        hold what it is chosen for).
+// The FIRST rung whose range (under the active data model) holds every value wins.
+// While the list is being processed, an implicit `previous + 1` that leaves the
+// previous constant's type walks the ladder of the PREVIOUS constant's signedness
+// (C23 6.7.3.3p12). The CONSTANTS' type is a separate question
+// (`enumerationConstantType`: `int` when every value fits it, else the enumerated
+// type, p15). A declared block covers EVERY rule (the loader enforces it), so a
+// format's rule always finds its ladders. UNDECLARED ⇒ the enum keeps the kind-only
+// record, and a value its kind cannot hold fails loud (S_EnumeratorValueOutOfRange)
+// — never a silent wrap.
+struct DSS_EXPORT EnumerationLadders {
+    std::vector<DataModelTypeRef> unsignedLadder;
+    std::vector<DataModelTypeRef> signedLadder;
+};
+struct DSS_EXPORT EnumerationCompatibleTypes {
+    std::unordered_map<EnumCompatibleTypeRule, EnumerationLadders> byRule;
+    [[nodiscard]] bool declared() const noexcept { return !byRule.empty(); }
+    // The ladders the format's `rule` selects; nullptr when undeclared or `None`.
+    [[nodiscard]] EnumerationLadders const* ladders(EnumCompatibleTypeRule rule) const {
+        auto const it = byRule.find(rule);
+        return it == byRule.end() ? nullptr : &it->second;
+    }
+};
+
+// ── P68 round 13 (lane `cs`): the static-initializer rule (`semantics.staticInitializers`) ──
+//
+// C 6.7.9p4 (C23 6.7.11p5): every expression in an initializer for an object of STATIC or
+// THREAD storage duration shall be a constant expression or a string literal. The block's
+// PRESENCE is that constraint — the semantic tier checks such an initializer and refuses
+// what is PROVABLY not a constant (S_StaticInitializerNotConstant). `otherConstantForms`
+// names the forms beyond C 6.6's own list the language admits (6.6p10 — the closed
+// `ConstantForm` vocabulary, `constant_form.hpp`); the constant evaluator the static-data
+// producer asks reads the SAME set (compile_pipeline threads it), so the check and the fold
+// cannot disagree about a form. UNDECLARED ⇒ unchecked, and the producer folds the
+// standard's forms only (a language with dynamic initialization, or no static storage).
+struct DSS_EXPORT StaticInitializerRule {
+    ConstantForms otherConstantForms{};
+};
+
+// What the static-data producer is told: nullopt when the language declares no rule (its
+// static objects may be initialized at run time), else the constraint WITH its forms — every
+// static initializer must fold, under C 6.6's forms and the named `otherConstantForms`. The
+// ONE read of the block, and it reaches `MirLoweringConfig` only through
+// `languageMirLoweringConfig` (hir_to_mir.hpp), the one assembly of the language's MIR
+// policy that the pipeline and every schema-built test fixture start from — so an
+// undeclared block means one thing everywhere. (P68 round 13, fold F7: this sentence
+// claimed that of every fixture while two schema-built ones assembled the config by hand
+// without it.)
+[[nodiscard]] inline std::optional<ConstantForms>
+otherConstantFormsOf(std::optional<StaticInitializerRule> const& rule) noexcept {
+    if (!rule.has_value()) return std::nullopt;
+    return rule->otherConstantForms;
+}
+
 // ── FC3 c1: integer-literal typing ladder (`semantics.integerLiteralTyping`) ──
 //
 // C 6.4.4.1: an integer constant's type is the FIRST of an ordered
@@ -2207,6 +2401,39 @@ struct DSS_EXPORT SynthesizedTypeRule {
 // A magnitude exceeding the LAST candidate's range fails loud
 // (S_IntegerLiteralTooLarge). Languages WITHOUT this block keep the
 // `literalTypes` token-kind map exactly (toy / tsql — pinned).
+//
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): the THIRD rule shape ──
+// A FIXED-TYPE rule (`type` + `outOfRange`): the literal's type is ONE declared
+// type whatever its magnitude — MSVC's sized suffixes, where `i8` IS `char` and
+// `ui64` IS `unsigned long long` — and `outOfRange` names what a magnitude that
+// type cannot represent does. It is a verb because the three shapes disagree
+// exactly there: the ladder climbs to the next candidate, the bit-precise rule
+// widens N, and a fixed type has nowhere to go.
+enum class IntegerLiteralOutOfRange : std::uint8_t {
+    // Reduce the magnitude modulo 2^width and read it at the type's signedness.
+    // ✔MEASURED 2026-09-25, MSVC 19.51.36260 (`dssharness run probe-reference-cc
+    // --legs windows-x86_64-release`, run 20260925-092743-c2711a1a): `300i8` is
+    // `char` 44, `0xFFi8` is -1, `256ui8` is 0, `4294967296i32` is 0 and
+    // `0xFFFFFFFFFFFFFFFFi64` is -1, with no diagnostic at /W4; a magnitude past
+    // 2^64 - 1 is refused ('constant too big') before any reduction.
+    Wrap = 1,
+};
+
+// ── THE SPELLINGS HAVE ONE OWNER — the loader's parse and refusal render from it ──
+inline constexpr EnumNameTable<IntegerLiteralOutOfRange, 1> kIntegerLiteralOutOfRangeTable{{{
+    { IntegerLiteralOutOfRange::Wrap, "wrap" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kIntegerLiteralOutOfRangeTable);
+
+[[nodiscard]] constexpr std::string_view
+integerLiteralOutOfRangeName(IntegerLiteralOutOfRange v) noexcept {
+    return kIntegerLiteralOutOfRangeTable.name(v);
+}
+[[nodiscard]] constexpr std::optional<IntegerLiteralOutOfRange>
+integerLiteralOutOfRangeFromName(std::string_view s) noexcept {
+    return kIntegerLiteralOutOfRangeTable.fromName(s);
+}
+
 struct DSS_EXPORT IntegerLiteralTypingRule {
     std::vector<std::string>      suffixes;   // exact spellings; empty = unsuffixed
     std::vector<DataModelTypeRef> decimal;
@@ -2222,6 +2449,16 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     // bit-precise rule never mints a `_BitInt` from a literal.
     bool                          bitPrecise       = false;
     bool                          bitPreciseSigned = false;
+    // P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): a FIXED-TYPE rule.
+    // Present ⇒ `decimal`/`nondecimal` are EMPTY and `bitPrecise` is false (the
+    // loader refuses a row that mixes shapes): the literal's type is this one
+    // whatever its magnitude, and `outOfRange` says what a magnitude past its
+    // range does. The loader admits only a type whose core is an integer kind of
+    // at most 64 bits, or plain `char`, and the SAME core under every data model:
+    // the reduction is modulo 2^width, and phase 4 performs it with no data model
+    // in scope. Absent ⇒ one of the other two shapes.
+    std::optional<DataModelTypeRef> fixedType;
+    IntegerLiteralOutOfRange        outOfRange = IntegerLiteralOutOfRange::Wrap;
 };
 
 // ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
@@ -2269,16 +2506,21 @@ struct DSS_EXPORT FloatLiteralTypingRule {
 //     promotes both to int; the engine never hardcodes C's view of
 //     char). Resolved per data model like every other name here.
 //   * `mixedSignedness` — closed verb for the cross-signedness rule.
-//     `rank-prefer-unsigned` (C): unsigned rank ≥ signed rank → the
-//     unsigned type; else the signed type (which, at strictly higher
-//     width-rank, represents the whole unsigned range). The loader
-//     rejects unknown verbs — a typo can never silently no-op.
+//     `rank-prefer-unsigned` (C 6.3.1.8's last three conversions): the
+//     unsigned operand's rank ≥ the signed one's → the unsigned type; else a
+//     signed type that represents every unsigned value (a strictly WIDER one)
+//     → the signed type; else — the SAME width, the signed operand ranked
+//     higher (C 6.3.1.1, by name: LP64 `long long` vs `unsigned long`, LLP64
+//     `long` vs `unsigned int`) — the UNSIGNED COUNTERPART of the signed type
+//     (`deriveUnsignedCounterparts`). The loader rejects unknown verbs — a
+//     typo can never silently no-op — and a named signed entry without a
+//     counterpart.
 //   * `promoteComparisons` — when true (C), comparison operands run the
 //     same conversion (so `-1 > 0ul` compares as U64); the result stays
 //     Bool. When false, comparisons keep their raw operand types.
-//   * `shiftResult` — closed verb for the C 6.5.7 shift-result discipline
-//     (D-UAC-SHIFT-RESULT-RULE-CONFIG). `promotedLeft` (C): a shift's result
-//     is the integer-PROMOTED LEFT operand's type; the right operand never
+//   * `shiftResult` — closed verb for the C 6.5.7 shift-result discipline.
+//     `promotedLeft` (C): a shift's result is the integer-PROMOTED LEFT
+//     operand's type; the right operand never
 //     contributes (`i32 << i64` is I32). `commonType`: the shift is typed
 //     like an ordinary binary op — both operands run the usual conversions
 //     and the result is their common type (`i32 << i64` is I64). The engine
@@ -2454,7 +2696,7 @@ enum class AttributeEffect : std::uint8_t {
     WarnOnUse,
     WarnOnDiscard,
     Align,
-    // TF-C78 (D-CSUBSET-NOINLINE): the declared function must never be inlined
+    // TF-C78 (D-CSUBSET-NOINLINE-PER-FUNCTION-SINK): the declared function must never be inlined
     // into a caller. Folded onto `SymbolRecord.isNoInline` (gated on the declared
     // type being a FnSig, the `isNoreturn` discipline), projected to
     // `HirNoInlineMap`, stamped onto `MirFunc.noInline`, and REFUSED by the
@@ -2688,13 +2930,31 @@ struct DSS_EXPORT LiteralTypeMapping {
 // C 6.7.6.3p10: a parameter list of exactly `(void)` declares a function
 // taking NO parameters. When `soleVoidMeansEmpty` is true, the engine's
 // param-harvest chokepoint drops a SOLE, UNNAMED parameter whose resolved
-// type is lattice `Void`; a NAMED void parameter, or void mixed with other
-// parameters, is ill-formed and emits S_InvalidVoidParam (an ERROR,
-// positioned at the param). Default false ⇒ raw param lists (toy / tsql —
-// pinned; a void-typed param would then surface through the normal
-// invalid-type checks downstream).
+// type is lattice `Void` and that no `...` follows; an unnamed void beside
+// another parameter or a `...` emits S_InvalidVoidParam (an ERROR, positioned
+// at the param). A NAMED void parameter is KEPT in a declaration that is not a
+// definition — gcc's meaning, a parameter of an incomplete type at which a
+// call's arguments END (`TypeInterner::fnArgumentParams`) — and refused in a
+// definition, as is a qualified sole void; a `const`/`restrict` named one and
+// an `_Atomic` sole one are refused everywhere (P68 round 8, measured against
+// gcc, clang, mingw and MSVC — see `normalizeSoleVoidParams`). Default false ⇒
+// raw param lists (toy / tsql — pinned; a void-typed param would then surface
+// through the normal invalid-type checks downstream).
+//
+// `unqualifiedParameterTypes` (P68 round 10, lane `cs`) — C 6.7.6.3p15: "In the
+// determination of type compatibility and of a composite type, ... each parameter
+// declared with qualified type is taken as having the unqualified version of its
+// declared type." When true, a FUNCTION type is built from each parameter's type
+// WITHOUT its top-level `volatile`, so every identity comparison of function types
+// (a function-pointer initialization, a `_Generic` association, `==` / `?:`, a call's
+// conversion — C 6.5.2.2p7 — and a redeclaration) is the language's compatibility by
+// construction; the parameter OBJECT inside the body keeps its qualifier. `_Atomic`
+// is not a qualification the rule removes (C 6.2.5p27), and a `void` parameter keeps
+// its skin (see `normalizeSoleVoidParams`). Default false ⇒ a function type carries
+// its parameters' declared types exactly.
 struct DSS_EXPORT ParametersConfig {
     bool soleVoidMeansEmpty = false;
+    bool unqualifiedParameterTypes = false;
 };
 
 // ── inline-asm P1 (`semantics.inlineAsm`, D-CSUBSET-INLINE-ASM +
@@ -3015,6 +3275,21 @@ struct DSS_EXPORT SemanticConfig {
     // answers to "what type does THIS operator have" with no cross-reference.
     SynthesizedTypeRule offsetofResultType;
     SynthesizedTypeRule typesCompatibleResultType;
+    // P68 round 12 (lane `cs`, the enumeration P1): the type of an ENUMERATION
+    // CONSTANT of an enumeration without a fixed underlying type whose values it
+    // holds — C17 6.4.4.3p2 and C23 6.7.3.3p12, p15 say `int`. The source never
+    // spells a constant's type, so it is an engine-synthesized type like
+    // `sizeof`'s, named per data model. UNDECLARED ⇒ a constant keeps its
+    // enumeration's type, as before, for a language that ships no row.
+    SynthesizedTypeRule enumerationConstantType;
+    // …and, per format convention, the ladders the type such an enumeration is
+    // COMPATIBLE with is chosen from (C23 6.7.3.3p13) — see
+    // `EnumerationCompatibleTypes`.
+    EnumerationCompatibleTypes enumerationCompatibleTypes;
+    // P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4's constraint and
+    // the language's 6.6p10 constant forms — see `StaticInitializerRule`. nullopt ⇒ the
+    // constraint is not checked.
+    std::optional<StaticInitializerRule> staticInitializers;
 
     // ── P31: the three GNU compile-time OPERATORS ────────────────────────────
     // All three are OPERATORS, not builtin FUNCTIONS, and the distinction is
@@ -3220,6 +3495,11 @@ struct DSS_EXPORT SemanticConfig {
     // the language has no predefined function-name surface (the bind never
     // runs — toy/tsql). Source-AGNOSTIC: WHICH spellings are per-language
     // config; the engine never hardcodes "__func__".
+    // P68 round 9 (lane `cs`): the same spellings also bind ONE file-scope twin
+    // each in the language's builtin scope — text "" (gcc's and clang's meaning
+    // outside a function body), each use warning
+    // S_PredefinedIdentifierOutsideFunction — and seed the parser's binder sketch
+    // as VALUES, so `sizeof ( __func__ )` takes the expression reading.
     std::vector<std::string>     predefinedFunctionNameIdentifiers;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // semantics table (see AttributeSemanticsRow). `attrSpecRule`/`stdAttrRule`
@@ -3499,6 +3779,17 @@ struct DSS_EXPORT SemanticConfig {
     // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
     // engine reads THIS, never a hardcoded token name.
     std::optional<SchemaTokenId>    atomicMarker;
+    // P68 round 9 (lane `cs`): the language's `const`- and `restrict`-class qualifier
+    // tokens (c: `ConstKeyword`, `RestrictKeyword`). NEITHER IS INTERNED, so both ride
+    // the qualifier spine beside a TypeId — a declaration's (the declarator walk, which
+    // reads them through each declarator-mode row's DERIVED `constMarker` /
+    // `restrictMarker`), a type NAME's and an expression's (`_Generic` matching). With
+    // `volatileMarker` / `atomicMarker` above these are the language's WHOLE qualifier
+    // vocabulary, declared ONCE here: a declaration row may no longer spell any of the
+    // three it used to (the loader refuses the key by name). nullopt ⇒ the language
+    // has no such qualifier, and no spine makes a claim about it.
+    std::optional<SchemaTokenId>    constMarker;
+    std::optional<SchemaTokenId>    restrictMarker;
     // ── RETIRED: `externLibraryByFormat` (UCRT-P4, Decision 1) ──────────────
     // A per-LANGUAGE map "object-format kind -> runtime library identity" that
     // supplied the import library for any source-declared extern carrying none of
@@ -3582,24 +3873,23 @@ struct DSS_EXPORT SemanticConfig {
     //     `Bitcast` (no representation change at runtime).
     //
     // Anchored for future:
-    //   * `D-LANG-VOIDPTR-ARITH-REJECT`: pointer arithmetic on void*
-    //     is undefined in standard C (sizeof(void) is invalid); GCC
+    //   * [[D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED]]: pointer arithmetic
+    //     on void* is undefined in standard C (sizeof(void) is invalid); GCC
     //     permits it as an extension treating void as 1-byte. When
     //     c gains pointer arithmetic, the void* arm rejects by
-    //     default; a `allowVoidPtrArithmetic: bool` opt-in field
-    //     extends this struct.
-    //     ✅ LANDED P42, and this 2026-06-02 sketch called the SHAPE
-    //     right and the LOCATION wrong — worth keeping for that. The
-    //     opt-in is real, but it is NOT a bool on THIS struct: `void`
+    //     default.
+    //     ✅ LANDED P42, and the 2026-06-02 sketch this bullet used to head
+    //     called the SHAPE right and the LOCATION wrong — worth recording for
+    //     that. The opt-in is real, but it is NOT a bool on THIS struct: `void`
     //     and a function type are objectless in the same way and take
     //     the same rule, so the fact is a SIZE (`nonObjectTypeSizes`,
     //     at the bottom of this file) read by the ONE `operandLayout`
     //     query that `sizeof`, `_Alignof` and the element stride all
     //     ask. A bool here would have made this a POINTER-CONVERSION
-    //     rule, which it is not — nothing is being converted. The
-    //     tracked row is [[D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED]];
-    //     the id above never became a registry row and is kept only as
-    //     this pointer to the one that did.
+    //     rule, which it is not — nothing is being converted. ⚠ The sketch's
+    //     own id never became a registry row, so spelling it here was a
+    //     citation that resolved to nothing; the row above is the one that
+    //     tracks this and the supersession is recorded in its registry entry.
     //   * `D-LANG-VOIDPTR-FN-CONVERT`: `void* ↔ fn-pointer` is
     //     technically UB in standard C even though every compiler
     //     permits it. Function-pointer types landed (FC4: Ptr<FnSig>
@@ -3607,21 +3897,26 @@ struct DSS_EXPORT SemanticConfig {
     //     opt-in below now gates the whole fn<->void* class (Option B, the
     //     single authoritative gate) for the gcc/POSIX dlsym / Tcl ClientData
     //     idiom; c opts in, default false stays ISO-strict.
-    //   * `D-LANG-VOIDPTR-PREDICATE-GATE` (type-design analyst,
-    //     step 13.2 audit fold): if a future language needs
-    //     per-element-type predicates ("only T* → void* when T ∈
-    //     {char, byte}" or "only when sizeof(T) ≥ alignof(void*)"),
-    //     today's two-bool shape forecloses it. Trigger: first
-    //     language whose `void*` rules depend on the element T.
-    //     Closure: add a `PointerConversionPredicate` variant slot
-    //     beside the bools (additive, doesn't break existing flags).
-    //   * `D-TYPERULES-PTRRULES-PASS-BY-VALUE` (type-design analyst
-    //     D4, step 13.2 audit fold): the `isAssignable` signature
-    //     takes `PointerConversionRules const&` for a 2-byte POD.
-    //     By-value would marginally simplify; const-ref form is
-    //     idiomatic-enough today. Trigger: any post-merge pass
-    //     touching the `isAssignable` signature (e.g. when a 3rd
-    //     rules-block lands).
+    // ── TWO 2026-06-02 type-design notes, BOTH REFUTED BY MEASUREMENT ──
+    // Each was recorded as a forward-looking anchor whose premise was the
+    // SHAPE of this struct on the day it was written. ✔MEASURED 2026-09-16:
+    // this struct carried SIX bools then (SEVEN since P68 round 9), not two, so
+    // neither premise holds and neither id ever became a registry row — spelling
+    // them here was a citation resolving to nothing. What survives is the design
+    // fact:
+    //   * PER-ELEMENT-TYPE PREDICATES ARE NOT FORECLOSED. The note claimed
+    //     "today's two-bool shape forecloses" a rule like "only T* → void*
+    //     when T ∈ {char, byte}". The flags added since (the two
+    //     null-pointer-constant arms, `allowVoidPtrFnConvert`, and the two
+    //     diagnosed-conversion classes) are the evidence that this block
+    //     extends ADDITIVELY; a `PointerConversionPredicate` variant slot
+    //     would land beside the bools exactly the same way, breaking
+    //     nothing. Nothing is deferred and nothing is at risk.
+    //   * `isAssignable` TAKING THIS BY CONST-REF IS NOW THE ONLY SENSIBLE
+    //     FORM. The note weighed by-value against const-ref "for a 2-byte
+    //     POD"; at seven bools, and with `isAssignable` carrying a dozen
+    //     further scalar parameters, by-value is not the simpler spelling
+    //     it was argued to be. The question is settled, not deferred.
     struct PointerConversionRules {
         // T* → void* (typed → untyped). Information-erasing direction.
         // Universally safe (no runtime risk; just forgetting type).
@@ -3687,63 +3982,43 @@ struct DSS_EXPORT SemanticConfig {
         // pointer (`char*`, `int*`, `struct S*`) STAYS a loud reject regardless of
         // this flag.
         bool allowVoidPtrFnConvert = false;
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT (was
-        // D-LANG-DIRECT-CALL-INT-POINTEE-COMPAT, TF-C41): at a DIRECT
-        // bare-name call's ARGUMENT boundary ONLY, admit an integer pointer whose
-        // pointee has the SAME representation (size ∧ signedness ∧
-        // integer-base-kind, via TypeInterner::sameRepresentation) but a DISTINCT
-        // identity (the `_Generic`-splitting vocabulary NAME differs) — e.g.
-        // `long long*`/`sqlite3_int64*` into a `long*` parameter on LP64 — and
-        // report S_IncompatiblePointerIntegerPointee as a WARNING rather than
-        // silently accepting it.
+        // ★★★ P68 round 9 (lane `cs`),
+        // D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS:
+        // the two CLASSES of pointer conversion C lists as constraint violations and
+        // every pinned reference nevertheless builds WITH A DIAGNOSTIC. Each flag
+        // admits its class at every site of the constraint — initialization (a brace
+        // element included), assignment, argument, return, and the pairings of
+        // `==`/`!=`/relational and `?:` — as a WARNING, never silently, and keeps the
+        // value exactly as the explicit cast would (`--warnings-as-errors` restores
+        // the refusal, which is also GCC 14's default). Default FALSE = the pair stays
+        // refused; only c opts in. `diagnosedConversion` in
+        // `src/analysis/semantic/type_rules.hpp` is the ONE classifier both tiers ask,
+        // and `cst_to_hir.cpp::coerce` realizes exactly the classes it names.
         //
-        // ★ SCOPE WIDENED 2026-08-07 (TF-C135) FROM "shipped FFI descriptor callee"
-        // TO "any direct callee", BY MEASUREMENT, and the widening is the whole
-        // point of this note. TF-C41 gated the relaxation on
-        // `isShippedDescriptorFn` because the only known consumer was the tcl.json
-        // `ptr<i64>` parameter. That gate made the admission a property of WHERE THE
-        // DECLARATION CAME FROM rather than of WHAT THE TYPES ARE — and a real
-        // header hits the identical shape: on Darwin/LP64 `tcl.h` takes its
-        // `#ifdef __APPLE__ / #ifdef __LP64__` override, defines
-        // TCL_WIDE_INT_IS_LONG, and so declares `Tcl_WideInt` = `long`, while
-        // `sqlite3_int64` is `long long`. sqlite's own
-        // `ext/session/test_session.c`'s
-        // `Tcl_GetWideIntFromObj(interp, objv[4], &iVal)` therefore passes
-        // `long long*` to a `long*` parameter on macOS and NOWHERE ELSE. ✔MEASURED
-        // on Apple clang 21.0.0 against every macOS SDK on the operator's machine
-        // (8.5.9 headers, MacOSX13.3/14.4/15.4/26.5): rc=0, 0 errors, 1
-        // `-Wincompatible-pointer-types` WARNING. DSS's hard S0003 there was
-        // stricter than the platform toolchain and cost the ENTIRE mach-o unit
-        // corpus on every host — a compiler that cannot build what the platform's
-        // own compiler builds is not portable, whatever the standard permits.
-        //
-        // C 6.5.2.2p7 makes this a CONSTRAINT VIOLATION requiring *a* diagnostic;
-        // both an error and a warning conform, so this is a policy choice and it is
-        // recorded as one. DSS now takes gcc's and clang's: diagnose, do not refuse.
-        // `--warnings-as-errors` restores the strict posture for anyone who wants
-        // it, so the strict reading remains available without being the default.
-        // ★ NOT a silent admission — the warning is the diagnostic the standard
-        // requires, and silence here would be exactly the fail-loud violation this
-        // flag's own default guards against.
-        //
-        // Read by `isAssignable` (admit — the trailing
-        // `intPointeeSameRepresentationCompat` arg, passed true ONLY by
-        // `checkCallAgainstSig` at a DIRECT callee) and by `cst_to_hir.cpp::coerce`
-        // (realize — the node-mark-gated Ptr→Ptr bitcast), in lockstep. Default
-        // FALSE = strict; only c opts in. The boundary stays SCOPED:
-        // init/assign/return and the fn-pointer/indirect call paths ALL remain
-        // strict, and identity is NEVER merged (a compat admission, not a
-        // canonicalization — `_Generic(long:,long long:)` still distinguishes).
-        // Per-target by construction, with NO format branch: on LLP64/pe64 `long`
-        // is I32, so `long*` still REFUSES a `long long*`/`ptr<i64>` parameter on
-        // sameRepresentation's kind axis. ⚠ THE WIDENING HAS A MEASURED
-        // CONSEQUENCE ON LLP64 THAT THE OLD GATE HID: `int*` into
-        // `_InterlockedCompareExchange`'s `long*` was previously rejected because a
-        // BUILTIN is not a shipped descriptor; on pe64 both are I32, so it is now
-        // admitted-with-a-warning — which is what MSVC (C4133) and clang do.
-        // Sibling of `allowVoidPtrFnConvert` (the fn<->void* Option-B gate) — the
-        // same admit/realize-in-lockstep discipline.
-        bool directCallIntPointeeCompat = false;
+        // `incompatiblePointerConvertsDiagnosed`: a pointer from a pointer (an array or
+        // a function designator contributing its decayed pointer) whose pointed-to
+        // type is not compatible — object pointers of different types, an object
+        // pointer beside a function pointer, a function pointer of another signature.
+        // Two distinct integer pointees of ONE representation (`long *` from `long
+        // long *` on LP64, `long *` from `int *` on LLP64) report under their own
+        // narrower code, S_IncompatiblePointerIntegerPointee.
+        // ⓘ This RETIRES `directCallIntPointeeCompat` (TF-C41 / TF-C135), which
+        // admitted only that same-representation integer pair and only at a DIRECT
+        // call's argument, with a node mark the HIR realize had to consult. The
+        // measurement that widened it once already — the sqlite-on-Darwin
+        // `Tcl_GetWideIntFromObj(…, &iVal)` shape, a `-Wincompatible-pointer-types`
+        // WARNING under Apple clang 21.0.0 and a hard refusal here — was one instance
+        // of this whole class; the class is now decided by the types alone, at every
+        // site, and the old key is REFUSED by the loader rather than read.
+        bool incompatiblePointerConvertsDiagnosed = false;
+        // `integerPointerConvertsDiagnosed`: a pointer from an integer that is not a
+        // null pointer constant (`int *p = 5;`, `struct B *pv = anIntptr;`), and an
+        // integer from a pointer (`intptr_t v = p;`, `int n = p;`). C 6.3.2.3p5-p6
+        // makes both results implementation-defined — the value an explicit cast
+        // gives; gcc 13.3.0, mingw-w64 13.2.0 and MSVC 19.51 build them with a warning
+        // (clang 18.1.3 refuses by default), and the union owes what one reference
+        // builds. `bool` from a pointer is C's own conversion and is not this class.
+        bool integerPointerConvertsDiagnosed = false;
     };
     PointerConversionRules pointerConversions;
 

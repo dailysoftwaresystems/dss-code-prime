@@ -23,7 +23,7 @@
 // a fail-loud assert, and the probe machinery is shared (`native_c_probe.hpp`) so the
 // bit-field twin cannot drift away from it again.
 //
-// D-TEST-NATIVE-ORACLE-INERT-ON-POSIX — a native oracle that skips on error is a broken oracle that reports success.
+// A native oracle that skips on error is a broken oracle that reports success.
 
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
