@@ -234,7 +234,7 @@ public:
           // ⓘ NO DATA MODEL ACCOMPANIES IT, and that is a property of C 6.10.1p4
           // rather than an omission: at phase-4 widths every candidate is 64
           // bits, so a WIDTH model cannot reach the signedness answer. See
-          // `preprocessorLiteralSignedness`.
+          // `preprocessorLiteral`.
           intLadder_(schema.semantics().integerLiteralTyping),
           charIsUnsigned_(charFacts.charIsUnsigned) {
         // The string-literal OPENER (C's `"`). A string literal lexes as an
@@ -658,35 +658,53 @@ private:
         return condTrue ? std::move(*thenOpt) : std::move(*elseOpt);
     }
 
-    // ── D-PP-IF-UNSIGNED-INTMAX: is this integer literal SIGNED? ─────────────
+    // ── D-PP-IF-UNSIGNED-INTMAX: this integer literal's #if OPERAND ─────────
     //
-    // Delegated whole to `preprocessorLiteralSignedness` -- the language's own
-    // C 6.4.4.1 candidate ladder, run at C 6.10.1p4's phase-4 widths. The suffix
-    // match, the radix classification and the candidate order all come from
-    // `semantics.integerLiteralTyping`; nothing about which suffixes exist or
-    // what they admit is known here.
-    [[nodiscard]] std::optional<bool>
-    literalSignedness(std::string_view text, std::uint64_t magnitude) {
+    // Delegated whole to `preprocessorLiteral` -- the language's own C 6.4.4.1
+    // candidate ladder, run at C 6.10.1p4's phase-4 widths, and since P68 round 13
+    // (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED) the fixed-type rules too, whose
+    // VALUE is the magnitude reduced to their type (`#if 300i8 == 44`). The suffix
+    // match, the radix classification, the candidate order and the reduction all
+    // come from `semantics.integerLiteralTyping`; nothing about which suffixes
+    // exist or what they mean is known here.
+    [[nodiscard]] std::optional<PhaseFourLiteral>
+    literalOperand(std::string_view text, std::uint64_t magnitude) {
         // A language that declares no ladder (toy / tsql) keeps the signed
         // reading it has always had -- now at intmax width rather than 32 bits.
         // The identity property: no ladder, no change in signedness.
-        if (intLadder_.empty()) return true;
-
-        auto const sgn = preprocessorLiteralSignedness(text, numberStyle_,
-                                                       intLadder_, magnitude);
-        if (!sgn.has_value()) {
-            // No rule covers the matched suffix, or a candidate's signedness is
-            // not model-invariant. The loader cross-checks both, so this is
-            // substrate drift. The semantic tier ABORTS here; a preprocessor
-            // reports instead -- but it still REFUSES rather than guessing a
-            // signedness, because a guess selects a wrong branch in silence,
-            // which is the entire defect this row exists to remove.
-            fail(DiagnosticCode::P_PreprocessorDirective,
-                 "integer literal in #if matched no integerLiteralTyping rule "
-                 "(config invariant violated): " + std::string{text});
-            return std::nullopt;
+        if (intLadder_.empty()) {
+            return PhaseFourLiteral{PhaseFourLiteralStatus::Operand, magnitude, true};
         }
-        return *sgn;
+
+        PhaseFourLiteral const lit = preprocessorLiteral(
+            text, numberStyle_, intLadder_, magnitude, charIsUnsigned_);
+        switch (lit.status) {
+            case PhaseFourLiteralStatus::Operand:
+                return lit;
+            case PhaseFourLiteralStatus::CharSignednessUnknown:
+                // A `char`-typed literal (`i8`) reads at plain char's signedness,
+                // which C 6.2.5p15 leaves to the implementation and the TARGET
+                // declares -- and this run was given none (the LSP, the direct
+                // API). Refuse rather than pick one: the branch depends on it.
+                fail(DiagnosticCode::P_PreprocessorDirective,
+                     "a literal whose type is plain `char` in #if takes that "
+                     "type's signedness, which is target-dependent (C 6.2.5p15), "
+                     "and no target was supplied to this preprocessor run: "
+                     + std::string{text});
+                return std::nullopt;
+            case PhaseFourLiteralStatus::NoRule:
+                break;
+        }
+        // No rule covers the matched suffix, or a candidate's signedness is not
+        // model-invariant. The loader cross-checks both, so this is substrate
+        // drift. The semantic tier ABORTS here; a preprocessor reports instead --
+        // but it still REFUSES rather than guessing a signedness, because a guess
+        // selects a wrong branch in silence, which is the entire defect this row
+        // exists to remove.
+        fail(DiagnosticCode::P_PreprocessorDirective,
+             "integer literal in #if matched no integerLiteralTyping rule "
+             "(config invariant violated): " + std::string{text});
+        return std::nullopt;
     }
 
     // ── D-PP-IF-LARGE-DECIMAL-LITERAL-HAS-NO-WARNING (C 6.10.1p4) ────────────
@@ -696,22 +714,21 @@ private:
     // default, and then evaluate exactly as DSS does — so this is a warning, not
     // a refusal, and the branch is unaffected.
     //
-    // ★ THE CONDITION IS RE-DERIVED FROM THE LADDER'S OWN VERBS, never from a
-    // hand-parsed suffix: `matchIntegerSuffix` and `integerLiteralIsPrefixed`
-    // are the SAME two the ladder used to reach its answer, so "was this
-    // reinterpreted" cannot drift from "what signedness did we use". A `u`-
-    // suffixed or hexadecimal literal reaches unsigned through a rule that
-    // ADMITS unsigned candidates — nothing was reinterpreted, and neither
-    // reference warns (both measured; see the diagnostic's note).
+    // ★ THE CONDITION IS THE LADDER'S OWN REPORT (`reinterpretedUnsigned`), never
+    // a hand-parsed suffix: the function that chose the unsigned reading says
+    // whether it chose it for a SIGNED type, so "was this reinterpreted" cannot
+    // drift from "what signedness did we use". A `u`-suffixed or hexadecimal
+    // literal reaches unsigned through a rule that ADMITS unsigned candidates —
+    // nothing was reinterpreted, and neither reference warns (both measured; see
+    // the diagnostic's note). Since P68 round 13 the report also covers a `wb`
+    // literal past INTMAX_MAX, which clang 18.1.3 reads unsigned with the same
+    // warning (D-PP-IF-BIT-PRECISE-LITERAL-READS-UNSIGNED).
     //
-    // ⓘ A language with no ladder never gets here: `literalSignedness` returns
-    // signed for that case and this predicate is false.
-    void warnIfImplicitlyUnsigned(std::string_view text, bool isSigned,
+    // ⓘ A language with no ladder never gets here: `literalOperand` returns a
+    // signed operand for that case and the report is false.
+    void warnIfImplicitlyUnsigned(std::string_view text, PhaseFourLiteral const& lit,
                                   SourceSpan span) {
-        if (isSigned) return;
-        if (intLadder_.empty()) return;
-        if (!matchIntegerSuffix(text, numberStyle_).empty()) return;  // suffixed
-        if (integerLiteralIsPrefixed(text, numberStyle_)) return;     // non-decimal
+        if (!lit.reinterpretedUnsigned) return;
         ParseDiagnostic d;
         d.code     = DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned;
         d.severity = DiagnosticSeverity::Warning;
@@ -721,8 +738,8 @@ private:
                    + "' is too large for a signed intmax_t and is interpreted as "
                      "UNSIGNED in this #if (C 6.10.1p4). A comparison against a "
                      "negative operand therefore converts that operand to "
-                     "uintmax_t and can select the opposite branch; add a 'u' "
-                     "suffix to say so, or use a value that fits intmax_t.";
+                     "uintmax_t and can select the opposite branch; spell it "
+                     "unsigned to say so, or use a value that fits intmax_t.";
         rep_.report(std::move(d));
     }
 
@@ -996,10 +1013,10 @@ private:
             // next token (the reference carets sit under the digits).
             SourceSpan const litSpan = t.span;
             advance();
-            auto const signedness = literalSignedness(text, *iv);
-            if (!signedness.has_value()) return std::nullopt;   // already reported
-            warnIfImplicitlyUnsigned(text, *signedness, litSpan);
-            return intmaxOperand(*iv, *signedness);
+            auto const operand = literalOperand(text, *iv);
+            if (!operand.has_value()) return std::nullopt;   // already reported
+            warnIfImplicitlyUnsigned(text, *operand, litSpan);
+            return intmaxOperand(operand->bits, operand->isSigned);
         }
 
         // Any other identifier that survived expansion -> 0 (C 6.10.1p4), which

@@ -553,11 +553,11 @@ def take_run_lock(run):
     crashed run never wedges the next one: a stale owner is taken over and SAID."""
     log = run.log
     import sqlite_procs as P
-    run.run_lock = P.RunLock(os.path.join(run.out_dir, ".harness-lock"))
+    run.run_lock = P.RunLock(os.path.join(run.out_dir, C.RUN_LOCK))
     stolen = run.run_lock.acquire(log)
     if stolen:
         run.hygiene.append("took over a STALE run lock left by PID %s" % stolen)
-    log.info("run lock: %s (pid %d)" % (os.path.join(run.out_dir, ".harness-lock"), os.getpid()))
+    log.info("run lock: %s (pid %d)" % (os.path.join(run.out_dir, C.RUN_LOCK), os.getpid()))
 
 
 # ── Steps 3–4 ─────────────────────────────────────────────────────────────────────────
@@ -701,17 +701,16 @@ def self_test():
 
 def place_run(run):
     """Where a run's trees are, the ONE rule for every mode: the DSS tree (SRC_DIR, else the tree
-    this harness ships in) and the output tree (OUT_DIR, else `<tree>/build/real-examples/c/sqlite`,
-    under `windows/` on a Windows host). The recompile finds the STAGE a run left there."""
+    this harness ships in) and the output tree (`sqlite_common.output_tree`: OUT_DIR, else
+    `<tree>/build/real-examples/c/sqlite`, under `windows/` on a Windows host). The recompile finds the
+    STAGE a run left there, and the speedtest1 benchmark keeps its pinned checkout there."""
     cfg = run.cfg
     run.driver_tree = C.driver_tree()
     run.repo_root = os.path.abspath(cfg.src_dir) if cfg.src_dir else (run.driver_tree or "")
     if not run.repo_root:
         C.die("this copy of the harness lives in no DSS tree, and SRC_DIR is not set — name the "
               "checkout to build with SRC_DIR=<path>.")
-    run.out_dir = os.path.abspath(cfg.out_dir) if cfg.out_dir else os.path.join(
-        run.repo_root, "build", "real-examples", "c", "sqlite",
-        *(["windows"] if run.host == "windows" else []))
+    run.out_dir = C.output_tree(run.repo_root, run.host, cfg.out_dir)
     run.registry_glob = os.path.join(run.driver_tree or os.path.join(HERE, "no-dss-tree"),
                                      ".plans", "_deferred-anchor-registry*.md")
 

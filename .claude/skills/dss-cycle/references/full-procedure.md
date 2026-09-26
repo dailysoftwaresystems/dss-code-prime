@@ -65,7 +65,7 @@ The loop resumes only after the user answers. While paused, do not start a diffe
   `-done.md`**: it is the archive
   (every closed row, moved out on close since 2026-09-01) and reading it to ORIENT is how a
   closed row got recommended three times in this project's history. One screen:
-  `DssHarness read-anchors --pending`.
+  `dssharness read-anchors --pending`.
 - Establish the baseline: `dssharness test --legs windows-x86_64-debug --json --time` — it builds first,
   and `--filter <regex>` iterates but never concludes.
   Baseline must be green before new work (unless the WIP is the thing being repaired). A red

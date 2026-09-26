@@ -58,7 +58,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 
 | step | what must hold | open |
 |---|---|---|
-| 0 | the handoff is the previous cycle's claim, not ground truth; orient from `_deferred-anchor-registry-production.md` (`DssHarness read-anchors --pending`), never the `-done.md` archive; a red baseline with no WIP-repair context is decided and reported veto-able, never silently (AMENDED 2026-09-21); READ CI (`dssharness check-ci-legs`): a red leg is a HARD STOP on picking work, and repairing it is a FIX | `workflow-steps.md`, `round-gate-and-ci.md` |
+| 0 | the handoff is the previous cycle's claim, not ground truth; orient from `_deferred-anchor-registry-production.md` (`dssharness read-anchors --pending`), never the `-done.md` archive; a red baseline with no WIP-repair context is decided and reported veto-able, never silently (AMENDED 2026-09-21); READ CI (`dssharness check-ci-legs`): a red leg is a HARD STOP on picking work, and repairing it is a FIX | `workflow-steps.md`, `round-gate-and-ci.md` |
 | 1 | an explicit argument overrides the auto-pick, never the bar, the pause gate or the hard stops; a dry §0.1 promotes an ELIGIBLE anchor (unconditional, or its trigger fired); a harness row never enters on its own ticket | `workflow-steps.md`, `registry-and-priority.md` |
 | 2 | blockers come from §0.1's "Blocked by" column, the registry, and any "requires deferrals" note | `workflow-steps.md` |
 | 3 | delegate the plan (`/feature-dev:feature-dev`, a `Plan` or `code-architect` agent) | `delegation.md` |
@@ -66,7 +66,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
 | 5 | each lane's owned and forbidden PATHS named; its own build tree and scratch directory; a new `D-*` cited in `src/` registered in the same commit | `delegation.md`, `lane-discipline.md`, `worktrees.md`, `build-layout.md` |
 | 6 | `/pr-review-toolkit:review-pr`, the agnosticism pass and the CI-hazard screen | `workflow-steps.md`, `full-procedure.md` |
 | 7 | net OPEN ≤ 0 against the cycle's start commit, and `check-anchor-registry` run too; a round of lanes owes EIGHT runs | `gate-and-cross-plan.md`, `round-gate-and-ci.md`, `no-follow-ups.md` |
-| 8 | `DssHarness set-anchor <ANCHOR> --status closed --closing '...'`; a new row is `DssHarness write-anchor`; both WRITE unless given `--anchor-dry-run` | `anchors-and-deferrals.md`, `registry-and-priority.md` |
+| 8 | `dssharness set-anchor <ANCHOR> --status closed --closing '...'`; a new row is `dssharness write-anchor`; both WRITE unless given `--anchor-dry-run` | `anchors-and-deferrals.md`, `registry-and-priority.md` |
 | 9 | plans updated in the SAME commit as the code; the handoff answers its five questions | `gate-and-cross-plan.md` |
 | 10 | the `dss-audit` rule-lens and guardrails on the complete, gate-passed cycle | `workflow-steps.md`, `full-procedure.md` |
 | 11 | subject `Cycle <id>: <concise summary>`; the `Co-authored-by:` trailer from the session, never hardcoded; pushing does NOT start CI; open the PR if absent; seed the next lane set only after this step | `workflow-steps.md`, `lane-sets-and-folding.md` |
@@ -98,7 +98,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   closed row left behind and an open row filed in the archive.
 - A row is six cells, `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`;
   `🔵 DISCLOSED` is for debt this cycle FOUND, never for debt it created.
-- The door is `DssHarness write-anchor` / `set-anchor`, which WRITE unless given `--anchor-dry-run`;
+- The door is `dssharness write-anchor` / `set-anchor`, which WRITE unless given `--anchor-dry-run`;
   a cell is read only with `read-anchor <ID> --json`; a row is never hand-assembled, hand-edited or
   hand-read → also `references/anchors-and-deferrals.md`.
 - Never quote an anchor count — re-derive it: `dssharness check-anchor-balance` for the balance,
@@ -121,8 +121,8 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   or `src/core/types/*schema*`; `.plans/**` is a guard input; each lane gets its own build tree and
   scratch directory → `references/lane-discipline.md`.
 - A lane's registry rows go to a ROWS DIRECTORY in its scratch, at an absolute path — anchor-rows'
-  `<dir>/<ANCHOR ID>/<cell>.txt`, one file per cell, VERBATIM — the report naming the directory, the ids and each
-  cell file's md5; all else travels INLINE (rule 9); a brief states an interface only if its author ran it;
+  `<dir>/<ANCHOR ID>/<cell>.txt`, one file per cell, VERBATIM — the report naming the directory, the ids (the NEW
+  ones named as new) and each cell file's md5; all else travels INLINE (rule 9); a brief states an interface only if its author ran it;
   an anchor id is never line-wrapped → same file.
 - ★★★★ **"Complete" means FOLDED** (2026-08-28): on a lane's report, fold it, apply its rows, re-derive the
   balance; a reported-but-unfolded lane is still in flight → `references/lane-sets-and-folding.md`.
@@ -157,7 +157,7 @@ use (3.5 design-audit, 6 gate, 8 cross-plan, 8.5 self-audit, 9 commit, 10 report
   program becomes an ACTION → `references/dss-harness.md`.
 - ★★★ **Use the program that exists — fix it rather than routing around it** (2026-08-19) → `references/actions.md`.
 - An action added, renamed, deleted or repurposed updates both indexes in the same commit
-  (`dssharness run check-scripts-index --manual-step write`); no `.sh` and no `.ps1` under the actions
+  (`dssharness run check-scripts-index-write`); no `.sh` and no `.ps1` under the actions
   root (2026-09-21) → same file.
 - ★★★ **Any issue found in DssHarness is reported in the cycle that finds it** (2026-09-16): SENT by the agent to
   the repo-harness session — the local session working in the repo-harness checkout — the operator told it was
@@ -241,7 +241,7 @@ next: <one line, matching the top NEXT entry in .plans/_handoff.md>
 
 ## File map
 
-- Read `references/the-bar.md` **at the start of every cycle** — the six non-negotiables in full,
+- Read `references/the-bar.md` **at the start of every cycle** — the seven non-negotiables in full,
   with the worked cases behind each. This is the standard everything else here serves.
 - Read `references/delegation.md` before steps 3–5 — what to delegate, how to split by disjoint file
   sets, and what the orchestrator keeps.

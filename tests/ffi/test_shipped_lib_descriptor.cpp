@@ -1312,6 +1312,252 @@ TEST(ShippedLibDescriptor, RetiredSignatureByDataModelKeyIsRefused) {
         << "the refusal must name the retired key";
 }
 
+// ── P68 round 12 (S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): a typedef
+//    that names its OWNER ────────────────────────────────────────────────────────
+//
+// `{ "name": "size_t", "shippedTypedef": { "header": "stddef.h" } }` — C's own model:
+// many headers declare `size_t`, one type defines it. The reference takes the owner's
+// WHOLE answer on the pair: its type (the owner's TypeId itself, in the same interner)
+// and "not declared here" too. Every fixture below is a small shipped root whose files
+// are named by their own headers — the provenance the reader finds an owner by.
+
+namespace {
+[[nodiscard]] std::optional<ShippedLibDescriptor>
+readOnPair(fs::path const& path, TypeInterner& interner, TypeRegistry& typeReg,
+           DataModel dm, std::string_view arch, ObjectFormatKind fmt, std::string& diags) {
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, dm, arch, fmt);
+    for (auto const& d : rep.all()) diags += "\n  " + d.actual;
+    if (rep.hasErrors()) return std::nullopt;
+    return desc;
+}
+
+[[nodiscard]] std::optional<TypeId> typedefIn(ShippedLibDescriptor const& d, std::string_view name) {
+    for (auto const& t : d.typedefs)
+        if (t.name == name) return t.type;
+    return std::nullopt;
+}
+
+// An owner declaring `sz` on elf and pe, with a different identity on each.
+constexpr char const* kRefOwner = R"JSON({ "header": "own.h", "typedefs": [
+    { "name": "sz", "variants": [
+        { "when": { "format": "elf" }, "type": "u64 \"unsigned long\"" },
+        { "when": { "format": "pe" },  "type": "u64 \"unsigned long long\"" } ] } ] })JSON";
+}  // namespace
+
+// The reference IS the owner's type — one TypeId, not an equal copy — on each pair, and
+// the referrer's own signatures spell it.
+TEST(ShippedLibDescriptor, TypedefReferenceIsTheOwnersTypeOnEachPair) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref"};
+    auto const owner = writeTemp(dir, "own.json", kRefOwner);
+    auto const ref   = writeTemp(dir, "ref.json", R"JSON({ "header": "ref.h",
+        "typedefs": [ { "name": "sz", "shippedTypedef": { "header": "own.h" } } ],
+        "symbols": [ { "name": "f", "signature": "fn(sz) -> sz" } ] })JSON");
+    struct Pair { ObjectFormatKind fmt; DataModel dm; };
+    for (Pair const p : {Pair{ObjectFormatKind::Elf, DataModel::Lp64},
+                         Pair{ObjectFormatKind::Pe, DataModel::Llp64}}) {
+        SCOPED_TRACE(std::string{objectFormatKindName(p.fmt)});
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        auto const o = readOnPair(owner, interner, typeReg, p.dm, "x86_64", p.fmt, diags);
+        auto const r = readOnPair(ref, interner, typeReg, p.dm, "x86_64", p.fmt, diags);
+        ASSERT_TRUE(o.has_value() && r.has_value()) << diags;
+        auto const ot = typedefIn(*o, "sz");
+        auto const rt = typedefIn(*r, "sz");
+        ASSERT_TRUE(ot.has_value() && rt.has_value());
+        EXPECT_EQ(*rt, *ot) << "the reference is the owner's type itself";
+        ASSERT_EQ(r->symbols.size(), 1u);
+        EXPECT_EQ(interner.fnResult(r->symbols[0].signature), *ot);
+    }
+}
+
+// THE OWNER'S ABSENCE IS THE REFERRER'S TOO — and the loud path is WITNESSED, not
+// assumed: where the owner declares nothing, the referrer declares nothing and reads
+// clean, and a signature that names the type there is REFUSED as an unknown type.
+TEST(ShippedLibDescriptor, TypedefReferenceTakesTheOwnersAbsenceAndAUseIsRefused) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-absent"};
+    (void)writeTemp(dir, "peonly.json", R"JSON({ "header": "peonly.h", "typedefs": [
+        { "name": "w", "variants": [ { "when": { "format": "pe" }, "type": "u16" } ] } ] })JSON");
+    auto const decl = writeTemp(dir, "decl.json", R"JSON({ "header": "decl.h",
+        "typedefs": [ { "name": "w", "shippedTypedef": { "header": "peonly.h" } } ] })JSON");
+    auto const use = writeTemp(dir, "use.json", R"JSON({ "header": "use.h",
+        "typedefs": [ { "name": "w", "shippedTypedef": { "header": "peonly.h" } } ],
+        "symbols": [ { "name": "g", "signature": "fn(w) -> i32" } ] })JSON");
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        auto const d = readOnPair(decl, interner, typeReg, DataModel::Llp64, "x86_64",
+                                  ObjectFormatKind::Pe, diags);
+        ASSERT_TRUE(d.has_value()) << diags;
+        EXPECT_TRUE(typedefIn(*d, "w").has_value()) << "control: the owner declares it on pe";
+        EXPECT_TRUE(readOnPair(use, interner, typeReg, DataModel::Llp64, "x86_64",
+                               ObjectFormatKind::Pe, diags).has_value()) << diags;
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        auto const d = readOnPair(decl, interner, typeReg, DataModel::Lp64, "x86_64",
+                                  ObjectFormatKind::Elf, diags);
+        ASSERT_TRUE(d.has_value()) << "not declared here is not an error" << diags;
+        EXPECT_FALSE(typedefIn(*d, "w").has_value()) << "the owner declares nothing on elf";
+        DiagnosticReporter rep;
+        auto const u = readShippedLibDescriptor(use, interner, typeReg, rep, DataModel::Lp64,
+                                                "x86_64", ObjectFormatKind::Elf);
+        EXPECT_FALSE(u.has_value());
+        EXPECT_TRUE(anyDiagMentions(rep, "unknown type 'w'"))
+            << "the use is refused as an unknown type, loudly";
+        EXPECT_TRUE(anyDiagMentions(rep, "has a 'signature' that failed to decode"));
+    }
+}
+
+// A header that declares the name on FEWER pairs than its owner gates a reference ARM.
+TEST(ShippedLibDescriptor, TypedefReferenceArmGatesTheReferrer) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-arm"};
+    (void)writeTemp(dir, "all.json", R"JSON({ "header": "all.h", "typedefs": [
+        { "name": "c", "type": "i16" } ] })JSON");
+    auto const gated = writeTemp(dir, "gated.json", R"JSON({ "header": "gated.h", "typedefs": [
+        { "name": "c", "variants": [ { "when": { "format": "pe" },
+                                       "shippedTypedef": { "header": "all.h" } } ] } ] })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    std::string diags;
+    auto const pe = readOnPair(gated, interner, typeReg, DataModel::Llp64, "x86_64",
+                               ObjectFormatKind::Pe, diags);
+    auto const elf = readOnPair(gated, interner, typeReg, DataModel::Lp64, "x86_64",
+                                ObjectFormatKind::Elf, diags);
+    ASSERT_TRUE(pe.has_value() && elf.has_value()) << diags;
+    EXPECT_TRUE(typedefIn(*pe, "c").has_value());
+    EXPECT_FALSE(typedefIn(*elf, "c").has_value()) << "the arm gates the referrer to pe";
+}
+
+// Every refusal the ruling names, each with its own sentence, each beside a control
+// that reads clean — so a refusal that fired for an unrelated reason cannot pass.
+TEST(ShippedLibDescriptor, TypedefReferenceRefusals) {
+    ScratchDir dir{Location::Temp, "shipped-lib-ref-bad"};
+    (void)writeTemp(dir, "own.json", kRefOwner);
+    (void)writeTemp(dir, "hop.json", R"JSON({ "header": "hop.h", "typedefs": [
+        { "name": "sz", "shippedTypedef": { "header": "own.h" } } ] })JSON");
+    // A cycle ACROSS names, every reference aimed at a DEFINITION (so no reference-to-a-
+    // reference refusal can fire first): cya DEFINES X and Z and names cyb for Y; cyb
+    // DEFINES Y and names cya for Z. Resolving cya.X decodes cya, whose Y decodes cyb,
+    // whose Z needs cya again — the cycle.
+    (void)writeTemp(dir, "cya.json", R"JSON({ "header": "cya.h", "typedefs": [
+        { "name": "X", "type": "i32" },
+        { "name": "Y", "shippedTypedef": { "header": "cyb.h" } },
+        { "name": "Z", "type": "u8" } ] })JSON");
+    (void)writeTemp(dir, "cyb.json", R"JSON({ "header": "cyb.h", "typedefs": [
+        { "name": "Y", "type": "i16" },
+        { "name": "Z", "shippedTypedef": { "header": "cya.h" } } ] })JSON");
+    int n = 0;
+    auto refusedWith = [&](std::string const& typedefJson, std::string_view needle) {
+        std::string const name = "bad" + std::to_string(n++);
+        auto const p = writeTemp(dir, name + ".json", R"({ "header": ")" + name
+                                     + R"(.h", "typedefs": [ )" + typedefJson + " ] }");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto const d = readShippedLibDescriptor(p, interner, typeReg, rep, DataModel::Lp64,
+                                                "x86_64", ObjectFormatKind::Elf);
+        bool const refused = !d.has_value() || rep.hasErrors();
+        return refused && anyDiagMentions(rep, needle);
+    };
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "header": "nowhere.h" } })",
+                            "no shipped descriptor for that header is beside this one"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "nosuch", "shippedTypedef": { "header": "own.h" } })",
+                            "declares no typedef 'nosuch' on any pair"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "header": "hop.h" } })",
+                            "is itself a reference"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "X", "shippedTypedef": { "header": "cya.h" } })",
+                            "closes a cycle of typedef references"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "type": "u64", "shippedTypedef": { "header": "own.h" } })",
+                            "states its type twice"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": "own.h" })",
+                            "'shippedTypedef' must be an object"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "hdr": "own.h" } })",
+                            "unknown key 'hdr'"));
+    EXPECT_TRUE(refusedWith(R"({ "name": "sz", "shippedTypedef": { "header": "" } })",
+                            "needs a non-empty string 'header'"));
+    // A referrer whose file does not carry its own header's name has no shipped root.
+    {
+        auto const p = writeTemp(dir, "misnamed.json", R"JSON({ "header": "other.h", "typedefs": [
+            { "name": "sz", "shippedTypedef": { "header": "own.h" } } ] })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        (void)readShippedLibDescriptor(p, interner, typeReg, rep, DataModel::Lp64, "x86_64",
+                                       ObjectFormatKind::Elf);
+        EXPECT_TRUE(anyDiagMentions(rep, "does not end in its own header's name"));
+    }
+    // CONTROL: a well-formed reference beside the same fixtures reads clean.
+    {
+        auto const p = writeTemp(dir, "good.json", R"JSON({ "header": "good.h", "typedefs": [
+            { "name": "sz", "shippedTypedef": { "header": "own.h" } } ] })JSON");
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        std::string diags;
+        EXPECT_TRUE(readOnPair(p, interner, typeReg, DataModel::Lp64, "x86_64",
+                               ObjectFormatKind::Elf, diags).has_value()) << diags;
+    }
+}
+
+// ── P68 round 12 (S2a-2a): a per-pair signature with no arm, by DECLARED availability ──
+// Available on the pair: refused, naming the pair and the symbol. Not available on the
+// pair: the symbol is simply absent there — the rule a typedef or struct variant with
+// no arm already follows — and every arm is still decoded. Availability is the row's
+// DECLARED `availableObjectFormats`, never inferred from which arms exist.
+TEST(ShippedLibDescriptor, SymbolSignatureNoArmFollowsDeclaredAvailability) {
+    ScratchDir dir{Location::Temp, "shipped-lib-avail"};
+    auto const path = writeTemp(dir, "ld.json", R"JSON({ "header": "ld.h", "symbols": [
+        { "name": "wide", "availableObjectFormats": ["elf", "pe"],
+          "signature": { "variants": [
+              { "when": { "longDoubleFormat": "x87-80" }, "value": "fn() -> i64" } ] } },
+        { "name": "elfonly", "availableObjectFormats": ["elf"],
+          "signature": { "variants": [
+              { "when": { "longDoubleFormat": "x87-80" }, "value": "fn() -> i32" } ] } } ] })JSON");
+    auto readWith = [&](LongDoubleFormat ldf, std::string_view arch, ObjectFormatKind fmt,
+                        DataModel dm, DiagnosticReporter& rep) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        ShippedPairFacts facts;
+        facts.dataModel        = dm;
+        facts.longDoubleFormat = ldf;
+        auto d = readShippedLibDescriptor(path, interner, typeReg, rep, dm, arch, fmt, {},
+                                          nullptr, &facts);
+        std::vector<std::string> names;
+        if (d.has_value())
+            for (auto const& s : d->symbols) names.push_back(s.name);
+        return std::make_pair(d.has_value() && !rep.hasErrors(), names);
+    };
+    {   // control: x87-80 on ELF x86_64 selects both arms
+        DiagnosticReporter rep;
+        auto const [clean, names] =
+            readWith(LongDoubleFormat::X87_80, "x86_64", ObjectFormatKind::Elf, DataModel::Lp64, rep);
+        EXPECT_TRUE(clean);
+        EXPECT_EQ(names, (std::vector<std::string>{"wide", "elfonly"}));
+    }
+    {   // AVAILABLE with no arm: `wide` on pe (f64) is refused, naming the pair and the symbol
+        DiagnosticReporter rep;
+        auto const [clean, names] =
+            readWith(LongDoubleFormat::F64, "x86_64", ObjectFormatKind::Pe, DataModel::Llp64, rep);
+        EXPECT_FALSE(clean);
+        EXPECT_TRUE(anyDiagMentions(rep, "symbol 'wide'"));
+        EXPECT_TRUE(anyDiagMentions(rep, "longDoubleFormat='f64'"));
+        EXPECT_FALSE(anyDiagMentions(rep, "symbol 'elfonly'"))
+            << "an UNAVAILABLE symbol with no arm is not a refusal";
+    }
+    {   // UNAVAILABLE with no arm: on arm64 ELF (ieee128) `wide` is available and refused, but
+        // on a format that excludes both, neither is refused and neither is injected
+        DiagnosticReporter rep;
+        auto const [clean, names] =
+            readWith(LongDoubleFormat::F64, "arm64", ObjectFormatKind::MachO, DataModel::Lp64, rep);
+        EXPECT_TRUE(clean) << "neither symbol exists on Mach-O, so neither is refused there";
+        EXPECT_TRUE(names.empty()) << "and neither is injected";
+    }
+}
+
 // ── `$`-DOCUMENTATION KEYS, ON EVERY OBJECT AND NOT ONLY THE ROOT ─────────
 //
 // The repo-wide convention is that ANY config object may carry a `$`-prefixed
@@ -6330,9 +6576,11 @@ TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
-    // Decode keeps EVERY symbol row regardless of the requested format (the
+    // Decode keeps every symbol row regardless of the requested format (the
     // per-symbol gate filters at INJECTION — the c106 pin-shape lesson), so one
-    // Elf-kind read exposes both symbols' availability sets.
+    // Elf-kind read exposes both symbols' availability sets. (The one exception,
+    // since P68 round 12: a per-pair signature with no arm on a pair its row is NOT
+    // available on is left out there; neither row here is per-pair.)
     auto desc = readShippedLibDescriptor(stdlibPath, interner, typeReg, rep,
                                          DataModel::Lp64,
                                          std::string_view{"x86_64"},

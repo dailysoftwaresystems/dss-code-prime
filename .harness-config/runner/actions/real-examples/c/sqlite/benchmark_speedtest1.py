@@ -52,25 +52,50 @@ THE PHASES
   MEASURE  `speedtest1_bench.py --plan`, natively; its exit code is this program's.
 
 WHAT THE UNION DECIDED (each pinned by a self-test arm):
-  * dsscp candidates are `sqlite_compiler.find_candidates`'s -- the fixed build roots AND every
-    `build/*/bin/dss` tree (the .sh searched every `build/*/`: MEASURED 2026-08-26, the arm64 VPS
-    keeps its Release tree in `build/bench-rel`; DssHarness builds each leg variant in
-    `build/<processor>-<toolchain>-<config>`), one owner for the driver and this program alike --
-    every one judged by `sqlite_compiler.build_type` / `select_compiler` /
-    `is_release` -- the newest RELEASE wins; a non-Release one is eligible only under
-    DSS_ALLOW_NONRELEASE_COMPILER and is then SAID; an explicit --dss / DSS_BIN passes the SAME
-    gate and still reports its build type.
+  * The dsscp is NAMED -- `--dss` (what the `speedtest1` runner's step passes: the leg's own
+    `{product}`, which its requireBuild has just built) or DSS_BIN by hand -- and a run naming none is
+    REFUSED in the driver's own words (`sqlite_compiler.require_named`, P68 round 13): never searched
+    for under `build/`, never built. Until then a nameless run by hand took the newest Release
+    `build/*/bin/dss` it could find -- a compiler nobody named. The named binary passes ONE gate
+    (`sqlite_compiler.build_type` / `is_release`): its build type is READ and printed beside the path,
+    and a non-Release one is refused unless DSS_ALLOW_NONRELEASE_COMPILER, which is then SAID.
   * `--dss` beside a DSS_BIN naming a DIFFERENT binary is a usage error (2026-09-25): the
     `speedtest1` runner's step names the leg's own compiler, `{product}`, and a variable set outside
     the run naming another would leave the measured compiler a matter of precedence.
   * The dss arm is the plan's ONE `required` arm (2026-09-25): a run in which it was not measured
     exits 4 though every reference arm was (the core's R9), its report still written.
-  * The subject is the PINNED sqlite (2026-09-25): the default checkout is put on legs.json
-    `stageBuild.sqliteCommit` -- the revision the corpus and the round-close recompile compile --
-    before anything reads it (`subject_on_pin`); an explicit --sqlite-dir / SQLITE_DIR is measured
-    as-is. The plan carries the pin beside the head it read, and the report names that head and
-    whether it IS the pin, in the .json and the .md alike (the core's R10): an off-pin number cannot
-    pass for an on-pin one.
+  * The subject is the PINNED sqlite -- legs.json `stageBuild.sqliteCommit`, the revision the corpus
+    and the round-close recompile compile -- and the benchmark measures it from the harness's OWN
+    checkout INSIDE THE TREE (P68 round 13): `<output tree>/speedtest1/sqlite`, the output tree being
+    the sqlite harness's one (`sqlite_common.output_tree`: OUT_DIR, else
+    `build/real-examples/c/sqlite[/windows]` of the tree measured), cloned when absent and put on the
+    pin through the stage's one checkout (`sqlite_stage.clone_or_update(..., commit=)`: the pin fetched
+    only when absent, never pulled, DETACHED). ✔MEASURED 2026-09-25 by round 12's audit: the default
+    was `C:\\Source\\sqlite` on Windows (`~/src/sqlite` elsewhere), CLONED when absent and MOVED onto the
+    pin -- a checkout outside the repository a person may be working in, with no lock on Windows. An
+    explicit `--sqlite-dir` is read AS-IS -- never switched, pulled or cleaned -- and REFUSED unless its
+    HEAD IS the pin; and whichever checkout is measured is REFUSED when its working tree differs from its
+    HEAD in a tracked file (`worktree_changes`): one revision is measured, as one is compiled. SQLITE_DIR is
+    NOT read (P68 round 13's audit, F3-A-SP-3): it names the corpus driver's SHARED clone, which that driver
+    writes under its own lock, so read here it made the benchmark measure a checkout outside the tree that
+    another tree's corpus run can move; set, it is SAID. The plan still carries the pin beside the head it
+    read, and the report names that head and whether it IS the pin, in the .json and the .md alike (the
+    core's R10).
+  * ONE RUN PER TREE, ON EVERY HOST (P68 round 13): the whole measuring run holds the output tree's run
+    lock (`sqlite_procs.RunLock` on `<output tree>/.harness-lock` -- atomic mkdir, liveness-checked, the
+    lock the driver's run and the round-close recompile take on the same tree), Windows included, so two
+    runs of one tree SERIALIZE (the second is refused, naming the holder) and a benchmark never times its
+    compilers beside the corpus run of the same tree. It is released however the run ends.
+  * WHAT IS WRITTEN, AND WHERE (P68 round 13's audit, F3-A-SP-1): inside the tree, by default -- the
+    checkout, the run lock, the output, and the SCRATCH, `<output tree>/speedtest1/scratch`
+    (`bench_scratch`), where the measurement core writes its own temporaries (the vcvars script, the
+    pre-flight probe, the timed databases: `speedtest1_bench.py --scratch`). The scratch is made fresh once
+    the lock is held and removed however the run ends. What is NOT this program's: the compilers it times,
+    and the POSIX build that derives the subject, write their own temporary files where their environment
+    says (the system temp directory; inside WSL, its /tmp) -- their conditions are measured, not moved -- and
+    an `--out` or OUT_DIR naming a directory outside the tree is written where it names.
+  * A run that names no dsscp is refused FIRST, before the subject is cloned or the resolver is asked
+    (P68 round 13's audit, F3-A-SP-2): the refusal used to come after the clone.
   * `CC` still pins one reference (the .sh), but the NOT PROBED note names the variable that did
     it (the .sh blamed `--cc`); a pin that is neither a file nor a name on PATH is refused.
   * Every reference that resolved but would not answer `--version` is UNUSABLE, and "none usable"
@@ -88,12 +113,13 @@ Refusal ids of the plan writer: W1 no reference compiler record reached the writ
 manifest is unreadable or lacks sources/includes/defines · W3 the plan cannot be written.
 
 CLI (the .sh's flags): see USAGE below, or `--help`. Exit codes: 0 measured (or `--derive-only`
-complete) · 1 a refusal · 2 usage · 3 no compiler produced a binary · 4 dsscp's arm was not
-measured, the report written and naming why (3 and 4 are the measurement core's) · 5 another
-harness run holds the shared sqlite clone the default checkout is (first stderr line
-`DSS-CLONE-LOCK-BLOCKED`, the clone lock's contract; not 3, which is the core's).
-Environment: SQLITE_DIR, SQLITE_REPO_URL (the origin a default checkout is cloned from), SRC_DIR
-(default: the tree this file lives in), DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER, DSS_CONFIG_ROOT.
+complete) · 1 a refusal (a live run already holding this tree's run lock included) · 2 usage · 3 no
+compiler produced a binary · 4 dsscp's arm was not measured, the report written and naming why (3 and
+4 are the measurement core's). The 5 that meant "another run holds the shared sqlite clone" retired with
+the clone (P68 round 13): this program no longer reads or writes it.
+Environment: SQLITE_REPO_URL (the origin the harness's own checkout is cloned from), SRC_DIR (default: the
+tree this file lives in), OUT_DIR (the sqlite harness's output tree), DSS_BIN, CC,
+DSS_ALLOW_NONRELEASE_COMPILER, DSS_CONFIG_ROOT. SQLITE_DIR is not read (the corpus driver's shared clone).
 
 `--self-test` (alias `--selftest`): every check of both retired drivers plus the negatives they
 lacked, counted against EXPECTED_ARMS; summary `passed=N failed=N skipped=N`, exit 0 only when
@@ -178,8 +204,8 @@ _PROCS = None
 
 
 def _procs():
-    """`sqlite_procs` -- the owner of the shared sqlite clone's lock -- loaded when a POSIX host's
-    default checkout, which IS that clone, is first put on the pin."""
+    """`sqlite_procs` -- the owner of the output tree's run lock (`RunLock`) -- loaded when a measuring
+    run first takes it."""
     global _PROCS
     if _PROCS is None:
         _PROCS = _sibling("sqlite_procs")
@@ -187,10 +213,14 @@ def _procs():
 
 
 DASH = C.DASH
-# A blocked shared clone (`sqlite_procs.CloneLock`, taken for a POSIX host's default checkout): the lock's
-# contract puts DSS-CLONE-LOCK-BLOCKED first on stderr; the exit code is this program's own, since 3 is the
-# measurement core's "no compiler produced a binary".
-EXIT_CLONE_BLOCKED = 5
+# Where the benchmark keeps what it writes, under the sqlite harness's output tree (`sqlite_common.output_tree`):
+# `<output tree>/speedtest1/sqlite` is its pinned checkout, `<output tree>/speedtest1/out` its default output.
+BENCH_SUBDIR = "speedtest1"
+SUBJECT_CHECKOUT = "sqlite"
+DEFAULT_OUT = "out"
+# `<output tree>/speedtest1/scratch`: where the measurement core writes its OWN temporaries (`--scratch`), made fresh
+# under the run lock and removed when the run ends (P68 round 13's audit, F3-A-SP-1).
+SCRATCH = "scratch"
 ARTIFACT_NAME = "speedtest1"
 MAIN_TU = "speedtest1.c"
 CLI_MAIN_TU = "shell.c"
@@ -244,20 +274,24 @@ Benchmark DSS Code Prime against the reference C compilers (the catalogue gcc, c
 whichever this host has -- and MSVC cl.exe on Windows) building and running SQLite's own
 test/speedtest1.c FROM FULL SOURCE, and print the measurement.
 
-  --sqlite-dir DIR      the SQLite checkout, used AS-IS (never switched, pulled or cleaned); the
-                        report says when its head is NOT the pinned revision. Default: $SQLITE_DIR,
-                        likewise as-is; else ~/src/sqlite (POSIX) or C:\Source\sqlite (Windows),
-                        put on the pin first -- legs.json stageBuild.sqliteCommit, the revision the
-                        corpus and the round-close recompile compile (fetched only when absent,
-                        never pulled). On Windows it must be on a LOCAL disk: a UNC path is refused.
-  --dss-src DIR         the DSS checkout whose build trees hold dsscp and whose src/dss-config is
-                        the default config root. Default: $SRC_DIR, else the tree this file is in.
-  --dss PATH            the dsscp to measure. Default: $DSS_BIN, else the newest RELEASE dsscp
-                        under <dss-src>/build, its build type READ from its own CMake tree. The
+  --sqlite-dir DIR      a SQLite checkout to measure instead of the harness's own, read AS-IS (never
+                        switched, pulled or cleaned) and REFUSED unless its HEAD is the pinned
+                        revision -- legs.json stageBuild.sqliteCommit, the revision the corpus and
+                        the round-close recompile compile -- and its working tree holds no change
+                        to a tracked file. Default: the harness's OWN checkout inside the tree,
+                        <output tree>/speedtest1/sqlite (cloned when absent, put on the pin, never
+                        pulled). $SQLITE_DIR is NOT read: it names the corpus driver's shared
+                        clone. On Windows it must be on a LOCAL disk: a UNC path is refused.
+  --dss-src DIR         the DSS checkout whose src/dss-config is the default config root and whose
+                        output tree (OUT_DIR, else build/real-examples/c/sqlite[/windows]) holds
+                        the benchmark's checkout and run lock. Default: $SRC_DIR, else the tree
+                        this file is in.
+  --dss PATH            the dsscp to measure -- REQUIRED: this, or $DSS_BIN. Never searched for and
+                        never built; its build type is READ from its own CMake tree. The
                         `speedtest1` runner's step passes the leg's own, {product}; a DSS_BIN
                         naming a DIFFERENT binary beside it is a usage error -- one compiler,
                         named once.
-  --out DIR             every derived file and the report. Default: <sqlite-dir>/bld-dss-bench.
+  --out DIR             every derived file and the report. Default: <output tree>/speedtest1/out.
   --plan FILE           where the plan is written. Default: <out>/benchmark-plan.json.
   --target SPEC         the <arch>:<format> of the DSS arm. Default: the one leg of legs.json that
                         runs natively on this host.
@@ -277,13 +311,12 @@ test/speedtest1.c FROM FULL SOURCE, and print the measurement.
   --self-test           (alias --selftest) prove every check refuses what it must.
   -h, --help            this text.
 
-environment: SQLITE_DIR, SQLITE_REPO_URL, SRC_DIR, DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER (1/true/yes: a
-non-Release dsscp becomes ELIGIBLE, never preferred, and is said), DSS_CONFIG_ROOT (the directory
-that CONTAINS src/dss-config; honoured on every host).
-exit: 0 measured (or --derive-only complete) - 1 refused - 2 usage - 3 no compiler produced a
-binary - 4 dsscp's arm was not measured, the report written and naming why (3 and 4 are the
-measurement core's) - 5 another harness run holds the shared sqlite clone (first stderr line
-DSS-CLONE-LOCK-BLOCKED)."""
+environment: SQLITE_REPO_URL, SRC_DIR, OUT_DIR, DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER (1/true/yes:
+a named non-Release dsscp is measured, and said), DSS_CONFIG_ROOT (the directory that CONTAINS
+src/dss-config; honoured on every host). SQLITE_DIR is not read: it names the corpus driver's shared clone.
+exit: 0 measured (or --derive-only complete) - 1 refused (another live run holding this tree's run
+lock included) - 2 usage - 3 no compiler produced a binary - 4 dsscp's arm was not measured, the
+report written and naming why (3 and 4 are the measurement core's)."""
 
 
 class UsageError(Exception):
@@ -335,12 +368,49 @@ def _run_to_log(argv, cwd, log_path):
 
 # ── RESOLVE: the subject ──────────────────────────────────────────────────────────────
 
-def default_sqlite_dir(host):
-    """The retired twins' defaults, one per host: the .ps1's `C:\\Source\\sqlite`, the .sh's
-    `~/src/sqlite`."""
-    if host == "windows":
-        return "C:\\Source\\sqlite"
-    return os.path.expanduser(os.path.join("~", "src", "sqlite"))
+def bench_tree(tree_out):
+    """`<output tree>/speedtest1`: everything the benchmark keeps, INSIDE the sqlite harness's output tree
+    (`sqlite_common.output_tree`) -- its pinned checkout and its default output."""
+    return os.path.join(tree_out, BENCH_SUBDIR)
+
+
+def default_subject(tree_out):
+    """The harness's OWN checkout of the pinned sqlite, `<output tree>/speedtest1/sqlite` (P68 round 13). It
+    replaced the retired twins' `C:\\Source\\sqlite` and `~/src/sqlite` -- checkouts outside the repository that
+    a person may be working in, which the benchmark had begun to clone and move onto the pin."""
+    return os.path.join(bench_tree(tree_out), SUBJECT_CHECKOUT)
+
+
+def default_out(tree_out):
+    """`<output tree>/speedtest1/out`: the default output, inside the tree and never inside the checkout
+    measured (an explicit one is read as-is: nothing is written into it)."""
+    return os.path.join(bench_tree(tree_out), DEFAULT_OUT)
+
+
+def bench_scratch(tree_out):
+    """`<output tree>/speedtest1/scratch`: the measurement core's own temporaries (the vcvars script, the pre-flight
+    probe, the timed databases), inside the tree beside the checkout and the output, never inside either -- made
+    fresh under the run lock and removed when the run ends (`run_measuring_host`). Until P68 round 13's audit
+    (F3-A-SP-1) they went to the SYSTEM temp directory, while this program said nothing outside the tree was
+    written."""
+    return os.path.join(bench_tree(tree_out), SCRATCH)
+
+
+def fresh_scratch(path, log):
+    """The scratch made EMPTY: one a killed run left behind is removed first -- only the run lock's holder calls
+    this, so no live run owns it -- and said."""
+    if os.path.exists(path):
+        log.warn("scratch   : %s was left by a run that did not end cleanly -- removed" % path)
+        if not C.owning_tree_module().remove_tree(path):
+            die("the scratch %s a killed run left could not be removed, so this run cannot start clean" % path)
+    os.makedirs(path)
+
+
+def drop_scratch(path, log):
+    """The scratch removed when the run ends, however it ends. A failure is WARNED -- raising here would hide the
+    run's own outcome -- and the next run of this tree removes it first (`fresh_scratch`)."""
+    if os.path.exists(path) and not C.owning_tree_module().remove_tree(path):
+        log.warn("scratch   : %s could not be removed now; the next run of this tree removes it first" % path)
 
 
 def is_unc(path):
@@ -361,10 +431,10 @@ def refuse_unc(path, host, what):
 def check_subject(sqlite_dir):
     """-> the path of test/speedtest1.c, or a refusal naming what is missing."""
     if not os.path.isdir(sqlite_dir):
-        die("no SQLite checkout at %s\n      Point --sqlite-dir (or $SQLITE_DIR) at one, or clone "
-            "https://github.com/sqlite/sqlite there.\n      A checkout named so is used AS-IS and never "
-            "switched or pulled -- a probe measures the tree exactly as it stands (the default checkout "
-            "is put on the pin, and cloned when absent)." % sqlite_dir)
+        die("no SQLite checkout at %s\n      A checkout named by --sqlite-dir is read AS-IS -- "
+            "never cloned, switched or pulled -- so it must exist, on the pin.\n      Name none to measure the "
+            "harness's own pinned checkout inside the tree (<output tree>/%s/%s, cloned when absent)."
+            % (sqlite_dir, BENCH_SUBDIR, SUBJECT_CHECKOUT))
     speedtest = os.path.join(sqlite_dir, "test", MAIN_TU)
     if not os.path.isfile(speedtest):
         die("the benchmark's subject is missing: %s\n      That file IS SQLite's own performance "
@@ -388,41 +458,121 @@ def sqlite_head(sqlite_dir):
                        % (r.rc, C.first_lines(r.err or r.out, 1) or "(no output)"))
 
 
-def subject_on_pin(sqlite_dir, pin, host, log, held, checkout=None, lock_factory=None):
-    """The DEFAULT checkout, put on the pin (2026-09-25): the benchmark measures the ONE sqlite revision
-    the corpus and the round-close recompile compile -- legs.json `stageBuild.sqliteCommit` -- through
-    the stage's own checkout (`sqlite_stage.clone_or_update(..., commit=)`: cloned when absent, the pin
-    fetched only when the clone lacks it, never pulled, DETACHED). On a POSIX host that checkout IS the
-    corpus's shared clone, so it moves under the clone's WRITE lock, which is then DOWNGRADED to READ
-    and kept -- in `held`, which the caller releases -- for as long as the benchmark compiles from it:
-    a run of another pin waits for the measurement instead of moving its subject underneath it. A
-    Windows host's default checkout is its own (the clone lock is POSIX-only), so it takes none.
-    `checkout` / `lock_factory` are the contract suite's stand-ins."""
+def subject_on_pin(dest, pin, log, checkout=None):
+    """The harness's OWN checkout, `dest` (`default_subject`: inside the tree), put on the pin -- legs.json
+    `stageBuild.sqliteCommit`, the ONE sqlite revision the corpus and the round-close recompile compile --
+    through the stage's one checkout implementation (`sqlite_stage.clone_or_update(..., commit=)`: cloned
+    when absent, the pin fetched only when the clone lacks it, never pulled, DETACHED). No lock is taken
+    HERE: the caller holds the output tree's run lock for the whole run (`run_measuring_host`), on every
+    host. Nothing outside the tree is read or written: the shared corpus clone and its lock are not this
+    program's. The checkout's git runs WITHOUT git's repository-local variables (`GIT_LOCAL_ENV`), as this
+    module's two reads do: an exported GIT_DIR would otherwise aim its fetch and checkout at another
+    repository -- typically this one, whose tree now holds the checkout (P68 round 13's audit, F3-A-SP-4).
+    `checkout` is the contract suite's stand-in."""
     url = C.env("SQLITE_REPO_URL").strip() or _stage().DEFAULT_SQLITE_REPO_URL
-    log.info("sqlite    : the default checkout %s goes on the pinned %s" % (sqlite_dir, pin[:12]))
-    lock = None
-    if host != "windows":
-        lock = (lock_factory or _procs().CloneLock)(sqlite_dir)
-        lock.write("benchmark_speedtest1.py (putting the default checkout on the pin)", log)
-        held.append(lock)
-        log.info("clone lock: WRITE on %s" % sqlite_dir)
-    (checkout or _stage().clone_or_update)(url, sqlite_dir, log=log, commit=pin)
-    if lock is not None:
-        lock.read("benchmark_speedtest1.py (measuring the pinned sqlite)", log)
-        log.info("clone lock: READ on %s, held until the measurement ends" % sqlite_dir)
+    log.info("sqlite    : the harness's own checkout %s goes on the pinned %s" % (dest, pin[:12]))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    (checkout or _stage().clone_or_update)(url, dest, log=log, commit=pin,
+                                           env=C.child_env({n: None for n in GIT_LOCAL_ENV}))
 
 
-def measured_subject(explicit, host, pin, log, held, checkout=None, lock_factory=None):
-    """-> the sqlite checkout the benchmark measures. An EXPLICIT one -- --sqlite-dir, or SQLITE_DIR,
-    its variable (one knob, two channels: which channel named a tree must not decide whether it is
-    moved) -- is measured AS-IS, never switched, pulled or cleaned: a deliberate experiment on another
-    tree, which the report names as NOT the pin when it is not. With neither, this host's default
-    checkout, put on the pin first (`subject_on_pin`). A UNC path is refused before anything is
-    written."""
-    d = os.path.abspath(os.path.expanduser(explicit or default_sqlite_dir(host)))
+def worktree_changes(sqlite_dir):
+    """-> ([the tracked files whose working-tree content differs from HEAD], "") or ([], why that could not be read):
+    `git status --porcelain --untracked-files=no`, asked with git's repository-local variables removed. A file a
+    build generates is untracked and never counted."""
+    git = shutil.which("git")
+    if not git:
+        return [], "git is not on this host's PATH"
+    r = C.capture([git, "-C", sqlite_dir, "status", "--porcelain", "--untracked-files=no"], timeout=300,
+                  env_=C.child_env({n: None for n in GIT_LOCAL_ENV}))
+    if r.rc != 0:
+        return [], ("git status exited %d: %s" % (r.rc, C.first_lines(r.err or r.out, 1) or "(no output)"))
+    return [ln[3:].strip() for ln in (r.out or "").splitlines() if ln.strip()], ""
+
+
+def refuse_modified(sqlite_dir):
+    """REFUSES a measured checkout whose working tree differs from its HEAD in a tracked file: the sources compiled
+    would not be the revision the report names (P68 round 13's audit, F3-A-SP-5 -- HEAD alone was checked, so a
+    checkout ON the pin with local edits was measured and reported as the pin). The harness's own checkout is
+    refused alike: remove it, and the next run clones it again."""
+    changed, why = worktree_changes(sqlite_dir)
+    if why:
+        die("the SQLite checkout %s cannot be shown to hold no local change: %s" % (sqlite_dir, why))
+    if changed:
+        die("the SQLite checkout %s differs from its HEAD in %d tracked file(s) (%s%s): the sources measured would "
+            "not be the revision the report names.\n      Discard or commit the change there -- or, for the "
+            "harness's own checkout, remove it: the next run clones it again." % (
+                sqlite_dir, len(changed), ", ".join(changed[:3]), " ..." if len(changed) > 3 else ""))
+
+
+def checkout_revision(sqlite_dir):
+    """-> (the full sha of `sqlite_dir`'s HEAD, "") or ("", why it could not be read). Asked with git's
+    repository-local variables removed, so a hook-exported GIT_DIR cannot answer for another repository. A
+    checkout whose working tree differs from its HEAD in a tracked file IS no revision, and answers why."""
+    git = shutil.which("git")
+    if not git:
+        return "", "git is not on this host's PATH"
+    if not os.path.exists(os.path.join(sqlite_dir, ".git")):
+        return "", "%s holds no .git (a source tree of unknown revision)" % sqlite_dir
+    r = C.capture([git, "-C", sqlite_dir, "rev-parse", "--verify", "HEAD"], timeout=120,
+                  env_=C.child_env({n: None for n in GIT_LOCAL_ENV}))
+    head = (r.out or "").strip().splitlines()
+    if r.rc == 0 and head and re.fullmatch(r"[0-9a-f]{40,64}", head[0].strip()):
+        changed, why = worktree_changes(sqlite_dir)
+        if why or changed:
+            return "", (why or "its working tree differs from HEAD in %d tracked file(s) (%s%s), so it is no "
+                        "revision" % (len(changed), ", ".join(changed[:3]), " ..." if len(changed) > 3 else ""))
+        return head[0].strip(), ""
+    return "", ("git rev-parse --verify HEAD exited %d: %s"
+                % (r.rc, C.first_lines(r.err or r.out, 1) or "(no output)"))
+
+
+def explicit_checkout(args, log):
+    """-> the checkout `--sqlite-dir` names, or "" -- NEVER SQLITE_DIR (P68 round 13's audit, F3-A-SP-3): that
+    variable (and its alias SQLITE_WSL_DIR) names the corpus driver's SHARED clone, which that driver writes under
+    its own POSIX lock; read here too, one knob held two meanings, and the benchmark measured a checkout outside
+    the tree that another tree's corpus run could move under it. Set, it is SAID, so a person who meant it for
+    this program learns it was not read."""
+    for name in ("SQLITE_DIR", "SQLITE_WSL_DIR"):
+        if C.env(name).strip():
+            log.info("sqlite    : %s is set -- it names the corpus driver's shared clone, which this benchmark "
+                     "does not read; name a checkout with --sqlite-dir" % name)
+    return args.sqlite_dir or ""
+
+
+def explicit_subject(sqlite_dir, host, pin, revision=None):
+    """An EXPLICIT checkout -- `--sqlite-dir` (`explicit_checkout`) -- read AS-IS,
+    never switched, pulled or cleaned, and REFUSED unless its HEAD IS the pin (P68 round 13): the benchmark
+    measures the one revision the corpus and the recompile compile, and an explicit checkout is only a
+    different place to read it from. A UNC path is refused before anything is read. `revision` is the
+    contract suite's stand-in for `checkout_revision`. -> the checkout's absolute path."""
+    d = os.path.abspath(os.path.expanduser(sqlite_dir))
     refuse_unc(d, host, "the SQLite checkout")
-    if not explicit:
-        subject_on_pin(d, pin, host, log, held, checkout, lock_factory)
+    check_subject(d)
+    head, why = (revision or checkout_revision)(d)
+    if not head:
+        die("the SQLite checkout %s cannot be shown to be the pinned %s (legs.json stageBuild.sqliteCommit): "
+            "%s.\n      An explicit checkout is read AS-IS and measured only on the pin. Name none to measure "
+            "the harness's own pinned checkout inside the tree." % (d, pin[:12], why))
+    if head != pin:
+        die("the SQLite checkout %s is at %s, not the pinned %s (legs.json stageBuild.sqliteCommit).\n      An "
+            "explicit checkout is read AS-IS -- never switched, pulled or cleaned -- so it must already stand "
+            "on the pin: check the pin out there yourself, or name none to measure the harness's own pinned "
+            "checkout inside the tree (<output tree>/%s/%s)." % (d, head[:12], pin[:12], BENCH_SUBDIR,
+                                                              SUBJECT_CHECKOUT))
+    return d
+
+
+def measured_subject(explicit, host, pin, tree_out, log, checkout=None, revision=None):
+    """-> the sqlite checkout the benchmark measures: an EXPLICIT one, read as-is and only on the pin
+    (`explicit_subject`); with no --sqlite-dir, the harness's OWN checkout inside the
+    tree, `<output tree>/speedtest1/sqlite`, put on the pin first (`subject_on_pin`). A UNC path is refused
+    before anything is written. `checkout` / `revision` are the contract suite's stand-ins."""
+    if explicit:
+        return explicit_subject(explicit, host, pin, revision)
+    d = os.path.abspath(default_subject(tree_out))
+    refuse_unc(d, host, "the SQLite checkout")
+    subject_on_pin(d, pin, log, checkout)
     return d
 
 
@@ -573,35 +723,21 @@ def report_references(refs, skips, log):
 
 # ── RESOLVE: which dsscp ─────────────────────────────────────────────────────────────
 
-def select_dss(repo_root, explicit, explicit_by, allow_nonrelease, log):
-    """-> sqlite_compiler.Compiler. ONE gate for every branch: the build type is READ and printed
-    beside the path, and a non-Release binary is refused unless DSS_ALLOW_NONRELEASE_COMPILER --
-    a benchmark cannot tell a slow compiler from a wrongly-selected one (MEASURED 2026-08-26: a
-    Debug dsscp was once benchmarked and nothing said so)."""
-    if explicit:
-        if not os.path.isfile(explicit):
-            die("the dsscp path given by %s is not a file: %s\n      (the compiler is named "
-                "'dsscp[.exe]', not 'dss')" % (explicit_by, explicit))
-        if not os.access(explicit, os.X_OK):
-            die("the dsscp path given by %s is not an executable file: %s" % (explicit_by, explicit))
-        info = COMP.build_type(explicit)
-        origin = "named by %s %s NOT selected by this program" % (explicit_by, DASH)
-    else:
-        cands, searched = COMP.find_candidates(repo_root)
-        info = COMP.select_compiler(cands, allow_nonrelease)
-        if info is None:
-            if cands:
-                die("the only dsscp binaries under %s are NOT Release builds:\n%s\n      A debug "
-                    "compiler's build time is not a number worth publishing, and a\n      benchmark "
-                    "cannot tell a slow compiler from a wrongly-selected one.\n      Build a release "
-                    "one:  dssharness build --legs <a release leg; dssharness legs lists them>\n"
-                    "      Pass one explicitly:  --dss <path>\n      Or override on purpose: "
-                    "DSS_ALLOW_NONRELEASE_COMPILER=1"
-                    % (os.path.join(repo_root, "build"), COMP.format_candidates(cands)))
-            die("no dsscp binary found.\n      Pass --dss <path>, or build one: dssharness build "
-                "--legs <a release leg; dssharness legs lists them>\n      Searched for dsscp[.exe] "
-                "at any depth under: %s" % "; ".join(searched))
-        origin = "the newest eligible of %d candidate(s), selected by BUILD TYPE" % len(cands)
+def select_dss(explicit, explicit_by, allow_nonrelease, log):
+    """-> sqlite_compiler.Compiler for the dsscp `--dss` or DSS_BIN NAMES -- REQUIRED (P68 round 13): a run
+    naming none is REFUSED in the driver's own words (`sqlite_compiler.require_named`), and nothing is
+    searched for under `build/` or built in its place -- the `speedtest1` runner's step names the leg's own
+    `{product}`. ONE gate: the build type is READ and printed beside the path, and a non-Release binary is
+    refused unless DSS_ALLOW_NONRELEASE_COMPILER -- a benchmark cannot tell a slow compiler from a
+    wrongly-selected one (MEASURED 2026-08-26: a Debug dsscp was once benchmarked and nothing said so)."""
+    explicit, explicit_by = COMP.require_named(explicit, explicit_by)
+    if not os.path.isfile(explicit):
+        die("the dsscp path given by %s is not a file: %s\n      (the compiler is named "
+            "'dsscp[.exe]', not 'dss')" % (explicit_by, explicit))
+    if not os.access(explicit, os.X_OK):
+        die("the dsscp path given by %s is not an executable file: %s" % (explicit_by, explicit))
+    info = COMP.build_type(explicit)
+    origin = "named by %s %s NOT selected by this program" % (explicit_by, DASH)
     # The CODE's stamp, naming the image file it came from -- the one rule Step 5 reports by
     # (`sqlite_compiler.built_stamp`), never the launcher's own time.
     built = COMP.built_stamp(info)
@@ -624,13 +760,15 @@ def select_dss(repo_root, explicit, explicit_by, allow_nonrelease, log):
     return COMP.Compiler(info.path, info.type, info.source, info.detail, info.tree, origin, built, note)
 
 
-def preflight(compiler, config_root, spec, repo_root, log, core=None, python=sys.executable):
+def preflight(compiler, config_root, spec, repo_root, log, *, scratch, core=None, python=sys.executable):
     """`speedtest1_bench.py --preflight-dss` through `sqlite_compiler.assert_current`: exit 1 is
     "THE COMPILER REFUSED" (the stale-binary signature), any other failure is "THE CHECK COULD NOT
     RUN" (nothing learnt about the binary) -- two answers with two remedies. Run on the measuring
-    host FOR THE TARGET the measurement will build, before a configure is paid for."""
+    host FOR THE TARGET the measurement will build, before a configure is paid for. Its probe is
+    written in `scratch` (`--scratch`), never the system temp directory; like every call into the
+    core, it cannot be made without naming one."""
     COMP.assert_current(core or C.BENCH_CORE, compiler, config_root, [spec],
-                        COMP.rebuild_command(compiler, repo_root), python=python)
+                        COMP.rebuild_command(compiler, repo_root), python=python, scratch=scratch)
     log.info("preflight : OK %s %s compiles three lines against %s for %s"
              % (DASH, compiler.path, os.path.join(config_root, "src", "dss-config"), spec))
 
@@ -1242,11 +1380,19 @@ def write_plan(path, *, manifest, sqlite_dir, sqlite_head, sqlite_pin, dss, conf
 
 # ── MEASURE ──────────────────────────────────────────────────────────────────────────
 
-def measure(plan_path, out_dir, core=None, python=sys.executable):
+def resolve_msvc(*, scratch, core=None, python=sys.executable):
+    """`speedtest1_bench.py --resolve-msvc` -> its Result: the cl.exe environment, or the reason there is none. The
+    vcvars script it runs is written in `scratch` (`--scratch`)."""
+    return C.capture([python, core or C.BENCH_CORE, "--resolve-msvc", "--scratch", scratch], timeout=600,
+                     env_=C.child_env(python=True))
+
+
+def measure(plan_path, out_dir, *, scratch, core=None, python=sys.executable):
     """`speedtest1_bench.py --plan`, natively, its output straight to this console -> its exit
     code (0 every required arm measured, 1 refused, 2 usage, 3 no arm produced a binary, 4 the
-    required arm -- dsscp's -- was not measured; the report is still written and names why)."""
-    argv = [python, core or C.BENCH_CORE, "--plan", plan_path,
+    required arm -- dsscp's -- was not measured; the report is still written and names why). The timed
+    databases are written in `scratch` (`--scratch`)."""
+    argv = [python, core or C.BENCH_CORE, "--plan", plan_path, "--scratch", scratch,
             "--json-out", os.path.join(out_dir, "benchmark-speedtest1.json"),
             "--md-out", os.path.join(out_dir, "benchmark-speedtest1.md")]
     try:
@@ -1258,28 +1404,62 @@ def measure(plan_path, out_dir, core=None, python=sys.executable):
 
 # ── the two ways this program runs ───────────────────────────────────────────────────
 
-def run_measuring_host(args, host, log=C.LOG, body=None):
-    """The measuring host's run. The clone lock its subject took -- a POSIX host's default checkout is
-    the corpus's shared clone (`subject_on_pin`) -- is released however the run ends. `body` is the
-    contract suite's stand-in."""
-    held = []
+def measured_tree(args):
+    """-> the DSS tree measured from: --dss-src, else SRC_DIR, else the tree this file lives in. Its config
+    tree is the default config root, and its sqlite output tree holds the benchmark's checkout and lock."""
+    repo_root = args.dss_src or C.path_knob(C.env("SRC_DIR"), "SRC_DIR") or C.driver_tree() or ""
+    if not repo_root:
+        die("this copy of the benchmark lives in no DSS tree, and neither --dss-src nor SRC_DIR names "
+            "one:\n      name the checkout whose output tree holds the benchmark's checkout, and whose config "
+            "tree is measured.")
+    return os.path.abspath(repo_root)
+
+
+def run_measuring_host(args, host, log=C.LOG, body=None, lock_factory=None):
+    """The measuring host's run, under the sqlite output tree's RUN LOCK for its whole length (P68 round 13):
+    `<output tree>/.harness-lock` (`sqlite_common.RUN_LOCK`), the `sqlite_procs.RunLock` the driver's run and
+    the round-close recompile take on the same tree -- atomic mkdir plus a liveness check, so it holds on
+    every host, Windows included. A second run of this tree is REFUSED while the first is live, naming it
+    (two runs serialize; a benchmark never times its compilers beside the corpus run of its own tree), and
+    the lock is released however the run ends. The SCRATCH (`bench_scratch`) is made fresh once the lock is
+    held -- only its holder may remove what a killed run left -- and removed however the run ends, before the
+    lock is released (P68 round 13's audit, F3-A-SP-1). `body` / `lock_factory` are the contract suite's
+    stand-ins."""
+    repo_root = measured_tree(args)
+    tree_out = C.output_tree(repo_root, host, C.env("OUT_DIR"))
+    lock_path = os.path.join(tree_out, C.RUN_LOCK)
+    lock = (lock_factory or _procs().RunLock)(lock_path)
+    lock.acquire(log)
+    scratch = bench_scratch(tree_out)
     try:
-        return (body or _measure_on_host)(args, host, log, held)
+        log.info("run lock  : %s (pid %d) %s this tree's sqlite runs serialize on it"
+                 % (lock_path, os.getpid(), DASH))
+        fresh_scratch(scratch, log)
+        log.info("scratch   : %s %s the measurement core's own temporaries, removed when the run ends"
+                 % (scratch, DASH))
+        return (body or _measure_on_host)(args, host, log, repo_root, tree_out)
     finally:
-        for lock in reversed(held):
-            lock.release()
+        drop_scratch(scratch, log)
+        lock.release()
 
 
-def _measure_on_host(args, host, log, held):
+def _measure_on_host(args, host, log, repo_root, tree_out, checkout=None):
+    """The measuring run's body (`run_measuring_host` holds the tree's run lock around it). `checkout` is the
+    self-test's stand-in for the subject's checkout."""
+    # A run that names no dsscp is refused FIRST -- before the resolver is asked or the subject cloned (P68 round
+    # 13's audit, F3-A-SP-2: the refusal came after the clone). `select_dss` below reads the binary named.
+    dss_flag, dss_env = args.dss, C.env("DSS_BIN").strip()
+    COMP.require_named(dss_flag or dss_env, "--dss" if dss_flag else "DSS_BIN")
     arch = C.host_arch()
     log.step("1/4  Resolve the subject, the compiler and the reference toolchains (%s/%s host)"
              % (host, arch))
     resolver = C.Resolver(host, arch)
-    # the pin, read FIRST: the default checkout goes on it before anything reads the subject
+    # the pin, read FIRST: the harness's own checkout goes on it before anything reads the subject
     stage = stage_build(resolver)
     pin = stage["sqlite_commit"]
-    sqlite_dir = measured_subject(args.sqlite_dir or C.env("SQLITE_DIR").strip(), host, pin, log, held)
+    sqlite_dir = measured_subject(explicit_checkout(args, log), host, pin, tree_out, log, checkout)
     check_subject(sqlite_dir)
+    refuse_modified(sqlite_dir)
     head, why = sqlite_head(sqlite_dir)
     log.info("sqlite    : %s  (upstream %s%s; the pin is %s)"
              % (sqlite_dir, head, (" %s %s" % (DASH, why)) if why else "", pin[:12]))
@@ -1291,14 +1471,8 @@ def _measure_on_host(args, host, log, held):
                 "MEASUREMENT still runs natively, here.")
     else:
         require_tools(DERIVE_TOOLS)
-    repo_root = args.dss_src or C.env("SRC_DIR").strip() or C.driver_tree() or ""
-    if not repo_root:
-        die("this copy of the benchmark lives in no DSS tree, and neither --dss-src nor SRC_DIR names "
-            "one:\n      name the checkout whose dsscp and config tree are measured.")
-    repo_root = os.path.abspath(repo_root)
     allow = C.tristate("DSS_ALLOW_NONRELEASE_COMPILER")
-    dss_flag, dss_env = args.dss, C.env("DSS_BIN").strip()
-    compiler = select_dss(repo_root, dss_flag or dss_env, "--dss" if dss_flag else "DSS_BIN", allow, log)
+    compiler = select_dss(dss_flag or dss_env, "--dss" if dss_flag else "DSS_BIN", allow, log)
     config_root = COMP.pin_config_root(repo_root, log)
     legs = leg_catalogue(resolver)
     spec = args.target or native_leg(legs, "%s/%s" % (host, arch))["spec"]
@@ -1310,9 +1484,9 @@ def _measure_on_host(args, host, log, held):
         pinned = resolve_pinned(cc_flag or cc_env, pinned_by)
     refs, skips = discover_references(pinned, pinned_by)
     report_references(refs, skips, log)
-    preflight(compiler, config_root, spec, repo_root, log)
-    msvc = C.capture([sys.executable, C.BENCH_CORE, "--resolve-msvc"], timeout=600,
-                     env_=C.child_env(python=True))
+    scratch = bench_scratch(tree_out)
+    preflight(compiler, config_root, spec, repo_root, log, scratch=scratch)
+    msvc = resolve_msvc(scratch=scratch)
     if msvc.rc == 0:
         log.info("msvc      : resolved (vswhere + vcvarsall)")
     else:
@@ -1322,7 +1496,7 @@ def _measure_on_host(args, host, log, held):
             reason = C.first_lines(msvc.err or msvc.out, 2) or "exit %d" % msvc.rc
         log.info("msvc      : ABSENT %s %s (the plan still carries the arm; the core skips it by name)"
                  % (DASH, reason))
-    out_dir = os.path.abspath(args.out) if args.out else os.path.join(sqlite_dir, "bld-dss-bench")
+    out_dir = os.path.abspath(args.out) if args.out else default_out(tree_out)
     refuse_unc(out_dir, host, "the output directory")
     os.makedirs(out_dir, exist_ok=True)
     plan_path = os.path.abspath(args.plan) if args.plan else os.path.join(out_dir, PLAN_FILE)
@@ -1361,7 +1535,7 @@ def _measure_on_host(args, host, log, held):
         log.info("(--derive-only: the measurement is the caller's: speedtest1_bench.py --plan <it>)")
         return 0
     log.step("4/4  Measure (natively)")
-    return measure(plan_path, out_dir)
+    return measure(plan_path, out_dir, scratch=scratch)
 
 
 def run_derive_half(args, log=C.LOG):
@@ -1507,9 +1681,6 @@ def main(argv=None):
         if host != "windows" and style == "windows":
             return run_derive_half(args)
         return run_measuring_host(args, host)
-    except C.CloneLockBlocked as exc:
-        print(str(exc), file=sys.stderr, flush=True)
-        return EXIT_CLONE_BLOCKED
     except C.HarnessDie as exc:
         print(" ✗ ERROR: %s" % exc, file=sys.stderr, flush=True)
         return exc.exit_code
@@ -1531,7 +1702,12 @@ def main(argv=None):
 # `make`, `wsl.exe` and the resolver run where they exist, and an arm that needs what this host
 # lacks is a NAMED, counted SKIP. An arm asserting an ABSENCE also proves its negative can occur.
 
-EXPECTED_ARMS = 105        # 22 sh + 6 ps + 1 core + 76 new
+# 22 sh + 6 ps + 1 core + 88 new (P68 round 13 retired n16-n18 with the dsscp search they pinned, and added
+# n76-n82: a nameless run refused; the subject inside the tree, an explicit one only on the pin; one run per tree;
+# then its audit's fold F6 added n83-n90: an exported GIT_DIR steers no checkout; a nameless run refused first; the
+# core's temporaries in the tree's scratch, made fresh and removed; SQLITE_DIR not read; a changed tracked file
+# refused in an explicit checkout and in the harness's own; one normalisation of the path knobs)
+EXPECTED_ARMS = 117
 # the pin the plan-writer arms hand over: a FULL sha, as legs.json declares one
 _PIN_FX = "0123456789abcdef0123456789abcdef01234567"
 
@@ -1607,6 +1783,10 @@ class _Arms:
     def _fail(self, label, detail):
         self.failed += 1
         print("  [FAIL] %s" % label)
+        # the system temp directory masked (both spellings a path takes in a repr): on Windows it lies under the
+        # user profile, and a failing arm's fixture path must not name the account in a run's log
+        tmp = tempfile.gettempdir()
+        detail = str(detail).replace(tmp, "<temp>").replace(tmp.replace("\\", "\\\\"), "<temp>")
         for line in str(detail).split("\n"):
             if line:
                 print("         %s" % line)
@@ -2098,37 +2278,35 @@ def _st_references(A, fx):
 def _st_dsscp(A, fx):
     repo = fx.fresh("repo")
     rel = fx.dss_tree(repo, "rel", ["CMAKE_BUILD_TYPE:STRING=Release"], "bin/dss/dsscp", 1000)
-    fx.dss_tree(repo, "dbg", ["CMAKE_BUILD_TYPE:STRING=Debug"], "bin/dss/dsscp", 3000)
-    bench = fx.dss_tree(repo, "bench-rel", ["CMAKE_BUILD_TYPE:STRING=Release"], "bin/dss/dsscp", 2000)
-    log, buf = fx.log()
-    got = select_dss(repo, "", "", False, log)
-    A.arm("n16 the NEWEST Release dsscp is selected, its build type READ from its own CMakeCache "
-          "and printed beside the path",
-          lambda: (os.path.normcase(got.path) == os.path.normcase(bench) and got.type == "Release"
-                   and "build type: Release" in buf.getvalue(), "%r\n%s" % (got, buf.getvalue())))
-    outside = os.path.join(repo, "elsewhere", "bin", "dss", "dsscp")
-    _put(outside, "fake dsscp\n", 0o755)
-    _put(os.path.join(repo, "elsewhere", "CMakeCache.txt"), "CMAKE_BUILD_TYPE:STRING=Release\n")
-    base_cands, _s = COMP.find_candidates(repo)
-    A.arm("n17 a Release tree under ANY build/<name> (build/bench-rel, the VPS case) is found by "
-          "sqlite_compiler.find_candidates ITSELF, the one owner of where to look (control: a tree "
-          "outside build/ is not)",
-          lambda: (any(os.path.normcase(c.path) == os.path.normcase(bench) for c in base_cands)
-                   and not any(os.path.normcase(c.path) == os.path.normcase(outside)
-                               for c in base_cands), [c.path for c in base_cands]))
-    log, buf = fx.log()
-    allow_pick = select_dss(repo, "", "", True, log)
-    A.arm("n18 the escape hatch makes a newer Debug ELIGIBLE, never PREFERRED over a Release",
-          lambda: (os.path.normcase(allow_pick.path) == os.path.normcase(bench), repr(allow_pick)))
+    nameless = [_dies(lambda v=v, by=by: select_dss(v, by, False, fx.log()[0]))
+                for v, by in (("", "--dss"), ("   ", "DSS_BIN"))]
+    A.arm("n76 a dsscp named by NOTHING -- and a DSS_BIN of blanks -- is REFUSED in the driver's own words, naming "
+          "--dss, DSS_BIN and {product} (P68 round 13; that a nameless RUN is refused before anything is spent, "
+          "a newer Release dsscp in its tree's build/ notwithstanding, is n84)",
+          lambda: (all(m is not None and "no dsscp was named" in m and "--dss <path>" in m and "DSS_BIN" in m
+                       and "{product}" in m and "never searched for" in m for m in nameless), nameless))
+    # n84: the ORDER (P68 round 13's audit, F3-A-SP-2). The retired search's pick sits in this tree -- a NEWER
+    # Release dsscp under build/ -- and the checkout stand-in records whether the subject was ever touched.
+    tree84 = fx.fresh("tree84")
+    fx.dss_tree(tree84, "bench-rel", ["CMAKE_BUILD_TYPE:STRING=Release"], "bin/dss/dsscp", 2000)
+    t_out84, spied84 = C.output_tree(tree84, fx.host), []
+    args84 = argparse.Namespace(dss=None, sqlite_dir=None)
+    with _env(DSS_BIN=None, SQLITE_DIR=None, SQLITE_WSL_DIR=None):
+        run84, err84 = _attempt(lambda: _dies(lambda: _measure_on_host(
+            args84, fx.host, fx.log()[0], tree84, t_out84, checkout=lambda *a, **k: spied84.append(a))))
+    A.arm("n84 a measuring RUN naming no dsscp is refused FIRST -- before the resolver is asked or the subject "
+          "cloned: the checkout never runs and nothing appears under the output tree, though a newer Release "
+          "dsscp sits in the tree's build/",
+          lambda: (not err84 and run84 is not None and "no dsscp was named" in run84 and not spied84
+                   and not os.path.exists(bench_tree(t_out84)), (err84, run84, spied84)))
     repo2 = fx.fresh("repo-dbg")
     dbg2 = fx.dss_tree(repo2, "dbg", ["CMAKE_BUILD_TYPE:STRING=Debug"], "bin/dss/dsscp", 1000)
-    log, buf = fx.log()
-    refused = _dies(lambda: select_dss(repo2, "", "", False, log))
-    A.arm("n19 only a Debug dsscp: REFUSED, naming its build type and the escape hatch",
-          lambda: (refused is not None and "NOT Release" in refused and "Debug" in refused
+    refused = _dies(lambda: select_dss(dbg2, "--dss", False, fx.log()[0]))
+    A.arm("n19 a NAMED Debug dsscp: REFUSED, naming its build type and the escape hatch",
+          lambda: (refused is not None and "NON-RELEASE" in refused and "Debug" in refused
                    and "DSS_ALLOW_NONRELEASE_COMPILER=1" in refused, refused))
     log, buf = fx.log()
-    hatch = select_dss(repo2, "", "", True, log)
+    hatch = select_dss(dbg2, "--dss", True, log)
     A.arm("n20   … and with DSS_ALLOW_NONRELEASE_COMPILER it is used AND said",
           lambda: (os.path.normcase(hatch.path) == os.path.normcase(dbg2)
                    and "NON-RELEASE compiler (Debug)" in buf.getvalue(), buf.getvalue()))
@@ -2138,33 +2316,328 @@ def _st_dsscp(A, fx):
                                       "CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022"],
                         "bin/dss/Release/dsscp", 1000)
     log, buf = fx.log()
-    mc = select_dss(repo3, "", "", False, log)
+    mc = select_dss(multi, "--dss", False, log)
     A.arm("n21 a MULTI-config tree's binary is judged by its per-config directory (Release), not "
           "by the ignored CMAKE_BUILD_TYPE (Debug)",
           lambda: (os.path.normcase(mc.path) == os.path.normcase(multi) and mc.type == "Release"
                    and "IGNORES" in buf.getvalue(), "%r\n%s" % (mc, buf.getvalue())))
     log, buf = fx.log()
-    ex = select_dss(repo2, rel, "--dss", False, log)
-    ex_dbg = _dies(lambda: select_dss(repo, dbg2, "--dss", False, fx.log()[0]))
-    A.arm("n22 an explicit --dss still REPORTS its build type, and passes the same gate (control: "
-          "an explicit Debug one is refused)",
+    ex = select_dss(rel, "--dss", False, log)
+    ex_dbg = _dies(lambda: select_dss(dbg2, "--dss", False, fx.log()[0]))
+    A.arm("n22 a named --dss REPORTS its build type, and passes the one gate (control: a named Debug one "
+          "is refused)",
           lambda: (ex.type == "Release" and "build type: Release" in buf.getvalue()
                    and "named by --dss" in buf.getvalue() and ex_dbg is not None
                    and "NON-RELEASE" in ex_dbg, "%s\n%r" % (buf.getvalue(), ex_dbg)))
-    nothing = _dies(lambda: select_dss(fx.fresh("repo-empty"), "", "", False, fx.log()[0]))
-    missing = _dies(lambda: select_dss(repo, os.path.join(repo, "nope", "dsscp"), "DSS_BIN", False, fx.log()[0]))
-    A.arm("n23 'nothing found' and 'the path given is not a file' are two DIFFERENT messages",
-          lambda: (nothing is not None and "no dsscp binary found" in nothing and missing is not None
-                   and "given by DSS_BIN is not a file" in missing, "%r / %r" % (nothing, missing)))
+    missing = _dies(lambda: select_dss(os.path.join(repo, "nope", "dsscp"), "DSS_BIN", False, fx.log()[0]))
+    A.arm("n23 'no dsscp named' and 'the path given is not a file' are two DIFFERENT messages",
+          lambda: (nameless[0] is not None and "no dsscp was named" in nameless[0] and missing is not None
+                   and "given by DSS_BIN is not a file" in missing, "%r / %r" % (nameless[0], missing)))
     if os.name == "nt":
         A.arm("n24 an explicit dsscp that is not EXECUTABLE is refused",
               lambda: (_SKIP, "Windows has no execute bit (os.access X_OK is true for every file)"))
     else:
         noexec = os.path.join(fx.fresh("noexec"), "dsscp")
         _put(noexec, "x", 0o644)
-        ne = _dies(lambda: select_dss(repo, noexec, "--dss", False, fx.log()[0]))
+        ne = _dies(lambda: select_dss(noexec, "--dss", False, fx.log()[0]))
         A.arm("n24 an explicit dsscp that is not EXECUTABLE is refused (control: the +x one above "
               "was accepted)", lambda: (ne is not None and "not an executable file" in ne, ne))
+
+
+# ── new (P68 round 13): the subject is the harness's own, INSIDE the tree; one run per tree ───────
+
+def _inside(path, root):
+    """Whether `path` lies strictly inside `root` (both made absolute; case folded where the host folds it)."""
+    p, r = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(root))
+    return p.startswith(r.rstrip("\\/") + os.sep)
+
+
+def _attempt(fn):
+    """-> (what `fn()` returned, "") or (None, "<exception>: <message>"): a call an arm judges AFTER it ran, so a
+    defect that raises reddens that arm by name instead of crashing the section and every arm after it."""
+    try:
+        return fn(), ""
+    except Exception as exc:  # noqa: BLE001 -- recorded, then judged by the arm
+        return None, "%s: %s" % (type(exc).__name__, exc)
+
+
+def _listing(root, skip=()):
+    """-> sorted (relative path, size) of every file AND directory under `root` (a directory's size is -1),
+    directories named in `skip` left out. Directories count: an EMPTY one left in a home -- the shape of a
+    defect's first write, a clone's parent or a lock -- is exactly what an arm asserting "nothing appeared" must
+    see (P68 round 13's audit, F3-A-SP-6: the listing saw files only)."""
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in skip)
+        for x in dirs:
+            out.append((os.path.relpath(os.path.join(d, x), root) + os.sep, -1))
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            out.append((os.path.relpath(p, root), os.path.getsize(p)))
+    return sorted(out)
+
+
+def _st_subject(A, fx):
+    pin = _PIN_FX
+    tree = fx.fresh("tree")
+    seen = []
+
+    def spy(url, dest, log=None, commit="", env=None):
+        seen.append((dest, commit))
+    # A scratch HOME for every call below: the retired defaults lived in a home directory, so a defect that puts
+    # one back writes into THIS scratch (and reddens the arm) -- never into the home of the account running it.
+    # Each fence also proves it TOOK (the home is resolved to the scratch inside it): an absence asserted in a
+    # home the program never resolved would pass vacuously (P68 round 13's audit, F3-A-SP-6).
+    home77 = fx.fresh("home77")
+    got, errs = [], []
+    with _env(HOME=home77, USERPROFILE=home77, XDG_CACHE_HOME=None):
+        fence77 = os.path.expanduser("~")
+        for h in ("linux", "windows"):
+            t_out = C.output_tree(tree, h)
+            sub, err = _attempt(lambda h=h, t_out=t_out: measured_subject("", h, pin, t_out, fx.log()[0],
+                                                                          checkout=spy))
+            got.append((sub, t_out))
+            errs.append(err)
+    A.arm("n77 a DEFAULT run measures the harness's OWN checkout INSIDE the tree -- <output tree>/speedtest1/sqlite, "
+          "for a POSIX and a Windows host alike -- put on the pin through the stage's one checkout, its default "
+          "output lies beside that checkout in the tree, never inside it, and nothing appears in the home (whose "
+          "fence took: the home resolves to it)",
+          lambda: (not any(errs) and seen == [(got[0][0], pin), (got[1][0], pin)] and _listing(home77) == []
+                   and not os.listdir(home77) and _same_dir(fence77, home77)
+                   and all(_same_dir(sub, os.path.join(t_out, BENCH_SUBDIR, SUBJECT_CHECKOUT)) and _inside(sub, tree)
+                           and _inside(default_out(t_out), bench_tree(t_out))
+                           and not _inside(default_out(t_out), sub) for sub, t_out in got),
+                   (errs, seen, got, fence77)))
+    # n81, FENCED (F3-A-SP-6): a scratch home, an origin that does not exist and a checkout stand-in, so a defect
+    # that lets an explicit directory fall through to the default path records a call here instead of cloning
+    # sqlite from the network inside a self-test.
+    plain = fx.fresh("plain-sqlite")
+    _put(os.path.join(plain, "test", MAIN_TU), "int main(void){return 0;}\n")
+    home81, fell81 = fx.fresh("home81"), []
+    with _env(HOME=home81, USERPROFILE=home81, XDG_CACHE_HOME=None, SQLITE_REPO_URL=os.path.join(home81, "no-origin")):
+        fence81 = os.path.expanduser("~")
+        nogit, ng_err = _attempt(lambda: _dies(lambda: measured_subject(
+            plain, fx.host, pin, C.output_tree(tree, fx.host), fx.log()[0],
+            checkout=lambda *a, **k: fell81.append(a))))
+    A.arm("n81 an EXPLICIT directory that is no git checkout is REFUSED: its revision cannot be shown to be the pin "
+          "-- fenced, so a fall-through to the default path is recorded, never a network clone",
+          lambda: (not ng_err and nogit is not None and "cannot be shown to be the pinned" in nogit and not fell81
+                   and _same_dir(fence81, home81), (ng_err, nogit, fell81, fence81)))
+    if not shutil.which("git"):
+        for label in ("n78 REAL git: the default checkout is cloned INSIDE the tree", "n79 an EXPLICIT checkout on "
+                      "the pin is read AS-IS", "n80 an EXPLICIT checkout off the pin is REFUSED",
+                      "n83 REAL git: an exported GIT_DIR does not steer the checkout",
+                      "n88 REAL git: an EXPLICIT checkout on the pin with a changed tracked file is REFUSED",
+                      "n89 REAL git: the harness's own checkout with a changed tracked file is REFUSED"):
+            A.arm(label, lambda: (_SKIP, "git is not on this host's PATH"))
+    else:
+        S = _stage()
+        g = fx.fresh("git")
+        genv = S._hermetic_git_env(g)
+        bare, work = S._make_origin(os.path.join(g, "origin"), genv, {
+            "configure": ("#!/bin/sh\n", 0o755), "test/%s" % MAIN_TU: ("int main(void){return 0;}\n", None)})
+        head = S._git(genv, "-C", work, "rev-parse", "HEAD")
+        home = os.path.join(g, "home")
+        _put(os.path.join(home, "src", "sqlite", "mine.txt"), "a person's work, where the retired default lived\n")
+        before = _listing(home)
+        t_out = C.output_tree(os.path.join(g, "tree"), fx.host)
+        hermetic = dict(HOME=home, USERPROFILE=home, XDG_CACHE_HOME=None, SQLITE_REPO_URL=bare,
+                        GIT_CONFIG_GLOBAL=genv["GIT_CONFIG_GLOBAL"], GIT_CONFIG_NOSYSTEM="1")
+        with _env(**hermetic):
+            fence78 = os.path.expanduser("~")
+            sub, err = _attempt(lambda: measured_subject("", fx.host, head, t_out, fx.log()[0]))
+        at = S._git(genv, "-C", sub, "rev-parse", "HEAD") if sub and os.path.isdir(os.path.join(sub, ".git")) else ""
+        detached = S._git(genv, "-C", sub, "rev-parse", "--abbrev-ref", "HEAD") if at else ""
+        after = _listing(home)
+        A.arm("n78 REAL git: the default checkout is CLONED INSIDE the tree and put on the pin, DETACHED -- and a "
+              "person's checkout where the retired default lived (<home>/src/sqlite) is untouched, as is everything "
+              "else under that home, directories included: no clone lock, no clone, nothing (the fence took: the "
+              "home resolves to it)",
+              lambda: (not err and _same_dir(sub, default_subject(t_out)) and at == head and detached == "HEAD"
+                       and before == after and _same_dir(fence78, home),
+                       (err, sub, at, head, detached, sorted(set(after) ^ set(before)), fence78)))
+        # n83 (F3-A-SP-4): a caller's git selection exported -- a decoy repository's GIT_DIR, GIT_WORK_TREE and
+        # GIT_INDEX_FILE, as a hook exports them -- must not steer the checkout's own git.
+        decoy = os.path.join(g, "decoy")
+        S._git(genv, "init", "--quiet", decoy)
+        _put(os.path.join(decoy, "d.txt"), "a decoy\n")
+        S._git(genv, "-C", decoy, "add", "-A")
+        S._git(genv, "-C", decoy, "commit", "--quiet", "-m", "decoy")
+
+        def decoy_state():
+            return (S._git(genv, "-C", decoy, "for-each-ref"), S._git(genv, "-C", decoy, "rev-parse", "HEAD"),
+                    _listing(decoy))
+        decoy_before = decoy_state()
+        t_out3 = C.output_tree(os.path.join(g, "tree3"), fx.host)
+        steer = dict(hermetic, GIT_DIR=os.path.join(decoy, ".git"), GIT_WORK_TREE=decoy,
+                     GIT_INDEX_FILE=os.path.join(decoy, ".git", "index"))
+        with _env(**steer):
+            sub3, err3 = _attempt(lambda: measured_subject("", fx.host, head, t_out3, fx.log()[0]))
+        at3 = S._git(genv, "-C", sub3, "rev-parse", "HEAD") if sub3 and os.path.isdir(os.path.join(sub3, ".git")) else ""
+        decoy_after = decoy_state()
+        A.arm("n83 REAL git: with a caller's git selection exported (a decoy repository's GIT_DIR, GIT_WORK_TREE and "
+              "GIT_INDEX_FILE, as a hook exports them), the default checkout is still cloned in the tree and put on "
+              "the pin, and the decoy is untouched -- the checkout's git runs without git's repository-local variables",
+              lambda: (not err3 and _same_dir(sub3, default_subject(t_out3)) and at3 == head
+                       and decoy_after == decoy_before, (err3, sub3, at3, decoy_after == decoy_before)))
+        t_out2 = C.output_tree(os.path.join(g, "tree2"), fx.host)
+        work_before = _listing(work, skip=(".git",))
+        with _env(**hermetic):
+            ex, ex_err = _attempt(lambda: measured_subject(work, fx.host, head, t_out2, fx.log()[0]))
+        branch = S._git(genv, "-C", work, "rev-parse", "--abbrev-ref", "HEAD")
+        A.arm("n79 an EXPLICIT checkout ON the pin is read AS-IS: returned as named, still on its branch (never "
+              "detached), nothing written into it, and no checkout of the harness's own made (control)",
+              lambda: (not ex_err and _same_dir(ex, work) and branch == "trunk"
+                       and _listing(work, skip=(".git",)) == work_before
+                       and not os.path.exists(default_subject(t_out2)), (ex_err, ex, branch)))
+        off_pin = "ab" * 20
+        with _env(**hermetic):
+            off, off_err = _attempt(lambda: _dies(lambda: measured_subject(work, fx.host, off_pin, t_out2,
+                                                                           fx.log()[0])))
+        still = S._git(genv, "-C", work, "rev-parse", "HEAD")
+        branch2 = S._git(genv, "-C", work, "rev-parse", "--abbrev-ref", "HEAD")
+        A.arm("n80 an EXPLICIT checkout OFF the pin is REFUSED, naming its head and the pin, and left exactly where "
+              "it stood (the negative of n79)",
+              lambda: (not off_err and off is not None and head[:12] in off and off_pin[:12] in off
+                       and "not the pinned" in off and still == head and branch2 == "trunk"
+                       and not os.path.exists(default_subject(t_out2)), (off_err, off, still, branch2)))
+        # n88 / n89 (F3-A-SP-5): HEAD alone is not the revision measured -- a tracked file changed in the working
+        # tree makes a checkout no revision, whether a person's (explicit) or the harness's own.
+        _put(os.path.join(work, "configure"), "#!/bin/sh\necho edited\n")
+        with _env(**hermetic):
+            mod, mod_err = _attempt(lambda: _dies(lambda: measured_subject(work, fx.host, head, t_out2, fx.log()[0])))
+        A.arm("n88 REAL git: an EXPLICIT checkout ON the pin whose working tree changed a tracked file is REFUSED, "
+              "naming the file -- its HEAD alone is not the revision that would be measured",
+              lambda: (not mod_err and mod is not None and "cannot be shown to be the pinned" in mod
+                       and "differs from HEAD in 1 tracked file(s) (configure)" in mod, (mod_err, mod)))
+        tree89 = os.path.join(g, "tree89")
+        t_out89 = C.output_tree(tree89, fx.host)
+        own = default_subject(t_out89)
+        S._git(genv, "clone", "--quiet", "--config", "core.autocrlf=false", bare, own)
+        _put(os.path.join(own, "configure"), "#!/bin/sh\necho edited\n")
+        args89 = argparse.Namespace(dss="named-and-never-read-here", sqlite_dir=None)
+        with _env(DSS_BIN=None, SQLITE_DIR=None, SQLITE_WSL_DIR=None, **hermetic):
+            own_run, own_err = _attempt(lambda: _dies(lambda: _measure_on_host(
+                args89, fx.host, fx.log()[0], tree89, t_out89, checkout=lambda *a, **k: None)))
+        A.arm("n89 REAL git: the harness's OWN checkout, a tracked file changed in it, is REFUSED before anything reads "
+              "it as the subject -- remove it, and the next run clones it again",
+              lambda: (not own_err and own_run is not None
+                       and "differs from its HEAD in 1 tracked file(s) (configure)" in own_run, (own_err, own_run)))
+    lt = fx.fresh("lock-tree")
+    args = argparse.Namespace(dss_src=lt)
+    lock_dir = os.path.join(C.output_tree(lt, fx.host), C.RUN_LOCK)
+    ran = []
+
+    def body(_a, _h, _log, repo_root, t_out):
+        ran.append((repo_root, t_out, os.path.isdir(lock_dir)))
+        return 0
+
+    def boom(_a, _h, _log, _repo, _t):
+        raise C.HarnessDie("the measurement stopped part-way")
+    first = _procs().RunLock(lock_dir)
+    with _env(OUT_DIR=None, SRC_DIR=None):
+        first.acquire(fx.log()[0])
+        try:
+            blocked, b_err = _attempt(lambda: _dies(lambda: run_measuring_host(args, fx.host, fx.log()[0], body=body)))
+        finally:
+            first.release()
+        rc, rc_err = _attempt(lambda: run_measuring_host(args, fx.host, fx.log()[0], body=body))
+        released = not os.path.exists(lock_dir)
+        part, p_err = _attempt(lambda: _dies(lambda: run_measuring_host(args, fx.host, fx.log()[0], body=boom)))
+        released2 = not os.path.exists(lock_dir)
+    A.arm("n82 two runs of ONE tree SERIALIZE on its run lock -- <output tree>/.harness-lock, the lock the driver's "
+          "run and the recompile take, on this host too: a second run is REFUSED while the first holds it, naming "
+          "it, and its body never runs; released, the run takes the lock and runs (control); and the lock is "
+          "released however the run ends",
+          lambda: (not (b_err or rc_err or p_err) and blocked is not None and "ALREADY ACTIVE" in blocked
+                   and "owner PID   : %d" % os.getpid() in blocked
+                   and rc == 0 and len(ran) == 1 and ran[0][2] and _same_dir(ran[0][0], lt)
+                   and _same_dir(ran[0][1], C.output_tree(lt, fx.host)) and released
+                   and part is not None and "part-way" in part and released2,
+                   (b_err, rc_err, p_err, blocked, rc, ran, released, part, released2)))
+
+    # n85 / n86 (F3-A-SP-1): the measurement core's OWN temporaries live in the tree -- every call into it names the
+    # scratch, and the scratch is made fresh under the lock and removed however the run ends.
+    rec_root = fx.fresh("rec-core")
+    calls_file = os.path.join(rec_root, "calls.jsonl")
+    rec_core = os.path.join(rec_root, "core.py")
+    _put(rec_core, "import json, sys\nwith open(%r, 'a', encoding='utf-8') as fh:\n"
+                   "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\nsys.exit(0)\n" % calls_file)
+    t85 = C.output_tree(fx.fresh("tree85"), fx.host)
+    s85 = bench_scratch(t85)
+    os.makedirs(s85)
+    cfg85 = fx.fresh("cfg85")
+    os.makedirs(os.path.join(cfg85, "src", "dss-config"))
+    comp85 = COMP.Compiler(os.path.join(cfg85, "dsscp"), "Release", "x", "", cfg85, "origin", "then", "")
+    plan85 = os.path.join(fx.fresh("plan85"), PLAN_FILE)
+    _put(plan85, "{}\n")
+    r85 = [_attempt(lambda: resolve_msvc(scratch=s85, core=rec_core)),
+           _attempt(lambda: preflight(comp85, cfg85, "x86_64:elf64-x86_64-linux-exec", cfg85, fx.log()[0],
+                                      scratch=s85, core=rec_core)),
+           _attempt(lambda: measure(plan85, os.path.dirname(plan85), scratch=s85, core=rec_core))]
+    calls85 = _calls(calls_file) if os.path.isfile(calls_file) else []
+    A.arm("n85 EVERY call the driver makes into the measurement core -- --resolve-msvc, the pre-flight, the "
+          "measurement -- names the scratch INSIDE the tree (<output tree>/speedtest1/scratch, beside the checkout "
+          "and the output, inside neither), never leaving the core's own temporaries to the system temp directory",
+          lambda: (not any(e for _r, e in r85) and [c[:1] for c in calls85] == [["--resolve-msvc"], ["--preflight-dss"],
+                                                                                 ["--plan"]]
+                   and all("--scratch" in c and c[c.index("--scratch") + 1] == s85 for c in calls85)
+                   and _inside(s85, bench_tree(t85)) and not _inside(s85, default_subject(t85))
+                   and not _inside(s85, default_out(t85)), (r85, calls85)))
+    lt86 = fx.fresh("lock-tree86")
+    s86 = bench_scratch(C.output_tree(lt86, fx.host))
+    _put(os.path.join(s86, "dss-st1-left", "run0.db"), "a killed run's database\n")
+    seen86 = []
+
+    def body86(_a, _h, _log, _repo, _t):
+        seen86.append((os.path.isdir(s86), _listing(s86)))
+        return 0
+
+    def boom86(_a, _h, _log, _repo, _t):
+        seen86.append((os.path.isdir(s86), _listing(s86)))
+        raise C.HarnessDie("the measurement stopped part-way")
+    args86 = argparse.Namespace(dss_src=lt86)
+    with _env(OUT_DIR=None, SRC_DIR=None):
+        rc86, e86 = _attempt(lambda: run_measuring_host(args86, fx.host, fx.log()[0], body=body86))
+        gone86 = not os.path.exists(s86)
+        part86, pe86 = _attempt(lambda: _dies(lambda: run_measuring_host(args86, fx.host, fx.log()[0], body=boom86)))
+        gone86b = not os.path.exists(s86)
+    A.arm("n86 the scratch is made FRESH once the run lock is held -- what a killed run left is removed first -- "
+          "exists, empty, for the body, and is REMOVED however the run ends (a clean end, a refusal part-way)",
+          lambda: (not (e86 or pe86) and rc86 == 0 and seen86 == [(True, []), (True, [])] and gone86
+                   and part86 is not None and "part-way" in part86 and gone86b,
+                   (e86, pe86, rc86, seen86, gone86, part86, gone86b)))
+
+    # n87 (F3-A-SP-3): SQLITE_DIR names the corpus driver's SHARED clone and is never the benchmark's subject.
+    shared87 = fx.fresh("shared-clone87")
+    log87, buf87 = fx.log()
+    with _env(SQLITE_DIR=shared87, SQLITE_WSL_DIR=None):
+        none87 = explicit_checkout(argparse.Namespace(sqlite_dir=None), log87)
+        named87 = explicit_checkout(argparse.Namespace(sqlite_dir="a-named-checkout"), fx.log()[0])
+    A.arm("n87 SQLITE_DIR -- the corpus driver's shared clone -- is NOT read as the benchmark's subject, and that is "
+          "SAID; --sqlite-dir names one (control)",
+          lambda: (none87 == "" and "SQLITE_DIR is set" in buf87.getvalue() and "does not read" in buf87.getvalue()
+                   and named87 == "a-named-checkout", (none87, named87, buf87.getvalue())))
+
+    # n90 (F3-A-SP-8): ONE normalisation of the path knobs, for the driver's Config and the benchmark alike.
+    repo90 = fx.fresh("repo90")
+    want90 = os.path.abspath(os.path.join(repo90, "out-tree"))
+    with _env(OUT_DIR="  %s  " % want90, SRC_DIR="  %s  " % repo90):
+        cfg90, cfg_err = _attempt(C.Config)
+        drv90 = C.output_tree(repo90, fx.host, cfg90.out_dir) if cfg90 is not None else None
+        bench90 = C.output_tree(repo90, fx.host, C.env("OUT_DIR"))
+        src90, src_err = _attempt(lambda: measured_tree(argparse.Namespace(dss_src=None)))
+    with _env(OUT_DIR="   "):
+        blank_cfg = _dies(C.Config)
+        blank_tree = _dies(lambda: C.output_tree(repo90, fx.host, C.env("OUT_DIR")))
+    A.arm("n90 ONE normalisation of the path knobs: a padded OUT_DIR / SRC_DIR gives the driver's Config and the "
+          "benchmark the SAME output tree (so one run lock) and the same DSS tree, and a value of blanks alone is "
+          "REFUSED by both",
+          lambda: (not cfg_err and not src_err and drv90 is not None and _same_dir(drv90, want90)
+                   and _same_dir(bench90, want90) and cfg90.src_dir == repo90 and _same_dir(src90, repo90)
+                   and blank_cfg is not None and "names nothing but blanks" in blank_cfg
+                   and blank_tree is not None and "names nothing but blanks" in blank_tree,
+                   (cfg_err, src_err, drv90, bench90, src90, blank_cfg, blank_tree)))
 
 
 # ── new: the catalogue's leg facts ───────────────────────────────────────────────────
@@ -2487,8 +2960,8 @@ def _st_plan(A, fx):
                    and "--" not in argv and "-l" not in argv and "bash" not in argv
                    and validate_mode(parsed, "linux") == "windows"
                    and parsed.stack_reserve == 8388608, argv))
-    rc3 = measure(path, d, core=fx.cores[3])
-    rc0 = measure(path, d, core=fx.cores[0])
+    rc3 = measure(path, d, scratch=fx.fresh("scratch68"), core=fx.cores[3])
+    rc0 = measure(path, d, scratch=fx.fresh("scratch68b"), core=fx.cores[0])
     A.arm("n68 the measurement core's exit code is passed through (3 no binary; 0 measured)",
           lambda: _eq((3, 0), (rc3, rc0)))
 
@@ -2502,7 +2975,7 @@ def _st_preflight(A, fx):
 
     def pf(rc):
         return _dies(lambda: preflight(comp, root, "x86_64:elf64-x86_64-linux-exec", root,
-                                       fx.log()[0], core=fx.cores[rc]))
+                                       fx.log()[0], scratch=fx.fresh("scratch69"), core=fx.cores[rc]))
     ok, refused, unrun = pf(0), pf(1), pf(3)
     A.arm("n69 ★ the pre-flight keeps 'the compiler REFUSED' (exit 1) and 'the check COULD NOT RUN' "
           "(exit 3) apart (control: exit 0 passes)",
@@ -2580,7 +3053,7 @@ def _st_cli(A, fx):
 _SECTIONS = (("substitution", _st_substitution), ("presence", _st_presence), ("label", _st_label),
              ("texe-real", _st_texe_real), ("carriage", _st_carriage), ("core", _st_core),
              ("post-conditions", _st_post_conditions), ("references", _st_references),
-             ("dsscp", _st_dsscp), ("legs", _st_legs), ("translation", _st_translation),
+             ("dsscp", _st_dsscp), ("subject", _st_subject), ("legs", _st_legs), ("translation", _st_translation),
              ("capabilities", _st_capabilities), ("derive", _st_derive), ("plan", _st_plan),
              ("preflight", _st_preflight), ("cli", _st_cli))
 

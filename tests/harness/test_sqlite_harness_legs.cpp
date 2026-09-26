@@ -4724,7 +4724,7 @@ TEST_F(HarnessLegs, TheRecordedIdentityFlagIsNamedInExactlyOneFile) {
 // ★ QUOTING IS NOT THE FIX, and that is why this is a test and not a review
 // note. ✔MEASURED at the real call site (Invoke-PosixCommand's payload): with no
 // `-e`, a SINGLE-QUOTED `$HOME` inside the payload still expanded, arriving as
-// `[lit /home/rafael and * and a\b]` instead of `[lit $HOME and * and a\b]`,
+// `[lit /home/<user> and * and a\b]` instead of `[lit $HOME and * and a\b]`,
 // because the outer shell removed the quotes first. Every escaping fix
 // therefore looks correct and still leaks.
 //

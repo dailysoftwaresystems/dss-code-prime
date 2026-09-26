@@ -194,6 +194,12 @@ RUN_DIRS = ("build", "artifacts")
 GROUP_FILES = ("README.md", ".gitkeep")
 
 EXIT_OK, EXIT_DISAGREE, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
+# The regeneration a refusal names: the `write` manual step of this action (check-scripts-index.yml),
+# run through the harness -- never this file started by hand -- on the runner that runs it on ONE leg,
+# this machine's own tree (config.json `check-scripts-index-write`): this action's own runner keeps both
+# local legs, and a `--manual-step write` through it would rewrite the WSL leg's synced copy too (P68
+# round 13's audit, F1-A11).
+WRITE_VERB = "dssharness run check-scripts-index-write"
 
 
 class Collapse(Exception):
@@ -893,7 +899,7 @@ def run(root, write):
         print("  an entry that no action backs sends them looking for a file that is gone.")
         print("")
         print("  Regenerate with:")
-        print("      python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py --write")
+        print("      %s" % WRITE_VERB)
     if unreached or dangling:
         print("check-scripts-index: FAIL -- actions and runners disagree in %s:"
               % CONFIG_REL.replace(os.sep, "/"))
@@ -949,8 +955,9 @@ def _arm(label, root, expect, says=None, not_says=None):
     ok, why = rc == expect, ""
     if not ok:
         why = "EXPECTED rc=%d" % expect
-    elif says is not None and says not in text:
-        ok, why = False, "rc was right but the message never said %r" % says
+    elif says is not None and [w for w in ((says,) if isinstance(says, str) else says) if w not in text]:
+        ok, why = False, ("rc was right but the message never said %r"
+                          % [w for w in ((says,) if isinstance(says, str) else says) if w not in text][0])
     elif not_says is not None and not_says in text:
         ok, why = False, ("rc was right but the message said %r, so this arm "
                           "proved a DIFFERENT refusal than it claims" % not_says)
@@ -960,6 +967,22 @@ def _arm(label, root, expect, says=None, not_says=None):
           % (label, rc, "as expected" if ok else why,
              (" (" + first + ")") if first else ""))
     return ok
+
+
+def remedy_runner_fact():
+    """-> (ok, detail): the runner WRITE_VERB names is declared in this tree's config.json, runs this action's
+    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
+    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
+    too). Read from config, never assumed: a second leg added there reds the self-test."""
+    cfg = _owning_tree().load_jsonc(os.path.join(repo_root(), CONFIG_REL))
+    name = WRITE_VERB.split()[-1]
+    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
+    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
+    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
+    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
+    ok = (isinstance(runner, dict) and runner.get("action") == "check-scripts-index/check-scripts-index.yml"
+          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
+    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
 
 
 def _mirror(root, dst):
@@ -1091,7 +1114,7 @@ def _newcomer(tmp, rel, runner):
 # defeated its own purpose: deleting a document from DOC_RELS then lowered BOTH
 # sides of the comparison and the sabotage passed. An expectation that follows
 # the change it is meant to catch is not an expectation.
-EXPECTED_ARMS = 54
+EXPECTED_ARMS = 55
 
 
 def selftest(root):
@@ -1135,8 +1158,15 @@ def selftest(root):
         gone = os.path.join(acts, SELFTEST_SUBJECT)
         stash = tempfile.mkdtemp(prefix="scripts-index-stash-")
         shutil.move(gone, os.path.join(stash, SELFTEST_SUBJECT))
-        ok &= _arm("2 INDEX-ENTRY-NOT-AN-ACTION", tmp, EXIT_DISAGREE, says=README_REL)
+        ok &= _arm("2 INDEX-ENTRY-NOT-AN-ACTION", tmp, EXIT_DISAGREE, says=(README_REL, WRITE_VERB))
         shutil.move(os.path.join(stash, SELFTEST_SUBJECT), gone)
+        # 2c -- ...and the runner that remedy names runs `write` alone, on ONE leg of this machine's own tree
+        # (F1-A11). A property of the TREE, counted like every arm.
+        _fact_ok, _fact_detail = remedy_runner_fact()
+        ran.append("2c REMEDY-RUNNER-ONE-LEG")
+        print("scripts-index: self-test arm %-26s %s" % ("2c REMEDY-RUNNER-ONE-LEG", "as expected" if _fact_ok
+                                                          else "FAILED (%s)" % _fact_detail[:300]))
+        ok &= _fact_ok
         shutil.rmtree(stash, ignore_errors=True)
         ok &= _arm("2b RESTORED", tmp, EXIT_OK)
 

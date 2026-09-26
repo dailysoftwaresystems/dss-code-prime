@@ -148,7 +148,7 @@ the correct shipping shape rather than a fallback.
 | The strictest broken-path pattern | `tests/core/test_tree_end_to_end.cpp` (9 tests, full pretty-print equality, exact diagnostic counts, error-leaf walks) |
 | A header-only template done right | `src/core/types/tree_attrs.hpp` (`NodeAttribute<T>`, custom move ops, dual storage) |
 | A typed view | `src/core/types/tree_views.hpp` (all 7 views, ~250 lines) |
-| The fatal helper pattern | `src/core/types/tree.cpp:20-25` (`treeFatal`) or `src/core/types/tree_attrs.hpp:35-40` (`attrFatal`) |
+| The fatal helper pattern | `treeFatal` in `src/core/types/tree.cpp`: each file keeps its own `[[noreturn]]` `<prefix>Fatal` helper (`cuFatal`, `ppFatal`, `bufferFatal`, …) |
 | Driving `TreeBuilder` from a test | `tests/core/test_tree_builder.cpp` (40+ tests covering every recovery flavor) |
 | The shipped grammar config | `src/dss-config/sources/toy.lang.json` |
 | Onboarding docs writing style | `docs/tree-model.md` (the WhileStmtView cookbook is the template) |

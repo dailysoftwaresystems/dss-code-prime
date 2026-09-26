@@ -37,8 +37,10 @@
 //       instruction count, which is what goes red if the FFI map is unthreaded.
 
 #include "lir/lir.hpp"
+#include "diagnostic_count.hpp"   // dss::test_support::countCode
 #include "lowered_lir_fixture.hpp"
 #include "mir/mir.hpp"
+#include "mir/mir_literal_pool.hpp"
 
 #include <gtest/gtest-spi.h>
 #include <gtest/gtest.h>
@@ -46,6 +48,7 @@
 #include <cstdint>
 #include <format>
 #include <string>
+#include <variant>
 
 using namespace dss;
 using namespace dss::test_support;
@@ -284,6 +287,42 @@ TEST(LirFixtureVacuityGuard, EveryHirFunctionDefinitionReachesLirWithInstruction
         for (std::uint32_t b = 0; b < lir.funcBlockCount(f); ++b)
             n += lir.blockInstCount(lir.funcBlockAt(f, b));
         EXPECT_GT(n, 0u) << "LIR function " << i << " has an empty body";
+    }
+}
+
+// ── (D) A STATIC INITIALIZER LOWERS HERE AS IT LOWERS IN THE PRODUCT ────────
+//
+// P68 round 13, fold F7 — the fixture assembled its `MirLoweringConfig` by hand and read
+// `globalsConstantForms`' default, so C's 6.7.9p4 constraint was OFF here and no const
+// object's value folded: `static const int k = 42; int y = k;` became a load-time store in
+// this fixture and a folded constant in every real build, and `int b = a;` of a non-const
+// `a` lowered here while every build refuses it — the fourth time a fixture read a default
+// the product never does. It now starts from the pipeline's ONE assembly
+// (`languageMirLoweringConfig`) and threads the mutability map the fold reads a const
+// object's value through. RED-ON-DISABLE: drop `globalsConstantForms` from the helper (the
+// first case gets a module initializer, the second lowers instead of refusing); drop the
+// fixture's mutability map (the first case is refused).
+TEST(LirFixtureVacuityGuard, AStaticInitializerLowersAsInTheProduct) {
+    {
+        auto const out = lowerCToLir(
+            "static const int k = 42;\nint y = k;\nint main(void) { return y; }\n", "x86_64");
+        Mir const& m = out.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 2u) << "k and y, and no other";
+        for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+            MirGlobalId const g = m.globalAt(i);
+            EXPECT_FALSE(m.globalInitFunc(g).valid()) << "global " << i << ": nothing runs at load";
+            std::uint32_t const li = m.globalInitLiteralIndex(g);
+            ASSERT_NE(li, UINT32_MAX) << "global " << i << ": a constant initializer";
+            auto const* v = std::get_if<std::int64_t>(&m.literalValue(li).value);
+            ASSERT_NE(v, nullptr) << "global " << i << ": an integer leaf";
+            EXPECT_EQ(*v, 42) << "global " << i;
+        }
+    }
+    {
+        auto const out = lowerCToLir("int a = 1;\nint b = a;\nint main(void) { return b; }\n",
+                                     "x86_64", /*mirCcIndex=*/0, LoweringExpectation::Refuses);
+        EXPECT_EQ(countCode(out.mirReporter, DiagnosticCode::H_StaticInitializerNotFolded), 1u)
+            << "the unfolded initializer is refused here, as the product refuses it";
     }
 }
 

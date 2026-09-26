@@ -19,7 +19,8 @@ steps:
       python3 ./check-doc-census.py --selftest
     successPattern: 'check-doc-census --selftest: PASS'
     requireInputsUnmoved: true
-  # The REPAIR verb, run only where a run names it (`dssharness run check-doc-census --manual-step write`):
+  # The REPAIR verb, run only where a run names it -- `dssharness run check-doc-census-write`, the runner that runs
+  # it on ONE leg, this machine's own tree (config.json):
   # after a fold moves a counted corpus, it rewrites the documented figures in place, never the prose. It
   # moves tracked files by design, so it cannot carry requireInputsUnmoved; a plain run afterwards verifies.
   - name: write

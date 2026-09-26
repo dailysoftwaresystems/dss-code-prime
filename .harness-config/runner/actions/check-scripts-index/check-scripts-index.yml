@@ -12,7 +12,8 @@ steps:
       python3 ./check-scripts-index.py
     successPattern: 'scripts-index: self-test OK'
     requireInputsUnmoved: true
-  # The REGENERATE verb, run only where a run names it (`dssharness run check-scripts-index --manual-step write`):
+  # The REGENERATE verb, run only where a run names it -- `dssharness run check-scripts-index-write`, the runner
+  # that runs it on ONE leg, this machine's own tree (config.json):
   # after an action is added, moved or re-purposed, it rewrites both index documents from the tree. It moves
   # tracked files by design, so it cannot carry requireInputsUnmoved; a plain run afterwards verifies.
   - name: write

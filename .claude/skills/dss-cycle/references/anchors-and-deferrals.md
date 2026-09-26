@@ -63,14 +63,14 @@ deferral is the rare exception that must earn its place, not the convenient way 
    **The schema is SIX cells:** `| Anchor | Priority | Status | Trigger | Closing work | Cross-refs |`
    — `Priority` is `P0`..`P5`, `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` /
    `🔵 DISCLOSED`, and `--status` or a `--status-file` holds one of those cells or its bare word
-   (`closed`, `open`, `gated`, `disclosed`); `DssHarness write-anchor` refuses anything else, the
+   (`closed`, `open`, `gated`, `disclosed`); `dssharness write-anchor` refuses anything else, the
    retired `🔵 🟠 OPEN (DISCLOSED)` included. The last one is **OPEN WORK** whose debt PRE-DATES this cycle: it
    counts in every total and is exempt only from the balance gate's net-increase refusal, so
    writing up a defect you merely FOUND is not punished like shipping a new deferral. The claim
    is checkable against the base ref — never use it for a defect this cycle introduced.
    ⚠⚠ **DO NOT HAND-WRITE THE ROW.** Use the writer, which takes the FIELDS:
 
-       DssHarness write-anchor D-<AREA>-<NAME> \
+       dssharness write-anchor D-<AREA>-<NAME> \
             --priority P1 --status open --trigger '...' --closing '...' --cross-refs '...'
 
    It WRITES by default; `--anchor-dry-run` shows the row and where it would be filed without writing,
@@ -85,7 +85,7 @@ deferral is the rare exception that must earn its place, not the convenient way 
 2b. **CLOSING IS A MOVE, NOT AN EDIT** (operator, 2026-09-01: *"always delete a done item and put
    into `_deferred-anchor-registry-done.md` once finished"*):
 
-       DssHarness set-anchor D-<AREA>-<NAME> --status closed --closing '...'
+       dssharness set-anchor D-<AREA>-<NAME> --status closed --closing '...'
 
    `set-anchor` patches only the fields you name, preserves the rest byte-for-byte, deletes the row
    from its working registry and appends it to the archive's matching table. Reopening (`--status
@@ -117,18 +117,18 @@ deferral is the rare exception that must earn its place, not the convenient way 
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
 | Deferral registry — WORKING (what is LEFT) | `.plans/_deferred-anchor-registry-production.md` — the only working registry since 2026-09-16 |
 | Deferral registry — ARCHIVE (closed; never read to ORIENT) | `.plans/_deferred-anchor-registry-done.md` |
-| Read ONE anchor, in full | `DssHarness read-anchor <ANCHOR>` — one command on every host |
-| List anchors — name, priority, status | `DssHarness read-anchors --pending [--band P0]` [→ the listing ends with its count, so `--open --band <P>` gives a band's](registry-and-priority.md) |
-| Write a NEW row from fields | `DssHarness write-anchor <ANCHOR> --trigger '...' --closing '...'` — ⚠ it WRITES; `--anchor-dry-run` is how you look first |
-| Change a row — **closing MOVES it to the archive** | `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` — ⚠ it WRITES |
-| Apply a lane's rows directory, as one batch | `python .harness-config/runner/actions/anchor-rows/anchor-rows.py stage <lane rows> <staged> --only <ID>...`, then `check <staged>`, then `apply <staged> [--accept-lost <ID>:<cell>]...` — rehearsed in a throwaway repository first, all or nothing, every row read back |
-| Lint every row a reader cannot key on | `DssHarness read-anchors --lint` |
+| Read ONE anchor, in full | `dssharness read-anchor <ANCHOR>` — one command on every host |
+| List anchors — name, priority, status | `dssharness read-anchors --pending [--band P0]` [→ the listing ends with its count, so `--open --band <P>` gives a band's](registry-and-priority.md) |
+| Write a NEW row from fields | `dssharness write-anchor <ANCHOR> --trigger '...' --closing '...'` — ⚠ it WRITES; `--anchor-dry-run` is how you look first |
+| Change a row — **closing MOVES it to the archive** | `dssharness set-anchor <ANCHOR> --status closed --closing '...'` — ⚠ it WRITES |
+| Apply a lane's rows directory, as one batch | `dssharness run rows --manual-step stage --input rows=<lane rows> --input staged=<staged> --input only=<ID>,...` (or `only=@<file>`, one id a line) `--input new=<ID>,...` (the ids the batch may CREATE: a row no registry holds that `new` does not name is refused as a typo), then `--manual-step check --input staged=<staged>` (read-only: each supplied cell SAME, RESPACED, KEPT, FILLED or LOST, status and priority SAME or CHANGED, with a word diff of each LOST cell; every id a row newly cites must be a row of a registry or of the batch, because no guard reads the registries' own citations, `check-anchor-citations` included), then `--manual-step apply --input staged=<staged>` (`--input acceptLost=<ID>:<cell>,...` for each LOST cell read) — rehearsed in a throwaway repository first, all or nothing, every row read back; a failure restores both registries unless another writer changed them meanwhile, which it says |
+| Lint every row a reader cannot key on | `dssharness read-anchors --lint` |
 
 ⛔⛔ **THE DEFAULT INVERTED WHEN THE DOOR MOVED, AND A COPIED IDIOM NOW WRITES.** The retired
-`.harness-config/runner/actions/anchors/*-anchor.{sh,ps1}` twins DRY-RAN unless given `--apply`; `DssHarness write-anchor`
+`.harness-config/runner/actions/anchors/*-anchor.{sh,ps1}` twins DRY-RAN unless given `--apply`; `dssharness write-anchor`
 and `set-anchor` **WRITE unless given `--anchor-dry-run`**. So the one habit that used to be safe —
 leaving `--apply` off to see what would happen — now lands the change. ✔MEASURED 2026-09-17:
-`DssHarness set-anchor <ID> --priority P2 --anchor-dry-run` answers *"dry run: … would be updated in
+`dssharness set-anchor <ID> --priority P2 --anchor-dry-run` answers *"dry run: … would be updated in
 the pending registry; nothing was written"*, exit 0, and `git status` is clean afterwards.
 ⓘ `--production` is gone with the twins: the registry a row lands in is decided by its STATUS, and
 `--pending` / `--done` narrow a LISTING. Every field also has a `--<field>-file` form, which is how

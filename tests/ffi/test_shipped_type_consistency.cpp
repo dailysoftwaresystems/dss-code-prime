@@ -59,6 +59,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <optional>
 #include <set>
@@ -305,6 +306,45 @@ TEST(ShippedTypeConsistency, EveryDescriptorAgreesOnEveryTagAndTypedefPerTarget)
                 << "only " << checked << " descriptors were checked on this "
                    "target — the sweep is no longer exhaustive";
         }
+    }
+}
+
+// ── P68 round 12 (S2a-2a): one owner per typedef name ───────────────────────
+//
+// ONE document defines each shipped typedef name; every other header that declares
+// it NAMES that owner. ✔MEASURED before S2a-2a: size_t was defined six times, wchar_t
+// four, intptr_t and time_t twice — held together only by the consistency sweep. A
+// second definition is where the next drift would start.
+TEST(ShippedTypeConsistency, EveryShippedTypedefNameHasOneDefiningDescriptor) {
+    fs::path const cfg = configRoot();
+    ASSERT_FALSE(cfg.empty());
+    fs::path const root = cfg / "shippedLibs";
+    std::map<std::string, std::vector<std::string>> definers;
+    std::size_t references = 0;
+    for (auto const& entry : fs::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+        std::ifstream in{entry.path(), std::ios::binary};
+        auto const doc = nlohmann::json::parse(in, nullptr, /*allow_exceptions=*/false);
+        ASSERT_FALSE(doc.is_discarded()) << entry.path().generic_string();
+        if (!doc.contains("typedefs")) continue;
+        std::string const rel = fs::relative(entry.path(), root).generic_string();
+        for (auto const& t : doc.at("typedefs")) {
+            bool isRef = t.contains("shippedTypedef");
+            if (t.contains("variants"))
+                for (auto const& v : t.at("variants")) isRef = isRef || v.contains("shippedTypedef");
+            if (isRef) { ++references; continue; }
+            definers[t.at("name").get<std::string>()].push_back(rel);
+        }
+    }
+    EXPECT_GE(definers.size(), 100u) << "the typedef enumeration collapsed (162 names at S2a-2a)";
+    EXPECT_GE(references, 10u) << "S2a-2a's references are gone";
+    for (auto const& [name, where] : definers) {
+        std::string list;
+        for (auto const& w : where) list += " " + w;
+        EXPECT_EQ(where.size(), 1u)
+            << "typedef '" << name << "' is DEFINED by" << list
+            << " — one document defines each type; every other header names it with "
+               "`shippedTypedef`";
     }
 }
 

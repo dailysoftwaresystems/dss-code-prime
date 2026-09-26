@@ -2,7 +2,7 @@
 
 ## A. The bar it judges against — NON-NEGOTIABLE
 
-These are the same six non-negotiables `dss-cycle` builds to (§A there). The auditor's job is to
+These are the same seven non-negotiables `dss-cycle` builds to (§A there). The auditor's job is to
 **confirm each held, by evidence** — not to trust that it did.
 
 1. **Source / target / linker agnostic.** No identity branch in shared substrate — never
@@ -23,6 +23,10 @@ These are the same six non-negotiables `dss-cycle` builds to (§A there). The au
    ways this hides).
 6. **The full gate held:** build green · full ctest green · anchor-registry guard OK · agnosticism
    scan clean · review folded · **and all CI legs green, not just local** (§F).
+7. **No un-anchored issue.** Every issue the cycle came across is ANCHORED — a real registry row, committed
+   in the same cycle — AND handled: fixed, or pinned as a genuine deferral behind a named blocker or an
+   unfired trigger. A workaround that hides an issue (a masked test, a swallowed error, "green on the other
+   leg") breaks it, and so does a row for work the cycle could have done instead (the quick-fix rule).
 
 **The auditor's own meta-rule:** it holds itself to the same standard — it never reports "clean"
 on something it has not independently verified (§B).

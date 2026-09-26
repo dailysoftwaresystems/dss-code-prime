@@ -155,7 +155,7 @@ This is the canonical gate checklist (§A.6 is its one-line statement). Verify e
   Rides ctest as `scripts_index_guard`, so it runs anyway — run it directly when this cycle
   added, renamed, deleted or REPURPOSED a script. It reds when the tree and the two indexes
   (`.harness-config/runner/actions/README.md`, `references/actions.md`) disagree, or when a script's own `PURPOSE:`
-  line differs from its index row. Regenerate both with `dssharness run check-scripts-index --manual-step write`; never hand-edit the block
+  line differs from its index row. Regenerate both with `dssharness run check-scripts-index-write`; never hand-edit the block
   between the generated-index markers. ★ It also refuses any `.sh` or `.ps1` under the actions root,
   by name: every action runs one Python program on every host (operator ruling 2026-09-21).
 - ⓘ There is no shell-portability guard any more: its subject, the `.sh` programs of the actions
@@ -303,9 +303,9 @@ Keep the plans honest in the **same commit** as the code:
 - Update the owning sub-plan: flip the §0 status row AND stamp the §3.1 deferred-items row
   (status flip in §0; `✅ CLOSED` stamp in §3.1 — update both, not one). [→ since 2026-09-25 a plan's §3.1 table is no longer a home a row can have: the registry row is the one that closes, by MOVING](anchors-and-deferrals.md)
 - In the registry: **close a row by MOVING it**, never by editing a status in place —
-  `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` stamps the
+  `dssharness set-anchor <ANCHOR> --status closed --closing '...'` stamps the
   `Status` column and lifts the row out of its working registry into
-  `_deferred-anchor-registry-done.md`. Add new anchors with `DssHarness write-anchor <ID> ...` (it
+  `_deferred-anchor-registry-done.md`. Add new anchors with `dssharness write-anchor <ID> ...` (it
   WRITES unless given `--anchor-dry-run`).
   **The row is never DELETED** — the audit trail is load-bearing, which is exactly why the archive
   exists rather than a deletion (operator, 2026-09-01). ⚠ Hand-editing a table is refused by

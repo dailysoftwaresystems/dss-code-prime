@@ -125,7 +125,7 @@ REGION_END = MARKER + ":END"
 #
 # THE REFUSED SHAPE: a DETECTOR VERB and a CR PATTERN on one line, in either order. The verb
 # co-requirement keeps prose out: `.gitattributes` discusses `$'\r'` with no verb, and a
-# Windows path `'Z:\home\rafael\test'` carries a bare `\r` that is no CR pattern. These are
+# Windows path `'Z:\home\<user>\test'` carries a bare `\r` that is no CR pattern. These are
 # the ERE the twins handed to `git grep -E`, byte for byte.
 CR_VERB = "(grep|egrep|fgrep|rg|awk|sed|findstr|Select-String)"
 CR_PAT = "(\\$'(\\\\r|\\\\015)'|['\"/]\\\\r\\$|['\"/]\\\\r['\"/])"

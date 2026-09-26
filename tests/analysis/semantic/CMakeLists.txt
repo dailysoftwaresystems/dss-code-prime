@@ -534,6 +534,26 @@ target_include_directories(dss_analysis_semantic_test_incompatible_pointer_conve
 target_link_libraries(dss_analysis_semantic_test_incompatible_pointer_conversion
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4 — an initializer of an
+# object of static or thread storage duration is refused where it PROVABLY is not a constant,
+# with the forms beyond C 6.6's own list the language names admitted
+# (`semantics.staticInitializers`). Perturbs the SHIPPED c JSON (the form list, the block), so
+# it links nlohmann_json.
+dss_add_test(NAME analysis/semantic/test_static_initializers
+             SOURCES test_static_initializers.cpp)
+target_include_directories(dss_analysis_semantic_test_static_initializers
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_link_libraries(dss_analysis_semantic_test_static_initializers
+                      PRIVATE nlohmann_json::nlohmann_json)
+
+# P68 round 13 (lane `cs`, found by the static-initializer item): the semantic walks that
+# stopped SILENTLY at a fixed depth (64 wrappers, 16 casts, 100000 items, 64 ancestors) and
+# answered as if they had finished — each now bounded by the tree alone.
+dss_add_test(NAME analysis/semantic/test_uncapped_semantic_walks
+             SOURCES test_uncapped_semantic_walks.cpp)
+target_include_directories(dss_analysis_semantic_test_uncapped_semantic_walks
+                           PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+
 # P68 round 9 (lane `cs`): the POINTER half of the arithmetic operators' operand
 # constraints (C23 6.5.4.3, 6.5.6-6.5.13, 6.5.17.3p1) — every pairing C does not
 # admit is refused ONCE, a refused operation has no type for its context to judge

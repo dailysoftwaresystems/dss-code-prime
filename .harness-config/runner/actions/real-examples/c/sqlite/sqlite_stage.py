@@ -1328,9 +1328,16 @@ def _pinned_checkout(url, dest, commit, log, genv):
     when the clone does not hold it -- `fetch --all` first (the pin lies on upstream's history), then the
     sha itself -- and nothing is pulled, so a fetch can never move a pinned subject. A populated directory
     that is not a checkout cannot be put on a commit, so it is REFUSED (the unpinned path uses such a
-    source tree as-is). -> [] (no warning: the subject is exactly the declared one)."""
-    name = posixpath.basename(dest.rstrip("/"))
-    if os.path.exists(_j(dest, ".git")):
+    source tree as-is). -> [] (no warning: the subject is exactly the declared one).
+    ★ THE CALLER HOLDS THE CHECKOUT'S LOCK, and nothing here takes one: the stage holds the shared clone's
+    CloneLock (POSIX, where that clone lives), the speedtest1 benchmark its output tree's run lock (every
+    host, Windows included) over the checkout it keeps inside the tree. Paths are the HOST's own -- the
+    benchmark calls this on Windows too -- and a checkout cloned here is cloned with `core.autocrlf=false`:
+    its text feeds a POSIX configure, and a git whose configuration converts to CRLF on checkout (Git for
+    Windows' system default; ✔MEASURED 2026-09-26, this project's Windows host sets it at the system level
+    and only a global override keeps its checkouts LF) would hand that configure a `#!/bin/sh\\r`."""
+    name = os.path.basename(dest.rstrip("/\\"))
+    if os.path.exists(os.path.join(dest, ".git")):
         log.info("pinning %s in %s to %s" % (name, dest, commit[:12]))
     elif os.path.isdir(dest) and os.listdir(dest):
         C.die("%s is not a git checkout, and the sqlite subject is PINNED to %s (legs.json "
@@ -1339,8 +1346,11 @@ def _pinned_checkout(url, dest, commit, log, genv):
               "it is." % (dest, commit))
     else:
         log.info("cloning %s -> %s" % (url, dest))
-        os.makedirs(posixpath.dirname(dest.rstrip("/")) or "/", exist_ok=True)
-        C.run_checked(["git", "clone", "--quiet", url, dest], "git clone %s" % url, env_=genv)
+        parent = os.path.dirname(dest.rstrip("/\\"))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        C.run_checked(["git", "clone", "--quiet", "--config", "core.autocrlf=false", url, dest],
+                      "git clone %s" % url, env_=genv)
     if not _has_commit(dest, commit, genv):
         log.info("  the pinned %s is not in the clone: fetching" % commit[:12])
         C.run_checked(["git", "-C", dest, "fetch", "--all", "--prune", "--quiet"],
@@ -2981,6 +2991,23 @@ def _st_git(t):
         t.check("... and sits on EXACTLY the pin, detached",
                 _git(env, "-C", pinned, "rev-parse", "HEAD") == c2
                 and git_head_branch(pinned, env) == "DETACHED-HEAD")
+        # ★ A PINNED CHECKOUT FEEDS A POSIX configure, so it is cloned LF whatever the host's git would convert
+        # it to (2026-09-26): a global configuration declaring core.autocrlf=true stands in for Git for
+        # Windows' system default, and a plain clone under it proves the conversion happens here.
+        crlf_env = dict(env, GIT_CONFIG_GLOBAL=_w(_j(tmp, "gitconfig-crlf"), "[core]\n\tautocrlf = true\n"))
+        converting = _j(tmp, "dest", "converting")
+        _git(crlf_env, "clone", "--quiet", bare, converting)
+        with open(_j(converting, "configure"), "rb") as fh:
+            converted = b"\r" in fh.read()
+        pinned_lf = _j(tmp, "dest", "pinned-lf")
+        clone_or_update(bare, pinned_lf, log=log, env=crlf_env, commit=c2)
+        with open(_j(pinned_lf, "configure"), "rb") as fh:
+            kept_lf = b"\r" not in fh.read()
+        t.check("a PINNED clone stays LF where the host's git converts to CRLF: its configure keeps a bare LF and "
+                "the clone records core.autocrlf=false (the negative occurs here: a plain clone under the same "
+                "configuration converts)",
+                converted and kept_lf and _git(crlf_env, "-C", pinned_lf, "config", "core.autocrlf") == "false",
+                "plain clone converted=%r, pinned clone kept LF=%r" % (converted, kept_lf))
         _git(env, "-C", work, "checkout", "--quiet", "trunk")
         _w(_j(work, "README"), "z\n")
         _git(env, "-C", work, "commit", "--quiet", "-am", "c3")

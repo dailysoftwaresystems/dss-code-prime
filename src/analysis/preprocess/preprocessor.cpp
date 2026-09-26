@@ -505,7 +505,13 @@ struct IntegerConstantSpelling {
 // of `magnitude` has PHASE-4 signedness `!isUnsigned` (`preprocessorLiteralSignedness`,
 // the one rule the `#if` evaluator reads) AND PHASE-7 type exactly (`core`,
 // `vocabularyName`) under every model in `models` (`typeIntegerLiteral`, the
-// ladder both typing tiers run). There is no "unsigned means `u`" map anywhere:
+// ladder both typing tiers run). ★ CONFIG ORDER IS WHY the C document lists MSVC's
+// sized suffixes LAST (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): every constant an
+// ISO spelling can carry keeps that spelling. A fixed-type rule reduces a magnitude
+// its type cannot hold (`300i8` is 44), but a spelling here must type exactly as
+// the constant, whose own range holds every magnitude this function is handed —
+// the most negative value goes through the `- 1` form — so nothing spelled is ever
+// reduced. There is no "unsigned means `u`" map anywhere:
 // the candidates are the config's own `suffixes`, verified. nullopt ⇒ no literal
 // of this language has that type.
 [[nodiscard]] std::optional<std::string>
@@ -522,7 +528,12 @@ verifiedLiteralSuffix(GrammarSchema const& schema, std::uint64_t magnitude,
         else for (auto const& s : r.suffixes) spellings.push_back(s);
         for (auto const& s : spellings) {
             std::string const text = std::to_string(magnitude) + s;
-            auto const sgn = preprocessorLiteralSignedness(text, ns, rules, magnitude);
+            // No plain-`char` signedness is supplied, deliberately: a spelling
+            // whose meaning waits on it (a `char`-typed fixed rule, MSVC's `i8`)
+            // answers nullopt and is simply not used — no shipped constant has
+            // type `char`, and one that did must not take a target's sign here.
+            auto const sgn =
+                preprocessorLiteralSignedness(text, ns, rules, magnitude, std::nullopt);
             if (!sgn.has_value() || *sgn == isUnsigned) continue;   // true = signed
             bool typed = true;
             for (DataModel const m : models) {

@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>         // a one-directory search span (a typedef reference's owner)
 #include <cmath>
 #include <cstddef>       // std::size_t (was <cstdlib> for std::getenv, gone with the local walk)
 #include <cstdint>
@@ -539,7 +540,16 @@ whenFactsFor(std::optional<std::string_view> activeTarget,
 // of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES) — so zero matches REFUSE, naming
 // the pair, unless the row says outright which arm serves every other pair:
 // `{ "default": true, "value": … }`, at most one, never with a `when`.
-enum class ZeroMatch { KeepEmpty, RefuseUnlessDefault };
+//
+// ★ AND ONLY WHERE THE SYMBOL IS AVAILABLE (P68 round 12, S2a-2a). On a pair its
+// DECLARED availability (`availableObjectFormats`, its own else its document's)
+// excludes, a symbol is not injected anyway, so a signature with no arm for that
+// pair is `OmitUnlessDefault`: the default serves if there is one, else the symbol
+// is simply absent there — the rule a typedef or struct variant already follows.
+// Availability is never inferred from which arms exist: `strtold`'s arms key on a
+// long-double format the wasm32/spirv documents do not declare, and its row states
+// elf/macho/pe. Every arm is decoded either way.
+enum class ZeroMatch { KeepEmpty, RefuseUnlessDefault, OmitUnlessDefault };
 
 // The pair, spelled for a refusal: every fact the selector can test.
 [[nodiscard]] std::string pairLabel(WhenFacts const& f) {
@@ -616,7 +626,7 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
               "string)");
         return false;
     }
-    bool const defaultLegal = (zeroMatch == ZeroMatch::RefuseUnlessDefault);
+    bool const defaultLegal = (zeroMatch != ZeroMatch::KeepEmpty);
     int         matchCount = 0;
     std::optional<std::string> defaultValue;
     std::size_t vi         = 0;
@@ -677,12 +687,19 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
               "ambiguous (each target must match at most one)");
         return false;
     }
-    if (matchCount == 0 && zeroMatch == ZeroMatch::RefuseUnlessDefault) {
+    if (matchCount == 0 && zeroMatch != ZeroMatch::KeepEmpty) {
         if (defaultValue.has_value()) {
             out = *defaultValue;
             return true;
         }
-        emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + key
+        if (zeroMatch == ZeroMatch::OmitUnlessDefault) {
+            out.clear();                            // not injected on this pair
+            return true;
+        }
+        std::string const symName =
+            sym.contains("name") && sym.at("name").is_string() ? sym.at("name").get<std::string>()
+                                                               : std::string{"<unnamed>"};
+        emitMalformed(reporter, "shipped-lib descriptor " + at + ": symbol '" + symName + "': '" + key
             + "' has no variant matching the active pair (" + pairLabel(facts)
             + ") and no 'default' arm — refusing to bind another pair's value "
               "(the variants form has no silent fallback)");
@@ -1918,6 +1935,138 @@ decodeConstantValueAndType(json const& obj, std::string const& at,
 // shared type-reference notation (`kTypeRefAbiTypedefKey`, preprocess_config.hpp).
 constexpr std::string_view kAbiTypedefKey = kTypeRefAbiTypedefKey;
 
+// ── A TYPEDEF THAT NAMES ITS OWNER ────────────────────────────────────────────
+// (P68 round 12, S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES)
+//
+// An entry — or a variant arm — may take its type from ANOTHER shipped header's
+// typedef: `{ "name": "size_t", "shippedTypedef": { "header": "stddef.h" } }`.
+// C's own model: many headers declare `size_t`, ONE type defines it. Before this,
+// `size_t`'s per-pair arms were copied into six descriptors, `wchar_t`'s into four,
+// held together only by the consistency sweep.
+//
+// ★ THE REFERENCE TAKES THE OWNER'S WHOLE ANSWER ON THE PAIR — its type, and "not
+// declared here" too, exactly as an `abiTypedef` the pair lacks is not injected: a
+// use of the name there then fails loud as an unknown type (at decode, for a
+// descriptor signature that names it). Nothing is guessed, because no type is
+// invented. A referrer that declares LESS than its owner (stdio.h's pe-only
+// `wchar_t`) gates a reference ARM.
+//
+// REFUSED AT LOAD, each with its own sentence: an owner the referrer's own shipped
+// root does not hold; an owner that declares the name on NO pair; an owner entry
+// that is itself a reference (one document defines each type — name that one); a
+// cycle of references; and a reference beside `type` or `abiTypedef` (two owners).
+//
+// WHERE THE OWNER IS FOUND: in the REFERRER's own shipped root — its path minus its
+// own `header`, rewritten as `#include <h>` rewrites a name (extension dropped,
+// `.json`, subdirectories kept) — matched as spelled, the precedent a config
+// cross-reference follows (`readShippedHeaderTypedefs`). So a reference resolves in
+// the corpus its referrer belongs to, the shipped tree or a test's scratch tree
+// alike, and needs no consuming language to find it.
+constexpr std::string_view kShippedTypedefRefKey = "shippedTypedef";
+
+// The shipped root `doc` (read from `pathStr`) lives in, or nullopt when its location
+// does not end in its own header's descriptor name — the provenance every shipped
+// descriptor holds (AllShippedDescriptorsDecode pins it).
+[[nodiscard]] std::optional<std::filesystem::path>
+shippedRootOf(std::string const& pathStr, json const& doc) {
+    if (!doc.contains("header") || !doc.at("header").is_string()) return std::nullopt;
+    std::string rel = doc.at("header").get<std::string>();
+    std::size_t const slash = rel.find_last_of('/');
+    std::size_t const dot   = rel.find_last_of('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) rel.erase(dot);
+    rel += ".json";
+    std::string const tail = "/" + rel;
+    if (pathStr.size() <= tail.size()
+        || pathStr.compare(pathStr.size() - tail.size(), tail.size(), tail) != 0)
+        return std::nullopt;
+    return std::filesystem::path{pathStr.substr(0, pathStr.size() - tail.size())};
+}
+
+// True when a typedef entry states its type by reference — flat, or in any arm.
+[[nodiscard]] bool typedefEntryIsReference(json const& entry) {
+    if (entry.contains(kShippedTypedefRefKey)) return true;
+    if (!entry.contains("variants") || !entry.at("variants").is_array()) return false;
+    return std::any_of(entry.at("variants").begin(), entry.at("variants").end(),
+                       [](json const& v) { return v.is_object() && v.contains(kShippedTypedefRefKey); });
+}
+
+// The OWNER a reference names, located and checked (not yet decoded): its path and
+// its entry for `name`. nullopt after reporting a refusal.
+struct TypedefReferenceOwner {
+    std::filesystem::path path;
+    std::string           pathStr;
+    json const*           doc   = nullptr;
+    json const*           entry = nullptr;
+};
+
+[[nodiscard]] std::optional<TypedefReferenceOwner>
+locateTypedefReferenceOwner(json const& ref, std::string const& ctx, std::string const& tname,
+                            std::string const& referrerPathStr, json const& referrerDoc,
+                            DiagnosticReporter& reporter) {
+    if (!ref.is_object()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "': 'shippedTypedef' must be an object "
+                                      "{ \"header\": \"<the header that defines it>\" }");
+        return std::nullopt;
+    }
+    if (!rejectUnknownKeys(reporter, ref, ctx + ".shippedTypedef", {"header"})) return std::nullopt;
+    if (!ref.contains("header") || !ref.at("header").is_string()
+        || ref.at("header").get<std::string>().empty()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "': 'shippedTypedef' needs a non-empty string 'header' "
+                                      "naming the header that defines it");
+        return std::nullopt;
+    }
+    std::string const ownerHeader = ref.at("header").get<std::string>();
+    auto const root = shippedRootOf(referrerPathStr, referrerDoc);
+    if (!root.has_value()) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "' names '" + ownerHeader + "', but this descriptor's location "
+                                      "does not end in its own header's name, so the shipped root "
+                                      "that header is found in cannot be named");
+        return std::nullopt;
+    }
+    HeaderSearchCache cache;
+    std::array<std::filesystem::path, 1> const dirs{*root};
+    HeaderSearchResult const found =
+        resolveSystemDescriptor(ownerHeader, dirs, kDefaultHeaderNameMatching, cache);
+    if (found.status != HeaderSearchStatus::Found) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                    + "' names '" + ownerHeader + "' as its owner, and no shipped "
+                                      "descriptor for that header is beside this one — a reference "
+                                      "must name a header of the same corpus");
+        return std::nullopt;
+    }
+    TypedefReferenceOwner owner;
+    owner.path    = found.path;
+    owner.pathStr = core::genericSpelling(found.path);
+    owner.doc     = cachedDescriptorJson(found.path, reporter);
+    if (owner.doc == nullptr) return std::nullopt;   // the read reported why
+    if (owner.doc->contains("typedefs") && owner.doc->at("typedefs").is_array()) {
+        for (json const& e : owner.doc->at("typedefs")) {
+            if (e.is_object() && e.contains("name") && e.at("name").is_string()
+                && e.at("name").get<std::string>() == tname) {
+                owner.entry = &e;
+                break;
+            }
+        }
+    }
+    if (owner.entry == nullptr) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname + "' names '"
+                                    + ownerHeader + "' as its owner, which declares no typedef '" + tname
+                                    + "' on any pair");
+        return std::nullopt;
+    }
+    if (typedefEntryIsReference(*owner.entry)) {
+        emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname + "' names '"
+                                    + ownerHeader + "' as its owner, whose '" + tname
+                                    + "' is itself a reference — one document defines each type; name "
+                                      "the header that defines it");
+        return std::nullopt;
+    }
+    return owner;
+}
+
 [[nodiscard]] bool
 decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                       TypeInterner& interner, TypeRegistry& typeReg,
@@ -1928,7 +2077,13 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                       std::string_view activeDataModelName,
                       std::deque<std::string>& typedefNameStore,
                       std::vector<NamedTypeBinding>& mergedNamedTypes,
-                      ShippedPairFacts const* pairFacts) {
+                      ShippedPairFacts const* pairFacts,
+                      std::vector<std::string>* referenceChain = nullptr) {
+    // The CALLER's bindings (a `va_list`), before this descriptor adds its own: what an
+    // owner a reference names is decoded with — never the referrer's typedefs.
+    std::size_t const callerBindings = mergedNamedTypes.size();
+    std::vector<std::string> chainStore;
+    std::vector<std::string>& chain = referenceChain != nullptr ? *referenceChain : chainStore;
     if (doc.contains("typedefs")) {
         if (!doc.at("typedefs").is_array()) {
             emitMalformed(reporter,
@@ -1949,7 +2104,8 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
             }
             (void)rejectUnknownKeys(reporter, t,
                                     "typedefs[" + std::to_string(tidx - 1) + "]",
-                                    {"name", "type", "variants", kAbiTypedefKey});
+                                    {"name", "type", "variants", kAbiTypedefKey,
+                                     kShippedTypedefRefKey});
             if (!t.contains("name") || !t.at("name").is_string()
                 || t.at("name").get<std::string>().empty()) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at
@@ -1983,10 +2139,58 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                 return ty;
             };
             // P68 round 9: the entry's (or variant's) type from EITHER source —
-            // a spelled `type`, or the pair's platform ABI typedef.
+            // a spelled `type`, or the pair's platform ABI typedef — and, since
+            // P68 round 12 (S2a-2a), a third: the typedef its OWNER header defines.
             enum class TypedefTypeOutcome { Decoded, Unrealized, Error };
+            auto referencedType = [&](json const& obj, std::string const& ctx,
+                                      TypeId& outTy) -> TypedefTypeOutcome {
+                if (obj.contains("type") || obj.contains(kAbiTypedefKey)) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '"
+                                                + tname + "' states its type twice — a "
+                                                  "'shippedTypedef' reference and a 'type' or "
+                                                  "'abiTypedef'; the header it names is the one "
+                                                  "owner, remove the other");
+                    return TypedefTypeOutcome::Error;
+                }
+                auto const owner = locateTypedefReferenceOwner(obj.at(kShippedTypedefRefKey), ctx,
+                                                               tname, pathStr, doc, reporter);
+                if (!owner.has_value()) return TypedefTypeOutcome::Error;
+                if (owner->pathStr == pathStr
+                    || std::find(chain.begin(), chain.end(), owner->pathStr) != chain.end()) {
+                    std::string cycle;
+                    for (std::string const& c : chain) cycle += "'" + c + "' -> ";
+                    emitMalformed(reporter, "shipped-lib descriptor " + ctx + ": typedef '" + tname
+                                                + "' closes a cycle of typedef references ("
+                                                + cycle + "'" + pathStr + "' -> '" + owner->pathStr
+                                                + "') — a reference must reach the header that "
+                                                  "defines the type");
+                    return TypedefTypeOutcome::Error;
+                }
+                // The owner's answer ON THIS PAIR, from its own ONE typedef decode —
+                // the same interner, target, format, model and pair facts, so its
+                // TypeId is the owner's identity itself.
+                std::deque<std::string>       ownerNames;
+                std::vector<NamedTypeBinding> ownerBindings(
+                    mergedNamedTypes.begin(),
+                    mergedNamedTypes.begin() + static_cast<std::ptrdiff_t>(callerBindings));
+                std::vector<ShippedTypedef> ownerOut;
+                chain.push_back(pathStr);
+                bool const ownerRead = decodeShippedTypedefs(
+                    *owner->doc, owner->pathStr, interner, typeReg, reporter, ownerOut,
+                    activeTarget, activeFormat, activeDataModelName, ownerNames, ownerBindings,
+                    pairFacts, &chain);
+                chain.pop_back();
+                if (!ownerRead) return TypedefTypeOutcome::Error;
+                for (ShippedTypedef const& o : ownerOut) {
+                    if (o.name != tname) continue;
+                    outTy = o.type;
+                    return TypedefTypeOutcome::Decoded;
+                }
+                return TypedefTypeOutcome::Unrealized;   // the owner does not declare it here
+            };
             auto typedefType = [&](json const& obj, std::string const& ctx,
                                    TypeId& outTy) -> TypedefTypeOutcome {
+                if (obj.contains(kShippedTypedefRefKey)) return referencedType(obj, ctx, outTy);
                 if (!obj.contains(kAbiTypedefKey)) {
                     TypeId const ty = decodeTypedefType(obj, ctx);
                     if (ty == InvalidType) return TypedefTypeOutcome::Error;
@@ -2020,17 +2224,19 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
             };
 
             // Exactly ONE of a flat `type` (single, back-compat) — or its
-            // `abiTypedef` sibling (P68 round 9) — or per-target `variants` (plan
-            // 25 extension): the name is INVARIANT; only the type/width varies per
-            // target (e.g. a `wchar_t` that is 32-bit on elf but 16-bit on pe).
-            // Both, or neither, is malformed — fail loud.
-            bool const tHasFlat     = t.contains("type") || t.contains(kAbiTypedefKey);
+            // `abiTypedef` sibling (P68 round 9), or a `shippedTypedef` reference
+            // (P68 round 12) — or per-target `variants` (plan 25 extension): the
+            // name is INVARIANT; only the type/width varies per target (e.g. a
+            // `wchar_t` that is 32-bit on elf but 16-bit on pe). Both, or neither,
+            // is malformed — fail loud.
+            bool const tHasFlat = t.contains("type") || t.contains(kAbiTypedefKey)
+                               || t.contains(kShippedTypedefRefKey);
             bool const tHasVariants = t.contains("variants");
             if (tHasFlat == tHasVariants) {
                 emitMalformed(reporter, "shipped-lib descriptor " + at
                                             + ": a typedef must declare EXACTLY one of a flat "
-                                              "'type' or 'abiTypedef' (single) or 'variants' "
-                                              "(per-target types)");
+                                              "'type', 'abiTypedef' or 'shippedTypedef' (single) "
+                                              "or 'variants' (per-target types)");
                 continue;
             }
 
@@ -2068,7 +2274,8 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                         okVariants = false; break;
                     }
                     (void)rejectUnknownKeys(reporter, vdef, vat,
-                                            {"when", "type", kAbiTypedefKey});
+                                            {"when", "type", kAbiTypedefKey,
+                                             kShippedTypedefRefKey});
                     if (!vdef.contains("when") || !vdef.at("when").is_object()) {
                         emitMalformed(reporter, "shipped-lib descriptor " + vat
                                                     + ": missing or non-object 'when' "
@@ -4001,9 +4208,17 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // model alone and could not say "long double" at all.
         std::string sigText;
         std::vector<std::string> sigArms;
+        // Available here (its DECLARED set, else the document's; no active format
+        // decides nothing, so it counts as available): no arm is a refusal.
+        // Unavailable here: no arm means the symbol is absent here (see ZeroMatch).
+        bool const availableHere =
+            !activeFormat.has_value()
+            || objectFormatInAvailabilitySet(symAvail.empty() ? out.availableObjectFormats : symAvail,
+                                             *activeFormat);
         if (!decodePerTargetSymbolString(sym, "signature", at, idx - 1, symFacts,
-                                         ZeroMatch::RefuseUnlessDefault, reporter,
-                                         sigText, &sigArms))
+                                         availableHere ? ZeroMatch::RefuseUnlessDefault
+                                                       : ZeroMatch::OmitUnlessDefault,
+                                         reporter, sigText, &sigArms))
             continue;
         // EAGER: every arm must decode as a TYPE, the active one or not — an arm
         // no current pair selects would otherwise lurk until that pair is first
@@ -4023,6 +4238,9 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             }
         }
         if (!armsOk) continue;
+        // No arm and no default on a pair the symbol is NOT available on: it is not
+        // injected here (every arm was still decoded above).
+        if (sigText.empty()) continue;
 
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
@@ -4308,11 +4526,15 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     bool const declaredConstants      = declaresArray("constants");
     bool const declaredTypedefs       = declaresArray("typedefs");
     bool const declaredMacroVariants  = declaresArray("macros");
+    // P68 round 12 (S2a-2a): `symbols` joins them — a per-pair signature with no arm
+    // on a pair its symbol is not available on leaves that symbol out there, so a
+    // header of such symbols can inject none on a pair and still declare them.
+    bool const declaredSymbols        = declaresArray("symbols");
     if (out.symbols.empty() && out.constants.empty() && out.floatConstants.empty()
         && out.typedefs.empty() && out.structs.empty() && out.unions.empty()
         && out.macros.empty()
         && !declaredStructs && !declaredUnions && !declaredConstants
-        && !declaredTypedefs && !declaredMacroVariants) {
+        && !declaredTypedefs && !declaredMacroVariants && !declaredSymbols) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + core::genericSpelling(path)
                 + "': declares nothing — needs at least one of 'symbols', "
@@ -4826,9 +5048,27 @@ namespace {
 [[nodiscard]] bool
 typedEntryReachableOnFormat(json const& entry, std::string const& at,
                             ObjectFormatKind fmt,
-                            DiagnosticReporter& reporter) {
+                            DiagnosticReporter& reporter,
+                            json const* referrerDoc = nullptr,
+                            std::string const* referrerPathStr = nullptr) {
+    // P68 round 12 (S2a-2a): a `shippedTypedef` reference exists wherever its OWNER's
+    // entry does — the reference takes the owner's whole answer, coverage included —
+    // so the harvest follows it, as the full read does. An owner the reference cannot
+    // name is refused here as there (the caller's reporter carries it).
+    auto const ownerReachable = [&](json const& node, std::string const& ctx) -> bool {
+        if (referrerDoc == nullptr || referrerPathStr == nullptr) return true;
+        std::string const tname =
+            entry.contains("name") && entry.at("name").is_string() ? entry.at("name").get<std::string>()
+                                                                   : std::string{};
+        auto const owner = locateTypedefReferenceOwner(node.at(kShippedTypedefRefKey), ctx, tname,
+                                                       *referrerPathStr, *referrerDoc, reporter);
+        if (!owner.has_value()) return false;
+        return typedEntryReachableOnFormat(*owner->entry, ctx + " -> '" + owner->pathStr + "'", fmt,
+                                           reporter);
+    };
     auto const it = entry.find("variants");
-    if (it == entry.end()) return true;             // flat ⇒ always present
+    if (it == entry.end())                          // flat ⇒ always present — a reference, where its owner is
+        return entry.contains(kShippedTypedefRefKey) ? ownerReachable(entry, at) : true;
     if (!it->is_array() || it->empty()) return false;
     std::size_t vidx = 0;
     for (auto const& vdef : *it) {
@@ -4841,7 +5081,9 @@ typedEntryReachableOnFormat(json const& entry, std::string const& at,
         WhenMatch const wm = matchVariantWhen(
             vdef.at("when"), WhenAxes::FormatReachability, vat + ".when",
             WhenFacts{.format = fmt}, reporter);
-        if (wm == WhenMatch::Match) return true;
+        if (wm == WhenMatch::Match
+            && (!vdef.contains(kShippedTypedefRefKey) || ownerReachable(vdef, vat)))
+            return true;
     }
     return false;
 }
@@ -4867,7 +5109,7 @@ void harvestNamedSurface(json const& doc, std::string const& pathStr,
         std::string name = e.at("name").get<std::string>();
         if (name.empty()) continue;
         if (surfaceAdmitsVariants
-            && !typedEntryReachableOnFormat(e, at, fmt, reporter)) {
+            && !typedEntryReachableOnFormat(e, at, fmt, reporter, &doc, &pathStr)) {
             continue;
         }
         out.push_back(std::move(name));
@@ -5285,14 +5527,15 @@ refusalBelongsToThisBuild(std::filesystem::path const&      path,
                           std::optional<std::string_view>   activeTarget,
                           std::optional<ObjectFormatKind>   activeFormat,
                           std::span<NamedTypeBinding const> namedTypes,
-                          RuntimeLibraryRoleResolver const* roleResolver) {
+                          RuntimeLibraryRoleResolver const* roleResolver,
+                          ShippedPairFacts const*           pairFacts) {
     // No resolver ⇒ nothing but the descriptor itself could have refused.
     if (roleResolver == nullptr) return false;
     DiagnosticReporter withoutResolver;
     auto const again = readShippedLibDescriptor(path, interner, typeReg,
                                                 withoutResolver, dataModel,
                                                 activeTarget, activeFormat,
-                                                namedTypes, nullptr);
+                                                namedTypes, nullptr, pairFacts);
     return again.has_value();
 }
 
@@ -5307,7 +5550,8 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             std::optional<std::string_view>   activeTarget,
                             std::optional<ObjectFormatKind>   activeFormat,
                             std::span<NamedTypeBinding const> namedTypes,
-                            RuntimeLibraryRoleResolver const* roleResolver) {
+                            RuntimeLibraryRoleResolver const* roleResolver,
+                            ShippedPairFacts const*           pairFacts) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;   // discovery failed — route unbound
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -5385,11 +5629,12 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
         DiagnosticReporter throwaway;
         auto desc = readShippedLibDescriptor(idx->root / rel, interner, typeReg,
                                              throwaway, dataModel, activeTarget,
-                                             activeFormat, namedTypes, roleResolver);
+                                             activeFormat, namedTypes, roleResolver,
+                                             pairFacts);
         if (!desc) {
             if (refusalBelongsToThisBuild(idx->root / rel, interner, typeReg,
                                           dataModel, activeTarget, activeFormat,
-                                          namedTypes, roleResolver)) {
+                                          namedTypes, roleResolver, pairFacts)) {
                 for (auto const& d : throwaway.all()) reporter.report(d);
             }
             continue;
@@ -5595,7 +5840,8 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
                                    std::span<NamedTypeBinding const> namedTypes,
-                                   RuntimeLibraryRoleResolver const* roleResolver) {
+                                   RuntimeLibraryRoleResolver const* roleResolver,
+                                   ShippedPairFacts const*           pairFacts) {
     CorpusIndex const* const idx = corpusIndex();
     if (idx == nullptr) return std::nullopt;
     std::unordered_map<std::string, ShippedSymbolRealization> out;
@@ -5618,7 +5864,7 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
         auto desc = readShippedLibDescriptor(idx->root / row.relPath, interner,
                                             typeReg, throwaway, dataModel,
                                             activeTarget, activeFormat, namedTypes,
-                                            roleResolver);
+                                            roleResolver, pairFacts);
         if (!desc) continue;
         bool const docHere = objectFormatInAvailabilitySet(
             desc->availableObjectFormats, *activeFormat);

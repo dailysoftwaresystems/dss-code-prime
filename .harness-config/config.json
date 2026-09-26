@@ -787,6 +787,26 @@
     // ⚠ A LINUX LEG CANNOT RUN AN ACTION UNDER 0.5.7: its sync withholds everything under
     // `.harness-config/` except this file, so the action's own directory never reaches the host.
     // Fixed upstream (round four, unreleased at this writing); the Windows legs run today.
+    "anchor-rows": {
+      "description": "Prove the rows batch can fail at stage, at check and at apply, and that a valid batch lands as declared: its self-test, on both local legs. The stage, check and apply steps run through the `rows` runner.",
+      "legs": [
+        "windows-x86_64-debug",
+        "linux-x86_64-debug"
+      ],
+      "action": "anchor-rows/anchor-rows.yml"
+    },
+    // ★ A FOLD'S ROWS ARE APPLIED TO THE TREE ITSELF, so this runner has ONE leg: the one whose tree is this
+    // machine's own checkout, run in place. A host's synced copy holds no lane's rows directory (`.worktrees`
+    // and `.temp` are ignored, and only what git does not ignore travels), so there a step refuses for want of
+    // its rows. A plain run runs the self-test; `--manual-step stage|check|apply --input <name>=<value> ...`
+    // runs a verb (anchor-rows.yml declares each step's inputs).
+    "rows": {
+      "description": "Stage, check and apply one fold's deferred-anchor rows as a batch -- anchor-rows' manual steps, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "action": "anchor-rows/anchor-rows.yml"
+    },
     "anchors": {
       "description": "Read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor.",
       "legs": [
@@ -840,6 +860,20 @@
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
+      ],
+      "action": "check-doc-census/check-doc-census.yml"
+    },
+    // ★ A STEP THAT WRITES THIS MACHINE'S OWN TREE RUNS ON ONE LEG, the leg whose tree IS that tree, as `rows`
+    // does (P68 round 13's audit, F1-A11): a guard's own runner keeps both local legs for its verify, and a
+    // `--manual-step write` through it would rewrite the WSL leg's synced copy too. Each of these runs the
+    // guard's `write` step alone; the remedy the guard prints names it.
+    "check-doc-census-write": {
+      "description": "Repair in place the documented figures a census refutes -- check-doc-census's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
       ],
       "action": "check-doc-census/check-doc-census.yml"
     },
@@ -940,6 +974,17 @@
       ],
       "action": "check-plan-citations/check-plan-citations.yml"
     },
+    // One leg, this machine's own tree: see `check-doc-census-write`.
+    "check-plan-citations-write": {
+      "description": "Burn down and re-stamp the plans' citation baseline -- check-plan-citations's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
+      ],
+      "action": "check-plan-citations/check-plan-citations.yml"
+    },
     "check-retyped-closed-sets": {
       "description": "Census the diagnostics that RETYPE a closed vocabulary instead of projecting it.",
       "legs": [
@@ -953,6 +998,17 @@
       "legs": [
         "windows-x86_64-debug",
         "linux-x86_64-debug"
+      ],
+      "action": "check-scripts-index/check-scripts-index.yml"
+    },
+    // One leg, this machine's own tree: see `check-doc-census-write`.
+    "check-scripts-index-write": {
+      "description": "Rewrite both action index documents from the tree -- check-scripts-index's write step, on this machine's own tree.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "write"
       ],
       "action": "check-scripts-index/check-scripts-index.yml"
     },

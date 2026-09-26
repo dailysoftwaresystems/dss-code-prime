@@ -1031,7 +1031,10 @@ or inside WSL, a real compile), so every leg runs them.
 - `pragma-profile-census.py` could not decode `c.lang.json` under cp1252 and did not find `dsscp.exe`;
   `corpus-census.py` died with `NameError` at import in a tree without `parse_diagnostic.cpp`.
 - `sqlite_compiler`'s candidate search missed every DssHarness build directory (`build/<processor>-<toolchain>-
-  <config>`), while the benchmark searched them on its own: one owner now (`search_roots`); since 2026-09-26 its one caller is the benchmark (`select_dss`), because the driver takes only a named compiler.
+  <config>`), while the benchmark searched them on its own: one owner then (`search_roots`). Since 2026-09-26 the
+  driver takes only a named compiler, and since P68 round 13 the benchmark's `select_dss` too (`require_named`, the
+  driver's own words), so the search -- `search_roots`, `find_candidates`, `select_compiler`, `format_candidates`,
+  and the constants `SEARCH_ROOTS` and `BINARY_NAMES` -- was deleted with its last caller.
 - `cmake-import` wrote paths relative to the PROJECT ROOT into a manifest that may live elsewhere (its own runner
   writes into the step's build directory): relative now to the MANIFEST's directory, absolute outside it.
 - The driver's provenance count excluded CR-only changes by `diff --ignore-cr-at-eol --name-only`, which still lists

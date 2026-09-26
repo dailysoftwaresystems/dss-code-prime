@@ -539,9 +539,9 @@ _MIRROR_LIST = ["alter.test", "swarmvtab.test", "swarmvtabfault.test", "symlink.
                 "symlink2.test", "wal2.test", "walsetlk.test", "zipfile.test"]
 _MIRROR_NAMES = ["inmemory_journal.swarmvtabfault-1.1-oom-persistent.143", "mm-wal2-3.3",
                  "walsetlk-2.1.3", "nothing-matches-here.1", "symlink.test-sharedcachesetting",
-                 "Z:/home/rafael/src/sqlite/test/symlink2.test",
-                 "/home/rafael/src/sqlite/test/symlink2.test",
-                 "Z:\\home\\rafael\\src\\sqlite\\test\\symlink2.test", "symlink2.test"]
+                 "Z:/home/dev/src/sqlite/test/symlink2.test",
+                 "/home/dev/src/sqlite/test/symlink2.test",
+                 "Z:\\home\\dev\\src\\sqlite\\test\\symlink2.test", "symlink2.test"]
 _MIRROR_SEGMENT_LOG = (b"Can't find a usable init.tcl in the following directories:\n"
                        b"alter-1.1... Ok\n"
                        b"Time: alter.test 12 ms\n"
@@ -563,7 +563,7 @@ _MIRROR_SEGMENT_LOG = (b"Can't find a usable init.tcl in the following directori
 # A segment log this harness really produced and then could not read (pe64-x86_64 under wine,
 # re-entering symlink2.test; it died before the first `name...` line). Verbatim, CRLF re-joined.
 _REAL_ABORT_SEGMENT_LOG = [
-    b'Z:\\home\\rafael\\src\\dss-code-prime\\build\\real-examples\\c\\sqlite\\pe64-x86_64\\pe64-x86_64-windows-exec\\testfixture.exe: Z:\\home\\rafael\\src\\sqlite\\test\\lnk220.sym: File Not Found',
+    b'Z:\\home\\dev\\src\\dss-code-prime\\build\\real-examples\\c\\sqlite\\pe64-x86_64\\pe64-x86_64-windows-exec\\testfixture.exe: Z:\\home\\dev\\src\\sqlite\\test\\lnk220.sym: File Not Found',
     b'    while executing',
     b'"exec -- $::env(ComSpec) /c del [file nativename $link]"',
     b'    (procedure "deleteWin32Symlink" line 2)',
@@ -572,9 +572,9 @@ _REAL_ABORT_SEGMENT_LOG = [
     b'    (procedure "canCreateWin32Symlink" line 6)',
     b'    invoked from within',
     b'"canCreateWin32Symlink"',
-    b'    (file "Z:/home/rafael/src/sqlite/test/symlink2.test" line 48)',
+    b'    (file "Z:/home/dev/src/sqlite/test/symlink2.test" line 48)',
     b'    invoked from within',
-    b'"source Z:/home/rafael/src/sqlite/test/symlink2.test"',
+    b'"source Z:/home/dev/src/sqlite/test/symlink2.test"',
     b'    invoked from within',
     b'"interp eval tinterp $script"',
     b'    (procedure "slave_test_script" line 30)',
@@ -587,14 +587,14 @@ _REAL_ABORT_SEGMENT_LOG = [
     b'"slave_test_file $file"',
     b'    (procedure "run_tests" line 36)',
     b'    invoked from within',
-    b'"run_tests veryquick -presql {} -files {shared3.test func7.test upfrom4.test Z:/home/rafael/src/sqlite/test/../ext/fts5/test/fts5misc.test vacuum5.test..."',
+    b'"run_tests veryquick -presql {} -files {shared3.test func7.test upfrom4.test Z:/home/dev/src/sqlite/test/../ext/fts5/test/fts5misc.test vacuum5.test..."',
     b'    ("eval" body line 1)',
     b'    invoked from within',
     b'"eval [list run_tests $suite] $S $extra"',
     b'    (procedure "main" line 34)',
     b'    invoked from within',
     b'"main $argv"',
-    b'    (file "/home/rafael/src/sqlite/test/permutations.test" line 1270)',
+    b'    (file "/home/dev/src/sqlite/test/permutations.test" line 1270)',
     b'    invoked from within',
     b'"source $argv0"',
     b'    invoked from within',
@@ -615,9 +615,9 @@ _MIRROR_RESOLVE_MEASURED = [
     "inmemory_journal.swarmvtabfault-1.1-oom-persistent.143\tswarmvtabfault.test",
     "mm-wal2-3.3\twal2.test", "walsetlk-2.1.3\twalsetlk.test", "nothing-matches-here.1",
     "symlink.test-sharedcachesetting\tsymlink.test",
-    "Z:/home/rafael/src/sqlite/test/symlink2.test\tsymlink2.test",
-    "/home/rafael/src/sqlite/test/symlink2.test\tsymlink2.test",
-    "Z:\\home\\rafael\\src\\sqlite\\test\\symlink2.test\tsymlink2.test",
+    "Z:/home/dev/src/sqlite/test/symlink2.test\tsymlink2.test",
+    "/home/dev/src/sqlite/test/symlink2.test\tsymlink2.test",
+    "Z:\\home\\dev\\src\\sqlite\\test\\symlink2.test\tsymlink2.test",
     "symlink2.test\tsymlink2.test"]
 _MIRROR_FILES_AFTER_MEASURED = ["swarmvtabfault.test", "symlink.test", "symlink2.test", "wal2.test",
                                 "walsetlk.test", "zipfile.test"]
@@ -631,7 +631,7 @@ _MIRROR_PARSE_MEASURED = [
 # carries its literal exactly ONCE (the constant above).
 _SENTINEL_EXPECTED = "<SILENT: the fixture produced no diagnostic," + \
     " no test result and no test name>"
-_MIRROR_ABORT_EXPECTED = ["B Z:/home/rafael/src/sqlite/test/symlink2.test", "T", "N 0",
+_MIRROR_ABORT_EXPECTED = ["B Z:/home/dev/src/sqlite/test/symlink2.test", "T", "N 0",
                           "FILE symlink2.test"]
 _MIRROR_ZERO_EXPECTED = ["1 boom: cannot open libtcl", "2 " + _SENTINEL_EXPECTED, "3", "4", "5",
                          "6 boom"]

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/constant_form.hpp"   // ConstantForms (StaticInitializerRule)
 #include "core/types/variant_when.hpp"   // WhenSpec — a builtin signature arm's `when`
 #include "core/types/data_model.hpp"
 #include "core/types/entry_shape.hpp"     // EntryFunctionShape (program-entry vocabulary)
@@ -2345,6 +2346,36 @@ struct DSS_EXPORT EnumerationCompatibleTypes {
     }
 };
 
+// ── P68 round 13 (lane `cs`): the static-initializer rule (`semantics.staticInitializers`) ──
+//
+// C 6.7.9p4 (C23 6.7.11p5): every expression in an initializer for an object of STATIC or
+// THREAD storage duration shall be a constant expression or a string literal. The block's
+// PRESENCE is that constraint — the semantic tier checks such an initializer and refuses
+// what is PROVABLY not a constant (S_StaticInitializerNotConstant). `otherConstantForms`
+// names the forms beyond C 6.6's own list the language admits (6.6p10 — the closed
+// `ConstantForm` vocabulary, `constant_form.hpp`); the constant evaluator the static-data
+// producer asks reads the SAME set (compile_pipeline threads it), so the check and the fold
+// cannot disagree about a form. UNDECLARED ⇒ unchecked, and the producer folds the
+// standard's forms only (a language with dynamic initialization, or no static storage).
+struct DSS_EXPORT StaticInitializerRule {
+    ConstantForms otherConstantForms{};
+};
+
+// What the static-data producer is told: nullopt when the language declares no rule (its
+// static objects may be initialized at run time), else the constraint WITH its forms — every
+// static initializer must fold, under C 6.6's forms and the named `otherConstantForms`. The
+// ONE read of the block, and it reaches `MirLoweringConfig` only through
+// `languageMirLoweringConfig` (hir_to_mir.hpp), the one assembly of the language's MIR
+// policy that the pipeline and every schema-built test fixture start from — so an
+// undeclared block means one thing everywhere. (P68 round 13, fold F7: this sentence
+// claimed that of every fixture while two schema-built ones assembled the config by hand
+// without it.)
+[[nodiscard]] inline std::optional<ConstantForms>
+otherConstantFormsOf(std::optional<StaticInitializerRule> const& rule) noexcept {
+    if (!rule.has_value()) return std::nullopt;
+    return rule->otherConstantForms;
+}
+
 // ── FC3 c1: integer-literal typing ladder (`semantics.integerLiteralTyping`) ──
 //
 // C 6.4.4.1: an integer constant's type is the FIRST of an ordered
@@ -2370,6 +2401,39 @@ struct DSS_EXPORT EnumerationCompatibleTypes {
 // A magnitude exceeding the LAST candidate's range fails loud
 // (S_IntegerLiteralTooLarge). Languages WITHOUT this block keep the
 // `literalTypes` token-kind map exactly (toy / tsql — pinned).
+//
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): the THIRD rule shape ──
+// A FIXED-TYPE rule (`type` + `outOfRange`): the literal's type is ONE declared
+// type whatever its magnitude — MSVC's sized suffixes, where `i8` IS `char` and
+// `ui64` IS `unsigned long long` — and `outOfRange` names what a magnitude that
+// type cannot represent does. It is a verb because the three shapes disagree
+// exactly there: the ladder climbs to the next candidate, the bit-precise rule
+// widens N, and a fixed type has nowhere to go.
+enum class IntegerLiteralOutOfRange : std::uint8_t {
+    // Reduce the magnitude modulo 2^width and read it at the type's signedness.
+    // ✔MEASURED 2026-09-25, MSVC 19.51.36260 (`dssharness run probe-reference-cc
+    // --legs windows-x86_64-release`, run 20260925-092743-c2711a1a): `300i8` is
+    // `char` 44, `0xFFi8` is -1, `256ui8` is 0, `4294967296i32` is 0 and
+    // `0xFFFFFFFFFFFFFFFFi64` is -1, with no diagnostic at /W4; a magnitude past
+    // 2^64 - 1 is refused ('constant too big') before any reduction.
+    Wrap = 1,
+};
+
+// ── THE SPELLINGS HAVE ONE OWNER — the loader's parse and refusal render from it ──
+inline constexpr EnumNameTable<IntegerLiteralOutOfRange, 1> kIntegerLiteralOutOfRangeTable{{{
+    { IntegerLiteralOutOfRange::Wrap, "wrap" },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kIntegerLiteralOutOfRangeTable);
+
+[[nodiscard]] constexpr std::string_view
+integerLiteralOutOfRangeName(IntegerLiteralOutOfRange v) noexcept {
+    return kIntegerLiteralOutOfRangeTable.name(v);
+}
+[[nodiscard]] constexpr std::optional<IntegerLiteralOutOfRange>
+integerLiteralOutOfRangeFromName(std::string_view s) noexcept {
+    return kIntegerLiteralOutOfRangeTable.fromName(s);
+}
+
 struct DSS_EXPORT IntegerLiteralTypingRule {
     std::vector<std::string>      suffixes;   // exact spellings; empty = unsuffixed
     std::vector<DataModelTypeRef> decimal;
@@ -2385,6 +2449,16 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     // bit-precise rule never mints a `_BitInt` from a literal.
     bool                          bitPrecise       = false;
     bool                          bitPreciseSigned = false;
+    // P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): a FIXED-TYPE rule.
+    // Present ⇒ `decimal`/`nondecimal` are EMPTY and `bitPrecise` is false (the
+    // loader refuses a row that mixes shapes): the literal's type is this one
+    // whatever its magnitude, and `outOfRange` says what a magnitude past its
+    // range does. The loader admits only a type whose core is an integer kind of
+    // at most 64 bits, or plain `char`, and the SAME core under every data model:
+    // the reduction is modulo 2^width, and phase 4 performs it with no data model
+    // in scope. Absent ⇒ one of the other two shapes.
+    std::optional<DataModelTypeRef> fixedType;
+    IntegerLiteralOutOfRange        outOfRange = IntegerLiteralOutOfRange::Wrap;
 };
 
 // ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
@@ -3212,6 +3286,10 @@ struct DSS_EXPORT SemanticConfig {
     // COMPATIBLE with is chosen from (C23 6.7.3.3p13) — see
     // `EnumerationCompatibleTypes`.
     EnumerationCompatibleTypes enumerationCompatibleTypes;
+    // P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4's constraint and
+    // the language's 6.6p10 constant forms — see `StaticInitializerRule`. nullopt ⇒ the
+    // constraint is not checked.
+    std::optional<StaticInitializerRule> staticInitializers;
 
     // ── P31: the three GNU compile-time OPERATORS ────────────────────────────
     // All three are OPERATORS, not builtin FUNCTIONS, and the distinction is

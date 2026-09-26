@@ -269,6 +269,21 @@ public:
     // atomic → the FC17.9(d) 1b atomic-access lowering).
     [[nodiscard]] bool isVolatileQualified(TypeId id) const;
     [[nodiscard]] bool isAtomicQualified(TypeId id) const;
+    // Is an OBJECT of type `id` a volatile object — `id`, looked through its ARRAY spine,
+    // volatile-qualified at some level? C 6.7.3p10 gives an array type's qualifiers to its
+    // ELEMENT type (C23 to both), and a declarator's qualifier is interned there, so
+    // `isVolatileQualified` alone answers "no" for `const volatile int a[2]`, every element of
+    // which is a volatile object. A pointer is NOT looked through (its pointee's qualifiers
+    // are not the object's), and neither is a structure or union: a volatile MEMBER does not
+    // make the object that holds it volatile. That is the line the references draw for a
+    // static initializer's read of a const object (P68 round 13, fold F7, MEASURED through
+    // `dssharness run probe-reference-cc`): gcc 13.3.0 and mingw-w64 13.2.0 fold `cs.v` of
+    // `static const struct { volatile int v; } cs`, and every reference — clang 18.1.3 and
+    // MSVC 19.51 too — refuses `cva[1]` of `static const volatile int cva[2]`, a 2-D one,
+    // an element of an array of const volatile structures, and a typedef'd volatile element.
+    // The ONE statement of what a volatile object is for that read: the semantic tier's
+    // static-initializer check and the static-data producer's fold both ask it.
+    [[nodiscard]] bool isVolatileObjectType(TypeId id) const;
     // array: operands=[element], scalars=[length]. slice: operands=[element].
     TypeId array(TypeId element, std::int64_t length);
     TypeId slice(TypeId element);

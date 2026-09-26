@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/aggregate_layout.hpp"
+#include "core/types/constant_form.hpp"   // ConstantForms (globalsConstantForms)
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
@@ -66,6 +67,16 @@ struct DSS_EXPORT HirToMirResult {
 // `false`) until per-Global routing lands in plan 20.
 struct DSS_EXPORT MirLoweringConfig {
     bool globalsAllowFloat = true;
+    // P68 round 13 (lane `cs`, the static-initializer item): the constant forms beyond
+    // C 6.6's own list the source language admits in a static initializer, threaded from
+    // `semantics.staticInitializers` exactly as the two `pointerAliasing` knobs below are —
+    // the SAME list the semantic tier's static-initializer check reads, so the constant the
+    // analyzer admits is the constant this tier folds. PRESENT ⇒ the language's static
+    // initializers MUST fold (C 6.7.9p4): one this tier cannot fold is refused here,
+    // positioned (H_StaticInitializerNotFolded), and never becomes a runtime initializer.
+    // ABSENT (the default) ⇒ a language whose static objects may be initialized at run
+    // time: the standard's forms fold, and the rest take the module initializer.
+    std::optional<ConstantForms> globalsConstantForms{};
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: threaded from the
     // source-language schema's
     // `semantics.pointerAliasing.strictAliasingOnDistinctTypes`. When
@@ -203,6 +214,21 @@ struct DSS_EXPORT MirLoweringConfig {
     // consults names).
     std::uint32_t syntheticSymbolFloor = 0;
 };
+
+class GrammarSchema;
+
+// The SOURCE LANGUAGE's part of `MirLoweringConfig`, read from its schema: the globals
+// const-eval `allowFloat` knob, the static-initializer constant forms (and so C 6.7.9p4's
+// constraint), the two `pointerAliasing` knobs and the `nonObjectTypeSizes`. The ONE
+// assembly of that part — `compile_pipeline.cpp` and every test fixture that lowers a
+// schema-built unit start from it, then add the target's and the calling convention's
+// fields — so a field a language declares cannot reach the product and miss a fixture.
+// P68 round 13 (fold F7): `globalsConstantForms` had been threaded into the pipeline and
+// the fixtures by hand, and missed two that lower C from a schema — the shared LIR fixture
+// (28 test binaries) and `test_builtin_unreachable_lowering` — whose C then lowered with the
+// constraint OFF and no const object's value folding: the fourth time a fixture read a
+// default the product never does (TF-C78, TF-C81, TF-C92).
+[[nodiscard]] DSS_EXPORT MirLoweringConfig languageMirLoweringConfig(GrammarSchema const& language);
 
 // Lower the frozen `hir` module to MIR. `literals` is the HirLiteralPool
 // that owns the decoded values for HIR `Literal` nodes (ML2 copies the

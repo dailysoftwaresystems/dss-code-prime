@@ -129,7 +129,11 @@ struct Lowered {
                                    // (the default) ⇒ no format in play and the
                                    // TARGET's value stands, byte-identically
                                    // what every pre-existing fixture here got.
-                                   std::string formatName = {}) {
+                                   std::string formatName = {},
+                                   // P68 round 13 (lane `cs`): FALSE lowers as a language whose
+                                   // static objects may be initialized at RUN time — the one way a
+                                   // C fixture still reaches the module initializer's lowering.
+                                   bool staticInitializersMustFold = true) {
     auto const schema = dss::test_support::shippedSchemaOrThrow("c");
     UnitBuilder builder{schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
@@ -234,12 +238,11 @@ struct Lowered {
     // Plan 12.5 §0.2 D3 closed: schema declares MIR-globals const-eval
     // policy; the test driver reads it off the loaded schema and passes
     // the resolved knob through. No per-language C++ — the policy lives
-    // in `c.lang.json`.
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = schema->hirLowering().globalsConstEval.allowFloat;
-    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: thread the language's declared
-    // OPERAND sizes for `void` / a function type exactly as compile_pipeline.cpp
-    // does, so `sizeof(void)`, `_Alignof(void)` and `void *` element stride lower
+    // in `c.lang.json`. The LANGUAGE's whole part of the policy comes from the ONE
+    // assembly `compile_pipeline.cpp` uses (`languageMirLoweringConfig`, P68 round 13
+    // fold F7): the const-eval knob, the static-initializer constant forms, the aliasing
+    // knobs, and D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED's `void` / function-type
+    // OPERAND sizes, so `sizeof(void)`, `_Alignof(void)` and `void *` element stride lower
     // here the way they lower in a real build.
     //   ★ READ FROM THE SHIPPED SCHEMA, NEVER HARD-CODED — and that is the whole
     // difference between a pin and a decoration. A fixture that wrote `{1, 1}`
@@ -248,7 +251,8 @@ struct Lowered {
     // cost this project 11 red tests to learn). Reading the real declaration means
     // DELETING the key turns these pins RED, which is the direction that proves
     // something.
-    mirCfg.nonObjectTypeSizes = schema->semantics().nonObjectTypeSizes;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
+    if (!staticInitializersMustFold) mirCfg.globalsConstantForms = std::nullopt;
     // FC7 (D-FC7-MEMBER-ACCESS): thread the target's aggregate-layout params
     // (struct/union field offsets + sizes) into the MIR config exactly as
     // compile_pipeline.cpp does, so member-access + aggregate-local lowering
@@ -900,14 +904,22 @@ TEST(MirLoweringC, ComplexRelationalIsRefusedNamingTheRealOperandRule) {
 // copy. The two are now independently mutable, which is what lets each one's
 // red-on-disable mean something: revert the copy arm and THIS reds; revert the
 // classifier and the static-image pins red.
+// ⚠ P68 round 13 (lane `cs`, the static-initializer item): `g = z0` reads a NON-const
+// object, which C 6.7.9p4 forbids and every reference refuses — and since this round the
+// analyzer says so (S_StaticInitializerNotConstant, exactly once), and the MIR tier, told
+// C's constraint, refuses to make it a runtime initializer at all. What this pins is how the
+// MIR tier lowers a runtime initializer of a by-value-class object FOR A LANGUAGE THAT
+// PERMITS ONE, so it lowers past the semantic error with the constraint OFF.
 TEST(MirLoweringC, ComplexGlobalRuntimeInitCopiesTheObjectNotAPointer) {
     auto L = lowerC(
         "double _Complex z0;\n"
         "double _Complex g = z0;\n"
-        "int main(void) { return 0; }\n");
-    ASSERT_FALSE(L.model.hasErrors())
-        << (L.model.diagnostics().all().empty()
-                ? "" : L.model.diagnostics().all()[0].actual);
+        "int main(void) { return 0; }\n",
+        "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+        /*staticInitializersMustFold=*/false);
+    ASSERT_EQ(dss::test_support::countCode(L.model.diagnostics(),
+                                           DiagnosticCode::S_StaticInitializerNotConstant), 1u)
+        << "C refuses the program; the MIR mechanism below is pinned regardless";
     ASSERT_TRUE(L.hir->ok)
         << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
     ASSERT_TRUE(L.mir.ok)
@@ -1096,8 +1108,7 @@ namespace {
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = schema->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -1185,8 +1196,7 @@ namespace {
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = schema->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -1990,14 +2000,23 @@ TEST(MirLoweringC, GlobalWithOverflowingInitFoldsWithModularWrap) {
     EXPECT_EQ(std::get<std::int64_t>(m.literalValue(m.globalInitLiteralIndex(g)).value), -1);
 }
 
-// CE2 wire-up: `int a = 1; int b = a;` folds end-to-end. `b`'s init is a
+// CE2 wire-up: `const int a = 1; int b = a;` folds end-to-end. `b`'s init is a
 // `Ref(a)`; the const-eval engine's resolver callback looks up `a`'s
 // init in the globals pre-pass table and folds it to `1`, so `b` lands
 // as a constant-init global too — no `__module_init__` synthesized.
+// P68 round 13 (lane `cs`, the static-initializer item): this used to pin `int a = 1;` —
+// a NON-const `a`, which every reference refuses (C 6.7.9p4; gcc "initializer element is
+// not constant", MSVC C2099) and the analyzer now refuses too
+// ([[D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED]]). The wire-up is
+// exercised by the form C 6.6p10 lets the language accept and c.lang.json names
+// (`constObjectRead`: gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 build it even at
+// -pedantic-errors), and the analysis must be clean.
 TEST(MirLoweringC, GlobalCrossReferenceFoldsViaConstEvalResolver) {
     auto L = lowerC(
-        "int a = 1;\n"
+        "const int a = 1;\n"
         "int b = a;\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
@@ -2005,8 +2024,12 @@ TEST(MirLoweringC, GlobalCrossReferenceFoldsViaConstEvalResolver) {
     // Both globals have constant initializers. No init function synthesized.
     MirGlobalId const ga = m.globalAt(0);
     MirGlobalId const gb = m.globalAt(1);
-    EXPECT_NE(m.globalInitLiteralIndex(ga), UINT32_MAX);
-    EXPECT_NE(m.globalInitLiteralIndex(gb), UINT32_MAX);
+    // ASSERT, not EXPECT: the literal reads below index the pool by these, and a missing one
+    // aborted the whole binary (`MirLiteralPool fatal: index 4294967295`, exit 0xc0000409) —
+    // measured when fold F7's red-on-disable dropped the static-initializer forms, where it
+    // hid every later test of the binary behind the crash.
+    ASSERT_NE(m.globalInitLiteralIndex(ga), UINT32_MAX);
+    ASSERT_NE(m.globalInitLiteralIndex(gb), UINT32_MAX);
     EXPECT_FALSE(m.globalInitFunc(ga).valid());
     EXPECT_FALSE(m.globalInitFunc(gb).valid());
     EXPECT_EQ(m.moduleFuncCount(), 0u);
@@ -2081,18 +2104,20 @@ TEST(MirLoweringC, GlobalWithFloatArithmeticInitializerFoldsThroughCastToInt) {
     EXPECT_EQ(std::get<std::int64_t>(lit.value), 4);
 }
 
-// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — tryClassifyIntToPtrConst ──
+// ── TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE) — the integer→pointer constant ──
 // An explicit integer-constant→pointer cast in a STATIC/global initializer
 // (`(void*)0x5`) folds to a PLAIN uint64 pointer leaf (core==Ptr) — an ABSOLUTE
-// address, no symbol, no relocation. const-eval refuses the cast-to-pointer, so
-// without the classifier the initializer falls to `runtimeInit`: a SCALAR becomes
-// an init-func store (UINT32_MAX literal + valid initFunc), and an AGGREGATE trips
-// the ConstructAggregate fail-loud (mir.ok == false). Each pin below is therefore
-// RED-ON-DISABLE on the exact wiring it names.
+// address, no symbol, no relocation. Since P68 round 13 (lane `cs`) it is the
+// constant evaluator's integer→pointer arm (a NULL-base `HirAddressValue`, which
+// `toMirLiteral` writes as its bytes) that folds it — the `tryClassifyIntToPtrConst`
+// shape classifier these pins were written against is deleted. Without the arm the
+// initializer falls to `runtimeInit`: a SCALAR becomes an init-func store (UINT32_MAX
+// literal + valid initFunc), and an AGGREGATE trips the ConstructAggregate fail-loud
+// (mir.ok == false).
 
 // pin (i): a TOP-LEVEL scalar int→ptr cast folds to a uint64 pointer leaf == 5,
-// core==Ptr, with NO init function. RED-ON-DISABLE: the classifyGlobals scalar-
-// cascade wiring — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
+// core==Ptr, with NO init function. RED-ON-DISABLE: the evaluator's integer→pointer
+// arm — `p` would fall to runtimeInit (UINT32_MAX literal + initFunc).
 TEST(MirLoweringC, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
     auto L = lowerC("static void* p = (void*)0x5;\n");
     ASSERT_TRUE(L.mir.ok)
@@ -2113,9 +2138,9 @@ TEST(MirLoweringC, StaticIntToPtrScalarFoldsToAbsolutePointerLeaf) {
 
 // pin (ii): an ARRAY of int→ptr — `static void* a[] = {(void*)1,(void*)2};` —
 // lowers to an aggregate const-init whose two fields are plain uint64 pointer
-// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the
-// member-loop wiring — the array aggregate would bail to runtimeInit → the
-// ConstructAggregate fail-loud (mir.ok == false).
+// leaves (1, 2), NEITHER a symbol-address (reloc) leaf. RED-ON-DISABLE: the same
+// arm, reached through the evaluator's aggregate fold — the array aggregate would
+// bail to runtimeInit → the ConstructAggregate fail-loud (mir.ok == false).
 TEST(MirLoweringC, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
     auto L = lowerC("static void* a[] = { (void*)1, (void*)2 };\n");
     ASSERT_TRUE(L.mir.ok)
@@ -2140,10 +2165,9 @@ TEST(MirLoweringC, StaticIntToPtrArrayFoldsToTwoRawPointerLeaves) {
     EXPECT_FALSE(std::holds_alternative<MirSymbolAddrValue>(agg.fields[1].value));
 }
 
-// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf.
-// tryClassifyNullPointerConst claims it FIRST (it runs before the int→ptr arm at
-// both sites) and the int→ptr arm would produce the byte-identical leaf anyway, so
-// the standard null-pointer constant is preserved — order intact.
+// pin (iii): `static void* z = (void*)0;` still folds to a uint64 0 pointer leaf —
+// the null pointer constant is the integer→pointer arm's value 0 (the separate
+// null-pointer classifier it used to take is deleted with the others).
 TEST(MirLoweringC, StaticNullPointerCastStillFoldsToZeroLeaf) {
     auto L = lowerC("static void* z = (void*)0;\n");
     ASSERT_TRUE(L.mir.ok)
@@ -2161,9 +2185,9 @@ TEST(MirLoweringC, StaticNullPointerCastStillFoldsToZeroLeaf) {
 
 // pin (iv): the MIX — `static struct Two X = {"a",(void*)0x5};` — `.a` stays a
 // SYMBOL-ADDRESS (reloc) leaf (the string's link-time rodata address) AND `.b` is
-// a plain uint64 pointer leaf == 5. Guards against the int→ptr arm cannibalizing
-// the symbol-address arm (which runs FIRST in the member loop). RED-ON-DISABLE:
-// the member-loop wiring — `.b` would bail the aggregate to runtimeInit.
+// a plain uint64 pointer leaf == 5. Guards against the integer→pointer arm turning
+// a symbol address into an integer (one fold now answers both). RED-ON-DISABLE: the
+// integer→pointer arm — `.b` would bail the aggregate to runtimeInit.
 TEST(MirLoweringC, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
     auto L = lowerC(
         "struct Two { char* a; void* b; };\n"
@@ -2194,10 +2218,10 @@ TEST(MirLoweringC, StaticStructSymbolPlusIntToPtrMixKeepsRelocAndRawLeaf) {
 }
 
 // pin (v) NEGATIVE: a pure SYMBOL-ADDRESS global — `char* s = "x";` — still routes
-// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer.
-// tryClassifyAsSymbolAddr runs FIRST in the scalar cascade, and the int→ptr arm
-// would nullopt on a non-Cast operand anyway. RED if the int→ptr arm ever swallowed
-// a symbol address (an integer leaf would appear where a reloc belongs).
+// to the symbol-address (reloc) leaf, NEVER mis-folded to an absolute integer: a
+// string literal's address is its interned rodata object (the evaluator's
+// `resolveStringLiteralSymbol`), and only a NULL base is written as bytes. RED if an
+// address were ever written as its offset (an integer leaf where a reloc belongs).
 TEST(MirLoweringC, StaticStringPointerStaysSymbolAddressNotInteger) {
     auto L = lowerC("char* s = \"x\";\n");
     ASSERT_TRUE(L.mir.ok)
@@ -4279,8 +4303,9 @@ TEST(MirLoweringCThreadLocal, ThreadLocalLinkageAndStaticComposition) {
 // fail loud S_ThreadLocalAddressNotConstant AT THE LOWERING TIER (the
 // semantic model is clean; the reject lives where MirSymbolAddrValue would
 // otherwise be minted). Scalar, aggregate-member, and block-scope-static
-// forms — the three mint paths. RED-ON-DISABLE: drop the
-// tryClassifyAsSymbolAddr screen and all three lower green with an abs64
+// forms. RED-ON-DISABLE: drop the `rejectTlsAddressesInFoldedLiteral` screen —
+// since P68 round 13 the screen of the ONE fold every address leaf comes from —
+// and all three lower green with an abs64
 // whose resolved value would be the link-time tpoff bit-cast into a data
 // slot (the silent garbage pointer this diagnostic exists to prevent).
 TEST(MirLoweringCThreadLocal, TlsAddressInStaticInitializerFailsLoud) {
@@ -5609,8 +5634,7 @@ TEST(MirLoweringC, SyntheticGlobalSymbolsRespectSemanticFloor) {
     ASSERT_TRUE(hir->ok);
     std::uint32_t const floor =
         static_cast<std::uint32_t>(model.symbols().size());
-    MirLoweringConfig cfg;
-    cfg.globalsAllowFloat    = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     cfg.syntheticSymbolFloor = floor;   // what compile_pipeline passes
     DiagnosticReporter mirRep;
     auto mir = lowerToMir(hir->hir, hir->literalPool,
@@ -6599,7 +6623,7 @@ TEST(MirLoweringC, FuncNameReadsShareOneRodataGlobal) {
 
 // FC17.5 F2, the code-audit MEDIUM-1 closure: the identity must hold ACROSS
 // producer positions — a `static const char *p = __func__;` INITIALIZER
-// (classified by tryClassifyAsSymbolAddr's Cast-of-string-Literal arm) and a
+// (folded by the constant evaluator through `resolveStringLiteralSymbol`) and a
 // BODY read of `__func__` (materializeStringLiteralGlobal) must reference the
 // SAME rodata global, or `p == __func__` is silently false (wrong value, no
 // diagnostic). Both producers now route through the ONE shared
@@ -15137,8 +15161,7 @@ constexpr char const* kSetjmpRoundTripSrc =
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = schema->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);   // the pipeline's assembly
     // A target that will not load is a STOP, never a fixture that quietly
     // measures a default machine model.
     {
@@ -17371,4 +17394,319 @@ TEST(MirLoweringC, AGlobalDeclaredThroughAConstTypedefIsReadOnlyData) {
         << "a typedef of a const typedef hands the const on (`typedef CI CI2;`)";
     EXPECT_FALSE(*readOnly("plain"))
         << "the CONTROL: a plain `int` global must stay mutable";
+}
+
+// ── P68 round 13 (lane `cs`, the static-initializer item) ─────────────────────────────────
+// The address constants C 6.6p7/p9 builds by INTERLEAVING a value and an lvalue — `&*&y`,
+// `&(&s)->m`, `&(a + 1)[1]`, `&a[1] + 1`, `1 + a`, `"x*" + 1`, `1 ? &y : &z` — and an address in a
+// pointer-sized integer slot: each classifies as STATIC DATA, one symbol-address leaf with the
+// address's own addend, never a runtime initializer (which the static-data producer refuses).
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/sti2`): gcc 13.3.0, clang 18.1.3, mingw-w64
+// 13.2.0 and MSVC 19.51 build and run every one; DSS refused each as a runtime initializer.
+namespace {
+struct SymAddrLeaf { std::uint32_t symbol; std::int64_t addend; };
+[[nodiscard]] std::vector<SymAddrLeaf> symbolAddressGlobals(Mir const& m) {
+    std::vector<SymAddrLeaf> out;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        std::uint32_t const li = m.globalInitLiteralIndex(m.globalAt(i));
+        if (li == UINT32_MAX) continue;
+        auto const& lit = m.literalValue(li);
+        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&lit.value))
+            out.push_back({sa->symbol, sa->addend});
+    }
+    return out;
+}
+[[nodiscard]] std::uint32_t symbolNamed(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 0; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == name) return static_cast<std::uint32_t>(i);
+    return UINT32_MAX;
+}
+} // namespace
+
+TEST(MirLoweringC, AnInterleavedAddressConstantIsStaticDataWithItsOwnAddend) {
+    struct Row { char const* src; char const* target; std::int64_t addend; };
+    for (Row const r : {
+             Row{"int a[3];\nint *p = &a[1] + 1;\n", "a", 8},
+             Row{"int a[3];\nint *p = 1 + a;\n", "a", 4},
+             Row{"int a[3];\nint *p = &a[2] - 1;\n", "a", 4},
+             Row{"int a[3];\nint *p = (int *)&a + 1;\n", "a", 4},
+             Row{"int a[3];\nint *p = &(a + 1)[1];\n", "a", 8},
+             Row{"struct S { int k; int m; } s;\nint *p = &(&s)->m;\n", "s", 4},
+             Row{"int y;\nint *p = &*&y;\n", "y", 0},
+             Row{"int y, z;\nint *p = 1 ? &y : &z;\n", "y", 0},
+             Row{"int y, z;\nint *p = 0 ? &y : &z;\n", "z", 0},
+             Row{"int y;\nint *p = (0, &y);\n", "y", 0},
+             // An array lvalue that is not a name decays to its first element's address.
+             Row{"int m[2][3];\nint *p = m[1];\n", "m", 12},
+             Row{"struct T { int k; int arr[2]; } t;\nint *p = t.arr;\n", "t", 4},
+             Row{"int m[2][3];\nint *p = m[1] + 2;\n", "m", 20},
+             Row{"int m[2][3];\nint *p = *(m + 1);\n", "m", 12},
+             Row{"int m[2][3];\nint (*r)[3] = m + 1;\n", "m", 12},
+             // An address in a pointer-sized INTEGER slot: the same leaf, the same relocation.
+             Row{"int a[2];\nunsigned long long u = (unsigned long long)&a[1];\n", "a", 4},
+             Row{"int a[2];\nlong l = (long)&a;\n", "a", 0},
+         }) {
+        auto L = lowerC(r.src);
+        ASSERT_TRUE(L.mir.ok) << r.src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const leaves = symbolAddressGlobals(L.mir.mir);
+        ASSERT_EQ(leaves.size(), 1u) << r.src << ": exactly the one address-initialized global";
+        EXPECT_EQ(leaves[0].symbol, symbolNamed(L.model, r.target)) << r.src;
+        EXPECT_EQ(leaves[0].addend, r.addend) << r.src;
+    }
+}
+
+// A string literal's address plus a constant: the leaf targets the literal's rodata global.
+TEST(MirLoweringC, AStringLiteralPlusAConstantIsItsRodataAddressPlusTheConstant) {
+    auto L = lowerC("char const *s = \"x*\" + 1;\n");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const leaves = symbolAddressGlobals(L.mir.mir);
+    ASSERT_EQ(leaves.size(), 1u);
+    EXPECT_EQ(leaves[0].addend, 1);
+    EXPECT_NE(leaves[0].symbol, symbolNamed(L.model, "s")) << "the target is the literal, not s";
+}
+
+// An address in a pointer-sized integer MEMBER, and a comma initializer, are static data too.
+TEST(MirLoweringC, AnIntegerMemberAddressAndACommaInitializerAreStaticData) {
+    {
+        auto L = lowerC("int a[2];\nstruct S { unsigned long long u; int k; } s = "
+                        "{ (unsigned long long)&a, 42 };\n");
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        MirAggregateValue const* agg = nullptr;
+        for (std::uint32_t i = 0; i < L.mir.mir.moduleGlobalCount(); ++i) {
+            std::uint32_t const li = L.mir.mir.globalInitLiteralIndex(L.mir.mir.globalAt(i));
+            if (li == UINT32_MAX) continue;
+            if (auto const* a = std::get_if<MirAggregateValue>(&L.mir.mir.literalValue(li).value))
+                agg = a;
+        }
+        ASSERT_NE(agg, nullptr) << "s must be const-init static data, not a runtime initializer";
+        ASSERT_EQ(agg->fields.size(), 2u);
+        auto const* sa = std::get_if<MirSymbolAddrValue>(&agg->fields[0].value);
+        ASSERT_NE(sa, nullptr) << ".u carries the relocation leaf";
+        EXPECT_EQ(sa->symbol, symbolNamed(L.model, "a"));
+    }
+    {
+        auto L = lowerC("int x = (1, 42);\n");
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        ASSERT_EQ(L.mir.mir.moduleGlobalCount(), 1u);
+        MirGlobalId const g = L.mir.mir.globalAt(0);
+        EXPECT_FALSE(L.mir.mir.globalInitFunc(g).valid()) << "not a runtime initializer";
+        std::uint32_t const li = L.mir.mir.globalInitLiteralIndex(g);
+        ASSERT_NE(li, UINT32_MAX);
+        auto const& lit = L.mir.mir.literalValue(li);
+        ASSERT_TRUE(std::holds_alternative<std::int64_t>(lit.value));
+        EXPECT_EQ(std::get<std::int64_t>(lit.value), 42);
+    }
+}
+
+// ── P68 round 13 (lane `cs`, the static-initializer item): the ONE fold ───────────────────
+// The static-data producer asks the constant evaluator for EVERY initializer now — its five
+// shape classifiers are gone — so the address algebra's VALUES land as static data. Each row
+// is a form a reference builds (lane `cs`'s `.temp/probe/sti4` … `sti9`), measured refused by
+// DSS as a runtime initializer before this item.
+namespace {
+[[nodiscard]] MirLiteralValue const* initOfGlobalNamed(Lowered const& L, std::string_view name) {
+    std::uint32_t const sym = symbolNamed(L.model, name);
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = m.globalAt(i);
+        if (m.globalSymbol(g).v != sym) continue;
+        std::uint32_t const li = m.globalInitLiteralIndex(g);
+        return li == UINT32_MAX ? nullptr : &m.literalValue(li);
+    }
+    return nullptr;
+}
+[[nodiscard]] bool hasRuntimeInitializer(Lowered const& L, std::string_view name) {
+    std::uint32_t const sym = symbolNamed(L.model, name);
+    Mir const& m = L.mir.mir;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        MirGlobalId const g = m.globalAt(i);
+        if (m.globalSymbol(g).v == sym) return m.globalInitFunc(g).valid();
+    }
+    return false;
+}
+[[nodiscard]] std::optional<std::int64_t> intOf(MirLiteralValue const& v) {
+    if (auto const* p = std::get_if<std::int64_t>(&v.value)) return *p;
+    if (auto const* p = std::get_if<std::uint64_t>(&v.value)) return static_cast<std::int64_t>(*p);
+    if (auto const* p = std::get_if<bool>(&v.value)) return *p ? 1 : 0;
+    return std::nullopt;
+}
+} // namespace
+
+// RED-ON-DISABLE: the evaluator's address-comparison / difference / truth-value /
+// integer-algebra arms, each (its row becomes a runtime initializer).
+TEST(MirLoweringC, TheAddressAlgebraFoldsToItsValue) {
+    struct Row { char const* src; char const* global; std::int64_t value; };
+    for (Row const r : {
+             Row{"int a[4];\n_Bool t = &a;\n", "t", 1},
+             Row{"int a[4];\nint t = !&a[0];\n", "t", 0},
+             Row{"int a[4];\nlong t = &a[3] - &a[1];\n", "t", 2},
+             Row{"int a[4];\nint t = &a[1] < &a[2];\n", "t", 1},
+             Row{"int a[4], b[2];\nint t = &a[0] == &b[0];\n", "t", 0},
+             Row{"int t = (int *)0 == 0;\n", "t", 1},
+             Row{"int a[4];\nunsigned long long t = (unsigned long long)&a * 0;\n", "t", 0},
+             Row{"int a[4];\nint t = 1 ? 42 : a[0];\n", "t", 42},
+             // A THREAD-LOCAL object's address is no address constant (6.6p9) — but a
+             // value computed FROM it that is not an address is, on every reference (gcc
+             // 13.3.0, clang 18.1.3, mingw-w64 13.2.0, both modes: lane `cs`'s
+             // `.temp/probe/sti12`), so these fold and only an ADDRESS result meets
+             // S_ThreadLocalAddressNotConstant (MirLoweringCThreadLocal pins that).
+             Row{"_Thread_local int t;\n_Bool v = &t;\n", "v", 1},
+             Row{"_Thread_local int t[2];\nlong v = &t[1] - &t[0];\n", "v", 1},
+         }) {
+        auto L = lowerC(r.src);
+        ASSERT_TRUE(L.mir.ok) << r.src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_FALSE(hasRuntimeInitializer(L, r.global)) << r.src;
+        auto const* lit = initOfGlobalNamed(L, r.global);
+        ASSERT_NE(lit, nullptr) << r.src << ": a constant initializer";
+        auto const v = intOf(*lit);
+        ASSERT_TRUE(v.has_value()) << r.src << ": an integer leaf";
+        EXPECT_EQ(*v, r.value) << r.src;
+    }
+}
+
+// The producer's resolver folds a READ only of a const, non-volatile object — the forms every
+// reference refuses (`int y = 42; int x = y;`, a `const volatile` read) used to fold here
+// silently (✔MEASURED at the fold-8 build: DSS ran 42). The semantic tier refuses them first
+// (S_StaticInitializerNotConstant); this pins that the producer cannot fold them either, from
+// any input. RED-ON-DISABLE: `classifyGlobals`' `constReadableSymbols` filter (the first two
+// fold again).
+TEST(MirLoweringC, OnlyAConstNonVolatileObjectsValueFolds) {
+    {
+        auto L = lowerC("int a = 1;\nint b = a;\n");
+        EXPECT_EQ(initOfGlobalNamed(L, "b"), nullptr) << "a non-const object's value is not folded";
+    }
+    {
+        auto L = lowerC("static const volatile int v = 42;\nint x = v;\n");
+        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << "a volatile object's value is not folded";
+    }
+    {
+        auto L = lowerC("static const int k = 42;\nint y = k;\n");
+        ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const* lit = initOfGlobalNamed(L, "y");
+        ASSERT_NE(lit, nullptr);
+        EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{42});
+    }
+}
+
+// P68 round 13, fold F7 — the resolver asks the ONE rule the semantic tier asks
+// (`TypeInterner::isVolatileObjectType`): an object is volatile when its type, looked through its
+// ARRAY spine, is. `cva[1]` of `static const volatile int cva[2]` FOLDED here and ran 42 (the
+// access-volatility attribute the resolver read answers the top level only, and the qualifier sits
+// on the element type) where every reference refuses it — the orchestrator's probe-reference-cc
+// runs 20260926-161013-cfcd4fdb, -161017-be070270 and -161024-bd368135 on gcc 13.2.0 mingw-w64,
+// gcc 13.3.0, clang 18.1.3 and MSVC 19.51. Each refused case below is refused by all four, and
+// each folded one is built by gcc and mingw-w64, which fold a const, non-volatile object's
+// volatile MEMBER (lane `cs`'s `.temp/probe/f7`). This tier decides it from any input: the
+// semantic tier's refusal of the first cases is not what keeps them from folding here.
+// RED-ON-DISABLE: read the top-level volatility again (the array, 2-D, array-of-structures and
+// typedef'd-element cases fold); refuse on a volatile member on the way down (the member cases
+// stop folding).
+TEST(MirLoweringC, AnObjectIsVolatileThroughItsArraySpineForTheResolverToo) {
+    for (char const* src : {
+             "static const volatile int cva[2] = { 1, 42 };\nint x = cva[1];\n",
+             "static const volatile int m[2][2] = { { 1, 2 }, { 3, 42 } };\nint x = m[1][1];\n",
+             "static const volatile struct { int v; } a[2] = { { 1 }, { 42 } };\nint x = a[1].v;\n",
+             "typedef volatile int VI;\nstatic const VI a[2] = { 1, 42 };\nint x = a[1];\n",
+             "static const volatile struct { int v; } s = { 42 };\nint x = s.v;\n",
+         }) {
+        auto L = lowerC(src);
+        EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << src << ": a volatile object's value folded";
+        EXPECT_FALSE(hasRuntimeInitializer(L, "x")) << src;
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u)
+            << src;
+    }
+    for (char const* src : {
+             "static const struct { volatile int v; } cs = { 42 };\nint x = cs.v;\n",
+             "static const struct { volatile int v[2]; } s = { { 1, 42 } };\nint x = s.v[1];\n",
+             "struct S { volatile int v; };\nstatic const struct S a[2] = { { 1 }, { 42 } };\n"
+             "int x = a[1].v;\n",
+             "static const struct { struct { volatile int v; } in; } s = { { 42 } };\n"
+             "int x = s.in.v;\n",
+             "static const struct { volatile int v; int w; } s = { 1, 42 };\nint x = s.w;\n",
+         }) {
+        auto L = lowerC(src);
+        ASSERT_TRUE(L.mir.ok) << src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const* lit = initOfGlobalNamed(L, "x");
+        ASSERT_NE(lit, nullptr) << src << ": a non-volatile object's volatile member folds";
+        EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{42}) << src;
+    }
+}
+
+// P68 round 13, fold F7 — an address whose BASE is null, converted to an integer narrower than a
+// pointer, is a plain integer constant, and the evaluator folds it to its value: all four
+// references build every row (lane `cs`'s `.temp/probe/f7`; clang -std=c17 -pedantic-errors
+// alone refuses the pointer arithmetic), where the semantic tier once refused each as "an address
+// no relocation can hold" (StaticInitializers.ANarrowedAddressIsProofOnlyForASymbolsAddress pins
+// that half). A SYMBOL's address in the same integer is not folded: every reference refuses it.
+// This pins the producer's half, which fold F7 did not change: `combineAddressCast`'s null-base
+// arm is the one that answers.
+TEST(MirLoweringC, ANullBasedAddressInANarrowerIntegerFoldsToItsValue) {
+    struct Row { char const* src; std::int64_t value; };
+    for (Row const r : {
+             Row{"struct T { int a; int m; };\nint x = (int)&((struct T *)0)->m;\n", 4},
+             Row{"struct T { int a; int m; };\nchar x = (char)&((struct T *)0)->m;\n", 4},
+             Row{"int x = (int)(void *)0;\n", 0},
+             Row{"short x = (short)(char *)5;\n", 5},
+             Row{"int x = (int)&((int *)0)[3];\n", 12},
+             Row{"int x = (int)((char *)0 + 12);\n", 12},
+         }) {
+        auto L = lowerC(r.src);
+        ASSERT_TRUE(L.mir.ok) << r.src << ": "
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_FALSE(hasRuntimeInitializer(L, "x")) << r.src;
+        auto const* lit = initOfGlobalNamed(L, "x");
+        ASSERT_NE(lit, nullptr) << r.src << ": a constant initializer";
+        EXPECT_EQ(intOf(*lit), std::optional<std::int64_t>{r.value}) << r.src;
+    }
+    auto L = lowerC("static int a[2];\nint x = (int)&a[1];\n");
+    EXPECT_EQ(initOfGlobalNamed(L, "x"), nullptr) << "a symbol's address in a narrower integer";
+}
+
+// A language whose static objects cannot be initialized at run time (C, whose
+// `semantics.staticInitializers` the fixture threads) gets NO runtime initializer: an
+// initializer the evaluator does not fold is refused HERE, once, positioned — the static-data
+// producer's object-format refusal ("has a runtime initializer") never meets it. With the
+// constraint off (a language that permits dynamic initialization) the same initializer takes
+// the module initializer, as it always did. RED-ON-DISABLE: `classifyGlobals`' constrained
+// arm (the first case becomes a runtime initializer, H_StaticInitializerNotFolded absent).
+TEST(MirLoweringC, AnUnfoldedStaticInitializerIsRefusedHereNotByTheImageProducer) {
+    std::string const src = "int a = 1;\nint b = a;\n";
+    {
+        auto L = lowerC(src);
+        EXPECT_FALSE(hasRuntimeInitializer(L, "b")) << "no runtime initializer under the constraint";
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 1u);
+        EXPECT_FALSE(L.mir.ok);
+    }
+    {
+        auto L = lowerC(src, "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                        /*staticInitializersMustFold=*/false);
+        EXPECT_TRUE(hasRuntimeInitializer(L, "b")) << "the runtime-initializer path, unconstrained";
+        EXPECT_EQ(dss::test_support::countCode(L.mirReporter,
+                                               DiagnosticCode::H_StaticInitializerNotFolded), 0u);
+    }
+}
+
+// The module initializer is a FUNCTION of its own: it starts with no local bindings, so an
+// operand of another function (`&l` of `main`'s `l`) is refused LOUD — never lowered against
+// `main`'s own alloca, which aborted dsscp in the rebuilder (exit 0xC0000409, ✔MEASURED at the
+// fold-7 build, lane `cs`'s `.temp/probe/sti` and `sti8`). C never reaches it any more (the
+// semantic tier refuses `&l`, and the constrained MIR tier refuses any unfolded initializer),
+// so it is pinned on the unconstrained path. RED-ON-DISABLE: drop the bindings' reset at the
+// initializer's entry (the module lowers "ok" with the foreign operand).
+TEST(MirLoweringC, TheModuleInitializerNeverReachesAnotherFunctionsLocal) {
+    auto L = lowerC("int main(void) { int l = 42; static int *p = &l; return *p; }\n",
+                    "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::None, {},
+                    /*staticInitializersMustFold=*/false);
+    EXPECT_FALSE(L.mir.ok) << "the foreign operand must be refused, not lowered";
+    bool named = false;
+    for (auto const& d : L.mirReporter.all())
+        if (d.code == DiagnosticCode::H_UnsupportedLoweringForKind
+            && d.actual.find("no storage slot") != std::string::npos)
+            named = true;
+    EXPECT_TRUE(named) << "the refusal names the unbound local";
 }

@@ -172,6 +172,12 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 EXIT_OK, EXIT_DISAGREE, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
+# The repair a refusal names: the `write` manual step of this action (check-doc-census.yml), run
+# through the harness like every other step -- never this file started by hand -- on the runner that
+# runs it on ONE leg, this machine's own tree (config.json `check-doc-census-write`): this action's own
+# runner keeps both local legs, and a `--manual-step write` through it would rewrite the WSL leg's
+# synced copy too (P68 round 13's audit, F1-A11).
+REPAIR_VERB = "dssharness run check-doc-census-write"
 
 # The tree acted on defaults to the one THIS SCRIPT LIVES IN, never the caller's
 # cwd -- the same rule `.harness-config/runner/actions/lane-worktree/` follows, and for the same reason:
@@ -186,6 +192,16 @@ def self_repo():
     Lazy because the self-test runs COPIES of the providers under synthetic roots with
     `--repo`, and a copy has no sibling owner to load.
     """
+    mod = _owning_tree_module()
+    try:
+        return mod.owning_tree(__file__)
+    except mod.Refusal as exc:
+        print("check-doc-census: %s" % exc, file=sys.stderr)
+        raise SystemExit(EXIT_COLLAPSE)
+
+
+def _owning_tree_module():
+    """`owning-tree`, loaded by path from this file's sibling action directory; missing, a collapse."""
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                         "owning-tree", "owning-tree.py")
     if not os.path.isfile(path):
@@ -195,11 +211,24 @@ def self_repo():
     spec = importlib.util.spec_from_file_location("dss_owning_tree", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    try:
-        return mod.owning_tree(__file__)
-    except mod.Refusal as exc:
-        print("check-doc-census: %s" % exc, file=sys.stderr)
-        raise SystemExit(EXIT_COLLAPSE)
+    return mod
+
+
+def remedy_runner_fact():
+    """-> (ok, detail): the runner REPAIR_VERB names is declared in this tree's config.json, runs this action's
+    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
+    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
+    too). Read from config, never assumed: a second leg added there reds the self-test."""
+    ot = _owning_tree_module()
+    cfg = ot.load_jsonc(os.path.join(self_repo(), ".harness-config", "config.json"))
+    name = REPAIR_VERB.split()[-1]
+    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
+    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
+    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
+    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
+    ok = (isinstance(runner, dict) and runner.get("action") == "check-doc-census/check-doc-census.yml"
+          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
+    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
 
 
 # Where this repository's programs live, relative to a tree root: DssHarness's actions
@@ -595,7 +624,7 @@ def run(repo, write):
             print("    %s  census:%s:%s  documented %s, actual %d"
                   % (c.doc, c.provider, c.key, c.raw, actual))
         print("  Repair them in place (the prose is untouched, only the numbers move):")
-        print("      python .harness-config/runner/actions/check-doc-census/check-doc-census.py --write")
+        print("      %s" % REPAIR_VERB)
         print("  ⚠ A figure is a DATED INVENTORY. If a SENTENCE around one has also gone "
               "false, --write will not notice -- read the claim, not only the number.")
         rc = EXIT_DISAGREE
@@ -775,6 +804,14 @@ def selftest():
         d = _doc(root)
         _write(d, _read(d).replace("**788**", "**634**", 1))
         ok &= _arm("1 FIGURE-DRIFTED", root, EXIT_DISAGREE, says="documented 634, actual 788")
+        # 1b -- the refusal names the REPAIR as the harness runs it (the `write` manual step).
+        ok &= _arm("1b REMEDY-IS-THE-HARNESS-STEP", root, EXIT_DISAGREE, says=REPAIR_VERB)
+        # 1c -- ...and the runner it names runs that step alone, on ONE leg of this machine's own tree (F1-A11).
+        _fact_ok, _fact_detail = remedy_runner_fact()
+        print("  %-34s %s" % ("1c REMEDY-RUNNER-IS-ONE-LEG", "OK" if _fact_ok else "FAIL"))
+        if not _fact_ok:
+            print("      %s" % _fact_detail[:600])
+        ok &= _fact_ok
 
         # 2 -- --write repairs it, and the repaired tree verifies clean.
         ok &= _arm("2 WRITE-REPAIRS", root, EXIT_OK, says="repaired", write=True)

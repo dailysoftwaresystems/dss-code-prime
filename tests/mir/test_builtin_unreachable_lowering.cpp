@@ -118,9 +118,9 @@ struct Lowered {
     auto hir = lowerToHir(model, hirReporter);
     Lowered out{.schema = schema, .target = target, .model = std::move(model),
                 .hir = std::move(hir), .mir = {}, .mirReporter = {}};
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat     = schema->hirLowering().globalsConstEval.allowFloat;
-    mirCfg.nonObjectTypeSizes    = schema->semantics().nonObjectTypeSizes;
+    // The language's policy through the pipeline's ONE assembly (P68 round 13 fold F7: by hand,
+    // this fixture missed `globalsConstantForms` and lowered C with 6.7.9p4's constraint off).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(*schema);
     mirCfg.aggregateLayout       = target->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = target->aggregateLayoutLoaded();
     out.mir = lowerToMir(out.hir->hir, out.hir->literalPool, out.model.lattice().interner(),

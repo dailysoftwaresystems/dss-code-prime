@@ -1,4 +1,5 @@
 #include "core/types/grammar_schema.hpp"
+#include "core/types/constant_form.hpp"
 // The registered artifact-profile TABLE under test below (name + composition
 // verb), plus the shared closed-vocabulary well-formedness guard it is checked
 // with — the SAME `isWellFormedKeyVocabulary` every config loader uses, not a
@@ -8275,4 +8276,64 @@ TEST(GrammarSchema, TheArrayParameterQualificationKeysFailLoud) {
         ASSERT_FALSE(r.has_value());
         EXPECT_TRUE(hasDiagMessage(r.error(), "must be an array of token-kind name strings"));
     }
+}
+
+// P68 round 13 (lane `cs`, the static-initializer item): `semantics.staticInitializers` —
+// C 6.7.9p4's constraint (the block's PRESENCE) and the constant forms beyond C 6.6's own
+// list the language admits (6.6p10), `otherConstantForms`, the closed `ConstantForm`
+// vocabulary. The shipped c names all seven; every malformed shape fails the load, loud —
+// a dropped name would silently turn a form a reference builds into a refusal, a misspelt
+// one would read as "not admitted"; an EMPTY list is a valid rule that admits no other form.
+// RED-ON-DISABLE: accept an unknown name, a duplicate, or a non-array (each arm's load then
+// succeeds); drop the key from `kSemanticsKeys` (every shipped load refuses the block).
+namespace {
+constexpr std::string_view kStaticInitializerFormsKey =
+    "\"otherConstantForms\": [\"constObjectRead\", \"commaOperator\", \"addressAsInteger\", "
+    "\"addressTruthValue\", \"addressComparison\", \"addressDifference\", "
+    "\"addressIntegerAlgebra\"]";
+} // namespace
+
+TEST(GrammarSchema, StaticInitializerFormsLoadAndEveryMalformedShapeFailsLoud) {
+    auto const base = GrammarSchema::loadFromText(shippedCTextForPrefixTest());
+    ASSERT_TRUE(base.has_value()) << "shipped c must load clean before mutation";
+    auto const& rule = (*base)->semantics().staticInitializers;
+    ASSERT_TRUE(rule.has_value()) << "c declares the static-initializer constraint";
+    for (ConstantForm const f :
+         {ConstantForm::ConstObjectRead, ConstantForm::CommaOperator,
+          ConstantForm::AddressAsInteger, ConstantForm::AddressTruthValue,
+          ConstantForm::AddressComparison, ConstantForm::AddressDifference,
+          ConstantForm::AddressIntegerAlgebra})
+        EXPECT_TRUE(rule->otherConstantForms.admits(f)) << constantFormName(f);
+    EXPECT_EQ(otherConstantFormsOf(rule), std::optional<ConstantForms>{rule->otherConstantForms});
+
+    struct Bad { std::string_view replacement; std::string_view message; };
+    for (Bad const b : {
+             Bad{"\"otherConstantForms\": \"commaOperator\"",
+                 "must be an array of constant-form names"},
+             Bad{"\"otherConstantForms\": [\"noSuchForm\"]", "unknown constant form 'noSuchForm'"},
+             Bad{"\"otherConstantForms\": [42]", "unknown constant form '42'"},
+             Bad{"\"otherConstantForms\": [\"commaOperator\", \"commaOperator\"]",
+                 "constant form 'commaOperator' is listed twice"},
+             Bad{"\"otherForms\": []", "otherForms"},
+         }) {
+        auto const text = shippedCWithReplaced(kStaticInitializerFormsKey, b.replacement);
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_FALSE(r.has_value()) << b.replacement;
+        EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics)) << b.replacement;
+        EXPECT_TRUE(hasDiagMessage(r.error(), b.message)) << b.replacement;
+    }
+    {
+        auto const text = shippedCWithReplaced(kStaticInitializerFormsKey,
+                                               "\"otherConstantForms\": []");
+        ASSERT_FALSE(text.empty());
+        auto const r = GrammarSchema::loadFromText(text);
+        ASSERT_TRUE(r.has_value()) << "an empty list is a rule that admits no other form";
+        auto const& empty = (*r)->semantics().staticInitializers;
+        ASSERT_TRUE(empty.has_value());
+        EXPECT_TRUE(empty->otherConstantForms.empty());
+    }
+    // An UNDECLARED block is no rule at all: the producer is told nothing (its static
+    // objects may be initialized at run time).
+    EXPECT_FALSE(otherConstantFormsOf(std::nullopt).has_value());
 }

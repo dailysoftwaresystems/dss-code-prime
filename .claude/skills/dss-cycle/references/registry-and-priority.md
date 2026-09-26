@@ -70,7 +70,7 @@ Operator, 2026-09-01: *"add columns for priority and status ... then the write e
 correctly, this way we always have clean statuses."* `Priority` is `P0`..`P5`; `Status` is a
 controlled vocabulary — `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCLOSED`. `--status` or a
 `--status-file` holds one of those cells or its bare word (`closed`, `open`, `gated`, `disclosed`);
-`DssHarness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)` included.
+`dssharness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)` included.
 
 - ★★★ **`DISCLOSED` is for debt this cycle FOUND, not debt it CREATED, and it exists to remove an
   incentive rather than to grant an excuse.** The balance gate forbids a cycle that OPENS new debt;
@@ -108,17 +108,20 @@ nothing else; `read-anchor` / `read-anchors` read it (`references/anchors-and-de
 `.harness-config/runner/actions/anchors/anchors.py` has no write verb: it is the reader
 (`read` / `list [--lint]`, each taking `--production` / `--done` and only those two — the harness
 registry retired on 2026-09-16) and the one launcher that `lane-fold` and `apply-registry-row` call
-the door through. [→ `anchor-rows` is its third caller: it applies a lane's rows directory as one batch, rehearsed first, all or nothing](lane-discipline.md) That launcher refuses, before the door, a write the gate would fail (a `Status`
-contradicting the verdict leading its `Trigger`) or the door would rewrite (in-line whitespace in a
-cell it writes), and an update names only the fields that change.
+the door through. [→ `anchor-rows` is its third caller: it applies a lane's rows directory as one batch, rehearsed first, all or nothing](lane-discipline.md) That launcher refuses, before the door, a status or band outside the vocabulary, an update naming no
+field, and a cell the door would store broken, judged as the door will store it (a line break becomes a
+space): an anchor id broken after a hyphen or wrapped inside a segment, or a path cut after its `/`. These
+checks are keyed on the id grammar config.json declares (`anchors.idPrefix`, `minimumIdSegments`). An update
+names only the fields that change. The verdict split and in-line whitespace have been the door's own checks
+since DssHarness 0.5.9.
 
 ```
-DssHarness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
+dssharness write-anchor  D-<AREA>-<NAME> --priority P1 --status open \
                                  --trigger '...' --closing '...' --cross-refs '...'   # writes; --anchor-dry-run previews
-DssHarness set-anchor    D-<AREA>-<NAME> --status closed --closing '...'           # MOVES it
-DssHarness read-anchor   D-<AREA>-<NAME>                    # the full row, field by field
-DssHarness read-anchors  --pending --band P0       # name + priority + status only
-DssHarness read-anchors  --lint                       # every row a reader cannot key on
+dssharness set-anchor    D-<AREA>-<NAME> --status closed --closing '...'           # MOVES it
+dssharness read-anchor   D-<AREA>-<NAME>                    # the full row, field by field
+dssharness read-anchors  --pending --band P0       # name + priority + status only
+dssharness read-anchors  --lint                       # every row a reader cannot key on
 ```
 
 ⚠ **Never hand-assemble a row.** The door takes the FIELDS, so a wrapped anchor id (invisible to

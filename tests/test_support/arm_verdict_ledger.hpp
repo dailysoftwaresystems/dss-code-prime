@@ -231,8 +231,8 @@ selectBoundTargetIndex(std::vector<HostBindingCandidate> const& candidates,
 // ★ IT LIVES HERE, BESIDE `specTargetArch` AND `findOnPath`, FOR THE REASON THE
 // WHOLE HEADER EXISTS — and it is here from the FIRST commit that has it rather
 // than after the usual two-copies-then-fold detour. It was written as a local
-// helper in `examples_runner.cpp`, and the pairing rule (SKILL.md §2: a
-// capability added to one harness is added to the other) was caught by review,
+// helper in `examples_runner.cpp`, and the pairing rule (the dss-code-prime skill's repository map, the
+// `integrated_tests/` row: a capability added to one harness is added to the other) was caught by review,
 // not by the author. A hint that fires in the in-process runner and stays
 // silent in the subprocess runner would mean the SAME failing arm explains
 // itself on one path and not the other — the divergence class this header was

@@ -1179,6 +1179,32 @@ def selftest() -> int:
           on_pin("0123456789", pin_fx) and on_pin(pin_fx, pin_fx) and not on_pin("4ebc78674d", pin_fx)
           and not on_pin("012345", pin_fx) and not on_pin("UNKNOWN", pin_fx) and not on_pin("master", pin_fx))
 
+    # --scratch (P68 round 13's audit, F3-A-SP-1): this program's OWN temporaries -- the vcvars script, the
+    # pre-flight probe and the timed databases, each made by `tempfile` with no directory of its own -- land in
+    # the directory `--scratch` names; one naming no directory is refused.
+    def _same(a: str, b: str) -> bool:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    held = tempfile.tempdir
+    with tempfile.TemporaryDirectory(prefix="dss-scratch-arm-") as sd:
+        try:
+            named = apply_scratch(sd)
+            fd, probe = tempfile.mkstemp(suffix=".bat", prefix="dss-vcvars-")
+            os.close(fd)
+            with tempfile.TemporaryDirectory(prefix="dss-st1-") as timed:
+                timed_in = os.path.dirname(timed)
+            probe_in = os.path.dirname(probe)
+            os.remove(probe)
+        finally:
+            tempfile.tempdir = held
+        try:
+            apply_scratch(os.path.join(sd, "no-such-dir"))
+            refused = False
+        except ValueError:
+            refused = True
+        check("--scratch puts this program's OWN temporaries (the vcvars script, the pre-flight probe, the timed "
+              "databases) in the directory it names; one naming no directory is refused",
+              _same(named, sd) and _same(probe_in, sd) and _same(timed_in, sd) and refused)
+
     env, why = msvc_env()
     print(f"  info  MSVC environment: {'resolved' if env else 'absent — ' + why}")
     if fails:
@@ -1186,6 +1212,24 @@ def selftest() -> int:
         return 1
     print("\nspeedtest1_bench selftest: all arms green")
     return 0
+
+
+def apply_scratch(path: str) -> str:
+    """Point THIS process's own temporaries -- the vcvars script (`msvc_env`), the pre-flight probe
+    (`preflight_dss`) and the timed databases (`run_arm`) -- at `path`, a directory that must exist, through
+    Python's own `tempfile.tempdir`. -> its absolute path.
+
+    ★ WHY (P68 round 13's audit, F3-A-SP-1): the benchmark driver said "nothing outside the tree is written",
+    and every default run wrote those three into the SYSTEM temporary directory. It now passes `--scratch`
+    naming a directory INSIDE its output tree, under the run lock it holds, which it empties when the run
+    ends. The compilers this program starts are NOT redirected -- their environment is left as it was, so
+    what they write for themselves still goes where their own TMP says, and the measurement's conditions do
+    not change. Without `--scratch` (this core run by hand) the system temporary directory is used."""
+    full = os.path.abspath(path)
+    if not os.path.isdir(full):
+        raise ValueError(f"--scratch names no directory: {full}")
+    tempfile.tempdir = full
+    return full
 
 
 def main() -> int:
@@ -1219,8 +1263,18 @@ def main() -> int:
                     help="the --target the MEASUREMENT will use, so the preflight "
                          "validates the same target document rather than whatever "
                          "dsscp defaults to (see preflight_dss)")
+    ap.add_argument("--scratch", metavar="DIR",
+                    help="the existing directory this program's OWN temporaries go in -- the "
+                         "vcvars script, the pre-flight probe, the timed databases (see "
+                         "apply_scratch). The benchmark driver names one inside its output tree; "
+                         "without it they go to the system temporary directory")
     args = ap.parse_args()
 
+    if args.scratch:
+        try:
+            apply_scratch(args.scratch)
+        except ValueError as exc:
+            ap.error(str(exc))
     if args.selftest:
         return selftest()
     if args.preflight_dss:

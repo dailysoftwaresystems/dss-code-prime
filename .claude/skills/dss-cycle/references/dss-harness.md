@@ -27,15 +27,15 @@ leg must run the same version as the machine driving it, a host ahead of the roo
 there is no downgrade path. So a fix we need in the tool costs a release before any leg can use it.
 ⇒ Read the published set with
 `curl -s https://api.nuget.org/v3-flatcontainer/dssharness/index.json`, never from a document: **this
-one included**. ⇒ and ask the machine what it has with `DssHarness --version`.
+one included**. ⇒ and ask the machine what it has with `dssharness --version`.
 
-★ **`DssHarness legs` INSTALLS OR UPDATES the tool on every host it measures**, bringing each leg up
+★ **`dssharness legs` INSTALLS OR UPDATES the tool on every host it measures**, bringing each leg up
 to the version the driving machine runs — ✔MEASURED repeatedly, most recently when the three remote
 hosts were carried forward by that command alone. ⇒ so `legs` is both the survey and the remedy for a
 host that is behind, and a version skew is usually one command from gone rather than a task.
 
 ⚠ **DO NOT RECORD THE INSTALLED VERSION, OR ANY OTHER CURRENT-STATE NUMBER, IN THIS FILE.** Ask the
-machine: `DssHarness --version`, and the published set from nuget's index as the block above says.
+machine: `dssharness --version`, and the published set from nuget's index as the block above says.
 ★ **The rule, because this file has been broken on it twice:** a statement about WHAT THE TOOL CAN DO
 is durable and belongs here; a statement about WHAT IS TRUE OF THIS MACHINE RIGHT NOW is stale-able
 and belongs in a command the reader runs. *"`buildOutputs` accepts a platform mapping"* never rots.
@@ -75,8 +75,8 @@ including the consumer-findings branch this repository files against, which may 
 that never ships.
 
 ★★★ **AND THE INSTALLED BINARY STILL OUTRANKS EVERY DOCUMENT FOR ONE QUESTION: what can I run now.**
-Ask it, do not look it up — `DssHarness --version`, `DssHarness help <topic>`, `DssHarness <verb>
---help`. ⚠ **WE HAVE PAID FOR GETTING THIS BACKWARDS.** The `clock-step-probe` runner action's own
+Ask it, do not look it up — `dssharness --version`, `dssharness help <topic>`,
+`dssharness <verb> --help`. ⚠ **WE HAVE PAID FOR GETTING THIS BACKWARDS.** The `clock-step-probe` runner action's own
 comment records its `.yml` being written against a capability the then-installed tool refused with
 exit **12**, *'is not a file name'*, and only a later release loaded it. Writing against a documented
 capability before it is installable costs a release before any leg can use it.
@@ -107,8 +107,8 @@ why they are safe to write down:
 ## What it does today, and what is still a script
 
 ★ **Every verb this migration was waiting for SHIPS** — `build`, `test`, `sync` and `run` among
-them. ⇒ confirm against the machine rather than against this sentence: `DssHarness --help` lists
-every verb the installed tool has, and `DssHarness --version` says which tool that is.
+them. ⇒ confirm against the machine rather than against this sentence: `dssharness --help` lists
+every verb the installed tool has, and `dssharness --version` says which tool that is.
 ⚠ **This table used to say `build` was 0.6.0, `test` 0.7.0, `sync` 0.8.0 and `run` 0.9.0.** Those
 releases never happened — all four landed in 0.5.3 instead. A document still quoting them is stale.
 
@@ -117,7 +117,7 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | `init`, `verify-git`, `legs`, `install-missing-tools`, `host-exec`, `help` | host discovery, the leg catalogue, host provisioning, remote invocation |
 | `create-worktree`, `delete-worktree`, `list-worktree` | the plain lane-worktree lifecycle. ⚠ The `lane-worktree` ACTION stays for what the verbs lack: a VERIFIED evidence copy (`--preserve-to`) and the seed manifest `lane-fold` adjudicates a fold with SUPERSEDED 2026-09-24 by `dssharness create-worktree` — the seed manifest is now reset and recorded by `lane-fold.py seed`, MANDATORY right after creation, and the action stays for the evidence copy `land` asks it for (see worktrees.md) |
 | `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | the eight anchor launchers — **DELETED**. The `anchors` action stays as the row LIBRARY other actions load; `apply-registry-row` stays for a lane's one-line VERBATIM row file, a different input than `set-anchor`'s file-per-cell SUPERSEDED 2026-09-25 by the one row format — a lane writes anchor-rows' rows directory, which the anchor-rows action applies as a batch (see lane-discipline.md) |
-| `check-anchor-citations` | resolving cited ids, over the roots in `anchors.citationRoots` (`.harness-config` since 2026-09-18, `tests` since 2026-09-19). ✔MEASURED: `--current-tree` reads tracked and untracked-not-ignored files and never an ignored one. From round four — the release this tree lands with — a citation resolves only to the row whose id it EXACTLY is (case counts; `read-anchor` agrees), and an id that runs into a hyphen at a line's end is reported as CUT whatever rows exist, even cut at its first or second hyphen when the next line completes it (0.5.7 resolved by substring and saw no cut at all). ⚠ Still unseen: a wrap inside a string literal whose prefix happens to be a row, and an id cut at a hyphen that OPENS the next line (that one fails as unresolved, not as cut) — `check-wrapped-anchor-ids` owns the first. ⚠ The `check-anchor-registry` action stays for what no verb covers: the plans' table cell-width property and the retired-id matcher |
+| `check-anchor-citations` | resolving cited ids, over the roots in `anchors.citationRoots` (`.harness-config` since 2026-09-18, `tests` since 2026-09-19) — never `.plans`, so an id cited inside a registry cell is resolved by no guard: `anchor-rows` resolves the ids a batch newly cites, and `lane-fold` / `apply-registry-row` resolve none. ✔MEASURED: `--current-tree` reads tracked and untracked-not-ignored files and never an ignored one. From round four — the release this tree lands with — a citation resolves only to the row whose id it EXACTLY is (case counts; `read-anchor` agrees), and an id that runs into a hyphen at a line's end is reported as CUT whatever rows exist, even cut at its first or second hyphen when the next line completes it (0.5.7 resolved by substring and saw no cut at all). ⚠ Still unseen: a wrap inside a string literal whose prefix happens to be a row, and an id cut at a hyphen that OPENS the next line (that one fails as unresolved, not as cut) — `check-wrapped-anchor-ids` owns the first. ⚠ The `check-anchor-registry` action stays for what no verb covers: the plans' table cell-width property and the retired-id matcher |
 | `check-root-litter` | the `check-root-litter` program — **DELETED** |
 | `fix-line-endings` | rewriting endings. ⚠ The `check-line-endings` action stays: HEAD and index blobs, a CR instrument that cannot see a CR, `--files`, and its watchdog |
 | `check-ci-legs` | the `check-ci-legs` program — **DELETED** |
@@ -186,7 +186,7 @@ already does is USED, never re-built around and never requested upstream. Read i
    never a `.sh`/`.ps1` twin (the 2026-09-21 ruling in the section on runner actions below). That covers quoting, a
    path holding a user name, a regex, cross-OS behaviour, JSON, and a retry loop with state.
 3. **DssHarness already does it → USE IT; ask for nothing.** Before a feature request, or before writing a program
-   around the tool, read `DssHarness --help`, `<verb> --help`, `help <topic>` (`runners`, `legs`, `worktrees`,
+   around the tool, read `dssharness --help`, `<verb> --help`, `help <topic>` (`runners`, `legs`, `worktrees`,
    `configuration`) and the latest release notes. A request goes upstream only for a gap that reading SHOWS. A DEFECT
    is still reported, as the closing section says. An interim script whose own stated reason has lapsed is retired,
    not kept "just in case".
@@ -215,8 +215,8 @@ correctly.
 
 - Both take **`--legs <names>`** — `--legs a,b` or `--legs a b`, naming legs or leg sets. Without it,
   every declared leg. Both also take `--json`, `-v/--verbose` and `-C/--directory`
-  (✔MEASURED 2026-09-16 at `305604f1`, `DssHarness legs --help` and
-  `DssHarness install-missing-tools --help`).
+  (✔MEASURED 2026-09-16 at `305604f1`, `dssharness legs --help` and
+  `dssharness install-missing-tools --help`).
 - ⚠ **`legs` is NOT a read-only probe.** Its own description: it *"installs or updates DssHarness on
   hosts that are behind"*. So does `host-exec`, before it runs anything remotely. Running `legs` to
   "just look" changes three remote hosts.
@@ -281,7 +281,7 @@ to live that is obviously owned by that action. It is the rule this repository a
 program it ships: **one directory per program, named for it, assets alongside.**
 
 ⚠ **The table below was written when the tool could express only HALF of this ruling, and the layout
-was declared as ruled anyway.** ⇒ **re-answer it before relying on it** — `DssHarness help runners`
+was declared as ruled anyway.** ⇒ **re-answer it before relying on it** — `dssharness help runners`
 states the current contract, and the upstream `architecture.md` section named at the top of this file
 gives the reasons. A capability claim pinned to a release goes quietly false the release after; this
 one has already moved once.
@@ -289,9 +289,9 @@ one has already moved once.
 | half of the ruling | state |
 |---|---|
 | **supporting files** beside the action | ✅ works, and is in use — the clock-step probe's only `run` line starts a program under `actions/clock-step-probe/` |
-| the **`.yml`** inside that directory | ⛔ refused: `DssHarness legs` passes (exit 0), `DssHarness run` fails **exit 12**, *'is not a file name. A runner's action names one file directly inside …'* SUPERSEDED 2026-09-23 by the release that runs every action from its `.yml` through `dssharness run <name>` (see actions.md) |
+| the **`.yml`** inside that directory | ⛔ refused: `dssharness legs` passes (exit 0), `dssharness run` fails **exit 12**, *'is not a file name. A runner's action names one file directly inside …'* SUPERSEDED 2026-09-23 by the release that runs every action from its `.yml` through `dssharness run <name>` (see actions.md) |
 
-★ **`config.json` names the ruled path regardless, and `DssHarness run` therefore refuses this
+★ **`config.json` names the ruled path regardless, and `dssharness run` therefore refuses this
 runner until repo-harness is fixed.** That cost was weighed rather than absorbed: no ctest entry
 invokes `run`, and the four runners that are real work are not written yet. SUPERSEDED 2026-09-23 by the release that runs every action from its `.yml` through `dssharness run <name>` (see actions.md) **Bending the layout to
 what today's tool accepts would have made the tool's limitation permanent** — the next author would
@@ -315,8 +315,8 @@ root: `python3 ./.harness-config/runner/actions/<action>/bla.py`, which is verif
 forward slashes on the Windows host. ★ That spelling also survives the `.yml` moving, because it was
 never relative to the `.yml`.
 ★ **A step can ask to run beside its own files**: `workingDirectoryRoot: action` runs it in the
-action's directory, and then `python3 ./bla.py` is right — ✔MEASURED through `DssHarness run` on the
-Windows leg, and it is the form every action in this tree uses (`DssHarness help runners` states the
+action's directory, and then `python3 ./bla.py` is right — ✔MEASURED through `dssharness run` on the
+Windows leg, and it is the form every action in this tree uses (`dssharness help runners` states the
 three roots, `tree` the default). A step may also name the operating systems it runs on (`runOn`);
 a Python program needs none, which is the point of having one program instead of a twin per OS.
 ⓘ `actions/` is tracked (its `.gitkeep`, and every action directory under it); `runner/.env/` and
@@ -331,8 +331,8 @@ config **cannot** be overridden per machine, and a machine-specific path belongs
 that the spelling without a trailing slash cannot answer NOT-IGNORED and ship N lane checkouts to
 every gate host. `.harness-config/worktrees/` exists but is empty and untracked: it is the tool's
 DEFAULT root, which this configuration overrides.
-⚠ **`DssHarness help worktrees` states the default, not your configuration** — it says a worktree
-sits below `.harness-config/worktrees/<name>`. ✔MEASURED here: `DssHarness list-worktree` reports
+⚠ **`dssharness help worktrees` states the default, not your configuration** — it says a worktree
+sits below `.harness-config/worktrees/<name>`. ✔MEASURED here: `dssharness list-worktree` reports
 `.manifests`, which exists only under `.worktrees/`, so the behaviour honours `worktrees.root` and
 the help topic's path is the one to distrust.
 

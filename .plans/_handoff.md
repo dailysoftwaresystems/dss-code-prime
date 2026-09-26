@@ -82,6 +82,184 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ P68 ROUND 13 — READ THIS FIRST: MSVC's sized integer suffixes compile with MSVC's meaning, a static initializer is folded by one constant evaluator or refused where it stands (`static int *p = &local;` no longer crashes the compiler), a fold's registry rows land as one rehearsed batch, and speedtest1 measures the pinned sqlite from inside the tree
+
+**THE LANES THIS COMMIT CARRIES**, in seven folds (F1–F7; F6 and F7 are the independent audit's fixes, below) and the
+orchestrator's own items. This is the PR's LAST round:
+no new item started in it. Each fold came from a snapshot the lane cut at its fold point and was md5-verified, with a
+three-way merge wherever main had moved. From F1 on, every fold's rows went through mig's new `anchor-rows` action
+(`dssharness run rows --manual-step stage|check|apply`), rehearsed in a throwaway repository and read back as declared;
+the five row scripts of the session toolkit are retired. Main was re-verified after the folds through `dssharness test
+--legs windows-x86_64-debug`. Tests on MinGW Debug went from 2514 to 2539 across the round:
+
+| lane | subject | what landed |
+|---|---|---|
+| `mig` | the harness (F1 the rows batch, F3 the speedtest1 subject, F6 the audit's fixes to both) | **A fold's registry rows land as ONE checked batch** (`anchor-rows`: stage, check, apply, MANUAL steps on the one-leg `rows` runner). `stage` copies exactly the named rows into a new directory, turning a lane's pre-escaped pipes back and refusing an id the lane never wrote. `check` is read-only: it judges each supplied cell against the stored one (SAME, RESPACED, KEPT, FILLED, LOST, CHANGED), prints every LOST cell as a word diff, and REHEARSES the whole batch for real in a throwaway git repository through the real door, each row read back, then lint and balance there. `apply` requires every LOST cell to be named (`acceptLost`), refuses if the registries changed since the plan, writes new rows before updates, reads each back, and restores both registries byte for byte on any failure. It is the one successor of five session scripts, each of which had cost a defect once: a loop that stopped half-applied, a `--dry-run` that applied, a cp1252 console that killed a loop after its first write, and a composer that stored `tests/hir/ test_x.cpp`. Self-test 52 arms, gated by ctest as `anchor_rows_selftest_guard`. It disclosed `D-HARNESS-ACTION-PROGRAM-VERBS-WITHOUT-A-HARNESS-STEP` (P2, HEAD's debt): program verbs that write the tree or answer a gate are reachable only by starting a program by hand (lane-fold's verbs, `apply-registry-row`, `check-anchor-balance`'s modes, eight write and baseline modes of the guards), which the operator's DssHarness-only order forbids. **speedtest1 measures the pinned sqlite from its own checkout inside the tree** (`D-HARNESS-SPEEDTEST1-MOVES-AN-UNLOCKED-OUT-OF-TREE-CHECKOUT-ONTO-THE-PIN`, P1, closed; the round-12 audit's M-7). The row's prescribed remedy assumed a tree-local full clone; mig MEASURED that none exists (the Windows stage is a partial copy, the POSIX stages hold none) and decided the fork: a pinned FULL checkout at `<output tree>/speedtest1/sqlite`, put on the pin only through the stage's one checkout, under the output tree's run lock on every host (Windows had none), cloned with `core.autocrlf=false` (this host's system git configuration says true). An explicit `--sqlite-dir` is read as-is and refused off the pin; `select_dss` refuses a nameless run, and the compiler search went with its last caller. Seven mutants went red on exactly their arms. The PR exit's four-leg speedtest1 is its first real measurement |
+| `lm` | shipped headers (F2 S2a-2a) | **A typedef names its owner**: `"shippedTypedef": { "header": "stddef.h" }` beside `type` and `abiTypedef`, C's own model (many headers declare `size_t`, one defines it). A reference takes the owner's whole answer on the pair, its absence included, so a use where the owner declares nothing fails loud as an unknown type. The 14 copies of 4 names (`size_t` ×6, `wchar_t` ×4, `intptr_t` ×2, `time_t` ×2) are now 4 definitions and 10 references, and a ratchet holds one defining descriptor per typedef name. A per-pair signature matching no arm is refused where the symbol's declared availability includes the pair, and not injected where it does not. The hand-declared realization path now reads with the pair's facts, so a row naming `wchar_t` or keyed on the long-double format no longer reads differently on the two paths. **It changes NO identity**: 2408 typedef and 8050 signature comparisons against main's JSON, 0 differences (the negative arm finds 34). Mutants A, B, C2 (a missing cycle check recursed until the stack gave out), D–H went red; C was mis-specified and replaced by C2. Gates: MSVC 2514/2514 with zero warnings, after lm fixed six `[[nodiscard]]` discards of its own new tests |
+| `xa` | literals (F4) | **MSVC's 24 sized suffixes `i8`…`ui64` compile with MSVC's MEANING** (`D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED`, P1, closed): the suffix FIXES the type (`i8` plain `char` … `ui64` `unsigned long long`) and an out-of-range magnitude wraps modulo 2^N with no warning (`300i8` is 44, `0xFFFFFFFFFFFFFFFFi64` is −1), measured on MSVC 19.51 under three standards, both preprocessors and /O2; gcc, clang and mingw-w64 refuse all 24, and MSVC's own `<limits.h>` writes `LLONG_MAX` with `i64`. It is a THIRD `integerLiteralTyping` rule shape in the C language document, FIXED-TYPE with a closed `outOfRange` verb set (`wrap`), listed last so every constant an ISO spelling can carry keeps that spelling. One shared reduction feeds the CST→HIR literal, the constant folder and phase 4; plain `char` reads the target's signedness and is refused, never guessed, with no target. **Found in passing and fixed: `#if` read a bit-precise literal as UNSIGNED** (`D-PP-IF-BIT-PRECISE-LITERAL-READS-UNSIGNED`, P1, born closed, a SILENT wrong branch: `#if 5wb - 6 < 0` took `#else`); clang is the witness, gcc refuses both spellings. Twelve mutants, one of them run twice, went red on exactly their predicted arms, with named controls green |
+| `cs` | C semantics (F5 static initializers, F7 the audit's fixes) | **A static initializer is C 6.7.9p4's constant, folded by ONE evaluator, or refused where it stands** (`D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED` and `D-C-A-CONSTANT-ADDRESS-INITIALIZER-IS-REFUSED-AS-A-RUNTIME-INITIALIZER`, both P1, closed). `semantics.staticInitializers` in the C language document declares the constraint, and the semantic tier refuses what PROVABLY is not a constant, at the construct and only where it is evaluated (`S_StaticInitializerNotConstant`): the value of an object that is not a const, non-volatile one with a visible initializer, a call to a function the unit defines, an assignment, an increment or decrement, an automatic object's address, an element read of a compound literal that is not const, an address narrowed below pointer width. The comma operator is admitted with a warning (6.6p3). The value comes from ONE engine: the HIR constant evaluator folds every ISO address constant (`HirAddressValue`, a symbol or null plus a byte offset, emitted as a relocation) and the seven 6.6p10 forms `otherConstantForms` names, each gated, and the static-data producer's five shape classifiers are DELETED. What the evaluator does not fold is refused at the initializer (`H_StaticInitializerNotFolded`), never turned into a runtime initializer. HEAD's CRASH on `static int *p = &local;` is gone twice over: the semantic tier refuses `&local`, and the module initializer starts from no local bindings. **Found in passing and fixed: the semantic tier's walks stopped SILENTLY at fixed depths** (`D-C-SEMANTIC-WALKS-STOPPED-SILENTLY-AT-A-FIXED-DEPTH`, P2, born closed): each walk now steps to a strict descendant or ancestor and ends on any tree, and only a cyclic, malformed tree stops the process, loud, through one helper. Disclosed, HEAD's debt, each a valid form DSS refuses: a block-scope `const` object's value (P1), a label-address difference (P2), a library call a reference folds (P2); a file-scope compound literal's address stays on its own row (P1). References measured through `probe-reference-cc`: gcc, clang, mingw-w64, AppleClang and MSVC 19.51. Six new examples, each runnable one with a release arm, and eight diagnostics-corpus pairs. 44 of 44 mutants went red (12 on macos-arm64-debug, 32 on linux-arm64-debug, the Mac being off the network that morning) with three named controls green, on the item's tree before the orchestrator's second forward merge; the gates measured the merged tree: MinGW and MSVC 2532 of 2533 each, the one red being the census that the fold's write step settles. DSS's own probe verdicts, re-measured on the merged build, were unchanged |
+
+**THE INDEPENDENT AUDIT (dss-cycle step 10) ruled GREEN-BUT-RULE-BREAKING: 1 blocker, 6 MAJOR, 31 MINOR, and every
+blocker and MAJOR is fixed in this commit.** It ran in two parts, read-only, while cs's gate and the round gate ran:
+part A on F1–F4 and the orchestrator's items (1 blocker, 5 MAJOR, 25 MINOR, with two sub-reviewers, anchor-rows and
+speedtest1) and part B on F5 (0 blocker, 1 MAJOR, 6 MINOR). It read every changed `src/` C++ file of F2, F4 and F5 and
+found no agnosticism break and no input-proportional recursion.
+- **The blocker:** xa's two rows were ✅ CLOSED while their closings still called the Mac run pending. The first gate's
+  Mac runs passed 2500 of 2500 each, the Fc3SizedSuffix and `#if` pins and both sized examples among them, and each
+  closing now says so in an addendum (the final gate's Mac runs passed them again).
+- **F6, lane `mig`, the four harness MAJORs:** `anchor-rows` judged a cut path on the cell as the lane wrote it, while the
+  door stores a line break as a space, so a path wrapped at its `/` landed cut; it now judges the text as stored. No
+  guard reads the registries' own citations (`check-anchor-citations` never reads `.plans`), so a batch now resolves
+  every id it newly cites. A mistyped id minted a new row; a new row must now be declared (`new`), as
+  `apply-registry-row` demands `--insert`. And speedtest1's claim "nothing outside the tree is written" was false: the
+  measurement core wrote its temporaries to the system temp directory; they now go to `<output tree>/speedtest1/scratch`
+  under the run lock and are removed however the run ends. Fifteen MINORs in the same files went with them, and three
+  more in part, among them one-leg write runners (`check-doc-census-write`, `check-plan-citations-write`,
+  `check-scripts-index-write`), because the old remedy lines ran the write step on the WSL leg's synced copy too. 39
+  mutants went red on exactly their arms; the controls were green on both local legs.
+- **F7, lane `cs`, the MAJOR, MEASURED sharper than it was filed:** the audit inferred that a volatile element or member
+  of a const object folds. The references split them. None builds `static const volatile int cva[2]; … cva[1]` (gcc
+  13.2 and 13.3, clang 18.1.3, MSVC 19.51), which DSS refused before F5 and F5 folded SILENTLY — debt this round created.
+  gcc builds a volatile MEMBER of a const structure, so DSS keeps folding that. The rule is stated once and asked by
+  both tiers: an object is volatile when its type, through its array spine, is volatile-qualified. F7 also fixed B-7,
+  a NULL-based address narrowed to an integer, which all four references build and DSS refused, before F5 as a runtime
+  initializer and after it as "no relocation can hold it"
+  (`D-C-A-NULL-BASED-ADDRESS-IN-A-NARROWER-INTEGER-IS-REFUSED-AS-NOT-A-CONSTANT`, P2, born closed). It
+  threaded the constant forms through ONE helper that builds the language's MIR policy for the pipeline and all 13
+  schema-built fixtures, which had lowered C under a policy production never uses, and it corrected three comments
+  and the walks row's claim (4 of 32 capped loops had been read; the rest are disclosed). Disclosed, HEAD's debt: a
+  const union's member read (P2; gcc and clang build it, but a fold keyed on the member's type would accept what no
+  reference does) and the 28 capped loops that may answer at their cap (P2). Ten mutants went red; the control ran 78
+  of 78.
+- **The orchestrator:** the scrub had missed this machine's host name, twice in the sqlite action's `legs.json`, a shape
+  its survey never looked for; both became `<host>`, the survey gained a bare-name shape, and it finds 0. `dss-audit`
+  now lists the seventh non-negotiable, a skill row no longer cites a helper that no longer exists, and eight
+  `DssHarness <verb>` spellings the earlier pass could not see (seven in code blocks, one wrapped) read as typed.
+- **The review converged:** an independent re-review of F6 and F7 (part C, read-only, while the re-gate ran) found 0
+  blockers and 0 MAJORs, and four MINORs: a break BEFORE a hyphen still passes the wrapped-id rule, the one-leg check
+  is stated four times, the corrected speedtest1 text leaves out the `--out` exception, and a volatile read inside a
+  folded `?:` is refused with the wrong code (still refused).
+- Of the 35 MINORs found (part C's four included), the ones not fixed this round are one row,
+  `D-AUDIT-P68-ROUND-13-MINOR-FINDINGS`, by owner.
+
+**Also (orchestrator).**
+- **This machine's WSL account and LAN hosts left the tracked files** (`D-REPO-TRACKED-FILES-NAME-THE-WSL-ACCOUNT-AND-LAN-HOSTS`,
+  P2, closed; the round-12 audit's MAJOR). The scrub is keyed on SHAPE — a home by its path component, a `.local` host
+  that holds the account, a four-part private address that is not part of a longer dotted number (the first rule matched
+  C section numbers and was tightened before it wrote) — and every report was masked. It changed seven files: the two
+  path-identity sources, check-line-endings, `sysctl.json`, a harness test, this handoff, and the sqlite driver's
+  self-test fixtures, where the account became a synthetic `dev` so inputs and expected values still agree. Three done
+  rows went through `anchor-rows` (four LOST cells accepted, each a home or address removed). A survey of every tracked
+  file finds 0. Kept on purpose: the maintainer attribution (README, CONTRIBUTING, the issue template). The names stay in
+  history already pushed: rewriting it needs a force-push, which is forbidden.
+- **The skills spell a command as it is typed**: 41 code spans `` `DssHarness <verb>` `` became `` `dssharness <verb>` ``
+  in 11 skill files (the prose name kept), and the dss-cycle root's "six non-negotiables" became seven, the count
+  `the-bar.md` lists. Three C++ comments that cited old SKILL.md sections by number point at stable references now
+  (comment-only).
+- **A slip printed the WSL account into my own tool output**: `anchor-rows check`'s word diff went through my redactor,
+  whose prefix rules missed `\\wsl.localhost\<distro>\home\<n>`. The redactor now keys on the home component, the rule
+  read-leg-path has used since round 12, verified on five forms. A Python traceback from a command I had not piped
+  through the redactor printed the Windows home path once in each of the round's two sessions. Nothing was written to
+  a file any time.
+- **Lane incidents, self-reported and fixed**: a first speedtest1 mutant created an empty `src` directory in the real home
+  (removed; that arm now runs behind a scratch home, and its red-on-disable was re-run), and a Python error path printed
+  the interpreter's install path, which holds the Windows account, into a lane transcript twice (no file).
+- **Evidence accepted with a stated limit**: lm's red-on-disable ran through two lane scripts, each wrapping the memory
+  gate and ONE `dssharness test` call per mutant with md5 checks both ways — the protocol round 12 prescribed. The next
+  PR's lane-fold and anchor actions should make such wrappers unnecessary.
+- **The Mac was off the network the morning of 2026-09-26**, so lane `cs`'s red-on-disable moved to the arm64 VPS (12 of
+  44 mutants on the Mac, 32 on `linux-arm64-debug`), and xa's targeted Mac runs waited for this round's gate. The
+  operator woke it before the gate.
+- **The round moved to a new session at the operator's stop order (~11:40)**, through a written handoff. The old
+  session's audit and lane `cs`'s two gate runs were stopped. cs's MSVC gate had already finished; its MinGW gate was
+  killed mid-ctest with no verdict and was re-run whole (2532 of 2533, the census red). The new session finished cs's
+  item itself, with no cs agent: DSS's own probe verdicts re-measured on the merged build, the rows written from the
+  measured facts, the cut, the fold. The audit restarted in two parts: part A on F1–F4 while cs's gate ran, part B on
+  F5 after its fold.
+- **cs's rows directory predated the `anchor-rows` contract**, and `stage` refused it: scripts sat beside the row
+  directories, and each row held a verb file next to its cells. The seven rows' cells were copied verbatim, each copy
+  compared byte for byte, into a directory of the contract's shape and staged from there. The action was right to
+  refuse, and it is unchanged.
+- **A slip wrote three stray files into cs's worktree**: my inline PowerShell named the facts file `$F` and a loop
+  variable `$f`, which PowerShell treats as one name, so three one-line facts landed in new files at the worktree's
+  root instead of the gate's facts file. Each was checked byte for byte and removed; no tracked file was touched.
+- A doubled period at the end of three of cs's row closings was fixed at its source, the facts builder, before the
+  rows were written.
+- **The gate's legs were pre-built on the F1–F4 tree** while cs's gate ran, so the gate after F5 rebuilt only what F5
+  touched. The WSL Debug pre-build rebuilt from clean, and DssHarness said why: a clock step (WSL2's `CLOCK_REALTIME`).
+- **A lane wrote a row cell from REDACTED output.** My display redactor masks a four-part number as an address, so
+  `C 6.7.2.5's` printed as `C <ip>'s`, and lane `cs` wrote a trigger cell from what it had printed. `anchor-rows check`
+  caught it as a LOST cell nobody intended; that one cell was dropped (every other cell went verbatim), and a scan of
+  every row cell written this round found no other mask. The redactor now skips a C section number and says it is for
+  display only. The auditors' own slips were the other direction: an `ls -l` owner column printed this machine's
+  Windows account into three reviewers' tool output (no file), and the redactor now masks this machine's bare account
+  and host names, read at run time.
+- **The fold tool read only one of md5sum's two line forms** (text mode, `<md5>  <path>`), and mig's cut used the other
+  (binary mode, `<md5> *<path>`), so F6's first dry run refused a manifest that verified; it takes both now and
+  refuses any other shape.
+
+**DssHarness.** **0.5.14** ran the whole round. One report was sent: a remote leg's `runDirectory` in the `--json` ledger,
+and the `logs of <leg> on <host>:` line, print the host's absolute path, which names the host account through its home
+directory; until it is fixed we redact what we print. Its delivery is NOT confirmed: the first attempts found the
+repo-harness session not running; two direct messages after it came back were held for approval there (it runs
+another permission mode) and expired; a third was queued through the session-message channel (message fa57a96b). From
+the session that finished this round, that repo-harness session is not found (its transcript cannot be read), so
+whether the queued copy ran is unknown; the text is kept in `.temp/dssharness-reports/`. No other DssHarness defect was
+found this round: a WSL leg refused while the other ran (below) is the tool's lock on a host's copy, reported as the
+`refused-locked` verdict with the holder named.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → "OK - the balance holds: 617 open now against 615 at 547f316f" — 5 open-at-HEAD rows closed (4 P1, 1 P2), 1 created (the audit's MINOR row) and 6 `🔵 DISCLOSED` rows of HEAD's debt found this round, which are not counted: counted, 615 → 611; banding **P0 0 · P1 62 · P2 209 · P3 331 · P4 11 · P5 4**; `read-anchors --lint` 0 findings. ✔MEASURED against HEAD (`registry_delta`): **10 new rows (3 born closed: 1 P1, 2 P2; 7 open: the P3 MINOR row and 6 disclosed, 1 P1 and 5 P2), 5 open at HEAD now closed and moved to the done registry, 0 reopened, 0 dropped**.
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.14) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2.0 (C, CXX) · **2539 / 2539** | MSVC 19.51.36260 (C, CXX) · **2539 / 2539** |
+| WSL x86_64, GNU 13.3.0 | **2506 / 2506** | **2506 / 2506** |
+| arm64 VPS, GNU 13.3.0 | **2506 / 2506** | **2506 / 2506** |
+| macOS arm64, AppleClang 21.0.0 | **2506 / 2506** | **2506 / 2506** |
+
+- **The gate ran TWICE.** The first ran on the tree through F5, while the audit read it: Windows 2533 / 2533 on both
+  build types, and Mac, VPS and WSL Debug 2500 / 2500 each, all green (WSL Release was left to the second). The audit
+  then found a regression in F5 itself, so F6 and F7 landed and the gate above re-ran all eight legs on the final code
+  tree; the six new entries are F7's three examples in both runners. Windows runs the 33 repo-guard entries too
+  (`2539 = 2506 + 33`).
+- **The round-close sqlite recompile** (`dssharness run sqlite-recompile --legs windows-x86_64-debug`, this tree's dsscp
+  against the mingw reference): `recompile: pe64-x86_64 sqlite=d21bd37c7cfc tus=189 reference_ok=189 dss_ok=189
+  blockers=0` on the final tree (run 20260926-185632-d2e77347), and the same on the F5 tree before it (run
+  20260926-163348-c9022174), because F5 changed the path every static initializer of sqlite and Tcl takes.
+- Invocations of the final gate: Windows Debug with the Mac and VPS pairs, run 20260926-181559-1a471ecb (host runs:
+  Mac Release 20260926-181551-00e3c331, Mac Debug -181552-9f3899a1, VPS Debug -181556-f98999e6, VPS Release
+  -181556-f24c7553); Windows Release run 20260926-181642-792665e5; WSL Debug run 20260926-184003-17cc706f (host
+  -184009-6cdb2542); WSL Release run 20260926-190635-980266a6 (host -190646-6d54abb1). At most two heavy local jobs at once, each admitted below 76%
+  committed memory. ⚠ A WSL leg refuses to start while the other WSL leg runs (`refused-locked`, exit 13): DssHarness
+  locks a host's copy for a run, so the two WSL legs share one invocation or run in turn.
+- After the gate, only documents landed: the round's rows (the MINOR row among them), one skill sentence and this
+  block. The write runners and the repo-guard label re-ran on the final tree with this block in place: the three write
+  runners passed, and the repo-guard label ran 33 of 33.
+
+**NEXT — THE PR EXIT.** No round follows in this PR. The exit runs units on every leg (the gate above, if nothing lands
+after it), `dssharness run sqlite --input tier=veryquick --input dssConfig=release` and `dssharness run speedtest1` on
+four legs, and the README; then the PR goes to the operator for merge (no auto-merge; `Run Pipes` is the operator's). A
+declined sqlite leg is STATED, never skipped. The next PR takes:
+- mig's `lane-fold` action, whole, plus the memory gate, the probe dispatcher and the one redactor, and the census guard
+  that closes `D-HARNESS-ACTION-PROGRAM-VERBS-WITHOUT-A-HARNESS-STEP`;
+- lm's S2a-2b/S2a-3 identities and S2b;
+- cs's block-scope `const` read (P1), undeclared `__builtin_expect`/`__builtin_strlen` (P1) and the pointee-`const`
+  `_Generic` row (P1), a compound literal as an object (the file-scope compound-literal address row, P1), the
+  label-address difference and library-call rows (P2), a const union's member read (P2, which needs a union constant
+  that names its member) and the capped loops that may answer at their cap (P2);
+- xa's unwind row (P1) and the shared-library static-initializer hook (P2);
+- the round-12 audit's remaining rows: check-doc-census's claim-rot walk floor (`mig`), prototype-census failing closed
+  and its first real run (`lm`), `aligned_alloc`'s runtime witness (`lm`, in its open row), the VLA stride pin (`cs`),
+  and `D-AUDIT-P68-ROUND-12-MINOR-FINDINGS`, worked by owner and struck from its list as each lands;
+- this round's `D-AUDIT-P68-ROUND-13-MINOR-FINDINGS`, the same way (`xa`: `outOfRange` read by the three tiers, the
+  `#if` `l`/`ll` decimal measured; `mig`: the door's other two callers; the orchestrator: `dss-audit`'s gate wording).
+
+---
+
+---
+
 ### ★ P68 ROUND 12 — READ THIS FIRST: an integer converts to `float` on x86_64, an enumeration has the type gcc and MSVC give it, the sqlite harness compiles one pinned revision, and every build, sync and test now goes through DssHarness
 
 **THE LANES THIS COMMIT CARRIES**, in eighteen folds (F1–F15, plus F4b, a three-file fix-forward to F4, and F14b and
@@ -5485,7 +5663,7 @@ value through a bare `fs::absolute`. ✔MEASURED, one path object, `.string()`:
 |---|---|
 | `is_absolute()` | **false** |
 | `has_root_name()` / `root_name()` | **false** / **empty** |
-| `absolute()` | **`C:\wsl.localhost\Ubuntu\home\rafael\p44_unc_inc`** |
+| `absolute()` | **`C:\wsl.localhost\Ubuntu\home\<user>\p44_unc_inc`** |
 | `exists(input)` / `exists(absolute())` | **true** / **false** |
 | `weakly_canonical` | **`<error> No such file or directory`** |
 
@@ -5860,7 +6038,7 @@ previous run can leave a stale object behind for the next one to inherit.
 
 ✔**MEASURED while running the four-leg gate for this very commit.**
 `remote-leg --carriage macos` resolved the host for `leg-tree prepare` — reaching it at
-192.168.0.71 and moving its clone from `301e2a63` with 2854 dirty paths to a pristine
+<ip> and moving its clone from `301e2a63` with 2854 dirty paths to a pristine
 `73f74972` — and then **failed to resolve the same `.local` name for the rsync seconds
 later**. A leg calls the carriage eight or so times and `ssh-macos.sh` re-ran its whole
 resolver on every one, so a run's success depended on N independent mDNS lookups ALL

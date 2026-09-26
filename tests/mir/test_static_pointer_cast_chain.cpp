@@ -6,8 +6,10 @@
 //
 // `char *p = NULL;` with the platforms' own `NULL`, `((void *)0)`, is TWO pointer
 // casts: the explicit `(void *)` and the implicit `void *` → `char *` conversion.
-// The static-initializer classifiers in `hir_to_mir.cpp`
-// (`tryClassifyNullPointerConst`, `tryClassifyIntToPtrConst`) peeled exactly ONE,
+// The static-initializer classifiers `hir_to_mir.cpp` had then
+// (`tryClassifyNullPointerConst`, `tryClassifyIntToPtrConst` — since P68 round 13 both
+// deleted, the constant evaluator's pointer-cast arms fold every such chain) peeled
+// exactly ONE,
 // and const-eval refuses a cast to a pointer, so the object became a RUNTIME
 // initializer — which the static-data producer refuses on every format ("has a
 // runtime initializer"), and which a pointer ARRAY cannot even reach (the
@@ -39,12 +41,13 @@
 //       which must stay a RELOCATION and never become an integer.
 // Each of (1)-(3b) is its own translation unit, so a regression names the family
 // it broke instead of failing every pin at the first refused global.
-// ⚠ WHICH ARM EACH FAMILY PROVES. A null chain reaches the integer-address arm too
-// (it runs after the null arm and folds `(char *)(void *)0` to the identical zero
-// leaf), so (1) and (3) stay green while EITHER arm peels the chain; they go red
-// only with both reverted. (2) needs the integer-address arm, and (3b) the null
-// arm — the null-base element classifier asks it about the base. ✔MEASURED by the
-// three red-on-disable runs recorded in the row. The runtime half
+// ⚠ WHICH ARM EACH FAMILY PROVES. P68 round 13 (lane `cs`) deleted the two classifiers
+// whose split this paragraph used to explain: the constant evaluator's pointer-cast
+// arm (a pointer→pointer conversion keeps the address; an integer constant converted
+// to a pointer is a NULL-base address) answers (1)-(3) alone, and (3b) is that arm
+// under an element address over a NULL base (the evaluator's lvalue `[]` arm). The
+// three red-on-disable runs the row records were taken against the classifiers; the
+// item's own runs are recorded in its row. The runtime half
 // — the bytes the image holds, read back through volatiles on pe64, ELF x86_64 and
 // ELF aarch64, debug and release — is `examples/c/static_pointer_cast_chain`.
 
@@ -291,12 +294,10 @@ constexpr std::string_view kAggregates =
     "int useG13(void) { return g13[0].val; }\n";
 
 // sqlite's `SQLITE_INT_TO_PTR(X)`, `(void *)&((char *)0)[X]`, with a CHAINED null
-// base — `NULL` or `(void *)0` under the `(char *)`. Only the null-pointer arm can
-// answer it: the null-base element classifier asks that arm whether the base is a
-// null pointer, and the integer-address arm does not look through `&…[X]` at all.
-// So this is the family that goes red when the NULL arm alone loses the chain —
-// every other family is ALSO answered by the integer-address arm (a null chain
-// folds to the identical zero leaf there), which masks it.
+// base — `NULL` or `(void *)0` under the `(char *)`. The constant evaluator folds the
+// base to a NULL-base address through the whole cast chain, then the element address
+// `&…[X]` adds X elements to it — an INTEGER address (no relocation). This family goes
+// red when either the chain or the element arm over a NULL base is lost.
 constexpr std::string_view kNullBases =
     "#include <stddef.h>\n"
     "struct F { const char *name; void *user; };\n"

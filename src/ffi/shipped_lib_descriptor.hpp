@@ -1850,7 +1850,15 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
                             std::span<NamedTypeBinding const> namedTypes = {},
                             // Threaded verbatim into every descriptor read this
                             // oracle performs — see `readShippedLibDescriptor`.
-                            RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+                            RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+                            // P68 round 12 (S2a-2a): the PAIR's facts, threaded the same
+                            // way, so a row whose signature names an ABI typedef
+                            // (`wchar_t`) or keys an arm on the long-double format reads
+                            // here exactly as it does through `#include` — without them
+                            // such a row would be refused (or its arm unselected) on this
+                            // path alone. `nullptr` realizes neither (the direct-API
+                            // default, as `readShippedLibDescriptor`'s).
+                            ShippedPairFacts const*           pairFacts    = nullptr);
 
 // EVERY symbol row of the descriptor that declares `name`, realized for the active
 // target — i.e. the whole import surface that descriptor would contribute.
@@ -1892,7 +1900,9 @@ realizeShippedDescriptorSurfaceFor(std::string_view                  name,
                                    std::optional<std::string_view>   activeTarget,
                                    std::optional<ObjectFormatKind>   activeFormat,
                                    std::span<NamedTypeBinding const> namedTypes = {},
-                                   RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+                                   RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+                                   // The pair's facts, as `realizeShippedExternSymbols`.
+                                   ShippedPairFacts const*           pairFacts    = nullptr);
 
 } // namespace ffi
 } // namespace dss

@@ -42,7 +42,8 @@ Decodes to `InvalidType`. Round-trips the "no type" sentinel — e.g. an extern 
 
 ### 2.2 Primitives
 
-A bare primitive keyword. The accepted names are exactly those in the `primName` / `primFromName` tables:
+A bare primitive keyword. The accepted names are exactly the rows of `kHirTextPrimTable` (`hir_text.cpp`), which
+`primName` and `primFromName` both read:
 
 | Name | Kind | Name | Kind |
 |---|---|---|---|
@@ -54,7 +55,8 @@ A bare primitive keyword. The accepted names are exactly those in the `primName`
 | `i128` | signed 128-bit | `u64` | unsigned 64-bit |
 | `f16` | float 16-bit | `u128` | unsigned 128-bit |
 | `f32` | float 32-bit | `void` | void / no value |
-| `f64` | float 64-bit | | |
+| `f64` | float 64-bit | `nullptr_t` | C23's `nullptr_t` |
+| `f80` | x87 80-bit extended float | | |
 | `f128` | float 128-bit | | |
 
 ```
@@ -63,7 +65,11 @@ char       // the character type
 void       // the void type
 ```
 
-There is no separate `f80` or platform-word keyword — the set above is the complete primitive vocabulary.
+`f80` is the x87 extended format — C's `long double` on a pair whose format document declares `longDoubleFormat:
+"x87-80"`, spelled `f80 "long double"` wherever the identity matters. There is no platform-word keyword: a width
+that depends on the pair (C's `long`) is written per pair, never as a keyword. These twenty names are the complete
+primitive vocabulary — the reader's refusal of an unknown name lists exactly them, plus `invalid` and the wrapper and
+composite keywords below.
 
 ### 2.3 Single-element wrappers — `ptr` `ref` `nullable` `optional` `slice`
 

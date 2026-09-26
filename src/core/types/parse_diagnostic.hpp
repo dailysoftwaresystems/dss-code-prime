@@ -2567,6 +2567,40 @@ enum class DiagnosticCode : std::uint16_t {
     // constraint asks for. A WARNING, suppressible; `--warnings-as-errors` restores
     // the refusal. Every other out-of-range value stays S_EnumeratorValueOutOfRange.
     S_EnumeratorValueConvertedToUnderlyingType = 0xE089,
+    // P68 round 13 (lane `cs`, the static-initializer item): the initializer of an object of
+    // STATIC or THREAD storage duration contains a construct that PROVABLY is not a constant,
+    // in a position that is evaluated — C 6.7.9p4, a constraint (C23 6.7.11p5): the value of
+    // an object that is not a const, non-volatile one with a visible initializer (a DECLARED
+    // object is volatile when its type, looked through its array spine, is; a compound
+    // literal's read, when any lvalue on its path is), a call to a function the translation
+    // unit defines, an assignment, an increment or decrement, the address (or an array's
+    // decay) of an object of automatic storage duration, a SYMBOL's address converted to an
+    // integer narrower than a pointer, or the comma operator where the language does not
+    // admit it. Declared by `semantics.staticInitializers`. ★ It never means "DSS cannot fold
+    // this": a form the static-data producer does not fold is left to that producer's own
+    // refusal, because a reference may build it. ✔MEASURED 2026-09-24 (lane `cs`'s
+    // `.temp/probe/nci`, `sti` … `sti11`: gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0, each
+    // separately, every build RUN): every reference refuses each such construct; DSS built
+    // `int x = y;` for a non-const `y` and `int a[2] = { 1, y };` silently, refused `static
+    // int x = g();` under an object-format code and ABORTED on a local's address in a
+    // block-scope `static`. `.actual` names the construct and why; the span is its position.
+    // SUPPRESSIBLE, like any constraint whose violation cannot become a wrong image: silenced,
+    // the static-data producer either refuses the initializer itself (H_StaticInitializerNotFolded
+    // — a call, an assignment, an automatic object's address, a narrowed symbol address, a
+    // declared object that is not const and non-volatile, whose value its resolver never
+    // folds) or folds the value the object holds at load time, never another one: an element
+    // or member of a compound literal (HIR does not carry a literal's const-ness, so this code
+    // is the only refusal of a non-const or volatile one), and a const object read before its
+    // initializer is visible (P68 round 13, fold F7 — the reason once read "the producer
+    // refuses such an initializer itself", which the compound literal's element made false).
+    S_StaticInitializerNotConstant        = 0xE08A,
+    // P68 round 13 (lane `cs`): a static initializer uses the COMMA operator, which C 6.6p3
+    // excludes from a constant expression; clang 18.1.3 (even -pedantic-errors) and MSVC
+    // 19.51 build `static int x = (1, 42);` and gcc 13.3.0 refuses it, so the union ACCEPTS
+    // it (`staticInitializers.otherConstantForms: commaOperator`) and this warning is the
+    // diagnostic the constraint asks for. A WARNING, suppressible; `--warnings-as-errors`
+    // restores the refusal. `.actual` is the comma expression.
+    S_StaticInitializerUsesTheCommaOperator = 0xE08B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -3906,6 +3940,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   one code. Two scopes, two rules, two codes, two remediations ("drop the
     //   `extern`" here; "remove the initializer" there).
     H_ExternRedundantOnDefinition = 0xF01B,
+    // P68 round 13 (lane `cs`, the static-initializer item): the initializer of an object of
+    // static storage duration, in a language whose static objects cannot be initialized at
+    // run time (`semantics.staticInitializers` declared — C 6.7.9p4), is not a constant the
+    // static-data producer folds: either it is not a constant expression — one the semantic
+    // tier's S_StaticInitializerNotConstant could not prove, like the truth value of a weak
+    // declaration's address or `(unsigned long long)&a * 2`, which every reference refuses —
+    // or it is a constant form this compiler does not fold yet (each such form a reference
+    // builds has its own registry row). Before this code the initializer became a RUNTIME
+    // initializer that the static-data producer refused under an object-format code
+    // (K_NoMatchingObjectFormat "has a runtime initializer"), or reached the module
+    // initializer's lowering. `.actual` states the two readings; the span is the initializer.
+    H_StaticInitializerNotFolded  = 0xF01C,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

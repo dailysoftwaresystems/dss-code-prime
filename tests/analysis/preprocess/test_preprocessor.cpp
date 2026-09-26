@@ -15247,6 +15247,163 @@ TEST(PreprocessorIfIntmax, TheImplicitlyUnsignedWarningIsAbsentWhereBothReferenc
     }
 }
 
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): A SIZED LITERAL IN
+//    #if IS REDUCED TO ITS TYPE FIRST, THEN READ AT INTMAX WIDTH ─────────────────
+//
+// MSVC's sized suffixes fix the literal's type; in phase 4 the literal is reduced
+// to that type and only then widened with the type's own signedness. ✔MEASURED
+// 2026-09-25, MSVC 19.51.36260 (`dssharness run probe-reference-cc --legs
+// windows-x86_64-release`, run 20260925-092749-73db8424), IDENTICALLY under its
+// conforming preprocessor (`/std:c17`), its traditional one (`/std:c17
+// /Zc:preprocessor-`), the default mode and `/std:clatest` — every arm below is
+// MSVC's. gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc refuse the spellings, so MSVC
+// is the only witness. Each case writes both arms and asserts WHICH survived.
+namespace {
+
+// The arm `cond` selects when the preprocessor is told plain `char`'s signedness
+// (`charIsUnsigned`; nullopt = no target), plus whether the run REFUSED.
+struct SizedIfArm { std::string arm; bool refused; };
+[[nodiscard]] SizedIfArm sizedIfArm(std::string const& cond,
+                                    std::optional<bool> charIsUnsigned) {
+    auto schema = cSubset();
+    std::vector<std::filesystem::path> noDirs;
+    auto buf = SourceBuffer::fromString(
+        "#if " + cond + "\nint taken_if;\n#else\nint taken_else;\n#endif\n", "main.c");
+    PreprocessResult r = preprocess(
+        buf, schema, noDirs, dss::kDefaultHeaderNameMatching,
+        DiagnosticBudget::libraryDefault(), {}, std::nullopt, {}, {}, {},
+        charIsUnsigned);
+    bool sawIf = false, sawElse = false;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        std::string_view const lex = r.synthBuffer->slice(t.span);
+        sawIf   = sawIf   || lex == "taken_if";
+        sawElse = sawElse || lex == "taken_else";
+    }
+    std::string arm = sawIf && sawElse ? "BOTH" : sawIf ? "taken_if"
+                    : sawElse ? "taken_else" : "NEITHER";
+    return {std::move(arm), hasPPCode(r, DiagnosticCode::P_PreprocessorDirective)};
+}
+
+}  // namespace
+
+TEST(PreprocessorIfSizedSuffix, TheValueIsReducedToTheFixedTypeFirst) {
+    struct Row { char const* cond; char const* arm; };
+    static constexpr Row kRows[] = {
+        {"5i64 == 5",                          "taken_if"},
+        {"300i8 == 44",                        "taken_if"},
+        {"300i8 == 300",                       "taken_else"},
+        {"128i8 < 0",                          "taken_if"},
+        {"0xFFi8 == -1",                       "taken_if"},
+        {"256ui8 == 0",                        "taken_if"},
+        {"4294967296i32 == 0",                 "taken_if"},
+        {"2147483648i32 < 0",                  "taken_if"},
+        {"0xFFFFFFFFi32 == -1",                "taken_if"},
+        {"0x80i8 == -128",                     "taken_if"},
+        {"65536i16 == 0",                      "taken_if"},
+        {"0xFFFFFFFFFFFFFFFFi64 < 0",          "taken_if"},
+        {"(1i64 << 40) == 1099511627776",      "taken_if"},
+    };
+    for (auto const& row : kRows) {
+        // x86_64 and every Windows pair: plain `char` is SIGNED, as it is for MSVC.
+        auto const got = sizedIfArm(row.cond, /*charIsUnsigned=*/false);
+        EXPECT_FALSE(got.refused) << row.cond;
+        EXPECT_EQ(got.arm, row.arm) << row.cond;
+    }
+}
+
+TEST(PreprocessorIfSizedSuffix, TheUnsignedFormsReadAsUintmax) {
+    // `5ui8 - 6` is UINTMAX_MAX, not -1: the `ui` types are unsigned, and phase 4
+    // keeps the sign of the literal's TYPE. The signed forms beside them are the
+    // control that the sign is read, not assumed.
+    struct Row { char const* cond; char const* arm; };
+    static constexpr Row kRows[] = {
+        {"5ui8 - 6 < 0",           "taken_else"},
+        {"5ui16 - 6 < 0",          "taken_else"},
+        {"5ui32 - 6 < 0",          "taken_else"},
+        {"5ui64 - 6 < 0",          "taken_else"},
+        {"-1 < 0ui8",              "taken_else"},
+        {"0xFFFFFFFFui32 > -1",    "taken_else"},
+        {"0xFFFFFFFFFFFFFFFFui64 > 0", "taken_if"},
+        {"5i8 - 6 < 0",            "taken_if"},
+        {"5i32 - 6 < 0",           "taken_if"},
+    };
+    for (auto const& row : kRows) {
+        auto const got = sizedIfArm(row.cond, /*charIsUnsigned=*/false);
+        EXPECT_FALSE(got.refused) << row.cond;
+        EXPECT_EQ(got.arm, row.arm) << row.cond;
+    }
+}
+
+TEST(PreprocessorIfSizedSuffix, AnI8LiteralTakesTheTargetsCharSignedness) {
+    // `i8` is plain `char`. On a signed-char pair `128i8` is -128; on the
+    // unsigned-char pair DSS ships (arm64 × ELF) it is +128 and UNSIGNED; with no
+    // pair its reading is the target's to decide, so the fold REFUSES — even for
+    // a byte whose value would not change, because the SIGN still would.
+    EXPECT_EQ(sizedIfArm("128i8 < 0", false).arm, "taken_if");
+    auto const unsignedChar = sizedIfArm("128i8 < 0", true);
+    EXPECT_FALSE(unsignedChar.refused);
+    EXPECT_EQ(unsignedChar.arm, "taken_else");
+    EXPECT_EQ(sizedIfArm("5i8 - 6 < 0", true).arm, "taken_else")
+        << "an unsigned `char` literal reads as uintmax_t in phase 4";
+    // The VALUE, not only the sign: `0xFFi8` is the char 255 where plain `char` is
+    // unsigned and -1 where it is signed. (A sign arm alone cannot tell a byte from
+    // its sign extension once phase 4 reads both as uintmax_t.)
+    EXPECT_EQ(sizedIfArm("0xFFi8 == 255", true).arm, "taken_if");
+    EXPECT_EQ(sizedIfArm("0xFFi8 == -1", false).arm, "taken_if");
+    auto const noTarget = sizedIfArm("5i8 - 6 < 0", std::nullopt);
+    EXPECT_TRUE(noTarget.refused)
+        << "the sign of a `char`-typed literal is the target's; with none, refuse";
+    // A sized literal whose type is NOT plain `char` needs no target at all.
+    auto const shortNoTarget = sizedIfArm("65536i16 == 0", std::nullopt);
+    EXPECT_FALSE(shortNoTarget.refused);
+    EXPECT_EQ(shortNoTarget.arm, "taken_if");
+}
+
+// ── P68 round 13 (D-PP-IF-BIT-PRECISE-LITERAL-READS-UNSIGNED): A BIT-PRECISE
+//    LITERAL KEEPS ITS TYPE'S SIGNEDNESS IN #if ─────────────────────────────────
+//
+// C23 counts the bit-precise types among the signed and unsigned integer types
+// phase 4 widens to intmax_t / uintmax_t, so `wb` is signed there and `uwb`
+// unsigned. ✔MEASURED 2026-09-25, clang 18.1.3 `-std=c23` and `-std=c2x
+// -pedantic-errors` (runs 20260925-095900-8cb95906 and 20260925-102338-6976cc3f);
+// gcc 13.3.0 refuses both spellings. DSS read BOTH as unsigned — the bit-precise
+// rule carries no candidate list, so the phase-4 ladder fell to its closing
+// `unsigned` — and `#if 5wb - 6 < 0` took the `#else` arm in silence.
+TEST(PreprocessorIfBitPrecise, AWbLiteralIsSignedAndAUwbLiteralIsNot) {
+    PreprocessResult r;
+    EXPECT_EQ(ppTakenArm("5wb - 6 < 0", r), "taken_if")
+        << "`wb` is a SIGNED bit-precise type; 5 - 6 is -1";
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_EQ(ppTakenArm("5uwb - 6 < 0", r), "taken_else")
+        << "`uwb` is unsigned; 5 - 6 is UINTMAX_MAX — the control for the arm above";
+    EXPECT_EQ(ppTakenArm("-1 < 0wb", r), "taken_if");
+    EXPECT_EQ(ppTakenArm("-1 < 0uwb", r), "taken_else");
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+}
+
+TEST(PreprocessorIfBitPrecise, AWbLiteralPastIntmaxMaxReadsUnsignedAndSaysSo) {
+    // clang: `9223372036854775808wb` is 'interpreting as unsigned' with a warning,
+    // the rule an unsuffixed decimal follows; INTMAX_MAX itself stays signed and
+    // silent, and a `uwb` literal is unsigned by its type, so it is never a surprise.
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775808wb > 0", r), "taken_if");
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("9223372036854775807wb > -1", r), "taken_if")
+            << "INTMAX_MAX fits a signed intmax_t, so -1 stays -1";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+    {
+        PreprocessResult r;
+        EXPECT_EQ(ppTakenArm("18446744073709551615uwb > 0", r), "taken_if");
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIfLiteralImplicitlyUnsigned));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // D-FFI-DESCRIPTOR-CONSTANTS-INVISIBLE-TO-THE-PREPROCESSOR
 //

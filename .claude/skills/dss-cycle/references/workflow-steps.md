@@ -38,7 +38,7 @@ hand-typing every edit or reading every subsystem.
    branch, last commit subject. Read plan-00 §0.1 and skim the anchor registry.
    ⚠ **ORIENTATION READS THE WORKING REGISTRY ONLY** — since 2026-09-16 that is ONE document,
    `-production.md`, which holds everything that is LEFT, and
-   `DssHarness read-anchors --pending` is the whole list in one screen.
+   `dssharness read-anchors --pending` is the whole list in one screen.
    (This line named `-harness.md` as a second working registry until the harness registry retired.)
    **Do not read `_deferred-anchor-registry-done.md` to choose work**: it is the archive, it is by
    far the larger of the two, and reading it to orient is how a closed row got recommended three
@@ -107,10 +107,10 @@ hand-typing every edit or reading every subsystem.
    keep surfacing logic findings without converging are a pause signal — stop and report, do not grind.
 7. **Fail-loud gate** — the mechanical battery, including the anchor-balance gate.
 8. **Pin every deferral** discovered this cycle — and **CLOSE by MOVING**, never by editing a status
-   in place. `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` rewrites
+   in place. `dssharness set-anchor <ANCHOR> --status closed --closing '...'` rewrites
    the row and lifts it out of the working registry into `_deferred-anchor-registry-done.md`; a lane
    handing you a verbatim row FILE goes through `apply-registry-row`, which hands its cells to the
-   same door. A NEW row is `DssHarness write-anchor <ID> ...` (it WRITES unless given
+   same door. A NEW row is `dssharness write-anchor <ID> ...` (it WRITES unless given
    `--anchor-dry-run`). ⚠ Never
    hand-edit a table: `check-anchor-balance`'s partition arm fails the tree for a closed row left
    behind or an open row filed in the archive, and its ARM 6 fails it for a `Status` column that

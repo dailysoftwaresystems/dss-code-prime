@@ -76,8 +76,8 @@ struct Lowered {
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // The language's policy through the pipeline's ONE assembly (`languageMirLoweringConfig`).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
     // VLA C1a (D-CSUBSET-VLA): thread the target's aggregate-layout params so a VLA
     // alloca's element STRIDE (sizeof(int)) resolves at MIR (cachedLayout gates on
     // aggregateLayoutLoaded — even a scalar element needs it). Harmless for the
@@ -96,7 +96,10 @@ struct Lowered {
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
-                                    /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
+                                    /*linkageMap=*/nullptr,
+                                    // The constrained static-initializer fold's const input
+                                    // (P68 round 13 fold F7: the constraint came without it).
+                                    &hir->mutabilityMap,
                                     /*volatileMap=*/nullptr,
                                     &hir->alignmentMap,    // VLA C1b over-align gate
                                     /*threadLocalMap=*/nullptr,
@@ -7496,15 +7499,16 @@ TEST(MirToLir, LongDoubleComplexArithmeticLowersOnX87Axis) {
     ASSERT_TRUE(hir->ok)
         << (hirReporter.all().empty() ? "" : hirReporter.all()[0].actual);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     mirCfg.aggregateLayout       = (*target)->aggregateLayout();
     mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    /*linkageMap=*/nullptr,
+                                    &hir->mutabilityMap);   // the constrained fold's const input
     ASSERT_TRUE(mir.ok)
         << "MIR lowering emits the componentwise F80 ops: "
         << (mirReporter.all().empty() ? "" : mirReporter.all()[0].actual);

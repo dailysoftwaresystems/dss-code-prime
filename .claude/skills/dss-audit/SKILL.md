@@ -62,6 +62,8 @@ If an item could not be verified, say **"unverified"** explicitly. Never round i
    is not strict enough.
 6. **The full gate held** — build · full ctest · anchor-registry guard · agnosticism scan · review
    folded · **and all CI legs, not just local**.
+7. **No un-anchored issue** — everything the cycle came across is anchored AND handled; a workaround
+   that hides an issue, or a row for work the cycle could have done, breaks it.
 
 ## Workflow
 

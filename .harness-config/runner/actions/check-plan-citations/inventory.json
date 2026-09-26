@@ -7,7 +7,6 @@
     "This file is DEBT, not a pass: green means no NEW positional citation landed."
   ],
   "ceilings": {
-    ".claude/skills/dss-code-prime/references/repo-map.md": 2,
     ".harness-config/runner/actions/check-plan-citations/check-plan-citations.py": 3,
     ".harness-config/runner/actions/corpus-census/corpus-census.py": 4,
     ".harness-config/runner/actions/pragma-profile-census/pragma-profile-census.py": 2,

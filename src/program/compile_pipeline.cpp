@@ -819,25 +819,18 @@ static std::optional<CuMirModule> buildCuMirImpl(
     //    policy into the lowering config (same shape as the
     //    lowered_lir_fixture used by ML6 / AS pipeline tests).
     auto const mirEntry = reporter.errorCount();
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat =
-        grammar.hirLowering().globalsConstEval.allowFloat;
-    // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d): thread
-    // the source-language strict-aliasing opt-in from the SemanticConfig
-    // through to the HIR→MIR lowering, which stamps it onto the Mir
-    // for CSE/LICM Load admission. Multi-language CUs will eventually
-    // AND each schema's knob; today's single-language-per-CU shape
-    // reads directly.
-    mirCfg.strictAliasingOnDistinctTypes =
-        grammar.semantics().pointerAliasing.strictAliasingOnDistinctTypes;
-    mirCfg.charTypesAliasAll =
-        grammar.semantics().pointerAliasing.charTypesAliasAll;
-    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED: the SAME shape, and threaded
-    // here for the same reason — `void`/function operand sizes are a per-LANGUAGE
-    // fact (GNU C says 1, ISO C says none) read at TWO tiers, so the schema states
-    // it once and both the semantic const-fold and HIR→MIR read that one
-    // declaration. Absent ⇒ the strict-ISO refusal, unchanged.
-    mirCfg.nonObjectTypeSizes = grammar.semantics().nonObjectTypeSizes;
+    // The LANGUAGE's part of the policy, read off its schema by the ONE assembly every
+    // schema-built test fixture starts from too (`languageMirLoweringConfig`): the globals
+    // const-eval `allowFloat` knob; the static-initializer constant forms
+    // (`semantics.staticInitializers`, the list the semantic tier's check read — P68 round
+    // 13); D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING's strict-aliasing opt-in and
+    // char-aliasing knob, which HIR→MIR stamps onto the Mir for CSE/LICM Load admission
+    // (multi-language CUs will eventually AND each schema's knob; today's
+    // single-language-per-CU shape reads directly); and
+    // D-CSUBSET-VOID-POINTER-ARITHMETIC-REFUSED's `void`/function operand sizes — a
+    // per-LANGUAGE fact (GNU C says 1, ISO C says none) the semantic const-fold and HIR→MIR
+    // both read from that one declaration (absent ⇒ the strict-ISO refusal).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(grammar);
     // FC6: thread the active target's aggregate-layout params + the format's data
     // model so HIR→MIR can fold `sizeof(T)` to T's byte size via the type_layout
     // engine. The target supplies the alignment rule, the format the pointer width.
@@ -2539,6 +2532,14 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // role entries exactly as the C front half does — one resolver shape, one
     // family answer, on every path a symbol reaches the linker by.
     FormatRuntimeLibraryRoleResolver const roleResolver{format};
+    // P68 round 12 (S2a-2a of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): and it reads
+    // each descriptor with the PAIR's facts, as the `#include` path does — the ABI
+    // typedefs a row's signature may name (`wchar_t`) and the long-double format an
+    // arm may key on — built by the one owner of a pair's type facts. No consuming
+    // language: this oracle realizes symbol rows, never a lattice-derived constant.
+    PredefinedTypeFacts const typeFacts = predefinedTypeFactsFor(target, format);
+    ffi::ShippedPairFacts const pairFacts{nullptr, typeFacts.dataModel, typeFacts.charIsUnsigned,
+                                          typeFacts.abiTypedefs, typeFacts.longDoubleFormat};
 
     // The oracle interns each row's declared signature, so it needs a lattice.
     // Neither of this file's on-binary-name producers has a `SemanticModel` (the
@@ -2637,7 +2638,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
         auto const realized = ffi::realizeShippedExternSymbols(
             forwardRequest, lattice.interner(), lattice.registry(), reporter,
             format.dataModel(), std::optional<std::string_view>{target.name()},
-            format.kind(), namedTypes, &roleResolver);
+            format.kind(), namedTypes, &roleResolver, &pairFacts);
         if (!realized.has_value()) return std::nullopt;   // corpus not located
         for (std::size_t i = 0; i < onBinaryNames.size(); ++i) {
             if (canonicalOf[i].empty()) continue;
@@ -2688,7 +2689,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     auto const wholeCorpus = ffi::realizeShippedExternSymbols(
         everyName, lattice.interner(), lattice.registry(), reporter,
         format.dataModel(), std::optional<std::string_view>{target.name()},
-        format.kind(), namedTypes, &roleResolver);
+        format.kind(), namedTypes, &roleResolver, &pairFacts);
     if (!wholeCorpus.has_value()) return std::nullopt;   // corpus not located
 
     // on-binary name -> the row realizing to it. A SECOND row claiming one name

@@ -5540,6 +5540,7 @@ struct Lowerer {
             // C-2: both tiers type the literal; one implementation, two
             // call sites), refining the static `literalTypes` core by
             // magnitude / suffix-class / radix-class under the model.
+            std::uint64_t bits = *iv;
             if (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
                 && numberStyle->emitKind.integer.valid()
                 && tk == numberStyle->emitKind.integer) {
@@ -5548,6 +5549,18 @@ struct Lowerer {
                 if (r.status == IntegerLadderStatus::Typed) {
                     core = r.kind;
                     type = interner.primitive(core, r.vocabularyName);
+                    // D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED: the VALUE is the
+                    // magnitude reduced to the type — the identity for a ladder
+                    // type, MSVC's `wrap` for a fixed one (`300i8` is 44). The ONE
+                    // shared reduction; a `char`-typed literal whose byte is above
+                    // 0x7F waits on the target's char signedness, and with none
+                    // (a direct-API lowering) it stays loud below, never guessed.
+                    if (auto const reduced =
+                            reducedIntegerLiteralBits(core, *iv, charIsUnsigned_)) {
+                        bits = *reduced;
+                    } else {
+                        ok = false;
+                    }
                 } else {
                     // TooLarge / NoRule: the semantic tier already
                     // diagnosed (S_IntegerLiteralTooLarge / loader
@@ -5557,8 +5570,8 @@ struct Lowerer {
                 }
             }
             if (ok) {
-                if (isSignedCore(core)) val.value = static_cast<std::int64_t>(*iv);
-                else                    val.value = *iv;
+                if (isSignedCore(core)) val.value = static_cast<std::int64_t>(bits);
+                else                    val.value = bits;
             }
         } else {
             ok = false;             // integer overflow

@@ -50,12 +50,13 @@ deleted, or repurposed without updating this file, or one no runner can start, i
 **red gate**, not a stale document.
 
 ```bash
-python .harness-config/runner/actions/check-scripts-index/check-scripts-index.py --write
+dssharness run check-scripts-index-write
 ```
 
 <!-- BEGIN GENERATED ACTION INDEX -->
 | Action | Runs | Purpose |
 | --- | --- | --- |
+| **`anchor-rows`** | `anchor-rows.py` | stage, check and apply one fold's deferred-anchor rows as a batch through the door, rehearsed in a throwaway repository first, all or nothing, every row read back. |
 | **`anchors`** | `anchors.py` | read and lint deferred-anchor registry rows, and launch the one door that writes them, dssharness write-anchor and set-anchor. |
 | **`apply-registry-row`** | `apply-registry-row.py` | replace one deferred-anchor registry row with a lane's verbatim row text from a file. |
 | **`burndown-queue`** | `burndown-queue.py` | re-derive the prioritized burndown queue from the registry, production errors first. |

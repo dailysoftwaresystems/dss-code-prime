@@ -336,7 +336,7 @@ def recompile(run, label, driver):
                                 CMP.rebuild_command(run.compiler, run.repo_root))
     log.ok("the pair compiles against its config for: %s" % proved)
     log.step("R3  The staged sqlite state (reused only when CURRENT)")
-    run.run_lock = P.RunLock(os.path.join(run.stage_root, ".harness-lock"))
+    run.run_lock = P.RunLock(os.path.join(run.stage_root, C.RUN_LOCK))
     stolen = run.run_lock.acquire(log)
     if stolen:
         log.warn("took over a STALE run lock left by PID %s" % stolen)

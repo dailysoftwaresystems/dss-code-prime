@@ -61,6 +61,12 @@ constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
 
 [[nodiscard]] TypeInterner makeInterner() { return TypeInterner{CompilationUnitId{1}}; }
 
+// A HAND-BUILT config for hand-built HIR: no language schema is loaded (none can spell these
+// explicit-offset structs), so `languageMirLoweringConfig` has no input here. The field an
+// audit listed this fixture as missing, `globalsConstantForms`, has no reader here either:
+// every case lowers a function-local initializer, and the static-initializer policy is read
+// only by `classifyGlobals`, over `HirKind::Global` declarations, which no case builds (P68
+// round 13 fold F7).
 [[nodiscard]] MirLoweringConfig makeConfig() {
     MirLoweringConfig cfg;
     cfg.aggregateLayout       = kNatural16;

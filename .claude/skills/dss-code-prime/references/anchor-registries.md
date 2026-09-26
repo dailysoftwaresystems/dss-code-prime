@@ -33,7 +33,7 @@ IS the compiler's behaviour, and a diagnostic IS its output to a user.
 
 `Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCLOSED`, and
 `--status` or a `--status-file` holds one of those cells or its bare word (`closed`, `open`, `gated`,
-`disclosed`); `DssHarness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)`
+`disclosed`); `dssharness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)`
 included.
 The status cell keeps its glyph because the project's one definition of closed is *"the cell OPENS
 with ✅"* — a column holding the bare word would make that test false for every closed row at once.

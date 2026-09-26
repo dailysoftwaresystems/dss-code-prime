@@ -98,9 +98,16 @@ steps:
   # The speedtest1 BENCHMARK: DSS against the reference C compilers building and running
   # SQLite's own test/speedtest1.c from full source (`benchmark_speedtest1.py` documents it), of
   # the PINNED sqlite -- legs.json `stageBuild.sqliteCommit`, the revision the corpus and the
-  # recompile compile, which the step's default checkout is put on first. The report is KEPT: the
-  # raw measurement and its README-ready markdown, each naming the sqlite head measured and whether
-  # it IS the pin.
+  # recompile compile -- read from the harness's OWN checkout inside this tree
+  # (build/real-examples/c/sqlite[/windows]/speedtest1/sqlite), put on the pin under the tree's run
+  # lock, the one the corpus run and the recompile take, so two runs of one tree serialize on every
+  # host. What the benchmark writes stays in the tree: the checkout, the lock, this step's output and
+  # the measurement core's own temporaries (the vcvars script, the pre-flight probe, the timed
+  # databases), which go in `speedtest1/scratch` beside the checkout and are removed when the run
+  # ends. The compilers it times, and the POSIX build that derives the subject, write their own
+  # temporary files where their environment says -- theirs, not moved. The report is KEPT: the raw
+  # measurement and its README-ready markdown, each naming the sqlite head measured and whether it IS
+  # the pin.
   - name: benchmark-speedtest1
     manual: true
     workingDirectoryRoot: action

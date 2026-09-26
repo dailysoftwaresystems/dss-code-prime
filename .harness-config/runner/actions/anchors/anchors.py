@@ -24,12 +24,15 @@ DELETED. What stays is what a reader, a guard or a caller of the door needs:
   * the READER -- `read_rows`, `find`, `lint`, and the `read` / `list` verbs;
   * the VOCABULARY -- the status words and cells, the bands, the table shape -- so a caller
     maps a lane's text to the door's words through one table;
-  * the LAUNCHER -- `door_write`, the one composition of a door call that `lane-fold` and
-    `apply-registry-row` share: the cells go by FILE (a 48 KB row once crossed Windows'
-    32,767-character command line), an update names only the fields that CHANGE (a cell the
+  * the LAUNCHER -- `door_write`, the one composition of a door call that `lane-fold`,
+    `apply-registry-row` and `anchor-rows` share: the cells go by FILE (a 48 KB row once crossed
+    Windows' 32,767-character command line), an update names only the fields that CHANGE (a cell the
     door is not asked to write keeps its bytes), and the call runs without the caller's git
-    selection. It refuses, BEFORE the door, only what is this repository's vocabulary (a status
-    or band outside it, the retired disclosed spelling) and an update naming no field. Its
+    selection. It refuses, BEFORE the door, what is this repository's vocabulary (a status or band
+    outside it, the retired disclosed spelling), an update naming no field, and text the door would
+    store BROKEN without seeing it, judged AS THE DOOR WILL STORE IT (`door_form`): an anchor id broken
+    by a line break or a joined-line space, and a path cut the same way (`cell_refusals`, keyed on the
+    id grammar the tree's config.json declares, `id_grammar`). Its
     report-#7 refusals (a Status/Trigger verdict split, in-line whitespace the door collapsed, a
     leading BOM) were DELETED when DssHarness 0.5.9 closed that gap: the door owns them now,
     the verdict rule through `anchors.triggerCarriesVerdict: true`.
@@ -69,6 +72,7 @@ A row is WRITTEN with `dssharness write-anchor` (new) or `dssharness set-anchor`
 from __future__ import annotations
 
 import argparse
+import collections
 import importlib.util
 import io
 import json
@@ -378,9 +382,9 @@ def lint(root):
 
 # ───────────────────────────────── the door ───────────────────────────────────
 #
-# ★★★ THE ONE COMPOSITION OF A ROW WRITE. `lane-fold` (a lane's cell files) and
-# `apply-registry-row` (a lane's one-line row file) both end here, so the argv, the cell
-# files, the executable and the refusals below exist once.
+# ★★★ THE ONE COMPOSITION OF A ROW WRITE. `lane-fold` (a lane's landing), `apply-registry-row`
+# (a lane's one-line row file) and `anchor-rows` (a fold's batch of cell files) all end here, so
+# the argv, the cell files, the executable and the refusals below exist once.
 # ✔MEASURED 2026-09-23 on DssHarness 0.5.8, in git fixture trees: the door refuses a
 # pre-escaped pipe, an empty Trigger, a new id no guard could resolve, a priority or status
 # outside the vocabulary, `write-anchor` over an existing row, `set-anchor` on a missing one,
@@ -429,12 +433,24 @@ def door_executable(environ=None):
         % (" and ".join(DOOR_NAMES), ", ".join(tried) or "no HOME / USERPROFILE to look under"))
 
 
-def door_config(root):
-    """-> {bucket: rel} the door writes, read from `root`'s `.harness-config/config.json`."""
-    cfg = _owning_tree().load_jsonc(os.path.join(root, *CONFIG_REL.split("/")))
+def _anchors_section(root):
+    """-> the `anchors` section of `root`'s `.harness-config/config.json`, the section the door reads. A file that
+    cannot be read or parsed, or a section that is missing, is REFUSED -- with THIS module's `Refused`, so a caller
+    catches one class (owning-tree's is a fresh class per load)."""
+    ot = _owning_tree()
+    try:
+        cfg = ot.load_jsonc(os.path.join(root, *CONFIG_REL.split("/")))
+    except ot.Refusal as exc:
+        raise Refused(str(exc))
     anchors = cfg.get("anchors") if isinstance(cfg, dict) else None
     if not isinstance(anchors, dict):
         raise Refused("%s declares no `anchors` section, so the door has no registries" % CONFIG_REL)
+    return anchors
+
+
+def door_config(root):
+    """-> {bucket: rel} the door writes, read from `root`'s `.harness-config/config.json`."""
+    anchors = _anchors_section(root)
     return dict((b, str(anchors.get(key, ""))) for b, key in DOOR_CONFIG_KEYS.items())
 
 
@@ -449,6 +465,103 @@ def door_config(root):
 # now stores byte for byte). Self-test arm (14) pins the config key the door's check rides on.
 
 
+# ★ WHAT THE DOOR STORES (`door_form`; ✔MEASURED 2026-09-25 on DssHarness 0.5.12, and pinned against the REAL door
+# by anchor-rows' parity arm (p1)): a line break collapses, with the whitespace either side of it, into ONE space;
+# every other run of spaces or tabs is kept; the value's ends are trimmed. EVERY CONTENT REFUSAL BELOW JUDGES A CELL
+# AS THE DOOR WILL STORE IT: a check of the raw text cannot see the break the door is about to join -- round 13's
+# path-cut refusal matched a literal space, so a path wrapped at its `/` held a line break, passed, and would have
+# been stored cut (P68 round 13's audit, F1-A1).
+_BREAK = re.compile(r"\s*(?:\r\n|\r|\n)\s*")
+
+
+def door_form(text):
+    """What the door STORES for `text`: each line break, with the whitespace either side of it, becomes one space;
+    every other run of spaces or tabs is kept; the ends are trimmed."""
+    return _BREAK.sub(" ", text).strip()
+
+
+# ★ THE ID GRAMMAR IS CONFIG'S: `anchors.idPrefix` and `anchors.minimumIdSegments` in the tree's own config.json --
+# the keys the door reads -- composed here, never typed (round 13 had typed it three more times; the audit's F1-A9).
+# A segment is `ID_SEGMENT` (✔MEASURED 2026-09-26 over both registries, 2,271 rows: upper case, digits and `_`, and
+# lower case in two ids; no `.`); the prefix is the id's first segment, so a minimum of 3 is `<prefix>-A-B`.
+ID_SEGMENT = r"[A-Za-z0-9_]+"
+IdGrammar = collections.namedtuple("IdGrammar", "prefix min_segments")
+_NOT_AFTER_ID_CHAR = r"(?<![A-Za-z0-9_-])"
+
+
+def id_grammar(root):
+    """-> IdGrammar(prefix, min_segments) from `root`'s config.json `anchors` section; REFUSED when either key is
+    missing or malformed -- a grammar nobody declared is never a default."""
+    section = _anchors_section(root)
+    prefix, n = section.get("idPrefix"), section.get("minimumIdSegments")
+    if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z0-9]+", prefix):
+        raise Refused("%s `anchors.idPrefix` is %r, not the letters and digits an id opens with"
+                      % (CONFIG_REL, prefix))
+    if isinstance(n, bool) or not isinstance(n, int) or n < 2:
+        raise Refused("%s `anchors.minimumIdSegments` is %r, not a count of at least 2" % (CONFIG_REL, n))
+    return IdGrammar(prefix, n)
+
+
+def id_pattern(grammar):
+    """-> the regular expression (source) of one WHOLE id: the prefix, then at least `min_segments - 1` segments."""
+    return r"%s(?:-%s){%d,}" % (re.escape(grammar.prefix), ID_SEGMENT, grammar.min_segments - 1)
+
+
+def cited_ids(text, grammar):
+    """-> the set of ids `text` cites: each whole id-shaped token, except one followed by `-`, `*` or `{` -- a family
+    or pattern mention (`<prefix>-HARNESS-*`), which names no row."""
+    rx = re.compile(_NOT_AFTER_ID_CHAR + "(%s)(?![A-Za-z0-9_])" % id_pattern(grammar))
+    return set(m.group(1) for m in rx.finditer(text) if text[m.end():m.end() + 1] not in ("-", "*", "{"))
+
+
+def tree_dirs(root):
+    """-> the top-level directory names of `root` (`.git` excepted): where a path a cell cites starts. A root that
+    cannot be listed is REFUSED -- an empty answer would switch the path-cut refusal off unseen (the audit's F1-A8)."""
+    try:
+        return tuple(sorted(n for n in os.listdir(root)
+                            if n != ".git" and os.path.isdir(os.path.join(root, n))))
+    except OSError as exc:
+        raise Refused("the top-level directories of %s cannot be listed (%s), so a path a cell cites cannot be "
+                      "checked" % (root, exc))
+
+
+# ★ WHAT THE DOOR WOULD STORE BROKEN, refused here because the door cannot see it (✔MEASURED, P68):
+#   * an anchor id BROKEN by a line break or a joined-line space. After a hyphen (`<prefix>-AREA-` then the next
+#     line), the door stores `<prefix>-AREA- TOPIC`, a FALSE id no grep for the real one returns: refused on the
+#     STORED form, so the already-joined shape, an id holding `_` and a break right after the prefix are refused
+#     too (the audit's F1-A2). INSIDE a segment the stored form cannot tell a break from prose (`<id> 2-TU` and
+#     `<id> MF-4` are real, stored, one-line text), so that one is read on the raw text: an id-shaped token ENDING
+#     a line whose next line opens with an upper-case hyphenated token;
+#   * a PATH cut by a joined-line space -- a composer that joined wrapped lines with a space stored three paths
+#     broken after a `/` (`tests/hir/ test_x.cpp`) in the archive (round 9, lane cs fold 2). A `<dir>/` followed,
+#     AS STORED, by whitespace and a PATH-SHAPED token (one holding `_`, `.` or `-`) is refused; prose such as
+#     "touches no src/hir/ or src/mir/" is not path-shaped and passes. The directories a path starts from are the
+#     tree's own top level (`tree_dirs`), never a list typed here.
+def cell_refusals(text, roots, grammar):
+    """-> [why] for a prose cell the door would store BROKEN (see above); [] when it would store it whole."""
+    out = []
+    stored = door_form(text)
+    prefix, seg = re.escape(grammar.prefix), ID_SEGMENT
+    m = re.search(_NOT_AFTER_ID_CHAR + r"%s-(?:%s-)*\s+[A-Za-z0-9_]" % (prefix, seg), stored)
+    if m:
+        out.append("holds an anchor id broken after a hyphen (%r, as the door stores it): a line break becomes a "
+                   "space, so the row would hold a FALSE id no grep for the real one returns -- keep every id "
+                   "whole on one line" % m.group(0))
+    m = re.search(_NOT_AFTER_ID_CHAR + r"%s-(?:%s-)*%s[ \t]*(?:\r\n|\r|\n)\s*[A-Z0-9_]+-[A-Za-z0-9_]"
+                  % (prefix, seg, seg), text)
+    if m:
+        out.append("holds an anchor id wrapped inside a segment (%r): joined, it reads as a shorter FALSE id -- "
+                   "keep every id whole on one line" % m.group(0))
+    if roots:
+        cut = re.compile(r"(?<![A-Za-z0-9_./-])(?:%s)/(?:[A-Za-z0-9_.-]+/)*[ \t]+[A-Za-z0-9]+[_.-][A-Za-z0-9_./-]*"
+                         % "|".join(re.escape(r) for r in roots))
+        m = cut.search(stored)
+        if m:
+            out.append("holds a path cut by a joined-line space (%r, as the door stores it): a line wrapped after "
+                       "its `/` is joined with a space -- write the path whole" % m.group(0)[:80])
+    return out
+
+
 def door_write(root, anchor, fields, new, apply_it, exe=None, env=None):
     """ONE row write through the door -> (rc, output).
 
@@ -458,8 +571,10 @@ def door_write(root, anchor, fields, new, apply_it, exe=None, env=None):
     fields change; every other cell keeps its bytes, and the door judges the row it would store,
     so a verdict split against a kept Trigger is refused there). Without `apply_it` the door is
     asked for a DRY RUN. This launcher's own refusals -- the controlled vocabulary, an update
-    naming no field -- come back as (DOOR_REFUSED, why) before the door is asked anything; the
-    door's own code and words pass through otherwise.
+    naming no field, a prose cell the door would store broken (`cell_refusals`, against `root`'s
+    own id grammar and top-level directories, neither of which may be missing) -- come back as
+    (DOOR_REFUSED, why) before the door is asked anything; the door's own code and words pass
+    through otherwise.
     """
     fields = dict(fields)
     why = []
@@ -472,6 +587,14 @@ def door_write(root, anchor, fields, new, apply_it, exe=None, env=None):
         why.append(str(exc))
     if not new and not fields:
         why.append("nothing to write: an update names at least one field")
+    try:
+        grammar, roots = id_grammar(root), tree_dirs(root)
+    except Refused as exc:
+        why.append("the cells cannot be checked: %s" % exc)
+    else:
+        for name, _flag in DOOR_CELLS:
+            if name in fields:
+                why += ["the %s cell %s" % (name, w) for w in cell_refusals(str(fields[name]), roots, grammar)]
     if why:
         return DOOR_REFUSED, "\n".join(why)
     box = tempfile.mkdtemp(prefix="anchors-door-")
@@ -609,6 +732,11 @@ def self_test():
     ot = _owning_tree()
 
     def pin(ok, why, detail=""):
+        # a detail is printed as text, the system temp directory masked: on Windows it lies under the user
+        # profile, and a fixture path must not name the account in a run's log
+        _tmp = tempfile.gettempdir()
+        detail = (str(detail).replace(_tmp, "<temp>").replace(_tmp.replace("\\", "\\\\"), "<temp>")
+                  if detail else "")
         print("  %-4s %s%s" % ("ok" if ok else "FAIL", why,
                                ("   " + detail) if detail else ""))
         if not ok:
@@ -700,11 +828,24 @@ def self_test():
     # ── (14)..(21) THE LAUNCHER'S OWN REFUSALS: nothing reaches the door ────────────
     # `exe` names a program that does not exist, so an arm that wrongly REACHES the door
     # fails with an OSError refusal instead of passing -- and (21) is the control that
-    # proves the same launcher does reach a door when nothing is wrong.
+    # proves the same launcher does reach a door when nothing is wrong. The launcher reads the
+    # id grammar from the root it launches in, so every arm launches in a box holding THIS
+    # tree's `anchors` section and a `src/` and a `tests/` directory (the roots a path a cell
+    # cites starts from, `tree_dirs`).
     nowhere = os.path.join(tempfile.gettempdir(), "anchors-no-such-door-%d" % os.getpid())
+    this_anchors = ot.load_jsonc(os.path.join(ROOT, *CONFIG_REL.split("/"))).get("anchors")
+    launch_box = tempfile.mkdtemp(prefix="anchors-launch-")
 
-    def launch(fields, new=True):
-        return door_write(tempfile.gettempdir(), A_, fields, new, False, exe=nowhere)
+    def config_box(path, section):
+        os.makedirs(os.path.join(path, ".harness-config"), exist_ok=True)
+        with io.open(os.path.join(path, *CONFIG_REL.split("/")), "w", encoding="utf-8") as fh:
+            json.dump({"anchors": section}, fh)
+    config_box(launch_box, this_anchors)
+    for _d in ("src", "tests"):
+        os.makedirs(os.path.join(launch_box, _d))
+
+    def launch(fields, new=True, root=None):
+        return door_write(root or launch_box, A_, fields, new, False, exe=nowhere)
 
     def says(result, *needles):
         rc, out = result
@@ -741,6 +882,72 @@ def self_test():
     pin(_none is not None and "dotnet tool install --global DssHarness" in _none,
         "(21b) a host WITHOUT the tool is a refusal that says how to install it -- never a "
         "fallback writer", (_none or "")[:120])
+    # (21c)..(21h) the content the door would store BROKEN, refused by the launcher AS THE DOOR WILL STORE IT
+    # (`door_form`) -- every shape a lane's cell file really holds, the line break included, never only the
+    # already-joined one (P68 round 13's audit, F1-A1/A2: the first arms synthesized only the joined shape, and the
+    # refusal they pinned could not see a line break). `pre` is the id prefix alone: this file is a citation root,
+    # so no whole three-segment id is ever written as one literal here.
+    pre = "D" + "-"
+    try:
+        _shapes = (("\\n", "FIXTURE-\nANCHORS-GAMMA"), ("\\n + indent", "FIXTURE-\n    ANCHORS-GAMMA"),
+                   ("\\r\\n", "FIXTURE-\r\nANCHORS-GAMMA"), ("already joined", "FIXTURE- ANCHORS-GAMMA"),
+                   ("an id holding _", "FIX_TURE-\nANCHORS-GAMMA"), ("right after the prefix", "\nFIXTURE-ANCHORS"))
+        _passed = [label for label, tail in _shapes
+                   if not says(launch({"priority": "P1", "trigger": "🟠 **OPEN** waits on " + pre + tail}),
+                               "the trigger cell", "broken after a hyphen")]
+        pin(not _passed, "(21c) an anchor id BROKEN after a hyphen is refused in every shape a cell file holds -- a "
+                         "line break, one with the next line indented, CRLF, the already-joined space, an id "
+                         "holding `_`, a break right after the prefix", "passed: %s" % _passed)
+        pin(says(launch({"priority": "P1", "trigger": "🟠 **OPEN** waits on " + pre + "FIXTURE-ANCH\nORS-GAMMA"}),
+                 "wrapped inside a segment"),
+            "(21c2) an anchor id wrapped INSIDE a segment is refused -- joined, it reads as a shorter false id")
+        for label, cut in (("(21d) the already-joined shape", "see tests/hir/ test_brace_element.cpp"),
+                           ("(21d2) a line break after the `/`", "see tests/hir/\ntest_brace_element.cpp"),
+                           ("(21d3) a line break and an indent after the `/`",
+                            "see tests/hir/\n    test_brace_element.cpp"),
+                           ("(21d4) a CRLF after the `/`", "see tests/hir/\r\ntest_brace_element.cpp")):
+            _r = launch({"priority": "P1", "trigger": "🟠 **OPEN** t", "closing": cut})
+            pin(says(_r, "the closing cell", "joined-line space"),
+                "%s: a path cut there is refused, naming the cell -- the door would store it cut" % label,
+                _r[1][:160])
+        _prose = launch({"priority": "P1", "trigger": "🟠 **OPEN** touches no src/hir/ or src/mir/",
+                         "cross_refs": "tests/hir/test_x.cpp\nand src/\nmore, " + pre + "FIXTURE-*",
+                         "closing": "blocked by " + pre + "FIXTURE-ANCHORS-GAMMA\nand more; " + pre
+                                    + "FIXTURE-ANCHORS-GAMMA 2-TU probe"})
+        pin(_prose[0] == DOOR_REFUSED and "could not be started" in _prose[1],
+            "(21e) CONTROL: prose naming directories, whole paths across a line break, a family mention, an id "
+            "ending a line before lower-case prose, and an id followed on ONE line by an upper-case hyphenated "
+            "token (a stored shape, ✔MEASURED) all reach the door (here one that does not exist, so its absence is "
+            "the only answer)", _prose[1][:200])
+        _unlisted = refuse(tree_dirs, os.path.join(launch_box, "no-such-root"))
+        pin(_unlisted is not None and "cannot be listed" in _unlisted,
+            "(21f) a root whose directories cannot be listed is a REFUSAL -- never an empty answer that switches the "
+            "path-cut refusal off unseen", _unlisted)
+        q_box = tempfile.mkdtemp(dir=launch_box)
+        config_box(q_box, dict(this_anchors, idPrefix="Q"))
+        _gq = refuse(id_grammar, q_box) or id_grammar(q_box)
+        _q_ok = isinstance(_gq, IdGrammar) and _gq.prefix == "Q"
+        pin(_q_ok and bool(cell_refusals("waits on Q-FIXTURE-\nANCHORS-GAMMA", (), _gq))
+            and not cell_refusals("waits on " + pre + "FIXTURE-\nANCHORS-GAMMA", (), _gq)
+            and cited_ids("Q-FIXTURE-ALPHA, and " + pre + "FIXTURE-ALPHA", _gq) == {"Q-FIXTURE-ALPHA"}
+            and re.fullmatch(id_pattern(_gq), "Q-A-B") and not re.fullmatch(id_pattern(_gq), "Q-A"),
+            "(21g) the id grammar is config.json's (`anchors.idPrefix` / `minimumIdSegments`): a tree declaring the "
+            "prefix Q breaks, cites and counts segments by Q, and the D of this tree is prose there", _gq)
+        bad_box = tempfile.mkdtemp(dir=launch_box)
+        config_box(bad_box, dict((k, v) for k, v in this_anchors.items() if k != "idPrefix"))
+        _nogrammar = launch({"priority": "P1", "trigger": "🟠 **OPEN** t"}, root=bad_box)
+        _noconfig = launch({"priority": "P1", "trigger": "🟠 **OPEN** t"}, root=tempfile.mkdtemp(dir=launch_box))
+        pin(says(_nogrammar, "cannot be checked", "idPrefix") and says(_noconfig, "cannot be checked"),
+            "(21h) a root declaring no id grammar, or no config at all, is refused before the door -- a grammar "
+            "nobody declared is never a default", (_nogrammar[1][:120], _noconfig[1][:120]))
+        cit = cited_ids("see [[" + pre + "FIXTURE-ALPHA]], `" + pre + "FIXTURE-BETA`; " + pre + "FIXTURE-GAMMA.1, "
+                        "the " + pre + "FIXTURE-ROWS-* family, " + pre + "FIXTURE-ROWS-{A,B} and " + pre + "TWO",
+                        IdGrammar("D", 3))
+        pin(cit == {pre + "FIXTURE-ALPHA", pre + "FIXTURE-BETA", pre + "FIXTURE-GAMMA"},
+            "(21i) cited_ids reads a wiki-link, a backticked id and an id before a dot as citations, and a family "
+            "mention (`-*`, `-{..}`) and a two-segment token as none", sorted(cit))
+    finally:
+        ot.remove_tree(launch_box)
 
     # ── (22)..(36) PARITY: every refusal the deleted writer made, in the REAL door ───
     fx_root = tempfile.mkdtemp(prefix="anchors-door-fixture-")

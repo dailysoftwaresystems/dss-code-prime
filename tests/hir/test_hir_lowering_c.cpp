@@ -5338,6 +5338,133 @@ TEST(HirLoweringC, HighByteCharLiteralLowersToItsSignedValueOnASignedCharTarget)
            "code unit, not the value";
 }
 
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): THE PAYLOAD OF A SIZED
+//    LITERAL IS ITS MAGNITUDE REDUCED TO ITS FIXED TYPE ─────────────────────────────
+//
+// MSVC's sized suffixes fix the type (`i8` char … `ui64` unsigned long long) and
+// reduce a magnitude that type cannot hold modulo 2^width at the type's sign.
+// ✔MEASURED 2026-09-25, MSVC 19.51.36260 through `dssharness run
+// probe-reference-cc --legs windows-x86_64-release` (run 20260925-092743-c2711a1a):
+// every (core, value) below is MSVC's. The pool is where the value is DECIDED —
+// every later tier copies it — so a lowering that stored the magnitude (300 in a
+// `char`) would hand codegen a constant no reference computes.
+TEST(HirLoweringC, SizedSuffixLiteralsCarryTheirFixedTypeAndReducedValue) {
+    struct Row {
+        char const*  text;
+        TypeKind     core;
+        std::int64_t value;      // the signed arm's payload…
+        bool         unsignedArm;  // …or, when set, the unsigned arm's (as bits)
+    };
+    static constexpr Row kRows[] = {
+        {"300i8",                     TypeKind::Char, 44,          false},
+        {"0xFFi8",                    TypeKind::Char, -1,          false},
+        {"128i8",                     TypeKind::Char, -128,        false},
+        {"256ui8",                    TypeKind::U8,   0,           true},
+        {"0x1FFui8",                  TypeKind::U8,   255,         true},
+        {"32768i16",                  TypeKind::I16,  -32768,      false},
+        {"65536ui16",                 TypeKind::U16,  0,           true},
+        {"2147483648i32",             TypeKind::I32,  -2147483648LL, false},
+        {"4294967296i32",             TypeKind::I32,  0,           false},
+        {"4294967296ui32",            TypeKind::U32,  0,           true},
+        {"0xFFFFFFFFFFFFFFFFi64",     TypeKind::I64,  -1,          false},
+        {"18446744073709551615ui64",  TypeKind::U64,  -1,          true},
+        {"5I16",                      TypeKind::I16,  5,           false},
+        {"5UI32",                     TypeKind::U32,  5,           true},
+    };
+    for (auto const& row : kRows) {
+        SemanticModel model =
+            analyzeC(std::string{"long long f(void) { return "} + row.text + "; }");
+        ASSERT_FALSE(model.hasErrors()) << row.text;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << row.text << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u) << row.text;
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, row.core) << row.text;
+        if (row.unsignedArm) {
+            ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value)) << row.text;
+            EXPECT_EQ(std::get<std::uint64_t>(v.value),
+                      static_cast<std::uint64_t>(row.value)) << row.text;
+        } else {
+            ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value)) << row.text;
+            EXPECT_EQ(std::get<std::int64_t>(v.value), row.value) << row.text;
+        }
+    }
+}
+
+// `i8` is plain `char`, so its reduced value follows the TARGET's char sign: the
+// fixture above is x86_64 (signed, -1); arm64 × ELF declares plain `char` UNSIGNED,
+// and there the same `0xFFi8` is +255. Both targets, one source: the answer is READ.
+TEST(HirLoweringC, SizedCharLiteralReadsTheTargetsCharSignedness) {
+    static std::shared_ptr<TargetSchema const> const kArm64 = [] {
+        auto t = TargetSchema::loadShipped("arm64");
+        return t.has_value() ? *t : nullptr;
+    }();
+    ASSERT_NE(kArm64, nullptr) << "the shipped arm64 target did not load";
+    auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+    UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
+    builder.addInMemory("int f(void) { return 0xFFi8; }", "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    SemanticModel model = analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                                  std::nullopt, std::nullopt,
+                                  SelectableObjectFormatKind::of(ObjectFormatKind::Elf),
+                                  std::nullopt, LongDoubleFormat::None, kArm64.get());
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value));
+    EXPECT_EQ(std::get<std::int64_t>(v.value), 255)
+        << "arm64 × ELF declares plain `char` unsigned: 0xFF reduced to a `char` is 255";
+}
+
+// The CONSTANT-EXPRESSION tier of the same rule, on both char signedness a shipped
+// pair declares: `0x80i8` is -128 where plain `char` is signed (x86_64 × ELF, and
+// every Windows pair — MSVC's `_Static_assert(0x80i8 == -128)` holds) and +128
+// where it is unsigned (arm64 × ELF). Each assertion's NEGATION is the control that
+// the fold decided the value rather than accepting anything.
+TEST(HirLoweringC, SizedCharLiteralFoldsAtTheTargetsCharSignedness) {
+    auto const analyzeOn = [](char const* arch, std::string src) {
+        static std::shared_ptr<TargetSchema const> const kX64 = [] {
+            auto t = TargetSchema::loadShipped("x86_64");
+            return t.has_value() ? *t : nullptr;
+        }();
+        static std::shared_ptr<TargetSchema const> const kArm64 = [] {
+            auto t = TargetSchema::loadShipped("arm64");
+            return t.has_value() ? *t : nullptr;
+        }();
+        TargetSchema const* const target =
+            std::string_view{arch} == "arm64" ? kArm64.get() : kX64.get();
+        EXPECT_NE(target, nullptr) << arch;
+        auto const loaded = dss::test_support::shippedSchemaOrThrow("c");
+        UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
+        builder.addInMemory(std::move(src), "<mem>");
+        auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+        return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64,
+                       std::nullopt, std::nullopt,
+                       SelectableObjectFormatKind::of(ObjectFormatKind::Elf),
+                       std::nullopt, LongDoubleFormat::None, target);
+    };
+    std::string const common = "_Static_assert(300i8 == 44, \"\");\n"
+                               "_Static_assert(256i8 == 0, \"\");\n";
+    EXPECT_FALSE(analyzeOn("x86_64", common + "_Static_assert(0x80i8 == -128, \"\");\n"
+                                              "_Static_assert(0xFFi8 + 0 == -1, \"\");\n")
+                     .hasErrors())
+        << "signed plain char: 0x80i8 is -128 and 0xFFi8 is -1";
+    EXPECT_TRUE(analyzeOn("x86_64", "_Static_assert(0x80i8 == 128, \"\");\n").hasErrors())
+        << "control: on a signed-char target 0x80i8 is NOT +128";
+    EXPECT_FALSE(analyzeOn("arm64", common + "_Static_assert(0x80i8 == 128, \"\");\n"
+                                             "_Static_assert(0xFFi8 + 0 == 255, \"\");\n")
+                     .hasErrors())
+        << "unsigned plain char: 0x80i8 is +128 and 0xFFi8 is 255";
+    EXPECT_TRUE(analyzeOn("arm64", "_Static_assert(0x80i8 == -128, \"\");\n").hasErrors())
+        << "control: on an unsigned-char target 0x80i8 is NOT -128";
+}
+
 TEST(HirLoweringC, CharEscapeLowersToControlCodepoint) {
     SemanticModel model = analyzeC("char f() { return '\\n'; }");
     ASSERT_FALSE(model.hasErrors());

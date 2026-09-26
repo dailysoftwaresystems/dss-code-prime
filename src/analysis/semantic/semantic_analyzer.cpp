@@ -1988,6 +1988,20 @@ readDeclaratorChain(Tree const& tree, NodeId start, DeclaratorConfig const& dc,
     }
 }
 
+// ★ P68 round 13 (lane `cs`): the ONE answer of a walk that has taken more steps than its
+// tree has nodes. Every uncapped walk that calls this moves to a strict descendant (or a
+// strict ancestor) at each step, so on a well-formed tree it can never get here; getting
+// here means the node graph is cyclic — memory corruption or a TreeBuilder bug, never the
+// program's fault — and the process stops loud, as `readDeclaratorChain` does. Never an
+// answer as if the walk had ended: a truncated walk is how the fixed depth caps these walks
+// replace skipped a constraint or admitted what they had not checked.
+[[noreturn]] void
+failOnCyclicTree(char const* walk) {
+    std::fprintf(stderr, "dss::analyze fatal: %s took more steps than its tree has nodes "
+                         "— the node graph is cyclic\n", walk);
+    std::abort();
+}
+
 [[nodiscard]] std::optional<QualifierSpine>
 declaratorConstSpine(Tree const& tree, NodeId dNode, NodeId headNode,
                      DeclaratorConfig const& dc, SchemaTokenId constMarker,
@@ -3665,7 +3679,14 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // (mirrors the nullptr operator-gate walk); resolveMemberAccess
                     // exposes a bit-field field via `bitFieldWidth`.
                     NodeId probe = operandNode;
-                    for (int guard = 0; probe.valid() && guard < 64; ++guard) {
+                    // ★ P68 round 13 (lane `cs`): no cap. This stopped after 64 wrappers
+                    // and never saw a member access below them, so a bit-field operand
+                    // inside 64 or more parentheses escaped the constraint. Each step goes
+                    // to a strict descendant, so the tree's node count bounds the walk
+                    // (`failOnCyclicTree` past it).
+                    std::size_t const probeBound = tree.nodeCount() + 1;
+                    for (std::size_t step = 0; probe.valid(); ++step) {
+                        if (step > probeBound) failOnCyclicTree("the typeof bit-field probe");
                         if (tree.kind(probe) == NodeKind::Internal
                             && s.idx().memberAccessByRule.contains(
                                    tree.rule(probe).v)) {
@@ -5075,10 +5096,18 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
 // arm uses, extracted so the brace-list arm and the empty-brace arm cannot drift
 // on what "the initializer node" means. Returns `node` itself when nothing is
 // interposed; never leaves the subtree.
+// ★ P68 round 13 (lane `cs`): NO DEPTH CAP. This loop stopped after 64 wrappers and
+// returned the wrapper it had reached AS IF it were the initializer — so a constexpr
+// pointer whose null cast sat inside 64 or more parentheses was refused, the cast never
+// seen. Every step moves to a strict descendant, so the walk ends on any tree; a walk
+// longer than the tree has nodes can only mean a cyclic (malformed) tree
+// (`failOnCyclicTree`).
 [[nodiscard]] NodeId
 descendInitWrappers(EngineState const& s, Tree const& tree, NodeId node) {
     NodeId walk = node;
-    for (int guard = 0; guard < 64 && walk.valid(); ++guard) {
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t step = 0; walk.valid(); ++step) {
+        if (step > bound) failOnCyclicTree("the initializer wrapper descent");
         if (tree.kind(walk) != NodeKind::Internal) return walk;
         if (s.idx().braceInitListRule.valid()
             && tree.rule(walk).v == s.idx().braceInitListRule.v) return walk;
@@ -5130,7 +5159,13 @@ descendInitWrappers(EngineState const& s, Tree const& tree, NodeId node) {
 constexprPointerCastFoldsToNull(EngineState& s, SemanticConfig const& cfg,
                                 Tree const& tree, NodeId node, ScopeId here) {
     NodeId cur = node;
-    for (int guard = 0; guard < 16 && cur.valid(); ++guard) {
+    // ★ P68 round 13 (lane `cs`): no cap — this stopped after 16 casts and refused a
+    // longer chain of pointer casts over a null constant as not constant. Each step goes
+    // to the cast's operand, a strict descendant; the tree's node count bounds it
+    // (`failOnCyclicTree` past it).
+    std::size_t const bound = tree.nodeCount() + 1;
+    for (std::size_t step = 0; cur.valid(); ++step) {
+        if (step > bound) failOnCyclicTree("the constexpr null pointer cast chain");
         cur = descendInitWrappers(s, tree, cur);
         if (!cur.valid() || tree.kind(cur) != NodeKind::Internal) return false;
         auto const it = s.idx().castByRule.find(tree.rule(cur).v);
@@ -5364,21 +5399,10 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
     // compound literal `(int){}` (two Internal children) is NOT admitted — a
     // compound literal is not a C constant expression.
     if (s.idx().braceInitListRule.valid()) {
-        NodeId walk = initNode;
-        for (int guard = 0; guard < 64 && walk.valid(); ++guard) {
-            if (tree.kind(walk) != NodeKind::Internal) { walk = NodeId{}; break; }
-            if (tree.rule(walk).v == s.idx().braceInitListRule.v) break;
-            NodeId sole{};
-            bool   multiple = false;
-            for (NodeId c : visibleChildren(tree, walk)) {
-                if (tree.kind(c) != NodeKind::Internal) continue;
-                if (sole.valid()) { multiple = true; break; }
-                sole = c;
-            }
-            if (multiple || !sole.valid()) { walk = NodeId{}; break; }
-            walk = sole;
-        }
-        if (walk.valid()
+        // P68 round 13 (lane `cs`): the ONE descent (`descendInitWrappers`), not a private
+        // copy of it with its own 64-step cap.
+        NodeId const walk = descendInitWrappers(s, tree, initNode);
+        if (walk.valid() && tree.kind(walk) == NodeKind::Internal
             && tree.rule(walk).v == s.idx().braceInitListRule.v) {
             bool anyElement = false;
             for (NodeId c : visibleChildren(tree, walk)) {
@@ -5419,7 +5443,15 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         // scalar or a string literal. Bounded: the tree is finite and every push
         // is a strict descendant.
         std::vector<NodeId> pending{initNode};
-        for (int guard = 0; guard < 100000 && !pending.empty(); ++guard) {
+        // ★ P68 round 13 (lane `cs`): no cap. This stopped after 100000 items and
+        // returned as if every element had been checked — the ones still pending (the
+        // FIRST elements, since the stack pops the last first) never were, so a
+        // non-constant element there was ADMITTED. Every item is a strict descendant of
+        // `initNode`, so the tree's node count bounds the walk; past it (a cyclic tree
+        // only) the process stops loud (`failOnCyclicTree`) rather than half-check it.
+        std::size_t const bound = tree.nodeCount() + 1;
+        for (std::size_t step = 0; !pending.empty(); ++step) {
+            if (step > bound) failOnCyclicTree("the constexpr aggregate walk");
             NodeId const raw = pending.back();
             pending.pop_back();
             NodeId const value = descendInitWrappers(s, tree, raw);
@@ -9610,6 +9642,611 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
                      rec.name, isExtern ? "extern" : "static"));
 }
 
+// ── P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4 ────────────────────────
+//
+// "All the expressions in an initializer for an object that has static or thread storage
+// duration shall be constant expressions or string literals" (C17 6.7.9p4; C23 6.7.11p5 adds
+// a constexpr object, which `validateConstexprDeclarator` owns). A CONSTRAINT, and DSS decided
+// it nowhere: the static-data producer folded a NON-const object's value silently (`int y =
+// 42; int x = y;`, `int a[2] = { 1, y };`, a `const volatile` read, a read of a const whose
+// initializer FOLLOWS it — every reference refuses them, DSS ran 42), refused a call with an
+// OBJECT-FORMAT code, and ABORTED on `static int *p = &local;` and on a static local
+// initialized from an automatic array's decay (MirFunctionRebuilder fatal, exit 0xC0000409)
+// — ✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/nci`, `sti` … `sti10`: gcc 13.3.0 and
+// clang 18.1.3 in both modes, mingw-w64 13.2.0, MSVC 19.51, every build RUN;
+// [[D-C-A-STATIC-INITIALIZER-THAT-IS-NOT-A-CONSTANT-EXPRESSION-IS-ACCEPTED]].
+//
+// ★★★ THIS REFUSES ONLY WHAT IS PROVABLY NOT A CONSTANT, IN AN EVALUATED POSITION — never
+// "what DSS cannot fold". The two are far apart: the same probes measured thirty-odd forms a
+// reference builds that the producer could not fold (address algebra, library calls gcc folds
+// as builtins, a block-scope const read, a statement expression), and a check that called
+// those "not a constant" would state something false about a working program. What IS proof,
+// each refused by every reference:
+//   * the VALUE of an object that is not a const, non-volatile object whose initializer is
+//     visible at the read (`constObjectRead`, when the language names it; the language names
+//     no such form ⇒ every object read) — volatile meaning the OBJECT's type, looked through
+//     its array spine (`TypeInterner::isVolatileObjectType`), for a declared object, and any
+//     volatile lvalue on the read's path for a compound literal (P68 round 13 fold F7);
+//   * a CALL to a function this translation unit DEFINES — a library name is NOT proof:
+//     `strlen("abc")` builds on gcc c2x, clang in both modes and mingw-w64 c2x, and `abs(-42)`
+//     / `sqrt(1764.0)` on gcc c2x and mingw-w64 c2x (`.temp/probe/sti10`);
+//   * an assignment, an increment or a decrement;
+//   * the ADDRESS — or an array designator's decay — of an object of automatic storage
+//     duration: a block-scope object, a parameter, a block-scope compound literal (6.5.2.5p5);
+//   * a SYMBOL's address converted to an integer narrower than a pointer (no relocation holds
+//     it; a NULL-based address is a compile-time integer, and all four fold it);
+//   * the comma operator, unless the language names `commaOperator` (then it is admitted WITH
+//     S_StaticInitializerUsesTheCommaOperator, the diagnostic 6.6p3's constraint asks for).
+// EVALUATEDNESS IS DECIDED, NOT GUESSED: a `?:` condition, the left operand of `&&` / `||`,
+// and a `__builtin_choose_expr` / `_Generic` selection are FOLDED first and only what runs is
+// walked (`int x = 1 ? 42 : y;` and `static int *p = 1 ? &s : &l;` build on all four); an
+// operand of `sizeof` / `_Alignof` reads nothing (6.5.3.4p2); a condition that does not fold
+// walks nothing below it — no refusal without proof. A thread-local object's address is not an
+// address constant either (6.6p9), but that refusal has ONE owner already
+// (S_ThreadLocalAddressNotConstant at the static-data producer) and is left there.
+//
+// No input-proportional recursion: one explicit work stack, bounded by the tree's node count.
+enum class StaticInitUse : std::uint8_t {
+    Value,     // the value is used (an rvalue)
+    Read,      // an lvalue whose stored value is read (an element's or a member's container)
+    Address,   // an lvalue whose ADDRESS is taken (`&`, and an array designator's decay)
+};
+
+// Does `rec` name an OBJECT of static storage duration (C 6.2.4p3) — declared at file scope,
+// `extern`, or at block scope with the language's static-storage specifier? Never a
+// thread-local one (thread storage, 6.2.4p4), a parameter or an automatic object.
+[[nodiscard]] bool
+objectHasStaticStorageDuration(EngineState const& s, SemanticConfig const& cfg,
+                               Tree const& tree, SymbolRecord const& rec) {
+    if (rec.kind != DeclarationKind::Variable || rec.isEnumerator) return false;
+    if (rec.isThreadLocal) return false;
+    if (rec.isPredefinedFunctionName) return true;   // `__func__`: C99 6.4.2.2p1 `static`
+    if (rec.scope.v == fileScopeOf(s, tree, rec.scope).v) return true;
+    if (rec.isExternDeclaration) return true;
+    if (rec.tree.v != tree.id().v || !rec.declRuleNode.valid()) return false;
+    auto const it = s.idx().declByRule.find(tree.rule(rec.declRuleNode).v);
+    if (it == s.idx().declByRule.end()) return false;
+    return scanSpecifierPrefixStorage(cfg, tree, rec.declRuleNode,
+                                      cfg.declarations[it->second]).staticStorage;
+}
+
+struct StaticInitializerFinding {
+    NodeId      notConstant{};   // the first provably non-constant construct
+    std::string why;             // what it is, for the diagnostic
+    NodeId      comma{};         // the first comma operator the element evaluates
+};
+
+// The qualifier spine a TYPE NAME claims (defined with the const-lvalue walk below); the
+// static-initializer check reads a compound literal's element qualification through it.
+[[nodiscard]] std::optional<QualifierSpine>
+typeNameQualifierSpine(EngineState const& s, SemanticConfig const& cfg,
+                       Tree const& tree, NodeId typeNode);
+
+// The first construct in ONE initializer element (never a brace list) that is provably not a
+// constant, and the first comma operator it evaluates. `outsideFunctionBodies` says whether the
+// DECLARATION is at file scope — where a compound literal of its initializer has static storage
+// duration, never automatic (C 6.5.2.5p5). It comes from the declared object's own scope, never
+// from `here`: a file-scope DEFINITION opens its own child scope in the walk, so `here` is not
+// the file scope there (P68 round 13: `int *p = &(int){ 42 };` was refused as automatic, where
+// all four references build it).
+[[nodiscard]] StaticInitializerFinding
+findNonConstantInStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                                   NodeId element, ScopeId here,
+                                   ConstantForms const& forms, bool outsideFunctionBodies) {
+    auto const& hirCfg = tree.schema().hirLowering();
+    TypeInterner& in = s.lattice.interner();
+    StaticInitializerFinding out;
+    auto const isRule = [&](NodeId n, RuleId r) {
+        return r.valid() && n.valid() && tree.kind(n) == NodeKind::Internal && tree.rule(n).v == r.v;
+    };
+    auto const isUnevaluated = [&](NodeId n) {
+        return isRule(n, hirCfg.sizeofRule) || isRule(n, hirCfg.alignofRule)
+            || isRule(n, cfg.sizeofTypeRule) || isRule(n, cfg.sizeofValueRule)
+            || isRule(n, cfg.alignofTypeRule) || isRule(n, cfg.alignofValueRule);
+    };
+    auto const isOperatorNode = [&](NodeId n) {
+        if (!n.valid() || tree.kind(n) != NodeKind::Internal) return false;
+        std::uint32_t const r = tree.rule(n).v;
+        return isRule(n, hirCfg.unaryExprRule) || isRule(n, hirCfg.binaryExprRule)
+            || isRule(n, hirCfg.postfixExprRule) || isRule(n, hirCfg.ternaryExprRule)
+            || isRule(n, hirCfg.labelAddressRule) || isRule(n, hirCfg.chooseExprRule)
+            || isRule(n, hirCfg.stmtExprRule) || isRule(n, cfg.genericRule)
+            || isRule(n, s.idx().braceInitListRule) || isRule(n, s.idx().stringLiteralExprRule)
+            || isUnevaluated(n)
+            || s.idx().castByRule.contains(r) || s.idx().compoundLiteralByRule.contains(r);
+    };
+    // Descend the transparent single-child wrappers (a paren group, the expression carriers)
+    // — never through an operator, a cast, a literal form or a selection.
+    std::size_t const bound = tree.nodeCount() + 1;   // a strict-descendant walk cannot exceed it
+    auto const peel = [&](NodeId n) {
+        for (std::size_t guard = 0; n.valid(); ++guard) {
+            if (guard > bound) failOnCyclicTree("the static initializer check's wrapper peel");
+            if (tree.kind(n) != NodeKind::Internal || isOperatorNode(n)) return n;
+            NodeId sole{};
+            bool multiple = false;
+            for (NodeId c : visibleChildren(tree, n)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (sole.valid()) { multiple = true; break; }
+                sole = c;
+            }
+            if (multiple || !sole.valid()) return n;
+            n = sole;
+        }
+        return n;
+    };
+    auto const operatorOf = [&](NodeId n, std::vector<HirOperatorEntry> const& ops)
+        -> HirOperatorEntry const* {
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) != NodeKind::Token) continue;
+            for (auto const& e : ops)
+                if (e.token.v == tree.tokenKind(c).v) return &e;
+        }
+        return nullptr;
+    };
+    auto const internals = [&](NodeId n) {
+        std::vector<NodeId> v;
+        for (NodeId c : visibleChildren(tree, n))
+            if (tree.kind(c) != NodeKind::Token) v.push_back(c);
+        return v;
+    };
+    // The identifier token of a LEAF operand (no Internal child), else invalid.
+    auto const identifierOf = [&](NodeId n) -> NodeId {
+        if (!cfg.identifierToken.valid() || !n.valid()) return NodeId{};
+        if (tree.kind(n) == NodeKind::Token)
+            return tree.tokenKind(n) == cfg.identifierToken ? n : NodeId{};
+        NodeId id{};
+        for (NodeId c : visibleChildren(tree, n)) {
+            if (tree.kind(c) == NodeKind::Internal) return NodeId{};
+            if (tree.tokenKind(c) == cfg.identifierToken) id = c;
+        }
+        return id;
+    };
+    auto const typeKindOf = [&](NodeId n) {
+        TypeId const t = subtreeType(s, tree, n, here);
+        return t.valid() ? in.kind(t) : TypeKind::Count_;
+    };
+    auto const isAddressKind = [](TypeKind k) {
+        return k == TypeKind::Ptr || k == TypeKind::Array || k == TypeKind::FnSig;
+    };
+    // A condition's truth value, when the CST engine folds it; nullopt when it does not (an
+    // address condition it does not model, or a genuinely non-constant one — whose own
+    // operands are then walked for proof).
+    auto const conditionValue = [&](NodeId c) -> std::optional<bool> {
+        auto const v = constExprValue(s, tree, c, here, &cfg);
+        if (!v.has_value()) return std::nullopt;
+        return asBoolBridge(*v, /*allowFloat=*/true);
+    };
+    auto const prove = [&](NodeId at, std::string why) {
+        out.notConstant = at;
+        out.why = std::move(why);
+    };
+    // Is `callee`'s function DEFINED in this translation unit (a user function: every
+    // reference refuses a call to it)? A builtin or a library name is not proof.
+    auto const calleeIsDefinedHere = [&](NodeId callee) {
+        NodeId const id = identifierOf(peel(callee));
+        if (!id.valid()) return false;
+        SymbolId const sym = s.scopes.lookup(here, tree.text(id));
+        if (!sym.valid()) return false;
+        SymbolRecord const& r = s.symbols.at(sym);
+        return r.kind == DeclarationKind::Function && r.tree.v == tree.id().v
+            && r.declRuleNode.valid() && !r.isProtoDeclaration && !r.isExternDeclaration;
+    };
+
+    // One node to walk, how its value is used, and two facts its parent hands down (P68 round
+    // 13, fold F7 — each MEASURED through `dssharness run probe-reference-cc` on gcc 13.3.0,
+    // clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51, both modes; lane `cs`'s `.temp/probe/f7`):
+    //   * `volatileRead` — this node is the container of a READ whose own lvalue is
+    //     volatile-qualified (a volatile element or member on the way down). Only a COMPOUND
+    //     LITERAL consults it: clang, the one reference that reads a compound literal's element
+    //     or member, refuses every volatile read (`((const struct { volatile int v; }){ 42 }).v`
+    //     is refused by all four), while for a DECLARED object gcc, its widest reader, asks only
+    //     whether the OBJECT is volatile (`cs.v` of `static const struct { volatile int v; } cs`
+    //     builds on gcc and mingw-w64) — `TypeInterner::isVolatileObjectType`;
+    //   * `narrowedBy` — a cast converting this node's ADDRESS to an integer narrower than a
+    //     pointer. That is proof only once the address's BASE shows it is a symbol's — an
+    //     object's or a function's designator, a string literal, a static compound literal, a
+    //     label — because a NULL-based address is a compile-time integer, and all four
+    //     references build `int off = (int)&((struct T *)0)->m;` (the evaluator folds it).
+    struct Item {
+        NodeId         node;
+        StaticInitUse  use;
+        bool           volatileRead = false;
+        NodeId         narrowedBy{};
+    };
+    std::vector<Item> work{{element, StaticInitUse::Value}};
+    for (std::size_t guard = 0; !work.empty() && !out.notConstant.valid(); ++guard) {
+        if (guard > bound) failOnCyclicTree("the static initializer check");
+        Item const it = work.back();
+        work.pop_back();
+        NodeId const cur = peel(it.node);
+        if (!cur.valid()) continue;
+        RuleId const rule = tree.kind(cur) == NodeKind::Internal ? tree.rule(cur) : RuleId{};
+        // The narrowing an operand of `cur` inherits: only the operand that CARRIES `cur`'s
+        // address — an lvalue whose address is taken, or an address-valued operand — never an
+        // index, a read through a pointer, or any other integer.
+        auto const carried = [&](NodeId child, StaticInitUse use) -> NodeId {
+            if (!it.narrowedBy.valid()) return NodeId{};
+            if (use == StaticInitUse::Address) return it.narrowedBy;
+            if (use == StaticInitUse::Value && isAddressKind(typeKindOf(child))) return it.narrowedBy;
+            return NodeId{};
+        };
+        auto const proveNarrowing = [&] {
+            prove(it.narrowedBy, "converts an address to an integer narrower than a pointer, "
+                                 "which no relocation can hold");
+        };
+
+        if (isUnevaluated(cur)) continue;   // `sizeof` / `_Alignof` read nothing (6.5.3.4p2)
+        if (isRule(cur, s.idx().stringLiteralExprRule)) {
+            // static storage (6.4.5p6); an element READ of one is a const-object read, and its
+            // address (a decay, or `&`) has the literal's object for its base
+            if (it.use == StaticInitUse::Read) {
+                if (!forms.admits(ConstantForm::ConstObjectRead))
+                    prove(cur, "reads an element of a string literal");
+            } else if (it.narrowedBy.valid()) {
+                proveNarrowing();
+            }
+            continue;
+        }
+        if (isRule(cur, hirCfg.labelAddressRule)) {   // `&&L`: the producer lays it down
+            if (it.narrowedBy.valid()) proveNarrowing();
+            continue;
+        }
+        if (isRule(cur, hirCfg.stmtExprRule)) continue;       // gcc and clang fold `({ 42; })`
+        if (isRule(cur, cfg.genericRule)) {
+            if (NodeId const arm = genericSelectedArm(s, cfg, tree, cur, here); arm.valid())
+                work.push_back({arm, it.use, it.volatileRead, it.narrowedBy});
+            continue;
+        }
+        if (isRule(cur, hirCfg.chooseExprRule)) {
+            if (NodeId const arm = chooseExprSelectedArm(s, cfg, tree, cur, here, /*loud=*/false);
+                arm.valid())
+                work.push_back({arm, it.use, it.volatileRead, it.narrowedBy});
+            continue;
+        }
+        if (auto const clIt = s.idx().compoundLiteralByRule.find(rule.v);
+            clIt != s.idx().compoundLiteralByRule.end()) {
+            // Outside a function body a compound literal has static storage duration, inside
+            // one automatic (6.5.2.5p5): all four references refuse the latter's ADDRESS. Its
+            // VALUE is no proof — gcc c2x and clang build `static int x = (int){ 42 };`.
+            bool const addressed = it.use == StaticInitUse::Address
+                                || (it.use == StaticInitUse::Value
+                                    && typeKindOf(cur) == TypeKind::Array);
+            if (addressed && !outsideFunctionBodies) {
+                prove(cur, "takes the address of a compound literal of automatic storage "
+                           "duration (C 6.5.2.5p5), which is not an address constant (6.6p9)");
+                continue;
+            }
+            if (addressed && it.narrowedBy.valid()) {   // a static literal's object is its base
+                proveNarrowing();
+                continue;
+            }
+            // An ELEMENT read of an array compound literal reads an OBJECT's value, which a
+            // constant expression may do only through the language's `constObjectRead` form,
+            // and only of a const object. P68 round 13, MEASURED through probe-reference-cc:
+            // every reference refuses `((int[]){ 1, 42 })[1]` at file scope and in a static
+            // local, where DSS folded it silently; clang builds a CONST array literal's element
+            // (and a structure literal's member, a READ this branch never proves). The element's
+            // qualification is the type name's base level; a type name whose qualifiers cannot
+            // be read makes no claim (ABSENT IS NOT UNQUALIFIED — a missed diagnostic, never a
+            // refused program).
+            if (it.use == StaticInitUse::Read && typeKindOf(cur) == TypeKind::Array) {
+                auto const& cl = cfg.compoundLiteralRules[clIt->second];
+                auto const kids = visibleChildren(tree, cur);
+                std::optional<QualifierSpine> const spine =
+                    cl.typeChild < kids.size()
+                        ? typeNameQualifierSpine(s, cfg, tree, kids[cl.typeChild])
+                        : std::nullopt;
+                if (spine.has_value() && spine->levels > 0) {
+                    bool const constElement =
+                        ((spine->constBits >> (spine->levels - 1u)) & 1u) != 0;
+                    if (!forms.admits(ConstantForm::ConstObjectRead))
+                        prove(cur, "reads an element of a compound literal, an object's value");
+                    else if (!constElement)
+                        prove(cur, "reads an element of a compound literal, an object that is "
+                                   "not const");
+                }
+            }
+            // A VOLATILE read through a compound literal — of any type: the literal is a volatile
+            // object (its type looked through its array spine), or the lvalue read is a volatile
+            // element or member of it (`volatileRead`). P68 round 13, fold F7: all four
+            // references refuse `((const volatile int[]){ 1, 42 })[1]` (file scope and a static
+            // local, a 2-D and a typedef'd element too), `((const volatile struct { int v; }){ 42
+            // }).v`, `((const struct { volatile int v; }){ 42 }).v` and a non-const one — and the
+            // producer's evaluator folds a literal's element or member (its value is its
+            // initializer; HIR does not carry a literal's const-ness, so this tier is the only
+            // one that can refuse). The literal's VALUE stays no proof: gcc -std=c2x and clang
+            // build `static int x = (const volatile int){ 42 };` and a structure's.
+            if (it.use == StaticInitUse::Read && !out.notConstant.valid()) {
+                TypeId const clTy = subtreeType(s, tree, cur, here);
+                if (it.volatileRead || (clTy.valid() && in.isVolatileObjectType(clTy)))
+                    prove(cur, "reads a volatile-qualified element or member of a compound "
+                               "literal");
+            }
+            continue;
+        }
+        if (isRule(cur, hirCfg.ternaryExprRule)) {
+            auto const ops = internals(cur);
+            if (ops.size() == 3 || ops.size() == 2) {
+                auto const c = conditionValue(ops[0]);
+                if (!c.has_value()) {   // which arm runs is unknown: walk the condition only
+                    work.push_back({ops[0], StaticInitUse::Value});
+                    continue;
+                }
+                if (ops.size() == 3)
+                    work.push_back({*c ? ops[1] : ops[2], it.use, it.volatileRead, it.narrowedBy});
+                else if (!*c)   // GNU `c ?: b`
+                    work.push_back({ops[1], it.use, it.volatileRead, it.narrowedBy});
+            }
+            continue;
+        }
+        if (auto const ci = s.idx().castByRule.find(rule.v); ci != s.idx().castByRule.end()) {
+            auto const& cr = tree.schema().semantics().castRules[ci->second];
+            auto const kids = visibleChildren(tree, cur);
+            if (cr.operandChild >= kids.size()) continue;
+            NodeId const operand = kids[cr.operandChild];
+            // A SYMBOL's address converted to an integer NARROWER than a pointer: no relocation
+            // can hold it, and every reference refuses it — `(int)&a` on LP64, `(long)&a` on
+            // LLP64 (`.temp/probe/sti7`; gcc "initializer element is not constant", MSVC C4311
+            // + C2099). The cast only MARKS the narrowing (`narrowedBy`): the proof waits for
+            // the address's base, because a NULL-based address is a compile-time integer — all
+            // four build `(int)&((struct T *)0)->m`, `(short)(char *)5`, `(int)&((int *)0)[3]`
+            // (P68 round 13 fold F7, `.temp/probe/f7`), where the check once refused them as
+            // "an address no relocation can hold". `_Bool` is a truth value, not a narrowing.
+            NodeId narrowing{};
+            if (cr.typeChild < kids.size() && isAddressKind(typeKindOf(operand))) {
+                TypeId const castTy = resolveTypeNode(s, cfg, tree, kids[cr.typeChild], here,
+                                                      /*emitOnMiss=*/false, /*emitTypeUse=*/false);
+                TypeKind const ck = castTy.valid() ? in.kind(castTy) : TypeKind::Count_;
+                if (ck == TypeKind::Char || isIntegerKind(ck)) {
+                    auto const pw = scalarByteSize(TypeKind::Ptr, s.dataModel);
+                    auto const iw = scalarByteSize(ck, s.dataModel);
+                    if (pw.has_value() && iw.has_value() && *iw < *pw) narrowing = cur;
+                }
+            }
+            // A pointer-to-pointer conversion keeps the address — and the narrowing it carries.
+            work.push_back({operand, StaticInitUse::Value, false,
+                            narrowing.valid() ? narrowing
+                                              : carried(operand, StaticInitUse::Value)});
+            continue;
+        }
+        if (isRule(cur, hirCfg.unaryExprRule)) {
+            HirOperatorEntry const* op = operatorOf(cur, hirCfg.unaryOps);
+            auto const ops = internals(cur);
+            if (op == nullptr || ops.size() != 1) continue;
+            if (op->target == "AddressOf") {
+                work.push_back({ops[0], StaticInitUse::Address, false,
+                                carried(ops[0], StaticInitUse::Address)});
+                continue;
+            }
+            if (op->target == "PreInc" || op->target == "PreDec") {
+                prove(cur, "increments or decrements an object");
+                continue;
+            }
+            // `*p` (its operand's value is used; the read itself is no proof — `*f` of a
+            // function builds on all four), `-`, `!`, `~`. `*p` IS an address — `p`'s value —
+            // where it is taken (`&*p`) or decays (an array or a function designator); read as a
+            // value it is whatever `*p` holds, whose base nothing here shows.
+            bool derefIsAddress = false;
+            if (it.narrowedBy.valid() && op->target == "Deref") {
+                TypeKind const k = typeKindOf(cur);
+                derefIsAddress = it.use == StaticInitUse::Address
+                              || (it.use == StaticInitUse::Value
+                                  && (k == TypeKind::Array || k == TypeKind::FnSig));
+            }
+            work.push_back({ops[0], StaticInitUse::Value, false,
+                            derefIsAddress ? it.narrowedBy : NodeId{}});
+            continue;
+        }
+        if (isRule(cur, hirCfg.binaryExprRule)) {
+            HirOperatorEntry const* op = operatorOf(cur, hirCfg.binaryOps);
+            auto const ops = internals(cur);
+            if (op == nullptr || ops.size() != 2) continue;
+            if (op->target == "Assign" || !op->compoundBase.empty()) {
+                prove(cur, "assigns to an object");
+                continue;
+            }
+            if (op->target == "Comma") {
+                // 6.6p3 names the comma operator; clang and MSVC build `(1, 42)` (both modes),
+                // so a language naming `commaOperator` admits it — with the warning.
+                if (!forms.admits(ConstantForm::CommaOperator)) {
+                    prove(cur, "uses the comma operator (C 6.6p3)");
+                    continue;
+                }
+                if (!out.comma.valid()) out.comma = cur;
+                work.push_back({ops[0], StaticInitUse::Value});
+                work.push_back({ops[1], it.use, false, carried(ops[1], it.use)});
+                continue;
+            }
+            if (op->target == "LogicalAnd" || op->target == "LogicalOr") {
+                auto const l = conditionValue(ops[0]);
+                if (!l.has_value()) {   // whether the right operand runs is unknown
+                    work.push_back({ops[0], StaticInitUse::Value});
+                    continue;
+                }
+                bool const shortCircuits = (op->target == "LogicalAnd") ? !*l : *l;
+                if (!shortCircuits) work.push_back({ops[1], StaticInitUse::Value});
+                continue;
+            }
+            // `a + 1`: the address-valued operand carries the result's base.
+            work.push_back({ops[0], StaticInitUse::Value, false,
+                            carried(ops[0], StaticInitUse::Value)});
+            work.push_back({ops[1], StaticInitUse::Value, false,
+                            carried(ops[1], StaticInitUse::Value)});
+            continue;
+        }
+        if (isRule(cur, hirCfg.postfixExprRule)) {
+            HirOperatorEntry const* op = operatorOf(cur, hirCfg.postfixOps);
+            auto const ops = internals(cur);
+            if (op == nullptr) continue;
+            if (op->target == "Call") {
+                if (!ops.empty() && calleeIsDefinedHere(ops[0])) {
+                    NodeId const id = identifierOf(peel(ops[0]));
+                    prove(cur, std::format("calls '{}', a function this translation unit "
+                                           "defines", tree.text(id)));
+                }
+                continue;
+            }
+            if (op->target == "PostInc" || op->target == "PostDec") {
+                prove(cur, "increments or decrements an object");
+                continue;
+            }
+            // An ARRAY-typed element or member in a VALUE position decays (6.3.2.1p3): its
+            // address is the value (`int *p = m[1];`, `s.arr`); in a READ it is a container.
+            TypeId const curTy = subtreeType(s, tree, cur, here);
+            bool const addressed = it.use == StaticInitUse::Address
+                                || (it.use == StaticInitUse::Value && curTy.valid()
+                                    && in.kind(curTy) == TypeKind::Array);
+            // A READ through this access is a volatile read when this lvalue is volatile (or one
+            // nearer the read was): see `Item`. An address carries its narrowing to the container
+            // whose address it is; a read carries none (its value's base is not shown here).
+            bool const volatileRead = !addressed
+                && (it.volatileRead || (curTy.valid() && in.isVolatileObjectType(curTy)));
+            NodeId const carry = addressed ? it.narrowedBy : NodeId{};
+            if (op->target == "MemberAccess" && !ops.empty()) {
+                // `s.m`: its container is addressed (for `&s.m`, or a decaying array member)
+                // or READ (for the member's value).
+                work.push_back({ops[0], addressed ? StaticInitUse::Address : StaticInitUse::Read,
+                                volatileRead, carry});
+                continue;
+            }
+            if (op->target == "MemberAccessThruPtr" && !ops.empty()) {
+                work.push_back({ops[0], StaticInitUse::Value, false, carry});   // p's value is used
+                continue;
+            }
+            if (op->target == "Index" && ops.size() == 2) {
+                // Either order (6.5.2.1p2): the container is the array- or pointer-typed
+                // operand, the other the index.
+                std::size_t const c = isAddressKind(typeKindOf(ops[0])) ? 0 : 1;
+                TypeKind const ck = typeKindOf(ops[c]);
+                if (ck == TypeKind::Array)
+                    work.push_back({ops[c], addressed ? StaticInitUse::Address : StaticInitUse::Read,
+                                    volatileRead, carry});
+                else   // a pointer's value is used
+                    work.push_back({ops[c], StaticInitUse::Value, false, carry});
+                work.push_back({ops[1 - c], StaticInitUse::Value});
+                continue;
+            }
+            continue;
+        }
+        if (NodeId const id = identifierOf(cur); id.valid()) {
+            SymbolId const sym = s.scopes.lookup(here, tree.text(id));
+            if (!sym.valid()) continue;   // S_UndeclaredIdentifier's
+            SymbolRecord const& rec = s.symbols.at(sym);
+            if (rec.kind == DeclarationKind::Function) {
+                // A function designator's value is its address (6.3.2.1p4) — a symbol's.
+                if (it.narrowedBy.valid() && it.use != StaticInitUse::Read) proveNarrowing();
+                continue;
+            }
+            if (rec.kind != DeclarationKind::Variable || rec.isEnumerator || rec.isInjectedConstant)
+                continue;   // a constant
+            bool const isArray = rec.type.valid() && in.kind(rec.type) == TypeKind::Array;
+            bool const addressed = it.use == StaticInitUse::Address
+                                || (it.use == StaticInitUse::Value && isArray);
+            std::string const name{tree.text(id)};
+            if (addressed) {
+                if (it.narrowedBy.valid()) {   // the address's base is this object: a symbol
+                    proveNarrowing();
+                    continue;
+                }
+                if (rec.isThreadLocal) continue;   // S_ThreadLocalAddressNotConstant's (the producer)
+                if (objectHasStaticStorageDuration(s, cfg, tree, rec)) continue;
+                prove(cur, std::format("takes the address of '{}', which has automatic storage "
+                                       "duration (C 6.2.4p5), and is not an address constant (6.6p9)",
+                                       name));
+                continue;
+            }
+            if (rec.isPredefinedFunctionName) continue;   // `__func__`: a string literal's object
+            // A READ of the object's value (or of an element or member of it).
+            if (!forms.admits(ConstantForm::ConstObjectRead)) {
+                prove(cur, std::format("reads the value of the object '{}'", name));
+                continue;
+            }
+            if (!rec.isConst) {
+                prove(cur, std::format("reads the value of '{}', which is not a const object", name));
+                continue;
+            }
+            // The OBJECT's volatility, through its array spine — `cva[1]` of `static const
+            // volatile int cva[2]` is refused by all four references, where F5 folded it (the
+            // qualifier sits on the element type). `it.volatileRead` (a volatile MEMBER on the
+            // way down) is not asked: gcc and mingw-w64 build `cs.v` of `static const struct {
+            // volatile int v; } cs` (P68 round 13 fold F7).
+            if (rec.type.valid() && in.isVolatileObjectType(rec.type)) {
+                prove(cur, std::format("reads the value of '{}', a volatile object", name));
+                continue;
+            }
+            auto const init = resolveConstSymbolInit(s, tree, cfg, here, tree.text(id));
+            if (!init.has_value() || !init->initExpr.valid()
+                || tree.span(init->initExpr).start() > tree.span(id).start()) {
+                prove(cur, std::format("reads the value of '{}', whose initializer is not visible "
+                                       "here", name));
+                continue;
+            }
+            continue;   // a const object's visible initializer: the fold's question, not a proof
+        }
+        // anything else: no proof
+    }
+    return out;
+}
+
+// The declaration-level hook: walk every element of `initNode` (brace lists iteratively; a
+// string literal for a character array is a string literal) and report each element's first
+// provably non-constant construct, or its first admitted comma operator. `fileScope`: the
+// declaration is at file scope (its compound literals are static, C 6.5.2.5p5).
+void validateStaticInitializer(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                               NodeId initNode, ScopeId here, StaticInitializerRule const& rule,
+                               bool fileScope) {
+    auto const report = [&](DiagnosticCode code, DiagnosticSeverity sev, NodeId at,
+                            std::string message) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = sev;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at);
+        d.actual   = std::move(message);
+        s.reporter.report(std::move(d));
+    };
+    std::vector<NodeId> pending{initNode};
+    std::size_t const bound = tree.nodeCount() + 1;   // strict descendants of one declaration
+    for (std::size_t guard = 0; !pending.empty(); ++guard) {
+        if (guard > bound) failOnCyclicTree("the static initializer element walk");
+        NodeId const raw = pending.back();
+        pending.pop_back();
+        NodeId const v = descendInitWrappers(s, tree, raw);
+        if (!v.valid()) continue;
+        if (tree.kind(v) == NodeKind::Internal && s.idx().braceInitListRule.valid()
+            && tree.rule(v).v == s.idx().braceInitListRule.v) {
+            for (NodeId el : visibleChildren(tree, v)) {
+                if (tree.kind(el) != NodeKind::Internal) continue;
+                if (s.idx().initElementRule.valid() && tree.rule(el).v != s.idx().initElementRule.v)
+                    continue;
+                // An element's VALUE is its last Internal child (a designator precedes it; a
+                // designator's own constant expression is the designator machinery's).
+                NodeId last{};
+                for (NodeId c : visibleChildren(tree, el))
+                    if (tree.kind(c) == NodeKind::Internal) last = c;
+                if (last.valid()) pending.push_back(last);
+            }
+            continue;
+        }
+        StaticInitializerFinding const f =
+            findNonConstantInStaticInitializer(s, cfg, tree, raw, here, rule.otherConstantForms,
+                                               fileScope);
+        if (f.notConstant.valid()) {
+            report(DiagnosticCode::S_StaticInitializerNotConstant, DiagnosticSeverity::Error,
+                   f.notConstant,
+                   std::format("'{}' is not a constant expression: it {} — an initializer of an "
+                               "object of static or thread storage duration must be one "
+                               "(C 6.7.9p4)", tree.text(f.notConstant), f.why));
+        } else if (f.comma.valid()) {
+            report(DiagnosticCode::S_StaticInitializerUsesTheCommaOperator,
+                   DiagnosticSeverity::Warning, f.comma,
+                   std::format("'{}' uses the comma operator in a static initializer (C 6.6p3 "
+                               "names it; the language admits it as a constant)",
+                               tree.text(f.comma)));
+        }
+    }
+}
+
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
 // D-CSUBSET-TENTATIVE-DEFINITION-MERGE: resolve a same-scope REDECLARATION (`prior`
 // already bound `name` in `bindScope`; `newId` is the new symbol). A redeclaration
@@ -11929,23 +12566,15 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
     // designated form) and whose value is not itself a nested brace list.
     NodeId valueNode = initNode;
     if (s.idx().braceInitListRule.valid()) {
+        // P68 round 13 (lane `cs`): the ONE descent (`descendInitWrappers`), not a private
+        // copy with its own 64-step cap; a brace list answers itself, anything else none.
         auto const descendToBrace = [&](NodeId from) -> NodeId {
-            NodeId walk = from;
-            for (int guard = 0; guard < 64 && walk.valid(); ++guard) {
-                if (tree.kind(walk) != NodeKind::Internal) return NodeId{};
-                if (tree.rule(walk).v == s.idx().braceInitListRule.v)
-                    return walk;
-                NodeId sole{};
-                bool   multiple = false;
-                for (NodeId c : visibleChildren(tree, walk)) {
-                    if (tree.kind(c) != NodeKind::Internal) continue;
-                    if (sole.valid()) { multiple = true; break; }
-                    sole = c;
-                }
-                if (multiple || !sole.valid()) return NodeId{};
-                walk = sole;
+            NodeId const walk = descendInitWrappers(s, tree, from);
+            if (!walk.valid() || tree.kind(walk) != NodeKind::Internal
+                || tree.rule(walk).v != s.idx().braceInitListRule.v) {
+                return NodeId{};
             }
-            return NodeId{};
+            return walk;
         };
         if (NodeId const brace = descendToBrace(initNode); brace.valid()) {
             std::vector<NodeId> elems;
@@ -18560,6 +19189,22 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         SymbolId const sym = s.symbolAtOr(nameNode);
                         if (!sym.valid()) continue;
                         auto& rec = s.symbols.at(sym);
+                        // P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4 —
+                        // an object of STATIC or THREAD storage duration (file scope, the
+                        // language's static-storage specifier, `thread_local`) takes only a
+                        // constant initializer; `semantics.staticInitializers` declares the
+                        // constraint. A constexpr object has its own validator; a block-scope
+                        // `extern` with an initializer is 6.7.9p5's, not this one.
+                        if (cfg.staticInitializers.has_value()
+                            && rec.kind == DeclarationKind::Variable && !rec.isConstexpr) {
+                            bool const fileScope = rec.scope.v == fileScopeOf(s, tree, rec.scope).v;
+                            bool const staticStorage = fileScope || rec.isThreadLocal
+                                || scanSpecifierPrefixStorage(cfg, tree, node, decl).staticStorage;
+                            if (staticStorage && (fileScope || !rec.isExternDeclaration)) {
+                                validateStaticInitializer(s, cfg, tree, initNode, here,
+                                                          *cfg.staticInitializers, fileScope);
+                            }
+                        }
                         // The init's type = the first stamped type along
                         // the SINGLE-child wrapper chain (initValue →
                         // expression → operand/binaryExpr/...). An
@@ -20801,7 +21446,13 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         };
         bool discarded = false;
         NodeId cur = node;
-        for (int guard = 0; guard < 64; ++guard) {
+        // ★ P68 round 13 (lane `cs`): no cap. This stopped after 64 ancestors, so a
+        // call discarded inside 64 or more transparent wrappers (parentheses) drew no
+        // warning. Each step goes to a strict ancestor, so the walk ends at the root;
+        // the tree's node count bounds it (`failOnCyclicTree` past it).
+        std::size_t const upBound = tree.nodeCount() + 1;
+        for (std::size_t step = 0;; ++step) {
+            if (step > upBound) failOnCyclicTree("the nodiscard discard walk");
             NodeId const p = tree.parent(cur);
             if (!p.valid() || tree.kind(p) != NodeKind::Internal) break;
             std::uint32_t const pv = tree.rule(p).v;
@@ -23930,6 +24581,50 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::vector<SymbolId> surfaces;  // descriptor symbols (members, typedefs) typed `shipped`
     };
     std::vector<ShippedTagAdoption> shippedTagAdoptions;
+    // ── P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS) ──
+    // THE CONSUMING LANGUAGE, and the pair's facts a lattice-derived
+    // descriptor constant (`LONG_MAX` is `of: "long"`) is realized from. The
+    // consumer is the schema whose semantics declare the shipped-library
+    // search path — the language that reaches a descriptor through
+    // `#include` — found from its own config declaration, never a language
+    // name. These are the SAME facts the preprocessor's splice receives from
+    // `applyTargetFormatPair` (data model, plain-`char` signedness), so the
+    // two seams realize one value and one type. ✔MEASURED at P68 round 9:
+    // exactly one shipped language declares `shippedLibDirs` (c), so a
+    // mixed-language CU has one consumer; were there two, the first by tree
+    // order answers — the descriptor is language-neutral and both would
+    // resolve its vocabulary names through their own tables.
+    //
+    // ★ ONE SET FOR BOTH DESCRIPTOR SEAMS (P68 round 12, S2a-2a): hoisted out of
+    // the injection block so the extern-declaration realization below reads a
+    // descriptor with the SAME pair facts as `#include` — a row whose signature
+    // names an ABI typedef or keys an arm on the long-double format would
+    // otherwise read one way here and another there.
+    GrammarSchema const* descriptorConsumer = nullptr;
+    for (GrammarSchema const* sch : distinctSchemas) {
+        if (!sch->semantics().shippedLibDirs.empty()) {
+            descriptorConsumer = sch;
+            break;
+        }
+    }
+    ffi::ShippedPairFacts pairFacts{descriptorConsumer, s.dataModel,
+                                    s.charIsUnsigned, {},
+                                    // P68 round 12 (S2a-1): the pair's long-double
+                                    // format, what a `longDoubleFormat` arm selects by.
+                                    s.longDoubleFormat};
+    // …and the target's platform ABI typedefs for this format, which a
+    // descriptor `typedefs` entry may name (`<stddef.h>`'s `wchar_t`: P68
+    // round 9, D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX) — resolved through the
+    // one accessor, exactly as `predefinedTypeFactsFor` builds them for the
+    // preprocessor, so both seams read one table.
+    if (s.target != nullptr && s.activeFormat.has_value()) {
+        for (std::string_view const name : s.target->abiTypedefNames()) {
+            if (auto const core =
+                    s.target->abiTypedefCore(name, s.activeFormat->kind())) {
+                pairFacts.abiTypedefs.emplace_back(std::string{name}, *core);
+            }
+        }
+    }
     {
         // Names any USER declaration (top-level, in any tree's own root scope)
         // claimed — the goal-2 skip set. A binding whose symbol's `tree` is the
@@ -24108,44 +24803,6 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                                     vocabulary,
                                                     objectFormatKindOf(s.activeFormat)};
 
-        // ── P68 round 9 (D-C-LIMITS-H-DEFINES-NINE-OF-THE-STANDARD-MACROS) ──
-        // THE CONSUMING LANGUAGE, and the pair's facts a lattice-derived
-        // descriptor constant (`LONG_MAX` is `of: "long"`) is realized from. The
-        // consumer is the schema whose semantics declare the shipped-library
-        // search path — the language that reaches a descriptor through
-        // `#include` — found from its own config declaration, never a language
-        // name. These are the SAME facts the preprocessor's splice receives from
-        // `applyTargetFormatPair` (data model, plain-`char` signedness), so the
-        // two seams realize one value and one type. ✔MEASURED at P68 round 9:
-        // exactly one shipped language declares `shippedLibDirs` (c), so a
-        // mixed-language CU has one consumer; were there two, the first by tree
-        // order answers — the descriptor is language-neutral and both would
-        // resolve its vocabulary names through their own tables.
-        GrammarSchema const* descriptorConsumer = nullptr;
-        for (GrammarSchema const* sch : distinctSchemas) {
-            if (!sch->semantics().shippedLibDirs.empty()) {
-                descriptorConsumer = sch;
-                break;
-            }
-        }
-        ffi::ShippedPairFacts pairFacts{descriptorConsumer, s.dataModel,
-                                        s.charIsUnsigned, {},
-                                        // P68 round 12 (S2a-1): the pair's long-double
-                                        // format, what a `longDoubleFormat` arm selects by.
-                                        s.longDoubleFormat};
-        // …and the target's platform ABI typedefs for this format, which a
-        // descriptor `typedefs` entry may name (`<stddef.h>`'s `wchar_t`: P68
-        // round 9, D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX) — resolved through the
-        // one accessor, exactly as `predefinedTypeFactsFor` builds them for the
-        // preprocessor, so both seams read one table.
-        if (s.target != nullptr && s.activeFormat.has_value()) {
-            for (std::string_view const name : s.target->abiTypedefNames()) {
-                if (auto const core =
-                        s.target->abiTypedefCore(name, s.activeFormat->kind())) {
-                    pairFacts.abiTypedefs.emplace_back(std::string{name}, *core);
-                }
-            }
-        }
         // THE `#undef` RULE. A preprocessor-visible constant IS a macro for a
         // language that preprocesses: the splice defines it, `#undef` removes it,
         // and after that the name is undeclared — gcc, clang, mingw and MSVC all
@@ -25383,7 +26040,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 unrealized, s.lattice.interner(), s.lattice.registry(),
                 s.reporter, s.dataModel, activeTargetView,
                 objectFormatKindOf(s.activeFormat),
-                namedTypes, s.roleResolver);
+                namedTypes, s.roleResolver, &pairFacts);
             // nullopt ⇒ the shippedLibs directory could not be located. That is a
             // statement about the ENVIRONMENT, never about the user's program, so
             // every name simply stays unrealized and routes unbound — the exact
@@ -25444,7 +26101,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                         name, s.lattice.interner(), s.lattice.registry(),
                         s.dataModel, activeTargetView,
                         objectFormatKindOf(s.activeFormat), namedTypes,
-                        s.roleResolver);
+                        s.roleResolver, &pairFacts);
                     if (!surface.has_value()) continue;
                     for (auto& [coreName, core] : *surface) {
                         // The declared name itself is already handled above, and a

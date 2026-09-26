@@ -10,7 +10,7 @@ non-vacuous by MUTATING a temporary COPY of the module that owns the guard (red-
 
   DC-01 .. DC-30  green pins; each carries the UNION of both twins' arms for its subject, plus
                   the negatives neither twin had (report 09, section E.4);
-  RD-01 .. RD-80  red arms (a retired arm's id is never reused, so the range has gaps; the
+  RD-01 .. RD-84  red arms (a retired arm's id is never reused, so the range has gaps; the
                   registry below counts them); each MUTATES a copy of one driver module -- fail-closed: the witness
                   occurs EXACTLY once, the mutant bytes (or AST) differ, the witness is absent,
                   it parses, compiles and IMPORTS under a unique module name kept out of
@@ -2444,25 +2444,16 @@ def pin_dc21(t, x):
     t.ck("N09", "control: naming one (--dss), the run goes on into Step 0", rc == 0 and "STEP0-REACHED" in out,
          (rc, out[-1500:]))
 
-    # ── (D) THE CANDIDATE SEARCH IS THE BENCHMARK'S BY-HAND DEFAULT, NEVER STEP 5'S ───────────────────────
-    repo3 = x.sub("repo-variant")
-    vtree, _vb = fake_tree(repo3, "build/x86_64-mingw-release", "Release")
-    fake_tree(repo3, "out/rel", "Release")
-    cands, _searched = CMP.find_candidates(repo3)
-    t.eq("P14", "the benchmark's by-hand search finds a Release tree under ANY build/<name> (DssHarness's variant "
-         "layout), and not one outside build/", [os.path.normcase(os.path.abspath(vtree))],
-         [os.path.normcase(c.tree) for c in cands])
+    # ── (D) retired 2026-09-26 (P68 round 13): P14 pinned the benchmark's by-hand candidate SEARCH, which went
+    # with its last caller -- the benchmark names its compiler as the driver does (`sqlite_compiler.require_named`).
 
-    # ── (E) THE STAMP IS THE CODE'S, NAMED, AND IT ORDERS THE CANDIDATES ─────────────────────────
+    # ── (E) THE STAMP IS THE CODE'S, NAMED (P20, which pinned how it ORDERED the search's candidates, went with it) ──
     repo5 = x.sub("repo-stamp")
     tree_a, bin_a = fake_tree(repo5, "build/a-rel", "Release")
     lib_a = write_bytes(os.path.join(tree_a, "bin", "dss", "libdsscp.so"), b"code a\n")
-    tree_b, bin_b = fake_tree(repo5, "build/b-rel", "Release")
-    lib_b = write_bytes(os.path.join(tree_b, "bin", "dss", "libdsscp.so"), b"code b\n")
     base = time.time() - 10000
-    for path_, at in ((bin_a, 500), (lib_a, 100), (bin_b, 200), (lib_b, 400)):
+    for path_, at in ((bin_a, 500), (lib_a, 100)):
         os.utime(path_, (base + at, base + at))
-    cands5, _searched5 = CMP.find_candidates(repo5)
     cand_a = CMP.build_type(bin_a)
     t.ck("P19", "a candidate's stamp is its CODE's -- the library beside the launcher -- and the line names that file",
          abs(cand_a.mtime - (base + 100)) < 1 and cand_a.image == os.path.abspath(lib_a)
@@ -2475,9 +2466,6 @@ def pin_dc21(t, x):
     t.eq("P19b", "...in each spelling the builds this project uses write -- MSVC, MinGW, ELF and Mach-O "
          "(read 2026-09-23 in build/x86_64-msvc-release, build/mig, the WSL tree)",
          ["dsscp.dll", "libdsscp.dll", "libdsscp.so", "libdsscp.dylib"], seen_images)
-    t.eq("P20", "a NEWER launcher over OLDER code LOSES: the candidates are ordered by their code's stamp",
-         [os.path.normcase(os.path.abspath(tree_b)), os.path.normcase(os.path.abspath(tree_a))],
-         [os.path.normcase(c.tree) for c in cands5])
     tree_c, bin_c = fake_tree(repo5, "build/c-rel", "Release")
     cand_c = CMP.build_type(bin_c)
     t.ck("P21", "CONTROL: with no library beside it the executable IS the code, and its own time is the stamp",
@@ -3236,9 +3224,12 @@ def pin_dc29(t, x):
     (DssHarness's one declared build output); the recompile REQUIRES a named compiler and re-stages a missing or stale
     stage in THIS tree through the driver's own Steps 3-4. MEASURED: until 2026-09-25 the round close ran a wrapper
     that pointed DSS_BIN at one tree's dsscp and OUT_DIR at another lane's output. The benchmark measures the PINNED
-    sqlite -- its default checkout put on legs.json stageBuild.sqliteCommit, an explicit one as-is -- and its report
-    names the head it measured and whether it IS the pin: MEASURED, the Mac's run of 2026-09-25 benchmarked
-    4ebc78674d while the round-close recompile compiled d21bd37c7c."""
+    sqlite and its report names the head it measured and whether it IS the pin: MEASURED, the Mac's run of 2026-09-25
+    benchmarked 4ebc78674d while the round-close recompile compiled d21bd37c7c. Since P68 round 13 it measures the pin
+    from the harness's OWN checkout INSIDE the tree (`<output tree>/speedtest1/sqlite`), an explicit checkout only
+    as-is AND on the pin, a named compiler only, and its whole run holds the output tree's run lock -- on every host:
+    MEASURED by round 12's audit, its default had become `C:\\Source\\sqlite` (`~/src/sqlite` elsewhere), cloned and
+    moved onto the pin outside the repository, with no lock on Windows."""
     Cm = x.M.mod("sqlite_common")
     RC = x.M.use("sqlite_recompile")
     work = x.sub("dc29")
@@ -3305,55 +3296,72 @@ def pin_dc29(t, x):
     alone = usage_of(["--dss", exe])
     t.ck("MS10", "control: the SAME binary in both, and --dss alone (the step's command line), are accepted",
          same == "" and alone == "", (same, alone))
-    # THE SUBJECT IS THE PIN (2026-09-25): the default checkout goes on it through the stage's own checkout
+    # THE SUBJECT IS THE PIN, READ FROM THE HARNESS'S OWN CHECKOUT INSIDE THE TREE (P68 round 13; the pin 2026-09-25).
+    # HOME points at a scratch home while it is resolved, so a mutant that puts the default back in a home
+    # directory writes nowhere but here.
     pin = "0123456789abcdef0123456789abcdef01234567"
-    events, checkouts = [], []
+    checkouts = []
+
+    def spy_checkout(url, dest, log=None, commit="", env=None):
+        checkouts.append((dest, commit))
+    tree = x.sub("dc29-tree")
+    home = x.sub("dc29-home")
+    outs = dict((h, Cm.output_tree(tree, h)) for h in ("linux", "windows"))
+    with patched_environ(HOME=home, USERPROFILE=home):
+        # the fence proves it TOOK: an absence asserted in a home the program never resolved passes vacuously
+        # (P68 round 13's audit, F3-A-SP-6)
+        fence = os.path.expanduser("~")
+        got = dict((h, B.measured_subject("", h, pin, outs[h], log, checkout=spy_checkout))
+                   for h in ("linux", "windows"))
+
+    def inside_tree(p):
+        return os.path.normcase(os.path.abspath(p)).startswith(os.path.normcase(os.path.abspath(tree)) + os.sep)
+    t.ck("MS11", "the benchmark's DEFAULT subject is the harness's OWN checkout INSIDE the tree -- <output "
+         "tree>/speedtest1/sqlite, the output tree being the driver's own (sqlite_common.output_tree) -- put on the "
+         "pin through the stage's one checkout, for a POSIX and a Windows host alike",
+         checkouts == [(got["linux"], pin), (got["windows"], pin)]
+         and os.path.normcase(os.path.abspath(fence)) == os.path.normcase(os.path.abspath(home))
+         and all(os.path.normcase(got[h]) == os.path.normcase(os.path.abspath(os.path.join(outs[h], "speedtest1",
+                                                                                           "sqlite")))
+                 and inside_tree(got[h]) for h in got), (checkouts, got, fence))
+    explicit = os.path.join(work, "explicit-sqlite")
+    write_bytes(os.path.join(explicit, "test", "speedtest1.c"), b"int main(void){return 0;}\n")
+    del checkouts[:]
+    as_is = [B.measured_subject(explicit, h, pin, outs[h], log, checkout=spy_checkout, revision=lambda d: (pin, ""))
+             for h in ("linux", "windows")]
+    t.ck("MS12", "an EXPLICIT --sqlite-dir ON the pin is measured AS-IS -- returned as named, no checkout made",
+         as_is == [os.path.abspath(explicit)] * 2 and checkouts == [], (as_is, checkouts))
+    off_head = "4ebc78674d" + "0" * 30
+    r, why = refused(B.measured_subject, explicit, "linux", pin, outs["linux"], log, checkout=spy_checkout,
+                     revision=lambda d: (off_head, ""))
+    t.ck("MS12b", "...and one OFF the pin is REFUSED, naming its head and the pin -- never moved onto it (no checkout)",
+         r and "not the pinned %s" % pin[:12] in why and off_head[:12] in why and checkouts == [], (why, checkouts))
+    events = []
 
     class _Lock:
         def __init__(self, path):
             events.append(("lock", path))
 
-        def write(self, what, log=None):
-            events.append("write")
-
-        def read(self, what, log=None):
-            events.append("read")
+        def acquire(self, log=None):
+            events.append("acquire")
 
         def release(self):
             events.append("release")
 
-    def spy_checkout(url, dest, log=None, commit=""):
-        events.append("checkout")
-        checkouts.append((dest, commit))
-    held = {"linux": [], "windows": []}
-    got = {h: B.measured_subject("", h, pin, log, held[h], checkout=spy_checkout, lock_factory=_Lock)
-           for h in ("linux", "windows")}
-    t.ck("MS11", "the benchmark's DEFAULT checkout goes on the pin through the stage's own checkout: on a POSIX host "
-         "under the shared clone's WRITE lock, then held READ while it is measured; a Windows host's takes no lock",
-         checkouts == [(got["linux"], pin), (got["windows"], pin)]
-         and events == [("lock", got["linux"]), "write", "checkout", "read", "checkout"]
-         and len(held["linux"]) == 1 and held["windows"] == [], (checkouts, events, held))
-    explicit = os.path.join(work, "explicit-sqlite")
-    del events[:], checkouts[:]
-    held_x = []
-    as_is = [B.measured_subject(explicit, h, pin, log, held_x, checkout=spy_checkout, lock_factory=_Lock)
-             for h in ("linux", "windows")]
-    t.ck("MS12", "control: an EXPLICIT --sqlite-dir is measured AS-IS -- no checkout, no lock",
-         as_is == [os.path.abspath(explicit)] * 2 and checkouts == [] and events == [] and held_x == [],
-         (as_is, checkouts, events))
-
-    class _Held:
-        released = 0
-
-        def release(self):
-            _Held.released += 1
-
-    def failing_body(args, host, log_, held_):
-        held_.append(_Held())
+    def failing_body(args, host, log_, repo_root, tree_out):
+        events.append(("body", repo_root, tree_out))
         raise Cm.HarnessDie("the measurement stopped part-way")
-    r, why = refused(B.run_measuring_host, None, "linux", log, body=failing_body)
-    t.ck("MS13", "a lock the subject took is RELEASED however the run ends (here, a refusal part-way)",
-         r and "part-way" in why and _Held.released == 1, (why, _Held.released))
+    with patched_environ(unset=("OUT_DIR", "SRC_DIR")):
+        r, why = refused(B.run_measuring_host, types.SimpleNamespace(dss_src=tree), "linux", log,
+                         body=failing_body, lock_factory=_Lock)
+    tree_out = Cm.output_tree(os.path.abspath(tree), "linux")
+    t.ck("MS13", "the whole measuring run holds the OUTPUT TREE's run lock -- the path the driver's run and the "
+         "recompile lock -- taken before the body runs and RELEASED however the run ends (here, a refusal part-way)",
+         r and "part-way" in why and events == [("lock", os.path.join(tree_out, Cm.RUN_LOCK)), "acquire",
+                                                ("body", os.path.abspath(tree), tree_out), "release"], (why, events))
+    r, why = refused(B.select_dss, "", "--dss", False, log)
+    t.ck("MS17", "a benchmark run naming NO dsscp is REFUSED in the driver's own words (sqlite_compiler.require_named) "
+         "-- never answered by a search of build/", r and "no dsscp was named" in why and "{product}" in why, why)
     # ...and the report names WHICH sqlite it measured (the core's R10)
     core = x.M.mod("speedtest1_bench")
     plan_subject = {"tus": ["/s/src/a.c", "/s/test/speedtest1.c"], "sqliteSrc": "/s", "defines": ["X"],
@@ -3372,19 +3380,8 @@ def pin_dc29(t, x):
     on, on_md = named(pin[:10])
     t.ck("MS15", "control: the pinned head is named the pinned revision, in the .json and the .md",
          on["onPin"] is True and "the pinned revision" in on_md and "NOT the pinned" not in on_md, (on, on_md[:400]))
-    # ...and a blocked shared clone keeps the lock's contract, with an exit code of the benchmark's own
-    Bf = x.M.fresh("benchmark_speedtest1")
-
-    def blocked(args, host, log=None, body=None):
-        raise Bf.C.CloneLockBlocked("DSS-CLONE-LOCK-BLOCKED\n\n [X] ERROR: another dss harness run is MUTATING "
-                                    "this sqlite clone")
-    Bf.run_measuring_host = blocked
-    err16 = io.StringIO()
-    with contextlib.redirect_stderr(err16):
-        rc16 = Bf.main([])
-    t.ck("MS16", "a blocked shared clone exits 5 with DSS-CLONE-LOCK-BLOCKED first on stderr -- never 3, the "
-         "measurement core's 'no compiler produced a binary'",
-         rc16 == 5 and err16.getvalue().splitlines()[:1] == ["DSS-CLONE-LOCK-BLOCKED"], (rc16, err16.getvalue()[:200]))
+    # (MS16, "a blocked shared clone exits 5", retired 2026-09-26 with the clone: the benchmark no longer reads or
+    # writes the shared corpus clone, and its own checkout is covered by the output tree's run lock -- MS13.)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -3715,8 +3712,8 @@ PINS = (
             pin_dc27),
     PinSpec("DC-28", "a SINGLE-FILE run (DSS_TEST_FILE) is judged on its own terms, and a tier still is not",
             pin_dc28),
-    PinSpec("DC-29", "the manual steps: the recompile's GIVEN compiler and its OWN stage; the benchmark's ONE "
-            "compiler", pin_dc29),
+    PinSpec("DC-29", "the manual steps: the recompile's GIVEN compiler and its OWN stage; the benchmark's ONE named "
+            "compiler, its pinned checkout INSIDE the tree, and the tree's run lock", pin_dc29),
     PinSpec("DC-30", "a step's knobs travel on its command line, read once by Config; Step 5 takes the compiler "
             "from it", pin_dc30),
 )
@@ -3967,12 +3964,12 @@ REDS = (
     red("RD-50", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
         "stamp a candidate with its launcher's time again",
         "    return [p for p in beside if os.path.isfile(p)] or [path]\n", new="    return [path]\n",
-        expect=("P19", "P19b", "P20"), stay_green=("P14", "P21", "N05", "N06")),
+        expect=("P19", "P19b"), stay_green=("P21", "N05", "N06")),
     red("RD-51", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
         "forget MinGW's spelling of the compiler's library (the one the first draft missed)",
         'COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")\n',
         new='COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")\n',
-        expect=("P19b",), stay_green=("P14", "P19", "P20", "P21", "N05")),
+        expect=("P19b",), stay_green=("P19", "P21", "N05")),
     red("RD-53", "DC-27", "harness_legs", "new (round-close recompile, 2026-09-23)",
         "leave a BLOCKER out of the census's count",
         '"blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}',
@@ -4043,11 +4040,14 @@ REDS = (
         expect=("KN02", "KN05", "KN10"), stay_green=("KN01", "KN03", "KN06")),
     red("RD-68", "DC-30", "build_and_test", "new (2026-09-25)", "take the last of a flag given twice",
         "        if name in got:\n", new="        if False:\n", expect=("KN08",), stay_green=("KN07",)),
-    red("RD-69", "DC-21", "sqlite_compiler", "new (2026-09-25; moved to DC-21 on 2026-09-26 with the retired default)",
+    red("RD-69", "DC-21", "sqlite_compiler", "new (2026-09-25; moved to DC-21 on 2026-09-26 with the retired default; "
+        "its search inlined in the mutant on 2026-09-26, P68 round 13, when the module's own search was deleted)",
         "search build/ for a newer Release dsscp although one was named",
         "    info = build_type(named)\n",
-        new="    info = select_compiler(find_candidates(os.path.dirname(os.path.dirname(build_tree(named))))[0],\n"
-            "                           cfg.allow_nonrelease) or build_type(named)\n",
+        new="    import glob as _glob\n"
+            "    _found = sorted(_glob.glob(os.path.join(os.path.dirname(os.path.dirname(build_tree(named))), \"build\",\n"
+            "                                            \"*\", \"bin\", \"dss\", \"dsscp*\")), key=os.path.getmtime)\n"
+            "    info = build_type(_found[-1] if _found else named)\n",
         expect=("N05",), stay_green=("N01", "N03", "N06")),
     red("RD-70", "DC-30", "build_and_test", "new (2026-09-25)", "let Step 5 ignore the compiler the run was given",
         "    run.compiler = CMP.obtain(run.cfg, log=run.log)\n",
@@ -4062,18 +4062,32 @@ REDS = (
         "                                        commit=cfg.sqlite_commit))\n",
         new="                                        commit=\"\"))\n", expect=("S07",),
         stay_green=("S01", "S03")),
-    red("RD-73", "DC-29", "benchmark_speedtest1", "new (2026-09-25)",
-        "measure the default checkout wherever it stands, not on the pin",
-        "    if not explicit:\n        subject_on_pin(d, pin, host, log, held, checkout, lock_factory)\n",
-        new="    if False:\n        subject_on_pin(d, pin, host, log, held, checkout, lock_factory)\n",
-        expect=("MS11",), stay_green=("MS12", "MS13")),
+    red("RD-73", "DC-29", "benchmark_speedtest1", "new (2026-09-25; re-aimed 2026-09-26, P68 round 13, at the "
+        "checkout inside the tree)", "measure the harness's own checkout wherever it stands, not on the pin",
+        "    subject_on_pin(d, pin, log, checkout)\n", new="    pass\n",
+        expect=("MS11",), stay_green=("MS12", "MS12b", "MS13")),
     red("RD-74", "DC-29", "speedtest1_bench", "new (2026-09-25)", "call every measured head the pinned revision",
         '    return bool(re.fullmatch(r"[0-9a-f]{7,40}", head or "")) and (pin or "").startswith(head)\n',
         new="    return True\n", expect=("MS14",), stay_green=("MS15",)),
-    red("RD-75", "DC-29", "benchmark_speedtest1", "new (2026-09-25)",
-        "report a blocked shared clone as the measurement core's exit 3",
-        "        return EXIT_CLONE_BLOCKED\n", new="        return exc.exit_code\n",
-        expect=("MS16",), stay_green=("MS11", "MS12")),
+    # (RD-75, "report a blocked shared clone as the measurement core's exit 3", retired 2026-09-26 with MS16: the
+    # benchmark no longer takes the shared clone's lock, so there is no blocked clone to report.)
+    red("RD-81", "DC-29", "benchmark_speedtest1", "new (P68 round 13, finding M-7)",
+        "keep the default checkout OUTSIDE the tree again (the retired home default)",
+        "    return os.path.join(bench_tree(tree_out), SUBJECT_CHECKOUT)\n",
+        new='    return os.path.expanduser(os.path.join("~", "src", "sqlite"))\n',
+        expect=("MS11",), stay_green=("MS12", "MS12b", "MS13")),
+    red("RD-82", "DC-29", "benchmark_speedtest1", "new (P68 round 13, finding M-7)",
+        "measure an explicit checkout that is NOT on the pin",
+        "    if head != pin:\n", new="    if False:\n",
+        expect=("MS12b",), stay_green=("MS11", "MS12", "MS13")),
+    red("RD-83", "DC-29", "benchmark_speedtest1", "new (P68 round 13, finding M-7)",
+        "run the benchmark without the output tree's run lock",
+        "    lock.acquire(log)\n", new="    pass\n",
+        expect=("MS13",), stay_green=("MS11", "MS12", "MS12b")),
+    red("RD-84", "DC-29", "benchmark_speedtest1", "new (P68 round 13)",
+        "let a benchmark run that names no dsscp reach the file check (the refusal's own words lost)",
+        "    explicit, explicit_by = COMP.require_named(explicit, explicit_by)\n", new="    pass\n",
+        expect=("MS17",), stay_green=("MS09", "MS10", "MS11")),
     # ── the compiler is GIVEN (2026-09-26, P68 round 12: the independent audit found Step 5 still building dsscp
     # for any run that named none; RD-31/48/49/52 retired with the refresh they guarded, RD-26 with SKIP_DSS_BUILD)
     red("RD-76", "DC-21", "sqlite_compiler", "new (the audit's finding, 2026-09-25)",
@@ -4212,11 +4226,12 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 30 pins + 82 red arms + 10 mutator arms. A registry that no longer
+# Every arm this file registers: 30 pins + 85 red arms + 10 mutator arms. A registry that no longer
 # adds up to this -- an arm deleted, or one added without this line -- is a FAILURE. (2026-09-26: five red
 # arms retired with the code they guarded -- RD-26, RD-31, RD-48, RD-49, RD-52 -- and five added, RD-76..RD-80;
+# then, P68 round 13, RD-75 retired with the benchmark's clone lock and four added, RD-81..RD-84;
 # a retired arm's id is never reused.)
-DECLARED_TOTAL = 122
+DECLARED_TOTAL = 125
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

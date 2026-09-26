@@ -31,11 +31,7 @@
     { "name": "blkcnt_t",    "type": "i64" },
     { "name": "suseconds_t", "type": "i64" },
     { "name": "useconds_t",  "type": "u32" },
-    { "name": "time_t",      "variants": [
-        { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "i64 \"long\"" },
-        { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "i64 \"long\"" },
-        { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "i64 \"long long\"" }
-    ] },
+    { "name": "time_t",      "shippedTypedef": { "header": "time.h" } },
     { "name": "u_char",      "variants": [
         { "when": { "format": "elf" },   "type": "u8" },
         { "when": { "format": "macho" }, "type": "u8" }

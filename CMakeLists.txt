@@ -1091,6 +1091,18 @@ if(DSS_BUILD_TESTS)
                 --self-test
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    # `anchor-rows.py --self-test` (2026-09-25, P68 round 13, lane mig): a fold's rows, applied as ONE
+    # batch through the door -- staged, rehearsed in a throwaway repository, all or nothing, every row
+    # read back. It replaced five toolkit scripts whose loop once stopped with SOME rows applied, and
+    # whose `--dry-run` was once not an option and APPLIED. Like the entry above it drives the REAL
+    # door in git fixture trees, so a host without DssHarness fails it rather than skipping it.
+    add_test(
+        NAME anchor_rows_selftest_guard
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/anchor-rows/anchor-rows.py"
+                --self-test
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # Which tree does a script's own file live in? (2026-09-15, P66 lane rr.)
     # Eleven Python scripts took their root from the CALLER'S working directory -- a
     # bare `git rev-parse --show-toplevel`, or a cwd-relative path -- and no entry in

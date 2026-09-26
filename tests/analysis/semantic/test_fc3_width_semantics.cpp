@@ -19,6 +19,7 @@
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_budget.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/integer_literal_ladder.hpp"   // reducedIntegerLiteralBits (the fixed-type reduction)
 #include "core/types/tree_cursor.hpp"
 #include "core/types/tree_visitor.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
@@ -41,10 +42,12 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace dss;
@@ -674,6 +677,240 @@ TEST(Fc3LoaderRejects, NonIntegerLadderCandidateRejects) {
     auto doc = loadShippedCJson();
     doc["semantics"]["integerLiteralTyping"][0]["decimal"][0] = "double";
     EXPECT_FALSE(schemaLoads(doc));
+}
+
+// ── P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): the FIXED-TYPE shape ──
+//
+// MSVC's sized suffixes — `i8` `i16` `i32` `i64` and `ui8` … `ui64`, the `i` and
+// the `u` each in either case — FIX the literal's type, and a magnitude that type
+// cannot hold is reduced modulo 2^width at the type's signedness. ✔MEASURED
+// 2026-09-25 through `dssharness run probe-reference-cc --legs
+// windows-x86_64-release` (MSVC 19.51.36260, run 20260925-092743-c2711a1a); gcc
+// 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 refuse all 24. Every value below
+// is MSVC's.
+namespace {
+
+// The loader's diagnostics for a perturbed C document, as `path: message` lines —
+// empty when it loads. A refusal is asserted by WHERE it points, so a test cannot
+// pass on an unrelated break in the perturbed document.
+[[nodiscard]] std::string loadDiagnostics(nlohmann::json const& doc) {
+    auto r = GrammarSchema::loadFromText(doc.dump(), "<sized-suffix-perturbed>");
+    if (r.has_value()) return {};
+    std::string out;
+    for (auto const& d : r.error()) {
+        out += d.path;
+        out += ": ";
+        out += d.message;
+        out += "\n";
+    }
+    return out;
+}
+
+// The shipped document's fixed-type rule whose first suffix is `first`.
+[[nodiscard]] nlohmann::json& sizedRule(nlohmann::json& doc, std::string_view first) {
+    for (auto& rule : doc["semantics"]["integerLiteralTyping"]) {
+        if (!rule["suffixes"].empty()
+            && rule["suffixes"][0].get<std::string>() == first) {
+            return rule;
+        }
+    }
+    throw std::runtime_error("the shipped C document has no rule led by '"
+                             + std::string{first} + "'");
+}
+
+} // namespace
+
+TEST(Fc3SizedSuffix, ReductionIsModuloTheWidthReadAtTheTypesSign) {
+    auto const bits = [](TypeKind k, std::uint64_t m,
+                         std::optional<bool> charIsUnsigned = false) {
+        return reducedIntegerLiteralBits(k, m, charIsUnsigned);
+    };
+    auto const neg = [](std::int64_t v) { return static_cast<std::uint64_t>(v); };
+    EXPECT_EQ(bits(TypeKind::I8, 300), std::optional<std::uint64_t>{44});
+    EXPECT_EQ(bits(TypeKind::I8, 0xFF), neg(-1));
+    EXPECT_EQ(bits(TypeKind::I8, 128), neg(-128));
+    EXPECT_EQ(bits(TypeKind::U8, 256), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(bits(TypeKind::U8, 0x1FF), std::optional<std::uint64_t>{255});
+    EXPECT_EQ(bits(TypeKind::I16, 32768), neg(-32768));
+    EXPECT_EQ(bits(TypeKind::U16, 65536), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(bits(TypeKind::I32, 2147483648ULL), neg(-2147483648LL));
+    EXPECT_EQ(bits(TypeKind::U32, 4294967296ULL), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(bits(TypeKind::I64, ~std::uint64_t{0}), neg(-1));
+    EXPECT_EQ(bits(TypeKind::U64, ~std::uint64_t{0}), ~std::uint64_t{0});
+    // The IDENTITY on every magnitude a ladder candidate holds — which is why every
+    // tier may ask this of every typed literal without changing an ISO one.
+    EXPECT_EQ(bits(TypeKind::I32, 2147483647), std::optional<std::uint64_t>{2147483647});
+    EXPECT_EQ(bits(TypeKind::U32, 4294967295ULL), std::optional<std::uint64_t>{4294967295ULL});
+    EXPECT_EQ(bits(TypeKind::U128, ~std::uint64_t{0}), ~std::uint64_t{0});
+    // Plain `char` reads the TARGET's sign; with none, a byte above 0x7F REFUSES.
+    EXPECT_EQ(bits(TypeKind::Char, 0xFF, false), neg(-1));
+    EXPECT_EQ(bits(TypeKind::Char, 0xFF, true), std::optional<std::uint64_t>{255});
+    EXPECT_EQ(bits(TypeKind::Char, 300, std::nullopt), std::optional<std::uint64_t>{44})
+        << "44 is the same char under either sign, so no target is needed";
+    EXPECT_EQ(bits(TypeKind::Char, 0x80, std::nullopt), std::nullopt)
+        << "0x80 is -128 or +128 by the target's char signedness: refuse, never guess";
+    EXPECT_EQ(bits(TypeKind::F64, 5), std::nullopt);
+}
+
+TEST(Fc3SizedSuffix, EachOfTheTwentyFourSpellingsTypesAsItsFixedType) {
+    struct Row { char const* suffix; TypeKind kind; };
+    static constexpr Row kRows[] = {
+        {"i8", TypeKind::Char},   {"I8", TypeKind::Char},
+        {"ui8", TypeKind::U8},    {"Ui8", TypeKind::U8},   {"uI8", TypeKind::U8},   {"UI8", TypeKind::U8},
+        {"i16", TypeKind::I16},   {"I16", TypeKind::I16},
+        {"ui16", TypeKind::U16},  {"Ui16", TypeKind::U16}, {"uI16", TypeKind::U16}, {"UI16", TypeKind::U16},
+        {"i32", TypeKind::I32},   {"I32", TypeKind::I32},
+        {"ui32", TypeKind::U32},  {"Ui32", TypeKind::U32}, {"uI32", TypeKind::U32}, {"UI32", TypeKind::U32},
+        {"i64", TypeKind::I64},   {"I64", TypeKind::I64},
+        {"ui64", TypeKind::U64},  {"Ui64", TypeKind::U64}, {"uI64", TypeKind::U64}, {"UI64", TypeKind::U64},
+    };
+    for (auto const& row : kRows) {
+        expectLiteralTypes(std::string{"5"} + row.suffix, row.kind);
+        expectLiteralTypes(std::string{"5"} + row.suffix, row.kind, DataModel::Llp64);
+    }
+}
+
+TEST(Fc3SizedSuffix, TheMagnitudeNeverChangesTheType) {
+    // Where a ladder would climb, a fixed type stays put: MSVC types each of these
+    // as its suffix's type (`_Generic`) and reduces the value.
+    expectLiteralTypes("300i8", TypeKind::Char);
+    expectLiteralTypes("4294967296i32", TypeKind::I32);
+    expectLiteralTypes("18446744073709551615ui16", TypeKind::U16);
+    // The `ll` ladder would type this `unsigned long long`; `i64` never does.
+    expectLiteralTypes("0xFFFFFFFFFFFFFFFFi64", TypeKind::I64);
+}
+
+TEST(Fc3SizedSuffix, I64IsLongLongAndNotLongUnderEveryModel) {
+    // `long` and `long long` share the I64 core on LP64, so only the vocabulary tag
+    // tells them apart — which `_Generic` reads.
+    for (DataModel const dm : {DataModel::Lp64, DataModel::Llp64}) {
+        auto m = analyzeC("int f(void) { return _Generic(5i64, long: 1, long long: 2, "
+                          "default: 3) + _Generic(5ui64, unsigned long: 10, "
+                          "unsigned long long: 20, default: 30); }\n", dm);
+        EXPECT_FALSE(m.hasErrors());
+        EXPECT_EQ(selectedGenericArms(m), (std::vector<std::string>{"2", "20"}));
+    }
+}
+
+TEST(Fc3SizedSuffix, AMagnitudePastUint64IsTooLargeRatherThanReduced) {
+    // MSVC: 'constant too big' (C2177) for both — the reduction acts on a 64-bit
+    // magnitude, and one past 2^64 - 1 never becomes one.
+    auto m = analyzeC("long long a = 18446744073709551616i64;\n"
+                      "unsigned char b = 18446744073709551616ui8;\n");
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_IntegerLiteralTooLarge), 2u);
+}
+
+TEST(Fc3SizedSuffix, ConstantExpressionsReadTheReducedValue) {
+    // Each dimension is a value MSVC 19.51 computes (`_Static_assert`, enumerator,
+    // array bound and case label all measured). The `char`-typed `i8` is pinned by
+    // the two tests below and, with a target, in test_hir_lowering_c: arithmetic
+    // on a plain `char` needs the target's sign, which this analysis is not given.
+    auto m = analyzeC("char b[256ui8 + 1];\n"
+                      "char c[65536i16 + 3];\n"
+                      "char d[(0xFFFFFFFFFFFFFFFFi64 == -1) + 1];\n"
+                      "char e[(4294967296i32 == 0) + 4];\n"
+                      "char g[(2147483648i32 < 0) + 6];\n"
+                      "enum { E = 65537ui16 };\n"
+                      "char h[E + 6];\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "b"), 1);
+    EXPECT_EQ(arrayDimOf(m, "c"), 3);
+    EXPECT_EQ(arrayDimOf(m, "d"), 2);
+    EXPECT_EQ(arrayDimOf(m, "e"), 5);
+    EXPECT_EQ(arrayDimOf(m, "g"), 7);
+    EXPECT_EQ(arrayDimOf(m, "h"), 7);
+}
+
+TEST(Fc3SizedSuffix, AnI8LiteralFoldsWithNoTargetOnlyWhenItsByteNeedsNoSign) {
+    // `300i8` reduces to the byte 44 and `0x7Fi8` to 127 — the same `char` under
+    // either sign — so each folds even though this analysis has no target.
+    auto m = analyzeC("char a[300i8];\n"
+                      "char d[0x7Fi8 ? 1 : 2];\n");
+    EXPECT_FALSE(m.hasErrors());
+    EXPECT_EQ(arrayDimOf(m, "a"), 44);
+    EXPECT_EQ(arrayDimOf(m, "d"), 1);
+    // The SAME shape with the byte 0x80, which is -128 or +128 by the target's
+    // char signedness: refused, never a guessed sign. (Truthiness would agree under
+    // both signs; the literal's VALUE does not, and that is what the leaf decides.)
+    auto m2 = analyzeC("char c[0x80i8 ? 1 : 2];\n");
+    EXPECT_TRUE(m2.hasErrors());
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleWithoutOutOfRangeRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i8").erase("outOfRange");
+    EXPECT_NE(loadDiagnostics(doc).find("/outOfRange: a fixed-type rule must say"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleUnknownOutOfRangeVerbRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i8")["outOfRange"] = "saturate";
+    EXPECT_NE(loadDiagnostics(doc).find("unknown 'outOfRange' verb 'saturate' — expected 'wrap'"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, OutOfRangeWithoutAFixedTypeRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i8").erase("type");
+    EXPECT_NE(loadDiagnostics(doc).find("/type: 'outOfRange' belongs to a fixed-type rule"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleMixingShapesRejects) {
+    std::pair<char const*, nlohmann::json> const kMixes[] = {
+        {"decimal", nlohmann::json::array({"int"})},
+        {"nondecimal", nlohmann::json::array({"int"})},
+        {"bitPrecise", true},
+        {"signed", true},
+    };
+    for (auto const& [key, value] : kMixes) {
+        auto doc = loadShippedCJson();
+        sizedRule(doc, "i16")[key] = value;
+        EXPECT_NE(loadDiagnostics(doc).find("a fixed-type rule ('type') types every literal"),
+                  std::string::npos) << key << "\n" << loadDiagnostics(doc);
+    }
+}
+
+TEST(Fc3LoaderRejects, FixedTypeThatVariesByDataModelRejects) {
+    // `long` is I64 on LP64 and I32 on LLP64: phase 4 reduces with no data model
+    // in scope, so a width the model decides is refused at load.
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i32")["type"] = "long";
+    EXPECT_NE(loadDiagnostics(doc).find("fixed type 'long' must resolve"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, FixedTypeThatIsNotAnIntegerRejects) {
+    for (char const* name : {"double", "_Bool"}) {
+        auto doc = loadShippedCJson();
+        sizedRule(doc, "i32")["type"] = name;
+        EXPECT_NE(loadDiagnostics(doc).find(std::string{"fixed type '"} + name + "' must resolve"),
+                  std::string::npos) << name << "\n" << loadDiagnostics(doc);
+    }
+}
+
+TEST(Fc3LoaderRejects, FixedTypeRuleWithoutSuffixesRejects) {
+    auto doc = loadShippedCJson();
+    sizedRule(doc, "i64")["suffixes"] = nlohmann::json::array();
+    EXPECT_NE(loadDiagnostics(doc).find("a fixed-type rule must declare its 'suffixes'"),
+              std::string::npos) << loadDiagnostics(doc);
+}
+
+TEST(Fc3LoaderRejects, AnUncoveredSizedSuffixRejects) {
+    // The lexer still admits `5ui64` once its rule is gone: the coverage cross-check
+    // spans the fixed-type shape like the other two.
+    auto doc = loadShippedCJson();
+    auto& ladder = doc["semantics"]["integerLiteralTyping"];
+    for (std::size_t i = 0; i < ladder.size(); ++i) {
+        if (!ladder[i]["suffixes"].empty()
+            && ladder[i]["suffixes"][0].get<std::string>() == "ui64") {
+            ladder.erase(i);
+            break;
+        }
+    }
+    EXPECT_NE(loadDiagnostics(doc).find("declares 'ui64' but no 'integerLiteralTyping' rule covers it"),
+              std::string::npos) << loadDiagnostics(doc);
 }
 
 // ── The shift-result rule is a config verb ──────────────────────────────

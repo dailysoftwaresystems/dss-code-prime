@@ -161,6 +161,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_EnumCompatibleTypeRuleUndeclared";
         case DiagnosticCode::S_EnumeratorValueConvertedToUnderlyingType:
             return "S_EnumeratorValueConvertedToUnderlyingType";
+        case DiagnosticCode::S_StaticInitializerNotConstant:
+            return "S_StaticInitializerNotConstant";
+        case DiagnosticCode::S_StaticInitializerUsesTheCommaOperator:
+            return "S_StaticInitializerUsesTheCommaOperator";
+        case DiagnosticCode::H_StaticInitializerNotFolded:
+            return "H_StaticInitializerNotFolded";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

@@ -30,9 +30,12 @@ rebuild instruction (`rebuild_command`), never a build of this driver's own.
 The build-type decision itself is `read_build_type` in `profile-compile/profile-compile-support.py`
 (its one owner, also used by `compile-bench`); this module only adds WHERE the binary's tree is (the
 recompile pairs a config with it, and the rebuild instruction names it), the stamp of the code that
-runs, and the multi-config note the PowerShell driver printed. The candidate search kept below
-(`find_candidates`, `select_compiler`) is NOT Step 5's: it is the benchmark's by-hand default when
-no `--dss` is given (`benchmark_speedtest1.select_dss`), and it too only reads -- it builds nothing.
+runs, and the multi-config note the PowerShell driver printed. The speedtest1 benchmark names its
+compiler under the same rule, with the same words (`require_named`, which `named_compiler` and
+`benchmark_speedtest1.select_dss` both call): since P68 round 13 nothing in this action searches
+`build/` for a dsscp, and the search that did (`search_roots`, `find_candidates`, `select_compiler`,
+`format_candidates`, and the constants `SEARCH_ROOTS` and `BINARY_NAMES`) was deleted with its last
+caller.
 """
 from __future__ import annotations
 
@@ -50,11 +53,6 @@ Candidate = collections.namedtuple("Candidate", ["path", "mtime", "type", "tree"
 Compiler = collections.namedtuple("Compiler", ["path", "type", "source", "detail", "tree", "origin",
                                                 "built", "build_type_note"])
 
-# The roots `find_candidates` searches, each with `bin/dss` below it -- the PowerShell driver's list,
-# unchanged, then every `build/<name>`. Only the benchmark's by-hand default reads them: Step 5 never
-# searches, because its compiler is named.
-SEARCH_ROOTS = ("build/rel", "build/dbg", "build-rel", "build", "build-dbg")
-BINARY_NAMES = ("dsscp.exe", "dsscp")
 # ★ THE COMPILER'S CODE IS NOT ALWAYS THE FILE THAT RUNS. The build puts it in a shared library of the
 # executable's own name beside a small launcher. ✔MEASURED 2026-09-22: `dsscp.exe` 11 KB, built 13:58,
 # beside `dsscp.dll` rebuilt 22:56 by a later build that left the launcher alone -- and the report said
@@ -146,60 +144,6 @@ def is_release(btype):
     return (btype or "").lower() == "release"
 
 
-def search_roots(repo_root):
-    """The fixed build roots, then EVERY `build/<name>` one level down, in name order. DssHarness
-    keys its build directories by leg variant (`build/<processor>-<toolchain>-<config>`), and a
-    Release tree kept under any other name (MEASURED 2026-08-26: `build/bench-rel` on the arm64
-    VPS) was invisible to a list of names -- the retired bash benchmark searched every
-    `build/*/` for that reason, and this is now the ONE place that decides where to look."""
-    roots = list(SEARCH_ROOTS)
-    build = os.path.join(repo_root, "build")
-    try:
-        names = sorted(n for n in os.listdir(build) if os.path.isdir(os.path.join(build, n)))
-    except OSError:
-        names = []
-    for n in names:
-        if "build/" + n not in roots:
-            roots.append("build/" + n)
-    return roots
-
-
-def find_candidates(repo_root):
-    """-> (candidates newest first, the directories searched). Every root `search_roots` names;
-    both executable spellings on every host; each root's `bin/dss` walked at any depth (a
-    multi-config generator lands the binary in a per-config subdirectory); a file seen twice is
-    one candidate. WHERE to look is decided here only; HOW a binary is judged is `build_type`."""
-    searched, seen, cands = [], set(), []
-    for r in search_roots(repo_root):
-        bin_dir = os.path.join(repo_root, *r.split("/"), "bin", "dss")
-        searched.append(bin_dir)
-        if not os.path.isdir(bin_dir):
-            continue
-        for dirpath, dirs, files in os.walk(bin_dir):
-            dirs.sort()
-            for f in sorted(files):
-                if f in BINARY_NAMES:
-                    full = os.path.abspath(os.path.join(dirpath, f))
-                    key = os.path.normcase(full)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    cands.append(build_type(full))
-    cands.sort(key=lambda c: -c.mtime)
-    return cands, searched
-
-
-def select_compiler(cands, allow_nonrelease):
-    """The newest RELEASE candidate; with `allow_nonrelease`, the newest of any when no Release
-    exists. The switch makes a non-Release binary ELIGIBLE, never PREFERRED."""
-    for c in cands:
-        if is_release(c.type):
-            return c
-    if allow_nonrelease and cands:
-        return cands[0]
-    return None
-
-
 def _stamp(t):
     return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S") if t else "<unknown>"
 
@@ -209,20 +153,13 @@ def built_stamp(cand):
     return "%s (%s)" % (_stamp(cand.mtime), os.path.basename(cand.image or cand.path))
 
 
-def format_candidates(cands):
-    if not cands:
-        return "        <none>"
-    return "\n".join("        %s\n            build type: %s   built: %s\n            read from : %s"
-                     % (c.path, c.type, built_stamp(c), c.source) for c in cands)
-
-
-def named_compiler(cfg):
-    """-> (path, channel): the dsscp the run's `sqlite_common.Config` names -- `dss_bin`, and the
-    channel `by["dss_bin"]` says set it: `--dss`, what every harness step passes (the leg's own
-    `{product}`), or DSS_BIN by hand. REFUSES when it names none: this run is given its compiler,
-    and nothing here or in Step 5 would find or build one in its place. `run_all` asks this FIRST,
-    so a run naming no compiler stops before Step 0 spends anything; `obtain` asks it again."""
-    named, by = (cfg.dss_bin or "").strip(), cfg.by["dss_bin"]
+def require_named(named, by):
+    """-> (path, channel) for the dsscp a run NAMES -- `named` (blank-stripped) and the channel `by` that named it:
+    `--dss`, what every harness step of the sqlite action passes (the leg's own `{product}`), or DSS_BIN by hand.
+    REFUSES when it names none, in ONE set of words for every mode that takes a compiler -- the driver's run and
+    its recompile (`named_compiler`) and the speedtest1 benchmark (`benchmark_speedtest1.select_dss`): a run is
+    given its compiler, and nothing in this action would find or build one in its place."""
+    named = (named or "").strip()
     if not named:
         C.die("no dsscp was named, and this run compiles with a GIVEN one: pass --dss <path> -- every "
               "harness step of the sqlite action passes the leg's own, {product}, which its runner's "
@@ -231,6 +168,15 @@ def named_compiler(cfg):
               "else, and a driver that picked or rebuilt the compiler it measures would measure a "
               "compiler nobody named.")
     return named, by
+
+
+def named_compiler(cfg):
+    """-> (path, channel): the dsscp the run's `sqlite_common.Config` names -- `dss_bin`, and the
+    channel `by["dss_bin"]` says set it: `--dss`, what every harness step passes (the leg's own
+    `{product}`), or DSS_BIN by hand. REFUSES when it names none (`require_named`): this run is given
+    its compiler, and nothing here or in Step 5 would find or build one in its place. `run_all` asks this
+    FIRST, so a run naming no compiler stops before Step 0 spends anything; `obtain` asks it again."""
+    return require_named(cfg.dss_bin, cfg.by["dss_bin"])
 
 
 def obtain(cfg, log=C.LOG):
@@ -284,10 +230,12 @@ def pin_config_root(repo_root, log=C.LOG):
     return root
 
 
-def assert_current(core, compiler, config_root, specs, rebuild_cmd, python=sys.executable):
+def assert_current(core, compiler, config_root, specs, rebuild_cmd, python=sys.executable, scratch=None):
     """One `--preflight-dss` probe per DISTINCT target spec (deduplicated, in order). rc 0 = proved;
     ONLY rc 1 accuses the compiler (stale-binary refusal); any other rc -- or a missing core -- is
-    COULD NOT RUN, which never tells the operator to rebuild. -> the specs proved, ", "-joined."""
+    COULD NOT RUN, which never tells the operator to rebuild. -> the specs proved, ", "-joined.
+    `scratch` names the directory the core writes its probe in (`--scratch`): the speedtest1 benchmark
+    passes its own, inside its output tree; without it the probe goes to the system temp directory."""
     if not os.path.isfile(core):
         C.die("the compiler-currency pre-flight CANNOT RUN, so this run does not know whether its "
               "compiler is current.\n      missing   : %s\n      It holds the ONE implementation of "
@@ -301,7 +249,8 @@ def assert_current(core, compiler, config_root, specs, rebuild_cmd, python=sys.e
     checked = []
     for spec in uniq:
         r = C.capture([python, core, "--preflight-dss", compiler.path, "--config-root", config_root,
-                       "--preflight-target", spec], merge=True, env_=C.child_env(python=True))
+                       "--preflight-target", spec] + (["--scratch", scratch] if scratch else []),
+                      merge=True, env_=C.child_env(python=True))
         text = "\n".join("      " + ln for ln in r.out.strip().splitlines())
         if r.rc == 0:
             checked.append(spec)

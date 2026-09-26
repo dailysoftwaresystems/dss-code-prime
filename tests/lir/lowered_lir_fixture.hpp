@@ -260,8 +260,13 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     DiagnosticReporter hirReporter;
     auto hir = lowerToHir(model, hirReporter);
     DiagnosticReporter mirReporter;
-    MirLoweringConfig mirCfg;
-    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    // The LANGUAGE's policy, through the ONE assembly `compile_pipeline.cpp` uses
+    // (`languageMirLoweringConfig`) — the static-initializer constraint and its constant forms
+    // among it. ⚠ P68 round 13 (fold F7): this fixture assembled the config by hand and read
+    // `globalsConstantForms`' default, so its C lowered with C 6.7.9p4's constraint OFF and no
+    // const object's value folding — a lowering the product never does, and the FOURTH miss of
+    // the class the note below records three times (TF-C78 / TF-C81 / TF-C92).
+    MirLoweringConfig mirCfg = languageMirLoweringConfig(**loaded);
     // Thread the SELECTED CC's by-value aggregate + va_list params into MIR
     // lowering, mirroring compile_pipeline.cpp — so a struct-by-value OR a
     // variadic-callee (va_start/va_arg) source lowers through THIS fixture too
@@ -347,7 +352,10 @@ lowerCToLir(std::string src, std::shared_ptr<TargetSchema> target,
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, &ffiMap,
-                                    /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
+                                    /*linkageMap=*/nullptr,
+                                    // The constrained fold's const input: which object's value
+                                    // a static initializer may read (fold F7, with the config).
+                                    &hir->mutabilityMap,
                                     /*volatileMap=*/nullptr, /*alignmentMap=*/nullptr,
                                     /*threadLocalMap=*/nullptr,
                                     &hir->vlaSizeExprBySymbol,

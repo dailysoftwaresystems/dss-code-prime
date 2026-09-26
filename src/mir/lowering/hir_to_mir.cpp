@@ -3,6 +3,7 @@
 #include "core/types/aggregate_abi.hpp"
 #include "core/types/bit_int_value.hpp"   // the ONE `_BitInt` padding policy (bitIntPaddingTracksSignBit)
 #include "core/types/call_payload.hpp"
+#include "core/types/grammar_schema.hpp"   // languageMirLoweringConfig's input
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"  // c103: BuiltinLowering (BuiltinCall payload)
 #include "core/types/type_lattice/type_layout.hpp"
@@ -81,12 +82,19 @@ namespace {
             } else if constexpr (std::is_same_v<T, HirAddressValue>) {
                 // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): an HIR address constant
                 // maps field-for-field to the MIR symbol-address relocation (F5).
-                // The fold-transient `pointeeType` is dropped — MIR addresses
-                // carry only {symbol, addend}. A NULL-base address never reaches
-                // here (the const-eval engines collapse it to an integer before
-                // pooling); if one did, the asm emitter's symbol-address arm
-                // would fail loud on symbol 0.
-                d.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
+                // The fold-transient `pointeeType` / `baseMayBeNull` are dropped —
+                // MIR addresses carry only {symbol, addend}.
+                // P68 round 13 (lane `cs`, the static-initializer item): the constant
+                // evaluator now folds a NULL-base address too — 6.6p9's integer
+                // constant cast to a pointer (`(void *)0x5`, `(T *)0`), sqlite's
+                // `SQLITE_INT_TO_PTR(X)` — which is an INTEGER with no symbol: it is
+                // written as its bytes, the plain `uint64_t` pointer leaf the retired
+                // null-pointer / integer-to-pointer classifiers produced, never a
+                // relocation against symbol 0.
+                if (arm.base == HirAddressValue::kNullBase)
+                    d.value = static_cast<std::uint64_t>(arm.byteOffset);
+                else
+                    d.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
             } else if constexpr (std::is_same_v<T, BitIntValue>) {
                 // C4b (D-CSUBSET-BITINT-WIDE-LITERAL / I1+C2): the `_BitInt`
                 // bit-precise value is the SAME host type in both pools — copy it
@@ -363,6 +371,15 @@ struct Lowerer {
     // MirSymbolAddrValue whose resolved abs64 would be the link-time tpoff
     // bit-cast into a data slot (a silent garbage pointer).
     std::unordered_set<std::uint32_t> threadLocalTargetSymbols;
+    // P68 round 13 (lane `cs`, the static-initializer item): the module's WEAK
+    // DECLARATIONS with no definition here (extern data and extern functions bound
+    // `weak`) — the only symbols whose address the loader may resolve to NULL. The
+    // constant evaluator gives such an address no truth value (gcc 13.3.0 "initializer
+    // element is not computable at load time" and clang 18.1.3 refuse `_Bool b = &w;` /
+    // `&w != 0` for one, and build both for a weak DEFINITION — lane `cs`'s
+    // `.temp/probe/sti7`, `sti9`). Populated by `collectExterns`, before
+    // `classifyGlobals` runs.
+    std::unordered_set<std::uint32_t> weakDeclarationSymbols;
     // The synthesized module-init function — created lazily when the first
     // non-constant initializer needs runtime evaluation. Each subsequent
     // non-constant init appends a Store-into-global into this function's
@@ -8053,8 +8070,9 @@ struct Lowerer {
     // backing global dedups.
     // The memo-aware minting CORE, shared by BOTH string-global producers —
     // `materializeStringLiteralGlobal` (function-body literals / decay / index)
-    // AND `tryClassifyAsSymbolAddr`'s Cast-of-string-Literal constant-initializer
-    // arm (`static const char *p = "s";` / `= __func__;`). ONE producer core is
+    // AND the constant evaluator's string-literal resolver (`classifyGlobals`'
+    // `resolveStringLiteralSymbol`: `static const char *p = "s";` / `= __func__;`,
+    // P68 round 13). ONE producer core is
     // what makes the C99 6.4.2.2 `__func__` identity hold ACROSS positions: a
     // body read and a static-initializer reference of the same function's
     // `__func__` must decay to EQUAL pointers (the code-audit's MEDIUM-1 — two
@@ -15857,6 +15875,7 @@ struct Lowerer {
                 // declaration's own reference binding, read from the SAME
                 // `linkageMap` a native global's binding comes from.
                 row.binding     = *dataBinding;
+                if (*dataBinding == SymbolBinding::Weak) weakDeclarationSymbols.insert(sym.v);
                 // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker
                 // (a shipped-descriptor DATA export, e.g. a library global) so
                 // the reference gate keeps it even when unreferenced.
@@ -16040,6 +16059,7 @@ struct Lowerer {
             // own reference binding, read from the SAME `linkageMap` a native
             // function's binding comes from — one map, one vocabulary, both rails.
             row.binding     = *fnBinding;
+            if (*fnBinding == SymbolBinding::Weak) weakDeclarationSymbols.insert(sym.v);
             // D-LINK-EXTERN-IMPORT-REFERENCE-GATE: carry the eager marker onto
             // the import row so the linker's reference gate keeps a shipped-
             // descriptor import (producer C) even when this TU never calls it.
@@ -16106,139 +16126,8 @@ struct Lowerer {
         // alignment in bytes (0 ⇒ none). Stamped onto MirGlobal.alignment so the
         // assembler raises the emitted data item's section alignment.
         std::uint32_t                  explicitAlignment = 0;
-        // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): init = the LINK-TIME-CONSTANT
-        // address of `symbolAddrInit` (+ addend) — a string-literal rodata global,
-        // another global, or a function. Routes to a MirSymbolAddrValue literal
-        // (an abs64 relocation), NOT __module_init__. Mutually exclusive with
-        // constInit / runtimeInit above.
-        std::optional<SymbolId>        symbolAddrInit;
-        std::int64_t                   symbolAddrAddend = 0;
     };
     std::vector<PendingGlobal> pendingGlobals;
-
-    // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): recognize a LINK-TIME-CONSTANT
-    // symbol-address global initializer that const-eval cannot fold — a global
-    // pointer initialized to another symbol's ADDRESS. Two shapes:
-    //   `int* p = &x;`     → AddressOf(Ref(global-or-function)) → that symbol
-    //   `char* g = "...";` → Cast(Literal(string), Ptr<Char>)   → a freshly minted
-    //                        rodata string global (pushed to pendingGlobals so
-    //                        emitGlobals_ emits its bytes; the pointer's reloc
-    //                        targets it)
-    // Returns {targetSymbol, addend} or nullopt (the caller falls back to
-    // const-eval / runtime-init). mintSyntheticGlobalSymbol is lazy-seeded after
-    // collect*, so minting here is safe; pushing the rodata PendingGlobal mid-
-    // classify is safe (the classify loop walks moduleDecls, not pendingGlobals).
-    //
-    // TLS C1 (★CRIT-1, D-CSUBSET-THREAD-LOCAL): callers use the
-    // `tryClassifyAsSymbolAddr` WRAPPER below — it screens every classified
-    // target against `threadLocalTargetSymbols` (C11 6.6p9: a thread-local
-    // object's address is NOT an address constant) so no MirSymbolAddrValue
-    // targeting TLS is ever minted silently. This Impl recurses to ITSELF
-    // (the Cast-peel arm) so one initializer emits at most ONE diagnostic.
-    //
-    // ⇒ P55 lane `ag`: the Cast-peel arm PEELS IN A LOOP instead of re-entering
-    // itself. `(void*)(char*)(void*)&g` is a left-deep chain, the shape a
-    // generated header or a macro expansion makes long, and the peel carried no
-    // cap. Peeling is a pure narrowing of the node under consideration — it
-    // combines nothing on the way back out — so the loop returns exactly what
-    // the recursion returned.
-    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
-    tryClassifyAsSymbolAddrImpl(HirNodeId node, EvalEnvironment const& env,
-                                EvalOptions const& opts) {
-      HirNodeId   initNode = node;
-      std::size_t step     = 0;
-      std::size_t const limit = hir.nodeCount() + 1;
-      for (;;) {
-        // HIR is a tree; a peel longer than the module has nodes is a cyclic —
-        // i.e. malformed — tree, an internal invariant break rather than deep
-        // input. Loud, never a silent nullopt (which would read as "not an
-        // address constant" and demote a legal static initializer).
-        if (++step > limit) {
-            unsupported(node, "symbol-address classification peeled more casts "
-                              "than the module has nodes — the HIR cast chain is "
-                              "cyclic (internal invariant break)");
-            return std::nullopt;
-        }
-        HirKind const k = hir.kind(initNode);
-        // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a bare `Ref` to a
-        // FUNCTION symbol is a function designator that has decayed to its
-        // ADDRESS (C 6.3.2.1p4 — the value of a function designator is a
-        // pointer to the function), e.g. the `posixOpen` / `f` member of a
-        // function-pointer table. Its link-time value IS the function's
-        // address. A bare `Ref` to a GLOBAL VARIABLE is excluded: that is an
-        // rvalue LOAD of the variable's contents, not its address (`&global`
-        // arrives as AddressOf(Ref) below). Only the FUNCTION designator
-        // decays designator→address here.
-        if (k == HirKind::Ref) {
-            std::uint32_t const s = hir.payload(initNode);
-            if (functionSymbols.contains(s))
-                return std::make_pair(SymbolId{s}, std::int64_t{0});
-            // c68 (D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER): a bare `Ref`
-            // to a GLOBAL ARRAY variable is an array designator that DECAYS to
-            // `&arr[0]` (C 6.3.2.1p3) — a link-time symbol address, addend 0
-            // (sqlite's `aWindowFuncs[].zName = row_numberName`, a `Ref` to a
-            // `static const char[]` global, wrapped in the decay Cast peeled by
-            // the Cast arm below). A bare `Ref` to a SCALAR global stays excluded
-            // (that is an rvalue LOAD of the variable's contents, NOT its address
-            // — `&global` arrives as AddressOf(Ref)); ONLY the array-to-pointer
-            // designator decay yields an address here.
-            if (globalSymbols.contains(s)) {
-                TypeId const rt = hir.typeId(initNode);
-                if (rt.valid() && interner.kind(rt) == TypeKind::Array)
-                    return std::make_pair(SymbolId{s}, std::int64_t{0});
-            }
-            return std::nullopt;
-        }
-        if (k == HirKind::AddressOf) {
-            // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): the operand
-            // is a CONSTANT LVALUE PATH rooted at a global — the bare
-            // `&global` (the original F5 arm: path = a lone Ref), or the
-            // symbol-base element/field address `&arr[K]` / `&s.field`
-            // (AddressOf(Index/MemberAccess chain)) → {rootSym, byteOffset}.
-            // The path resolver owns the constant-address rules; a
-            // non-constant path (a local, a pointer-typed base, a runtime
-            // index) yields nullopt exactly as the old Ref-only arm did.
-            auto kids = hir.children(initNode);
-            if (kids.size() == 1)
-                return tryResolveConstLvaluePath(kids[0], env, opts);
-            return std::nullopt;
-        }
-        if (k == HirKind::Cast) {
-            auto kids = hir.children(initNode);
-            if (kids.size() != 1) return std::nullopt;
-            TypeId const ct = hir.typeId(initNode);
-            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
-                return std::nullopt;
-            // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a POINTER-typed
-            // cast WRAPPING another symbol-address — `(void*)&x`, the
-            // `(sqlite3_syscall_ptr)posixOpen` member of aSyscall, any
-            // pointer-to-pointer reinterpret. A reinterpret between pointer
-            // types preserves the bit pattern, so the cast IS the same
-            // link-time address (+ addend); peel it and recurse. (Also covers
-            // the scalar top-level `void* p = (void*)&x;` form — same anchor.)
-            // The result type is already gated to Ptr above, so a cast that
-            // changes representation — `(long)&x` — never reaches here.
-            if (hir.kind(kids[0]) != HirKind::Literal) {
-                initNode = kids[0];
-                continue;
-            }
-            std::uint32_t const litIdx0 = hir.payload(kids[0]);
-            HirLiteralValue const& src = literals.at(litIdx0);
-            if (!std::holds_alternative<std::string>(src.value))
-                return std::nullopt;
-            // FC17.5 F2 (code-audit MEDIUM-1): route through the SHARED memoized
-            // producer core — a `static const char *p = __func__;` initializer and
-            // a body read of `__func__` must reference the SAME rodata global
-            // (C99 6.4.2.2 identity), and identical plain string literals dedup
-            // here too (C 6.4.5p7 permits sharing). The prior per-occurrence
-            // PendingGlobal mint broke the identity across positions.
-            SymbolId const rodataSym = internStringLiteralGlobal(kids[0]);
-            if (!rodataSym.valid()) return std::nullopt;  // exhausted → fall back
-            return std::make_pair(rodataSym, std::int64_t{0});
-        }
-        return std::nullopt;
-      }
-    }
 
     // TLS C1 (★CRIT-1, D-CSUBSET-THREAD-LOCAL): fail loud when a
     // STATIC-storage-duration initializer names a thread-local object's
@@ -16266,21 +16155,6 @@ struct Lowerer {
         reporter.report(std::move(d));
     }
 
-    // TLS C1 (★CRIT-1): the screened entry point EVERY symbol-address
-    // classification consumer calls — the scalar classify loop and the
-    // aggregate member loop both mint MirSymbolAddrValue from this result,
-    // so the screen here covers every mint site by construction. The
-    // classification is still RETURNED on a reject (the module stays
-    // walkable — the Error gates the compile), matching the
-    // abort-resilience discipline emitGlobals_ documents.
-    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
-    tryClassifyAsSymbolAddr(HirNodeId initNode, EvalEnvironment const& env,
-                            EvalOptions const& opts) {
-        auto const r = tryClassifyAsSymbolAddrImpl(initNode, env, opts);
-        if (r.has_value()) rejectThreadLocalAddressTarget(r->first, initNode);
-        return r;
-    }
-
     // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: recognize a `&&label` in a
     // STATIC-STORAGE initializer — `static void *p = &&L;` and the array/struct
     // member form `static void *tbl[] = {&&L0, &&L1};`. Both gcc and clang accept
@@ -16295,9 +16169,9 @@ struct Lowerer {
     // cross-CU merge, linker) needs no new case at all — a label address IS a
     // symbol address, once the label has a symbol.
     //
-    // A pointer-typed Cast is peeled first, exactly as `tryClassifyAsSymbolAddrImpl`
-    // peels `(void*)&x`: `(char*)&&L` reinterprets a pointer, so it is the SAME
-    // link-time address.
+    // A pointer-typed Cast is peeled first, exactly as the constant evaluator's
+    // pointer-to-pointer conversion keeps an address: `(char*)&&L` reinterprets a
+    // pointer, so it is the SAME link-time address.
     [[nodiscard]] std::optional<MirLiteralValue>
     tryClassifyAsLabelAddr(HirNodeId initNode) {
         HirNodeId n = initNode;
@@ -16397,14 +16271,14 @@ struct Lowerer {
         pendingLabelExports_.erase(it);
     }
 
-    // TLS C1 (★CRIT-1, belt over the fold path): screen a CONST-EVAL-FOLDED
-    // literal for symbol-address leaves targeting a thread-local object —
-    // the third producer of MirSymbolAddrValue (toMirLiteral's
-    // HirAddressValue arm, fed by evaluateConstant's c43 address folds)
-    // bypasses tryClassifyAsSymbolAddr entirely. Called on the two fold
-    // outputs that become static data (the scalar constInit fold and the
-    // aggregate member fold). Recursive over aggregate arms; scalar leaves
-    // are O(1).
+    // TLS C1 (★CRIT-1): screen a CONST-EVAL-FOLDED literal for symbol-address
+    // leaves targeting a thread-local object (C11 6.6p9 — thread storage is not
+    // static storage, so `&tls` is not an address constant). P68 round 13 (lane
+    // `cs`): since the constant evaluator folds EVERY address constant (the shape
+    // classifiers it replaced are gone), this is the screen of the ONE producer of
+    // an address leaf — toMirLiteral's HirAddressValue arm. Called on the two fold
+    // outputs that become static data (the scalar constInit fold and the aggregate
+    // member fold).
     //
     // ⇒ P55 lane `ag`: this was the SIXTH private copy of the nested-literal
     // walk and it is now the sixth CALLER of `forEachLiteralNode` — the shared
@@ -16423,141 +16297,33 @@ struct Lowerer {
         });
     }
 
-    // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): resolve a CONSTANT
-    // LVALUE PATH rooted at a module global — the operand of a global
-    // initializer's `&…` — to {rootSymbol, byteOffset}. Shapes:
-    //   Ref(global|function)          → {sym, 0}   (the F5/c67 base arm)
-    //   Index(arrayPath, constIdx)    → {sym, off + constIdx * elementStride}
-    //   MemberAccess(recordPath, .f)  → {sym, off + fieldByteOffset(record, f)}
-    // Canonical sqlite shape (sqlite3.c): `const unsigned char
-    // *sqlite3aLTb = &sqlite3UpperToLower[256-OP_Ne];` — an ADDRESS CONSTANT
-    // (C 6.6p9): gcc emits `.quad sqlite3UpperToLower+203` (an abs64 reloc
-    // with an addend), never a runtime store. c67's encoder already threads
-    // the addend, so RECOGNIZING the shape is the whole fix.
-    // ★ CONSERVATIVE (the c65/c68 no-over-fire discipline):
-    //   - an Index base must be ARRAY-typed: indexing THROUGH a pointer-typed
-    //     global (`&ptrGlobal[3]`) reads the pointer's RUNTIME VALUE — not an
-    //     address constant (gcc rejects it as a static initializer too) →
-    //     nullopt (stays fail-loud);
-    //   - a MemberAccess base must be Struct/Union-typed: a `p->f` deref base
-    //     arrives as Deref — no arm matches → nullopt;
-    //   - the index must fold under the SAME const-eval policy the classify
-    //     loop uses (env/opts threaded from it).
-    // Offsets accumulate SIGNED (`&arr[i-j]` with i<j is a negative addend;
-    // the Relocation addend is int64). Nested paths (`&s.arr[K]`,
-    // `&arr[K].field`, `&m[i][j]`) compose by recursion.
-    // ★★ D-MIR-HIRTOMIR-CONST-CHAIN-AND-VOID-TERNARY-FOLDS-RECURSE-PER-LINK
-    // ⇒ P55 lane `ag`: ITERATIVE. `&s.a.b[i].c…` is a LEFT-DEEP CHAIN, and the
-    // census `rc` measured says a chain — not brace nesting — is the shape a
-    // real corpus makes long. The recursion descended `kids[0]` one host frame
-    // per link with no cap; the offsets it accumulated are a plain SUM, and
-    // addition is associative, so summing them on the way DOWN gives the
-    // identical addend the unwinding sum gave. A `nullopt` at any link still
-    // aborts the whole classification, because the sum is only ever returned
-    // once the descent reaches a root the `Ref` arm accepts.
-    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
-    tryResolveConstLvaluePath(HirNodeId n, EvalEnvironment const& env,
-                              EvalOptions const& opts) {
-        std::int64_t addend = 0;
-        HirNodeId    cur    = n;
-        std::size_t  step   = 0;
-        std::size_t const limit = hir.nodeCount() + 1;
-        for (;;) {
-            // HIR is a tree, so a descent longer than the module has nodes is a
-            // malformed (cyclic) tree rather than a deep input. Refuse loud — a
-            // silent nullopt would read as "not an address constant" and quietly
-            // demote a legal static initializer to a runtime store chain.
-            if (++step > limit) {
-                unsupported(n, "constant lvalue-path walk exceeded the module's "
-                               "own node count — the HIR path is cyclic "
-                               "(internal invariant break)");
-                return std::nullopt;
-            }
-            HirKind const k = hir.kind(cur);
-            if (k == HirKind::Ref) {
-                std::uint32_t const s = hir.payload(cur);
-                if (globalSymbols.contains(s) || functionSymbols.contains(s))
-                    return std::make_pair(SymbolId{s}, addend);
-                return std::nullopt;
-            }
-            if (k == HirKind::Index) {
-                auto kids = hir.children(cur);
-                if (kids.size() != 2) return std::nullopt;
-                TypeId const baseTy = hir.typeId(kids[0]);
-                if (!baseTy.valid() || interner.kind(baseTy) != TypeKind::Array)
-                    return std::nullopt;
-                ConstEvalResult const ir =
-                    evaluateConstant(hir, interner, literals, kids[1], env, opts);
-                if (!ir.value.has_value()) return std::nullopt;
-                std::int64_t idxVal = 0;
-                if (std::holds_alternative<std::int64_t>(ir.value->value))
-                    idxVal = std::get<std::int64_t>(ir.value->value);
-                else if (std::holds_alternative<std::uint64_t>(ir.value->value))
-                    idxVal = static_cast<std::int64_t>(
-                        std::get<std::uint64_t>(ir.value->value));
-                else
-                    return std::nullopt;
-                // Stride = the element type's layout size (the Index node's own
-                // type IS the element type) — the SAME `elementStride` engine the
-                // runtime Gep path scales with, so the folded address equals the
-                // address the program would compute.
-                auto const stride = elementStride(hir.typeId(cur));
-                if (!stride.has_value()) return std::nullopt;
-                addend += idxVal * static_cast<std::int64_t>(*stride);
-                cur = kids[0];
-                continue;
-            }
-            if (k == HirKind::MemberAccess) {
-                auto kids = hir.children(cur);
-                if (kids.size() != 1) return std::nullopt;
-                TypeId const baseTy = hir.typeId(kids[0]);
-                if (!baseTy.valid()) return std::nullopt;
-                TypeKind const btk = interner.kind(baseTy);
-                if (btk != TypeKind::Struct && btk != TypeKind::Union)
-                    return std::nullopt;
-                // The FC7 field-offset engine (combineMemberAddr's authority) —
-                // folded field addresses match runtime member access exactly.
-                auto const off = fieldByteOffset(baseTy, hir.payload(cur));
-                if (!off.has_value()) return std::nullopt;
-                addend += static_cast<std::int64_t>(*off);
-                cur = kids[0];
-                continue;
-            }
-            return std::nullopt;
-        }
-    }
-
     // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): recognize a file-scope
-    // AGGREGATE global whose initializer carries a LINK-TIME-CONSTANT member —
-    // a function address, `&global`, or a string literal nested in a struct /
-    // union / array (canonical: sqlite's `static struct unix_syscall aSyscall[]
-    // = {{"open",(sqlite3_syscall_ptr)posixOpen,0},…}`). const-eval cannot fold
-    // such a member (the address is not known until link), so the whole
-    // aggregate would otherwise fall to runtimeInit and trip the
-    // bitfield-rvalue fail-loud guard. This is the AGGREGATE generalization of
-    // the F5 scalar mechanism (`tryClassifyAsSymbolAddr`, D-CSUBSET-SYMBOL-ADDRESS-GLOBAL):
-    // emit STATIC DATA with abs64 relocations at the member
-    // offsets (the C-correct, gcc-matching placement) instead of a
-    // __module_init__ store-chain.
+    // AGGREGATE global whose initializer carries a member the constant evaluator
+    // does not fold — a `&&label` address or a `_Complex` value — nested in a
+    // struct / union / array. P68 round 13 (lane `cs`): an ADDRESS member (a
+    // function, `&global`, a string literal, sqlite's `static struct unix_syscall
+    // aSyscall[] = {{"open",(sqlite3_syscall_ptr)posixOpen,0},…}`) folds in the
+    // evaluator itself now, so a whole aggregate of those never reaches here; this
+    // classifier is the aggregate's route for the two leaf kinds that still need
+    // their own classifier, emitting STATIC DATA (relocations at the member
+    // offsets, the gcc-matching placement) instead of a __module_init__
+    // store-chain.
     //
     // Build a `MirAggregateValue` whose `fields` pair 1:1 with the
     // ConstructAggregate's POSITIONAL children (zero-fills already normalized at
     // HIR lowering — same discipline the const-eval ConstructAggregate arm and
     // `encodeAggregateValue` rely on). Each child resolves by trying, in order:
-    //   (a) `tryClassifyAsSymbolAddr` → a reloc-bearing pointer leaf (a string
-    //       member mints + pushes its own rodata PendingGlobal, the F5 path);
+    //   (a) a `&&label` member → a per-block symbol's address;
     //   (b) a NESTED `tryClassifyAggregateConst` (recurse — struct-in-struct /
     //       array-of-struct like aSyscall);
-    //   (c) `evaluateConstant` → an ordinary folded leaf (plain `0`, ints, …).
+    //   (c) a `_Complex` member → its two components;
+    //   (d) `evaluateConstant` → every other constant, ADDRESS CONSTANTS INCLUDED
+    //       (a function, `&global`, a string literal, a null pointer, `(void*)0x5`,
+    //       `SQLITE_INT_TO_PTR(X)` — P68 round 13 retired the four shape
+    //       classifiers that used to recognize those one by one).
     // If ANY member resolves by none → nullopt (the whole aggregate falls back
     // to runtimeInit — never partially classify). `env`/`opts` are threaded
     // from the classify loop's locals (the SAME const-eval policy globals use).
-    //   (d) a NULL POINTER CONSTANT in a pointer member — `(void*)0`, the
-    //       trailing `0` of an aSyscall row, `int(*fn)(void) = 0`. const-eval
-    //       leaves a cast-to-pointer un-folded ("pointer targets remain
-    //       non-foldable"), so peel the pointer-typed Cast, fold its INTEGER
-    //       operand, and — iff it is 0 — emit a zero pointer leaf (8 zero bytes,
-    //       NO relocation; the encoder's pre-zeroed slot already holds them).
     //
     // ★★ P55 lane `ag`: ITERATIVE, WITH SPECULATIVE DESCENT AND ROLLBACK — and
     // the rollback is not decoration, it is the recursion's ACTUAL semantics
@@ -16634,14 +16400,6 @@ struct Lowerer {
                     work[top].next++;
                     continue;
                 }
-                if (auto sa = tryClassifyAsSymbolAddr(child, env, opts)) {
-                    MirLiteralValue leaf;
-                    leaf.value = MirSymbolAddrValue{sa->first.v, sa->second};
-                    leaf.core  = TypeKind::Ptr;
-                    dst->fields.push_back(std::move(leaf));
-                    work[top].next++;
-                    continue;
-                }
                 // (b) a NESTED aggregate — struct-in-struct / array-of-struct
                 // like aSyscall. Descend SPECULATIVELY; `retry` marks the
                 // resume point should the subtree turn out not to classify.
@@ -16655,25 +16413,6 @@ struct Lowerer {
                         0, false});
                     continue;
                 }
-            }
-            if (auto np = tryClassifyNullPointerConst(child, env, opts)) {
-                dst->fields.push_back(std::move(*np));
-                work[top].next++;
-                continue;
-            }
-            if (auto ip = tryClassifyNullBaseIndexConst(child, env, opts)) {
-                dst->fields.push_back(std::move(*ip));
-                work[top].next++;
-                continue;
-            }
-            // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): an explicit int-const→
-            // pointer cast member — `(void*)0x5`. AFTER the specific handlers (so the
-            // null-pointer `(void*)0` and the SQLITE_INT_TO_PTR AddressOf-Index shape
-            // are claimed by their own arms first), BEFORE the generic fold fallback.
-            if (auto itp = tryClassifyIntToPtrConst(child, env, opts)) {
-                dst->fields.push_back(std::move(*itp));
-                work[top].next++;
-                continue;
             }
             // D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE: a
             // `_Complex` MEMBER / ELEMENT — `struct S { double _Complex z; } s = {…};`,
@@ -17272,183 +17011,6 @@ struct Lowerer {
         }
     }
 
-    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a NULL POINTER in a
-    // pointer object or member — an integer constant expression equal to 0
-    // reaching a POINTER type (`(void*)0`, `int(*fn)(void) = 0`, the `0` member of
-    // an aSyscall row, `char *p = NULL`). const-eval refuses a cast-to-pointer
-    // ("pointer/aggregate targets remain non-foldable", const_eval.cpp), so peel
-    // the pointer-typed Casts and fold the INTEGER operand under them. iff it
-    // folds to 0 the object is a null pointer → a zero pointer leaf (`uint64_t
-    // 0`, core=Ptr); the encoder's scalar-leaf arm writes 8 zero bytes with NO
-    // relocation. A non-zero or non-integer operand (`(void*)0x1000`, an address,
-    // a runtime expr) yields nullopt so the caller's later arms / whole-aggregate
-    // bail still govern — this arm recognizes ONLY a null pointer.
-    // ★ EVERY POINTER-TYPED CAST IS PEELED, NOT ONE
-    // (D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED). `char *p = NULL;` with
-    // the references' `NULL`, `((void*)0)`, is TWO casts: the explicit `(void*)`
-    // and the implicit `void*`→`char*` conversion. Peeling one left the `(void*)0`
-    // for const-eval, which refused it, so the object fell to a runtime
-    // initializer that the static-data producer refuses on every format.
-    // ✔MEASURED at 4d9a24c4 on x86_64 ELF: `char *g = (void*)0`,
-    // `(char*)(void*)0`, `int (*g)(void) = (void*)0`, a struct member, `char
-    // *const`, a static local and a mixed pointer array were each refused, while
-    // gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 14.51 accept them all.
-    // C 6.3.2.3p4 makes the chain a null pointer ("conversion of a null pointer
-    // to another pointer type yields a null pointer of that type"), and 6.6p9
-    // lets pointer casts build an address constant. The peel stops at the first
-    // node that is not a pointer-typed Cast: an integer-typed cast is the
-    // integer expression's own business, and the fold below still demands a
-    // plain integer, so no address can pass for a null pointer.
-    [[nodiscard]] std::optional<MirLiteralValue>
-    tryClassifyNullPointerConst(HirNodeId node, EvalEnvironment const& env,
-                                EvalOptions const& opts) {
-        TypeId const ty = hir.typeId(node);
-        if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr)
-            return std::nullopt;
-        HirNodeId operand = node;
-        while (hir.kind(operand) == HirKind::Cast) {
-            TypeId const ct = hir.typeId(operand);
-            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr) break;
-            auto kids = hir.children(operand);
-            if (kids.size() != 1) return std::nullopt;
-            operand = kids[0];   // the value behind this pointer cast
-        }
-        ConstEvalResult const r =
-            evaluateConstant(hir, interner, literals, operand, env, opts);
-        if (!r.value.has_value()) return std::nullopt;
-        bool isZero = false;
-        if (std::holds_alternative<std::int64_t>(r.value->value))
-            isZero = std::get<std::int64_t>(r.value->value) == 0;
-        else if (std::holds_alternative<std::uint64_t>(r.value->value))
-            isZero = std::get<std::uint64_t>(r.value->value) == 0;
-        if (!isZero) return std::nullopt;
-        MirLiteralValue leaf;
-        leaf.value = std::uint64_t{0};
-        leaf.core  = TypeKind::Ptr;
-        return leaf;
-    }
-
-    // c68 (D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER): a NULL-BASE ARRAY-
-    // ELEMENT address constant — `(T*)&((char*)0)[X]`. This is sqlite's
-    // `SQLITE_INT_TO_PTR(X)` idiom (sqlite3.c: `#define SQLITE_INT_TO_PTR(X)
-    // ((void*)&((char*)0)[X])`): stash a small integer X in a `void*` (read back
-    // via `SQLITE_PTR_TO_INT`), used for the `pUserData` member of the built-in
-    // `FuncDef` tables (`aBuiltinFunc[]`, `aJsonFunc[]`). The address of element
-    // X of a NULL pointer base is `0 + X*sizeof(elem)` — a pointer-valued INTEGER
-    // constant: NO symbol, NO relocation (gcc folds it to the same bytes). This
-    // is the array-element sibling of c43's offsetof MEMBER folding
-    // ([[D-CSUBSET-ADDRESS-CONSTANT-FOLD]]); the CST const-eval deliberately
-    // punted the `&arr[i]` Index form to the global-init lowering ("the HIR
-    // engine", cst_const_eval.cpp Index comment) — this is that handler. Shape:
-    // peel pointer reinterpret cast(s) → AddressOf → Index(base, X).
-    // ★ CONSERVATIVE (no over-fire, the c65 discipline): the base MUST fold to a
-    // NULL pointer (address 0). `&realArray[i]` (a SYMBOL base) is NOT this idiom
-    // — its value is the symbol's address + i*stride (a reloc), NOT the bare
-    // integer — so a non-null base returns nullopt (the member falls through to
-    // the whole-aggregate bail → the fail-loud guard) rather than being silently
-    // mis-folded to an integer.
-    [[nodiscard]] std::optional<MirLiteralValue>
-    tryClassifyNullBaseIndexConst(HirNodeId node, EvalEnvironment const& env,
-                                  EvalOptions const& opts) {
-        // Peel pointer-typed reinterpret cast(s) — the outer `(void*)`.
-        while (hir.kind(node) == HirKind::Cast) {
-            TypeId const ct = hir.typeId(node);
-            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
-                return std::nullopt;
-            auto cKids = hir.children(node);
-            if (cKids.size() != 1) return std::nullopt;
-            node = cKids[0];
-        }
-        if (hir.kind(node) != HirKind::AddressOf) return std::nullopt;
-        auto aoKids = hir.children(node);
-        if (aoKids.size() != 1) return std::nullopt;
-        HirNodeId const idxNode = aoKids[0];
-        if (hir.kind(idxNode) != HirKind::Index) return std::nullopt;
-        auto ixKids = hir.children(idxNode);
-        if (ixKids.size() != 2) return std::nullopt;
-        // The base MUST be a null pointer constant (address 0) — only then is
-        // the element address the bare integer X*stride with no symbol/reloc.
-        if (!tryClassifyNullPointerConst(ixKids[0], env, opts)) return std::nullopt;
-        // Fold the index to an integer.
-        ConstEvalResult const ir =
-            evaluateConstant(hir, interner, literals, ixKids[1], env, opts);
-        if (!ir.value.has_value()) return std::nullopt;
-        std::int64_t idxVal = 0;
-        if (std::holds_alternative<std::int64_t>(ir.value->value))
-            idxVal = std::get<std::int64_t>(ir.value->value);
-        else if (std::holds_alternative<std::uint64_t>(ir.value->value))
-            idxVal = static_cast<std::int64_t>(
-                std::get<std::uint64_t>(ir.value->value));
-        else
-            return std::nullopt;
-        // Stride = sizeof(element). The Index node's type IS the element type
-        // (Subscript: type is the element type).
-        TypeId const elemTy = hir.typeId(idxNode);
-        auto const layout = computeLayout(elemTy, interner,
-                                          config.aggregateLayout, config.dataModel);
-        if (!layout) return std::nullopt;
-        std::uint64_t const value = static_cast<std::uint64_t>(idxVal)
-                                  * static_cast<std::uint64_t>(layout->size);
-        MirLiteralValue leaf;
-        leaf.value = value;
-        leaf.core  = TypeKind::Ptr;
-        return leaf;
-    }
-
-    // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): an explicit integer-constant→
-    // pointer cast in a static initializer — `(void*)0x5`, `(T*)0x1000`,
-    // `((Tcl_ChannelTypeVersion)0x5)`. C permits an integer-constant address in a
-    // STATIC-storage pointer initializer (6.6/6.3.2.3); its value IS the integer,
-    // an ABSOLUTE address with NO symbol and NO relocation (gcc/clang emit the same
-    // bytes). const-eval refuses a cast-to-pointer (invariant: "pointer targets
-    // remain non-foldable", const_eval.cpp) so peel the pointer Casts and fold the
-    // INTEGER operand under them → a plain `uint64_t` leaf (core=Ptr); the encoder's
-    // scalar-leaf arm writes 8 raw LE bytes. Sibling of the null-pointer (c67/c80)
-    // and null-base array-index (c68/c80) classifiers. CONSERVATIVE: fires ONLY on
-    // a Cast whose integer operand folds to a PLAIN integer (int64/uint64 arm) — a
-    // symbol address (HirAddressValue), an AddressOf/Index (the SQLITE_INT_TO_PTR
-    // shape, claimed by tryClassifyNullBaseIndexConst which runs FIRST), an
-    // aggregate, a float, or a fold-failure all yield nullopt → the earlier
-    // symbol-addr path or the whole-aggregate bail / runtimeInit fail-loud still
-    // governs.
-    // ★ EVERY POINTER-TYPED CAST IS PEELED, NOT ONE
-    // (D-C-STATIC-INITIALIZER-POINTER-CAST-CHAIN-REFUSED), for the reason the
-    // null-pointer arm above gives: `char *g = (char*)(void*)0x10;` is a chain of
-    // pointer casts over one integer, an address constant by C 6.6p9, and peeling
-    // one handed `(void*)0x10` to const-eval, which refused it — ✔MEASURED at
-    // 4d9a24c4 on x86_64 ELF, as a scalar and as a struct member, while the four
-    // references accept both and keep the value 0x10 through the chain.
-    [[nodiscard]] std::optional<MirLiteralValue>
-    tryClassifyIntToPtrConst(HirNodeId node, EvalEnvironment const& env,
-                             EvalOptions const& opts) {
-        TypeId const ty = hir.typeId(node);
-        if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr) return std::nullopt;
-        if (hir.kind(node) != HirKind::Cast) return std::nullopt;   // explicit int→ptr cast only
-        HirNodeId operand = node;
-        while (hir.kind(operand) == HirKind::Cast) {
-            TypeId const ct = hir.typeId(operand);
-            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr) break;
-            auto kids = hir.children(operand);
-            if (kids.size() != 1) return std::nullopt;
-            operand = kids[0];   // the value behind this pointer cast
-        }
-        ConstEvalResult const r =
-            evaluateConstant(hir, interner, literals, operand, env, opts);
-        if (!r.value.has_value()) return std::nullopt;
-        std::uint64_t value = 0;
-        if (std::holds_alternative<std::int64_t>(r.value->value))
-            value = static_cast<std::uint64_t>(std::get<std::int64_t>(r.value->value));
-        else if (std::holds_alternative<std::uint64_t>(r.value->value))
-            value = std::get<std::uint64_t>(r.value->value);
-        else
-            return std::nullopt;   // not a plain integer (address/aggregate/float) → not this idiom
-        MirLiteralValue leaf;
-        leaf.value = value;
-        leaf.core  = TypeKind::Ptr;
-        return leaf;
-    }
-
-
     // Classify each module-level global into pendingGlobals. Called after
     // `collectGlobals` (so `globalSymbols` is already populated for any
     // function body that refers to globals during lowering).
@@ -17472,13 +17034,68 @@ struct Lowerer {
                 initBySymbol[sym.v] = *initN;
             }
         }
+        // P68 round 13 (lane `cs`, the static-initializer item): a READ of another
+        // object folds only under the language's `constObjectRead` form, and only for a
+        // CONST, NON-VOLATILE object — every reference refuses `int y = 42; int x = y;`
+        // and a `const volatile` read, and this resolver used to fold both (✔MEASURED at
+        // the fold-8 build, lane `cs`'s `.temp/probe/nci`, `sti9`: DSS ran 42). The
+        // semantic tier refuses those programs first; this keeps a lowering that reaches
+        // here without it (HIR text, or that tier's diagnostic silenced) from folding a
+        // DECLARED object's value silently. A compound literal's element or member is that
+        // tier's alone: HIR carries no literal's const-ness (const is not a lattice bit).
+        // VOLATILE is the OBJECT's type looked through its array spine — the ONE rule
+        // (`TypeInterner::isVolatileObjectType`) the semantic tier's check asks too. Fold F7:
+        // `cva[1]` of `static const volatile int cva[2]` folded here (the qualifier sits on
+        // the ELEMENT type, and the access-volatility attribute this read before answers the
+        // top level only), where every reference refuses it; `cs.v` of `static const struct {
+        // volatile int v; } cs` still folds — gcc and mingw-w64 build it.
+        std::unordered_set<std::uint32_t> constReadableSymbols;
+        ConstantForms const forms = config.globalsConstantForms.value_or(ConstantForms{});
+        if (forms.admits(ConstantForm::ConstObjectRead)) {
+            for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+                if (hir.kind(decl) != HirKind::Global) continue;
+                SymbolId const sym = hir.globalSymbol(decl);
+                if (!sym.valid()) continue;
+                bool const isConst = mutabilityMap != nullptr
+                    && mutabilityMap->tryGet(decl) != nullptr
+                    && mutabilityMap->tryGet(decl)->isConst;
+                bool const isVolatile = interner.isVolatileObjectType(hir.globalType(decl));
+                if (isConst && !isVolatile) constReadableSymbols.insert(sym.v);
+            }
+        }
         EvalEnvironment env;
-        env.resolveConstSymbol = [&initBySymbol](SymbolId s)
+        env.resolveConstSymbol = [&initBySymbol, &constReadableSymbols](SymbolId s)
                 -> std::optional<HirNodeId> {
+            if (!constReadableSymbols.contains(s.v)) return std::nullopt;
             if (auto it = initBySymbol.find(s.v); it != initBySymbol.end()) {
                 return it->second;
             }
             return std::nullopt;
+        };
+        // The ADDRESS facts (`const_eval.hpp`): which symbols have a link-time address a
+        // static initializer may name — every module global (a static local included,
+        // it is one), extern datum and function; a THREAD-LOCAL one too, so the fold
+        // produces it and `rejectTlsAddressesInFoldedLiteral` refuses it by its own code
+        // — and which of them may be NULL.
+        env.resolveAddressableSymbol = [this](SymbolId s) -> std::optional<AddressableSymbol> {
+            if (!globalSymbols.contains(s.v) && !functionSymbols.contains(s.v))
+                return std::nullopt;
+            return AddressableSymbol{weakDeclarationSymbols.contains(s.v)};
+        };
+        // A string literal's array object: the SAME memoized rodata global a body read
+        // of it decays to (C99 6.4.2.2 for `__func__`), minted on first use.
+        env.resolveStringLiteralSymbol = [this](HirNodeId lit) -> std::optional<SymbolId> {
+            SymbolId const s = internStringLiteralGlobal(lit);
+            if (!s.valid()) return std::nullopt;
+            return s;
+        };
+        env.resolveFieldOffset = [this](TypeId record, std::uint32_t field)
+                -> std::optional<std::uint64_t> {
+            return fieldByteOffset(record, field);
+        };
+        // The runtime `Gep`'s own stride (GNU `void *` arithmetic included).
+        env.resolveElementStride = [this](TypeId elem) -> std::optional<std::uint64_t> {
+            return elementStride(elem);
         };
         // FC6 deferral-close: let a global initializer `int g = sizeof(T)` fold
         // through the SAME `computeLayout` engine the dedicated MIR SizeOf case
@@ -17524,6 +17141,10 @@ struct Lowerer {
         // at b1f31420, rc 0 and no diagnostic). Reading the one field means the
         // load-time value and the runtime conversion cannot disagree.
         opts.charIsUnsigned = config.charIsUnsigned;
+        // P68 round 13: address constants fold, and so do the 6.6p10 forms the language
+        // names — the SAME list its semantic tier's static-initializer check read.
+        opts.foldAddressConstants = true;
+        opts.admittedForms        = forms;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
             if (hir.kind(decl) != HirKind::Global) continue;
             // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the declaration
@@ -17545,10 +17166,6 @@ struct Lowerer {
                 if (auto const* p = alignmentMap->tryGet(decl))
                     pg.explicitAlignment = p->alignmentBytes;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
-                // F5: a symbol-ADDRESS initializer (`int* p = &x;`, `char* g =
-                // "...";`) is a LINK-TIME constant const-eval cannot fold —
-                // recognize it FIRST (and route to a MirSymbolAddrValue / abs64
-                // reloc) before falling back to const-eval / runtime-init.
                 // D-C-LABEL-ADDRESS-IN-A-STATIC-INITIALIZER-REFUSED: the TOP-LEVEL
                 // scalar `static void *p = &&L;`. Before every other arm for the
                 // same reason as the aggregate member: const-eval cannot fold a
@@ -17558,19 +17175,17 @@ struct Lowerer {
                 // MirBuilder with "created but never filled".
                 if (auto la = tryClassifyAsLabelAddr(*initN)) {
                     pg.constInit = std::move(*la);
-                } else if (auto sa = tryClassifyAsSymbolAddr(*initN, env, opts)) {
-                    pg.symbolAddrInit   = sa->first;
-                    pg.symbolAddrAddend = sa->second;
                 } else {
-                    // The resolver covers Refs to sibling globals; literal /
-                    // arithmetic / Cast paths still fold per CE1.
+                    // The ONE fold: arithmetic constants, address constants (a
+                    // symbol's address plus an addend becomes a MirSymbolAddrValue /
+                    // abs64 relocation; a NULL-base one its integer bytes) and the
+                    // language's 6.6p10 forms.
                     ConstEvalResult const r = evaluateConstant(
                         hir, interner, literals, *initN, env, opts);
                     if (r.value.has_value()) {
                         pg.constInit = toMirLiteral(*r.value);
-                        // TLS C1 (★CRIT-1): screen the c43 address-fold arm
-                        // — the one MirSymbolAddrValue producer that never
-                        // passes through tryClassifyAsSymbolAddr.
+                        // TLS C1 (★CRIT-1): an address leaf naming a
+                        // thread-local object is refused by its own code.
                         rejectTlsAddressesInFoldedLiteral(*pg.constInit,
                                                           *initN);
                     } else if (auto aggC =
@@ -17586,37 +17201,6 @@ struct Lowerer {
                         // folded above; only the address-bearing case reaches
                         // here.
                         pg.constInit = std::move(*aggC);
-                    } else if (auto np = tryClassifyNullPointerConst(*initN,
-                                                                    env, opts)) {
-                        // c80: a TOP-LEVEL scalar NULL POINTER CONSTANT —
-                        // `T* g = 0;` (sqlite's `vfsList`/`unixBigLock`/
-                        // `inodeList`/`sqlite3SharedCacheList`/
-                        // `sqlite3_temp_directory`/`sqlite3_data_directory`).
-                        // const-eval refuses a cast-to-pointer ("pointer
-                        // targets remain non-foldable"), and c67 wired the
-                        // null-pointer-constant recognizer only into the
-                        // AGGREGATE member loop — a bare scalar pointer
-                        // global fell to runtimeInit → the asm fail-loud.
-                        // Same classifier, same order as the member loop.
-                        pg.constInit = std::move(*np);
-                    } else if (auto ip = tryClassifyNullBaseIndexConst(*initN,
-                                                                      env, opts)) {
-                        // c80: the TOP-LEVEL scalar sibling of c68's member
-                        // arm — `void* g = SQLITE_INT_TO_PTR(X)` =
-                        // `(void*)&((char*)0)[X]` at file scope: a pointer-
-                        // valued INTEGER constant (no symbol, no reloc).
-                        pg.constInit = std::move(*ip);
-                    } else if (auto itp = tryClassifyIntToPtrConst(*initN,
-                                                                   env, opts)) {
-                        // TF-C38 (D-CSUBSET-STATIC-INT-TO-PTR-ABSOLUTE): the
-                        // TOP-LEVEL scalar sibling — `void* p = (void*)0x5;`
-                        // (the tcl.h `((Tcl_ChannelTypeVersion)0x5)` shape).
-                        // const-eval refuses the cast-to-pointer, so the
-                        // explicit int→ptr cast folds to a plain uint64 pointer
-                        // leaf (an ABSOLUTE address, no symbol, no reloc). AFTER
-                        // the null-pointer + null-base-index arms, BEFORE
-                        // runtimeInit — same order as the aggregate member loop.
-                        pg.constInit = std::move(*itp);
                     } else if (auto cx = tryClassifyComplexConst(*initN, pg.type,
                                                                  env, opts)) {
                         // D-CSUBSET-COMPLEX-STATIC-STORAGE-INITIALIZER-HAS-NO-CONSTANT-IMAGE:
@@ -17628,6 +17212,34 @@ struct Lowerer {
                         // its own shape, exactly as the aggregate member loop orders
                         // its handlers.
                         pg.constInit = std::move(*cx);
+                    } else if (config.globalsConstantForms.has_value()) {
+                        // P68 round 13 (lane `cs`, the static-initializer item): the
+                        // language's static objects cannot be initialized at run time
+                        // (C 6.7.9p4), so an initializer no fold above lays down is REFUSED
+                        // HERE, where it is known — never handed on as a runtime initializer
+                        // for the static-data producer to refuse under an object-format code
+                        // ("has a runtime initializer"), and never lowered into a module
+                        // initializer (where a static local's initializer once reached
+                        // another function's operand and aborted dsscp). Its semantic tier
+                        // has already refused every initializer that PROVABLY is not a
+                        // constant; what reaches here is either one it could not prove or a
+                        // constant form this compiler does not fold yet, so the code says
+                        // exactly that and no more.
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::H_StaticInitializerNotFolded;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = "the initializer of this object of static storage "
+                                     "duration is not a constant DSS lays down as static "
+                                     "data: either it is not a constant expression (C "
+                                     "6.7.9p4), or it is a constant form this compiler does "
+                                     "not fold yet";
+                        if (sourceMap != nullptr) {
+                            if (auto const* loc = sourceMap->tryGet(*initN); loc != nullptr) {
+                                d.buffer = loc->buffer;
+                                d.span   = loc->span;
+                            }
+                        }
+                        reporter.report(std::move(d));
                     } else {
                         pg.runtimeInit = *initN;
                     }
@@ -17683,21 +17295,7 @@ struct Lowerer {
                 ok = false;
                 continue;
             }
-            if (pg.symbolAddrInit.has_value()) {
-                // F5: init = link-time-constant symbol address. Emit a
-                // MirSymbolAddrValue literal; lowerMirGlobalsToDataItems (asm)
-                // emits a pointer slot + an abs64 reloc against the target symbol,
-                // NOT a __module_init__ runtime store.
-                MirLiteralValue v;
-                v.value = MirSymbolAddrValue{pg.symbolAddrInit->v,
-                                             pg.symbolAddrAddend};
-                v.core  = TypeKind::Ptr;
-                std::uint32_t const idx = mir.literalPoolAdd(std::move(v));
-                mir.addGlobal(pg.type, pg.symbol, idx, {},
-                              pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
-                              pg.explicitAlignment);
-            } else if (pg.constInit.has_value()) {
+            if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,
@@ -17734,6 +17332,18 @@ struct Lowerer {
             labelBlocks_.clear();
             labelNodeByOrdinal_.clear();
             addressTakenLabelOrdinals_.clear();
+            // P68 round 13 (lane `cs`, the static-initializer item): the same holds for
+            // the VALUE bindings. `symbolToValue` / `addressableLocal` still named the
+            // last lowered function's locals, so `int main(void) { int l = 42; static
+            // int *p = &l; … }` lowered `&l` HERE as `main`'s own alloca — an operand of
+            // another function, and dsscp ABORTED in the rebuilder (exit 0xC0000409,
+            // "rewriteOperand: old MirInstId v=1 has no rewrite entry" — ✔MEASURED, lane
+            // `cs`'s `.temp/probe/sti` and `sti8`). The semantic tier refuses that
+            // program first now; a lowering that reaches here without it (HIR text)
+            // gets the loud "no storage slot" refusal instead of the abort.
+            symbolToValue.clear();
+            addressableLocal.clear();
+            vlaStrideSlot.clear();
             mir.beginBlock(initEntry);
             for (auto const& pg : pendingGlobals) {
                 if (!pg.runtimeInit.valid()) continue;
@@ -17909,6 +17519,17 @@ struct Lowerer {
 };
 
 } // namespace
+
+MirLoweringConfig languageMirLoweringConfig(GrammarSchema const& language) {
+    SemanticConfig const& sem = language.semantics();
+    MirLoweringConfig cfg;
+    cfg.globalsAllowFloat             = language.hirLowering().globalsConstEval.allowFloat;
+    cfg.globalsConstantForms          = otherConstantFormsOf(sem.staticInitializers);
+    cfg.strictAliasingOnDistinctTypes = sem.pointerAliasing.strictAliasingOnDistinctTypes;
+    cfg.charTypesAliasAll             = sem.pointerAliasing.charTypesAliasAll;
+    cfg.nonObjectTypeSizes            = sem.nonObjectTypeSizes;
+    return cfg;
+}
 
 HirToMirResult lowerToMir(Hir const&               hir,
                           HirLiteralPool const&    literals,

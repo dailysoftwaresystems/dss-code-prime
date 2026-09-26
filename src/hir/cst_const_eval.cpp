@@ -466,13 +466,29 @@ evalNode(NodeId                              expr,
             // the true (width, signed); absent rules ⇒ the I32 default (inert for
             // every non-BitInt fold — the leaf's other consumers read `.value`).
             lv.core = TypeKind::I32;
+            std::uint64_t bits = *iv;
             if (!ctx.integerLiteralTyping.empty()) {
                 auto const r = typeIntegerLiteral(tree.text(expr), ctx.numberStyle,
                                                   ctx.integerLiteralTyping,
                                                   ctx.dataModel, *iv);
-                if (r.status == IntegerLadderStatus::Typed) lv.core = r.kind;
+                if (r.status == IntegerLadderStatus::Typed) {
+                    lv.core = r.kind;
+                    // D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED: the VALUE is the
+                    // magnitude reduced to the type — the identity for a ladder
+                    // type, MSVC's `wrap` for a fixed one, so
+                    // `_Static_assert(300i8 == 44, "")` holds (✔MEASURED, MSVC
+                    // 19.51). The SAME shared reduction the CST→HIR literal and
+                    // phase 4 perform; a `char`-typed literal above 0x7F with no
+                    // target answer is not a constant this fold can decide.
+                    auto const reduced = reducedIntegerLiteralBits(
+                        r.kind, *iv, options.charIsUnsigned);
+                    if (!reduced.has_value()) {
+                        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                    }
+                    bits = *reduced;
+                }
             }
-            lv.value = static_cast<std::int64_t>(*iv);
+            lv.value = static_cast<std::int64_t>(bits);
             return ok(std::move(lv));
         }
         // FC17 (D-CSUBSET-CONSTEXPR): a FLOAT literal leaf — ONLY when the

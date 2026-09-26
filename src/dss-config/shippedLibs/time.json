@@ -41,11 +41,7 @@
         { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long\"" },
         { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "i32 \"long\"" }
     ] },
-    { "name": "size_t", "variants": [
-        { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "u64 \"unsigned long\"" },
-        { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long\"" },
-        { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" }
-    ] }
+    { "name": "size_t", "shippedTypedef": { "header": "stddef.h" } }
   ],
   "macros": [
     { "name": "NULL", "replacement": "((void*)0)" }

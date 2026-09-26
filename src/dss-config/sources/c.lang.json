@@ -639,7 +639,11 @@
                           "ull", "uLL", "Ull", "ULL", "llu", "llU", "LLu", "LLU",
                           "ulL", "uLl", "UlL", "ULl", "lLu", "lLU", "Llu", "LlU",
                           "wb", "WB",
-                          "uwb", "uWB", "Uwb", "UWB", "wbu", "wbU", "WBu", "WBU"],
+                          "uwb", "uWB", "Uwb", "UWB", "wbu", "wbU", "WBu", "WBU",
+                          "i8", "I8", "ui8", "Ui8", "uI8", "UI8",
+                          "i16", "I16", "ui16", "Ui16", "uI16", "UI16",
+                          "i32", "I32", "ui32", "Ui32", "uI32", "UI32",
+                          "i64", "I64", "ui64", "Ui64", "uI64", "UI64"],
     "floatSuffixes":    ["f", "F", "l", "L"],
     "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
   },
@@ -2604,6 +2608,10 @@
       "elseChild": 6
     },
     "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
+    "$staticInitializersComment": "P68 round 13 (lane `cs`, the static-initializer item): C 6.7.9p4 (C23 6.7.11p5) — every expression in an initializer for an object of STATIC or THREAD storage duration shall be a constant expression or a string literal; the block's presence is that constraint, and the semantic tier refuses what is PROVABLY not a constant (S_StaticInitializerNotConstant): the value of an object that is not a const, non-volatile one with a visible initializer, a call to a function this translation unit defines, an assignment, an increment or decrement, the address of an object of automatic storage duration — each in an EVALUATED position (a `?:` / `&&` / `||` condition is folded first; `sizeof` reads nothing). 6.6p10 lets an implementation accept other forms, and under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` every form a reference builds is REQUIRED; `otherConstantForms` names them, and the constant evaluator the static-data producer asks reads the SAME list. ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/sti` … `sti10`: gcc 13.3.0 and clang 18.1.3 at -std=c17 -pedantic-errors and -std=c2x, mingw-w64 13.2.0 both modes, MSVC 19.51 /std:c17 and /std:clatest, each separately, every build RUN): constObjectRead — gcc, clang, mingw-w64 (`c[1]` of a const array, `s.m`, a const pointer; never a volatile one, never one whose initializer follows the read); commaOperator — clang, MSVC (admitted with S_StaticInitializerUsesTheCommaOperator, 6.6p3 names the comma); addressAsInteger — all four (`(unsigned long long)&a + 5`; a narrower integer: none); addressTruthValue — gcc, clang, mingw-w64 (`!&a[0]`, `&a[0] ? 42 : 1`, `(_Bool)&a`; never a weak declaration without a definition); addressComparison and addressDifference — gcc, clang, mingw-w64 (`&a[1] < &a[2]`, `&a[3] - &a[1]`, two objects unequal); addressIntegerAlgebra — gcc, mingw-w64 (`(unsigned long long)&a * 0`, `| 0`, `% 1`).",
+    "staticInitializers": {
+      "otherConstantForms": ["constObjectRead", "commaOperator", "addressAsInteger", "addressTruthValue", "addressComparison", "addressDifference", "addressIntegerAlgebra"]
+    },
     "compoundLiterals": [
       { "rule": "compoundLiteralExpr", "typeChild": 1 }
     ],
@@ -2808,7 +2816,7 @@
       { "suffixes": ["f", "F"], "type": "float"  },
       { "suffixes": ["l", "L"], "type": "long double" }
     ],
-    "$integerLiteralTypingComment": "FC3 c1: C 6.4.4.1 EXACTLY — the FIRST candidate (per suffix-group x radix-class) whose range holds the decoded magnitude is the literal's type. `decimal` = no declared numberStyle prefix matched; `nondecimal` (hex/octal/binary) adds the unsigned candidates per the C table. Type names resolve through typeSpecifiers/builtinTypes at LOAD time, so LLP64's 32-bit `long` falls out of the data-model select (2147483648 is `long` on LP64 but `long long` on LLP64). Suffix GROUPS list the exact numberStyle.integerSuffixes spellings they cover; the loader cross-checks every declared suffix is covered exactly once. A magnitude beyond the last candidate -> S_IntegerLiteralTooLarge.",
+    "$integerLiteralTypingComment": "FC3 c1: C 6.4.4.1 EXACTLY — the FIRST candidate (per suffix-group x radix-class) whose range holds the decoded magnitude is the literal's type. `decimal` = no declared numberStyle prefix matched; `nondecimal` (hex/octal/binary) adds the unsigned candidates per the C table. Type names resolve through typeSpecifiers/builtinTypes at LOAD time, so LLP64's 32-bit `long` falls out of the data-model select (2147483648 is `long` on LP64 but `long long` on LLP64). Suffix GROUPS list the exact numberStyle.integerSuffixes spellings they cover; the loader cross-checks every declared suffix is covered exactly once. A magnitude beyond the last candidate -> S_IntegerLiteralTooLarge. ★ THE LAST EIGHT RULES ARE THE THIRD SHAPE, FIXED-TYPE (P68 round 13, D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): MSVC's sized suffixes `i8` `i16` `i32` `i64` and `ui8` … `ui64`, the `i` and the `u` each in either case (24 spellings). The suffix FIXES the type — `type`, resolved like a ladder candidate — and `outOfRange: wrap` reduces a magnitude that type cannot hold modulo 2^width, read at the type's signedness. ✔MEASURED 2026-09-25 through `dssharness run probe-reference-cc --legs windows-x86_64-release` (MSVC 19.51.36260): all 24 compile with no diagnostic at /W4 under /std:c11, /std:c17, /std:clatest and the default mode, typed (by `_Generic`) `i8` char, `ui8` unsigned char, `i16` short, `ui16` unsigned short, `i32` int, `ui32` unsigned int, `i64` long long, `ui64` unsigned long long; `300i8` is 44, `0xFFi8` -1, `256ui8` 0, `2147483648i32` INT_MIN, `4294967296i32` 0, `0xFFFFFFFFFFFFFFFFi64` -1, and `-128i8` is the int +128 (the literal wraps to -128 first); the same values hold in `_Static_assert`, an enumerator, an array bound and a case label (run 20260925-092743-c2711a1a); in `#if` the literal is reduced first and then read at intmax width with its type's signedness — `#if 300i8 == 44`, `#if 128i8 < 0` true, `#if 5ui8 - 6 < 0` false — under both of MSVC's preprocessors (run 20260925-092749-73db8424); a magnitude past 2^64-1 is refused before any reduction (C2177), and every neighbouring spelling measured (`i128`, `i7`, `i08`, `u8`, `iu64`, `i64u`, `ui64l`, `LLi64`, …) is refused (C2059; runs 20260925-092754-b6178dbc, 20260925-092800-a2d72691). gcc 13.3.0, clang 18.1.3 and mingw-w64 gcc 13.2.0 refuse all 24. Under `DSS = (gcc ∪ clang ∪ MSVC) ∪ ISO C` one accepting reference makes a spelling required and MSVC is the only witness of its meaning; MSVC's own <limits.h> and <stdint.h> spell LLONG_MAX `9223372036854775807i64`, ULLONG_MAX `0xffffffffffffffffui64` and INT8_MIN `(-127i8 - 1)`. `i8` is plain `char`, so its reduction reads the TARGET's char signedness. ⚠ THEY ARE LISTED LAST ON PURPOSE: the preprocessor spells a shipped constant with the first suffix in CONFIG ORDER whose literal has the constant's type and value, so every constant an ISO spelling can carry keeps that spelling.",
     "integerLiteralTyping": [
       { "suffixes": [],
         "decimal":    ["int", "long", "long long"],
@@ -2831,7 +2839,15 @@
         "nondecimal": ["unsigned long long"] },
       { "suffixes": ["wb", "WB"], "bitPrecise": true, "signed": true },
       { "suffixes": ["uwb", "uWB", "Uwb", "UWB", "wbu", "wbU", "WBu", "WBU"],
-        "bitPrecise": true, "signed": false }
+        "bitPrecise": true, "signed": false },
+      { "suffixes": ["i8", "I8"],                      "type": "char",               "outOfRange": "wrap" },
+      { "suffixes": ["ui8", "Ui8", "uI8", "UI8"],      "type": "unsigned char",      "outOfRange": "wrap" },
+      { "suffixes": ["i16", "I16"],                    "type": "short",              "outOfRange": "wrap" },
+      { "suffixes": ["ui16", "Ui16", "uI16", "UI16"],  "type": "unsigned short",     "outOfRange": "wrap" },
+      { "suffixes": ["i32", "I32"],                    "type": "int",                "outOfRange": "wrap" },
+      { "suffixes": ["ui32", "Ui32", "uI32", "UI32"],  "type": "unsigned int",       "outOfRange": "wrap" },
+      { "suffixes": ["i64", "I64"],                    "type": "long long",          "outOfRange": "wrap" },
+      { "suffixes": ["ui64", "Ui64", "uI64", "UI64"],  "type": "unsigned long long", "outOfRange": "wrap" }
     ],
     "$arithmeticConversionsComment": "FC3 c1: C 6.3.1.8 usual arithmetic conversions, declared (the engine algorithm in analysis/semantic/type_rules.hpp is closed-verb config-driven; languages WITHOUT this block keep the legacy commonType path). integerPromotion: operands below `int`'s rank promote to int; `alsoPromote` pulls char/bool (outside the width-rank lattice) into promotion WITHOUT the engine hardcoding C's view of char. mixedSignedness `rank-prefer-unsigned`: unsigned rank >= signed rank -> the unsigned type, else the (strictly wider) signed type. promoteComparisons: comparisons convert operands to the common type (so -1 > 0ul compares as U64 -> true); the SSA carrier stays i1/Bool while the SEMANTIC result type is C's `int` (D-CSUBSET-SIZEOF-COMPARISON-INT-TYPE / D-CSUBSET-COMPARISON-SEMANTIC-INT-HIR-I1-DIVERGENCE — a deliberate tier split, like char->i32). shiftResult `promotedLeft` (C 6.5.7): a shift's type is its PROMOTED LEFT operand (the right operand never contributes, so `i32 << i64` is I32) -- the engine reads this verb instead of hardcoding C's special shift rule; the alternative `commonType` types `<<`/`>>` like an ordinary binary op (common type of both).",
     "arithmeticConversions": {

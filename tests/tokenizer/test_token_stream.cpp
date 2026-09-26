@@ -148,7 +148,7 @@ void advanceOnMovedFrom() {
 } // namespace
 
 TEST(TokenStreamDeath, DefaultConstructedPeekAborts) {
-    // SKILL.md's fail-loud discipline: default-constructed / moved-from
+    // The dss-code-prime skill's fail-loud discipline: default-constructed / moved-from
     // streams must not silently succeed with UB. Guard fires before
     // size()-1 underflow.
     EXPECT_DEATH(peekOnDefault(),

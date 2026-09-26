@@ -449,6 +449,20 @@ bool TypeInterner::isAtomicQualified(TypeId id) const {
     return (qualifierBits(id) & static_cast<std::int64_t>(QualBit::Atomic)) != 0;
 }
 
+bool TypeInterner::isVolatileObjectType(TypeId id) const {
+    // The array-element spine only (`ops[0]`), as `typeContainsVla` walks it: a qualifier
+    // skin at ANY level answers — over an element type, or over an array type itself (a skin
+    // qualifies every element beneath it) — and a non-array level ends the walk.
+    while (id.valid()) {
+        if (isVolatileQualified(id)) return true;
+        if (kind(id) != TypeKind::Array) return false;
+        auto const ops = operands(id);
+        if (ops.empty()) return false;
+        id = ops[0];
+    }
+    return false;
+}
+
 TypeId TypeInterner::array(TypeId element, std::int64_t length) {
     std::array<TypeId, 1> const ops{element};
     std::array<std::int64_t, 1> const sc{length};

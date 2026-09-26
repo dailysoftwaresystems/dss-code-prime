@@ -6,12 +6,8 @@
   "library": { "pe": { "role": "cLibrary" }, "elf": { "role": "cLibrary" }, "macho": { "role": "cLibrary" } },
   "typedefs": [
     { "name": "FILE",   "type": "struct \"FILE\" opaque" },
-    { "name": "size_t", "variants": [
-        { "when": { "dataModel": "LP64",  "format": "elf"   }, "type": "u64 \"unsigned long\"" },
-        { "when": { "dataModel": "LP64",  "format": "macho" }, "type": "u64 \"unsigned long\"" },
-        { "when": { "dataModel": "LLP64", "format": "pe"    }, "type": "u64 \"unsigned long long\"" }
-    ] },
-    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "abiTypedef": "wchar_t" }] }
+    { "name": "size_t", "shippedTypedef": { "header": "stddef.h" } },
+    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "shippedTypedef": { "header": "stddef.h" } }] }
   ],
   "constants": [
     { "name": "FILENAME_MAX", "variants": [

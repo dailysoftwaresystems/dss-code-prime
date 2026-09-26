@@ -116,6 +116,18 @@ def env(name, default=""):
     return default if v is None else v
 
 
+def path_knob(value, name):
+    """A path-valued knob (SRC_DIR, OUT_DIR), normalised ONCE for every mode that reads it: "" when unset or empty,
+    the value without its surrounding blanks otherwise, and a value of blanks alone REFUSED -- it names nothing,
+    and read as a relative path it named a directory of blanks under the working directory. (P68 round 13's audit,
+    F3-A-SP-8: the driver passed OUT_DIR / SRC_DIR raw and the benchmark stripped them, so one padded value gave the
+    two modes two trees and two run locks.)"""
+    v = value or ""
+    if v and not v.strip():
+        die("%s=%r names nothing but blanks: unset it, or name a directory." % (name, v))
+    return v.strip()
+
+
 def tristate(name):
     """A three-state switch read EXACTLY as both drivers read it: an ON spelling, an OFF
     spelling (unset/empty included), or a refusal -- a typo is never silently OFF."""
@@ -335,6 +347,27 @@ def driver_tree():
         return None
 
 
+# ── the output tree, and the one run lock on it ─────────────────────────────────────
+
+# The run lock of an output tree (`sqlite_procs.RunLock`), one name for every mode that takes it: the
+# driver's run, the round-close recompile and the speedtest1 benchmark all hold `<output tree>/<RUN_LOCK>`,
+# so two of them on one tree SERIALIZE -- on every host, Windows included (atomic mkdir, liveness-checked).
+RUN_LOCK = ".harness-lock"
+
+
+def output_tree(repo_root, host, out_dir=""):
+    """The sqlite harness's OUTPUT TREE, the ONE rule every mode reads: OUT_DIR (`out_dir`, when set -- as the
+    variable holds it: `path_knob` normalises it here, once, for every caller), else
+    `<repo_root>/build/real-examples/c/sqlite`, under `windows/` on a Windows host. The driver's run and its
+    stage live under it, the recompile finds that stage there, and the speedtest1 benchmark keeps its pinned
+    checkout, its scratch and its default output there -- inside the tree, never beside it."""
+    out_dir = path_knob(out_dir, "OUT_DIR")
+    if out_dir:
+        return os.path.abspath(out_dir)
+    return os.path.join(repo_root, "build", "real-examples", "c", "sqlite",
+                        *(["windows"] if host == "windows" else []))
+
+
 # ── the resolver ────────────────────────────────────────────────────────────────────
 
 class Resolver:
@@ -541,7 +574,7 @@ class Config:
              ("test_file", "--test-file", "DSS_TEST_FILE"), ("dss_bin", "--dss", "DSS_BIN"))
 
     def __init__(self, knobs=None):
-        self.src_dir = env("SRC_DIR")                      # "" = the tree this harness ships in
+        self.src_dir = path_knob(env("SRC_DIR"), "SRC_DIR")    # "" = the tree this harness ships in
         self.dss_repo_url = env("DSS_REPO_URL",
                                 "git@github.com:dailysoftwaresystems/dss-code-prime.git")
         self.sqlite_repo_url = env("SQLITE_REPO_URL", "https://github.com/sqlite/sqlite.git")
@@ -551,7 +584,7 @@ class Config:
             die("SQLITE_DIR='%s' and SQLITE_WSL_DIR='%s' name two different clones; both name the "
                 "POSIX-side sqlite clone of this run, so set one of them." % (a, b))
         self.sqlite_dir = a or b                           # "" = ~/src/sqlite on the POSIX side
-        self.out_dir = env("OUT_DIR")                      # "" = derived from the tree (Run)
+        self.out_dir = path_knob(env("OUT_DIR"), "OUT_DIR")    # "" = derived from the tree (Run)
         # DSS_JOBS (the .ps1's name) wins over JOBS (the .sh's); both validated.
         jobs_name = "DSS_JOBS" if env("DSS_JOBS").strip() else "JOBS"
         self.jobs = int_env(jobs_name, cpu_count(), 1)

@@ -21,8 +21,9 @@
  * exit 42 iff ALL members verify. A wrong/unpatched reloc yields a NULL or wrong
  * address -> a SIGSEGV or a non-42 exit, never a silent pass.
  *
- * Red-on-disable: revert the c67 classify arm (tryClassifyAggregateConst /
- * tryClassifyNullPointerConst / the Cast+Ref symbol-addr peels) OR the asm
+ * Red-on-disable: revert the constant evaluator's address arms (P68 round 13
+ * replaced the c67 classify arm — tryClassifyAggregateConst's symbol-address and
+ * null-pointer members and the Cast+Ref peels — with them) OR the asm
  * encodeAggregateValue reloc-leaf arm -> the table falls to runtime-init and the
  * compile fails with H_UnsupportedLoweringForKind
  * (D-CSUBSET-BITFIELD-RVALUE-RUNTIME) on every target.

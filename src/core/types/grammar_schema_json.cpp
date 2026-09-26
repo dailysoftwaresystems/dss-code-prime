@@ -8876,7 +8876,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // ⓘ 63 → 64 (P68 round 12, lane `cs`): `enumerationCompatibleTypes` — the
             // ladders an enumeration's compatible type is chosen from (C23
             // 6.7.3.3p13); a sibling of `integerLiteralTyping`, whose shape it has.
-            static constexpr std::array<std::string_view, 64> kSemanticsKeys{
+            // ⓘ 64 → 65 (P68 round 13, lane `cs`): `staticInitializers` — C 6.7.9p4's
+            // constraint and the 6.6p10 constant forms (`StaticInitializerRule`); a sibling
+            // of `compoundLiterals`.
+            static constexpr std::array<std::string_view, 65> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
@@ -8895,7 +8898,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 // remaining expression / declaration facets
                 "variadic", "staticAssertRule", "inlineAsm",
                 "inlineAsmTemplateLexemes", "generic",
-                "compoundLiterals", "builtinFunctions",
+                "compoundLiterals", "staticInitializers", "builtinFunctions",
                 // P31: the compile-time OPERATORS (not functions — see above)
                 "builtinOffsetof", "builtinTypesCompatible", "builtinChooseExpr",
                 // statement surface
@@ -12437,11 +12440,13 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // required; `decimal`/`nondecimal` are the candidate
                         // ladders an ordinary row carries; `bitPrecise` selects
                         // the magnitude-derived `_BitInt` row and `signed`
-                        // picks `wb` vs `uwb` within it.
-                        static constexpr std::array<std::string_view, 5>
+                        // picks `wb` vs `uwb` within it; `type` + `outOfRange`
+                        // make the FIXED-TYPE row (MSVC's sized suffixes).
+                        static constexpr std::array<std::string_view, 7>
                             kIntegerLiteralRowKeys{"suffixes", "decimal",
                                                    "nondecimal", "bitPrecise",
-                                                   "signed"};
+                                                   "signed", "type",
+                                                   "outOfRange"};
                         DSS_CHECK_KEY_VOCABULARY(kIntegerLiteralRowKeys);
                         if (!checkKeysAgainst(
                                 entry, kIntegerLiteralRowKeys, path,
@@ -12472,6 +12477,104 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             rule.suffixes.push_back(s.get<std::string>());
                         }
                         if (!entryOk) { rowsOk = false; continue; }
+                        // P68 round 13 (D-C-MSVC-SIZED-INTEGER-SUFFIXES-REFUSED): a
+                        // FIXED-TYPE rule — `type` names the literal's ONE type and
+                        // `outOfRange` what a magnitude past its range does. Its type
+                        // does not depend on the magnitude, so it carries no candidate
+                        // ladder and is not bit-precise; a row that mixes shapes is
+                        // refused rather than read one way.
+                        if (entry.contains("type") || entry.contains("outOfRange")) {
+                            if (!entry.contains("type")) {
+                                coll.emit(DiagnosticCode::C_MissingField, path + "/type",
+                                          "'outOfRange' belongs to a fixed-type rule, "
+                                          "which must name its 'type'");
+                                rowsOk = false; continue;
+                            }
+                            auto const verbs = [] {
+                                return renderAllowedList(
+                                    allNames(kIntegerLiteralOutOfRangeTable), " or ");
+                            };
+                            if (!entry.contains("outOfRange")) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/outOfRange",
+                                          std::format("a fixed-type rule must say what a "
+                                                      "magnitude its type cannot hold "
+                                                      "does: 'outOfRange' is required — "
+                                                      "expected {}", verbs()));
+                                rowsOk = false; continue;
+                            }
+                            if (entry.contains("decimal") || entry.contains("nondecimal")
+                                || entry.contains("bitPrecise") || entry.contains("signed")) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                          "a fixed-type rule ('type') types every "
+                                          "literal it covers as that one type, so it "
+                                          "must NOT declare 'decimal'/'nondecimal' "
+                                          "candidates or 'bitPrecise'/'signed'");
+                                rowsOk = false; continue;
+                            }
+                            if (!entry.at("outOfRange").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/outOfRange",
+                                          std::format("'outOfRange' must be a string "
+                                                      "(closed verb) — expected {}",
+                                                      verbs()));
+                                rowsOk = false; continue;
+                            }
+                            auto const verb = entry.at("outOfRange").get<std::string>();
+                            auto const parsedVerb = integerLiteralOutOfRangeFromName(verb);
+                            if (!parsedVerb.has_value()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/outOfRange",
+                                          std::format("unknown 'outOfRange' verb '{}' — "
+                                                      "expected {}", verb, verbs()));
+                                rowsOk = false; continue;
+                            }
+                            if (!entry.at("type").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/type",
+                                          "'type' must be a type-name string");
+                                rowsOk = false; continue;
+                            }
+                            DataModelTypeRef ref;
+                            if (!resolveTypeName(entry.at("type").get<std::string>(),
+                                                 path + "/type", ref)) {
+                                rowsOk = false; continue;
+                            }
+                            // An integer core of at most 64 bits, or plain `char`: the
+                            // reduction is modulo 2^width of a 64-bit magnitude. And the
+                            // SAME core under every data model, because phase 4 (`#if`)
+                            // reduces with no data model in scope — a width the model
+                            // decided would make the preprocessor's answer a guess.
+                            auto const fixedKind = [](TypeKind k) noexcept {
+                                return k == TypeKind::I8 || k == TypeKind::U8
+                                    || k == TypeKind::I16 || k == TypeKind::U16
+                                    || k == TypeKind::I32 || k == TypeKind::U32
+                                    || k == TypeKind::I64 || k == TypeKind::U64
+                                    || k == TypeKind::Char;
+                            };
+                            bool const invariant = std::ranges::all_of(
+                                ref.coreByDataModel,
+                                [&](auto const& row) { return row.second == ref.core; });
+                            if (!fixedKind(ref.core) || !invariant) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/type",
+                                          std::format("fixed type '{}' must resolve to an "
+                                                      "integer kind of at most 64 bits, or "
+                                                      "plain char, and to the same kind "
+                                                      "under every data model", ref.name));
+                                rowsOk = false; continue;
+                            }
+                            if (rule.suffixes.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                          "a fixed-type rule must declare its "
+                                          "'suffixes' (the unsuffixed rule is a ladder)");
+                                rowsOk = false; continue;
+                            }
+                            rule.fixedType  = std::move(ref);
+                            rule.outOfRange = *parsedVerb;
+                            cfg.integerLiteralTyping.push_back(std::move(rule));
+                            continue;
+                        }
                         // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a
                         // `wb`/`uwb` bit-precise rule. Its type is magnitude-derived
                         // (`_BitInt(N)`), so it carries NO `decimal`/`nondecimal`
@@ -13253,6 +13356,68 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             break;
                         }
                     }
+                }
+            }
+
+            // ── P68 round 13 (lane `cs`): `staticInitializers` (C 6.7.9p4, 6.6p7-p10) ──
+            // An object whose one optional key, `otherConstantForms`, lists the constant
+            // forms beyond C 6.6's own list the language admits in a static initializer
+            // (6.6p10), each a name of the closed `ConstantForm` vocabulary, each at most
+            // once. The block's presence IS the constraint. Refused loud: a non-object, an
+            // unknown key, a non-array list, a non-string or unknown name, a duplicate — a
+            // dropped name would silently turn a form every reference builds into a refusal.
+            if (sem.contains("staticInitializers")) {
+                json const& obj = sem.at("staticInitializers");
+                std::string const base = "/semantics/staticInitializers";
+                static constexpr std::array<std::string_view, 1> kStaticInitializerKeys{
+                    "otherConstantForms"};
+                DSS_CHECK_KEY_VOCABULARY(kStaticInitializerKeys);
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                              "'staticInitializers' must be an object");
+                } else if (checkKeysAgainst(obj, kStaticInitializerKeys, base,
+                                            "the 'staticInitializers' block",
+                                            DiagnosticCode::C_InvalidSemantics, coll,
+                                            "each key names one part of the rule")) {
+                    StaticInitializerRule rule;
+                    bool ok = true;
+                    if (obj.contains("otherConstantForms")) {
+                        std::string const path = base + "/otherConstantForms";
+                        json const& forms = obj.at("otherConstantForms");
+                        if (!forms.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                      std::format("'otherConstantForms' must be an array of "
+                                                  "constant-form names ({})",
+                                                  renderAllowedList(allNames(kConstantFormTable))));
+                            ok = false;
+                        } else {
+                            for (auto const& f : forms) {
+                                auto const form = f.is_string()
+                                    ? constantFormFromName(f.get<std::string>())
+                                    : std::nullopt;
+                                if (!form.has_value()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("unknown constant form '{}' (expected "
+                                                          "one of {})",
+                                                          f.is_string() ? f.get<std::string>()
+                                                                        : f.dump(),
+                                                          renderAllowedList(
+                                                              allNames(kConstantFormTable))));
+                                    ok = false;
+                                    continue;
+                                }
+                                if (rule.otherConstantForms.admits(*form)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("constant form '{}' is listed twice",
+                                                          constantFormName(*form)));
+                                    ok = false;
+                                    continue;
+                                }
+                                rule.otherConstantForms.admit(*form);
+                            }
+                        }
+                    }
+                    if (ok) cfg.staticInitializers = rule;
                 }
             }
 

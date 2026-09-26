@@ -51,6 +51,7 @@
 // that lost it; bind quick_exit unversioned and (1) fails on both ELF pairs;
 // remove the `offsetof` row from stddef.json and both fail on every pair.
 
+#include "analysis/compilation_unit/compilation_unit.hpp"   // predefinedTypeFactsFor — the pair's own facts
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -276,10 +277,11 @@ TEST(StdlibHIsoSurface, EveryS1FactHoldsOnEveryExecutablePair) {
         std::string const         fmt{objectFormatKindName(kind)};
         DataModel const           model  = format.dataModel();
 
-        ShippedPairFacts facts{cLanguage().get(), model, target.charIsUnsigned(kind), {}};
-        for (std::string_view const n : target.abiTypedefNames())
-            if (auto const core = target.abiTypedefCore(n, kind))
-                facts.abiTypedefs.emplace_back(std::string{n}, *core);
+        // The pair's facts from their one owner (P68 round 12, S2a-2a): this built them
+        // by hand and left out the long-double format a signature arm may key on.
+        PredefinedTypeFacts const typeFacts = predefinedTypeFactsFor(target, format);
+        ShippedPairFacts const facts{cLanguage().get(), typeFacts.dataModel, typeFacts.charIsUnsigned,
+                                     typeFacts.abiTypedefs, typeFacts.longDoubleFormat};
 
         TypeInterner       interner{CompilationUnitId{1}};
         TypeRegistry       typeReg;

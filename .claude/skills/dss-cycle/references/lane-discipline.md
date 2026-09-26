@@ -124,9 +124,12 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    (rule 12) — and says: write each row there in anchor-rows' format,
    `<rows dir>/<ANCHOR ID>/{priority,status,trigger,closing,crossrefs}.txt` — UTF-8 with no byte-order mark,
    one file per cell, each cell VERBATIM on one line (the door stores a line break as a space, so a wrapped
-   id or path is stored cut), a pipe written plain (the door escapes it, and refuses one already escaped),
+   id or path is stored cut), each written from the stored text (`dssharness read-anchor <ID> --json`) or the
+   lane's own words and NEVER from a redacted display, whose masks are not the text (✔MEASURED 2026-09-26:
+   `C 6.7.2.5's` displayed as `C <ip>'s`, and a cell copied from the display stored the mask), a pipe written plain (the door escapes it, and refuses one already escaped),
    nothing else in the directory, and a NEW row carrying at least `priority`, `status` and `trigger` — and
-   reply with the directory, the ids and each cell file's md5. Rule 9 holds the scope split: the rows go to
+   reply with the directory, the ids (the NEW ones named as new: the fold declares them with the stage step's
+   `new` input) and each cell file's md5. Rule 9 holds the scope split: the rows go to
    that directory, everything else travels inline. ⚠ The recovery is
    always to ASK THE LANE TO WRITE IT — **never to retype the row from a report**, because a
    retyped row can WRAP an anchor id, and a wrapped id does not fail: it goes invisible to every

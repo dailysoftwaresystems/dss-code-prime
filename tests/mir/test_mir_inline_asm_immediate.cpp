@@ -113,8 +113,7 @@ struct Lowered {
     out.hir = lowerToHir(*out.model, out.hirReporter);
     if (out.hir == nullptr) return out;
 
-    MirLoweringConfig cfg;
-    cfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    MirLoweringConfig cfg = languageMirLoweringConfig(**loaded);   // the pipeline's assembly
     if (out.target != nullptr) {
         cfg.aggregateLayout       = out.target->aggregateLayout();
         cfg.aggregateLayoutLoaded = out.target->aggregateLayoutLoaded();

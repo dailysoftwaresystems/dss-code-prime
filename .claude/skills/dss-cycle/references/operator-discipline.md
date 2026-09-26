@@ -40,7 +40,7 @@ landed in cf27fe8b, 2026-08-23.
 A new one reds immediately. Converting one reds until its ceiling is lowered in the same commit:
 
 ```bash
-dssharness run check-plan-citations --manual-step write
+dssharness run check-plan-citations-write
 ```
 
 
@@ -80,7 +80,7 @@ said ~2365 when it landed in cf27fe8b, 2026-08-23. A new one reds immediately; c
 commit, because unclaimed headroom is where the next one hides.
 
 ```bash
-dssharness run check-plan-citations --manual-step write
+dssharness run check-plan-citations-write
 ```
 
 ⚠ **Green there means no NEW positional citation landed — never that the plans cite stably.** The

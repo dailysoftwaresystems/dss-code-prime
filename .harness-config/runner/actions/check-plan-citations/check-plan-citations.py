@@ -278,6 +278,12 @@ CONTINUATION = re.compile(r"(?:\s*[,;/·]\s*|\s+):\d+(?:-\d+)?")
 URL_SPAN = re.compile(r"https?://\S+")
 
 EXIT_OK, EXIT_RATCHET, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
+# The burn-down and re-stamp a refusal names: the `write` manual step of this action
+# (check-plan-citations.yml), run through the harness -- never this file started by hand -- on the
+# runner that runs it on ONE leg, this machine's own tree (config.json `check-plan-citations-write`):
+# this action's own runner keeps both local legs, and a `--manual-step write` through it would rewrite
+# the WSL leg's synced copy too (P68 round 13's audit, F1-A11).
+WRITE_VERB = "dssharness run check-plan-citations-write"
 
 # ★ A DOCUMENT COUNT, NOT A CITATION COUNT -- `census()` compares this against
 # `len(documents())`. ⚠ The value stood at 40 justifying itself against "2374 at
@@ -363,6 +369,22 @@ def repo_root():
         return ot.resolve(__file__)
     except ot.Refusal as exc:
         raise Collapse(str(exc))
+
+
+def remedy_runner_fact():
+    """-> (ok, detail): the runner WRITE_VERB names is declared in this tree's config.json, runs this action's
+    `write` step ALONE, on ONE leg whose definition names no other host -- this machine's own tree (P68 round 13's
+    audit, F1-A11: the remedy named the two-leg runner, whose `--manual-step write` rewrote the WSL leg's copy
+    too). Read from config, never assumed: a second leg added there reds the self-test."""
+    cfg = _owning_tree().load_jsonc(os.path.join(repo_root(), ".harness-config", "config.json"))
+    name = WRITE_VERB.split()[-1]
+    runner = (cfg.get("predefinedRunners") or {}).get(name) if isinstance(cfg, dict) else None
+    legs = (runner.get("legs") or []) if isinstance(runner, dict) else []
+    leg = (cfg.get("legs") or {}).get(legs[0]) if len(legs) == 1 else None
+    others = [k for k in (cfg.get("hosts") or {}) if k != "local" and isinstance(leg, dict) and k in leg]
+    ok = (isinstance(runner, dict) and runner.get("action") == "check-plan-citations/check-plan-citations.yml"
+          and runner.get("steps") == ["write"] and isinstance(leg, dict) and not others)
+    return ok, "runner %r: %r; its leg names another host: %r" % (name, runner, others)
 
 
 def _walk(root, rel_roots, keep):
@@ -610,7 +632,7 @@ def report_comment_divergence(comment):
     print("  become false.")
     print("  FIX: DECIDE WHICH SIDE IS TRUE FIRST; the repair is not symmetric. If")
     print("  the CODE is right, re-stamp the JSON:")
-    print("      python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --write")
+    print("      %s" % WRITE_VERB)
     print("  If the JSON is right, edit `_INVENTORY_COMMENT` to match it -- running")
     print("  `--write` would DESTROY the corrected text. The species: a claim that")
     print("  was TRUE WHEN IT WAS TYPED and FALSE WHEN THE COMMIT LANDED, still")
@@ -717,7 +739,7 @@ def run(root, write, baseline=False):
         print("")
         print("  Unclaimed headroom is where the next one hides. If you converted a")
         print("  citation, lower the ceiling in the same commit:")
-        print("      python .harness-config/runner/actions/check-plan-citations/check-plan-citations.py --write")
+        print("      %s" % WRITE_VERB)
         print("  That verb only lowers, so it cannot hide a regression while it does.")
         return EXIT_RATCHET
 
@@ -734,7 +756,7 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 46
+EXPECTED_ARMS = 47
 # A documentation root cut down to this many documents is a COLLAPSE (arms 5c, 11c): every
 # floor in `DOC_ROOT_FLOORS` must sit above it, or those arms fail.
 PARTIAL_DOCS = 10
@@ -1014,7 +1036,10 @@ def selftest(root):
         assert converted != pristine, "arm 2 mutation removed no citation"
         io.open(subject, "w", encoding="utf-8", newline="").write(converted)
         ok &= _arm("2 CEILING-NOW-STALE", tmp, EXIT_RATCHET,
-                   says="above the live count", not_says="new positional citation")
+                   says=("above the live count", WRITE_VERB), not_says="new positional citation")
+        # 2c -- ...and the runner that remedy names runs `write` alone, on ONE leg of this machine's own tree.
+        _fact_ok, _fact_detail = remedy_runner_fact()
+        ok &= _fact("2c REMEDY-RUNNER-ONE-LEG", _fact_ok, "" if _fact_ok else _fact_detail[:300])
         io.open(subject, "w", encoding="utf-8", newline="").write(pristine)
         ok &= _arm("2b RESTORED", tmp, EXIT_OK)
 
@@ -1301,7 +1326,7 @@ def selftest(root):
         # would rot the first time the literal is reworded.
         ok &= _arm("21 COMMENT-DIVERGED", tmp, EXIT_RATCHET,
                    says=("has DIVERGED", _STALE_COMMENT[0],
-                         _INVENTORY_COMMENT[0]),
+                         _INVENTORY_COMMENT[0], WRITE_VERB),
                    not_says="new positional citation")
         _stamp_comment(_MISSING)
         ok &= _arm("22 COMMENT-ABSENT", tmp, EXIT_RATCHET,

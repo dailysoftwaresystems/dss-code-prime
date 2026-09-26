@@ -22,7 +22,7 @@ namespace {
 
 // Layer-local fatal helper. Same posture as treeFatal / attrFatal /
 // streamFatal: always-on, release-mode abort, prefix identifies the
-// originating layer for triage. SKILL.md mandates this pattern over
+// originating layer for triage. The dss-code-prime skill's fail-loud rule mandates this pattern over
 // `<cassert>` (the latter is debug-only and silenced in Release).
 [[noreturn]] void tokenizerFatal(char const* what) {
     std::fputs("dss::Tokenizer fatal: ", stderr);

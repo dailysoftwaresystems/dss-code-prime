@@ -49,6 +49,7 @@
 // binary reads whichever config tree the shell happens to stand in.
 
 #include "core/types/config_path_walk.hpp"
+#include "core/types/constant_form.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/entry_shape.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -339,6 +340,8 @@ inline std::vector<ScalarSite> scalarSites() {
     static constexpr auto kBindingNames = allNames(dss::kSymbolBindingTable);
     static constexpr auto kVisNames     = allNames(dss::kSymbolVisibilityTable);
     static constexpr auto kVerbNames    = allNames(dss::kEntryMaterializationTable);
+    // P68 round 13 (lane `cs`): the 6.6p10 constant forms a static initializer may take.
+    static constexpr auto kConstantFormNames = allNames(dss::kConstantFormTable);
     return {
         {"c",
          "/semantics/declarations/7/linkageSpecifiers/weak/binding",
@@ -351,6 +354,8 @@ inline std::vector<ScalarSite> scalarSites() {
          kIgnoreProbeOnly},
         {"c", "/semantics/declarations/7/entryFunctions/main/0/verb",
          "entryFunctions verb", kVerbNames, kIgnoreVerb},
+        {"c", "/semantics/staticInitializers/otherConstantForms/0",
+         "staticInitializers constant form", kConstantFormNames, kIgnoreProbeOnly},
     };
 }
 

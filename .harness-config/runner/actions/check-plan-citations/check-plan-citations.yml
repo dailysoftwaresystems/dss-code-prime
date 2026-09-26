@@ -12,8 +12,8 @@ steps:
       python3 ./check-plan-citations.py
     successPattern: 'plan-citations: self-test OK'
     requireInputsUnmoved: true
-  # The BURN-DOWN verb, run only where a run names it (`dssharness run check-plan-citations --manual-step
-  # write`): it may only LOWER a ceiling, and it writes nothing when it refuses. It moves a tracked file by
+  # The BURN-DOWN verb, run only where a run names it -- `dssharness run check-plan-citations-write`, the runner
+  # that runs it on ONE leg, this machine's own tree (config.json): it may only LOWER a ceiling, and it writes nothing when it refuses. It moves a tracked file by
   # design, so it cannot carry requireInputsUnmoved; a plain run afterwards verifies.
   - name: write
     manual: true
