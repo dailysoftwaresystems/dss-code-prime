@@ -877,6 +877,68 @@ TEST(ShippedStatTypedSurface, ThePeLegacyStat64TagIsTheUcrtTagNotASecondRecord) 
     EXPECT_FALSE(offPe.diagnostics().hasErrors());
 }
 
+// P68 round 11 — the POSIX spellings of the same record and entry points on pe:
+// `struct stat64`, `stat64()` and `fstat64()`. MEASURED in the one reference that
+// accepts them, mingw-w64 `_mingw_stat64.h`, beside the legacy alias above:
+//   #define stat64   _stat64  /* for POSIX */
+//   #define fstat64  _fstat64 /* for POSIX */
+// The UCRT's headers spell neither, and MSVC refuses such a program (C2079 `uses
+// undefined struct 'stat64'`); under the disjunction mingw-w64's acceptance makes
+// both required. The model is the reference's own mechanism again -- two
+// `when:{format:pe}` `macros` rows -- so the POSIX tag IS the UCRT tag and the two
+// calls ARE `_stat64` / `_fstat64`. examples/c/shipped_stat64_alias_pe runs it.
+//
+// RED-ON-DISABLE: delete the `stat64` row -> (a) and (b) meet an incomplete `struct
+// stat64` and an undeclared `stat64`, and (d)'s `#ifndef` arm fires `#error`; delete
+// the `fstat64` row -> (a)'s second call is undeclared and (d) fires. (c) is the
+// OVER-REACH detector, as for `__stat64`; (e) keeps both names off elf, where
+// `struct stat64` is glibc's genuinely different LFS record.
+TEST(ShippedStatTypedSurface, ThePePosixStat64SpellingsAreTheUcrtOnes) {
+    // (a) the calls, each with the POSIX tag: the parameter IS `struct _stat64 *`.
+    auto const calls =
+        peC("#include <sys/stat.h>\n"
+            "int main(void){ struct stat64 st;\n"
+            " return stat64(\".\", &st) + fstat64(0, &st); }\n");
+    EXPECT_FALSE(calls.diagnostics().hasErrors())
+        << "`stat64`/`fstat64` must resolve on pe, onto `_stat64`/`_fstat64`";
+    EXPECT_FALSE(diagnosesAPointerConversion(calls.diagnostics()))
+        << "`struct stat64 *` IS the UCRT entry points' parameter type";
+
+    // (b) ONE TYPE, so a pointer crosses in BOTH directions with no cast.
+    auto const both =
+        peC("#include <sys/stat.h>\n"
+            "int main(void){ struct stat64 a; struct _stat64 b;\n"
+            " struct _stat64 *p = &a; struct stat64 *q = &b;\n"
+            " return (p != 0) + (q != 0); }\n");
+    EXPECT_FALSE(both.diagnostics().hasErrors());
+    EXPECT_FALSE(diagnosesAPointerConversion(both.diagnostics()))
+        << "two look-alike tags would DIAGNOSE this even with identical members";
+
+    // (c) THE OVER-REACH DETECTOR: `_stat64i32` shares the field list and must stay
+    // a distinct tag.
+    auto const distinct =
+        peC("#include <sys/stat.h>\n"
+            "int main(void){ struct stat64 x; return _stat64i32(\"x\", &x); }\n");
+    EXPECT_TRUE(hasCode(distinct.diagnostics(),
+                        DiagnosticCode::S_IncompatiblePointerConversion))
+        << "the alias must make ONE pair of spellings one type, not collapse "
+           "every UCRT record of the same shape";
+
+    // (d) + (e) THE FORMAT GATE, from the preprocessor, in both directions.
+    auto const onPe = peC("#include <sys/stat.h>\n"
+                          "#if !defined(stat64) || !defined(fstat64)\n"
+                          "#error the pe POSIX aliases must be spliced on pe\n"
+                          "#endif\n"
+                          "int main(void){ return 0; }\n");
+    EXPECT_FALSE(onPe.diagnostics().hasErrors());
+    auto const offPe = elfC("#include <sys/stat.h>\n"
+                            "#if defined(stat64) || defined(fstat64)\n"
+                            "#error the pe POSIX aliases must not reach elf\n"
+                            "#endif\n"
+                            "int main(void){ return 0; }\n");
+    EXPECT_FALSE(offPe.diagnostics().hasErrors());
+}
+
 // The RETURN side, which the corpus example also witnesses by execution — kept
 // here as well so the descriptor set is judged in one place.
 TEST(ShippedStatTypedSurface, ATypedReturnNoLongerAssignsToAnyPointer) {

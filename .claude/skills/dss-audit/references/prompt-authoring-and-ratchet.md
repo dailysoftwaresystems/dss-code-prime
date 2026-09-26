@@ -27,7 +27,8 @@ implementer understands the failure mode, not just the task.
 A weak test caught once is a finding; a weak-test *class* caught once will recur every cycle until
 the implementer's standing instructions forbid it. The per-instance repair (§G flag + §H prompt)
 fixes *this* cycle; the ratchet fixes *every future* cycle by hardening `dss-cycle`'s own
-`SKILL.md`. This is the only place the auditor touches the implementer — and it edits its
+standing test-discipline prose — `references/the-bar.md` §A.5, which its `SKILL.md` only summarizes.
+This is the only place the auditor touches the implementer — and it edits its
 *instructions*, never its code, tests, or config.
 
 **When it fires — evidence-gated, never speculative.** Only from a concrete gap *observed in the
@@ -44,8 +45,8 @@ audited delta*, of one of these classes:
 - **Not** an honestly-named, trigger-gated deferral — those are legit (§F). Never ratchet an honest
   pin; ratchet only an *unflagged* gap.
 
-**The trigger question:** *would a careful implementer following `dss-cycle`'s current `SKILL.md`
-have known to write the stronger test?*
+**The trigger question:** *would a careful implementer following `dss-cycle`'s current `SKILL.md` and
+`references/the-bar.md` have known to write the stronger test?*
 
 - The instruction that would have prevented it is **absent or too weak** → **ratchet** (this section).
 - The instruction already exists and was simply **ignored** → that is an implementer-discipline
@@ -78,7 +79,8 @@ have known to write the stronger test?*
   whether this is a recurring class (vs a one-off), do *not* edit the skill — quote the exact
   instruction text you *would* add, in the verdict, and let the human apply it. Same rule as §I: when
   unsure, it's a judgment call — report, don't commit.
-- **Touch only `dss-cycle`'s standing test-discipline prose** — never its run mechanics, anchors, or
+- **Touch only `dss-cycle`'s standing test-discipline prose** (`references/the-bar.md` §A.5) — never its
+  run mechanics, anchors, or
   anything else — and **never while the loop might be reading/writing that file** (race; flag in the
   verdict instead, exactly as §I).
 

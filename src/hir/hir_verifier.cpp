@@ -294,13 +294,15 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
 //       filter-expression OR handler-body; `_exception_info()` a filter only.
 //   (2) H_SehJumpIntoRegion — a goto may not enter any part of a __try
 //       statement it is not already inside (MSVC rejects it too).
-//   (3) H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, trigger-gated, option (C) of
-//       the c115 design-audit) — no return / goto-out / break-out /
-//       continue-out / indirect-goto from INSIDE a guarded body: the guarded
-//       body keeps exactly ONE exit (the fall-through) so the c116 scope-table
-//       region membership stays CFG-derivable. sqlite: zero early exits.
-//   (4) H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, trigger-gated) — `&&label`
-//       naming a label inside any part of a __try statement.
+//   (3) H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, open: MSVC and clang run
+//       every early exit; option (C) of the c115 design-audit) — no return /
+//       goto-out / break-out / continue-out / indirect-goto from INSIDE a
+//       guarded body YET: the guarded body keeps exactly ONE exit (the
+//       fall-through) so the c116 scope-table region membership stays
+//       CFG-derivable.
+//   (4) H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, open since its 2026-09-24
+//       re-verdict: clang runs the region-internal form) — `&&label` naming a
+//       label inside any part of a __try statement.
 void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
     std::uint32_t const moduleTag = hir_.id().v;
 
@@ -400,11 +402,11 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
             for (auto const& [seh, slot] : sehAncestry(id)) {
                 (void)seh;
                 if (slot == 0u) {
+                    // Anchored: D-CSUBSET-SEH-EARLY-EXIT (open: MSVC and clang run it).
                     reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
                              "'return' inside a __try guarded body is not "
-                             "supported (D-CSUBSET-SEH-EARLY-EXIT: the guarded "
-                             "body keeps a single fall-through exit; "
-                             "trigger-gated — no shipped consumer)",
+                             "supported yet (the guarded body keeps a single "
+                             "fall-through exit)",
                              sourceMap_);
                     break;
                 }
@@ -428,11 +430,11 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
             }
             for (auto const& [seh, slot] : gAnc) {
                 if (slot == 0u && !contains(lAnc, seh, 0u)) {
+                    // Anchored: D-CSUBSET-SEH-EARLY-EXIT (open: MSVC and clang run it).
                     reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
                              "goto out of a __try guarded body is not supported "
-                             "(D-CSUBSET-SEH-EARLY-EXIT: the guarded body keeps "
-                             "a single fall-through exit; trigger-gated — no "
-                             "shipped consumer)",
+                             "yet (the guarded body keeps a single fall-through "
+                             "exit)",
                              sourceMap_);
                     break;
                 }
@@ -443,10 +445,12 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
             for (auto const& [seh, slot] : sehAncestry(id)) {
                 (void)seh;
                 if (slot == 0u) {
+                    // Anchored: D-CSUBSET-SEH-EARLY-EXIT and D-CSUBSET-SEH-LABEL-ADDR (clang runs
+                    // the region-internal form).
                     reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
                              "computed goto inside a __try guarded body is not "
-                             "supported (D-CSUBSET-SEH-EARLY-EXIT: its target "
-                             "set cannot be proven region-internal)",
+                             "supported yet (its target set cannot be proven "
+                             "region-internal)",
                              sourceMap_);
                     break;
                 }
@@ -457,11 +461,12 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
             HirNodeId const label = resolveLabel(id, hir_.payload(id));
             if (!label.valid()) break;
             if (!sehAncestry(label).empty()) {
+                // Anchored: D-CSUBSET-SEH-LABEL-ADDR (open: clang runs the region-internal
+                // form, and an address taken in a static local's initializer escapes this).
                 reportAt(reporter, DiagnosticCode::H_SehLabelAddress, id,
                          "'&&label' naming a label inside a __try statement is "
-                         "not supported (D-CSUBSET-SEH-LABEL-ADDR: a computed "
-                         "goto could enter the guarded range; trigger-gated — "
-                         "no shipped consumer)",
+                         "not supported yet (a computed goto could enter the "
+                         "guarded range)",
                          sourceMap_);
             }
             break;
@@ -489,12 +494,12 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
                 if (hir_.kind(cur) == HirKind::SehTryExcept) {
                     auto const kids = hir_.children(cur);
                     if (!kids.empty() && kids[0] == prev) {
+                        // Anchored: D-CSUBSET-SEH-EARLY-EXIT (open: MSVC and clang run it).
                         reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
                                  std::format(
                                      "'{}' exiting a __try guarded body is not "
-                                     "supported (D-CSUBSET-SEH-EARLY-EXIT: the "
-                                     "guarded body keeps a single fall-through "
-                                     "exit; trigger-gated — no shipped consumer)",
+                                     "supported yet (the guarded body keeps a "
+                                     "single fall-through exit)",
                                      hir_.kind(id) == HirKind::BreakStmt
                                          ? "break" : "continue"),
                                  sourceMap_);

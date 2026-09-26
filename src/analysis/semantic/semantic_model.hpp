@@ -1020,6 +1020,7 @@ public:
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
                   UnitAttribute<NodeId>                  nodeToSelectedExpr,
+                  UnitAttribute<SymbolId>                typedefNamedByToken,
                   UnitAttribute<std::uint64_t>           nodeToFoldedConstant,
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
@@ -1052,6 +1053,7 @@ public:
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
           nodeToSelectedExpr_(std::move(nodeToSelectedExpr)),
+          typedefNamedByToken_(std::move(typedefNamedByToken)),
           nodeToFoldedConstant_(std::move(nodeToFoldedConstant)),
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
@@ -1126,6 +1128,14 @@ public:
     // analyzer left untyped + errored). The CST→HIR `lowerGeneric` reads this to
     // lower ONLY the selected sub-expression.
     [[nodiscard]] NodeId   selectedGenericExpr(NodeId id) const;
+
+    // P68 round 12 (lane `cs`): the TYPEDEF a type-position identifier token
+    // names, as the type resolver decided it (the first, positional resolution),
+    // or InvalidSymbol for a token that names none. A typedef name in type
+    // position is a bare token the reference walker never binds, so `symbolAt`
+    // cannot say it; this can. Read by the CST→HIR lowering to find the typedef
+    // that owns a variable-length type a type NAME reaches (`sizeof(V)`).
+    [[nodiscard]] SymbolId typedefNamedAt(NodeId token) const;
 
     // P31: the COMPILE-TIME ANSWER for a node whose whole meaning is a number the
     // semantic tier computed — `__builtin_offsetof(T, m)` (the member's byte
@@ -1283,6 +1293,9 @@ private:
     // FC16 (D-CSUBSET-GENERIC-SELECTION): `_Generic` node → selected assoc's
     // result-expression NodeId. See `selectedGenericExpr`.
     UnitAttribute<NodeId>                  nodeToSelectedExpr_;
+    // P68 round 12 (lane `cs`): type-position identifier token → the typedef it
+    // names. See `typedefNamedAt`.
+    UnitAttribute<SymbolId>                typedefNamedByToken_;
     // P31: the compile-time-answer side table — see `foldedConstantAt`.
     UnitAttribute<std::uint64_t>           nodeToFoldedConstant_;
     DiagnosticReporter                     diagnostics_;

@@ -1366,7 +1366,7 @@ struct DSS_EXPORT ObjectFormatData {
     // target), so the width contract does too. Consumed by the driver
     // (`buildCuMir` threads it into `analyze()`) — the per-language
     // `coreByDataModel` overrides, the integer-literal ladder, and the
-    // shipped-lib descriptor `signatureByDataModel` all resolve
+    // shipped-lib descriptor's `when: {dataModel}` signature variants all resolve
     // against it. The zero default is the INVALID sentinel: a
     // hand-built ObjectFormatData that never set it is rejected by
     // validate() (the loader path always sets it or fails).
@@ -1563,6 +1563,20 @@ struct DSS_EXPORT ObjectFormatData {
     // spirv skeletons omit it deliberately). Unlike bitFieldStrategy there is
     // NO target-side fallback field — the axis is format-only.
     LongDoubleFormat     longDoubleFormat = LongDoubleFormat::None;
+
+    // ── P68 round 12 (lane `cs`): the per-format ENUMERATION COMPATIBLE-TYPE RULE ──
+    //
+    // OPTIONAL top-level `"enumCompatibleTypeRule"` ("msvc" / "gnu"; closed enum,
+    // loader fails loud on an unknown spelling — the longDoubleFormat discipline):
+    // which integer type an enumeration WITHOUT a fixed underlying type is
+    // compatible with is the PLATFORM ABI's choice (C 6.7.2.2p4) — `int` on the
+    // Microsoft x64 ABI, `unsigned int` when no value is negative on the SysV /
+    // AAPCS / Darwin ones — observable in an enum bit-field's signedness, the
+    // enumeration's arithmetic, `_Generic` and redeclarations. The format names the
+    // convention; the language's `enumerationCompatibleTypes` says which of its types
+    // each one chooses. Absent ⇒ `None`: an enumeration without a fixed type is then
+    // S_EnumCompatibleTypeRuleUndeclared (wasm / spirv skeletons omit it). FORMAT-ONLY.
+    EnumCompatibleTypeRule enumCompatibleTypeRule = EnumCompatibleTypeRule::None;
 
     // ── TF-C97 (D-PP-FORMAT-DATA-MODEL-PREDEFINES): the format's own
     //    predefined macros ─────────────────────────────────────────────
@@ -2457,6 +2471,12 @@ public:
     // Read by the driver via `effectiveLongDoubleFormat(target, format)`.
     [[nodiscard]] LongDoubleFormat     longDoubleFormat() const noexcept {
         return d_.longDoubleFormat;
+    }
+    // P68 round 12 (lane `cs`): the format's declared enumeration compatible-type
+    // rule, or `None` if it declared none. Read by the driver via
+    // `effectiveEnumCompatibleTypeRule(format)`.
+    [[nodiscard]] EnumCompatibleTypeRule enumCompatibleTypeRule() const noexcept {
+        return d_.enumCompatibleTypeRule;
     }
 
     // ── Format-owned predefined macros (TF-C97) ───────────────────

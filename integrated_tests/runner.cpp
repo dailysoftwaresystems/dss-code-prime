@@ -92,6 +92,7 @@
 // implemented identically in the in-process sibling.
 
 #include "arm_verdict_ledger.hpp"
+#include "host_translations.hpp"
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
 // parsed by the boundary guard. Its header states the boundary as a sentence;
 // this runner's own statement of its half is in the block above `runExampleViaCli`.
@@ -2488,26 +2489,21 @@ std::size_t dependencyImagesDiffered  = 0;
     // property of this MACHINE and is what DSS_STRICT_ARM_VERDICTS reds.
     // Mirrors the in-process examples_runner exactly.
     std::vector<std::string> launcherPrefix;
+    bool launcherExecsImage = false;   // runBinary's admission warm-up follows it
     if (std::string const targetArch = specTargetArch(target->spec);
         !targetArch.empty() && targetArch != currentHostArch()) {
-        if (target->emulator.empty()) {
-            std::string const why = "target arch '" + targetArch
-                + "' != host arch '" + currentHostArch()
-                + "' and the manifest declares no 'emulator'";
-            std::cout << "  [SKIP] " << armName << " — " << why << "\n";
-            return compiledOutcome(ArmVerdict::SkippedNoEmulatorDeclared, why);
+        // The SAME decision the in-process sibling makes (host_translations.hpp).
+        auto const gate = ::dss::test_support::crossArchDecisionForThisHost(targetArch, target->emulator);
+        if (!gate.runs) {
+            std::cout << "  [SKIP] " << armName << " — " << gate.why << "\n";
+            return compiledOutcome(gate.skip, gate.why);
         }
-        auto const emuPath = findOnPath(target->emulator);
-        if (emuPath.empty()) {
-            std::string const why = "declared emulator '" + target->emulator
-                + "' is not on PATH (target arch '" + targetArch
-                + "' != host arch '" + currentHostArch() + "')";
-            std::cout << "  [SKIP] " << armName << " — " << why << "\n";
-            return compiledOutcome(ArmVerdict::SkippedEmulatorMissing, why);
-        }
-        launcherPrefix.push_back(emuPath);
+        // Named, as the in-process sibling logs it: an arm that runs under a
+        // launcher (the manifest's emulator or this host's own translation) says which.
+        std::cout << "  [LAUNCHER] " << armName << " — " << gate.why << "\n";
+        launcherPrefix = gate.launcherPrefix;
+        launcherExecsImage = gate.launcherExecsImage;
     }
-
     // ── Run WITH `outDir` AS THE WORKING DIRECTORY ──────────────────────────
     //
     // The staged neighbor files above are only reachable if the child's CWD is
@@ -2573,7 +2569,7 @@ std::size_t dependencyImagesDiffered  = 0;
         }
         result = dss::test_support::runBinary(
             absArtifact, dss::test_support::kRunBudget, captureStdout,
-            launcherPrefix);
+            launcherPrefix, /*programArgs=*/{}, launcherExecsImage);
     }
     check(armName + ": spawn succeeded (diag='"
           + result.diagnostic + "')", result.spawned);

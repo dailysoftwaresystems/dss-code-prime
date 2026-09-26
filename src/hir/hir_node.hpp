@@ -64,9 +64,10 @@ enum class HirKind : std::uint16_t {
     //    in the filter (code also in the handler) — HirVerifier owns the context
     //    rules (checkSehContext), incl. the option-(C) early-exit restriction
     //    D-CSUBSET-SEH-EARLY-EXIT (no return / goto-out / break-out of the try
-    //    body until a real consumer fires the trigger). `__finally`/`__leave`
-    //    get NO HirKind — they fail loud at CST→HIR (D-CSUBSET-SEH-FINALLY /
-    //    D-CSUBSET-SEH-LEAVE, trigger-gated; sqlite ground truth: zero uses). ──
+    //    body yet — open: MSVC and clang run all three). `__finally`/`__leave`
+    //    get NO HirKind yet — they fail loud at CST→HIR (D-CSUBSET-SEH-FINALLY /
+    //    D-CSUBSET-SEH-LEAVE, both open since their 2026-09-24 re-verdict:
+    //    MSVC runs both). ──
     SehTryExcept,
     // ── FC17.9(i) / P5 (D-CSUBSET-INLINE-ASM, -OPERANDS, -TEXT): the GNU
     //    inline-asm STATEMENT `__asm__ [volatile|goto] (template [: … ]) ;`.

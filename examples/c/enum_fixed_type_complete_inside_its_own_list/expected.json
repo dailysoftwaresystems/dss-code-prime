@@ -1,0 +1,45 @@
+{
+  "$comment": "P68 round 12 (lane `cs`, D-C-AN-ENUMERATION-WITH-A-FIXED-TYPE-IS-INCOMPLETE-INSIDE-ITS-OWN-LIST): C23 6.7.3.4p6 completes an enumeration with a fixed underlying type immediately after its enum type specifier, so `sizeof(enum Big)`, `sizeof((enum Big)B_ONE)` and `_Generic(B_ONE, enum Big: …)` inside Big's own list are valid, and the constants have the enumerated type there (6.7.3.3p12; EXAMPLE 3's `m40 = sizeof(enum E4)`). MEASURED 2026-09-24, this file compiled and RUN on each reference separately: gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 at -std=c2x exit 42; the -std=c17 -pedantic-errors modes and MSVC 19.51 refuse the C23 `: T` clause. Before this round DSS refused the three `sizeof` uses (S_NonConstantEnumeratorValue) and selected `default` in the `_Generic`. exit 42 = every check holds.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release",
+      "mustDifferFromBaseline": true
+    }
+  ]
+}

@@ -215,6 +215,15 @@ enum class MnemonicSlot : std::uint8_t {
     // cycle 3d float arithmetic + casts
     FAdd, FSub, FMul, FDiv, FNeg,
     FpCvt, FpToSi, FpToUi, SiToFp, UiToFp,
+    // P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): the F32-DESTINATION pair.
+    // A conversion's two ends have independent widths and a LIR instruction
+    // carries ONE — the SOURCE integer width, exactly as for the F64 pair — so
+    // the destination width rides the OPCODE, the convention both targets
+    // already use for the reverse direction (`fp_to_si32`) and for `fpcvt_h`.
+    // Each target declares what `si_to_fp32` / `ui_to_fp32` are (one
+    // instruction, or a sequence); the SIToFP/UIToFP arm picks the slot by the
+    // RESULT type's kind, never by a target identity.
+    SiToFp32, UiToFp32,
     // ⓘ `MovqXClass` USED TO LIVE HERE and is DELETED, not deprecated
     // (D-TARGET-NO-CROSS-CLASS-MOVE-VERB). A cross-class move is not a
     // module-wide mnemonic SLOT — it is one cell of the `registerClassOps`
@@ -588,6 +597,8 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FpToUi,        "fp_to_ui"},
     {MnemonicSlot::SiToFp,        "si_to_fp"},
     {MnemonicSlot::UiToFp,        "ui_to_fp"},
+    {MnemonicSlot::SiToFp32,      "si_to_fp32"},
+    {MnemonicSlot::UiToFp32,      "ui_to_fp32"},
     {MnemonicSlot::Call,           "call"},
     {MnemonicSlot::IntrinsicCall,  "intrinsic_call"},
     {MnemonicSlot::CallIndirectViaExtern, "call_indirect_via_extern"},
@@ -3420,12 +3431,22 @@ struct Lowerer {
                 // source the no-REX.W cvtsi2sd xmm,r32 / SCVTF Dd,Wn form. The
                 // result-width default would mis-key the source axis (and a float
                 // result has no integer width anyway), so thread the source's int
-                // width as the override. The DESTINATION float is fixed at F64 (sd /
-                // Dd) for the ENCODED path on both targets — the variant guard
-                // carries ONE width axis and the source-int axis OWNS it (REX.W /
-                // Wn-vs-Xn must be exact), so a NON-F64 result has no encoding and
-                // FAILS LOUD here rather than silently selecting a wrong-width
-                // form.
+                // width as the override.
+                //
+                // ★★ THE DESTINATION WIDTH RIDES THE OPCODE (P68 round 12,
+                // D-CSUBSET-INT-TO-F32-CODEGEN — the F64-only refusal that stood
+                // here since c57 is gone). The variant guard carries ONE width
+                // axis and the source integer OWNS it (REX.W / Wn-vs-Xn must be
+                // exact); a LIR instruction carries one width, so a second width
+                // cannot be a guard — the encoder re-selects post-regalloc off that
+                // one. The destination is therefore the OPCODE's: an F64 result
+                // names `si_to_fp` / `ui_to_fp`, an F32 result `si_to_fp32` /
+                // `ui_to_fp32`, and each variant DECLARES its destination width
+                // (`destWidth`) for the text tier's election. Choosing the opcode by
+                // the RESULT TYPE's kind is the whole dispatch here; which
+                // instruction(s) realize it is each target's declaration — arm64
+                // one SCVTF/UCVTF Sd, x86-64 CVTSI2SS, and for an unsigned source a
+                // declared SEQUENCE, because SSE has no unsigned convert.
                 //
                 // ★★ LD-7 (D-TARGET-ENCODING-WIDTH-GUARD) UN-WALLS THE `long
                 // double` DESTINATION, which used to be one of the two deferral
@@ -3440,9 +3461,8 @@ struct Lowerer {
                 //            row falls through to the gate below and walls loud,
                 //            which is the load-bearing agnosticism condition
                 //            (x86_64 is exactly that target and is pinned).
-                // What STILL reaches the gate: an F32 destination (int→F32,
-                // D-CSUBSET-INT-TO-F32-CODEGEN; sqlite uses `double` only), an
-                // F16 one, and the undeclared-row F128 case. A NARROW source
+                // What STILL reaches the gate: an F16 destination and the
+                // undeclared-row F128 case. A NARROW source
                 // (Char/I8/I16 — widthFlagsForType → 8/16) has no declared
                 // variant either and fails loud at its own named check below (no
                 // partial-register conversion this cycle); the C int literal `5`
@@ -3485,38 +3505,41 @@ struct Lowerer {
                         return lowerWideFloatSoftcall(id, fromOp, *cfg);
                     // No row → the loud gate below. NOT a silent fallback.
                 }
-                if (resultK != TypeKind::F64) {
-                    // Cite the anchor matching the deferral class the result
-                    // kind falls into, so a long double conversion-result wall
-                    // points at the long-double arc, not the int→F32 one.
-                    // ⚠ IT USED TO ALSO NAME `D-CSUBSET-LONG-DOUBLE`, WHICH IS
-                    // CLOSED — a reader following the citation landed in the
-                    // done registry with no live owner for a live refusal.
-                    char const* const resultAnchor =
-                        (resultK == TypeKind::F80 || resultK == TypeKind::F128)
-                            ? "D-TARGET-ENCODING-WIDTH-GUARD"
-                            : "D-CSUBSET-INT-TO-F32-CODEGEN";
+                if (resultK != TypeKind::F64 && resultK != TypeKind::F32) {
+                    // What reaches here, and who owns it — stated in the SOURCE,
+                    // not the message (an anchor id is bookkeeping, and a closed
+                    // one turns operator output false: `check-emitted-anchor-ids`):
+                    //   * an F16 result: no half-precision conversion is realized
+                    //     on any shipped target (D-LK4-RODATA-PRODUCER-EXOTIC);
+                    //   * an F128 result on a target that declares the kind with
+                    //     no `wideFloatSoftcalls` row for this conversion — the
+                    //     load-bearing agnosticism case the long-double arc left
+                    //     refused on purpose (x86_64 is exactly that target).
+                    // An F80 result never gets here: `lowerIntToF80` owns it.
                     dss::report(reporter,
                         DiagnosticCode::L_UnsupportedLoweringForOpcode,
                         DiagnosticSeverity::Error,
                         std::format(
                             "MIR {}: integer→float result TypeKind ordinal {} is "
-                            "not lowerable to target '{}' — only an F64 (double) "
-                            "destination has an int→float encoding this cycle; "
-                            "proceeding would silently select a wrong-width "
-                            "instruction form ({})",
+                            "not lowerable to target '{}' — a double or float "
+                            "destination is realized, a long double one only "
+                            "through a conversion the target declares, and this "
+                            "one has none; proceeding would silently select a "
+                            "wrong-width instruction form. Convert to double "
+                            "first if that rounding is acceptable",
                             op == MirOpcode::SIToFP ? "SIToFP" : "UIToFP",
-                            static_cast<unsigned>(resultK), target.name(),
-                            resultAnchor));
+                            static_cast<unsigned>(resultK), target.name()));
                     poisonValue(id);
                     return;
                 }
+                bool const toF32 = (resultK == TypeKind::F32);
                 std::uint8_t const i2fSrcWidth = (i2fOps.size() == 1)
                     ? widthFlagsForType(mir.instType(i2fOps[0]))
                     : 0;
-                return lowerCast(id,
-                                 op == MirOpcode::SIToFP ? MnemonicSlot::SiToFp
-                                                         : MnemonicSlot::UiToFp,
+                MnemonicSlot const i2fSlot = (op == MirOpcode::SIToFP)
+                    ? (toF32 ? MnemonicSlot::SiToFp32 : MnemonicSlot::SiToFp)
+                    : (toF32 ? MnemonicSlot::UiToFp32 : MnemonicSlot::UiToFp);
+                return lowerCast(id, i2fSlot,
                                  op == MirOpcode::SIToFP ? "MIR SIToFP"
                                                          : "MIR UIToFP",
                                  i2fSrcWidth);

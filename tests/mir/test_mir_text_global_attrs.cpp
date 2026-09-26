@@ -224,7 +224,7 @@ TEST(MirTextGlobalAttrs, AForwardReferencedInitFuncGlobalKeepsItsAttributes) {
 namespace {
 
 [[nodiscard]] std::string globalDoc(std::string_view attrs) {
-    return std::string{"dssir 2\nmodule {\n  global %10 : i32"} +
+    return std::string{"dssir 3\nmodule {\n  global %10 : i32"} +
            std::string{attrs} + " = zero\n}\n";
 }
 

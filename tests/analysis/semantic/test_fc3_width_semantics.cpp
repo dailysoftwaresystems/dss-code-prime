@@ -2,8 +2,8 @@
 // (plan 23): the C 6.7.2 type-specifier multiset table, the format-schema
 // dataModel (LP64/LLP64/ILP32) threading, the C 6.4.4.1 integer-literal
 // ladder, the bool keyword literals, the loader fail-louds for every new
-// config block, the shipped-lib descriptor signatureByDataModel
-// resolution, and the toy/tsql typing-unchanged pins.
+// config block, the shipped-lib descriptor's per-data-model `signature`
+// arms, and the toy/tsql typing-unchanged pins.
 //
 // Discipline: every engine behavior here is driven by the SHIPPED
 // c config (the vocabulary lives in JSON; the tests perturb the
@@ -26,6 +26,7 @@
 #include "link/object_format_schema.hpp"
 #include "repo_root.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
 
 #include <nlohmann/json.hpp>
 
@@ -143,8 +144,21 @@ namespace {
     mutate(doc["semantics"]["arithmeticConversions"]);
     auto schema = GrammarSchema::loadFromText(doc.dump(), "<arith-perturbed>");
     if (!schema) {
-        ADD_FAILURE() << "perturbed schema failed to load";
-        std::abort();
+        // THROW, with the loader's own diagnostics — the `shipped_schema_or_throw.hpp`
+        // pattern. GoogleTest reports an escaping exception as a failure of the ONE
+        // running case, names it, and runs the others; this helper cannot `ASSERT_*`
+        // because it returns a model. Until P68 round 12 it called the process-kill
+        // here instead, which Windows ends in a `__fastfail` (0xC0000409): ✔MEASURED
+        // with the shipped C document made refusable, 38 of the 71 tests reported and
+        // the other 33 lost their verdicts, with no word of WHY the document was refused.
+        std::string message = "the perturbed C document did not load";
+        for (auto const& d : schema.error()) {
+            message += "\n    ";
+            message += d.path;
+            message += ": ";
+            message += d.message;
+        }
+        throw std::runtime_error(std::move(message));
     }
     UnitBuilder builder{*schema, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
@@ -884,7 +898,7 @@ TEST(Fc3FormatDataModel, ShippedFormatsDeclareTheirOsModels) {
     }
 }
 
-// ── P5: descriptor signatureByDataModel ─────────────────────────────────
+// ── P5: a descriptor `signature`'s per-data-model arms ──────────────────
 
 namespace {
 
@@ -892,7 +906,7 @@ namespace {
 // ("no descriptor came back, and something errored"). Negative-only is
 // VACUOUS: a VANISHED or half-written fixture satisfies both just as well as
 // the malformed content the test means to pin, so the test can report green
-// while never once reaching the `signatureByDataModel` rejection path.
+// while never once reaching the data-model rejection path.
 // MEASURED at the time these helpers were added: with the descriptor files
 // hammer-deleted for a whole run, both tests still reported OK. These two
 // helpers close that hole from both ends — the PREMISE (the fixture really is
@@ -969,9 +983,14 @@ findDiagnostic(DiagnosticReporter const& rep, DiagnosticCode code,
 } // namespace
 
 TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
-    // The SAME shipped stdio.json yields the LP64 i64 offset under LP64
-    // and the LLP64 i32 offset under LLP64 — the reader resolves the
-    // per-symbol signatureByDataModel against the threaded model.
+    // The SAME shipped stdio.json yields the LP64 i64 offset on an LP64 pair
+    // and the LLP64 i32 offset on an LLP64 pair — the reader selects fseek's
+    // per-pair `signature` arm by the pair's data model.
+    //
+    // ★ READ ON EVERY REAL PAIR (P68 round 12, S2a-1). This read passed only a
+    // data model — no arch, no format — which is a read no compile makes: the
+    // day stdio.json's prototypes name a per-format typedef (`off_t`, `size_t`),
+    // it stops decoding here while every build still succeeds.
     namespace fs = std::filesystem;
     // …/src/dss-config/sources/… — throws (never returns `{}`) if unresolvable,
     // so the old `ASSERT_FALSE(base.empty())` here would now be vacuous.
@@ -980,7 +999,7 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         base.parent_path().parent_path() / "shippedLibs" / "stdio.json";
     ASSERT_TRUE(fs::exists(desc));
 
-    auto const offsetKindUnder = [&](DataModel dm) {
+    auto const offsetKindOn = [&](test_support::ShippedReadPair const& pair) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry registry;
         DiagnosticReporter rep;
@@ -996,9 +1015,11 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
             interner.structType("__va_list_tag", vaTagFields), 1);
         std::array<NamedTypeBinding, 1> namedTypes{
             NamedTypeBinding{"va_list", vaListTy}};
-        auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep, dm,
-                                               std::nullopt, std::nullopt,
-                                               namedTypes);
+        ffi::ShippedPairFacts const facts = pair.pairFacts();
+        auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep,
+                                               pair.dataModel(), pair.activeTarget(),
+                                               pair.activeFormat(), namedTypes,
+                                               nullptr, &facts);
         EXPECT_TRUE(d.has_value());
         EXPECT_EQ(rep.errorCount(), 0u);
         if (!d) return TypeKind::Void;
@@ -1012,11 +1033,31 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         ADD_FAILURE() << "fseek not found in stdio.json";
         return TypeKind::Void;
     };
-    EXPECT_EQ(offsetKindUnder(DataModel::Lp64), TypeKind::I64);
-    EXPECT_EQ(offsetKindUnder(DataModel::Llp64), TypeKind::I32);
+    std::size_t lp64  = 0;
+    std::size_t llp64 = 0;
+    for (auto const& pair : test_support::shippedReadPairs()) {
+        SCOPED_TRACE(pair.label());
+        if (pair.dataModel() == DataModel::Lp64) {
+            ++lp64;
+            EXPECT_EQ(offsetKindOn(pair), TypeKind::I64);
+        } else if (pair.dataModel() == DataModel::Llp64) {
+            ++llp64;
+            EXPECT_EQ(offsetKindOn(pair), TypeKind::I32);
+        } else {
+            ADD_FAILURE() << "a shipped pair of a third data model — say what its offset is";
+        }
+    }
+    // Both arms must actually have been read.
+    EXPECT_GE(lp64, 1u);
+    EXPECT_GE(llp64, 1u);
 }
 
-TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
+// A data model a `when` names must be one the vocabulary knows. The retired
+// `signatureByDataModel` map (P68 round 12 replaced it with `signature`
+// `variants`) pinned this for its own keys; the refusal now belongs to the ONE
+// `when` decoder (core/types/variant_when.hpp), so the pin follows it there — a
+// typo'd model would otherwise select nothing on every pair, in silence.
+TEST(Fc3Descriptor, UnknownDataModelInASignatureArmFailsLoud) {
     // The descriptor used to be a CONSTANT filename under
     // `temp_directory_path()`, shared by every concurrent instance
     // of this binary. That never went RED here (MEASURED: 600/600 green with the
@@ -1033,8 +1074,9 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
     // rejection assertions below are only meaningful against.
     static constexpr std::string_view kDescriptor =
         R"({"header":"x.h","symbols":[
-          {"name":"f","signature":"fn(i32) -> i32",
-           "signatureByDataModel":{"LLP65":"fn(i32) -> i32"}}]})";
+          {"name":"f","signature":{"variants":[
+            {"when":{"dataModel":"LLP65"},"value":"fn(i32) -> i32"},
+            {"default":true,"value":"fn(i32) -> i32"}]}}]})";
     {
         std::ofstream out{tmp, std::ios::binary};
         out << kDescriptor;
@@ -1049,16 +1091,16 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
                                            DataModel::Lp64);
     EXPECT_FALSE(d.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
-    // …and it must be THE unknown-key rejection, named in the message. Code
+    // …and it must be THE unknown-model rejection, named in the message. Code
     // alone is not enough: F_ShippedLibDescriptorMalformed is also what a
-    // missing file, a non-object `signatureByDataModel` and a non-string
-    // override all raise, so `errorCount() > 0` (and even a code match) is
-    // satisfied by rejections that never look at the key vocabulary.
+    // missing file, a non-object `when` and a non-string `value` all raise, so
+    // `errorCount() > 0` (and even a code match) is satisfied by rejections
+    // that never look at the model vocabulary.
     EXPECT_NE(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
-                             {"'signatureByDataModel' has unknown data-model key",
+                             {"'dataModel' has unknown data-model name",
                               "'LLP65'"}),
               nullptr)
-        << "the unknown-key rejection never ran; diagnostics were:"
+        << "the unknown-model rejection never ran; diagnostics were:"
         << renderDiagnostics(rep);
     // Specifically NOT the I/O rejection — that is the vacuous pass this test
     // used to accept.
@@ -1070,9 +1112,9 @@ TEST(Fc3Descriptor, UnknownSignatureByDataModelKeyFailsLoud) {
     // `scratch`'s dtor removes the file — no manual `fs::remove`.
 }
 
-TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
-    // A broken LLP64 override must fail the read under LP64 too — it
-    // would otherwise lurk until the first Windows compile.
+TEST(Fc3Descriptor, MalformedInactiveSignatureArmFailsEvenWhenNotSelected) {
+    // A broken LLP64 arm must fail the read under LP64 too — it would
+    // otherwise lurk until the first Windows compile.
     // Same fixed-name/false-green hazard as the sibling above; see the note
     // there.
     dss::test_support::ScratchDir scratch{
@@ -1080,8 +1122,9 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
     auto const tmp = scratch.path() / "desc.json";
     static constexpr std::string_view kDescriptor =
         R"({"header":"x.h","symbols":[
-          {"name":"f","signature":"fn(i32) -> i32",
-           "signatureByDataModel":{"LLP64":"fn(notatype) -> i32"}}]})";
+          {"name":"f","signature":{"variants":[
+            {"when":{"dataModel":"LP64"},"value":"fn(i32) -> i32"},
+            {"when":{"dataModel":"LLP64"},"value":"fn(notatype) -> i32"}]}}]})";
     {
         std::ofstream out{tmp, std::ios::binary};
         out << kDescriptor;
@@ -1094,23 +1137,22 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
                                            DataModel::Lp64);
     EXPECT_FALSE(d.has_value());
     EXPECT_GT(rep.errorCount(), 0u);
-    // …and the error must name the NON-SELECTED LLP64 override — that is the
-    // whole claim of this test. `errorCount() > 0` alone is equally satisfied
-    // by an unreadable file or by the BASE signature failing to decode, i.e.
-    // by rejections that prove nothing about the lurking-override rule.
+    // …and the error must name the NON-SELECTED LLP64 arm — that is the whole
+    // claim of this test. `errorCount() > 0` alone is equally satisfied by an
+    // unreadable file or by the SELECTED arm failing to decode, i.e. by
+    // rejections that prove nothing about the lurking-arm rule.
     EXPECT_NE(findDiagnostic(rep, DiagnosticCode::F_ShippedLibUnsupportedType,
-                             {"'signatureByDataModel.LLP64' that failed to "
-                              "decode as a type",
+                             {"has a 'signature' variant that failed to decode as a type",
                               "fn(notatype) -> i32"}),
               nullptr)
-        << "the non-selected override was never decoded; diagnostics were:"
+        << "the non-selected arm was never decoded; diagnostics were:"
         << renderDiagnostics(rep);
-    // The BASE (LP64-selected) signature is well-formed — if IT is what failed,
-    // the override rule was not what rejected this descriptor.
+    // The SELECTED (LP64) arm is well-formed — if IT is what failed, the eager
+    // rule was not what rejected this descriptor.
     EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibUnsupportedType,
                              {"has a 'signature' that failed to decode"}),
               nullptr)
-        << "the base signature failed instead of the override; diagnostics were:"
+        << "the selected arm failed instead of the inactive one; diagnostics were:"
         << renderDiagnostics(rep);
     EXPECT_EQ(findDiagnostic(rep, DiagnosticCode::F_ShippedLibDescriptorMalformed,
                              {"failed to open"}),

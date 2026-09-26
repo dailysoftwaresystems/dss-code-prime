@@ -1,5 +1,11 @@
 # Build-directory layout — ONE root, subdirectories for everything else
 
+## Contents
+- The rule — one root, subdirectories, lane builds are temporary
+- Why one root, and this is measured rather than tidiness
+- What this does NOT license
+- Migration status — and the two rules for doing it
+
 **Operator instruction, 2026-08-17:** *"EVERY build must be inside build directory (we can have
 multiple subdirectories for distinct builds), but only 1 root build. Also, lane builds MUST be
 cleared once everything is fine, so we keep the storage good and also organize build directories."*
@@ -13,16 +19,16 @@ complete). It is part of the fail-loud gate, not housekeeping advice.
    be a build tree. `build-dbg/`, `build-rel/`, `build-lane-x/`, `build-wsl/`, `build-red/` are all
    violations of this rule by their existence, not by their contents.
 2. **Every distinct build is a SUBDIRECTORY of that root**, named for what makes it distinct:
-   `build/dbg`, `build/rel`, `build/wsl`, `build/lane-<id>`, `build/red-<mutant>`. Add a
+   `build/dbg`, `build/rel`, `build/wsl`, `build/lane-<id>`, `build/red-<mutant>`. ⏳ SCRIPT-ERA (superseded 2026-09-24: DssHarness names each leg's variant-keyed directory under build/ — build/x86_64-mingw-gcc-debug, build/x86_64-msvc-release and so on; see dss-harness.md) Add a
    subdirectory; never add a sibling.
 3. **A worktree gets the same rule applied at ITS root** — `<worktree>/build/<name>`. A worktree must
    never build into the main tree's `build/`, and the main tree must never build into a worktree's.
 4. **Lane builds are TEMPORARY.** A `build/lane-*` tree is deleted as soon as that lane's work is
-   folded AND the gate that covers it is green. **A cycle may not be reported complete while any
+   folded AND the gate that covers it is green. ⏳ SCRIPT-ERA (superseded 2026-09-24: a lane builds inside its own worktree, `<worktree>/build/<variant>`, which goes with the worktree when it is landed or deleted, so the completion check is that no lane worktree survives its landing; see worktrees.md) **A cycle may not be reported complete while any
    `build/lane-*` survives** — same shape as the anchor-balance gate: the report is a receipt, so the
-   check has to be mechanical.
+   check has to be mechanical. SUPERSEDED 2026-09-24 by lane builds inside lane worktrees — the check is now that no lane worktree survives its landing, which `dssharness list-worktree` shows (see worktrees.md)
 5. **The same applies to agent worktrees.** A worktree whose work is folded is removed
-   (`git worktree remove`), and its build tree goes with it. Verify the fold by **CONTAINMENT** of the
+   (`lane-fold.py land`, then `dssharness delete-worktree` for its host copies), and its build tree goes with it. Verify the fold by **CONTAINMENT** of the
    lane's contribution, never by byte-identity with the main tree — later edits legitimately stack on
    top, so `diff -q` reporting DIFFERS proves nothing either way.
 
@@ -61,11 +67,13 @@ not folded — finish the fold.
 
 ## Migration status — NOT yet done, and it is not a `mv`
 
+SUPERSEDED 2026-08-23 by the one-root build/ migration, measured done that day — `build-dbg` no longer exists, and DssHarness now names each leg's variant-keyed directory under `build/` (see gate-and-cross-plan.md)
+
 ⚠ The live tree still uses the flat layout. **✔MEASURED 2026-08-17 (corrected): 19 files carry 33
 reference lines** — the witness gate twins (since retired), `.harness-config/runner/actions/check-ninja-deps/check-ninja-deps.py`, `tests/CMakeLists.txt`,
 `tests/core/native_c_probe.hpp`, `tests/core/test_header_name_matching.cpp`,
 `tests/harness/test_sqlite_harness_legs.cpp`, the PowerShell sqlite driver of the time (9 lines,
-`build-rel`; since 2026-09-21 the one Python driver, whose compiler search is `sqlite_compiler.py`),
+`build-rel`; since 2026-09-21 the one Python driver, whose compiler gate is `sqlite_compiler.py`, which since 2026-09-26 searches for nothing and builds nothing: a run names its compiler and the harness step passes `{product}`),
 plus narrative mentions in `src/core/types/parse_diagnostic.hpp`, a `.format.json`, a
 `.lang.json` and an `expected.json`. Every hit is a genuine token — no `build-rel*` prefix collisions.
 
@@ -103,7 +111,7 @@ than sending the reader after a deliberately removed one — both arms measured)
 searches `build/rel`, `build/dbg`, then the three legacy roots, and a from-scratch build lands in the
 new layout.
 
-The flat root-level `build-*` directories are not migrated yet. Sequence that migration for a quiet
+The flat root-level `build-*` directories are not migrated yet. SUPERSEDED 2026-08-23 by the one-root build/ migration (see gate-and-cross-plan.md) Sequence that migration for a quiet
 tree — no lanes in flight, no gate mid-run — because it edits the very scripts the gate runs.
 ⚠ Until it lands, the rule above still governs **new** build trees: create them as
 `build/<name>`, and do not add another root-level `build-*`.

@@ -11,7 +11,7 @@ ThreadPool::ThreadPool(std::size_t workerCount) {
     const auto count = std::max<std::size_t>(1, workerCount);
     workers_.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
-        workers_.emplace_back([this] { workerLoop_(); });
+        workers_.emplace_back(kMainThreadClassStackBytes, [this] { workerLoop_(); });
     }
 }
 

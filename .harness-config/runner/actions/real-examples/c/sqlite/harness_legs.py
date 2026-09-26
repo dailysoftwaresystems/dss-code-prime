@@ -54,7 +54,6 @@ USAGE
   harness_legs.py --plan [--host-os OS] [--host-arch ARCH] [--format json]
                          [--launchers-available a,b,... | --launchers-none]
   harness_legs.py --header-stages
-  harness_legs.py --config-stages
   harness_legs.py --path-translations
   harness_legs.py --path-translation VERB --translate-path PATH [--translate-path …]
   harness_legs.py --path-translation VERB --assert-translated ARG [--assert-translated …]
@@ -6681,7 +6680,7 @@ def reference_tu_rows(log_text, index):
 
 
 def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_text,
-                       oracle_status, label="<unlabelled>", dss_detail=""):
+                       oracle_status, label="<unlabelled>", dss_detail="", sqlite_head=""):
     """THE ROUND-CLOSE CENSUS: per TU of the manifest, did the reference accept it,
     did dsscp? -> a report dict: `tus` (one row per TU, manifest order, each with a
     RECOMPILE_VERDICTS verdict), `counts` {tus, referenceOk, dssOk, blockers},
@@ -6789,17 +6788,20 @@ def recompile_verdicts(manifest_sources, dss_log_text, dss_build, reference_log_
               "referenceOk": sum(1 for r in rows if r["referenceOk"]),
               "dssOk": sum(1 for r in rows if r["dssOk"]),
               "blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}
-    return {"leg": label, "oracleStatus": oracle_status, "dssBuild": dss_build,
+    return {"leg": label, "sqliteHead": sqlite_head, "oracleStatus": oracle_status, "dssBuild": dss_build,
             "tus": rows, "counts": counts, "incomplete": incomplete,
             "unplacedDss": unplaced_dss, "unplacedReference": unplaced_ref,
             "clean": counts["blockers"] == 0 and not incomplete}
 
 
 def recompile_summary_line(report):
-    """The ONE summary line a round close reads."""
+    """The ONE summary line a round close reads, naming the sqlite commit it compiled (2026-09-25: the
+    subject is PINNED, legs.json `stageBuild.sqliteCommit`, and a summary that cannot name its subject
+    cannot be reproduced -- an unnamed one says UNKNOWN, which no success pattern accepts)."""
     c = report["counts"]
-    return ("recompile: %s tus=%d reference_ok=%d dss_ok=%d blockers=%d"
-            % (report["leg"], c["tus"], c["referenceOk"], c["dssOk"], c["blockers"]))
+    return ("recompile: %s sqlite=%s tus=%d reference_ok=%d dss_ok=%d blockers=%d"
+            % (report["leg"], report.get("sqliteHead") or "UNKNOWN", c["tus"], c["referenceOk"],
+               c["dssOk"], c["blockers"]))
 
 
 def recompile_report_lines(report):
@@ -8538,6 +8540,10 @@ _STAGE_FLAG_RE = re.compile(r"^--[A-Za-z0-9][A-Za-z0-9._-]*$")
 _STAGE_DEFINE_RE = re.compile(r"^SQLITE_[A-Z0-9_]+$")
 _STAGE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _STAGE_FILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# The ONE sqlite revision every stage compiles (`sqliteCommit`, 2026-09-25): the FULL sha, never an
+# abbreviation (an abbreviation is unique only in the clone that printed it) and never a branch name
+# (a branch moves, which is the whole defect a pin exists to end).
+_STAGE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def stage_build(path=CATALOGUE):
@@ -8620,11 +8626,19 @@ def stage_build(path=CATALOGUE):
                 "turns on." % (cap, define))
         witnesses[cap] = {"file": stem, "define": define}
     wit = witnesses
+    commit = sb.get("sqliteCommit")
+    if not isinstance(commit, str) or not _STAGE_COMMIT_RE.match(commit):
+        raise LegError(
+            "stageBuild.sqliteCommit must be the FULL 40-hex sha of the ONE sqlite "
+            "revision every stage compiles (got %r). Without it a stage pulls "
+            "whatever upstream's default branch is that day, and the round-close "
+            "recompile's subject moves under it." % (commit,))
     return {
         "configureFlags": flags,
         "optionDefines": defines,
         "requiredDefines": sorted(required),
         "capabilityWitnesses": dict(wit),
+        "sqliteCommit": commit,
         # The single string handed to `make`. Assembled HERE so the
         # `-D` prefix is applied in exactly one place: a driver that spelled it
         # itself could disagree, and `make OPTIONS=SQLITE_ENABLE_STAT4` (no -D)
@@ -12154,7 +12168,8 @@ def self_test(path=CATALOGUE, out=sys.stdout):
         _sb_wire = {"<unparseable>": str(_exc)}
     check("the stage-build JSON carries exactly the fields the driver reads",
           sorted(_sb_wire) == ["capabilityWitnesses", "configureFlags",
-                               "makeOptions", "optionDefines", "requiredDefines"],
+                               "makeOptions", "optionDefines", "requiredDefines",
+                               "sqliteCommit"],
           "keys=%r" % (sorted(_sb_wire),))
     # And the values SURVIVE the round trip. "the fields are there" was already
     # true of an emitter that dropped the -D prefix; only reading the value back
@@ -12163,6 +12178,36 @@ def self_test(path=CATALOGUE, out=sys.stdout):
           "verbatim",
           all(_sb_wire.get(k) == v for k, v in sb.items()),
           "wire=%r stage=%r" % (_sb_wire, sb))
+    # ★ THE PIN (2026-09-25): the shipped catalogue pins sqlite to a FULL sha, and a
+    # catalogue whose pin is abbreviated, a branch name or absent is REFUSED -- each
+    # arm on a copy of the shipped catalogue with that one field changed.
+    check("stageBuild pins sqlite to a FULL 40-hex commit",
+          bool(_STAGE_COMMIT_RE.match(sb.get("sqliteCommit") or "")),
+          "sqliteCommit=%r" % (sb.get("sqliteCommit"),))
+    import tempfile as _tf_pin
+    _pin_dir = _tf_pin.mkdtemp(prefix="dss-sbpin-")
+    try:
+        with open(path, "r", encoding="utf-8") as _fh:
+            _pin_doc = json.load(_fh)
+        for _pin_label, _pin_value in (("abbreviated", "d21bd37c7c"), ("a branch name", "master"),
+                                       ("absent", None)):
+            _pin_cat = json.loads(json.dumps(_pin_doc))
+            if _pin_value is None:
+                _pin_cat["stageBuild"].pop("sqliteCommit", None)
+            else:
+                _pin_cat["stageBuild"]["sqliteCommit"] = _pin_value
+            _pin_path = os.path.join(_pin_dir, "legs-%s.json" % _pin_label.replace(" ", "-"))
+            with open(_pin_path, "w", encoding="utf-8") as _fh:
+                json.dump(_pin_cat, _fh)
+            try:
+                stage_build(_pin_path)
+                _pin_why = ""
+            except LegError as _exc:
+                _pin_why = str(_exc)
+            check("a stageBuild whose sqliteCommit is %s is REFUSED, naming the key" % _pin_label,
+                  "sqliteCommit" in _pin_why, _pin_why or "accepted")
+    finally:
+        shutil.rmtree(_pin_dir, ignore_errors=True)
 
     legs = load_catalogue(path)
     labels = [leg["label"] for leg in legs]
@@ -14181,25 +14226,27 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                        "  --> %s:63:1\n" % _rc_tcl)
     _rc_clean_ref = ("gcc -o ref.exe %s\n%s: In function 'f':\n%s:40:3: warning: unused variable "
                      "'x' [-Wunused-variable]\n" % (" ".join(_rc_src), _rc_d, _rc_d))
-    _rc = recompile_verdicts(_rc_src, _rc_clean_dss, "built", _rc_clean_ref, "built", "L")
+    _rc = recompile_verdicts(_rc_src, _rc_clean_dss, "built", _rc_clean_ref, "built", "L",
+                             sqlite_head="0123456789ab")
     check("recompile: a clean pair -- every TU accepted, a dedup-only elision marker (the shape a "
           "CLEAN pe64 build carries) is NOT a reason, and the summary line is exact",
           _rc["clean"] and not _rc["incomplete"]
           and [t["verdict"] for t in _rc["tus"]] == ["accepted"] * 3
           and recompile_summary_line(_rc)
-          == "recompile: L tus=3 reference_ok=3 dss_ok=3 blockers=0"
+          == "recompile: L sqlite=0123456789ab tus=3 reference_ok=3 dss_ok=3 blockers=0"
           and _rc["tus"][2]["reference"]["warnings"] == 1
           and _rc["tus"][0]["dss"]["warnings"] == 1, "%r" % (_rc,))
     _rc_blk_dss = _rc_dss(("error", "S_ConstViolation", _rc_b, 4335,
                            "increment or decrement of `objv`, a const-qualified object"))
-    _rc_blk = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", _rc_clean_ref, "built", "L")
+    _rc_blk = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", _rc_clean_ref, "built", "L",
+                                 sqlite_head="0123456789ab")
     _rc_blk_lines = recompile_report_lines(_rc_blk)
     check("recompile: a TU the reference BUILT and dsscp refused is a BLOCKER, COUNTED in the "
           "summary, the census not clean, and its first dsscp error printed under it",
           [t["verdict"] for t in _rc_blk["tus"]] == ["accepted", "BLOCKER", "accepted"]
           and _rc_blk["counts"] == {"tus": 3, "referenceOk": 3, "dssOk": 2, "blockers": 1}
           and not _rc_blk["clean"] and not _rc_blk["incomplete"]
-          and _rc_blk_lines[-1] == "recompile: L tus=3 reference_ok=3 dss_ok=2 blockers=1"
+          and _rc_blk_lines[-1] == "recompile: L sqlite=0123456789ab tus=3 reference_ok=3 dss_ok=2 blockers=1"
           and any("S_ConstViolation" in ln and "4335" in ln for ln in _rc_blk_lines),
           "%r\n%s" % (_rc_blk["counts"], "\n".join(_rc_blk_lines)))
     _rc_both_ref = ("gcc -o ref.exe x\n%s: In function 'g':\n%s:4335:9: error: increment of "
@@ -14270,13 +14317,14 @@ def self_test(path=CATALOGUE, out=sys.stdout):
               not _rc_i["clean"] and any(_rc_why in w for w in _rc_i["incomplete"]),
               "%r" % (_rc_i["incomplete"],))
     _rc_nr = recompile_verdicts(_rc_src, _rc_blk_dss, "errors", "", "no-reference-compiler", "L")
+    # ...and a census asked for WITHOUT a head names none: UNKNOWN, which no success pattern accepts
     check("recompile: with NO reference, every TU is `no-reference` -- none counted as accepted by a "
           "reference that never ran, none a blocker -- and the census is not clean",
           [t["verdict"] for t in _rc_nr["tus"]] == ["no-reference"] * 3
           and _rc_nr["counts"] == {"tus": 3, "referenceOk": 0, "dssOk": 2, "blockers": 0}
           and not _rc_nr["clean"]
           and recompile_summary_line(_rc_nr)
-          == "recompile: L tus=3 reference_ok=0 dss_ok=2 blockers=0", "%r" % (_rc_nr,))
+          == "recompile: L sqlite=UNKNOWN tus=3 reference_ok=0 dss_ok=2 blockers=0", "%r" % (_rc_nr,))
     _rc_link = recompile_verdicts(
         _rc_src, _rc_dss(("error", "S_ConstViolation", _rc_a, 3, "x")), "errors",
         "gcc -o ref.exe x\nC:/mingw/bin/ld.exe: a.o:alter.c:(.text+0x1): undefined reference to "
@@ -18121,14 +18169,6 @@ def main(argv=None):
                         "in-process): '<key>\\t<GUARD>=<0|1> ...', one per "
                         "line. HOST-FREE — a leg's header configuration is a fact "
                         "about its TARGET.")
-    p.add_argument("--config-stages", action="store_true",
-                   help="print the distinct staged sqlite_cfg.h directories the "
-                        "harness materialises (`stage-zinc.py` computes the same "
-                        "set in-process): '<targetOs>\\t<HAVE_*>=<0|1> "
-                        "...', one per line. HOST-FREE — which ./configure "
-                        "answers a leg compiles against is a fact about its "
-                        "TARGET, and inheriting the DERIVING host's is how a "
-                        "Mach-O leg once got Linux configure probes.")
     p.add_argument("--stage-build", action="store_true",
                    help="print the declared sqlite stage build configuration — "
                         "the configure flags, the `make OPTIONS=` defines, the "
@@ -18293,10 +18333,6 @@ def main(argv=None):
                    help="the leg's .dss-project.json — the SAME file dss "
                         "consumed, so the oracle compiles one declaration "
                         "rather than a second, drifting copy of it")
-    p.add_argument("--oracle-output", default="", metavar="PATH",
-                   help="where to write the oracle binary. Prefer --oracle-dir: "
-                        "the FILE NAME carries the target's executable suffix "
-                        "and is this catalogue's business, not a driver's.")
     p.add_argument("--oracle-dir", default="", metavar="DIR",
                    help="write the oracle into DIR under the name this leg's "
                         "TARGET requires (reference_oracle_name). A driver that "
@@ -18326,7 +18362,7 @@ def main(argv=None):
                         "--oracle-log and --oracle-status (from THIS run's "
                         "--build-reference-oracle). Prints a JSON report with the "
                         "driver's report lines (the per-TU table, then ONE line "
-                        "`recompile: <leg> tus=N reference_ok=N dss_ok=N "
+                        "`recompile: <leg> sqlite=<sha> tus=N reference_ok=N dss_ok=N "
                         "blockers=N`); rc 0 = no blocker and a census that saw "
                         "everything, rc 3 = a blocker or an INCOMPLETE census.")
     p.add_argument("--dss-build", default="", metavar="OUTCOME",
@@ -18334,6 +18370,9 @@ def main(argv=None):
                         % " | ".join(RECOMPILE_DSS_BUILDS))
     p.add_argument("--dss-build-detail", default="", metavar="TEXT",
                    help="why dsscp's build `failed`, for --recompile-verdicts")
+    p.add_argument("--sqlite-head", default="", metavar="SHA",
+                   help="the sqlite commit the recompile compiled (the pin, legs.json "
+                        "stageBuild.sqliteCommit), named in --recompile-verdicts' summary")
     p.add_argument("--oracle-status", default="", metavar="STATUS",
                    help="--build-reference-oracle's reported `status`, verbatim. "
                         "Only `built`/`build-failed` mean the control RAN; "
@@ -18530,11 +18569,6 @@ def main(argv=None):
                         "(tests pin this so a plan is reproducible)")
     p.add_argument("--launchers-none", action="store_true",
                    help="treat every declared launcher as absent")
-    p.add_argument("--run-filesystems", action="store_true",
-                   help="print the closed runFilesystem vocabulary, one verb "
-                        "per line, for an operator (no driver reads it: each "
-                        "leg's verb reaches the driver in its plan and its "
-                        "--run-dir-plan)")
     p.add_argument("--run-fidelities", action="store_true",
                    help="print the closed RUN FIDELITY vocabulary, one value per "
                         "line — what KIND of evidence a leg's run produces here "
@@ -18625,7 +18659,7 @@ def main(argv=None):
 
     if not (args.verdict_vocabulary or args.verdict_classes or args.library_providers
             or args.plan or args.lint or args.self_test
-            or args.header_stages or args.config_stages or args.path_translations
+            or args.header_stages or args.path_translations
             or args.translate_path or args.assert_translated
             or args.env_transfers or args.env_transfer
             or args.acquire or args.acquire_plan or args.resolve_library_argv
@@ -18634,7 +18668,7 @@ def main(argv=None):
             or args.classify_abort or args.attribute_build
             or args.recompile_verdicts
             or args.loadext_builder or args.tcl_coherence
-            or args.run_filesystems or args.run_fidelities or args.run_dir_plan
+            or args.run_fidelities or args.run_dir_plan
             or args.corroborate_run_dir or args.measure_run_dir
             or args.stage_build or args.check_launcher or args.identify_binary
             or args.launcher_for_target
@@ -18646,7 +18680,7 @@ def main(argv=None):
                 "--plan / --probe-environment / "
                 "--print-probe-budget / "
                 "--header-stages / "
-                "--config-stages / --stage-build / --lint "
+                "--stage-build / --lint "
                 "/ --self-test / --path-translations / --translate-path / "
                 "--assert-translated / --env-transfers / --env-transfer / "
                 "--registry-controls / "
@@ -18654,7 +18688,7 @@ def main(argv=None):
                 "--resolve-target-cc / --oracle-report / --classify-abort / "
                 "--attribute-build / --recompile-verdicts / "
                 "--build-reference-oracle / --build-loadext-helper / "
-                "--loadext-builder / --tcl-coherence / --run-filesystems / "
+                "--loadext-builder / --tcl-coherence / "
                 "--run-fidelities / "
                 "--run-dir-plan / --check-launcher / --identify-binary / "
                 "--launcher-for-target is required")
@@ -18874,12 +18908,12 @@ def main(argv=None):
         if args.build_reference_oracle:
             leg = leg_by_label(load_catalogue(args.catalogue),
                                args.build_reference_oracle, args.catalogue)
-            if bool(args.oracle_output) == bool(args.oracle_dir):
-                p.error("--build-reference-oracle needs exactly one of "
-                        "--oracle-dir (preferred: the catalogue names the file) "
-                        "or --oracle-output (an explicit path)")
-            oracle_output = args.oracle_output or os.path.join(
-                args.oracle_dir, reference_oracle_name(leg))
+            if not args.oracle_dir:
+                p.error("--build-reference-oracle requires --oracle-dir: the "
+                        "oracle is written under the name its leg's TARGET "
+                        "requires (reference_oracle_name), never a name a "
+                        "driver spells")
+            oracle_output = os.path.join(args.oracle_dir, reference_oracle_name(leg))
             for flag, value in (("--manifest", args.manifest),
                                 ("--oracle-log", args.oracle_log)):
                 if not value:
@@ -18907,6 +18941,10 @@ def main(argv=None):
                 p.error("--recompile-verdicts requires --oracle-status, verbatim from THIS "
                         "run's --build-reference-oracle: a log left by another run would "
                         "otherwise stand for a reference this run never ran.")
+            if not re.match(r"^[0-9a-f]{7,40}$", args.sqlite_head or ""):
+                p.error("--recompile-verdicts requires --sqlite-head <the sqlite commit the stage "
+                        "compiled> (got %r): a summary that cannot name its subject cannot be "
+                        "reproduced." % (args.sqlite_head,))
             _texts = []
             for _path, _what, _needed in (
                     (args.compile_log, "dsscp's compile log", True),
@@ -18937,7 +18975,7 @@ def main(argv=None):
                                "nothing and call it clean" % args.manifest)
             _report = recompile_verdicts(_sources, _texts[0], args.dss_build, _texts[1],
                                          args.oracle_status, leg.get("label"),
-                                         args.dss_build_detail)
+                                         args.dss_build_detail, sqlite_head=args.sqlite_head)
             _report["report"] = recompile_report_lines(_report)
             sys.stdout.write(json.dumps(_report, indent=1, sort_keys=True) + "\n")
             return 0 if _report["clean"] else 3
@@ -19012,11 +19050,6 @@ def main(argv=None):
                 sys.stdout.write("%s\t%s\n" % (key, " ".join(
                     "%s=%d" % (n, 1 if v else 0) for n, v in sorted(guards.items()))))
             return 0
-        if args.config_stages:
-            for key, answers in configure_stages(load_catalogue(args.catalogue)).items():
-                sys.stdout.write("%s\t%s\n" % (key, " ".join(
-                    "%s=%d" % (n, 1 if v else 0) for n, v in sorted(answers.items()))))
-            return 0
         if args.stage_build:
             sys.stdout.write(stage_build_json(stage_build(args.catalogue)))
             return 0
@@ -19061,9 +19094,6 @@ def main(argv=None):
             return 1 if findings else 0
         if args.self_test:
             return self_test(args.catalogue)
-        if args.run_filesystems:
-            sys.stdout.write("\n".join(sorted(RUN_FILESYSTEMS)) + "\n")
-            return 0
         if args.run_fidelities:
             # DECLARATION ORDER, not sorted: the values are ordered by how much
             # they prove (native > foreign-kernel > emulated), and a reader

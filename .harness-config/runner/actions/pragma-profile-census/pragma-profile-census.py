@@ -279,7 +279,7 @@ def main(argv: list[str]) -> int:
                              / "sqlite" / "host" / "host.dss-project.json"))
     if not manifest_path.is_file():
         die(f"no corpus manifest at {manifest_path} — run "
-            f"`python3 .harness-config/runner/actions/real-examples/c/sqlite/build_and_test.py` first (it writes <OUT_DIR>/<leg>/<leg>.dss-project.json per "
+            f"`dssharness run sqlite --legs <leg>` first (it writes <OUT_DIR>/<leg>/<leg>.dss-project.json per "
             f"declared leg, OUT_DIR = build/real-examples/c/sqlite, with /windows on a Windows "
             f"host), or set SQLITE_MANIFEST.")
     manifest = json.loads(read_text(manifest_path))

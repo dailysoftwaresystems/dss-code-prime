@@ -202,6 +202,14 @@ dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi
 # gcc/clang `__attribute__((packed))`) and asserts dss's computeLayout(packed) is
 # byte-identical (sizeof + per-field offsetof). Skips when no toolchain.
 dss_add_test(NAME core/test_packed_abi_conformance     SOURCES test_packed_abi_conformance.cpp)
+# The MSVC developer-environment ENTRY every native witness shares (native_c_probe.hpp),
+# entered from parents a real process has: nested up to cmd.exe's 8,191-character line
+# limit and one level past it, each beside the control arm that proves such a parent still
+# breaks an entry that keeps it (dying at the limit, losing its PATH past it — refused by
+# name), one whose own never-entered PATH is past the limit (refused, not silently dropped),
+# and one that entered another installation. Skips only where no MSVC toolchain is installed.
+dss_add_test(NAME core/test_msvc_environment_entry
+             SOURCES test_msvc_environment_entry.cpp)
 # D-CSUBSET-PER-MEMBER-PACKED: the PER-FIELD packed channel — GNU `packed` on ONE
 # member-declarator, which packs that member and leaves the aggregate's own size and
 # alignment alone. Every golden is transcribed from a four-arm measurement (gcc 13.3.0

@@ -186,3 +186,34 @@ TEST(ConstDesignationWalk, AWriteThroughAComputedPointerToConstIsRefused) {
          false},
     });
 }
+
+// ── (3) the refusal QUOTES the operand exactly as it was written ─────────────
+// P68 round 12 (lane `cs`, D-PARSE-A-NODES-SPAN-RAN-ON-OVER-THE-TRIVIA-AFTER-ITS-LAST-TOKEN): the message
+// names the operand by its source text, `tree.text` of its node. That text used to run on over the
+// whitespace before the next token — `*p = 'x'` quoted `*p ` — and a helper trimmed it
+// (`trimmedNodeText`). A node's span now ends at its last token, the helper is gone, and each operand
+// below is quoted as written, with no whitespace inside the backquotes and a comment between the operand
+// and the operator not quoted at all.
+TEST(ConstDesignationWalk, TheRefusalQuotesTheOperandExactlyAsWritten) {
+    struct Quoted {
+        char const* src;
+        char const* quoted;
+    };
+    for (Quoted const& q : std::initializer_list<Quoted>{
+             {"void f(const char *p) { *p = 'x'; }\n", "`*p`"},
+             {"void f(const char *p) { *p  /* c */  = 'x'; }\n", "`*p`"},
+             {"void f(const char *p) { p[1]\n  = 'x'; }\n", "`p[1]`"},
+             {"struct S { const int m; };\nvoid f(struct S *s) { s->m += 1; }\n", "`s->m`"},
+             {"void f(const int *p) { (*p)++; }\n", "`(*p)`"},
+         }) {
+        SCOPED_TRACE(q.src);
+        auto model = analyzeShipped("c", {std::string{q.src}});
+        bool quotedExactly = false;
+        for (auto const& d : model.diagnostics().all()) {
+            if (d.code != DiagnosticCode::S_ConstViolation) continue;
+            quotedExactly = d.actual.find(q.quoted) != std::string::npos;
+            EXPECT_TRUE(quotedExactly) << "expected the operand quoted as " << q.quoted << ": " << d.actual;
+        }
+        EXPECT_TRUE(quotedExactly) << "no S_ConstViolation quoting " << q.quoted;
+    }
+}

@@ -466,7 +466,7 @@ struct HirAttrVocabulary {
 // Everything else is the minimum a module needs, so a diagnostic can only be
 // about the hole.
 [[nodiscard]] std::string mirGlobalModule(std::string_view globalTail) {
-    return std::string{"dssir 2\n"
+    return std::string{"dssir 3\n"
                        "symbols { %1 \"f\" %2 \"g\" }\n"
                        "module {\n"
                        "  global %2 : "} + std::string{globalTail} + "\n"
@@ -510,7 +510,7 @@ TEST(TextTierVocabulary, CoreTypeRefusalNamesEverySpellingTheLoaderAccepts) {
 TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
     expectEveryAdvertisedValueIsAccepted(
         "c", "/semantics/builtinFunctions/0/lowering",
-        "unknown builtin lowering", 37, "semantics.builtinFunctions[0].lowering");
+        "unknown builtin lowering", 38, "semantics.builtinFunctions[0].lowering");
 }
 
 // ★★ THE `.dsshir` ATTRIBUTE VOCABULARIES. Six sets that each used to exist
@@ -520,22 +520,22 @@ TEST(TextTierVocabulary, BuiltinLoweringRefusalNamesEveryVerbTheLoaderAccepts) {
 TEST(TextTierVocabulary, EveryHirAttributeRefusalAdvertisesExactlyWhatItAccepts) {
     constexpr HirAttrVocabulary kVocabularies[] = {
         {"ffi linkage",
-         "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(link ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi linkage", 3},
         {"ffi visibility",
-         "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @ffi(vis ",
          ")\n  extern_global %1 : i32\n}\n", "unknown ffi visibility", 3},
         {"shader stage",
-         "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(stage ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader stage", 7},
         {"shader builtin",
-         "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @shader(builtin ",
          ")\n  extern_global %1 : i32\n}\n", "unknown shader builtin", 12},
         {"transpile idiom",
-         "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @transpile(idiom ",
          ")\n  extern_global %1 : i32\n}\n", "unknown transpile idiom", 6},
         {"diag recovery",
-         "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
+         "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n  @diag(code 0, recovery ",
          ")\n  extern_global %1 : i32\n}\n", "unknown diag recovery", 4},
     };
 
@@ -590,7 +590,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
     // in the test. Found only because a sibling pin added a POSITIVE control and
     // the control reddened; the negative arm alone can never see this.
     auto const module = [](std::string_view marker) {
-        return std::string{"dssir 2\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -676,7 +676,7 @@ TEST(TextTierVocabulary, UnknownMirBlockMarkerIsRefusedAndNamesTheAcceptedSet) {
 // anchored for later.
 TEST(TextTierVocabulary, UnknownMirCallingConventionIsRefusedAndNamesTheAcceptedSet) {
     auto const module = [](std::string_view cc) {
-        return std::string{"dssir 2\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void cc "} +
@@ -978,7 +978,7 @@ TEST(TextTierVocabulary, UnknownMirLiteralCoreIsRefusedAndNamesTheAcceptedSet) {
 // is this file's own rule, written beside the inline-asm arm.
 TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
     auto const module = [](char const* arms, char const* extraBlock) {
-        return std::string{"dssir 2\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1017,7 +1017,7 @@ TEST(TextTierVocabulary, MirSwitchWithoutADefaultArmIsRefused) {
 // SILENT. `%b`, `%vx`, `%b3x` all fell out of the prefix-stripping loop as 0.
 TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 2\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1060,7 +1060,7 @@ TEST(TextTierVocabulary, MalformedMirPercentHandleIsRefused) {
 // crash is not a guard.
 TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
     auto const module = [](char const* target) {
-        return std::string{"dssir 2\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void {\n"
@@ -1093,7 +1093,7 @@ TEST(TextTierVocabulary, MirBranchToAnUndeclaredBlockIsRefused) {
 // the two arms pinned above were being converted in the same file.
 TEST(TextTierVocabulary, MirFunctionAttributeRefusalProjectsBindingAndVisibility) {
     auto const module = [](std::string_view attr) {
-        return std::string{"dssir 2\n"
+        return std::string{"dssir 3\n"
                            "symbols { %1 \"f\" }\n"
                            "module {\n"
                            "  function %1 : fn() -> void ["} + std::string{attr} + "] {\n"
@@ -1180,7 +1180,7 @@ TEST(TextTierVocabulary, MirBitIntAndWideFloatLiteralsRoundTripThroughText) {
 // constant in the reader's translation unit, so the two ends cannot drift.
 TEST(TextTierVocabulary, TheUnspelledAggregateLiteralMarkerIsRefusedByName) {
     auto const text =
-        std::string{"dsshir 5\nproducer \"\"\n"
+        std::string{"dsshir 6\nproducer \"\"\n"
                     "symbols { %1 \"g\" }\n"
                     "module [] \"probe\" {\n"
                     "  global %1 : i32 = lit unspelled_aggregate : i32\n"
@@ -1224,7 +1224,7 @@ namespace {
 
 // A `.dsshir` module whose single function body is `bodyLine`.
 [[nodiscard]] std::string hirBody(std::string_view bodyLine) {
-    return std::string{"dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+    return std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                        "  function %1 : fn() -> void {\n    block {\n      "}
          + std::string{bodyLine} + "\n      return void\n    }\n  }\n}\n";
 }

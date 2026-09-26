@@ -1,5 +1,16 @@
 # Deferral & anchor pinning discipline + quick reference
 
+## Contents
+- F. Deferral & anchor pinning discipline — 0. the admissibility gate · 1. explain it · 2. pin it in the
+  best home (the registry files, the six-cell schema, the writer) · 2b. closing is a move · 3. state its
+  priority · 4. cite, don't orphan
+- G. Quick reference — commands and paths; the write-by-default warning; the loop's own creed
+
+This file numbers the steps the older way; the crosswalk to `SKILL.md`'s 0–12 is at the top of
+`workflow-steps.md`.
+
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+
 ## F. Deferral & anchor pinning discipline
 
 Every deferral is explicit, located, and prioritized — never silent. **But first: most
@@ -30,11 +41,11 @@ deferral is the rare exception that must earn its place, not the convenient way 
 
 1. **Explain it.** One clear paragraph: what is deferred and *why* (the real blocker or the
    missing trigger) — the *why* is the admissible reason from step 0, restated.
-2. **Pin it in the best home.** A feature-area `D-*` anchor → that plan's §3.1 anchor row.
-   A project-level known-open item that is not a feature anchor → plan-00 **§0.2** (Deferred &
-   Known-Open Items registry). An orphan / cross-cutting anchor → the deferred-anchor registry,
-   which is **three documents** — two WORKING lists and one ARCHIVE — and the choice is not
-   cosmetic:
+2. **Pin it in the best home.** Every anchor → the deferred-anchor registry, the only home a row can
+   have, because the door writes nothing else (since 2026-09-25 a plan's §3.1 table and plan-00 **§0.2**
+   are no longer homes; ✔MEASURED that day, the plans held no open row the program counted),
+   which is **two documents** — one WORKING list (`-production.md`) and one ARCHIVE (`-done.md`) —
+   and the choice is not cosmetic:
    - `.plans/_deferred-anchor-registry-production.md` — a still-open defect **a user of the
      compiler could hit**, in the shipped binary or in the config it reads. ★ This is the file
      the burndown works from, ALWAYS (operator, 2026-08-25).
@@ -81,12 +92,15 @@ deferral is the rare exception that must earn its place, not the convenient way 
    open`) moves it back. `check-anchor-balance` fails the tree for a closed row left in a working
    registry, for an open row filed in the archive, and for a `Status` column that contradicts the
    verdict leading its own `Trigger` prose.
-3. **State its priority explicitly** in the row — one of: **blocker-now** (must close inside
-   this cycle, Step 2 or before push), **high** (run at end of this cycle, or earlier if it
-   becomes a blocker), **normal** (backlog), **trigger-gated** (do not build until the named
-   trigger fires). High and blocker-now items never leave the cycle open-ended.
-4. **Cite, don't orphan.** Any `D-*` referenced in `src/` must resolve to a registry row or
-   a plan citation, or the anchor guard fails the gate (§C step 6).
+3. **State its priority explicitly** in the row's `Priority` cell — `P0`..`P5`, the bands defined in
+   `registry-and-priority.md`, a declaration `burndown-queue` seeds and then reads. A row waiting on a
+   named trigger carries `⏳ GATED` in its `Status` cell: do not build until the trigger fires. Work that
+   blocks this cycle closes inside it (Step 2 or before push), and work due this cycle runs at its end, or
+   earlier if it becomes a blocker — neither leaves the cycle open-ended.
+4. **Cite, don't orphan.** Any `D-*` referenced in `src/` must resolve to a registry row — the only
+   home a row can have — or the anchor guards fail the gate (§C step 6): `dssharness check-anchor-citations`
+   resolves a cited id only to a row of the two registries, while `check-anchor-registry` still accepts an
+   id found anywhere in `.plans/`.
 
 ---
 
@@ -94,19 +108,20 @@ deferral is the rare exception that must earn its place, not the convenient way 
 
 | Need | Command / path |
 |---|---|
-| Build | `cmake --build build` |
-| Full test suite | `ctest --test-dir build --output-on-failure` |
-| Anchor guard | `python .harness-config/runner/actions/check-anchor-registry/check-anchor-registry.py` (ctest `anchor_registry_guard`) |
+| Build | `dssharness build --legs <leg>` |
+| Full test suite | `dssharness test --legs windows-x86_64-debug --json --time` — it builds first; the round gate is `dssharness test --legs gate` |
+| Anchor guard | `dssharness run check-anchor-registry` (ctest `anchor_registry_guard`) |
+| Resolve every cited id to a registry row | `dssharness check-anchor-citations --current-tree` |
 | **Handoff — read at Step 0, rewritten at Step 8.1** | `.plans/_handoff.md` — ①where we are ②where we need to get ③priorities ④concurrent branches/PRs (rebase surface) ⑤timeline (accumulates) |
 | Open PRs / rebase surface | `gh pr list --state open` · `gh pr view <n> --json files` (Step 8.2) |
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0.1 |
 | Deferral registry — WORKING (what is LEFT) | `.plans/_deferred-anchor-registry-production.md` — the only working registry since 2026-09-16 |
 | Deferral registry — ARCHIVE (closed; never read to ORIENT) | `.plans/_deferred-anchor-registry-done.md` |
 | Read ONE anchor, in full | `DssHarness read-anchor <ANCHOR>` — one command on every host |
-| List anchors — name, priority, status | `DssHarness read-anchors --pending [--band P0]` |
+| List anchors — name, priority, status | `DssHarness read-anchors --pending [--band P0]` [→ the listing ends with its count, so `--open --band <P>` gives a band's](registry-and-priority.md) |
 | Write a NEW row from fields | `DssHarness write-anchor <ANCHOR> --trigger '...' --closing '...'` — ⚠ it WRITES; `--anchor-dry-run` is how you look first |
 | Change a row — **closing MOVES it to the archive** | `DssHarness set-anchor <ANCHOR> --status closed --closing '...'` — ⚠ it WRITES |
-| Apply a lane's VERBATIM row file | `python .harness-config/runner/actions/apply-registry-row/apply-registry-row.py <working-registry> <ANCHOR> <row-file> --apply` |
+| Apply a lane's rows directory, as one batch | `python .harness-config/runner/actions/anchor-rows/anchor-rows.py stage <lane rows> <staged> --only <ID>...`, then `check <staged>`, then `apply <staged> [--accept-lost <ID>:<cell>]...` — rehearsed in a throwaway repository first, all or nothing, every row read back |
 | Lint every row a reader cannot key on | `DssHarness read-anchors --lint` |
 
 ⛔⛔ **THE DEFAULT INVERTED WHEN THE DOOR MOVED, AND A COPIED IDIOM NOW WRITES.** The retired
@@ -119,7 +134,7 @@ the pending registry; nothing was written"*, exit 0, and `git status` is clean a
 `--pending` / `--done` narrow a LISTING. Every field also has a `--<field>-file` form, which is how
 a multi-line cell reaches the tool without a shell quoting it.
 
-| Anchor balance gate | `python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py` |
+| Anchor balance gate | `dssharness check-anchor-balance --base <cycle-start-sha>` |
 | Per-cycle plan | `/feature-dev:feature-dev` (Step 3) |
 | Plan-lock design audit | independent `dss-audit` lens on the plan, pre-build (Step 3.5) |
 | Per-cycle review (+ re-review the fold) | `/pr-review-toolkit:review-pr` ×N to a fixed point (Step 5) |

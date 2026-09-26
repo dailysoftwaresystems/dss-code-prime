@@ -100,7 +100,7 @@ void announce(char const* kind, std::size_t index, std::string_view detail) {
 }
 
 std::string oneFunction(std::string const& blocks) {
-    return "dssir 2\n"
+    return "dssir 3\n"
            "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n"
            "module {\n"
            "  function %1 : fn() -> i32 {\n" + blocks +
@@ -113,7 +113,7 @@ std::string entryBlock(std::string const& body) {
 }
 
 std::string twoFunctions(std::string const& first, std::string const& second) {
-    return "dssir 2\n"
+    return "dssir 3\n"
            "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n"
            "module {\n"
            "  function %1 : fn() -> i32 {\n" + first +
@@ -180,7 +180,7 @@ std::vector<Shape> measuredShapes() {
                     "      %v2 = const : i32 (lit int 2 : i32)\n      return %v2\n"),
          "globaladdr names symbol %0, the invalid sentinel", 1},
         {"EG a global of the invalid symbol",
-         "dssir 2\nmodule {\n  global %0 : i32 = zero\n}\n",
+         "dssir 3\nmodule {\n  global %0 : i32 = zero\n}\n",
          "a global names symbol %0, the invalid sentinel", 1},
         // ── the block rules (`openBlockHasTerminator`, `isBlockUnopened`) ──
         {"E7 an instruction after the terminator",
@@ -271,7 +271,7 @@ struct Truncation {
 };
 
 std::vector<Truncation> measuredTruncations() {
-    std::string const head = "dssir 2\nsymbols {\n  %1 \"f\"\n}\nmodule {\n"
+    std::string const head = "dssir 3\nsymbols {\n  %1 \"f\"\n}\nmodule {\n"
                              "  function %1 : fn() -> i32 {\n";
     return {
         {"H1 cut inside an operand list",
@@ -656,7 +656,7 @@ TEST(MirTextReaderNeverAborts, OneBadBlockCostsItsOwnDiagnosticAndLaterBlocksAre
 namespace {
 
 std::string preambleOnly(std::string const& symbols) {
-    return "dssir 2\nsymbols {\n" + symbols + "}\nmodule {\n}\n";
+    return "dssir 3\nsymbols {\n" + symbols + "}\nmodule {\n}\n";
 }
 
 struct ParsedTable {
@@ -733,7 +733,7 @@ TEST(MirTextSymbolTable, AClassLetterHandlePast32BitsIsRefusedNotWrapped) {
 // holding it reads, re-emits under the same id, and reads again.
 TEST(MirTextSymbolTable, AFunctionAtTheTopSymbolIdReadsAndRoundTrips) {
     std::string const text =
-        "dssir 2\nsymbols {\n  %4294967295 \"top\"\n}\nmodule {\n"
+        "dssir 3\nsymbols {\n  %4294967295 \"top\"\n}\nmodule {\n"
         "  function %4294967295 : fn() -> i32 {\n" + kOneBlockF + "  }\n}\n";
     DiagnosticReporter r1;
     auto const first = parseMir(text, CompilationUnitId{7}, r1);
@@ -992,12 +992,12 @@ TEST(LoweringMintsPastTheHighWater, TheExhaustionRefusalSurvivesSuppressionAndDe
 namespace {
 
 std::string literalGlobal(std::string const& type, std::string const& value) {
-    return "dssir 2\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
+    return "dssir 3\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
            " = lit " + value + "\n}\n";
 }
 
 std::string zeroGlobal(std::string const& type) {
-    return "dssir 2\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
+    return "dssir 3\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : " + type +
            " = zero\n}\n";
 }
 
@@ -1039,7 +1039,7 @@ TEST(MirTextLiteralTwins, TheBitIntTypeWidthIsOneTheModelDefines) {
             << "_BitInt(" << w << ")" << listed(p.diagnostics);
     }
     DiagnosticReporter r;
-    auto const res = parseMir("dssir 2\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : _BitInt(" +
+    auto const res = parseMir("dssir 3\nsymbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : _BitInt(" +
                                   std::to_string(kBitIntMaxWidth) + ") = zero\n}\n",
                               CompilationUnitId{7}, r);
     std::vector<std::string> diags;

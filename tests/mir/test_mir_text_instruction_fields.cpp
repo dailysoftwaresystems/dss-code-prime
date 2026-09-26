@@ -225,7 +225,7 @@ TEST(MirTextInstructionFields, AFlaglessDefaultAlignedModuleIsSpelledAsBefore) {
     MirTextContext ctx{&in, &names};
     DiagnosticReporter r;
     EXPECT_EQ(emitMir(m, ctx, r),
-              "dssir 2\n"
+              "dssir 3\n"
               "symbols {\n"
               "  %1 \"f\"\n"
               "}\n"
@@ -280,7 +280,7 @@ TEST(MirTextInstructionFields, ANonPowerOfTwoAlignmentReadBackIsRefusedByTheRule
 // set — never read as "no flags".
 TEST(MirTextInstructionFields, AnUnknownFlagIsRefusedByNameWithTheAcceptedSet) {
     std::string const text =
-        "dssir 2\n"
+        "dssir 3\n"
         "symbols {\n  %1 \"f\"\n}\n"
         "module {\n"
         "  function %1 : fn() -> i32 {\n"

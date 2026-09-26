@@ -5,7 +5,8 @@
 #include "core/types/config_document_parse.hpp"   // THE ONE config-document parse
 #include "core/types/config_key_vocabulary.hpp"   // the ONE closed-key check + the `$`-prose carve-out
 #include "core/types/config_path_walk.hpp"       // findShippedConfigDir — shared src/dss-config/<dir> resolver; resolveSystemDirs (a header named by a config row)
-#include "core/types/data_model.hpp"             // dataModelFromName (signatureByDataModel keys)
+#include "core/types/data_model.hpp"             // dataModelFromName, longDoubleFormatName (the pair's `when` facts)
+#include "core/types/variant_when_json.hpp"      // the ONE `when` selector: decodeWhen + whenMatches (S2a-1)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/enum_name_table.hpp"        // EnumNameTable/allNames (the descriptor-local closed sets)
 #include "core/types/include_path_resolve.hpp"   // resolveSystemDescriptor (the `includes` closure walk)
@@ -257,6 +258,17 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
 // `objPath` doubles as the object LABEL — it is already the most specific
 // name this loader has for the object ("(root)", "symbols[3]", "macros[7]"),
 // so the message names it once instead of twice.
+//
+// The ONE emission of the shared check's sentence, in this reader's diagnostic
+// and shape — used by this adapter and by the `when` adapter below, whose keys
+// the core `when` decoder checks (P68 round 12, S2a-1), so the two cannot say
+// the refusal two ways.
+void emitUnknownKeySentence(DiagnosticReporter& reporter, std::string sentence) {
+    emitMalformed(reporter,
+        std::string{"shipped-lib descriptor: "} + std::move(sentence)
+            + " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)");
+}
+
 [[nodiscard]] bool rejectUnknownKeys(DiagnosticReporter& reporter,
                                      json const& obj, std::string const& objPath,
                                      std::initializer_list<std::string_view> allowed) {
@@ -264,9 +276,7 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
     detail::rejectUnknownKeys(obj, allowed, "'" + objPath + "'",
         [&](std::string_view, std::string message) {
             ok = false;
-            emitMalformed(reporter,
-                std::string{"shipped-lib descriptor: "} + std::move(message)
-                    + " (D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD)");
+            emitUnknownKeySentence(reporter, std::move(message));
         });
     return ok;
 }
@@ -479,212 +489,104 @@ decodeConstantValue(json const& v, TypeKind kind) {
 // clean selection outcomes.
 enum class WhenMatch { Match, NoMatch, Error };
 
-// WHICH AXES OF THE `when` SELECTOR PARTICIPATE IN THE MATCH. One evaluator,
-// three modes — never a second evaluator (a `when` decoded by two readers is a
-// `when` two readers can disagree about).
-//
-//  • `FormatOnly`     — `{format}` is the WHOLE legal key vocabulary; an `arch`
-//                       or `dataModel` key FAILS LOUD. The preprocessor-facing
-//                       surfaces (`macros`, and the `includes` edge gate) live
-//                       here: neither arch nor the data model is threaded into
-//                       preprocess (c9 build-key avoidance), so a key naming
-//                       them could only ever be a config author's mistake.
-//  • `FullTarget`     — `{arch,format,dataModel}` are all legal and all
-//                       participate. The TYPED surfaces (structs / constants /
-//                       typedefs / per-target `value` variants), which select a
-//                       LAYOUT or a TYPE and therefore need every axis.
-//  • `FormatReachability` — `{arch,format,dataModel}` are all legal and
-//                       VALIDATED, but only `format` participates. This answers
-//                       a strictly weaker question than `FullTarget`: "could
-//                       this arm be selected on object format F, for SOME
-//                       target?" — which is the right question for a NAME
-//                       PRESENCE scan (`shippedSurfaceNamesForFormat`), because
-//                       a variant set changes a name's TYPE or LAYOUT per arch,
-//                       never whether the name exists at all. Answering it with
-//                       `FullTarget` and no active arch would say NoMatch for
-//                       every arch-keyed arm and under-report the surface;
-//                       answering it by ignoring `variants` entirely would
-//                       over-report it. Both are silent wrong answers to a
-//                       question two fail-loud invariants are built on.
-enum class WhenAxes { FormatOnly, FullTarget, FormatReachability };
-
-// Decode + test a variant's `when` object (the per-target SELECTOR shared by the
-// `structs` / `constants` / `typedefs` / `macros` variant surfaces). The contract
-// is MATCH-ALL-SPECIFIED: every key the `when` SPECIFIES must equal the active
-// value (generic string equality — never an `if (arch == "x86_64")` here); an
-// unspecified key is a wildcard. A key tested against an UNKNOWN active value
-// (activeTarget / activeFormat nullopt — direct-API/LSP/test callers) can never
-// match. `axes` selects which keys are LEGAL and which PARTICIPATE — see the
-// `WhenAxes` table above. EVERY mode VALIDATES every key it admits (a typo'd
-// value fails loud in all three, including on an axis that does not
-// participate). `activeFormatName` is the precomputed
-// `objectFormatKindName(*activeFormat)` (empty when activeFormat is nullopt);
-// `activeDataModelName` is the precomputed `dataModelName(dataModel)` — the
-// descriptor reader always has a data model (a non-optional parameter), so unlike
-// arch/format this axis can never be "unknown". `whenCtx` is the caller's
-// diagnostic context for the `when` object (e.g. "structs[0] variants[1].when").
-// Reports via `emitMalformed` on a malformed `when`; the format and data-model
-// VALUES are validated against their closed vocabularies so a typo'd "elff" /
-// "LP62" fails loud rather than silently never matching.
-//
-// D-LANG-TYPE-IDENTITY-VOCABULARY: `dataModel` is the axis that lets a descriptor
-// spell a type C defines as a per-data-model ALIAS of a standard NAMED type —
-// `size_t` IS `unsigned long` on LP64 and `unsigned long long` on LLP64, `int64_t`
-// IS `long` / `long long`. A FIXED vocabulary tag would be wrong on one of the two
-// models, and an untagged core is a THIRD type matching neither. It rides the SAME
-// selector arch/format already use rather than a typedef-only `typeByDataModel`
-// key, so structs/constants/versions gain the axis for free.
+// THE `when` SELECTOR IS NOT DECIDED HERE (P68 round 12, S2a-1 of
+// D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). Its three participation modes
+// (`WhenAxes`), its closed key and value vocabularies, the empty-`when` refusal
+// and the match-all-specified contract live in `core/types/variant_when.hpp` —
+// ONE owner for this reader and for the C language document's builtin
+// `signature` variants, which are decoded at LOAD and matched at INJECTION.
+// This adapter only routes the decoder's findings into THIS reader's
+// diagnostic (F_ShippedLibDescriptorMalformed), in the sentences this reader
+// always printed, and turns the verdict into the tri-state the variant loops
+// below consume. `facts` is the pair — build it with `whenFactsFor`.
 [[nodiscard]] WhenMatch
 matchVariantWhen(json const& when, WhenAxes axes, std::string const& whenCtx,
-                 std::optional<std::string_view> activeTarget,
-                 std::optional<ObjectFormatKind> activeFormat,
-                 std::string const& activeFormatName,
-                 std::string_view activeDataModelName,
-                 DiagnosticReporter& reporter) {
-    // Closed key vocabulary: {arch,format,dataModel} for the typed surfaces,
-    // {format} only for macros. An unknown/forbidden key (e.g. `arch` in a macro
-    // `when`, or a typo'd "ach") fails loud — a silently-ignored key would match
-    // more broadly than intended.
-    //
-    // ★ LEGALITY AND PARTICIPATION ARE SEPARATE. `FormatReachability` admits the
-    // arch axes (they are legal in a typed surface's `when`) and still VALIDATES
-    // their values, but does not let them decide the match — which is what makes
-    // it a strictly WEAKER test than `FullTarget` rather than a different one.
-    bool const archKeysLegal        = (axes != WhenAxes::FormatOnly);
-    bool const archKeysParticipate  = (axes == WhenAxes::FullTarget);
-    if (archKeysLegal) {
-        if (!rejectUnknownKeys(reporter, when, whenCtx,
-                               {"arch", "format", "dataModel"}))
-            return WhenMatch::Error;
-    } else {
-        if (!rejectUnknownKeys(reporter, when, whenCtx, {"format"}))
-            return WhenMatch::Error;
-    }
-    // ── D-FFI-DESCRIPTOR-MACRO-VARIANT-COVERAGE-AND-ARITY-UNCHECKED limb (c) ──
-    // AN EMPTY `when` IS REFUSED. It used to be an UNCONDITIONAL CATCH-ALL by
-    // accident rather than by design: with no key present no branch below runs,
-    // `matches` keeps its initial `true`, and the variant matched EVERY target —
-    // including `activeFormat == nullopt`, which this function's own contract
-    // says can never select anything. So a `{}` selector both contradicted the
-    // documented rule and gave a per-target surface a silent target-invariant
-    // arm. ✔MEASURED: zero `"when": {}` in the shipped corpus (a sweep of every
-    // `when` object under `src/dss-config`), so this refuses a shape nothing
-    // relies on and stops the next one from being written.
-    //
-    // A caller wanting a target-invariant entry already has the FLAT form, which
-    // is what makes this refusal a narrowing with no expressiveness lost. The
-    // `includes` surface already required a non-empty `when` for the same
-    // reason; this moves the rule into the ONE `when` evaluator so every surface
-    // gets it and the two cannot drift.
-    if (when.empty()) {
-        emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                    + ": 'when' must name at least one selector "
-                                      "(an empty 'when' would match EVERY target, "
-                                      "including one with no active format — use the "
-                                      "flat, non-variant form for a target-invariant "
-                                      "entry)");
-        return WhenMatch::Error;
-    }
-    bool matches = true;
-    if (archKeysLegal && when.contains("dataModel")) {
-        if (!when.at("dataModel").is_string()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'dataModel' must be a string");
-            return WhenMatch::Error;
-        }
-        std::string const wantModel = when.at("dataModel").get<std::string>();
-        // CLOSED vocabulary (the same spellings `coreByDataModel` /
-        // `signatureByDataModel` use) — a typo would otherwise silently never
-        // match, making the entry vanish on every target.
-        if (!dataModelFromName(wantModel).has_value()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'dataModel' has unknown data-model name '"
-                                        + wantModel + "' (expected "
-                                        + allowedList(allNames(kDataModelTable))
-                                        + ")");
-            return WhenMatch::Error;
-        }
-        if (archKeysParticipate && activeDataModelName != wantModel) matches = false;
-    }
-    if (archKeysLegal && when.contains("arch")) {
-        if (!when.at("arch").is_string()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'arch' must be a string");
-            return WhenMatch::Error;
-        }
-        std::string const wantArch = when.at("arch").get<std::string>();
-        // The arch name is OPEN (it lives only in the target schemas this reader
-        // does not load) — an unknown arch simply never matches.
-        if (archKeysParticipate
-            && (!activeTarget.has_value() || *activeTarget != wantArch))
-            matches = false;
-    }
-    if (when.contains("format")) {
-        if (!when.at("format").is_string()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'format' must be a string");
-            return WhenMatch::Error;
-        }
-        std::string const wantFormat = when.at("format").get<std::string>();
-        // The format VALUE is matched against the CLOSED object-format vocabulary
-        // (a typo'd "elff" would otherwise silently never match → the entry
-        // vanishes on every target).
-        auto const wantKind = objectFormatKindFromName(wantFormat);
-        if (!wantKind.has_value()) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'format' has unknown object-format name '"
-                                        + wantFormat + "' (expected "
-                                        + allowedList(kSelectableObjectFormatKindNames)
-                                        + ")");
-            return WhenMatch::Error;
-        }
-        // ...and the `unknown` SENTINEL has the identical consequence by the
-        // rationale one line up: it spells correctly, so the lookup accepts it,
-        // and then it matches no real active format — the entry vanishes on
-        // every target, exactly as the typo would. Same defect, same verdict.
-        if (!isSelectableObjectFormatKind(*wantKind)) {
-            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx
-                                        + ": 'format' names the invalid sentinel — "
-                                        + std::string{kObjectFormatKindSentinelRejection});
-            return WhenMatch::Error;
-        }
-        if (!activeFormat.has_value() || activeFormatName != wantFormat) matches = false;
-    }
-    return matches ? WhenMatch::Match : WhenMatch::NoMatch;
+                 WhenFacts const& facts, DiagnosticReporter& reporter) {
+    auto const spec = decodeWhen(
+        when, axes, whenCtx,
+        [&](std::string body) {
+            emitMalformed(reporter, "shipped-lib descriptor " + whenCtx + ": " + std::move(body));
+        },
+        [&](std::string sentence) { emitUnknownKeySentence(reporter, std::move(sentence)); });
+    if (!spec.has_value()) return WhenMatch::Error;
+    return whenMatches(*spec, axes, facts) ? WhenMatch::Match : WhenMatch::NoMatch;
+}
+
+// The pair's selector facts as the typed surfaces see them: the reader's own
+// arch / format / data model, plus the long-double format the CALLER's pair facts
+// carry (ShippedPairFacts::longDoubleFormat — nullopt without a pair, so a
+// `longDoubleFormat` key then matches nothing, exactly like an unknown arch).
+[[nodiscard]] WhenFacts
+whenFactsFor(std::optional<std::string_view> activeTarget,
+             std::optional<ObjectFormatKind> activeFormat,
+             std::string_view activeDataModelName,
+             ShippedPairFacts const* pairFacts) {
+    WhenFacts f;
+    f.arch          = activeTarget;
+    f.format        = activeFormat;
+    f.dataModelName = activeDataModelName;
+    if (pairFacts != nullptr && pairFacts->longDoubleFormat.has_value()
+        && *pairFacts->longDoubleFormat != LongDoubleFormat::None)
+        f.longDoubleFormatName = longDoubleFormatName(*pairFacts->longDoubleFormat);
+    return f;
+}
+
+// WHAT A PAIR MATCHING NO ARM MEANS, per field. For `version` and `linkName`
+// "no arm" is a VALUE — unversioned, the plain identifier — so zero matches keep
+// the empty default. For a `signature` there is no such value: a symbol whose
+// type no arm gives on this pair has NO prototype here, and binding some other
+// arm's would be the silent fallback the variants form exists to remove (S2a-1
+// of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES) — so zero matches REFUSE, naming
+// the pair, unless the row says outright which arm serves every other pair:
+// `{ "default": true, "value": … }`, at most one, never with a `when`.
+enum class ZeroMatch { KeepEmpty, RefuseUnlessDefault };
+
+// The pair, spelled for a refusal: every fact the selector can test.
+[[nodiscard]] std::string pairLabel(WhenFacts const& f) {
+    auto const opt = [](std::optional<std::string_view> v) {
+        return v.has_value() ? "'" + std::string{*v} + "'" : std::string{"<none>"};
+    };
+    return "arch=" + opt(f.arch) + ", format="
+           + (f.format.has_value() ? "'" + std::string{objectFormatKindName(*f.format)} + "'"
+                                   : std::string{"<none>"})
+           + ", dataModel='" + std::string{f.dataModelName} + "', longDoubleFormat="
+           + opt(f.longDoubleFormatName);
 }
 
 // Decode ONE optional per-symbol PER-TARGET STRING field into `out`. The shape
 // is the c156 `version` shape, generalized so its TF-C121 sibling `linkName`
-// cannot drift from it:
+// and the S2a-1 `signature` cannot drift from it:
 //
 //   "<key>": "flat"                                        (target-invariant)
-//   "<key>": { "variants": [ { "when": {arch?,format?,dataModel?},
-//                              "value": "…" }, … ] }        (per-target)
+//   "<key>": { "variants": [ { "when": {arch?,format?,dataModel?,longDoubleFormat?},
+//                              "value": "…" }, …,
+//                            { "default": true, "value": "…" } ] }   (per-pair)
 //
-// ABSENT ⇒ `out` untouched (the caller pre-sets the empty default). 0 matching
-// variants ⇒ `out` stays empty — LEGAL, and load-bearing for BOTH consumers: it
-// is aarch64's single-versioned realpath, and it is arm64-Darwin's `fstat`,
-// whose only ABI is the modern one so the plain name is already right.
-// >1 match ⇒ ambiguous ⇒ fail loud (each target must select at most one).
+// ABSENT ⇒ `out` untouched (the caller pre-sets the empty default). >1 match ⇒
+// ambiguous ⇒ fail loud (each pair must select at most one). 0 matches ⇒ the
+// field's `ZeroMatch` policy: `KeepEmpty` (LEGAL, and load-bearing for
+// `version` — aarch64's single-versioned realpath — and for `linkName` —
+// arm64-Darwin's `fstat`, whose only ABI is the modern one) or
+// `RefuseUnlessDefault` (a `signature`: the `default` arm's value, else a
+// refusal naming the pair). A `default` arm is legal only under
+// `RefuseUnlessDefault`: an unversioned `version` needs no arm to say so.
 //
 // EAGER: every variant's SHAPE is validated regardless of which one is active,
-// so a malformed INACTIVE variant fails the read on EVERY target rather than
-// lurking until that target is first compiled (mirrors `signatureByDataModel`
-// and the struct variants). Returns false when the entry is malformed — the
-// caller `continue`s past this symbol and the read fails via its errorCount
-// delta.
+// so a malformed INACTIVE variant fails the read on EVERY pair rather than
+// lurking until that pair is first compiled; `allArms`, when given, receives
+// every arm's value so the caller can decode each one too (a signature's TYPE).
+// Returns false when the entry is malformed — the caller `continue`s past this
+// symbol and the read fails via its errorCount delta.
 //
-// ★ ONE DECODER FOR BOTH FIELDS IS THE POINT. `version` and `linkName` are the
-// two per-symbol strings whose correct value depends on the active target; they
-// were written as one block and a copy would let the second silently lose a
-// validation the first gained (a `when` key vocabulary, the ambiguity check).
+// ★ ONE DECODER FOR EVERY PER-PAIR SYMBOL STRING IS THE POINT. They were written
+// as one block and a copy would let the next field silently lose a validation
+// the first gained (a `when` key vocabulary, the ambiguity check).
 [[nodiscard]] bool
 decodePerTargetSymbolString(json const& sym, std::string const& key,
                             std::string const& at, std::size_t symIdx,
-                            std::optional<std::string_view> activeTarget,
-                            std::optional<ObjectFormatKind> activeFormat,
-                            std::string_view activeDataModelName,
-                            DiagnosticReporter& reporter, std::string& out) {
+                            WhenFacts const& facts, ZeroMatch zeroMatch,
+                            DiagnosticReporter& reporter, std::string& out,
+                            std::vector<std::string>* allArms = nullptr) {
     if (!sym.contains(key)) return true;
     json const& node = sym.at(key);
     if (node.is_string()) {
@@ -695,6 +597,7 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
                   "this symbol's " + key + " unset)");
             return false;
         }
+        if (allArms != nullptr) allArms->push_back(out);
         return true;
     }
     if (!node.is_object()) {
@@ -713,10 +616,9 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
               "string)");
         return false;
     }
-    std::string const activeFormatName =
-        activeFormat.has_value() ? std::string{objectFormatKindName(*activeFormat)}
-                                 : std::string{};
+    bool const defaultLegal = (zeroMatch == ZeroMatch::RefuseUnlessDefault);
     int         matchCount = 0;
+    std::optional<std::string> defaultValue;
     std::size_t vi         = 0;
     for (auto const& vdef : node.at("variants")) {
         std::string const vctx = objCtx + ".variants[" + std::to_string(vi) + "]";
@@ -726,13 +628,33 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
                 + "' must be an object with 'when' + 'value'");
             return false;
         }
-        if (!rejectUnknownKeys(reporter, vdef, vctx, {"when", "value"}))
-            return false;   // already reported
+        bool const isDefault = defaultLegal && vdef.contains("default");
+        bool const keysOk = isDefault ? rejectUnknownKeys(reporter, vdef, vctx, {"default", "value"})
+                                      : rejectUnknownKeys(reporter, vdef, vctx, {"when", "value"});
+        if (!keysOk) return false;   // already reported
         if (!vdef.contains("value") || !vdef.at("value").is_string()
             || vdef.at("value").get<std::string>().empty()) {
             emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + vctx
                 + "' must carry a non-empty string 'value'");
             return false;
+        }
+        std::string const value = vdef.at("value").get<std::string>();
+        if (allArms != nullptr) allArms->push_back(value);
+        if (isDefault) {
+            if (!vdef.at("default").is_boolean() || !vdef.at("default").get<bool>()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + vctx
+                    + "' 'default' must be the literal true (a default arm has no "
+                      "'when'; omit the key for a guarded arm)");
+                return false;
+            }
+            if (defaultValue.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + key
+                    + "' has more than one 'default' arm — at most one arm may "
+                      "serve every pair no other arm selects");
+                return false;
+            }
+            defaultValue = value;
+            continue;
         }
         if (!vdef.contains("when") || !vdef.at("when").is_object()) {
             emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + vctx
@@ -741,12 +663,11 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
         }
         WhenMatch const wm =
             matchVariantWhen(vdef.at("when"), WhenAxes::FullTarget, vctx + ".when",
-                             activeTarget, activeFormat, activeFormatName,
-                             activeDataModelName, reporter);
+                             facts, reporter);
         if (wm == WhenMatch::Error) return false;
         if (wm == WhenMatch::Match) {
             ++matchCount;
-            out = vdef.at("value").get<std::string>();
+            out = value;
         }
     }
     if (matchCount > 1) {
@@ -756,7 +677,18 @@ decodePerTargetSymbolString(json const& sym, std::string const& key,
               "ambiguous (each target must match at most one)");
         return false;
     }
-    // matchCount == 0 ⇒ `out` stays empty on this target. LEGAL, not an error.
+    if (matchCount == 0 && zeroMatch == ZeroMatch::RefuseUnlessDefault) {
+        if (defaultValue.has_value()) {
+            out = *defaultValue;
+            return true;
+        }
+        emitMalformed(reporter, "shipped-lib descriptor " + at + ": '" + key
+            + "' has no variant matching the active pair (" + pairLabel(facts)
+            + ") and no 'default' arm — refusing to bind another pair's value "
+              "(the variants form has no silent fallback)");
+        return false;
+    }
+    // matchCount == 0 under KeepEmpty ⇒ `out` stays empty on this target. LEGAL, not an error.
     return true;
 }
 
@@ -1085,8 +1017,7 @@ void decodeShippedMacros(json const& doc, std::string const& pathStr,
             // preprocessor). A nullopt activeFormat can never match (no selection).
             WhenMatch const wm = matchVariantWhen(
                 vdef.at("when"), WhenAxes::FormatOnly, vat + ".when",
-                /*activeTarget=*/std::nullopt, activeFormat, activeFormatName,
-                /*activeDataModelName=*/std::string_view{}, reporter);
+                WhenFacts{.format = activeFormat}, reporter);
             if (wm == WhenMatch::Error) { okVariants = false; break; }
             if (wm == WhenMatch::Match) {
                 ++matchCount;
@@ -1746,9 +1677,6 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
                                       "strings, e.g. [\"stdio.h\"]");
         return;
     }
-    std::string const activeFormatName =
-        activeFormat.has_value() ? std::string{objectFormatKindName(*activeFormat)}
-                                 : std::string{};
     std::size_t iidx = 0;
     for (auto const& v : doc.at("includes")) {
         std::string const at =
@@ -1818,9 +1746,7 @@ void decodeShippedIncludes(json const& doc, std::string const& pathStr,
         // have). Only the DECISION is per-format.
         WhenMatch const wm =
             matchVariantWhen(v.at("when"), WhenAxes::FormatOnly, at + ".when",
-                             /*activeTarget=*/std::nullopt, activeFormat,
-                             activeFormatName,
-                             /*activeDataModelName=*/std::string_view{}, reporter);
+                             WhenFacts{.format = activeFormat}, reporter);
         if (wm == WhenMatch::Error) continue;   // already reported
         // NoMatch (including EVERY conditional edge when no format is active —
         // LSP / direct-API / test callers) ⇒ the edge is NOT TAKEN. It is not an
@@ -2154,8 +2080,8 @@ decodeShippedTypedefs(json const& doc, std::string const& pathStr,
                     if (vo == TypedefTypeOutcome::Error) { okVariants = false; break; }
                     WhenMatch const wm = matchVariantWhen(
                         vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                        activeTarget, activeFormat, activeFormatName,
-                        activeDataModelName, reporter);
+                        whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
+                        reporter);
                     if (wm == WhenMatch::Error) { okVariants = false; break; }
                     if (wm == WhenMatch::Match) {
                         ++matchCount;
@@ -3038,8 +2964,8 @@ if (doc.contains("constants")) {
                 }
                 WhenMatch const wm = matchVariantWhen(
                     vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                    activeTarget, activeFormat, activeFormatName,
-                    activeDataModelName, reporter);
+                    whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
+                    reporter);
                 if (wm == WhenMatch::Error) { okVariants = false; break; }
                 if (wm == WhenMatch::Match) {
                     ++matchCount;
@@ -3458,7 +3384,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // and the measurement that refuted the stricter rule it replaced).
     // EAGER: EVERY variant's field list is decoded regardless
     // of which is active, so a malformed INACTIVE variant fails the read on EVERY
-    // target (anti-lurking, mirrors `signatureByDataModel`).
+    // target (anti-lurking, mirrors the `signature` variants).
     //
     // (3.struct.pre) THE BY-NAME DEPENDENCY GATE. The loop below PUBLISHES each
     // injected struct's tag name into `mergedNamedTypes` (the typedef/union
@@ -3706,8 +3632,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         // SHARED selector — typed surfaces allow {arch,format}.)
                         WhenMatch const wm = matchVariantWhen(
                             vdef.at("when"), WhenAxes::FullTarget, vat + ".when",
-                            activeTarget, activeFormat, activeFormatName,
-                            activeDataModelName, reporter);
+                            whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts),
+                            reporter);
                         if (wm == WhenMatch::Error) { okVariants = false; break; }
                         if (wm == WhenMatch::Match) {
                             ++matchCount;
@@ -3844,6 +3770,10 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // overall read still fails (errorCount delta below) so a malformed
     // descriptor never yields a usable result.
     out.symbols.reserve(symbols.size());
+    // The pair every per-pair symbol field (`signature`, `version`, `linkName`)
+    // is selected for — built once; the long-double format rides in from the
+    // caller's pair facts.
+    WhenFacts const symFacts = whenFactsFor(activeTarget, activeFormat, activeDataModelName, pairFacts);
     std::size_t idx = 0;
     for (auto const& sym : symbols) {
         std::string const at =
@@ -3866,13 +3796,16 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             continue;
         }
 
-        // signature (required string → decoded type).
-        if (!sym.contains("signature") || !sym.at("signature").is_string()) {
+        // signature (required): a type-text STRING, or a per-pair OBJECT whose
+        // `variants` select the text for this pair — decoded below, through the
+        // ONE per-pair decoder `version` and `linkName` use (S2a-1).
+        if (!sym.contains("signature")
+            || !(sym.at("signature").is_string() || sym.at("signature").is_object())) {
             emitMalformed(reporter, "shipped-lib descriptor " + at
-                                        + ": missing or non-string 'signature'");
+                                        + ": missing 'signature', or one that is neither a type-text "
+                                          "string nor a per-pair object with 'variants'");
             continue;
         }
-        std::string const sigText = sym.at("signature").get<std::string>();
 
         // kind (optional, closed enum, default Function).
         ShippedSymbolKind kind = ShippedSymbolKind::Function;
@@ -3989,11 +3922,10 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // on that target (LEGAL — the aarch64 realpath case). EAGER: every
         // variant's shape is validated regardless of which is active (a
         // malformed INACTIVE variant fails the read on EVERY target —
-        // anti-lurking, mirrors `signatureByDataModel` / the struct variants).
+        // anti-lurking, mirrors the `signature` variants / the struct variants).
         std::string version;
-        if (!decodePerTargetSymbolString(sym, "version", at, idx - 1,
-                                         activeTarget, activeFormat,
-                                         activeDataModelName, reporter, version))
+        if (!decodePerTargetSymbolString(sym, "version", at, idx - 1, symFacts,
+                                         ZeroMatch::KeepEmpty, reporter, version))
             continue;
 
         // TF-C121 (D-FFI-SHIPPED-SYMBOL-PER-TARGET-LINK-NAME): the optional
@@ -4012,9 +3944,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // `applyCMangling` — the SAME single call the un-overridden path takes.
         // Config never spells a per-FORMAT fact per-symbol.
         std::string linkName;
-        if (!decodePerTargetSymbolString(sym, "linkName", at, idx - 1,
-                                         activeTarget, activeFormat,
-                                         activeDataModelName, reporter, linkName))
+        if (!decodePerTargetSymbolString(sym, "linkName", at, idx - 1, symFacts,
+                                         ZeroMatch::KeepEmpty, reporter, linkName))
             continue;
 
         // Optional per-SYMBOL `availableObjectFormats` — which object-formats this
@@ -4059,81 +3990,57 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                                      reporter, symRealization))
             continue;
 
-        // FC3 c1: optional per-data-model signature override
-        // (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH closure for the
-        // LP64-merged libc symbols — fseek/ftell/atol/strtol/strtoul/
-        // labs carry the C `long`, whose width is the FORMAT's data
-        // model, not one signature). Shape mirrors the Model-3
-        // per-format `library` map: the BASE `signature` is the
-        // LP64-correct text; `signatureByDataModel` keys data-model
-        // names ("LLP64"/"ILP32") to replacement type texts. The
-        // ACTIVE model's entry (when present) becomes the effective
-        // signature; EVERY declared override must parse (a malformed
-        // override under a model not currently selected would
-        // otherwise lurk until that model is first compiled). Unknown
-        // model keys fail loud (closed vocabulary).
-        std::string effectiveSigText = sigText;
-        bool overridesOk = true;
-        if (sym.contains("signatureByDataModel")) {
-            if (!sym.at("signatureByDataModel").is_object()) {
-                emitMalformed(reporter, "shipped-lib descriptor " + at
-                                            + ": 'signatureByDataModel' must be an "
-                                              "object mapping data-model names to "
-                                              "signature strings");
-                continue;
-            }
-            for (auto const& kv : sym.at("signatureByDataModel").items()) {
-                auto const dm = dataModelFromName(kv.key());
-                if (!dm) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                        + ": 'signatureByDataModel' has unknown data-model key '"
-                        + kv.key() + "' (expected one of "
-                        + allowedList(allNames(kDataModelTable)) + ")");
-                    overridesOk = false;
-                    continue;
-                }
-                if (!kv.value().is_string()) {
-                    emitMalformed(reporter, "shipped-lib descriptor " + at
-                        + ": 'signatureByDataModel." + kv.key()
-                        + "' must be a signature string");
-                    overridesOk = false;
-                    continue;
-                }
-                std::string const ovText = kv.value().get<std::string>();
-                TypeId const ovSig =
-                    parseTypeFromText(ovText, interner, typeReg, reporter, mergedNamedTypes);
-                if (!ovSig.valid() || ovSig == InvalidType) {
-                    dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
-                                DiagnosticSeverity::Error,
-                                "shipped-lib descriptor " + at + ": symbol '" + name
-                                    + "' has a 'signatureByDataModel." + kv.key()
-                                    + "' that failed to decode as a type ('" + ovText
-                                    + "') — refusing a descriptor whose override "
-                                      "would fail when that data model is selected");
-                    overridesOk = false;
-                    continue;
-                }
-                if (*dm == dataModel) effectiveSigText = ovText;
+        // ★ THE SIGNATURE FOR THIS PAIR (P68 round 12, S2a-1 of
+        // D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES). A prototype that differs by
+        // pair — C's `long` is 64-bit on LP64 and 32-bit on LLP64; `long double`
+        // is x87-80, ieee128 or f64 by the format document — carries `variants`
+        // selected by the ONE `when` selector (core/types/variant_when.hpp), with
+        // NO silent fallback: a pair no arm selects is refused by name unless a
+        // `default` arm says outright that it serves every other pair. It
+        // REPLACES the old `signatureByDataModel` map, which keyed on the data
+        // model alone and could not say "long double" at all.
+        std::string sigText;
+        std::vector<std::string> sigArms;
+        if (!decodePerTargetSymbolString(sym, "signature", at, idx - 1, symFacts,
+                                         ZeroMatch::RefuseUnlessDefault, reporter,
+                                         sigText, &sigArms))
+            continue;
+        // EAGER: every arm must decode as a TYPE, the active one or not — an arm
+        // no current pair selects would otherwise lurk until that pair is first
+        // compiled.
+        bool armsOk = true;
+        for (std::string const& arm : sigArms) {
+            if (arm == sigText) continue;               // decoded below, with its claim
+            TypeId const armSig = parseTypeFromText(arm, interner, typeReg, reporter, mergedNamedTypes);
+            if (!armSig.valid() || armSig == InvalidType) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": symbol '" + name
+                                + "' has a 'signature' variant that failed to decode as a type ('"
+                                + arm + "') — refusing a descriptor whose arm would fail when that "
+                                  "pair is selected");
+                armsOk = false;
             }
         }
-        if (!overridesOk) continue;
+        if (!armsOk) continue;
 
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
-                                {"name", "signature", "signatureByDataModel",
+                                {"name", "signature",
                                  "kind", "linkage", "availableObjectFormats",
                                  "noreturn", "returnsTwice", "synthesize", "version",
                                  "linkName", "library", "realization"});
 
-        // Decode the signature via the ONE type-text decoder. A decode failure
-        // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
+        // Decode the pair's signature via the ONE type-text decoder. A decode
+        // failure is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
         // symbol is NEVER appended with InvalidType (it is dropped from `out`,
-        // and the whole read fails via the errorCount delta below). The BASE
-        // text is decoded even when an override is active (both must be
-        // valid); the EFFECTIVE signature is the active model's.
+        // and the whole read fails via the errorCount delta below). Every other
+        // arm was decoded above.
         // P44: the qualification claim comes out of the SAME decode, not a
         // second reader — `const<…>` is part of the signature grammar, so the one
-        // type-text decoder is the one place it is understood.
+        // type-text decoder is the one place it is understood. The claim is the
+        // SELECTED arm's: each arm is its own statement, and the one this pair
+        // selects is what this build is compiled against.
         DeclaredQualification baseQual;
         TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, mergedNamedTypes, &baseQual);
         if (!baseSig.valid() || baseSig == InvalidType) {
@@ -4145,20 +4052,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                               "an extern with an unresolved signature");
             continue;
         }
-        TypeId sig = baseSig;
+        TypeId const sig = baseSig;
         DeclaredQualification qual = std::move(baseQual);
-        if (effectiveSigText != sigText) {
-            // The per-data-model override carries its OWN claim: the two texts
-            // are two independent statements and the ACTIVE one is what this
-            // build is compiled against. Taking the base's claim here would
-            // describe a signature that is not the one being used.
-            DeclaredQualification ovQual;
-            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, mergedNamedTypes, &ovQual);
-            // Already validated above; a second-parse failure here would be
-            // interner drift — covered by the errorCount delta either way.
-            if (!sig.valid() || sig == InvalidType) continue;
-            qual = std::move(ovQual);
-        }
         // An EMPTY claim is stored as NO claim: the two spellings of "this row
         // says nothing about qualifiers" must not be distinguishable downstream,
         // or a consumer will eventually treat one of them as a statement.
@@ -4931,7 +4826,6 @@ namespace {
 [[nodiscard]] bool
 typedEntryReachableOnFormat(json const& entry, std::string const& at,
                             ObjectFormatKind fmt,
-                            std::string const& fmtName,
                             DiagnosticReporter& reporter) {
     auto const it = entry.find("variants");
     if (it == entry.end()) return true;             // flat ⇒ always present
@@ -4946,8 +4840,7 @@ typedEntryReachableOnFormat(json const& entry, std::string const& at,
         }
         WhenMatch const wm = matchVariantWhen(
             vdef.at("when"), WhenAxes::FormatReachability, vat + ".when",
-            /*activeTarget=*/std::nullopt, fmt, fmtName,
-            /*activeDataModelName=*/std::string_view{}, reporter);
+            WhenFacts{.format = fmt}, reporter);
         if (wm == WhenMatch::Match) return true;
     }
     return false;
@@ -4959,7 +4852,7 @@ typedEntryReachableOnFormat(json const& entry, std::string const& at,
 // reachability probe entirely rather than probe a key that cannot be there).
 void harvestNamedSurface(json const& doc, std::string const& pathStr,
                          char const* key, bool surfaceAdmitsVariants,
-                         ObjectFormatKind fmt, std::string const& fmtName,
+                         ObjectFormatKind fmt,
                          DiagnosticReporter& reporter,
                          std::vector<std::string>& out) {
     auto const it = doc.find(key);
@@ -4974,7 +4867,7 @@ void harvestNamedSurface(json const& doc, std::string const& pathStr,
         std::string name = e.at("name").get<std::string>();
         if (name.empty()) continue;
         if (surfaceAdmitsVariants
-            && !typedEntryReachableOnFormat(e, at, fmt, fmtName, reporter)) {
+            && !typedEntryReachableOnFormat(e, at, fmt, reporter)) {
             continue;
         }
         out.push_back(std::move(name));
@@ -4992,7 +4885,6 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     if (!docPtr) return std::nullopt;
     json const&       doc      = *docPtr;
     std::string const pathStr  = core::genericSpelling(path);
-    std::string const fmtName{objectFormatKindName(fmt)};
 
     std::vector<std::string> out;
 
@@ -5030,16 +4922,11 @@ shippedSurfaceNamesForFormat(std::filesystem::path const& path,
     // the SAME facts the full read's key vocabularies declare — a surface that
     // grows `variants` later must flip its flag here, and the surface-name test
     // is what makes that visible.
-    harvestNamedSurface(doc, pathStr, "constants",      true,  fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "floatConstants", false, fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, fmtName,
-                        reporter, out);
-    harvestNamedSurface(doc, pathStr, "unions",         false, fmt, fmtName,
-                        reporter, out);
+    harvestNamedSurface(doc, pathStr, "constants",      true,  fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "floatConstants", false, fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "typedefs",       true,  fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "structs",        true,  fmt, reporter, out);
+    harvestNamedSurface(doc, pathStr, "unions",         false, fmt, reporter, out);
 
     // macros — decoded through the REAL macro decoder with the real format, so a
     // variants-only macro that selects no arm on `fmt` contributes no name here
@@ -5481,7 +5368,7 @@ realizeShippedExternSymbols(std::span<std::string const>      names,
     std::sort(wantedDescriptors.begin(), wantedDescriptors.end());
 
     // (2) Read each candidate descriptor ONCE, through the SAME reader the
-    // `#include` path uses — so `variants`, `signatureByDataModel` and per-symbol
+    // `#include` path uses — so `variants` (a signature's among them) and per-symbol
     // `library` overrides cannot resolve one way here and another way there.
     //
     // THROWAWAY reporter, and a failed read is SKIPPED: this oracle is consulted

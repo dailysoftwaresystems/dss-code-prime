@@ -3081,7 +3081,11 @@ INSTANTIATE_TEST_SUITE_P(
         CastCase{::dss::MirOpcode::FPTrunc,  "fpcvt",    ::dss::TypeKind::F64, ::dss::TypeKind::F32, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPExt,    "fpcvt",    ::dss::TypeKind::F32, ::dss::TypeKind::F64, LirRegClass::FPR},
         CastCase{::dss::MirOpcode::FPToSI,   "fp_to_si", ::dss::TypeKind::F64, ::dss::TypeKind::I64, LirRegClass::GPR},
-        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR}
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp", ::dss::TypeKind::I64, ::dss::TypeKind::F64, LirRegClass::FPR},
+        // P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): an F32 result names the
+        // F32-destination opcode — the destination width rides the opcode.
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp32", ::dss::TypeKind::I64, ::dss::TypeKind::F32, LirRegClass::FPR},
+        CastCase{::dss::MirOpcode::SIToFP,   "si_to_fp32", ::dss::TypeKind::I32, ::dss::TypeKind::F32, LirRegClass::FPR}
         // ⚠ FPToUI and UIToFP USED TO SIT HERE, asserting that each emits ONE
         // LIR instruction of the same-named opcode. On x86_64 that assertion
         // was TRUE AND THE BUG: the same-named opcode carried the SIGNED
@@ -3238,6 +3242,96 @@ TEST(MirToLir, UnsignedFloatConversionsEmitTheDeclaredSequence) {
         EXPECT_EQ(countOf(f2u.ops, *sch.opcodeByMnemonic("and")), 1u);
         ASSERT_GE(f2u.ops.size(), 2u);
         EXPECT_EQ(f2u.ops[f2u.ops.size() - 2], *sch.opcodeByMnemonic("or"));
+    }
+}
+
+// ─── D-CSUBSET-INT-TO-F32-CODEGEN (P68 round 12): THE F32 DESTINATION ────
+//
+// An integer→float conversion with an F32 result names the F32-DESTINATION
+// opcode (`si_to_fp32` / `ui_to_fp32`) — the destination width rides the
+// opcode because the variant guard's one width axis is the source integer's.
+// Stated here INDEPENDENTLY of the config, as the test above states the F64
+// half:
+//
+//   * no F32 conversion may reach the F64 opcode — a detour through binary64
+//     rounds TWICE for a 64-bit source (2^63 + 2^39 + 1 becomes 0x5F000000
+//     instead of 0x5F000001), the silent wrong answer this guards;
+//   * arm64 emits exactly one converter of the right signedness;
+//   * x86_64's unsigned form is a SEQUENCE (SSE has no unsigned convert): the
+//     encodingless `ui_to_fp32` is never emitted, the value is converted SIGNED
+//     once, and the result comes out of the final power-of-two scale.
+//
+// The VALUE-level proof is examples/c/int_to_float_every_width.
+TEST(MirToLir, IntToF32ConversionsNameTheF32DestinationOpcode) {
+    // ── arm64: one SCVTF / UCVTF Sd each.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("arm64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const siToFp32 = *sch.opcodeByMnemonic("si_to_fp32");
+        auto const uiToFp32 = *sch.opcodeByMnemonic("ui_to_fp32");
+        auto const siToFp   = *sch.opcodeByMnemonic("si_to_fp");
+        auto const uiToFp   = *sch.opcodeByMnemonic("ui_to_fp");
+        for (auto const src : {::dss::TypeKind::I32, ::dss::TypeKind::I64}) {
+            auto const s2f = lowerOneCast(sch, ::dss::MirOpcode::SIToFP, src,
+                                          ::dss::TypeKind::F32);
+            EXPECT_EQ(countOf(s2f.ops, siToFp32), 1u)
+                << "arm64 SIToFP to F32 must emit exactly one SCVTF Sd (`si_to_fp32`)";
+            EXPECT_EQ(countOf(s2f.ops, siToFp), 0u)
+                << "an F32 result must never take the F64 converter";
+        }
+        for (auto const src : {::dss::TypeKind::U32, ::dss::TypeKind::U64}) {
+            auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP, src,
+                                          ::dss::TypeKind::F32);
+            EXPECT_EQ(countOf(u2f.ops, uiToFp32), 1u)
+                << "arm64 UIToFP to F32 must emit exactly one UCVTF Sd (`ui_to_fp32`)";
+            EXPECT_EQ(countOf(u2f.ops, siToFp32), 0u)
+                << "arm64 UIToFP must NOT reach for the SIGNED SCVTF";
+            EXPECT_EQ(countOf(u2f.ops, uiToFp), 0u)
+                << "an F32 result must never take the F64 converter";
+        }
+    }
+
+    // ── x86_64: CVTSI2SS for a signed source; the sticky-halving sequence for
+    //    an unsigned 64-bit one.
+    {
+        auto target = ::dss::TargetSchema::loadShipped("x86_64");
+        ASSERT_TRUE(target.has_value());
+        auto const& sch = **target;
+        auto const siToFp32 = *sch.opcodeByMnemonic("si_to_fp32");
+        auto const uiToFp32 = *sch.opcodeByMnemonic("ui_to_fp32");
+        auto const siToFp   = *sch.opcodeByMnemonic("si_to_fp");
+        EXPECT_TRUE(sch.opcodeInfo(uiToFp32)->encoding.variants.empty())
+            << "x86_64 `ui_to_fp32` must declare NO encoding — SSE has no "
+               "unsigned int->float instruction to encode";
+        for (auto const src : {::dss::TypeKind::I32, ::dss::TypeKind::I64}) {
+            auto const s2f = lowerOneCast(sch, ::dss::MirOpcode::SIToFP, src,
+                                          ::dss::TypeKind::F32);
+            EXPECT_EQ(countOf(s2f.ops, siToFp32), 1u)
+                << "x86_64 SIToFP to F32 must emit exactly one CVTSI2SS (`si_to_fp32`)";
+            EXPECT_EQ(countOf(s2f.ops, siToFp), 0u)
+                << "an F32 result must never take CVTSI2SD";
+        }
+        auto const u2f = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U64, ::dss::TypeKind::F32);
+        EXPECT_EQ(countOf(u2f.ops, uiToFp32), 0u)
+            << "x86_64 UIToFP must not emit the encodingless `ui_to_fp32`";
+        EXPECT_EQ(countOf(u2f.ops, siToFp32), 1u)
+            << "the u64->float expansion converts ONCE, signed, after the select";
+        EXPECT_EQ(countOf(u2f.ops, siToFp), 0u)
+            << "a detour through CVTSI2SD rounds twice";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("shr_a")), 1u)
+            << "the select and the scale come from ONE arithmetic-shift sign mask";
+        EXPECT_EQ(countOf(u2f.ops, *sch.opcodeByMnemonic("or")), 1u)
+            << "the halved value keeps its lost low bit as a STICKY bit";
+        ASSERT_GE(u2f.ops.size(), 2u);
+        EXPECT_EQ(u2f.ops[u2f.ops.size() - 2], *sch.opcodeByMnemonic("fmul"))
+            << "the value is produced by the exact power-of-two scale (1.0f or 2.0f)";
+        auto const u32 = lowerOneCast(sch, ::dss::MirOpcode::UIToFP,
+                                      ::dss::TypeKind::U32, ::dss::TypeKind::F32);
+        EXPECT_EQ(countOf(u32.ops, *sch.opcodeByMnemonic("zext")), 1u)
+            << "a u32 is zero-extended before the 64-bit signed convert";
+        EXPECT_EQ(countOf(u32.ops, siToFp32), 1u);
     }
 }
 
@@ -10495,7 +10589,10 @@ TEST(MirToLir, IntToF128FailsLoudWithoutItsConfigRow) {
         EXPECT_FALSE(result.ok)
             << c.name << ": an integer→F128 conversion on a target with no row "
                          "must fail loud, not silently take some other helper";
-        EXPECT_TRUE(sawAnchor(rep, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        // P68 round 12: the gate's message states its CONDITION, not a row id
+        // (`check-emitted-anchor-ids`), so the pin reads the condition.
+        EXPECT_TRUE(sawAnchor(rep, "a long double one only through a conversion "
+                                   "the target declares"))
             << c.name << ": the fall-through must hit the encoded-width gate";
     }
 }

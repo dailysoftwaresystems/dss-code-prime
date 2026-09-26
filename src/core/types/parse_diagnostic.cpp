@@ -157,6 +157,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_AbiTypedefUndeclared";
         case DiagnosticCode::S_ExcessInitializerElements:
             return "S_ExcessInitializerElements";
+        case DiagnosticCode::S_EnumCompatibleTypeRuleUndeclared:
+            return "S_EnumCompatibleTypeRuleUndeclared";
+        case DiagnosticCode::S_EnumeratorValueConvertedToUnderlyingType:
+            return "S_EnumeratorValueConvertedToUnderlyingType";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";

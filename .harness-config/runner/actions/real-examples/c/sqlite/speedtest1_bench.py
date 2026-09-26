@@ -63,8 +63,18 @@ Refusals (all fail-loud, all exercised by --selftest):
       must survive everything); zero surviving arms is a non-zero exit
   R6  two arms whose normalized speedtest1 output differs
   R7  repeats < 1, or a jobs arm < 1
+  R8  a plan stating no usable executable extension (its target format's own)
+  R9  a plan marking no arm `required`: the arm under measurement decides the
+      verdict, and without one a run in which it failed while a reference arm
+      did not would exit 0 and read as a benchmark of it
+  R10 a plan whose subject names no FULL `sqlitePin` (legs.json
+      stageBuild.sqliteCommit): the report names the sqlite head it measured and
+      whether it IS the pin, in the .json and the .md alike, so an off-pin
+      number cannot pass for an on-pin one
 
-Exit codes: 0 measured · 1 a refusal · 2 usage · 3 no arm produced a binary.
+Exit codes: 0 every required arm measured · 1 a refusal · 2 usage · 3 no arm
+produced a binary · 4 a REQUIRED arm was not measured (the report is still
+written, and names every arm's outcome).
 """
 from __future__ import annotations
 
@@ -676,6 +686,30 @@ def validate_plan(plan: dict) -> None:
         die(f"R8 the plan states no usable executable extension (exeSuffix={suffix!r}): it is the "
             f"target format's `outputExtension`, '' or a '.name', written by the plan writer.")
 
+    # R9 -- THE ARM UNDER MEASUREMENT DECIDES THE VERDICT. R5 keeps a failing arm from taking the
+    # run down, so a run in which DSS failed and gcc did not still writes its report -- and, until
+    # 2026-09-25, exited 0: a benchmark without its subject read as a benchmark of it. The plan
+    # writer marks the arm the run is FOR; a plan marking none has no verdict to give, and a
+    # `required` that is not a boolean is refused rather than read as a truthy string.
+    arms = plan.get("compilers") if isinstance(plan.get("compilers"), list) else []
+    loose = [a.get("id") for a in arms
+             if isinstance(a, dict) and "required" in a and not isinstance(a["required"], bool)]
+    if loose:                                                               # R9
+        die(f"R9 `required` is true or false; arm(s) {loose} carry another value.")
+    if not any(isinstance(a, dict) and a.get("required") is True for a in arms):  # R9
+        die("R9 the plan marks no arm `required`: the arm under measurement decides the verdict, "
+            "and without one a run in which it failed would exit 0 and read as a benchmark of it. "
+            "The plan writer marks it.")
+
+    # R10 -- THE REPORT NAMES WHICH SQLITE IT MEASURED (2026-09-25). The plan carries the head its writer
+    # read (`upstreamCommit`) and the pin (`sqlitePin`, legs.json stageBuild.sqliteCommit, a FULL sha); the
+    # report says whether they agree, in the .json and the .md alike, so an off-pin number cannot pass for
+    # an on-pin one -- and a plan without the pin could not say.
+    pin = subject.get("sqlitePin")
+    if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{40}", pin):          # R10
+        die(f"R10 the plan's subject names no FULL sqlitePin (got {pin!r}): the report says whether the "
+            f"measured sqlite IS the pinned revision, and cannot without it. The plan writer names it.")
+
 
 # ── the measurement ──────────────────────────────────────────────────────────
 def measure(plan: dict) -> dict:
@@ -696,7 +730,8 @@ def measure(plan: dict) -> dict:
                   "version": arm.get("version", ""),
                   "optimization": arm.get("optimizationLabel", ""),
                   "mechanism": MECHANISM[kind], "builds": {}, "run": None,
-                  "skipped": arm.get("_skipReason", "")}
+                  "skipped": arm.get("_skipReason", ""),
+                  "required": arm.get("required") is True}
         if record["skipped"]:
             print(f"  {arm['id']:<6} SKIPPED — {record['skipped']}")
             results.append(record)
@@ -784,17 +819,66 @@ def measure(plan: dict) -> dict:
         "host": {"system": platform.system(), "release": platform.release(),
                  "machine": platform.machine(),
                  "cpus": os.cpu_count()},
-        "subject": {"tuCount": len(subject["tus"]),
-                    "sqliteSrc": subject.get("sqliteSrc", ""),
-                    "upstreamCommit": subject.get("upstreamCommit", ""),
-                    "defineCount": len(subject.get("defines", [])),
-                    "mainTu": next(t for t in subject["tus"]
-                                   if os.path.basename(t) == MAIN_TU_BASENAME)},
+        "subject": report_subject(subject),
         "workload": plan["workload"],
         "repeats": plan["repeats"],
         "jobsArms": jobs_arms,
         "arms": results,
     }
+
+
+def on_pin(head: str, pin: str) -> bool:
+    """Whether the measured sqlite head IS the pin: a hex abbreviation of at least 7 digits that the
+    pin's full sha begins with. UNKNOWN, another revision and a branch name are each off the pin."""
+    return bool(re.fullmatch(r"[0-9a-f]{7,40}", head or "")) and (pin or "").startswith(head)
+
+
+def report_subject(subject: dict) -> dict:
+    """The report's `subject`, from the plan's: what was compiled, and WHICH sqlite -- the head the plan
+    writer read, the pin (R10), and whether they agree (`onPin`)."""
+    head, pin = subject.get("upstreamCommit", ""), subject["sqlitePin"]
+    return {"tuCount": len(subject["tus"]),
+            "sqliteSrc": subject.get("sqliteSrc", ""),
+            "upstreamCommit": head,
+            "sqlitePin": pin,
+            "onPin": on_pin(head, pin),
+            "defineCount": len(subject.get("defines", [])),
+            "mainTu": next(t for t in subject["tus"] if os.path.basename(t) == MAIN_TU_BASENAME)}
+
+
+def unmeasured_required(report: dict) -> list[str]:
+    """-> one line per REQUIRED arm (R9) the report holds no complete measurement of: skipped, a
+    build that failed or never ran at a jobs arm, or a run that failed or never happened. Empty
+    means every required arm was measured. The report is written either way -- R5 names every
+    arm's outcome -- and this is the VERDICT main() exits by."""
+    def first(text) -> str:
+        return (str(text).splitlines() or ["(the arm said nothing)"])[0]
+
+    missing: list[str] = []
+    for arm in report["arms"]:
+        if not arm.get("required"):
+            continue
+        if arm.get("skipped"):
+            missing.append(f"{arm['id']}: skipped: {first(arm['skipped'])}")
+            continue
+        broken = ""
+        for j in report["jobsArms"]:
+            b = arm["builds"].get(str(j))
+            if not isinstance(b, dict):
+                broken = f"{arm['id']}: build -j{j}: never built"
+            elif "failed" in b:
+                broken = f"{arm['id']}: build -j{j}: {first(b['failed'])}"
+            if broken:
+                break
+        if broken:
+            missing.append(broken)
+            continue
+        r = arm.get("run")
+        if not isinstance(r, dict):
+            missing.append(f"{arm['id']}: run: never ran")
+        elif "failed" in r:
+            missing.append(f"{arm['id']}: run: {first(r['failed'])}")
+    return missing
 
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -806,7 +890,10 @@ def render_markdown(report: dict) -> str:
         "",
         f"Subject: SQLite's own `test/speedtest1.c` linked against **{subj['tuCount']} "
         f"full-source translation units** (no amalgamation), upstream "
-        f"`{subj['upstreamCommit'] or 'unknown'}`.",
+        f"`{subj['upstreamCommit'] or 'unknown'}` — "
+        + ("the pinned revision (legs.json `stageBuild.sqliteCommit`)." if subj["onPin"] else
+           f"**NOT the pinned `{subj['sqlitePin'][:12]}`**: a tree measured as-is, not the revision "
+           f"the corpus and the round-close recompile compile."),
         f"Host: {host['system']} {host['release']} / {host['machine']}, "
         f"{host['cpus']} logical CPUs. Workload: `--size {wl.get('size')}`"
         + (f" `--testset {wl['testset']}`" if wl.get("testset") else "") + ".",
@@ -855,6 +942,36 @@ def render_markdown(report: dict) -> str:
         for arm_id, where, why in failures:
             lines.append(f"- `{arm_id}` at `{where}`: {why.splitlines()[0]}")
     return "\n".join(lines) + "\n"
+
+
+def finish(report: dict, out_json: str, out_md: str) -> int:
+    """Write the report -- the raw JSON and the README-ready markdown -- print it, and return the
+    VERDICT (R9) main() exits with: 0 when every required arm was measured, 4 when one was not.
+    The report is written either way: R5 names every arm's outcome, and the reader of a failed
+    benchmark needs exactly that."""
+    with open(out_json, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(report, fh, indent=2)
+        fh.write("\n")
+    md = render_markdown(report)
+    with open(out_md, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(md)
+
+    print()
+    print(md)
+    print(f"raw JSON : {out_json}")
+    print(f"markdown : {out_md}")
+    missing = unmeasured_required(report)
+    if missing:                                                             # R9
+        print("speedtest1_bench: a REQUIRED arm was NOT measured -- the report above names every "
+              "arm's outcome, and it is no benchmark of this one:\n      " + "\n      ".join(missing),
+              file=sys.stderr)
+        return 4
+    subj = report["subject"]
+    print("speedtest1_bench: every required arm measured (%s); sqlite %s, %s"
+          % (", ".join(a["id"] for a in report["arms"] if a.get("required")),
+             subj.get("upstreamCommit") or "unknown",
+             "the pin" if subj["onPin"] else "NOT the pinned " + subj["sqlitePin"][:12]))
+    return 0
 
 
 # ── self-test ────────────────────────────────────────────────────────────────
@@ -939,8 +1056,10 @@ def selftest() -> int:
         return False
 
     here = os.path.abspath(__file__)
-    base = {"subject": {"tus": [here] * MIN_TUS, "sqliteSrc": os.path.dirname(here)},
-            "repeats": {"build": 1, "run": 1}, "jobsArms": [1], "exeSuffix": ""}
+    base = {"subject": {"tus": [here] * MIN_TUS, "sqliteSrc": os.path.dirname(here),
+                        "upstreamCommit": "0123456789", "sqlitePin": "0123456789" + "ab" * 15},
+            "repeats": {"build": 1, "run": 1}, "jobsArms": [1], "exeSuffix": "",
+            "compilers": [{"id": "dss", "kind": "dss", "required": True}]}
     check("R2 refuses a collapsed TU list",
           refuses({**base, "subject": {**base["subject"], "tus": [here]}}, "R2"))
     check("R1 refuses a TU that is not on disk",
@@ -981,6 +1100,18 @@ def selftest() -> int:
         except SystemExit:
             dotted_ok = False
         check("R8 accepts the extension a format config states (a '.name')", dotted_ok)
+        check("R9 refuses a plan that marks no arm required (none marked, or one marked false)",
+              refuses({**ok_plan, "compilers": [{"id": "gcc", "kind": "unix-cc"}]}, "R9")
+              and refuses({**ok_plan, "compilers": [{"id": "dss", "kind": "dss",
+                                                     "required": False}]}, "R9"))
+        check("R9 refuses a `required` that is not a boolean -- never read as a truthy string",
+              refuses({**ok_plan, "compilers": [{"id": "dss", "kind": "dss", "required": True},
+                                                {"id": "gcc", "kind": "unix-cc",
+                                                 "required": "yes"}]}, "R9"))
+        check("R10 refuses a plan whose subject names no FULL sqlitePin (absent, or abbreviated)",
+              refuses({**ok_plan, "subject": {k: v for k, v in ok_plan["subject"].items()
+                                              if k != "sqlitePin"}}, "R10")
+              and refuses({**ok_plan, "subject": {**ok_plan["subject"], "sqlitePin": "0123456789"}}, "R10"))
         # The complement that keeps the refusals honest: a well-formed plan must
         # pass. Without this arm, a validate_plan() that refused EVERYTHING would
         # score a perfect self-test.
@@ -990,6 +1121,63 @@ def selftest() -> int:
         except SystemExit:
             passed = False
         check("a well-formed plan is NOT refused", passed)
+
+    # ★ THE VERDICT (R9): the required arm decides it, and a failed REFERENCE arm does not. Each
+    # arm below is a shape measure() records -- a build that failed at a jobs arm (its loop stops
+    # there), a binary that built and did not run, a toolchain skipped by name -- beside the
+    # control: the required arm measured next to a failed reference.
+    ok_b = {"median": 1.0}
+    dss_ok = {"id": "dss", "required": True, "skipped": "", "builds": {"1": ok_b, "4": ok_b},
+              "run": {"median": 0.5}}
+    gcc_bad = {"id": "gcc", "required": False, "skipped": "",
+               "builds": {"1": {"failed": "cc1: internal error"}}, "run": None}
+
+    def verdict(dss_arm: dict) -> list[str]:
+        return unmeasured_required({"jobsArms": [1, 4], "arms": [dss_arm, gcc_bad]})
+    check("the required arm measured is a PASS even beside a failed reference arm",
+          verdict(dss_ok) == [])
+    check("a required arm whose build FAILED is named, by the failure's first line",
+          verdict({**dss_ok, "builds": {"1": {"failed": "dsscp: E1 refused\ndetail"}}})
+          == ["dss: build -j1: dsscp: E1 refused"])
+    check("a required arm whose SECOND jobs arm failed is named at that arm",
+          verdict({**dss_ok, "builds": {"1": ok_b, "4": {"failed": "killed"}}})
+          == ["dss: build -j4: killed"])
+    check("a required arm that built and did not RUN is named (failed, or never ran)",
+          verdict({**dss_ok, "run": {"failed": "exit 139"}}) == ["dss: run: exit 139"]
+          and verdict({**dss_ok, "run": None}) == ["dss: run: never ran"])
+    check("a required arm SKIPPED by name is named, never a pass",
+          verdict({**dss_ok, "skipped": "not executable on this host"})
+          == ["dss: skipped: not executable on this host"])
+
+    # ...and the exit code main() returns IS finish()'s, the report written either way.
+    def full(dss_arm: dict) -> dict:
+        return {"host": {"system": "S", "release": "R", "machine": "M", "cpus": 1},
+                "subject": {"tuCount": MIN_TUS, "upstreamCommit": "0123456789",
+                            "sqlitePin": "0123456789" + "ab" * 15, "onPin": True},
+                "workload": {"size": 1},
+                "repeats": {"build": 1, "run": 1}, "jobsArms": [1, 4],
+                "arms": [{"label": "DSS", "version": "", "optimization": "", "mechanism": "pool",
+                          **dss_arm},
+                         {"label": "gcc", "version": "", "optimization": "", "mechanism": "procs",
+                          **gcc_bad}]}
+    with tempfile.TemporaryDirectory() as td:
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            rc_bad = finish(full({**dss_ok, "run": {"failed": "exit 139"}}),
+                            os.path.join(td, "bad.json"), os.path.join(td, "bad.md"))
+            rc_ok = finish(full(dss_ok), os.path.join(td, "ok.json"), os.path.join(td, "ok.md"))
+        check("finish() returns 4 for an unmeasured required arm with the report STILL written, "
+              "and 0 for the control",
+              rc_bad == 4 and rc_ok == 0
+              and all(os.path.isfile(os.path.join(td, n))
+                      for n in ("bad.json", "bad.md", "ok.json", "ok.md")))
+
+    # WHICH sqlite (R10): a head is ON the pin only when the pin's full sha begins with it
+    pin_fx = "0123456789" + "ab" * 15
+    check("on_pin: a head the pin begins with is ON it; another revision, a too-short prefix, UNKNOWN and "
+          "a branch name are not",
+          on_pin("0123456789", pin_fx) and on_pin(pin_fx, pin_fx) and not on_pin("4ebc78674d", pin_fx)
+          and not on_pin("012345", pin_fx) and not on_pin("UNKNOWN", pin_fx) and not on_pin("master", pin_fx))
 
     env, why = msvc_env()
     print(f"  info  MSVC environment: {'resolved' if env else 'absent — ' + why}")
@@ -1127,21 +1315,9 @@ def main() -> int:
                                   f"a driver that resolved the wrong one")
 
     report = measure(plan)
-
-    out_json = args.json_out or os.path.join(plan["outDir"], "benchmark-speedtest1.json")
-    with open(out_json, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(report, fh, indent=2)
-        fh.write("\n")
-    md = render_markdown(report)
-    out_md = args.md_out or os.path.join(plan["outDir"], "benchmark-speedtest1.md")
-    with open(out_md, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(md)
-
-    print()
-    print(md)
-    print(f"raw JSON : {out_json}")
-    print(f"markdown : {out_md}")
-    return 0
+    return finish(report,
+                  args.json_out or os.path.join(plan["outDir"], "benchmark-speedtest1.json"),
+                  args.md_out or os.path.join(plan["outDir"], "benchmark-speedtest1.md"))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
+#include "core/types/type_lattice/type_compatibility.hpp"   // sameOrEnumCompatible
 
 #include <cstdint>
 #include <optional>
@@ -196,10 +197,14 @@ namespace detail::type_rules {
 // mingw-w64 13.2.0 and MSVC 19.51; DSS warned S_IncompatiblePointerIntegerPointee
 // ("a pointer of a different integer type") because the arm compared the element
 // by identity while the pointer arm stripped the skin.
+// P68 round 12 (lane `cs`, the enumeration P1): an enumerated element beside its
+// compatible integer pointee decays the same way (`sameOrEnumCompatible`,
+// core/types/type_lattice/type_compatibility.hpp).
 [[nodiscard]] inline bool decayedElementReachesPointee(TypeInterner const& interner,
                                                        TypeId pointee, TypeId element) {
     return pointee.valid() && element.valid()
-        && interner.stripVolatile(pointee) == interner.stripVolatile(element);
+        && sameOrEnumCompatible(interner, interner.stripVolatile(pointee),
+                                interner.stripVolatile(element));
 }
 
 // rhs assignable into lhs?
@@ -648,14 +653,21 @@ namespace detail::type_rules {
     // int→enum (`enum Color c = 1;`, the `c += 1` read-modify-write-back).
     // Gated on `enumConvertsToArith` (default false → a non-C schema keeps
     // `Enum` strictly distinct from the integer ranks); mirrors the
-    // `charConvertsToArith` gate. SCOPE: admits enum↔INT only — an
-    // enum↔DIFFERENT-enum pair satisfies neither disjunct (signedIntRank/
-    // unsignedIntRank of an Enum kind is 0), so it stays a loud mismatch (a
-    // C constraint violation); same-enum is already caught by the sameType
-    // identity above. Closes D-CSUBSET-ENUM-INT-CONVERSION.
+    // `charConvertsToArith` gate. Closes D-CSUBSET-ENUM-INT-CONVERSION.
+    // ★ P68 round 12 (lane `cs`, the enumeration P1): and enum↔DIFFERENT-enum. This
+    // comment used to call that pair "a C constraint violation" — it is not: C
+    // 6.5.16.1p1 admits arithmetic ← arithmetic, and an enumerated type is an integer
+    // type (6.2.5p17). ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/eec`): `e = f;`,
+    // `enum E e = C;` of an `enum F` constant, an `enum F` argument to an `enum E`
+    // parameter and an `enum F` returned as `enum E` — gcc 13.3.0, clang 18.1.3,
+    // mingw-w64 13.2.0 and MSVC 19.51 all build and run them (clang and MSVC warn by
+    // default, gcc under -Wextra); DSS refused all five
+    // ([[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]). Same-enum is
+    // already caught by the sameType identity above.
     if (enumConvertsToArith
         && ((lk == TypeKind::Enum
-             && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0))
+             && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0
+                 || rk == TypeKind::Enum))
             || (rk == TypeKind::Enum
                 && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)))) {
         return true;
@@ -839,8 +851,10 @@ namespace detail::type_rules {
             // changes layout/codegen, only the access flag, which is keyed off the
             // ACCESSED type, so a dropped-qualifier pointer simply yields a plain
             // access through the lhs's stripped pointee — never a miscompile.)
-            if (interner.stripVolatile(lhsElem[0])
-                == interner.stripVolatile(rhsElem[0])) {
+            // P68 round 12 (lane `cs`, the enumeration P1): or an enumerated
+            // pointee beside its compatible integer type (`sameOrEnumCompatible`).
+            if (sameOrEnumCompatible(interner, interner.stripVolatile(lhsElem[0]),
+                                     interner.stripVolatile(rhsElem[0]))) {
                 return true;
             }
             // D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT (C 6.7.6.2p6 + 6.5.16.1): two
@@ -1026,12 +1040,14 @@ enum class DiagnosedConversionSite : std::uint8_t {
 // qualifiers C23 6.5.10p2 / 6.5.16p3 let the two sides differ by (DSS interns
 // `volatile` on the type; `const` lives on the qualifier spine), or two array types C
 // 6.7.6.2p6 calls compatible? The same relation `isAssignable`'s pointer arms apply.
+// P68 round 12: an enumerated type and its compatible integer type too.
 [[nodiscard]] inline bool pointeesCompatible(TypeInterner const& interner,
                                              TypeId a, TypeId b) {
     if (!a.valid() || !b.valid()) return true;   // cascade suppression
     TypeId const sa = interner.stripVolatile(a);
     TypeId const sb = interner.stripVolatile(b);
-    return sa == sb || vlaCompatibleArrayTypes(interner, sa, sb);
+    return sa == sb || vlaCompatibleArrayTypes(interner, sa, sb)
+        || sameOrEnumCompatible(interner, sa, sb);
 }
 
 // A POINTER PAIRING C admits without a diagnostic at `==`/`!=` and `?:`: compatible
@@ -1791,9 +1807,25 @@ promoteIntegerKind(TypeKind k, ResolvedArithmeticRules const& rules) noexcept {
 // Used by `usualArithmeticCommonType` / `integerPromotedType` below so the
 // closed arithmetic verb never has to special-case Enum. Part of
 // D-CSUBSET-ENUM-INT-CONVERSION.
+// P68 round 12 (lane `cs`): an enum with a FIXED underlying type (C23 6.7.2.2) answers
+// with that type AS DECLARED — `enum E : long` is `long`, the vocabulary entry, not an
+// anonymous I32 / I64 — because C 6.3.1.1p1 gives the enumerated type the rank of its
+// underlying type and the conversions decide by rank, i.e. by name. ✔MEASURED
+// 2026-09-24 (lane `cs`'s `.temp/probe/uacx`): `e + u` for `enum E : long e` and
+// `unsigned int u` is `unsigned long` on LLP64 and `long` on LP64 under gcc 13.3.0,
+// clang 18.1.3 and mingw-w64 13.2.0 (-std=c2x; MSVC 19.51 has no fixed underlying
+// types); DSS answered `unsigned int` and an unnamed 64-bit type. An enum WITHOUT a
+// fixed underlying type keeps the kind-only answer (its type is compatible with an
+// implementation-chosen integer type, which DSS makes `int`).
+// The enumeration P1 (P68 round 12, lane `cs`): an enum WITHOUT a fixed underlying
+// type answers the same way when its language chose its compatible type (C23
+// 6.7.3.3p13) — the name its rank is decided by, like a fixed one's. Only a
+// kind-only record (a language that declares no choice) answers with its kind.
 [[nodiscard]] inline TypeId
 enumUnderlyingOrSelf(TypeInterner& interner, TypeId t) {
     if (!t.valid() || interner.kind(t) != TypeKind::Enum) return t;
+    if (TypeId const underlying = interner.enumUnderlyingType(t); underlying.valid())
+        return underlying;
     auto const sc = interner.scalars(t);
     return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
 }
@@ -1829,6 +1861,59 @@ enumeratorValueFitsUnderlying(std::int64_t value, TypeKind underlying) noexcept 
     if (bits >= 64) return true;                            // any non-negative int64 fits U64/U128
     std::uint64_t const hi = (std::uint64_t{1} << bits) - 1;
     return static_cast<std::uint64_t>(value) <= hi;
+}
+
+// ── P68 round 12 (lane `cs`, the enumeration P1): an enumerator's VALUE WITH ITS
+// SIGNEDNESS ──
+//
+// The semantic tier carries an enumerator's value as an int64 BIT PATTERN
+// (`SymbolRecord::enumValue`), and the pattern alone cannot say whether
+// 0xFFFFFFFFFFFFFFFF is -1 or 2^64 - 1 — the type the value came from does (the
+// constant expression's type for an explicit `= expr`, the previous constant's
+// arithmetic for an implicit one). Reading every pattern as signed refused
+// `enum E : unsigned long long { X = 0xFFFFFFFFFFFFFFFFULL }`, which C23 6.7.3.3p3
+// admits (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/ect7`: gcc 13.3.0, clang
+// 18.1.3 and mingw-w64 13.2.0 run it; DSS said S_EnumeratorValueOutOfRange) —
+// [[D-C-A-FIXED-ENUMERATIONS-VALUE-ABOVE-THE-INT64-RANGE-IS-REFUSED]].
+struct EnumeratorValue {
+    std::int64_t bits = 0;
+    bool         isUnsigned = false;   // `bits` is a uint64 pattern
+    [[nodiscard]] bool isNegative() const noexcept { return !isUnsigned && bits < 0; }
+};
+
+// Does `v` fit the integer kind `k`? False for a non-integer kind.
+[[nodiscard]] inline bool enumeratorValueFitsKind(EnumeratorValue v, TypeKind k) noexcept {
+    int const width = intKindBits(k);
+    if (width == 0) return false;
+    bool const kindSigned = detail::type_rules::signedIntRank(k) != 0;
+    if (v.isNegative()) {
+        if (!kindSigned) return false;
+        if (width >= 64) return true;
+        return v.bits >= -(std::int64_t{1} << (width - 1));
+    }
+    auto const magnitude = static_cast<std::uint64_t>(v.bits);   // non-negative here
+    if (kindSigned) {
+        if (width >= 128) return true;
+        return magnitude <= (std::uint64_t{1} << (width - 1)) - 1;
+    }
+    if (width >= 64) return true;
+    return magnitude <= (std::uint64_t{1} << width) - 1;
+}
+
+// `v + 1` as a MATHEMATICAL value (C23 6.7.3.3p10 defines an implicit enumerator by
+// that addition, and p12 chooses a type able to hold the result rather than
+// letting it wrap); nullopt when the result leaves the uint64 range.
+[[nodiscard]] inline std::optional<EnumeratorValue>
+enumeratorSuccessor(EnumeratorValue v) noexcept {
+    if (v.isUnsigned) {
+        auto const u = static_cast<std::uint64_t>(v.bits);
+        if (u == UINT64_MAX) return std::nullopt;
+        return EnumeratorValue{static_cast<std::int64_t>(u + 1), true};
+    }
+    if (v.bits == INT64_MAX) {   // 2^63: only an unsigned pattern holds it
+        return EnumeratorValue{static_cast<std::int64_t>(std::uint64_t{1} << 63), true};
+    }
+    return EnumeratorValue{v.bits + 1, false};
 }
 
 // The C 6.3.1.8 common type of two operands under the language's

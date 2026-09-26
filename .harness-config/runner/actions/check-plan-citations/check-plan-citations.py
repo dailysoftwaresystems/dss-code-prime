@@ -179,7 +179,9 @@ SCAN_ROOTS = (".plans", ".claude")
 # doc-collapse detector stops detecting. That is exactly the "one family
 # vanishing behind the other's size" failure `CODE_FLOOR` exists to prevent,
 # reproduced at a fiftieth of the scale. Two families, two floors, and markdown
-# outside the documentation roots belongs to the tree it lives in.
+# outside the documentation roots belongs to the tree it lives in. (Since
+# 2026-09-25 the document family has one floor per root, `DOC_ROOT_FLOORS`, for
+# the same reason one level down.)
 # ★ `docs`, `packaging` and `.github` join the roots for the same reason: each
 # carries author-facing markdown that no root named. ✔MEASURED 2026-08-20 they
 # carry ZERO positional citations, so the ceiling that arrives with them is zero
@@ -286,7 +288,20 @@ EXIT_OK, EXIT_RATCHET, EXIT_COLLAPSE, EXIT_USAGE = 0, 1, 2, 3
 # EITHER root vanishing alone while sitting 28 documents below the live count,
 # which no ordinary churn reaches -- documents are added here, not deleted in
 # dozens.
-DOC_FLOOR = 45
+# ★★ SUPERSEDED 2026-09-25 (P68 round 12): ONE FLOOR PER DOCUMENTATION ROOT, NOT ONE
+# FOR THE FAMILY. ✔MEASURED: the skills rewrite took `.claude` from 33 to 45
+# documents -- exactly the family floor -- so a scan that lost `.plans` still
+# enumerated 45 and passed as clean; self-test arm 5 went red, which is this
+# design's own detector working. A family floor has to sit above EVERY root's count
+# alone, so each root's GROWTH silently disarms the detection of the other's LOSS,
+# and documents are added here in dozens. A floor per root cannot be disarmed by its
+# sibling. Each sits well below its root's live count (`.plans` 42, `.claude` 45 on
+# 2026-09-25): a root that falls under it lost most of itself, which no ordinary
+# churn does. A root added to `SCAN_ROOTS` without a floor is refused at import.
+DOC_ROOT_FLOORS = {".plans": 25, ".claude": 20}
+if set(DOC_ROOT_FLOORS) != set(SCAN_ROOTS):
+    raise SystemExit("check-plan-citations: DOC_ROOT_FLOORS names %s but SCAN_ROOTS is %s -- every documentation "
+                     "root needs its own floor" % (sorted(DOC_ROOT_FLOORS), sorted(SCAN_ROOTS)))
 
 # ★ THE CODE FAMILY GETS ITS OWN FLOOR, NOT A SHARED ONE. A single total
 # would let one family collapse entirely while the other's size covered for it --
@@ -470,11 +485,13 @@ def count_text(text):
 
 def census(root):
     docs = documents(root)
-    if len(docs) < DOC_FLOOR:
-        raise Collapse(
-            "found only %d governed document(s) under %s, floor is %d. The scan "
-            "COLLAPSED -- fix the scan, do not lower the floor."
-            % (len(docs), " + ".join(SCAN_ROOTS), DOC_FLOOR))
+    for rel_root in SCAN_ROOTS:  # one floor per root: a sibling's size never covers a root's loss
+        found = sum(1 for d in docs if d.startswith(rel_root.replace(os.sep, "/") + "/"))
+        if found < DOC_ROOT_FLOORS[rel_root]:
+            raise Collapse(
+                "found only %d governed document(s) under %s, floor is %d. The scan "
+                "COLLAPSED -- fix the scan, do not lower the floor."
+                % (found, rel_root, DOC_ROOT_FLOORS[rel_root]))
     code = code_files(root)
     if len(code) < CODE_FLOOR:
         raise Collapse(
@@ -717,7 +734,10 @@ def run(root, write, baseline=False):
 # an arm that checks only the code cannot tell which one it proved. That mistake
 # was measured in a sibling guard in this same cycle.
 
-EXPECTED_ARMS = 43
+EXPECTED_ARMS = 46
+# A documentation root cut down to this many documents is a COLLAPSE (arms 5c, 11c): every
+# floor in `DOC_ROOT_FLOORS` must sit above it, or those arms fail.
+PARTIAL_DOCS = 10
 _RAN = None
 
 # ⚠ THE MUTATION FIXTURE IS ASSEMBLED, NOT SPELLED OUT. A literal `path:line` in
@@ -832,11 +852,14 @@ def _pipe_arms(fact):
                     json.dumps({"_comment": _INVENTORY_COMMENT, "ceilings": {}},
                                indent=2, ensure_ascii=False) + "\n")
 
+        # ⓘ The box holds one document under `.plans` and none under `.claude`, so every
+        # root's floor is lifted to 0 (a floor per root since 2026-09-25): this arm
+        # witnesses the pipe's encoding, and a collapse here would be the wrong refusal.
         driver = ("import importlib.util, sys\n"
                   "spec = importlib.util.spec_from_file_location('g', %r)\n"
                   "m = importlib.util.module_from_spec(spec)\n"
                   "spec.loader.exec_module(m)\n"
-                  "m.DOC_FLOOR = m.CODE_FLOOR = 1\n"
+                  "m.DOC_ROOT_FLOORS = dict.fromkeys(m.SCAN_ROOTS, 0); m.CODE_FLOOR = 1\n"
                   "sys.exit(m.run(%r, write=False))\n"
                   % (os.path.abspath(__file__), box))
         env = dict(os.environ)
@@ -864,7 +887,7 @@ def _pipe_arms(fact):
         written = _files_under(prefix)
         # The control: the SAME by-path load without `-B` does write bytecode here, so an
         # empty prefix is a measurement and not a host that never writes any.
-        c = subprocess.run([sys.executable, "-c", driver.split("m.DOC_FLOOR")[0]], cwd=box,
+        c = subprocess.run([sys.executable, "-c", driver.split("m.DOC_ROOT_FLOORS")[0]], cwd=box,
                            env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         control = _files_under(prefix)
@@ -1135,14 +1158,48 @@ def selftest(root):
         held = tempfile.mkdtemp(prefix="plan-citations-held-")
         shutil.move(os.path.join(tmp, ".plans"), os.path.join(held, ".plans"))
         ok &= _arm("5 SCAN-COLLAPSED", tmp, EXIT_COLLAPSE, says="governed document(s)")
+        # ★ AND A SIBLING'S GROWTH NEVER COVERS THE LOSS: `.claude` grown by more
+        # documents than both roots hold today, `.plans` still gone. ✔MEASURED
+        # 2026-09-25: under the former family floor, `.claude` reaching the floor
+        # alone was enough to pass a scan that had lost `.plans`.
+        growth = os.path.join(tmp, ".claude", "zz-selftest-growth")
+        os.makedirs(growth)
+        for i in range(200):
+            io.open(os.path.join(growth, "doc%03d.md" % i), "w", encoding="utf-8").write("growth\n")
+        ok &= _arm("5b SIBLING-GROWTH-NO-COVER", tmp, EXIT_COLLAPSE,
+                   says=("governed document(s) under .plans", "floor is"))
+        shutil.rmtree(growth)
         shutil.move(os.path.join(held, ".plans"), os.path.join(tmp, ".plans"))
+
+        # ★ AND EACH FLOOR'S VALUE IS PINNED, NOT ONLY ITS EXISTENCE: a root cut down to
+        # `PARTIAL_DOCS` documents -- a scan that lost most of it -- must collapse. Arms 5,
+        # 5b and 11 remove a WHOLE root, which a floor of 1 would catch as well as the
+        # real one. ✔FOUND 2026-09-25 by round 12's independent audit: every floor could
+        # be lowered to 1 with all 44 arms still green. `GREEN-CONTROL` holds each floor
+        # below its root's live count, so the floors sit in (PARTIAL_DOCS, live].
+        for label, rel_root in (("5c PLANS-PARTIAL-COLLAPSE", ".plans"),
+                                ("11c CLAUDE-PARTIAL-COLLAPSE", ".claude")):
+            docs = [d for d in documents(tmp) if d.startswith(rel_root + "/")]
+            moved = docs[PARTIAL_DOCS:]
+            for rel in moved:
+                dst = os.path.join(held, "partial", rel.replace("/", os.sep))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(os.path.join(tmp, rel.replace("/", os.sep)), dst)
+            ok &= _arm(label, tmp, EXIT_COLLAPSE,
+                       says=("found only %d governed document(s) under %s" % (PARTIAL_DOCS, rel_root),
+                             "floor is"))
+            for rel in moved:
+                shutil.move(os.path.join(held, "partial", rel.replace("/", os.sep)),
+                            os.path.join(tmp, rel.replace("/", os.sep)))
 
         # ⚠ AND ONCE PER DOCUMENTATION ROOT, not once per family. ✔MEASURED
         # 2026-08-20: `.plans` is 41 of the 73 governed documents and `.claude`
         # is 32, so a scan that loses only the LARGER root still enumerates 32
         # while one that loses only the smaller still enumerates 41. Arm 5 covers
         # the first; at the former floor of 40 the second passed as CLEAN, and
-        # this arm is what holds `DOC_FLOOR` above it.
+        # this arm is what holds `DOC_FLOOR` above it. (Since 2026-09-25 each root
+        # has its own floor, `DOC_ROOT_FLOORS`; this arm proves a VANISHED `.claude`
+        # is caught, and arm 11c pins the floor's value.)
         shutil.move(os.path.join(tmp, ".claude"), os.path.join(held, ".claude"))
         ok &= _arm("11 DOC-HALF-COLLAPSED", tmp, EXIT_COLLAPSE,
                    says="governed document(s)", not_says="governed code file(s)")

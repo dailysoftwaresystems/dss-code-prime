@@ -94,11 +94,13 @@
 #include "repo_root.hpp"
 #include "scoped_env.hpp"
 #include "scratch_dir.hpp"
+#include "shipped_read_pairs.hpp"   // the real pairs a REAL descriptor is read on
 
 #include <nlohmann/json.hpp>
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -545,29 +547,49 @@ TEST(ShippedNoLibraryForFormat, NoShippedRowIsBodylessOnAFormatAShippedTargetBui
     fs::path const libs = *cfg / "shippedLibs";
     ASSERT_TRUE(fs::is_directory(libs)) << libs.generic_string();
 
-    struct Leg { ObjectFormatKind fmt; DataModel dm; };
-    Leg const legs[] = {{ObjectFormatKind::Elf, DataModel::Lp64},
-                        {ObjectFormatKind::Pe, DataModel::Llp64},
-                        {ObjectFormatKind::MachO, DataModel::Lp64}};
+    // ★ ON EVERY DISTINCT REAL PAIR, WITH THE PAIR'S OWN FACTS (P68 round 12,
+    // S2a-1). The legs were three hand-written (format, data model) rows read as
+    // "x86_64" — arm64 was never read — with no pair facts, and a descriptor
+    // that FAILED to read was skipped in silence (`continue`), so a corpus edit
+    // that broke a read on one format shrank this sweep instead of reddening it;
+    // the floors below could not see a handful of missing files. The pairs now
+    // come from the shipped documents (`shipped_read_pairs.hpp`) and a failed
+    // read is a failure, named.
+    auto const& pairs = dss::test_support::shippedReadPairs();
+    ASSERT_FALSE(pairs.empty());
     std::size_t descriptorsRead = 0;
     std::size_t rowsAsked       = 0;
     std::vector<std::string> refused;
-    for (auto const& leg : legs) {
+    for (auto const& pair : pairs) {
+        SCOPED_TRACE(pair.label());
+        ShippedPairFacts const facts = pair.pairFacts();
         for (auto const& entry : fs::recursive_directory_iterator{libs}) {
             if (!entry.is_regular_file() || entry.path().extension() != ".json")
                 continue;
             TypeInterner       interner{CompilationUnitId{1}};
             TypeRegistry       typeReg;
             DiagnosticReporter rep;
+            // stdio.json's `vfprintf` spells the ABI alias `va_list`, and a read
+            // without a binding fails loud — which the silent `continue` this
+            // sweep used to take HID: ✔MEASURED at S2a-1, stdio.json was never
+            // read here on any leg, so none of its rows was ever asked. Any
+            // consistent stand-in serves, as in the consistency sweep: nothing
+            // here reads a TypeId.
+            std::array<NamedTypeBinding, 1> const named{NamedTypeBinding{
+                "va_list", interner.pointer(interner.primitive(TypeKind::Void))}};
             auto const desc = readShippedLibDescriptor(
-                entry.path(), interner, typeReg, rep, leg.dm,
-                std::optional<std::string_view>{"x86_64"}, leg.fmt, {});
+                entry.path(), interner, typeReg, rep, pair.dataModel(),
+                pair.activeTarget(), pair.activeFormat(), named, nullptr, &facts);
+            EXPECT_TRUE(desc.has_value())
+                << entry.path().generic_string() << " failed to read on this pair: "
+                << (rep.all().empty() ? std::string{"<no diagnostic>"}
+                                      : rep.all().front().actual);
             if (!desc.has_value()) continue;
             ++descriptorsRead;
             for (auto const& sym : desc->symbols) {
                 ++rowsAsked;
                 if (auto const d = refuseShippedSymbolWithoutABody(
-                        *desc, sym, leg.fmt, entry.path()))
+                        *desc, sym, pair.kind, entry.path()))
                     refused.push_back(d->actual);
             }
         }

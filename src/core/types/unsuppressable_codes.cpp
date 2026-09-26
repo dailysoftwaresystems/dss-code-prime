@@ -506,6 +506,10 @@ constexpr MembershipReason kWhyEnumUnderlying{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the enum is laid out at the default width instead, or an "
     "out-of-range enumerator wraps into a wrong constant"};
+constexpr MembershipReason kWhyEnumCompatibleTypeRule{
+    MembershipProng::WrongArtifactShipsGreen,
+    "silenced, an enumeration the format names no convention for keeps a "
+    "guessed compatible type, which then reaches codegen"};
 constexpr MembershipReason kWhyTypeofBitfield{
     MembershipProng::WrongArtifactShipsGreen,
     "silenced, the typeof resolves to the bit-field declared (widened) "
@@ -782,7 +786,11 @@ constexpr MembershipReason kWhyIncludeReentryRefused{
 // and the fold reconciled the count, as ruled.)
 // (Lane `fo` wrote this note as 194 → 196 in its own tree; it landed after the entries above,
 // and the fold reconciled the count, as ruled.)
-constexpr std::array<UnsuppressableEntry, 198> kUnsuppressableCodes{{
+// ⓘ EXTENT 198 → 199 (2026-09-24, P68 round 12, lane `cs`, the enumeration P1):
+// `S_EnumCompatibleTypeRuleUndeclared` joins under `kWhyEnumCompatibleTypeRule`, prong
+// (1) — a suppressed one would leave a guessed compatible type reaching codegen.
+// (Written from main's 198; a fold landing another member first reconciles the count.)
+constexpr std::array<UnsuppressableEntry, 199> kUnsuppressableCodes{{
     // D_* build-lifecycle band — a `.dss-project.json` pre/post-build hook
     // that could not be spawned, or that ran and failed. PRONG (2), and only
     // prong (2): both already abort the build with or without the diagnostic
@@ -1705,11 +1713,16 @@ constexpr std::array<UnsuppressableEntry, 198> kUnsuppressableCodes{{
     // a suppressed invalid-underlying would silently lay the enum out at the default
     // int width/signedness instead of failing, and a suppressed out-of-range value
     // would be truncated/wrapped into the underlying type — a wrong constant. Same
-    // silent-miscompile-guard class as the S_Alignas* entries above. (The
-    // default-int enum path never emits either, so unsuppressing changes nothing
-    // for existing enums.)
+    // silent-miscompile-guard class as the S_Alignas* entries above. P68 round 12
+    // (lane `cs`): the enumeration without a fixed type now emits the second too,
+    // for a value set no chosen type holds (C23 6.7.3.3p4) — the same wrong
+    // constant if silenced.
     {DiagnosticCode::S_InvalidEnumUnderlyingType, kWhyEnumUnderlying},
     {DiagnosticCode::S_EnumeratorValueOutOfRange, kWhyEnumUnderlying},
+    // S_EnumCompatibleTypeRuleUndeclared (P68 round 12, lane `cs`): the active
+    // format names no enumeration compatible-type convention, so no type can be
+    // chosen for an enumeration without a fixed underlying type (C 6.7.2.2p4).
+    {DiagnosticCode::S_EnumCompatibleTypeRuleUndeclared, kWhyEnumCompatibleTypeRule},
     // S_TypeofBitfieldOperand (FC17, D-CSUBSET-TYPEOF, C23 6.7.2.5): the operand
     // of a `typeof`/`typeof_unqual` is a bit-field member access. Same
     // silent-miscompile-guard class as the enum/nullptr entries above: on the

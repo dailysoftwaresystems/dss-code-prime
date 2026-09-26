@@ -651,7 +651,14 @@ class RunLock:
     `mkdir` is the atomic test-and-set; the owner file `owner.txt` is ASCII
     `pid|start-marker|iso-time`. The lock is LIVENESS-based: its owner is alive only when the pid
     is alive AND its start marker is the recorded one (a reused pid is a stranger), so a crashed
-    run never wedges the next -- its lock is STOLEN and the theft reported. Two attempts."""
+    run never wedges the next -- its lock is STOLEN and the theft reported. Two attempts.
+
+    ★ THE LOCK OWNS ITS DIRECTORY: `acquire` creates the directory the lock lives in (`_prepare`,
+    as CloneLock's does) before the test-and-set, which stays the bare `mkdir` of the lock itself.
+    ✔MEASURED 2026-09-25: until then every caller had to create it first -- the normal mode did,
+    the recompile did not, and on a tree that had never staged sqlite its R3 died with `could not
+    create the run lock ... path not found`. Arms RL00 (a directory that does not exist yet is
+    created) and RL10 (one that cannot be created is refused by name)."""
 
     OWNER = "owner.txt"
     OWNER_SETTLE_S = 2.0      # a lock taken a moment ago may not have its owner file yet
@@ -661,6 +668,13 @@ class RunLock:
         self.owner_file = os.path.join(self.lock_dir, self.OWNER)
         self.held = False
         self._marker = ""
+
+    def _prepare(self):
+        parent = os.path.dirname(self.lock_dir)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            C.die("could not create the directory the run lock %s lives in: %s" % (self.lock_dir, exc))
 
     def _mkdir(self):
         os.mkdir(self.lock_dir)
@@ -702,6 +716,7 @@ class RunLock:
         if not mark:
             C.die("cannot read this process's own start marker (pid %d), so a run lock taken now "
                   "could not prove it is alive and would be stolen from this very run." % me)
+        self._prepare()
         stolen = None
         for _attempt in (1, 2):
             try:
@@ -1447,6 +1462,16 @@ def _selftest_markers(t):
 
 def _selftest_run_lock(t, work):
     t.section("RL  the run lock: a live owner refused, a stale one stolen and reported")
+    # RL00 -- the NEGATIVE: a lock whose directory does not exist yet (a tree that never staged has
+    # no stage root), two levels of it, proven absent before the acquire.
+    fresh = os.path.join(work, "never-staged", "stage-root", ".harness-lock")
+    absent = not os.path.lexists(os.path.join(work, "never-staged"))
+    lk = RunLock(fresh)
+    got = _acquire(lk, _CaptureLog())
+    t.check("RL00 a lock whose DIRECTORY does not exist yet is taken: the lock creates it", absent
+            and got is None and lk.held and os.path.isfile(lk.owner_file), repr((absent, got)))
+    lk.release()
+    # RL01-RL09 take the lock in a directory that EXISTS (the branch RL00 does not reach).
     lock_dir = os.path.join(work, "out", ".harness-lock")
     os.makedirs(os.path.dirname(lock_dir))
     lk = RunLock(lock_dir)
@@ -1518,6 +1543,14 @@ def _selftest_run_lock(t, work):
         msg = str(exc)
     t.check("RL09 two attempts exhausted is refused by name (never an overwrite)",
             "after 2 attempts" in msg, msg)
+    blocked = os.path.join(work, "a-file-not-a-directory")
+    with open(blocked, "wb") as fh:
+        fh.write(b"x")
+    stuck = os.path.join(blocked, ".harness-lock")
+    got = _acquire(RunLock(stuck), _CaptureLog())
+    t.check("RL10 a directory the lock cannot create is refused, naming the lock",
+            str(got).startswith("REFUSED: could not create the directory the run lock %s lives in"
+                                % os.path.abspath(stuck)), repr(got))
 
 
 def _acquire(lock, log):

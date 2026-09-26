@@ -29,8 +29,8 @@ dss_add_test(NAME analysis/semantic/test_semantic_analyzer_genericity
              SOURCES test_semantic_analyzer_genericity.cpp)
 
 # FC3 c1: width/signedness front-end semantics (typeSpecifiers multiset
-# table, dataModel threading, the integer-literal ladder, descriptor
-# signatureByDataModel, loader fail-louds, toy/tsql typing pins).
+# table, dataModel threading, the integer-literal ladder, a descriptor
+# signature's per-data-model arms, loader fail-louds, toy/tsql typing pins).
 dss_add_test(NAME analysis/semantic/test_fc3_width_semantics
              SOURCES test_fc3_width_semantics.cpp)
 

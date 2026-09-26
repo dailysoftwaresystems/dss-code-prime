@@ -1224,14 +1224,28 @@ runBinary(std::filesystem::path const&     binaryPath,
           std::vector<std::string> const&  launcherPrefix = {},
           // UCRT-P4: the program's own `argv[1..]`. Empty = the pre-UCRT-P4
           // behaviour (argc == 1) for every existing caller.
-          std::vector<std::string> const&  programArgs    = {}) {
-    // Skipped under an emulator: there the program the kernel actually
+          std::vector<std::string> const&  programArgs    = {},
+          // Whether `launcherPrefix` EXECS the image rather than reading it as
+          // DATA: an OS-provided translation (`arch -x86_64` hands the freshly
+          // written x86_64 image to the kernel, which admits it and starts
+          // Rosetta 2) does; qemu-user does not. The caller knows it from
+          // `crossArchDecision` (host_translations.hpp), never from a name.
+          bool                             launcherExecsImage = false) {
+    // Skipped under an EMULATOR: there the program the kernel actually
     // exec's is `launcherPrefix[0]` — a long-lived system binary that was
     // admitted once, long ago — while the freshly written image is merely
     // read as DATA by the emulator and never exec'd. So there is no
     // admission cost to absorb, and warming up would only double the
     // runtime of the slowest arm in the matrix.
-    if (launcherPrefix.empty()) {
+    // ★ NOT skipped under a launcher that EXECS the image: there the kernel
+    // admits the freshly written image exactly as it does a native one, and
+    // the translation layer translates it on its first run. ✔MEASURED
+    // 2026-09-24, macos-arm64-release leg, the first `arch -x86_64` runs of
+    // fresh x86_64 Mach-O images with this warm-up skipped: three arms hit
+    // "child timed out after 5000 ms" while the same arms passed on the debug
+    // leg -- admission and the first translation had landed inside the timed
+    // window this function exists to keep them out of.
+    if (launcherPrefix.empty() || launcherExecsImage) {
         // The warm-up passes the SAME arguments as the timed run. It must: a
         // program given different input can take a different path, and the point of
         // phase 1 is to pay the OS's one-time admission cost for the code the timed

@@ -235,8 +235,8 @@ struct DSS_EXPORT HirLoweringConfig {
     // c115 SEH (both optional — unset for languages without `__try`): the two
     // handler-arm sub-rules of the try statement. The engine identifies which
     // arm parsed by RULE identity: the except arm carries [filterExpr, block]
-    // children; the finally arm is the trigger-gated fail-loud
-    // (D-CSUBSET-SEH-FINALLY — no shipped consumer).
+    // children; the finally arm is still a fail-loud
+    // (D-CSUBSET-SEH-FINALLY, open since its 2026-09-24 re-verdict).
     RuleId        sehExceptArmRule{};  std::string sehExceptArmRuleName;
     RuleId        sehFinallyArmRule{}; std::string sehFinallyArmRuleName;
 

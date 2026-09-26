@@ -51,9 +51,14 @@ below is IN it.
 4. **`.claude/skills/dss-cycle/references/dss-harness.md`** — the tool the harness is moving to:
    which of its verbs exist today, which scripts are still the only way to do their job, this
    repository's `.harness-config/config.json`, and the exit codes.
-5. **`.claude/skills/dss-cycle/SKILL.md`** — the operator's standing rulings, in force, verbatim,
-   with the measurements that produced them. **Read it before deciding anything about scope, about
-   what counts as done, or about what the reference compilers are evidence FOR.**
+5. **`.claude/skills/dss-cycle/SKILL.md`** — the cycle's checklist, one line per standing operator
+   ruling, and the map to the reference file that keeps each ruling whole, verbatim, with the
+   measurements that produced it. **Read it before deciding anything about scope, about what counts
+   as done, or about what the reference compilers are evidence FOR** — then open the file its line
+   names: scope and priority `references/registry-and-priority.md`, `references/no-follow-ups.md`
+   and `references/triggers-and-hard-stops.md` (the decision gate itself is in `SKILL.md`); what
+   counts as done `references/lane-sets-and-folding.md`; the reference compilers
+   `references/reference-compilers.md`.
 6. **`.claude/skills/dss-code-prime/SKILL.md`** — conventions; it wins on any conflict about those.
 7. **`git log`** — DEMOTED. PR #56 was squashed and the P45–P52 messages are unrecoverable, which is
    the argument for putting substance in the ROWS rather than in commit messages.
@@ -76,6 +81,205 @@ below is IN it.
 # §0 — RESUME HERE (a session with no context reads this block first)
 
 ## §0.0 — STATE
+
+### ★ P68 ROUND 12 — READ THIS FIRST: an integer converts to `float` on x86_64, an enumeration has the type gcc and MSVC give it, the sqlite harness compiles one pinned revision, and every build, sync and test now goes through DssHarness
+
+**THE LANES THIS COMMIT CARRIES**, in eighteen folds (F1–F15, plus F4b, a three-file fix-forward to F4, and F14b and
+F16, the independent audit's blockers). F12–F15 are four merge blockers the round close itself found, below. Each fold came from a snapshot the lane cut at its fold point and was
+md5-verified, with a three-way merge wherever main had moved. Its rows went through `dssharness {write,set}-anchor` and were
+read back identical. From F4b on, main was re-verified after every fold through `dssharness test --legs windows-x86_64-debug`.
+Tests on MinGW Debug went from 2473 to 2514 across the round:
+
+| lane | subject | what landed |
+|---|---|---|
+| `xa` | assembler surface, relocations, linker (F4 fc3 + MSVC entry, F4b, F7 int → f32, F8 the MSVC probe dialect) | **`float f = n;` compiles on x86_64** (`D-CSUBSET-INT-TO-F32-CODEGEN`, P2 → P1, closed). The audit came first, because the row named one corner of a matrix nobody had measured whole. It MEASURED 34 conversion cells × three targets × debug/release, 204 runs, each value checked bit for bit against the exact result. 48 runs were REFUSED, exactly the 8 int → f32 cells everywhere, and none ran wrong. The fix adds CVTSI2SS/SCVTF at the f32 width and an exact unsigned-64 sequence. The row's old "SQLite uses `double` only" was false: rtree's `RtreeValue`, geopoly's `GeoCoord` and `date.c` declare `float`. Disclosed: wide-integer ↔ `long double` conversions are refused (P1), and the constant folder skips float conversions (P2). **`probe-reference-cc` speaks MSVC's command line** (`cl`/`clang-cl`: no-colon `/Fe` `/Fo` `/Fa`, a `/link` tail, `dumpbin`, a manual self-test step). It runs inside the leg's own Visual Studio environment, so it needed no environment of its own. Its first use re-measured the int → f32 row's MSVC arm: 68/68 exit 42. It found that `cl` 19.51 accepts the deprecated `-o` (warning D9035, then links), which is now refused. **The fc3 suite no longer aborts on a refused C document**, and **the MSVC environment entry refuses what it used to lose silently**. Root cause of F4's one red on main: `cmd.exe` behaves two ways past its documented 8,191-character line. From 8,150 to 8,191 the expanding line dies (exit 255). At 8,192 and above it EXPANDS TO NOTHING and exits 0. The real entry then dropped a never-entered parent's PATH with System32 in it (MEASURED from 8,607), so it now refuses an entered environment whose PATH lacks the saved pre-entry PATH |
+| `cs` | C semantics (F3 fold 7, F9 fold 8) | **An enumeration has the type the references give it.** Enumeration constants are `int`. An enumerated type is compatible with its underlying integer type: MSVC's `int` on pe64, and GCC's rule on ELF and Mach-O, `unsigned int` for a non-negative enumeration. This MEANING FORK was decided per format from GCC's manual §4.10 and MSVC's documentation, measured on clang and Apple clang, and pinned by `e - 1` (4294967295 vs -1) and `_Generic`. An assignment between two enumerated types, a fixed-type enumeration inside its own list, and a negative value for an unsigned fixed enumeration all work now. Six disclosed rows closed, four of them P1. A static `enum E g = 2;` was refused (HEAD's debt), and four shipped examples went red on it once enumerations were typed (born closed, P1). The fold also fixed a latent default that the typing change would have made SILENT. The constant builder typed a non-enumeration enumerator as 32-bit, so `enum E { A = 0x100000000, B = A + 1 }` would have given `B == 1` (gcc and clang: 0x100000001). **Fold 7**: a node's span no longer runs on over the trivia after its last token (the `trimmedNodeText` workaround is deleted, and 9 corpus spans move). The HIR and MIR text formats carry an enumeration's fixed underlying type: **`dsshir` 5 → 6, `dssir` 2 → 3**, so a test spelling the old version fails. The VLA type-name cases (`sizeof` through a pointer to a VLA, a qualified VLA typedef) are fixed. Fold 7 disclosed 14 rows, 7 of them P1. The worst is `static int *p = &local;`, which CRASHES the compiler (HEAD's debt; the static-initializer item below owns it) |
+| `lm` | limits, shipped headers and runtime (F2 S1, F5 S1b, F11 S2a-1) | **18 of `<stdlib.h>`'s 35 missing ISO names ship on every pair**: `EXIT_SUCCESS`, `EXIT_FAILURE`, `RAND_MAX`, `MB_CUR_MAX`, the `div` family, `atoll`, `llabs`, `strtoull`, `strtof`, `_Exit`, `quick_exit`, `at_quick_exit` and `mblen`. `aligned_alloc` ships on the four pairs whose C library exports one. The rest stay on the row, P1. **C23's `unreachable()`** ships in `<stddef.h>`, with `__builtin_unreachable`: one `ud2`/`brk #0` per use, exit 42 on pe64 and both ELF ISAs. `max_align_t` waits for S2, since its representation is a `long double` format fact. **One signature mechanism (S2a-1)**: per-pair signature `variants`, decoded by one core `when` evaluator for descriptors and builtins alike. There is no silent fallback: a served pair matches exactly one arm or an explicit default. `signatureByDataModel` is gone from both loaders. It changes NO identity: 575 rows × 5 real pairs plus 14 sweep pairs (8,050 comparisons) gave 0 differences, and swapping two arms gives 40. lm also found more debt, all now disclosed rows. **The ELF `atexit` macro registers a NULL DSO handle** (P2). A DSS `.so`'s handler runs after `dlclose` unmapped it: SIGSEGV at exit, where gcc's `.so` runs it AT `dlclose`. S1's `at_quick_exit` copied that macro on my instruction. **A DSS shared library runs no static initializers on any format** (P2). **`_Generic` treats `void f(char *)` and `void f(const char *)` as compatible** (P1, SILENT; gcc and clang: incompatible). **`<unistd.h>` declares none of its seven POSIX typedefs** (P1). **The shipped prototypes differ from the real headers** (P2): 155 untagged positions in 104 entries |
+| `mig` | the harness and the diagnostics surface (F1 row 3, F6 the queue, F10 manual steps) | **The sqlite harness compiles ONE pinned sqlite revision** (`D-HARNESS-SQLITE-SUBJECT-REVISION-NEVER-PINNED`, P1, born closed). The driver pinned nothing: every stage fetched and pulled origin's default branch, and its currency rule never compared the head. A recompile that the lane's acceptance had judged CURRENT compiled `b943fa1288` from a stale stage, while the clone had moved 21 commits. `legs.json` now pins d21bd37c7cfc: the stage checks out exactly that commit, a stage at another revision is refused, and every summary names `sqlite=<sha12>`. The benchmark, the third consumer, had measured the Mac's own clone instead, and now measures the pin. **The round-close recompile and speedtest1 are DssHarness MANUAL STEPS** of the sqlite action: runners `sqlite-recompile` and `speedtest1` with `requireBuild`, measuring the leg's own dsscp (`{product}`). The driver no longer searches `build/*/bin/dss` or rebuilds dsscp inside a step. A failed dss arm of the benchmark no longer exits 0. The run knobs are step inputs (`tier`, `dssConfig`, `testFile`), and four dead verbs are gone. **The x86_64 Mach-O exec carried no `LC_BUILD_VERSION`** (P1, born closed). dyld then gave it no `executable_path=` in `apple[]`. mig found this with the first corpus run of x86_64 Mach-O images anywhere: 61 + 4 never-run example arms, now run under Rosetta in both runners. It is fixed (minimum OS 10.14, the lowest the command can say), and the static exec arm emits the command too. **Three Release-only timeouts** were `runBinary` skipping its untimed warm-up under any launcher, a skip whose premise holds for qemu but not for `arch -x86_64`. A single-file sqlite run is no longer judged "zero files", and the two remote-leg readers' redaction and refusal gaps are closed. **Row 3 (F1)**: the convention is enforced. check-doc-census's second clause refuses a quantified corpus claim in config prose unless it is pinned to its measurement. The 29 claims it refused were rewritten, and four of them had been FALSE from the start. MSVC 19.51 and clang 18.1.3 both RUN three SEH/label-address forms, so those rows went from gated to OPEN |
+
+**THE ROUND CLOSE FOUND FOUR MERGE BLOCKERS, and all four are fixed rather than re-run.**
+- **F12, the recompile could not run on a tree that never staged sqlite** (lane `mig`,
+  `D-HARNESS-SQLITE-RUN-LOCK-ASSUMED-ITS-DIRECTORY-EXISTED`, P1, born closed). It was the first round-close recompile through
+  DssHarness (`dssharness run sqlite-recompile`), and it failed on main at its lock: `could not create the run lock …
+  [WinError 3]`. Main had never staged sqlite, because round 11's script had pointed the output tree at a lane's checkout. The
+  recompile mode took its lock inside a directory nothing created. The normal mode survived only because its caller made the
+  directory by hand, and the self-test's own lock fixture made the parent first, so no arm ever saw the negative. The lock now
+  creates its own parent (the clone lock's precedent). The caller-side `makedirs` is gone, and a new arm builds a lock under an
+  absent two-level parent. The proof ran end to end on a tree with `build\real-examples` moved aside whole: it staged fresh at
+  the pin and printed `blockers=0`.
+- **F13, a schema built on a worker thread overflowed macOS's thread stack** (lane `xa`,
+  `D-SUBSTRATE-WORKER-THREADS-TAKE-THE-HOST-DEFAULT-STACK`, P1, born closed). The Mac Debug leg went red once in 2482:
+  `lsp/test_schema_cache_shuffled`, "Bus error". Seven isolated re-runs passed, and it was root-caused rather than re-run away.
+  P34 (2026-08-25) had measured `buildSchemaFromJsonText`'s frame at 415,360 bytes under clang -O0, and macOS gives a
+  secondary thread 512 KiB. The memo lookup precedes the build, so only a COLD build pays that frame. The concurrency test's 16
+  plain threads built cold only when the shuffle ordered them before every warm-up. With the memo cleared first, it died on
+  every run (MEASURED). Production had the same class: `ThreadPool` workers, which run the LSP parse jobs and the driver's
+  per-CU loop, took the host default. Workers and racers now run on `StackSizedThread` with one stated constant (8 MiB, the
+  main-thread class), and the LSP harness's constant points at it. The concurrency test now requires a memo miss. A new pin
+  builds `c`'s schema cold on a pool worker. Red-on-disable ran on the Mac Debug leg for both. Whether HEAD already crashed
+  is NOT MEASURED: the confirming runs carried this round's larger schema builder.
+- **F14, a remote read kept this machine's Windows account name** (lane `mig`'s measurement, finished by the orchestrator;
+  `D-HARNESS-READ-LEG-PATH-HOME-REDACTED-ONLY-AS-THIS-HOSTS-OWN-PATH`, P1, born closed). Gate A's only VPS red,
+  `harness/read_leg_path_selftest`, was NOT a leak: the self-test synthesized the user and host but took the home from the
+  process, and the VPS account IS the synthesized distro word, so the home rule redacted the arm's input to `~/` while the arm
+  demanded a `<user>` mark. Measuring it found a REAL leak: read on the WSL leg, a tracked file naming this machine's Windows
+  home came back with the account name kept three times out of three, because the redactor knew a home only as its own
+  process's path. The home is now a parameter, and a home directory is redacted by its SHAPE whatever account it names
+  (`/home/<n>`, `/Users/<n>` where a path starts, `/mnt/<d>/Users/<n>`, `<drive>:\Users\<n>` in any case and either slash).
+  The self-test grew to 49 arms: collisions, 12 shapes for unknown accounts, not-a-home controls, a stranger's home read
+  through `read()`, and this host's own names. It is green on all four hosts, red-on-disable on Windows (13 arms red with
+  the shapes off; exactly the collision arm red with the home ignored), and the WSL read now keeps the name 0 times.
+- **F15, the plan-citations guard's collapse detector had been disarmed by the skills rewrite** (the orchestrator,
+  `D-HARNESS-PLAN-CITATIONS-DOC-FLOOR-DISARMED-BY-A-GROWING-ROOT`, P2, born closed). The first repo-guard run with the
+  rewritten skills went 31 of 32: `plan_citations_guard`'s own self-test arm `5 SCAN-COLLAPSED`. One floor for the whole
+  document family (45) catches a root vanishing only while it sits above EVERY root alone, and `.claude` grew from 33 to 45
+  documents, so a scan that lost `.plans` passed as clean. Each documentation root now has its own floor (`DOC_ROOT_FLOORS`),
+  so a sibling's growth can never cover a root's loss. New arm `5b` grows `.claude` by 200 documents with `.plans` gone and
+  requires the collapse; a raised family floor, the would-be fix, fails that arm alone.
+
+**THE INDEPENDENT AUDIT (dss-cycle step 10) ruled GREEN-BUT-RULE-BREAKING: 3 blockers, 9 MAJOR, 45 MINOR** — an
+auditor that wrote none of this, with three read-only sub-reviewers (harness, tests, registry), while the gate ran. It
+read all 51 changed `src/` C++ files in full and found no agnosticism break, silent fallback, input-proportional
+recursion or unfiled-workaround comment. All three blockers were fixed before this commit, none in C++:
+- **B-1, a false history claim:** `D-FFI-ELF-ATEXIT-REGISTERS-NO-DSO-HANDLE` was filed `🔵 DISCLOSED` (the base ref holds
+  it), but R12-F2 CREATED its `at_quick_exit` half. Re-statused `🟠 OPEN`, counted as created.
+- **B-2, F14's mirror image (R12-F14b):** the first fix's four prefix shapes missed the WSL home as Windows names it
+  (`\\wsl.localhost\<distro>\home\<n>`) and Wine's `Z:\home\<n>`, and `path_identity.hpp` holds the WSL account in
+  four such lines: ✔MEASURED 4 of 4 kept on the Windows leg. The rule is now keyed on the COMPONENT — the path component
+  after any `home` or `Users` component — so there is no next prefix to miss; 0 of 4 kept on all four hosts. The same
+  fold settles MAJOR M-2 (a `getpass` failure no longer leaves the account silently unredacted: the home names it, else
+  the read is refused) and M-3 (each plan-citations floor's VALUE is now pinned by a partial-collapse arm per root).
+- **B-3, an over-claimed close:** `D-HARNESS-SQLITE-STEP5-BUILT-DSSCP-OUTSIDE-THE-HARNESS` said the sqlite driver no longer built the compiler it measures, yet with no compiler named its `obtain` still configured `build/rel`, ran `cmake --build`, or nested a `dssharness build`, and the driver's own contract arms pinned that path as correct. **R12-F16** makes a named compiler MANDATORY: a run naming none is refused before Step 0, a named one is used exactly as given (never rebuilt, never replaced by a newer one found elsewhere), the refresh path and its pins are deleted, and a new `sqlite-self-test` runner runs the driver's self-test on any leg with no build. Six mutants went red on exactly their arms.
+The other MAJORs each got a row, for round 13 or the next PR: the WSL account and LAN hosts still in tracked files
+(`D-REPO-TRACKED-FILES-NAME-THE-WSL-ACCOUNT-AND-LAN-HOSTS`, 🔵 DISCLOSED, HEAD's debt), check-doc-census's claim-rot walk
+flooring at one document, prototype-census passing with no verdicts, speedtest1 moving an unlocked out-of-tree checkout
+onto the pin (it gates the PR exit's speedtest1 runs), a VLA pin that accepts any slot load, and `aligned_alloc`'s missing
+runtime witness (added to lm's open row). The 43 remaining MINORs are one row, `D-AUDIT-P68-ROUND-12-MINOR-FINDINGS`.
+
+**Also (orchestrator).**
+- **This machine's Windows account name is gone from the tree** — ten occurrences in FIVE tracked files, where the lane's
+  measurement had named three: `src/core/substrate/path_identity.hpp` and `.plans/_handoff.md` (a measured path, now
+  `C:\Users\<user>\...`), two `tests/test_support/` comments that quoted the name with its length (now "five characters
+  long"), and one done row (`D-LATTICE-PRIMITIVE-BUILDER-ACCEPTS-A-NON-PRIMITIVE-KIND`, through `set-anchor`). A scan of all
+  3,797 tracked files and the 12 new skill files finds 0. The name stays in history already pushed: rewriting it needs a
+  force-push, which is forbidden.
+- **The dss-cycle and dss-code-prime skills are rewritten** (operator, 2026-09-25: "without loosing anything the skills
+  sets"): the dss-cycle root from 1,413 lines to 299 and dss-code-prime's from 238 to 137, with 12 new reference files. The
+  no-loss check passed (1,422 units: 1,354 verbatim, 67 declared superseded and verified, 1 justified, 0 unresolved), and
+  an independent review's 16 findings were ruled and fixed. The guards that read `.claude` ran on the final tree (F15).
+- **The inlined CI pipeline took DSS.DevOps's ASan symbolizer fix** (operator FYI 2026-09-25: DSS.DevOps a0d4abf,
+  `cpp-app-pr` installs `llvm-${VER}` on clang legs). `.github/workflows/pipeline-pr.yml` vendors that reusable and had
+  the same package list: ✔MEASURED on Ubuntu 24.04 (the `ubuntu-latest` image's release), the unversioned `llvm` is 18,
+  `/usr/bin/llvm-symbolizer-19` belongs only to `llvm-19`, and none of `clang-19`, `clang-tools-19` or
+  `libclang-rt-19-dev` depends on it — so the clang-19 ASan leg had no symbolizer at the path its runtime probes
+  (`D-CI-ASAN-LEG-SYMBOLIZER-PACKAGE-MISMATCH`, born closed; the leg runs only when the operator adds `Run Pipes`). The
+  reusable's two timeout raises do not apply here: this pipeline computes its own Test budget.
+- **The deletion inventory stopped claiming a marker that does not exist** (audit A-03): its two `W-sync` rows pointed at
+  skill blocks said to carry a `⏳ SCRIPT-ERA` marker and two script names; neither block has either (re-verified), so
+  the rows now record that the principle survived and no deletion-wave edit remains there.
+- **The round was handed to a new session** at the operator's stop order (10:42), through a written handoff; the old
+  session's gate runs T2-A/T2-B were stopped before a verdict, and the lanes wrote their own state files.
+- **BUILD, SYNC, TEST AND WORKTREES WENT THROUGH DSSHARNESS ALONE, FROM F4b ON** (operator rulings 2026-09-24, now in
+  the dss-cycle skill's DssHarness reference). The overflow behind F4's red came only from OUR scripts building MSVC trees outside
+  the tool. The `windows-x86_64-release` leg already enters the Visual Studio environment once. My three MSVC scripts
+  are retired, and my feature request to repo-harness for a "declared toolchain environment" was withdrawn as
+  unneeded. So was a kept-outputs request, since `help runners` already documents the path. Main's verify had been
+  running as a script. It was stopped mid-ctest and restarted as `dssharness test`. The post-fold write
+  verbs became manual steps `write` of check-doc-census, check-plan-citations and check-scripts-index. The recompile
+  became mig's manual step, a round-12 blocker, because my `round_close_recompile.sh` compiled sqlite with dsscp by
+  script. The fold and row scripts remain the only fold tooling until mig's `anchor-rows` (round 13) and `lane-fold`
+  (next PR) actions replace them. That is stated as the interim, with its plan.
+- **A lane's scripted red-on-disable was VOID**: it did not rebuild after a code mutant's restore, so six of its nine reads
+  came from mutant 1's binaries. Red-on-disable is now one mutant per call: Edit, one `dssharness test --filter` run
+  (which builds first), Edit back, and the md5 read both ways. Mutants run by script earlier in the round were re-run.
+- **My instruction put a defect into `at_quick_exit`.** I told lm to pass `__dso_handle`, assuming the existing
+  `atexit` macro did. It passes NULL, and S1 copied it. lm corrected the premise and measured the consequence, and
+  the row is disclosed. **My guard spec for S2a was unsound.** It would have refused correct `int` positions, and it
+  needed a second type-text parser. lm's reader rule on the one decoder replaced it.
+- **The VPS disk filled** when one lane's own worktree copy first-built Debug and Release together (report #12). The
+  operator cleared it. No lane copy builds on the VPS until each arm64 variant has a recorded size.
+- **A process listing printed a local key-file PATH** (no contents, no address). Every process listing now excludes
+  `ssh.exe`.
+- **Two Mac sleeps I nearly reported were our own configuration.** A worktree reads its OWN `config.json`, and the lanes'
+  copies predated the Mac wake settings added on main.
+- **A Visual Studio update (19.51.36257 → 36260)** made every MSVC tree rebuild from clean once. DssHarness stated why:
+  CMake's cached compiler identification is not re-checked.
+- **The API session limit** stopped all four lanes twice (21:0x and ~00:45). All four resumed from their own state.
+- **A ledger note RAN a command.** I appended a note through an unquoted shell heredoc. The note quoted `dssharness run
+  lane-fold` in backticks, and the shell executed it on two legs: 20 s and 40 s runs of that action's self-test, which
+  passed and changed nothing. Its output replaced the note's words. The same slip printed one home-directory path into my
+  own tool output. Ledger appends now use a quoted heredoc, and every read of the ledger goes through the redactor.
+
+**DssHarness.** **0.5.11** (installed 2026-09-24 19:18) ships manual steps and fixes report #10. A copy made by sync had a
+git index that named nothing, so every remote guard that watched inputs watched NOTHING, and every Mac build after
+the first started from clean. ✔MEASURED after: one clean rebuild, then 14 s with no rebuild line. **0.5.12**
+(installed 2026-09-25 04:47) answers #11 and #12:
+- `hosts.ssh` `wakeWaitSeconds` / `holdAwakeSeconds`, now set for the Mac (30 / 600);
+- `clean --legs`, a room check before a build, and free space in `legs -v`;
+- the `cleandead` note on an unowned long path;
+- `run --json` `keptOutputs`.
+
+Sent this round:
+- **#12**, the VPS full;
+- **#13**: a successPattern ending in `$` never matches a CRLF line on a Windows leg, while the kept log looks
+  normalized. Fixed upstream after the 0.5.12 tag, so our patterns carry no trailing `$` until the next release;
+- **#14**: a NUL byte in the WSL sync progress line;
+- the results of their manual-step and kept-output checks on the Mac. `ranSteps`, `manualSteps` and `unselectedSteps`
+  are right, and `sync --pull` fetches every kept output inside the hold-awake window.
+
+**0.5.14** (installed by the operator before this session's gate) ran the whole final gate; nothing in it needed a report. A stale lock record from the stopped T2 runs (its holder long dead) did not block the new runs. Each WSL leg rebuilt FROM CLEAN, and DssHarness said why: "a clock step: the previous build's 'configure' phase spanned one" (WSL2's broken CLOCK_REALTIME) — stated, not silent. On the Mac, the release leg warned that the debug leg's dsscp processes ran beside it and shared the per-user runtime object cache; both legs passed.
+
+**Registry.** ✔MEASURED at this commit: `check-anchor-balance` → **598 open at HEAD → 615**, "OK - the balance holds: 615 open now against 598 at 76f0b1cc" — 6 open-at-HEAD rows closed, 6 created (5 of them the audit's MAJOR and MINOR rows), and 17 `🔵 DISCLOSED` rows of HEAD's debt found this round, which are not counted: counted, 598 → 598;
+banding **P0 0 · P1 65 · P2 205 · P3 330 · P4 11 · P5 4**; `read-anchors --lint` 0 findings. ✔MEASURED against HEAD (`registry_delta`): **52 new rows (29 born closed: 12 P1, 16 P2, 1 P3; 23 open: 7 P1, 15 P2, 1 P3), 6 open at HEAD now closed and moved to the done registry, 0 reopened, 0 dropped**.
+
+**THE GATE THIS COMMIT CARRIES** — ✔MEASURED with `dssharness test` (0.5.14) on the folded tree:
+
+| leg | Debug | Release |
+|---|---|---|
+| Windows x86_64 | MinGW gcc 13.2.0 (C, CXX) · **2514 / 2514** | MSVC 19.51.36260 (C, CXX) · **2514 / 2514** |
+| WSL x86_64, GNU 13.3.0 | **2482 / 2482** | **2482 / 2482** |
+| arm64 VPS, GNU 13.3.0 | **2482 / 2482** | **2482 / 2482** |
+| macOS arm64, AppleClang 21.0.0 | **2482 / 2482** | **2482 / 2482** |
+
+- **The round-close sqlite recompile, now a DssHarness manual step** (`dssharness run sqlite-recompile --legs
+  windows-x86_64-debug`, this tree's dsscp against the mingw reference): `recompile: pe64-x86_64 sqlite=d21bd37c7cfc tus=189 reference_ok=189 dss_ok=189 blockers=0` — run on the gated tree (run 20260925-222945-d5919b27, the first on main: it staged sqlite fresh at the pin) and again on the final tree after F16 changed the driver module the recompile imports (run 20260926-121529-45514df5).
+- **After the gate, the Python-only folds (F14b, F16), the rows and the docs landed, and what they touch was re-run:**
+  `harness/read_leg_path_selftest` and `harness/sqlite_driver_selftest` with `--no-build` on six legs — Windows debug
+  and release, WSL debug and release, VPS debug and release — 2 of 2 each (run 20260926-121309-774150d1); the repo-guard
+  label 32 of 32 (run 20260926-121217-1c64c772). The Mac legs could not run: the machine was asleep or off (its `.local`
+  name resolved to no address), which is STATED here, not skipped. F14b's final self-test had already run 69 of 69 on
+  macos-arm64-release (host run 20260925-224832-211fefcd); F16's has not run on the Mac.
+- Invocations: Windows pair run 20260925-215619-360feac8; Mac + VPS pairs run 20260925-215624-bde96b54 (host runs 20260925-215623-734e87df Mac debug, -215625-c677858b Mac release, -215626-0f10f72b VPS debug, -215627-01c84176 VPS release); WSL debug run 20260925-221352-5b91559f (host -221344-7f13e65d), WSL release run 20260925-224401-81013130 (host -224349-a45fda42). At most two heavy local jobs at once, each admitted below 76% committed memory (it peaked near 46%). The gated tree carried every fold through F15 and the account-name scrub; F14b, F16, the rows and the docs landed after it, and what they touch was re-run on every reachable leg (above). Windows ran 2514 and every other leg 2482: the 32-entry repo-guard label runs on the Windows legs only.
+
+**NEXT — P68 ROUND 13, THIS PR'S LAST ROUND.** No new items start. It carries:
+- mig's **`anchor-rows` action** (stage, check, apply, with a rehearsal in a throwaway repository). It replaces the five row
+  scripts, and the door refuses a wrapped id;
+- lane `xa`'s **MSVC sized suffixes** `i8`…`ui64` (P1: MSVC's own `limits.h` writes `LLONG_MAX` with `i64`), plus the
+  `#if` reading of a `wb` literal as unsigned (a SILENT wrong branch, born closed);
+- lane `lm`'s S2a-2a (`shippedTypedef` references, no identity change);
+- lane `cs`'s static-initializer item (one HIR evaluator, which fixes the compiler crash above) only if it is green at the
+  cut;
+- two of the audit's MAJOR rows, because the PR exit needs them: speedtest1 must stop moving an out-of-tree checkout
+  onto the pin before the exit runs it (`D-HARNESS-SPEEDTEST1-MOVES-AN-UNLOCKED-OUT-OF-TREE-CHECKOUT-ONTO-THE-PIN`,
+  lane `mig`, with the benchmark's compiler made named too), and this machine's WSL account and LAN hosts leave the
+  tracked files (`D-REPO-TRACKED-FILES-NAME-THE-WSL-ACCOUNT-AND-LAN-HOSTS`, scanned by home and host SHAPE).
+⚠ **The Mac was OFF the network at this commit** (asleep or off; its `.local` name resolved to no address): round 13's
+gate and the PR exit's Mac legs need it awake — until it answers `dssharness legs`, those legs are STATED as pending, never
+skipped silently. Lane `cs`'s red-on-disable moved from the Mac to the arm64 VPS for that reason (13 of 44 mutants ran on
+the Mac, the rest on `linux-arm64-debug`).
+
+Then the PR exit: units on every leg, `dssharness run sqlite --input tier=veryquick --input dssConfig=release` and
+`dssharness run speedtest1` on four legs, the README, and the PR goes to the operator for merge. The next PR takes:
+- mig's `lane-fold` action, whole, plus the memory gate, the probe dispatcher and the one redactor;
+- lm's S2a-2b/S2a-3 identities and S2b;
+- cs's block-scope `const` read (P1), undeclared `__builtin_expect`/`__builtin_strlen` (P1) and the pointee-`const`
+  `_Generic` row (P1);
+- xa's unwind row (P1) and the shared-library static-initializer hook (P2);
+- the audit's remaining rows: check-doc-census's claim-rot walk floor (`mig`), prototype-census failing closed and its
+  first real run (`lm`), `aligned_alloc`'s runtime witness (`lm`, in its open row), the VLA stride pin (`cs`), and
+  `D-AUDIT-P68-ROUND-12-MINOR-FINDINGS`, worked by owner and struck from its list as each lands.
+
+---
 
 ### ★ P68 ROUND 11 — READ THIS FIRST: `getopt`, `environ` and `main`'s third parameter ship on every format, GOT relocations link through the driver on ELF and Mach-O, and the round-close recompile caught a printf family that a second unit duplicated
 
@@ -812,8 +1016,9 @@ a defect in the file it names.
 
 ★ **The cross-leg identity, re-derived and not re-quoted:** `2207 − 40 repo-guards = 2167`, exact on
 both ssh legs. ⚠ **WSL is 2206 because it RUNS the guards** — only the two ssh legs skip them, and the
-skill's claim that guards ran on *"exactly one local host"* was false in both halves (see the
-SCRIPT-ERA blocks in `dss-cycle/SKILL.md`).
+skill's claim that guards ran on *"exactly one local host"* was false in both halves (see
+`dss-cycle/references/round-gate-and-ci.md`, *THE LEG SET IS DECLARED*, and the red-CI-leg hard stop
+in `dss-cycle/references/triggers-and-hard-stops.md`).
 ⚠ The four suite runs above predate three markdown edits made after them, so **the 40-guard subset was
 re-measured at the exact tree this commit carries**: `40 / 40`, 265 s, witness present, inputs held
 still. Compiled code was untouched in between.
@@ -5507,7 +5712,7 @@ added.
 
 ⚠⚠ **THE ORCHESTRATOR'S CYCLE INSTRUMENTS LIVE IN A SESSION-SCOPED SCRATCHPAD AND DO NOT
 SURVIVE A NEW SESSION.** They are at
-`C:\Users\rafae\AppData\Local\Temp\claude\C--Source-DailySoftware-dss-code-prime\0da5ab3a-fae5-4d34-b834-a49c20f74be6\scratchpad\p44\`
+`C:\Users\<user>\AppData\Local\Temp\claude\C--Source-DailySoftware-dss-code-prime\0da5ab3a-fae5-4d34-b834-a49c20f74be6\scratchpad\p44\`
 and that directory still exists on disk — **read them from there rather than rewriting them.**
 The ones that earned their keep: `porcelain.py` (`git status -z`, because git C-QUOTES a path with
 spaces and this repo holds one), `seed_lane.py` + `fold_seeded.py` (a lane's contribution is
@@ -10184,10 +10389,10 @@ full matrix is in that row's numbers: ~18 min per leg on the Windows host agains
 the compiler `build/dbg` actually uses:
 
 ```
-input            : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1
+input            : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1
 exists           : yes
-weakly_canonical : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
-canonical        : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
+weakly_canonical : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1   ec: <none>
+canonical        : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1   ec: <none>
 ```
 
 libstdc++ resolves `.`/`..` and symlinks and has **no concept of an 8.3 alias**, so two spellings of

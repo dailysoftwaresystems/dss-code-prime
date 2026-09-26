@@ -113,8 +113,17 @@
       "name": "dss-code-prime",
       "type": "cmake",
       "path": ".",
+      // ★ ONE buildOutput, SO `{product}` RESOLVES (2026-09-25, P68 round 12). DssHarness fills a
+      // step's `{product}` only where the project declares exactly one build output for the platform
+      // ("the one file this build is declared to make"), and every sqlite step names the leg's own
+      // dsscp as `{product}`. `compile_commands.json` left the list: 7df54cc1 added it with no stated
+      // reason beyond being a measured artifact (its negative control proved the platform MAPPING of
+      // the dsscp entry), and nothing in this repository reads the build tree's copy -- cmake-import
+      // writes and reads its OWN in a throwaway build of the project it imports. CMakeLists.txt still
+      // sets CMAKE_EXPORT_COMPILE_COMMANDS for IDEs. ✔MEASURED 2026-09-25 that editing this file
+      // discards no build directory: the harness's build record fingerprints no .json of a cmake
+      // project (build/<variant>/.harness-build, 2186 inputs, config.json not among them).
       "buildOutputs": [
-        "compile_commands.json",
         { "windows": "bin/dss/dsscp.exe", "all": "bin/dss/dsscp" }
       ],
       "defaultToolchain": {
@@ -182,6 +191,12 @@
       }
     },
     "ssh": {
+      // ★ THE MAC SLEEPS BETWEEN COMMANDS (DssHarness report #11, P68 r12): a command that met it in a dark wake
+      // resolved no address and skipped its legs, so a gate "passed" having run nothing on them. DssHarness 0.5.12:
+      // `wakeWaitSeconds` keeps looking the host up for that long before skipping; `holdAwakeSeconds` runs
+      // `keepAwake` on the Mac for that long AFTER each command, so the next one finds it awake (a running leg
+      // already holds it with its own caffeinate). 30 follows the report addendum's dark-wake timings; 600 covers
+      // the gaps between one lane's commands without holding the machine awake all night.
       "macos": {
         "repositoryPath": "~/src/dss-code-prime",
         "keepAwake": [
@@ -191,7 +206,9 @@
           "{pid}"
         ],
         "connectTimeoutSeconds": 25,
-        "keepAliveSeconds": 30
+        "keepAliveSeconds": 30,
+        "wakeWaitSeconds": 30,
+        "holdAwakeSeconds": 600
       },
       "arm64-vps": {
         "repositoryPath": "~/src/Github/dss-code-prime",
@@ -688,6 +705,24 @@
       "action": "probe-reference-cc/probe-reference-cc.yml",
       "stallSeconds": 420
     },
+    // THE PROTOTYPE CENSUS (P68 round 12, lane lm): every shipped prototype judged against the TYPE the leg's own
+    // platform header gives it, twice: by DSS's own `_Generic`, in a program the leg's dsscp builds and runs there,
+    // and by the leg's reference compiler over the descriptor's rendered text. `requireBuild` because it runs the
+    // leg's dsscp ({product}). No Windows leg yet: verdict (a) reads clang's `(aka ...)` refusal, and cl has no such
+    // form.
+    "prototype-census": {
+      "legs": [
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "action": "prototype-census/prototype-census.yml",
+      "requireBuild": true,
+      "stallSeconds": 1800
+    },
     // ★★★ THE MANUAL END-TO-END CORPUS. Declared here because a runner is reachable ONLY through
     // this map — `DssHarness run <runner>` takes the runner "as predefinedRunners names it", so an
     // action directory without an entry here is a program nothing can start. ✔MEASURED 2026-09-17:
@@ -1034,10 +1069,82 @@
       ],
       "action": "refresh_landing_log/refresh_landing_log.yml"
     },
+    // ★ THE speedtest1 BENCHMARK, A RUNNER (2026-09-25, P68 round 12; the operator: the benchmark
+    // "now becomes a manual step inside sqlite.yml"). The four RELEASE legs, because the benchmark
+    // measures a Release dsscp against the reference compilers of the host it runs on -- the leg's
+    // own dsscp, {product}. Its size / run repeats / worker counts are the step's own
+    // inputs (`--input size=...`); its report is kept (outputs + persist).
+    "speedtest1": {
+      "description": "Benchmark this leg's own dsscp against the host's reference C compilers building and running SQLite's own speedtest1 from full source, and keep the report.",
+      "legs": [
+        "windows-x86_64-release",
+        "linux-x86_64-release",
+        "macos-arm64-release",
+        "linux-arm64-release"
+      ],
+      "steps": [
+        "benchmark-speedtest1"
+      ],
+      "requireBuild": true,
+      "action": "real-examples/c/sqlite/sqlite.yml"
+    },
+    // ★ REPLACES the existing `sqlite` runner (2026-09-25, P68 round 12): the PR exit's FOUR-LEG corpus
+    // is one invocation, `dssharness run sqlite --input tier=veryquick --input dssConfig=release`. The
+    // four hosts' RELEASE legs, because the corpus measures a Release dsscp and its step names the leg's
+    // own, {product}; `requireBuild`, because naming it means the leg built it first. Until now
+    // the runner declared linux-x86_64-debug alone and the driver SEARCHED build/*/bin/dss and refreshed
+    // what it found from inside the step -- on a Windows release leg through `dssharness build` of the
+    // very leg the run holds.
     "sqlite": {
       "description": "Prove dsscp builds SQLite from its real sources into the Tcl testfixture and the sqlite3 CLI, and runs SQLite's own unit corpus green, for every declared target.",
       "legs": [
-        "linux-x86_64-debug"
+        "windows-x86_64-release",
+        "linux-x86_64-release",
+        "macos-arm64-release",
+        "linux-arm64-release"
+      ],
+      "requireBuild": true,
+      "action": "real-examples/c/sqlite/sqlite.yml"
+    },
+    // ★ THE ROUND-CLOSE RECOMPILE, A RUNNER (2026-09-25, P68 round 12). The sqlite action's manual
+    // `recompile` step: one leg's testfixture manifest compiled by THIS leg's dsscp and by that leg's
+    // same-platform reference, a TU the reference compiles and dsscp refuses a merge blocker. The
+    // Windows MinGW leg, because the round close compiles pe64-x86_64 there, against the mingw
+    // reference. It replaced an orchestrator wrapper script that pointed at another tree's dsscp
+    // and another lane's output tree -- exactly what a runner cannot do: the step names the leg's
+    // own dsscp, {product}, and refreshes the stage in the leg's own tree.
+    // `requireBuild`: the step compiles with the dsscp this leg built.
+    "sqlite-recompile": {
+      "description": "The round-close recompile: one leg's sqlite testfixture manifest compiled by this leg's own dsscp and by the leg's same-platform reference; a translation unit the reference compiles and dsscp refuses is a merge blocker.",
+      "legs": [
+        "windows-x86_64-debug"
+      ],
+      "steps": [
+        "recompile"
+      ],
+      "requireBuild": true,
+      "action": "real-examples/c/sqlite/sqlite.yml"
+    },
+    // ★ THE SQLITE ACTION'S OWN CHECKS, WITH NO BUILD (2026-09-26, P68 round 12). The action's manual
+    // `self-test` step: the benchmark's self-test, then the driver's Step 0 alone -- programs checking their
+    // own logic, which no dsscp takes part in. The `sqlite` runner cannot run it bare: its `requireBuild`
+    // builds the leg first, because its other steps run the leg's dsscp. So this runner names that one step,
+    // declares no `requireBuild`, and runs on every leg, because what the driver's checks meet depends on
+    // the host (how its processes are enumerated, whether its POSIX half runs in-process or inside WSL).
+    "sqlite-self-test": {
+      "description": "Run the sqlite action's own checks on a leg's host with no build: the speedtest1 benchmark's self-test, then the corpus driver's Step 0 alone (both suites, every module's self-test, the leg plan's self-test and lint).",
+      "legs": [
+        "windows-x86_64-debug",
+        "windows-x86_64-release",
+        "linux-x86_64-debug",
+        "linux-x86_64-release",
+        "macos-arm64-debug",
+        "macos-arm64-release",
+        "linux-arm64-debug",
+        "linux-arm64-release"
+      ],
+      "steps": [
+        "self-test"
       ],
       "action": "real-examples/c/sqlite/sqlite.yml"
     },

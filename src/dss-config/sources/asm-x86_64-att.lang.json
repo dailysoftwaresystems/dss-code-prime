@@ -404,7 +404,13 @@
       { "spelling": "cvttsd2si", "opcodes": ["fp_to_si"], "width": 64 },
       { "spelling": "cvttss2si", "opcodes": ["fp_to_si"], "width": 32, "destWidth": 64 },
       { "spelling": "cvtsi2sdq", "opcodes": ["si_to_fp"], "width": 64 },
-      { "spelling": "cvtsi2sdl", "opcodes": ["si_to_fp"], "width": 32, "destWidth": 64 }
+      { "spelling": "cvtsi2sdl", "opcodes": ["si_to_fp"], "width": 32, "destWidth": 64 },
+      { "$comment": "P68 round 12 (D-CSUBSET-INT-TO-F32-CODEGEN): the F32-destination pair, now that the target declares `si_to_fp32` (CVTSI2SS). gcc 13.3.0 and clang 18.1.3 accept both spellings in inline asm and run them (✔MEASURED 2026-09-24), where DSS refused them as an unknown mnemonic. The 64-bit source's destination (a single) is narrower than its operation width, so it is declared; the 32-bit source's is not.",
+        "spelling": "cvtsi2ssq", "opcodes": ["si_to_fp32"], "width": 64, "destWidth": 32 },
+      { "spelling": "cvtsi2ssl", "opcodes": ["si_to_fp32"], "width": 32 },
+      { "$comment": "P68 round 12: the UNSUFFIXED spellings, whose operation width is the SOURCE register's (`%eax` 32, `%rax` 64) and whose destination is the mnemonic's own (sd / ss) — `destWidthFromOperands`, the derivation the arm64 conversion rows use. gcc 13.3.0 and clang 18.1.3 accept `cvtsi2ss %eax, %xmm0`, `cvtsi2ss %rax, %xmm0` and `cvtsi2sd %eax, %xmm0` in inline asm and run them (✔MEASURED 2026-09-24); DSS refused all three as unknown mnemonics.",
+        "spelling": "cvtsi2ss", "opcodes": ["si_to_fp32"], "destWidthFromOperands": true },
+      { "spelling": "cvtsi2sd", "opcodes": ["si_to_fp"],   "destWidthFromOperands": true }
     ],
 
     "directives": [

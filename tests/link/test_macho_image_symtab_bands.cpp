@@ -24,12 +24,12 @@
 //   1. on both ports × all three image arms: the exact nlist SEQUENCE (names
 //      AND n_types), the six LC_DYSYMTAB fields exactly, every indirect-symbol
 //      entry still naming the import it named before, and the band predicate
-//      holding over the emitted table. ⚠ FIVE of those six cells reach the
-//      bands: the arm64 STATIC cell pins the
-//      D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION refusal instead, because that
-//      document declares `image.buildVersion`. Each port DECLARES which
-//      outcome it expects and the fixture is asserted against the
-//      declaration, so the coverage cannot empty itself silently;
+//      holding over the emitted table. ALL SIX cells reach the bands: the
+//      static exec arm EMITS LC_BUILD_VERSION since
+//      D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION closed, so neither port's
+//      `image.buildVersion` turns its static cell into a refusal any more,
+//      and a count after the matrix asserts that every port's static cell
+//      got there — the coverage cannot empty itself silently;
 //   2. every refusal arm of `machoDysymtabBandBreach` fires and names the
 //      offender (the writer's belt reads it, and a belt that cannot fire is
 //      worse than none);
@@ -191,28 +191,19 @@ struct MachoPortSpec {
     char const*               execFormat;
     char const*               dylibFormat;
     std::vector<std::uint8_t> retBytes;
-    // ⚠⚠ STATED PER PORT, NEVER DERIVED FROM THE FIXTURE, and that is the
-    // whole point of the field. This cell used to compute the static arm's
-    // expected outcome from `(*fmt)->machoImage().buildVersion.has_value()`
-    // — so whichever way the fixture went, the cell agreed with it. The
-    // arm64 exec document declares `buildVersion`, which the static walker
-    // refuses (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION), leaving the x86_64
-    // cell as the ONLY one of the six that reaches the bands on that arm; the
-    // day the x86_64 document gained a `buildVersion` too, BOTH static cells
-    // would have short-circuited into the refusal branch and this pin would
-    // have covered the static arm's bands NOWHERE, staying green throughout.
-    // Stating the expectation and asserting the fixture against it turns that
-    // silent emptying into a red that names the document that moved.
-    bool                      staticArmRefusesOnBuildVersion;
+    // (A per-port `staticArmRefusesOnBuildVersion` flag lived here while the
+    // static walker REFUSED a document declaring `image.buildVersion`. That
+    // refusal is gone — D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION closed on
+    // 2026-09-24, the day the x86_64 exec document gained the key — and the
+    // emptying it guarded against, the static arm's bands pinned by NO cell,
+    // is asserted by the count after the matrix below.)
 };
 
 std::vector<MachoPortSpec> const kPorts{
     {"arm64", "arm64", "macho64-arm64-darwin-exec", "macho64-arm64-darwin-dylib",
-     {0xC0, 0x03, 0x5F, 0xD6},                                  // RET
-     /*staticArmRefusesOnBuildVersion=*/true},
+     {0xC0, 0x03, 0x5F, 0xD6}},                                 // RET
     {"x86_64", "x86_64", "macho64-x86_64-darwin-exec",
-     "macho64-x86_64-darwin-dylib", {0xC3},                     // ret
-     /*staticArmRefusesOnBuildVersion=*/false},
+     "macho64-x86_64-darwin-dylib", {0xC3}},                    // ret
 };
 
 // A 16-byte nlist_64 record carrying only the n_type the predicate reads.
@@ -237,7 +228,8 @@ table(std::initializer_list<std::uint8_t> types) {
 // ── (1) THE MATRIX: both ports × all three image arms ───────────────────────
 
 TEST(MachoImageSymtabBands, StaticFunctionIsLocalAndSortsFirstOnEveryImageArm) {
-    auto runCell = [](MachoPortSpec const& port, ImageArm arm) -> void {
+    std::size_t staticCellsReachingBands = 0;
+    auto runCell = [&staticCellsReachingBands](MachoPortSpec const& port, ImageArm arm) -> void {
         char const* const armLabel =
             arm == ImageArm::StaticExec  ? " [static exec arm]"
           : arm == ImageArm::DynamicExec ? " [dynamic exec arm]"
@@ -298,38 +290,12 @@ TEST(MachoImageSymtabBands, StaticFunctionIsLocalAndSortsFirstOnEveryImageArm) {
         }
         if (!isDylibCell) mod.imageEntryOverride = std::size_t{0};
 
-        // The arm64 exec schema declares image.buildVersion, which the static
-        // walker refuses (D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION) — pinned by
-        // its sibling; there the cell asserts the boundary and stops. The
-        // expectation is DECLARED by the port (see the field's comment) and
-        // the fixture is asserted AGAINST it, so a document that gains or
-        // loses `buildVersion` reds here instead of quietly moving this cell
-        // from "pins the bands" to "pins the refusal".
-        bool const staticArmRefusedByBuildVersion =
-            arm == ImageArm::StaticExec && port.staticArmRefusesOnBuildVersion;
-        if (arm == ImageArm::StaticExec) {
-            ASSERT_EQ((*fmt)->machoImage().buildVersion.has_value(),
-                      port.staticArmRefusesOnBuildVersion)
-                << label
-                << ": the exec document's buildVersion no longer matches what "
-                   "this port DECLARES. Update the port row deliberately — if "
-                   "both ports come to refuse, the static arm's bands are "
-                   "pinned by no cell at all.";
-        }
-
         DiagnosticReporter rep;
         auto const bytes = dss::macho::encode(mod, **target, **fmt, rep,
                              dss::ImageRequest{.artifactFileName = kFixtureArtifactFileName});
         std::string diags;
         for (auto const& d : rep.all()) diags += d.actual + "\n";
 
-        if (staticArmRefusedByBuildVersion) {
-            EXPECT_TRUE(bytes.empty()) << label << "\n" << diags;
-            EXPECT_TRUE(sawDiagnosticContaining(
-                rep, "D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION"))
-                << label << "\n" << diags;
-            return;
-        }
         ASSERT_EQ(rep.errorCount(), 0u) << label << "\n" << diags;
         ASSERT_FALSE(bytes.empty()) << label << "\n" << diags;
 
@@ -386,6 +352,7 @@ TEST(MachoImageSymtabBands, StaticFunctionIsLocalAndSortsFirstOnEveryImageArm) {
         if (arm == ImageArm::StaticExec) {
             EXPECT_FALSE(dysym.found)
                 << label << ": the static walker emits no LC_DYSYMTAB";
+            ++staticCellsReachingBands;
             return;
         }
         ASSERT_TRUE(dysym.found) << label;
@@ -421,22 +388,17 @@ TEST(MachoImageSymtabBands, StaticFunctionIsLocalAndSortsFirstOnEveryImageArm) {
         EXPECT_EQ(nlist[5].name, "_write") << label;
     };
 
-    // The static arm's bands are reached by whichever ports do NOT refuse on
-    // `buildVersion`. If that set is ever empty the six cells still all pass
-    // — five pinning bands, one pinning a refusal — with the static arm's
-    // band layout pinned by nothing. Say so here rather than discovering it.
-    ASSERT_TRUE(std::any_of(kPorts.begin(), kPorts.end(),
-                            [](MachoPortSpec const& p) {
-                                return !p.staticArmRefusesOnBuildVersion;
-                            }))
-        << "every port now refuses the static exec arm on buildVersion, so no "
-           "cell below reaches that arm's LC_DYSYMTAB band layout";
-
     for (auto const& port : kPorts) {
         runCell(port, ImageArm::StaticExec);
         runCell(port, ImageArm::DynamicExec);
         runCell(port, ImageArm::Dylib);
     }
+    // THE VACUITY GUARD: every port's static cell must have reached the band
+    // checks. A cell that stops short (a refusal, an early return) leaves the
+    // static arm's layout pinned by fewer ports than the matrix names.
+    EXPECT_EQ(staticCellsReachingBands, kPorts.size())
+        << "a static exec cell stopped before the band checks, so the static "
+           "arm's nlist layout is pinned on fewer ports than the matrix names";
 }
 
 // ── (2) EVERY REFUSAL ARM OF THE PREDICATE FIRES, and names its offender ────

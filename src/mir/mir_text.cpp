@@ -153,7 +153,9 @@ namespace {
 
 // v2 (P68 round 8, lane `ht`, part 1d): composites are `type <H>` references into a `types`
 // table, each DEFINED ONCE with every layout channel; v1 spelled each one inline at every use.
-constexpr int kVersion = 2;
+// v3 (P68 round 12, lane `cs`): an enumeration's FIXED underlying type is spelled, `enum "E" fixed
+// i64` — `enum E : long` and `enum E` are different types (C23 6.2.7p1), and v2 wrote both `: i64`.
+constexpr int kVersion = 3;
 
 [[nodiscard]] std::string quote(std::string_view s) {
     std::string out;
@@ -829,6 +831,23 @@ private:
             // (D-TEXT-TIER-ENUM-UNDERLYING-SERIALIZED-AS-A-TYPEKIND-ORDINAL).
             case TypeKind::Enum: {
                 out_ += "enum "; out_ += quote(in.name(t));
+                // ★ A FIXED UNDERLYING TYPE (v3, P68 round 12, lane `cs`): `enum E :
+                // long` and `enum E` are different types (C23 6.2.7p1), so the fixed
+                // form says so — `enum "E" fixed <declared type>`, the HIR tier's
+                // spelling, printed by this tier's primitive arm (which, like every
+                // `.dssir` primitive, carries no vocabulary tag: `fixed i64`).
+                if (TypeId const declared = in.enumDeclaredUnderlying(t); declared.valid()) {
+                    out_ += " fixed ";
+                    pushType(declared);
+                    return;
+                }
+                // ★ …and a CHOSEN compatible type (the enumeration P1, same round):
+                // `enum "E" chosen u32` — a different record from `fixed` (C23 6.2.7p1).
+                if (TypeId const chosen = in.enumChosenUnderlying(t); chosen.valid()) {
+                    out_ += " chosen ";
+                    pushType(chosen);
+                    return;
+                }
                 auto sc = in.scalars(t);
                 if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
                     auto const k = static_cast<TypeKind>(sc[0]);
@@ -2499,6 +2518,40 @@ private:
             // The spelling now comes off `kMirTextPrimTable`, the SAME table the
             // rest of this type grammar reads, so an unrecognized name is refused
             // with the accepted set projected from those rows.
+            // ★ `fixed <primitive>` — a FIXED underlying type (v3, P68 round 12, lane
+            // `cs`; the printer's arm says why). The kind is the declared type's.
+            if (lex_.peek().kind == TokKind::Ident && lex_.peek().text == "fixed") {
+                lex_.take();
+                Tok n = lex_.take();
+                TypeKind k = TypeKind::I32;
+                if (n.kind != TokKind::Ident) {
+                    emitMalformed(std::format(
+                        "expected a fixed enum underlying type name after 'fixed', got '{}'",
+                        n.text));
+                } else {
+                    k = orUnknownName(kMirTextPrimTable, n.text,
+                                      "fixed enum underlying type", TypeKind::I32);
+                }
+                out = interner_.enumType(name.text, k, interner_.primitive(k));
+                return true;
+            }
+            // ★ `chosen <primitive>` — a CHOSEN compatible type (the enumeration P1).
+            if (lex_.peek().kind == TokKind::Ident && lex_.peek().text == "chosen") {
+                lex_.take();
+                Tok n = lex_.take();
+                TypeKind k = TypeKind::I32;
+                if (n.kind != TokKind::Ident) {
+                    emitMalformed(std::format(
+                        "expected a chosen enum compatible type name after 'chosen', got '{}'",
+                        n.text));
+                } else {
+                    k = orUnknownName(kMirTextPrimTable, n.text,
+                                      "chosen enum compatible type", TypeKind::I32);
+                }
+                out = interner_.enumType(name.text, k, interner_.primitive(k),
+                                         TypeInterner::EnumUnderlyingOrigin::Chosen);
+                return true;
+            }
             TypeKind underlying = TypeKind::I32;
             if (lex_.peek().kind == TokKind::Colon) {
                 lex_.take();

@@ -157,6 +157,13 @@ dss_add_test(NAME mir/test_synth_threads_mtx_type
 dss_add_test(NAME mir/test_synth_shim_collapse_linkage
              SOURCES test_synth_shim_collapse_linkage.cpp)
 
+# P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE, lane `lm`, fold S1b):
+# GNU `__builtin_unreachable()` ENDS its block with MIR's `Unreachable` terminator —
+# the C front end through MIR, and the pin a no-op lowering reds (the then-branch
+# would fall through to the join), whatever any example's exit code says.
+dss_add_test(NAME mir/test_builtin_unreachable_lowering
+             SOURCES test_builtin_unreachable_lowering.cpp)
+
 # P55 lane `rc` — "depth costs heap, not host call frames". Its OWN binary
 # because a red here is a STACK OVERFLOW, which kills the process and would take
 # every sibling test in a shared executable down unattributably with it.

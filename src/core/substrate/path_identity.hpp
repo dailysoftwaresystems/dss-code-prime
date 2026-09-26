@@ -29,10 +29,10 @@
 // libstdc++ (the toolchain this repo's Windows build actually uses) returns an
 // 8.3 SHORT NAME UNCHANGED and WITH NO ERROR:
 //
-//     input            : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1
+//     input            : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1
 //     exists           : yes
-//     weakly_canonical : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
-//     canonical        : C:\Users\rafae\AppData\Local\Temp\DSS-SC~1   ec: <none>
+//     weakly_canonical : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1   ec: <none>
+//     canonical        : C:\Users\<user>\AppData\Local\Temp\DSS-SC~1   ec: <none>
 //
 // libstdc++ resolves `.`/`..` and symlinks and has no concept of an 8.3 alias,
 // so two spellings of ONE directory survived as TWO keys. The MSVC STL happens

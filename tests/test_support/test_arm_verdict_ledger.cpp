@@ -16,11 +16,14 @@
 
 #include "arm_verdict_ledger.hpp"
 #include "host_native_target.hpp"
+#include "host_translations.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>   // std::size_t (do not rely on a transitive include)
 #include <string>
+#include <stdexcept>
+#include <tuple>
 #include <vector>
 
 using dss::test_support::ArmVerdict;
@@ -616,5 +619,131 @@ TEST(HostTargetBinding, FindsTheNativeArmAtAnyDeclarationPosition) {
     };
     for (std::size_t position = 0; position < 3; ++position) {
         checkPosition(position);
+    }
+}
+
+// ── THE CROSS-ARCH GATE (D-TEST-EXAMPLES-X8664-MACHO-ARMS-NEVER-RUN-ON-THE-DARWIN-LEG) ──
+//
+// `crossArchDecision` takes every host fact as a parameter, so each row below asks
+// it about a host this run need not be on: a table, a host, a guest arch, the
+// manifest's `emulator`, and stand-ins for PATH and the filesystem.
+namespace {
+
+using dss::test_support::crossArchDecision;
+using dss::test_support::HostTranslation;
+using dss::test_support::parseHostTranslations;
+using dss::test_support::shippedHostTranslations;
+
+[[nodiscard]] std::vector<HostTranslation> rosettaTable() {
+    return parseHostTranslations(
+        R"({"translations": [{"hostOs": "darwin", "hostArch": "arm64", "guestArch": "x86_64",
+             "command": ["arch", "-x86_64"],
+             "requires": [{"kind": "directory", "path": "/rosetta", "provides": "the translator runtime",
+                           "install": "get-the-translator"}]}]})",
+        "the test's table");
+}
+
+[[nodiscard]] auto onPath(std::vector<std::string> names) {
+    return [names](std::string const& n) -> std::string {
+        for (auto const& x : names) if (x == n) return "/bin/" + n;
+        return {};
+    };
+}
+
+[[nodiscard]] auto dirs(std::vector<std::string> present) {
+    return [present](std::string const& d) {
+        for (auto const& x : present) if (x == d) return true;
+        return false;
+    };
+}
+
+}  // namespace
+
+// The shipped table is READ, and it declares what the darwin leg needs: the
+// launcher the sqlite harness already uses for its macho64-x86_64 leg, and the
+// Rosetta runtime as its prerequisite. Red-on-disable: delete the row and this
+// reds — and on the Mac every x86_64 Mach-O arm is `SkippedNoEmulatorDeclared` again.
+TEST(CrossArchGate, TheShippedTableDeclaresAppleSiliconsOwnX8664Translation) {
+    auto const& table = shippedHostTranslations();
+    auto const* t = dss::test_support::hostTranslationFor(table, "darwin", "arm64", "x86_64");
+    ASSERT_NE(t, nullptr) << "no darwin/arm64 -> x86_64 row in tests/test_support/host_translations.json";
+    EXPECT_EQ(t->command, (std::vector<std::string>{"arch", "-x86_64"}));
+    ASSERT_EQ(t->requires_.size(), 1u);
+    EXPECT_EQ(t->requires_[0].path, "/Library/Apple/usr/libexec/oah");
+    EXPECT_NE(t->requires_[0].provides.find("Rosetta 2"), std::string::npos) << t->requires_[0].provides;
+}
+
+// THE FIX, host-independent: an x86_64 arm on darwin/arm64 RUNS under the host's
+// own translation, with no manifest `emulator` at all.
+TEST(CrossArchGate, AHostsOwnTranslationRunsTheArmWithNoManifestEmulator) {
+    auto const d = crossArchDecision(rosettaTable(), "darwin", "arm64", "x86_64", "", onPath({"arch"}),
+                                     dirs({"/rosetta"}));
+    EXPECT_TRUE(d.runs) << d.why;
+    EXPECT_EQ(d.launcherPrefix, (std::vector<std::string>{"/bin/arch", "-x86_64"}));
+    // An OS translation EXECS the image: runBinary's untimed admission warm-up must run.
+    EXPECT_TRUE(d.launcherExecsImage);
+}
+
+// ...and ONLY for the host and guest the row names: an Intel Mac running an arm64
+// image, a Linux arm64 host running x86_64, fall through to the manifest rule.
+TEST(CrossArchGate, TheTranslationAppliesOnlyToTheHostAndGuestItNames) {
+    for (auto const& [os, arch, guest] :
+         std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"darwin", "x86_64", "arm64"}, {"linux", "arm64", "x86_64"}, {"darwin", "arm64", "riscv64"}}) {
+        auto const d = crossArchDecision(rosettaTable(), os, arch, guest, "", onPath({"arch"}), dirs({"/rosetta"}));
+        EXPECT_FALSE(d.runs) << os << '/' << arch << " -> " << guest;
+        EXPECT_EQ(d.skip, ArmVerdict::SkippedNoEmulatorDeclared) << os << '/' << arch << " -> " << guest;
+    }
+}
+
+// A Mac WITHOUT Rosetta: the launcher is there (`arch` ships with macOS), its
+// prerequisite is not — an ENVIRONMENTAL skip the strict gate reds, never a pass,
+// and its reason NAMES what is absent, where, and how to install it.
+TEST(CrossArchGate, AnAbsentTranslationRuntimeIsAnEnvironmentalSkip) {
+    auto const d = crossArchDecision(rosettaTable(), "darwin", "arm64", "x86_64", "", onPath({"arch"}), dirs({}));
+    EXPECT_FALSE(d.runs);
+    EXPECT_EQ(d.skip, ArmVerdict::SkippedLauncherPrerequisiteMissing) << d.why;
+    EXPECT_TRUE(armVerdictIsEnvironmentalSkip(d.skip));
+    EXPECT_NE(d.why.find("/rosetta"), std::string::npos) << d.why;
+    EXPECT_NE(d.why.find("the translator runtime"), std::string::npos) << d.why;
+    EXPECT_NE(d.why.find("get-the-translator"), std::string::npos) << d.why;
+}
+
+// The manifest rule is unchanged where no translation applies: its emulator runs
+// the arm, an absent one is environmental, no key is structural.
+TEST(CrossArchGate, WithoutATranslationTheManifestEmulatorRuleIsUnchanged) {
+    std::vector<HostTranslation> const none;
+    auto const runs = crossArchDecision(none, "linux", "x86_64", "arm64", "qemu-aarch64", onPath({"qemu-aarch64"}),
+                                        dirs({}));
+    EXPECT_TRUE(runs.runs);
+    EXPECT_EQ(runs.launcherPrefix, (std::vector<std::string>{"/bin/qemu-aarch64"}));
+    // qemu-user reads the image as DATA; the kernel only ever admits qemu itself.
+    EXPECT_FALSE(runs.launcherExecsImage);
+    auto const missing = crossArchDecision(none, "linux", "x86_64", "arm64", "qemu-aarch64", onPath({}), dirs({}));
+    EXPECT_EQ(missing.skip, ArmVerdict::SkippedEmulatorMissing);
+    auto const undeclared = crossArchDecision(none, "linux", "x86_64", "arm64", "", onPath({}), dirs({}));
+    EXPECT_EQ(undeclared.skip, ArmVerdict::SkippedNoEmulatorDeclared);
+}
+
+// A malformed table is REFUSED by name — never read as "no translations", which
+// would put every arm it serves back to a silent skip.
+TEST(CrossArchGate, AMalformedTableIsRefusedByName) {
+    for (auto const& [text, needle] : std::vector<std::pair<std::string, std::string>>{
+             {"[]", "`translations` array"},
+             {R"({"translations": [{"hostOs": "darwin", "hostArch": "arm64", "guestArch": "x86_64"}]})",
+              "`command`"},
+             {R"({"translations": [{"hostOs": "darwin", "hostArch": "arm64", "guestArch": "x86_64",
+                  "command": ["arch"], "launcher": ["x"]}]})", "unknown key `launcher`"},
+             {R"({"translations": [{"hostOs": "darwin", "hostArch": "arm64", "guestArch": "x86_64",
+                  "command": ["arch"], "requires": [{"kind": "file", "path": "/x"}]}]})", "kind `file`"},
+             {R"({"translations": [{"hostOs": "darwin", "hostArch": "arm64", "guestArch": "x86_64",
+                  "command": ["arch"], "requires": [{"kind": "directory", "path": "/x"}]}]})", "`provides`"}}) {
+        try {
+            (void)parseHostTranslations(text, "table.json");
+            ADD_FAILURE() << "accepted: " << text;
+        } catch (std::runtime_error const& e) {
+            EXPECT_NE(std::string{e.what()}.find(needle), std::string::npos) << e.what();
+            EXPECT_NE(std::string{e.what()}.find("table.json"), std::string::npos) << e.what();
+        }
     }
 }

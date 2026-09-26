@@ -629,7 +629,7 @@ shippedTypedefsForPredefines(std::span<PredefinedMacroDef const> rows,
     std::vector<PredefinedShippedTypedef> out;
     if (headers.empty()) return out;
     ffi::ShippedPairFacts const pair{&language, facts.dataModel, facts.charIsUnsigned,
-                                     facts.abiTypedefs};
+                                     facts.abiTypedefs, facts.longDoubleFormat};
     std::optional<std::string_view> const target =
         facts.targetName.empty() ? std::nullopt
                                  : std::optional<std::string_view>{facts.targetName};
@@ -748,7 +748,8 @@ realizeTypeDerivedPredefine(PredefinedMacroDef const&                 pm,
             // 7.22.4.1: `INTN_C(v)` expands to a constant of `int_leastN_t`'s
             // promoted type) — so both kinds ask the one computation.
             ffi::ShippedPairFacts const pair{&language, facts.dataModel,
-                                             facts.charIsUnsigned, facts.abiTypedefs};
+                                             facts.charIsUnsigned, facts.abiTypedefs,
+                                             facts.longDoubleFormat};
             IntegerTypeLimit const limit = (pm.kind == PredefinedMacroKind::TypeLimit)
                                                ? pm.typeLimit
                                                : IntegerTypeLimit::Max;
@@ -10366,7 +10367,11 @@ PreprocessResult preprocessRun(
         // The target's ABI typedefs for this format — what an `abiTypedef`
         // descriptor typedef (`<stddef.h>`'s `wchar_t`) reads.
         typeFacts != nullptr ? typeFacts->abiTypedefs
-                             : std::vector<std::pair<std::string, TypeKind>>{}};
+                             : std::vector<std::pair<std::string, TypeKind>>{},
+        // P68 round 12 (S2a-1): the format document's long-double format — what a
+        // `when: { "longDoubleFormat": … }` arm is selected by.
+        typeFacts != nullptr ? std::optional<LongDoubleFormat>{typeFacts->longDoubleFormat}
+                             : std::optional<LongDoubleFormat>{}};
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          headerNameMatching, headerSearch,
                          *result.diagnostics, 0, includeStack, includeOnce,

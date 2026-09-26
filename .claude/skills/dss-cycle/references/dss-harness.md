@@ -1,5 +1,17 @@
 # DssHarness — the harness this repository runs on
 
+## Contents
+- Install, versions, and the capabilities this repository depends on
+- The upstream docs are the authority, and they are readable from here
+- What it does today, and what is still a script
+- Build, sync, test and worktrees go through DssHarness — and what becomes an action (2026-09-24)
+- `legs` and `install-missing-tools`
+- This repository's configuration — what is tracked and ignored; the runner actions (one directory per
+  action); the worktrees root
+- The anchor registries, after the migration
+- Exit codes
+- The rule that matters most — a DssHarness defect is reported (sent by the agent to the repo-harness session), never worked around
+
 `DssHarness` is a cross-platform .NET tool, built in `dailysoftwaresystems/repo-harness` and published
 on nuget.org. It REPLACED `scripts/`: the anchor registries, the worktrees, the legs, the builds,
 the test runs and the corpus runners moved to it, so that one implementation serves every host and
@@ -103,8 +115,8 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 | Verb | What it replaces here |
 |---|---|
 | `init`, `verify-git`, `legs`, `install-missing-tools`, `host-exec`, `help` | host discovery, the leg catalogue, host provisioning, remote invocation |
-| `create-worktree`, `delete-worktree`, `list-worktree` | the plain lane-worktree lifecycle. ⚠ The `lane-worktree` ACTION stays for what the verbs lack: a VERIFIED evidence copy (`--preserve-to`) and the seed manifest `lane-fold` adjudicates a fold with |
-| `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | the eight anchor launchers — **DELETED**. The `anchors` action stays as the row LIBRARY other actions load; `apply-registry-row` stays for a lane's one-line VERBATIM row file, a different input than `set-anchor`'s file-per-cell |
+| `create-worktree`, `delete-worktree`, `list-worktree` | the plain lane-worktree lifecycle. ⚠ The `lane-worktree` ACTION stays for what the verbs lack: a VERIFIED evidence copy (`--preserve-to`) and the seed manifest `lane-fold` adjudicates a fold with SUPERSEDED 2026-09-24 by `dssharness create-worktree` — the seed manifest is now reset and recorded by `lane-fold.py seed`, MANDATORY right after creation, and the action stays for the evidence copy `land` asks it for (see worktrees.md) |
+| `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`, `check-anchor-balance` | the eight anchor launchers — **DELETED**. The `anchors` action stays as the row LIBRARY other actions load; `apply-registry-row` stays for a lane's one-line VERBATIM row file, a different input than `set-anchor`'s file-per-cell SUPERSEDED 2026-09-25 by the one row format — a lane writes anchor-rows' rows directory, which the anchor-rows action applies as a batch (see lane-discipline.md) |
 | `check-anchor-citations` | resolving cited ids, over the roots in `anchors.citationRoots` (`.harness-config` since 2026-09-18, `tests` since 2026-09-19). ✔MEASURED: `--current-tree` reads tracked and untracked-not-ignored files and never an ignored one. From round four — the release this tree lands with — a citation resolves only to the row whose id it EXACTLY is (case counts; `read-anchor` agrees), and an id that runs into a hyphen at a line's end is reported as CUT whatever rows exist, even cut at its first or second hyphen when the next line completes it (0.5.7 resolved by substring and saw no cut at all). ⚠ Still unseen: a wrap inside a string literal whose prefix happens to be a row, and an id cut at a hyphen that OPENS the next line (that one fails as unresolved, not as cut) — `check-wrapped-anchor-ids` owns the first. ⚠ The `check-anchor-registry` action stays for what no verb covers: the plans' table cell-width property and the retired-id matcher |
 | `check-root-litter` | the `check-root-litter` program — **DELETED** |
 | `fix-line-endings` | rewriting endings. ⚠ The `check-line-endings` action stays: HEAD and index blobs, a CR instrument that cannot see a CR, `--files`, and its watchdog |
@@ -117,7 +129,87 @@ releases never happened — all four landed in 0.5.3 instead. A document still q
 ⚠ **A verb EXISTING is not a script deleted, and this rule did not change when the verbs shipped.**
 **Nothing is deleted before the verb that replaces it has been proven on all four legs**, and the
 deletions land one commit per verb group — so a group that cannot be proven leaves everything after
-it untouched. Until its replacement is proven, a script stays and is the only way to do that job.
+it untouched. Build, sync, test and worktree management go through DssHarness only (2026-09-24): the
+one exception is a DssHarness BUG — reproduce it and REPORT it; a route around it lives only as long as
+the bug, is named as such, and is retired the day the fix ships. Besides it there is one NAMED INTERIM:
+seeding, folding and landing a lane run through the lane-fold action's own program until the action
+declares them as manual steps (the next section).
+
+## ⛔★★★ BUILD, SYNC, TEST AND WORKTREES GO THROUGH DSSHARNESS — AND WHAT BECOMES AN ACTION
+
+*In one paragraph, as the cycle's root file stated it — its closing pointer leads to this section:*
+
+⛔★★★ **BUILD, SYNC, TEST AND WORKTREE MANAGEMENT GO THROUGH DSSHARNESS, NEVER A SCRIPT** (operator, 2026-09-24:
+*"IS FORBIDDEN using scripts (unless a bug is found in dssharness)"*). `dssharness build`/`test` (MSVC is its
+`windows-x86_64-release` leg), `sync`, the worktree verbs, and — a NAMED INTERIM
+until the action declares them as manual steps — the lane-fold action's own program, `lane-fold.py seed` /
+`land`, for seeding, folding and landing. A program that is
+big or reusable, or hard to write in `.ps1`/`.sh`, becomes an ACTION. Work an action owns but a plain run must not
+do, such as a benchmark or the round-close recompile, is a MANUAL STEP of that action. What the installed tool
+already does is USED, never re-built around and never requested upstream. Read its help first. See
+`references/dss-harness.md`, *BUILD, SYNC, TEST AND WORKTREES GO THROUGH DSSHARNESS*.
+
+**Operator rulings, 2026-09-24**, verbatim:
+- *"build, sync, test and worktree management IS FORBIDDEN using scripts (unless a bug is found in dssharness)"*
+- *"the rules is to turn into dssharness actions: big scripts, mainly reusable · hard to do scripts for .ps1 and .sh ·
+  avoid ask for more features when dssharness fits us well with no workarounds"*
+- *"please be aware on repo harness current features, if it already can solve our issues before asking more stuff
+  without thinking"*
+
+⛔ **Forbidden through a script, for main, every lane and the orchestrator alike:**
+- **BUILD**: `dssharness build --legs <leg>` (or `test`, which builds first). Never `cmake --build` or `ninja` from a
+  shell or a wrapper.
+- **TEST**: `dssharness test --legs <leg>`, with `--filter <regex>` for a focused set, a re-run or a red-on-disable
+  read. Never `ctest` from a shell or a wrapper. MSVC is the `windows-x86_64-release` leg, where the harness enters
+  the Visual Studio environment itself, once, for `build`, `test` and `run` alike. WSL, the VPS and the Mac are legs
+  too. A red-on-disable read is one mutant per call: the Edit tool applies the mutant, one `dssharness test --filter`
+  call builds and reads it, and the Edit tool restores it, with the source md5 checked moved and returned. No loop
+  script drives the mutants. One did not rebuild after restoring a code mutant, and six of its nine reads came from a
+  stale binary (P68, 2026-09-24); `test` always builds the tree as it stands first.
+- **SYNC**: `dssharness sync` (with `--pull` and `--artifact`). Never a hand copy of a host's tree.
+- **WORKTREE MANAGEMENT**: `dssharness create-worktree` / `delete-worktree` / `list-worktree`. Seeding, folding and
+  landing a lane run through the lane-fold action's own program — `lane-fold.py seed <lane>`, and
+  `lane-fold.py land <lane> production --apply`, which folds — as a NAMED INTERIM: `dssharness run lane-fold`
+  runs only the action's self-test, and the interim ends when the action declares `seed` and `land` as manual
+  steps (scheduled: the harness lane's next-PR item). It is the only route besides a reported DssHarness bug,
+  and never a script of one's own. `seed` is MANDATORY right after `create-worktree` (`worktrees.md`).
+- **The one exception is a DssHarness BUG.** Reproduce it and REPORT it (the closing section). A route around it lives
+  only as long as the bug, is named as such, and is retired the day the fix ships. [→ besides it, the only route is the lane-fold interim in the bullet above, which ends when the action declares its verbs as manual steps](dss-harness.md)
+
+⇒ **What becomes an action, four tests applied to every program a cycle, a lane or the orchestrator writes:**
+1. **BIG or REUSABLE → an ACTION.** A program that more than one lane, round or leg will run lives under
+   `.harness-config/runner/actions/<name>/`. Applying rows, probing a reference compiler, reading a leg's files and
+   gating on host memory are all such jobs. The action has its `.yml`, a `predefinedRunners` entry and a
+   `--self-test`, and runs as `dssharness run <name>`. A copy under `.temp/` or in a lane's worktree is a DRAFT, not a
+   tool. Fold it into the action that already owns the job, and extend that one before adding a sibling.
+2. **HARD in `.ps1`/`.sh` → an ACTION in Python.** Anything a shell makes fragile is one `.py` program behind a `.yml`,
+   never a `.sh`/`.ps1` twin (the 2026-09-21 ruling in the section on runner actions below). That covers quoting, a
+   path holding a user name, a regex, cross-OS behaviour, JSON, and a retry loop with state.
+3. **DssHarness already does it → USE IT; ask for nothing.** Before a feature request, or before writing a program
+   around the tool, read `DssHarness --help`, `<verb> --help`, `help <topic>` (`runners`, `legs`, `worktrees`,
+   `configuration`) and the latest release notes. A request goes upstream only for a gap that reading SHOWS. A DEFECT
+   is still reported, as the closing section says. An interim script whose own stated reason has lapsed is retired,
+   not kept "just in case".
+4. **Work an action owns but a plain run must not do → a MANUAL STEP of that action, never a script beside it.**
+   The operator, 2026-09-24, on the speedtest1 benchmark: it *"now becomes a manual step inside sqlite.yml, so this
+   gap is covered too"*. A step with `manual: true` runs only when a run names it: `dssharness run <runner>
+   --manual-step <step>`, or a runner of its own that names it under `"steps"`, with legs of its own. That runner
+   declares `requireBuild: true` when the step runs the leg's `dsscp`, and the harness then builds the leg before the
+   step runs. The program is handed the leg's own build through `{buildDir}`, never "the newest build it can find".
+   A plain run lists the step under `unselectedSteps`, so skipping it is never read as having done it. A benchmark,
+   the round-close testfixture recompile and any other opt-in measurement of an action's subject are such steps.
+
+★ **What skipping the third test cost (P68, 2026-09-24).** Two requests went upstream for things the installed tool
+already did, and both were withdrawn:
+- a declared developer environment for a leg's tests, while the `windows-x86_64-release` leg already enters the Visual
+  Studio environment itself;
+- a list of a run's kept outputs, while `help runners` documents `{runArtifacts}/<leg>/<step>/<file>` and
+  `sync --pull` fetches any of them.
+
+The first came from local scripts that imported `vcvars64` OUTSIDE the leg. Nested entries grew PATH past cmd.exe's
+documented 8,191-character line, where the line dies (exit 255) or, from 8,192 characters, PATH silently expands to
+nothing. The rulings above exist so that no build or test runs outside the one tool that enters an environment
+correctly.
 
 ## `legs` and `install-missing-tools`
 
@@ -197,11 +289,11 @@ one has already moved once.
 | half of the ruling | state |
 |---|---|
 | **supporting files** beside the action | ✅ works, and is in use — the clock-step probe's only `run` line starts a program under `actions/clock-step-probe/` |
-| the **`.yml`** inside that directory | ⛔ refused: `DssHarness legs` passes (exit 0), `DssHarness run` fails **exit 12**, *'is not a file name. A runner's action names one file directly inside …'* |
+| the **`.yml`** inside that directory | ⛔ refused: `DssHarness legs` passes (exit 0), `DssHarness run` fails **exit 12**, *'is not a file name. A runner's action names one file directly inside …'* SUPERSEDED 2026-09-23 by the release that runs every action from its `.yml` through `dssharness run <name>` (see actions.md) |
 
 ★ **`config.json` names the ruled path regardless, and `DssHarness run` therefore refuses this
 runner until repo-harness is fixed.** That cost was weighed rather than absorbed: no ctest entry
-invokes `run`, and the four runners that are real work are not written yet. **Bending the layout to
+invokes `run`, and the four runners that are real work are not written yet. SUPERSEDED 2026-09-23 by the release that runs every action from its `.yml` through `dssharness run <name>` (see actions.md) **Bending the layout to
 what today's tool accepts would have made the tool's limitation permanent** — the next author would
 read a flat tree as the convention and never learn a ruling existed.
 
@@ -214,7 +306,7 @@ path, and require it to stay UNDER the actions directory — which still refuses
 ⚠ **A second defect rides it:** `RepoHarness.Core.Configuration.HarnessConfigValidator` ACCEPTS this
 value while the verb rejects it, so a config `legs` calls valid fails only when a runner is invoked —
 against `help configuration`'s promise that every problem is listed at once when the file is read.
-Both are **REPORTED** (see the closing section).
+Both are **REPORTED** (see the closing section). SUPERSEDED 2026-09-23 by the repo-harness release that loads each action from its own directory (see actions.md)
 
 ⚠⚠ **A `run` line's working directory is the REPOSITORY ROOT, not the action's directory.**
 ✔MEASURED by a step that printed its own cwd. **So the ruling's own example `python3 ./bla.py` does
@@ -280,8 +372,10 @@ the same number for two different reasons unless you know which leg was asked.
 
 ## The rule that matters most
 
-**A defect in DssHarness is a repo-harness issue, never a local workaround — AND IT IS REPORTED TO
-THE OPERATOR.** The whole point of the move is that one implementation serves every host; a patch
+**A defect in DssHarness is a repo-harness issue, never a local workaround — AND IT IS REPORTED: the
+agent SENDS it to the repo-harness session and tells the operator it was sent (2026-09-21).** That
+session is found by listing the local sessions and picking the one working in the repo-harness checkout;
+the report is sent to it there. The whole point of the move is that one implementation serves every host; a patch
 here that routes around the tool re-creates the drift the migration exists to end. Reproduce it,
 state the measurement, and file it there.
 
@@ -290,7 +384,7 @@ dss-cycle skill that any issue found in DssHarness must be reported to me (the o
 because the rule used to say only where the FIX goes and was silent on who must be TOLD — and under
 the cycle's silence-is-the-default output contract, a tool defect that is neither a failure nor a
 blocker for this cycle had **no route to the operator at all**. It usually is neither: the cycle
-routes around it by using the script that still exists, and the finding dies in a lane report.
+routes around it by using the script that still exists, and the finding dies in a lane report. SUPERSEDED 2026-09-24 by *build, sync, test and worktree management go through DssHarness* — a DssHarness BUG is the one exception, and a route around it lives only as long as the bug, is named as such, and is retired the day the fix ships (see the section on BUILD, SYNC, TEST AND WORKTREES above) AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — the agent SENDS the report to the repo-harness session with SendMessage and tells the operator it was sent, never asking the operator to relay it; the 2026-09-16 clause *report it in the cycle that finds it* stands (see output-contract.md)
 
 **A report owes four things, and nothing more:**
 1. what was run; 2. what happened; 3. what should have happened;
@@ -299,8 +393,8 @@ routes around it by using the script that still exists, and the finding dies in 
 
 - **Report it in the cycle that FINDS it**, never filed for later. Same shape as *fix it when you
   face it*.
-- **A DssHarness defect is not a `D-*` row here** — it is not this repository's defect — so the cycle
-  report is its only route out. See the `dss-cycle` output contract, item 6.
+- **A DssHarness defect is not a `D-*` row here** — it is not this repository's defect — so the report
+  SENT to the repo-harness session, and the cycle report's line that it was sent, is its only route out. See the `dss-cycle` output contract, item 6.
 - ⚠ **Reporting does not replace fixing our side.** Where the defect has a correct LOCAL expression
   that is not a workaround — spelling a `minVersion` with three components because the tool documents
   semantic versions, say — fix it here AND report the tool's part. The two are not alternatives.

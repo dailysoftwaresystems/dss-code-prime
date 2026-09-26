@@ -574,8 +574,41 @@ public:
     // enum: nominal name + scalars=[(int)underlyingTypeKind]. Variants
     // are NOT stored as operands (each enumerator is a Variable symbol
     // with the enum TypeId; the enum type itself is int-compatible).
+    // P68 round 12 (lane `cs`): an enum with a FIXED underlying type (C23 6.7.2.2,
+    // `enum E : long`) also keeps that type AS DECLARED — its vocabulary identity,
+    // not only its kind — as its one operand, because C 6.3.1.1p1 gives the enum
+    // the RANK of that type and the usual arithmetic conversions decide by rank,
+    // i.e. by name (`long` beside `unsigned int` on LLP64 is `unsigned long`; an
+    // anonymous I32 would give `unsigned int`). `declaredUnderlying` is that TypeId
+    // (InvalidType for an enum without a fixed underlying type — no operand, the
+    // record byte-identical to before). Its KIND must be `underlying`.
+    // ★ P68 round 12 (lane `cs`, the enumeration P1): an enum WITHOUT a fixed
+    // underlying type has one too — C23 6.7.3.3p2: "the enumeration's compatible
+    // type", which the implementation CHOOSES to hold every value (p13), and which
+    // the language declares how to choose (`semantics.enumerationCompatibleTypes`).
+    // Such an enum keeps its chosen type as its operand as well, told apart from a
+    // fixed one by `origin`: scalars=[kind, 1] for `Chosen`, [kind] for `Fixed`.
+    // They must differ because `enum E : unsigned int { … }` and an `enum E { … }`
+    // whose compatible type is `unsigned int` are different types (C23 6.2.7p1: a
+    // fixed underlying type is part of an enumeration's identity). An enum of a
+    // language that declares no choice keeps the kind-only record (no operand).
+    // `origin` is read only when `declaredUnderlying` is valid.
+    enum class EnumUnderlyingOrigin : std::uint8_t { Fixed, Chosen };
     TypeId enumType(std::string_view name,
-                    TypeKind underlying = TypeKind::I32);
+                    TypeKind underlying = TypeKind::I32,
+                    TypeId declaredUnderlying = InvalidType,
+                    EnumUnderlyingOrigin origin = EnumUnderlyingOrigin::Fixed);
+    // The fixed underlying type an enum was declared with (`enumType`'s
+    // `declaredUnderlying` with origin `Fixed`), or InvalidType when it has none,
+    // its type was chosen instead, or `id` is not an enum.
+    [[nodiscard]] TypeId enumDeclaredUnderlying(TypeId id) const;
+    // The compatible type CHOSEN for an enum without a fixed underlying type
+    // (origin `Chosen`), or InvalidType.
+    [[nodiscard]] TypeId enumChosenUnderlying(TypeId id) const;
+    // Either — the integer type an enum's record says it is COMPATIBLE with (C
+    // 6.7.2.2p4, C23 6.7.3.3p13, p16) — or InvalidType for a kind-only record or a
+    // non-enum.
+    [[nodiscard]] TypeId enumUnderlyingType(TypeId id) const;
     // C23 _BitInt(N) (D-CSUBSET-BITINT / C23 §6.2.5): a bit-precise integer of
     // EXACT width `widthBits`, signed iff `isSigned`. scalars=[widthBits, signed?1:0];
     // no operands, no name (structural identity — two `_BitInt(N)` of the same width

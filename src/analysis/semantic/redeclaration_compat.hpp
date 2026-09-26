@@ -3,6 +3,7 @@
 #include "core/types/declared_qualification.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
+#include "core/types/type_lattice/type_compatibility.hpp"   // sameOrEnumCompatible
 #include "core/types/type_lattice/type_interner.hpp"
 
 #include <algorithm>
@@ -210,6 +211,17 @@ namespace detail::redecl {
                  .second)
             continue;
         TypeKind const kx = in.kind(x);
+        // P68 round 12 (lane `cs`, the enumeration P1): an enumerated type beside a
+        // non-enumerated one is compared THROUGH the integer type its record says it
+        // is compatible with (`TypeInterner::enumUnderlyingType`), spelling-blind like
+        // every other leaf here; a kind-only record has none and stays nominal.
+        if ((kx == TypeKind::Enum) != (in.kind(y) == TypeKind::Enum)) {
+            TypeId const ex = in.enumUnderlyingType(x);
+            TypeId const ey = in.enumUnderlyingType(y);
+            if (!ex.valid() && !ey.valid()) return false;
+            work.emplace_back(ex.valid() ? ex : x, ey.valid() ? ey : y);
+            continue;
+        }
         if (kx != in.kind(y)) return false;
         switch (kx) {
             case TypeKind::Struct:
@@ -244,10 +256,17 @@ namespace detail::redecl {
 // The leaf relation for one comparison mode. Everything above the leaves — arity,
 // ellipsis, the pointer spine — is walked identically in both modes; only the
 // question "are these two types the same" changes.
+// ★ P68 round 12 (lane `cs`, the enumeration P1): in the SOURCE vocabulary "the
+// same type" is C's compatibility, which also pairs an enumerated type with its
+// compatible integer type, at any pointer depth (`sameOrEnumCompatible`) —
+// ✔MEASURED (lane `cs`'s `.temp/probe/ect8`): `int f(void);` then `enum E { A = -1,
+// B = 42 } f(void) { … }` builds and runs under gcc 13.3.0, clang 18.1.3, mingw-w64
+// 13.2.0 and MSVC 19.51 (silently even at /Za); DSS refused it, "the return type
+// differs".
 [[nodiscard]] inline bool leavesCompatible(TypeInterner const& in, TypeId a,
                                            TypeId b, LeafComparison mode) {
     return mode == LeafComparison::SourceVocabulary
-               ? a.v == b.v
+               ? sameOrEnumCompatible(in, a, b)
                : spellingBlindCompatible(in, a, b);
 }
 

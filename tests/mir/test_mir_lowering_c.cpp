@@ -1491,16 +1491,23 @@ TEST(MirLoweringC, EnumParamArithmeticLowersClean) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
-// Scope guard at the SEMANTIC tier: enum↔DIFFERENT-enum stays a loud mismatch
-// (the conversion arm admits enum↔int ONLY). RED-ON-DISABLE: if the arm
-// over-admitted enum↔enum, this cross-enum assignment would wrongly type-check.
-TEST(MirLoweringC, DifferentEnumAssignStaysMismatch) {
+// P68 round 12 (lane `cs`, the enumeration P1): a value of one enumeration assigns to
+// an object of ANOTHER and lowers through the width-exact Cast (C 6.5.16.1p1 — an
+// enumerated type is an integer type). This test used to pin the refusal as a "loud
+// mismatch"; every reference builds both shapes (lane `cs`'s `.temp/probe/eec`,
+// [[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]). `Y` is an `int`
+// constant now (C17 6.4.4.3p2); `b` is a `enum B` object, the enum ← enum shape.
+TEST(MirLoweringC, AssignmentBetweenTwoEnumerationsLowersClean) {
     auto L = lowerC(
         "enum A { X };\n"
         "enum B { Y };\n"
-        "int main(void) { enum A a = Y; return (int)a; }\n");
-    EXPECT_TRUE(L.model.hasErrors())
-        << "assigning a B enumerator to an A-typed var must be a loud mismatch";
+        "int main(void) { enum A a = Y; enum B b = Y; a = b; return (int)a; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
 
 // ML2 cycle 1: literal + return.
@@ -12124,34 +12131,75 @@ TEST(MirLoweringC, WideBitIntFloatConversionLowersWithTheMultiLimbPrimitives) {
     }
 }
 
-// D-CSUBSET-INT128-FLOAT-CONV: the refusal SURVIVES for every floating type that is not
-// `double`, and each survivor has its own reason — one message that covered all of them
-// would hide which. F32/F16 are reachable only as a rounding of the F64 result, so they
-// would round TWICE and can land outside the two values C 6.3.1.4p2 permits (and int->F32
-// has no encoded form at all one tier down, D-CSUBSET-INT-TO-F32-CODEGEN). F80/F128 carry
-// more precision than F64, so widening an F64 result into them would invent precision on
-// the way out and rounding into F64 would lose it on the way in (D-CSUBSET-LONG-DOUBLE).
-// ⚠ `long double` is NOT used here: it is F64 on this target, so a `long double` probe
-// would assert nothing. The `float` spelling is F32 on every shipped data model.
-// RED-ON-DISABLE: drop the `toK != TypeKind::F64` gate in combineCast's wide-source arm
-// and a `(float)wide` silently acquires a double-rounded value.
-TEST(MirLoweringC, WideBitIntToNonDoubleFloatStillFailsLoud) {
+// ── D-CSUBSET-INT-TO-F32-CODEGEN (P68 round 12): A WIDE INTEGER TO `float`, DIRECTLY ──
+// This pin used to assert the REFUSAL of `(float)wide`, for two reasons: reaching F32 as
+// a rounding of the F64 result rounds TWICE and can land outside the two values C
+// 6.3.1.4p2 permits, and the int->F32 conversion one tier down did not exist. The second
+// reason is gone, and the first never applied to the right shape: the round-to-odd
+// intermediate converts STRAIGHT to F32 with one rounding. So the pin asserts THAT shape —
+// the multi-limb primitives, a UIToFP whose RESULT is F32, and NO FPTrunc anywhere (an
+// FPTrunc is precisely the double-rounding detour). The values are pinned where a value
+// can be observed: examples/c/wide_int_to_float_bit_exact (gcc 13.3.0 / clang 18.1.3
+// agreed, the double-rounding values included).
+// RED-ON-DISABLE: route the F32 destination through the F64 result plus an FPTrunc and
+// the FPTrunc expectation goes red (and the example's double-rounding checks fail).
+TEST(MirLoweringC, WideIntToFloatConvertsDirectlyWithOneRounding) {
     for (char const* src : {
         "int main(void){ _BitInt(128) x = 3; float f = (float)x;\n"
         "  return (int)f; }\n",
         "int main(void){ unsigned __int128 x = 3; float f = (float)x;\n"
+        "  return (int)f; }\n",
+        "int main(void){ __int128 x = -3; float f = (float)x;\n"
         "  return (int)f; }\n"}) {
         auto L = lowerC(src);
         ASSERT_FALSE(L.model.hasErrors()) << src;
         ASSERT_TRUE(L.hir->ok) << src;
-        EXPECT_FALSE(L.mir.ok) << src
-            << "\na wide-integer -> `float` conversion must still fail LOUD";
-        std::size_t n = 0;
-        for (auto const& d : L.mirReporter.all())
-            if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
-        EXPECT_EQ(n, 1u) << src
-            << "\nexactly one S_BitIntWideFloatConvUnsupported (0xE050)";
+        ASSERT_TRUE(L.mir.ok) << src
+            << "\na wide-integer -> `float` conversion must LOWER\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_GT(countOpcode(ops, MirOpcode::Clz), 0u) << src;
+        EXPECT_GT(countOpcode(ops, MirOpcode::FMul), 0u) << src;
+        EXPECT_EQ(countOpcode(ops, MirOpcode::FPTrunc), 0u) << src
+            << "\nan FPTrunc means the `float` was reached THROUGH the `double` result — "
+               "two roundings, the defect this emitter's argument forbids";
+        bool f32Convert = false;
+        Mir const& m = L.mir.mir;
+        TypeInterner const& ti = L.model.lattice().interner();
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const f = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+                MirBlockId const b = m.funcBlockAt(f, bi);
+                for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                    MirInstId const inst = m.blockInstAt(b, ii);
+                    if (m.instOpcode(inst) == MirOpcode::UIToFP
+                        && ti.kind(m.instType(inst)) == TypeKind::F32) {
+                        f32Convert = true;
+                    }
+                }
+            }
+        }
+        EXPECT_TRUE(f32Convert) << src
+            << "\nthe round-to-odd intermediate must convert straight to F32";
     }
+}
+
+// The refusal SURVIVES for a `long double` destination: it carries more precision than
+// the 64-bit round-to-odd intermediate keeps, so the emitter's one-rounding argument does
+// not cover it. Probed with the x87 80-bit axis (the x86-64 ELF shape) — on the default
+// fixture `long double` may not be spelled at all.
+// RED-ON-DISABLE: admit F80 in combineCast's wide-source gate and this goes red.
+TEST(MirLoweringC, WideIntToLongDoubleStillFailsLoud) {
+    auto L = lowerC("int main(void){ _BitInt(128) x = 3; long double f = (long double)x;\n"
+                    "  return (int)f; }\n",
+                    "x86_64", "sysv_amd64", DataModel::Lp64, LongDoubleFormat::X87_80);
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    EXPECT_FALSE(L.mir.ok) << "a wide-integer -> `long double` conversion must still fail LOUD";
+    std::size_t n = 0;
+    for (auto const& d : L.mirReporter.all())
+        if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
+    EXPECT_EQ(n, 1u) << "exactly one S_BitIntWideFloatConvUnsupported (0xE050)";
 }
 
 namespace {
@@ -13026,6 +13074,142 @@ TEST(MirLoweringC, VlaTypedefObjectAllocaLoadsFrozenSizeNotReLoweredN) {
     EXPECT_TRUE(sawCopyDownStore)
         << "`R a;` must COPY R's frozen size DOWN — a Load(R's slot) Stored into a's own "
            "8-byte slot — so `a[i]` / `sizeof a` Load a's own copied slot";
+}
+
+// P68 round 12 (lane `cs`) — a QUALIFIED use of a variable-length typedef reads the size
+// the typedef FROZE. C 6.7.3p10 puts `volatile V`'s qualifier on the element, so every
+// level of the object's type is a different TypeId from the ones the typedef froze under;
+// the size slots are keyed by the level's unqualified SHAPE, so the object copies the
+// typedef's frozen size down exactly as `V v;` does (a Load of the typedef's slot, never a
+// re-lowered `n`), its element stores are volatile, and a pointer to the qualified alias
+// copies the alias's whole-object size as its row stride. Before this, each of these three
+// refused "origin froze no whole-object size slot"; gcc 13.3.0, clang 18.1.3 and mingw-w64
+// 13.2.0 build and run them (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vt`).
+// RED-ON-DISABLE: key the slots by the held TypeId again and all three refuse.
+TEST(MirLoweringC, AQualifiedUseOfAVlaTypedefCopiesItsFrozenSize) {
+    for (char const* src : {
+             "int main(void) { int n = 3; typedef int V[n]; volatile V a; a[0] = 1; return 0; }\n",
+             "int main(void) { int n = 3; typedef int V[n]; volatile V arr[2]; arr[1][0] = 1; "
+             "return 0; }\n",
+             "int main(void) { int n = 2; typedef int V[n]; int b[3][2] = {{0}}; "
+             "volatile V *p = (volatile V *)b; p[2][1] = 1; return 0; }\n",
+         }) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok)
+            << src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << src;
+        // The copy-down: a Store whose VALUE is a Load, into an 8-byte slot.
+        bool sawCopyDown = false;
+        MirBlockId const entry = m.funcEntry(m.funcAt(0));
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+            MirInstId const id = m.blockInstAt(entry, i);
+            if (m.instOpcode(id) != MirOpcode::Store) continue;
+            auto const ops = m.instOperands(id);
+            if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Load
+                && m.instOpcode(ops[1]) == MirOpcode::Alloca && m.instPayload(ops[1]) == 8u)
+                sawCopyDown = true;
+        }
+        EXPECT_TRUE(sawCopyDown)
+            << "the typedef's frozen size must be COPIED DOWN (a Load of its slot stored "
+               "into the use's own 8-byte slot), never re-lowered: " << src;
+        EXPECT_GE(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+            << "the element store through the qualified use must be volatile: " << src;
+    }
+}
+
+// P68 round 12 (lane `cs`) — a variable-length TYPE NAME's size and alignment. `sizeof(V)` of
+// a variable-length typedef reads the size the typedef FROZE (C17 6.7.8p3: `n` changed
+// afterwards moves nothing), qualified or not; `sizeof(V[3])` multiplies it by the name's own
+// bound; `_Alignof` of a variable-length type is its element's alignment and does not evaluate
+// its operand (C 6.5.3.4p3). Each was refused ("sizeof of an incomplete or un-sizeable type" /
+// "_Alignof of an incomplete or un-alignable type"); gcc 13.3.0, clang 18.1.3 and mingw-w64
+// 13.2.0 build and run every one (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vt`). The
+// size forms must READ the frozen slot — a Load — and the alignment forms must not: they fold.
+TEST(MirLoweringC, AVlaTypeNamesSizeReadsTheFrozenSizeAndItsAlignmentFolds) {
+    struct Case {
+        char const* src;
+        bool        readsAFrozenSize;
+    };
+    for (Case const& c : {
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(V); }\n", true},
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(volatile V); }\n", true},
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(V[3]); }\n", true},
+             Case{"int f(int n) { typedef int V[n]; n = 9; return (int)sizeof(volatile V[3]); }\n", true},
+             Case{"int f(int n) { return (int)_Alignof(int[n]); }\n", false},
+             Case{"int f(int n) { typedef double W[n][3]; return (int)_Alignof(volatile W); }\n", false},
+         }) {
+        auto L = lowerC(c.src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.src;
+        ASSERT_TRUE(L.hir->ok) << c.src;
+        ASSERT_TRUE(L.mir.ok)
+            << c.src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << c.src;
+        MirFuncId const fn = m.funcAt(0);
+        // A Load whose address is an 8-byte slot: the frozen size, read.
+        unsigned frozenReads = 0;
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const id = m.blockInstAt(blk, i);
+                if (m.instOpcode(id) != MirOpcode::Load) continue;
+                auto const ops = m.instOperands(id);
+                if (ops.size() == 1u && m.instOpcode(ops[0]) == MirOpcode::Alloca
+                    && m.instPayload(ops[0]) == 8u && m.instOperands(ops[0]).empty())
+                    ++frozenReads;
+            }
+        }
+        if (c.readsAFrozenSize)
+            EXPECT_GE(frozenReads, 1u) << "the size must be READ from the typedef's frozen slot: "
+                                       << c.src;
+        else
+            EXPECT_EQ(frozenReads, 0u) << "an alignment is static; nothing is read: " << c.src;
+    }
+}
+
+// P68 round 12 (lane `cs`) — `sizeof` THROUGH A POINTER to a variable-length array: `sizeof
+// *p` and `sizeof p[i]` are the pointee's size, which the pointer froze as its row stride at
+// its own declaration, so the size is READ from that slot — for a direct `int (*p)[n]`, a
+// typedef's `V *p` and a qualified `volatile V *p` alike. Each was refused at the static fold
+// ("sizeof of an incomplete or un-sizeable type"); gcc 13.3.0, clang 18.1.3 and mingw-w64
+// 13.2.0 answer the pointee's size (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vtp`).
+// Two indirections through a pointer (`sizeof **pp`) stay refused: no slot holds that size.
+TEST(MirLoweringC, SizeofThroughAPointerToAVlaReadsItsFrozenStride) {
+    for (char const* src : {
+             "int f(int n, int (*p)[n]) { n = 9; return (int)sizeof *p; }\n",
+             "int f(int n, int (*p)[n]) { n = 9; return (int)sizeof p[1]; }\n",
+             "int f(int n, void *q) { typedef int V[n]; V *p = q; n = 9; return (int)sizeof *p; }\n",
+             "int f(int n, void *q) { typedef int V[n]; volatile V *p = q; n = 9; return (int)sizeof(*p); }\n",
+         }) {
+        auto L = lowerC(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        ASSERT_TRUE(L.mir.ok)
+            << src << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 1u) << src;
+        MirFuncId const fn = m.funcAt(0);
+        unsigned frozenReads = 0;
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fn); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const id = m.blockInstAt(blk, i);
+                if (m.instOpcode(id) != MirOpcode::Load) continue;
+                auto const ops = m.instOperands(id);
+                if (ops.size() == 1u && m.instOpcode(ops[0]) == MirOpcode::Alloca
+                    && m.instPayload(ops[0]) == 8u && m.instOperands(ops[0]).empty())
+                    ++frozenReads;
+            }
+        }
+        EXPECT_GE(frozenReads, 1u) << "the pointee's size must be READ from the pointer's frozen "
+                                      "stride slot: " << src;
+    }
+    auto deep = lowerC("int f(int n, int (**pp)[n]) { return (int)sizeof **pp; }\n");
+    EXPECT_TRUE(deep.model.hasErrors() || !deep.hir->ok || !deep.mir.ok)
+        << "`sizeof **pp` has no frozen slot to read; it must stay refused, never guessed";
 }
 
 // VLA (D-CSUBSET-VLA) — THE COMPOSED VLA-TYPEDEF SHAPES LOWER. These three tests were
@@ -16233,14 +16417,22 @@ TEST(MirLoweringC, PointerArithEnumIndexInSubtractionWidensBeforeTheNegate) {
     // widening after) would sign-flip a 32-bit value into the high half of the
     // register. Pins the ordering by pinning that the widen exists at all on the
     // subtraction arm, which reaches the same site through a different opcode.
+    // P68 round 12 (lane `cs`, the enumeration P1): the widen's SIGNEDNESS follows
+    // the enumeration's compatible type, and `enum Step { ST_TWO = 2 }` has no negative
+    // value, so under the SysV convention this analysis runs (`lowerC`'s default, the
+    // LP64 platforms' "gnu") it is `unsigned int` — gcc 13.3.0 and clang 18.1.3 zero-
+    // extend it (lane `cs`'s `.temp/probe/ect8`, `exP1c`). This used to expect an SExt
+    // ("a default (int) underlying is signed"), true only under the msvc convention.
     auto L = lowerC(
         "enum Step { ST_TWO = 2 };\n"
         "int *f(int *p, enum Step e) { return p - e; }\n");
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
-    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 1u)
-        << "a default (int) underlying is signed → SExt to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::ZExt).size(), 1u)
+        << "a non-negative enumeration is `unsigned int` under gnu → ZExt to the 64-bit offset";
+    EXPECT_EQ(collectOps(m, MirOpcode::SExt).size(), 0u)
+        << "an SExt would read an index above INT_MAX as negative — a wrong address";
     ASSERT_EQ(collectOps(m, MirOpcode::Neg).size(), 1u)
         << "`p - e` must negate the widened index";
     auto const& interner = L.model.lattice().interner();

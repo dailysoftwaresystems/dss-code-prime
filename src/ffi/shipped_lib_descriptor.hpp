@@ -3,7 +3,7 @@
 #include "core/substrate/path_identity.hpp"
 
 #include "core/export.hpp"
-#include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/data_model.hpp"   // DataModel, LongDoubleFormat (the pair's `when` facts)
 #include "core/types/declared_qualification.hpp" // DeclaredQualification (a row's const/restrict claim)
 #include "core/types/include_path_resolve.hpp" // HeaderNameMatching + HeaderSearchResult (the `includes` closure walk's case policy)
 #include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
@@ -493,6 +493,14 @@ struct DSS_EXPORT ShippedPairFacts {
     std::optional<DataModel> dataModel;
     std::optional<bool>      charIsUnsigned;
     std::vector<std::pair<std::string, TypeKind>> abiTypedefs;
+    // P68 round 12 (S2a-1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): the
+    // pair's LONG-DOUBLE FORMAT (the format document's `longDoubleFormat`), the
+    // fact a `when: { "longDoubleFormat": … }` arm is selected by — the
+    // representation of C's `long double` belongs to the format document, not
+    // to arch, format kind or data model. nullopt / `None` ⇒ no such arm can
+    // match (a key naming an absent fact never matches), never a borrowed
+    // default.
+    std::optional<LongDoubleFormat> longDoubleFormat;
 };
 
 // One decoded named FLOAT CONSTANT — the float-valued sibling of `ShippedConstant`
@@ -1049,15 +1057,16 @@ validateShippedSurfaceRequirements(
 // On success the returned descriptor is fully populated and every symbol's
 // `signature` is a valid TypeId in `interner`.
 // FC3 c1 `dataModel`: the ACTIVE format's width triple (threaded from
-// `analyze()`, which is per-(CU × target)). A symbol MAY carry a
-// `signatureByDataModel` object ({"LLP64": "fn(...) -> i32", …} — the
-// Model-3 `library`-map shape) whose entry for the active model REPLACES
-// the base `signature` (the base text is the LP64-correct form). Every
-// declared override must parse — a malformed override fails the read
-// even when its model is not the active one (it would otherwise lurk
-// until that model's first compile). Unknown model keys fail loud.
-// Defaulted for direct-API/unit callers (LP64 = the base-signature
-// identity); the semantic analyzer always passes its threaded model.
+// `analyze()`, which is per-(CU × target)). A symbol's `signature` MAY be a
+// per-pair OBJECT — `{ "variants": [ { "when": {…}, "value": "fn(…)" }, …,
+// { "default": true, "value": "fn(…)" } ] }`, the `version` / `linkName`
+// shape — selected by the ONE `when` selector (core/types/variant_when.hpp)
+// over arch, format, data model and long-double format (P68 round 12, S2a-1;
+// it replaced the data-model-only `signatureByDataModel` map). Every arm must
+// parse — a malformed arm fails the read even when no current pair selects it
+// — and a pair no arm selects is REFUSED by name unless a `default` arm serves
+// it: there is no silent fallback. Defaulted for direct-API/unit callers
+// (LP64); the semantic analyzer always passes its threaded model.
 // Plan-25 `activeTarget` / `activeFormat`: the ACTIVE compile target's
 // (arch name, object-format) — the per-target STRUCT-VARIANT selector. A
 // `structs` entry that declares `variants` is decoded by selecting the
@@ -1072,8 +1081,8 @@ validateShippedSurfaceRequirements(
 // field fails loud (P56 — see the arm in the .cpp for why the stricter
 // "publish nothing" rule was refuted). EAGER: every variant's field list is
 // decoded regardless of which is active (a malformed INACTIVE variant fails
-// the whole read on EVERY target — anti-lurking, mirrors
-// `signatureByDataModel`). Both default to nullopt for direct-API/LSP/unit
+// the whole read on EVERY target — anti-lurking, mirrors the `signature`
+// variants). Both default to nullopt for direct-API/LSP/unit
 // callers ⇒ no variant selection (a flat-`fields` struct decodes exactly as
 // before; a struct that carries ONLY `variants` contributes no layout when
 // no selector is available).
@@ -1615,7 +1624,7 @@ collectShippedExternSymbolFormats();
 // A user declaration carries the SIGNATURE. The PLATFORM — this shipped-descriptor
 // corpus, per object format — carries the REALIZATION: `library`,
 // `availableObjectFormats`, the `synthesize` recipe, `linkName`, `version`,
-// `signatureByDataModel`. `#include <stdio.h>` and a hand-written
+// the per-pair `signature` arm. `#include <stdio.h>` and a hand-written
 // `extern int printf(const char *, ...);` are two ways to obtain a TYPE; NEITHER
 // is a way to obtain a different PLATFORM.
 //
@@ -1730,7 +1739,7 @@ struct DSS_EXPORT ShippedSymbolRealization {
     // `status == ProvidedByShippedSource`; EMPTY for every other status.
     std::string shippedSourcePath;
     // The row's DECLARED signature, interned in the CALLER's interner (the
-    // `signatureByDataModel` override for the active model already applied).
+    // active pair's `signature` arm already selected).
     // InvalidType unless `status == Realized`.
     TypeId      signature;
     bool        isFunction = true;   // ExternFunction vs ExternGlobal
@@ -1794,7 +1803,7 @@ refuseShippedSymbolWithoutABody(ShippedLibDescriptor const&  desc,
 // so a TU that hand-declares nothing reads NOTHING and a TU that hand-declares
 // `popen`/`pclose` reads ONE descriptor. Descriptors are read through the SAME
 // `readShippedLibDescriptor` the `#include` path uses — there is no second
-// resolution grammar, so `variants` / `signatureByDataModel` / per-symbol
+// resolution grammar, so `variants` (a signature's among them) / per-symbol
 // `library` overrides cannot be resolved one way here and another way there.
 //
 // A descriptor that FAILS to read is SKIPPED (its names stay `Unknown` and route

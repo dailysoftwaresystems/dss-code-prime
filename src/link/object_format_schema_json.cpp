@@ -371,12 +371,15 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // 42 -> 43 (P68 round 9): `inputSectionPlacement`, whether the link may split
     // a relocatable object's input section into independently placed atoms
     // (`InputSectionPlacement`).
-    static constexpr std::array<std::string_view, 43> kFormatDocumentKeys{
+    // 43 -> 44 (P68 round 12, lane `cs`): `enumCompatibleTypeRule`, the integer
+    // type an enumeration without a fixed underlying type is compatible with
+    // (`EnumCompatibleTypeRule`).
+    static constexpr std::array<std::string_view, 44> kFormatDocumentKeys{
         // identity + loader gates
         "dssObjectFormatVersion", "format",
         // C-family ABI axes (every one a silent-miscompile risk if it typos)
         "dataModel", "bitFieldStrategy", "longDoubleFormat",
-        "unnamedBitFieldAlignment",
+        "unnamedBitFieldAlignment", "enumCompatibleTypeRule",
         // the per-OS `#include` header-NAME case rule — a silent WRONG-ACCEPT
         // in one direction and a wrong REJECT in the other if it typos
         "headerNameMatching",
@@ -1251,6 +1254,35 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                           ", ")));
             } else {
                 data.longDoubleFormat = *lf;
+            }
+        }
+    }
+
+    // ── P68 round 12 (lane `cs`): OPTIONAL `enumCompatibleTypeRule` ──
+    //
+    // The per-format rule for the integer type an enumeration without a fixed
+    // underlying type is compatible with ("msvc" / "gnu"; see
+    // `EnumCompatibleTypeRule`). OPTIONAL: absent ⇒ None — an enumeration without a
+    // fixed type is then S_EnumCompatibleTypeRuleUndeclared at semantic bind, never
+    // a silent pick. A wrong spelling is a HARD error; `None` has no spelling.
+    if (doc.contains("enumCompatibleTypeRule")) {
+        if (!doc.at("enumCompatibleTypeRule").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/enumCompatibleTypeRule",
+                      std::format("'enumCompatibleTypeRule' must be a string ({})",
+                                  allowedList(allNames(kEnumCompatibleTypeRuleTable),
+                                              ", ")));
+        } else {
+            auto const s = doc.at("enumCompatibleTypeRule").get<std::string>();
+            auto const rule = enumCompatibleTypeRuleFromName(s);
+            if (!rule) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/enumCompatibleTypeRule",
+                          std::format("unknown enumCompatibleTypeRule '{}' — expected "
+                                      "{}", s,
+                                      allowedList(
+                                          allNames(kEnumCompatibleTypeRuleTable),
+                                          ", ")));
+            } else {
+                data.enumCompatibleTypeRule = *rule;
             }
         }
     }

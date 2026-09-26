@@ -144,7 +144,7 @@ public:
         //
         // ⚠ THE LOCAL GATE STRUCTURALLY CANNOT SEE THIS, which is why it reached
         // CI. 8.3 shortening only kicks in for a directory component longer than
-        // 8 characters; the local operator's user directory is `rafae` (5), so
+        // 8 characters; the local operator's user directory is five characters long, so
         // short form == long form and every assertion here is trivially
         // satisfied. It is not a flaky test or a Release-vs-Debug difference —
         // it is a test that could only ever fail on a machine whose username is

@@ -102,12 +102,13 @@ private:
 // client messages, then calls `runUntilExit()` to await server
 // teardown and return the exit code. Move-only; one harness per
 // test.
-// The stack the harness gives the server loop. 8 MiB is the DOCUMENTED main-
-// thread default on both POSIX hosts this project gates on, and production runs
-// `server.run()` on main -- so this is not a generous number, it is the number
-// the emulated thread already had. Reserved, not committed: a shallow run
-// touches about one page of it.
-inline constexpr std::size_t kServerLoopStackBytes = 8u * 1024u * 1024u;
+// The stack the harness gives the server loop. Production runs `server.run()` on
+// main, so the emulated thread gets the main thread's stack — the ONE constant
+// the substrate states for every thread doing main-thread work (the executor's
+// workers included), 8 MiB, the DOCUMENTED main-thread default on both POSIX
+// hosts this project gates on. Reserved, not committed: a shallow run touches
+// about one page of it.
+inline constexpr std::size_t kServerLoopStackBytes = substrate::kMainThreadClassStackBytes;
 
 class LspTestHarness {
 public:

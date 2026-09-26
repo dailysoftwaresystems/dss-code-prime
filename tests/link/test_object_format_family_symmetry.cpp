@@ -387,6 +387,36 @@ TEST(ObjectFormatFamilySymmetry, EveryDarwinFormatDeclaresItsLongDoubleAxis) {
 // `longDoubleFormat` (including the same absence, which only the declared-only
 // wasm/spirv skeletons have, one document each).
 // ─────────────────────────────────────────────────────────────────────────
+// P68 round 12 (lane `cs`): the enumeration compatible-type rule is the PLATFORM's
+// ABI too — every image kind of one platform declares the same one (an enumeration
+// must not change its compatible type between the `.o`, the `.dll` and the `.exe`
+// built from one translation unit).
+TEST(ObjectFormatFamilySymmetry, EveryImageKindOfOnePlatformDeclaresOneEnumCompatibleTypeRule) {
+    auto const formats = loadShippedFormats();
+    ASSERT_GE(formats.size(), 24u) << "the enumeration collapsed";
+    std::map<std::string, std::vector<std::pair<std::string, EnumCompatibleTypeRule>>> byPlatform;
+    for (auto const& f : formats) {
+        auto r = ObjectFormatSchema::loadShipped(f.name);
+        ASSERT_TRUE(r.has_value()) << f.name;
+        std::string platform{objectFormatKindName((*r)->kind())};
+        platform += '/';
+        platform += (*r)->targetArch();
+        byPlatform[platform].emplace_back(f.name, (*r)->enumCompatibleTypeRule());
+    }
+    std::size_t multiTier = 0;
+    for (auto const& [platform, members] : byPlatform) {
+        if (members.size() >= 2) ++multiTier;
+        for (auto const& [name, rule] : members) {
+            EXPECT_EQ(rule, members.front().second)
+                << platform << ": " << name << " declares enumCompatibleTypeRule '"
+                << enumCompatibleTypeRuleName(rule) << "' but " << members.front().first
+                << " declares '" << enumCompatibleTypeRuleName(members.front().second)
+                << "' (an empty name is an undeclared rule)";
+        }
+    }
+    EXPECT_GE(multiTier, 5u);
+}
+
 TEST(ObjectFormatFamilySymmetry, EveryImageKindOfOnePlatformDeclaresOneLongDoubleFormat) {
     auto const formats = loadShippedFormats();
     ASSERT_GE(formats.size(), 24u) << "the enumeration collapsed";

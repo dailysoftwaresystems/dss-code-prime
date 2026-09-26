@@ -151,19 +151,21 @@ The name is a quoted string literal; members are comma-separated types until the
 
 **`rec <H>`** marks a composite whose own type graph reaches itself, and **`rec <H>` in type position** is the back-reference that closes the cycle. `H` is a handle for the *composite*, artifact-local and 1-based, and the same composite carries the same handle everywhere in one text — which is what lets a mutually recursive pair be written down, since one type then has two different spellings in one text. A back-reference resolves only against composites **currently open** at that point; a handle of `0`, a back-reference to a closed composite, and one handle carrying two different bodies are each refused by name.
 
-**⚠ Inline composites and `rec <H>` are the STANDALONE form.** A `.dsshir` *module* (format v5) defines every composite ONCE, in its `types` section, and names it everywhere else as **`type <H>`** — so in a module an inline `struct "N" {…}`, `union "N" {…}` or `rec <H>` is refused by name, and `type <H>` is the only composite spelling. A standalone type text — every FFI-descriptor signature `parseTypeFromText` decodes — has no `types` table, so it keeps every form in this section unchanged and refuses `type <H>` instead, by name, as module-only. See [`hir-text-format.md` §4.7 and §5.1](./hir-text-format.md) for the table, the cycle and mutual-recursion examples, and what a reader that re-interns must do about them.
+**⚠ Inline composites and `rec <H>` are the STANDALONE form.** A `.dsshir` *module* (format v5 and later) defines every composite ONCE, in its `types` section, and names it everywhere else as **`type <H>`** — so in a module an inline `struct "N" {…}`, `union "N" {…}` or `rec <H>` is refused by name, and `type <H>` is the only composite spelling. A standalone type text — every FFI-descriptor signature `parseTypeFromText` decodes — has no `types` table, so it keeps every form in this section unchanged and refuses `type <H>` instead, by name, as module-only. See [`hir-text-format.md` §4.7 and §5.1](./hir-text-format.md) for the table, the cycle and mutual-recursion examples, and what a reader that re-interns must do about them.
 
-**The MIR text follows the same rule since `.dssir` v2.** A `.dssir` module defines every composite ONCE, in a `types` section between the `dssir 2` header and the `symbols` preamble, with the **same entry spelling** as the HIR table — `type <H> = struct|union "<name>" (opaque | [packed] [aligned N] [pack N] { <type> [@N | ~N] [bits N] [packed], … })` — and names it everywhere else as `type <H>`. Both tables are written and completed through one owner of what a definition carries (`src/core/types/type_lattice/composite_definition.hpp`), so the two tiers cannot drift on a layout channel. `.dssir` v1 spelled every composite inline at every use, with its field types only; a v1 text is refused by the version check, and an inline `struct "N" {…}` in a v2 module is refused by name.
+**The MIR text follows the same rule since `.dssir` v2.** A `.dssir` module defines every composite ONCE, in a `types` section between the `dssir <version>` header and the `symbols` preamble, with the **same entry spelling** as the HIR table — `type <H> = struct|union "<name>" (opaque | [packed] [aligned N] [pack N] { <type> [@N | ~N] [bits N] [packed], … })` — and names it everywhere else as `type <H>`. Both tables are written and completed through one owner of what a definition carries (`src/core/types/type_lattice/composite_definition.hpp`), so the two tiers cannot drift on a layout channel. `.dssir` v1 spelled every composite inline at every use, with its field types only; a v1 text is refused by the version check, and an inline `struct "N" {…}` in a v2 module is refused by name.
 
 **`packed`** (after the name) is the whole-composite packed flag; **`@<byteOffset>`** and **`~<align>`** after a field are explicit offsets and per-member alignment (all-or-none, and mutually exclusive with each other); a trailing **`packed`** on one field is the per-member packed attribute.
 
 ### 2.7 `enum`
 
-A nominal enum with a quoted name and an **optional** underlying-type selector:
+A nominal enum with a quoted name and an **optional** underlying-type selector, a **fixed** underlying type, or a **chosen** compatible type:
 
 ```
 enum "Name"
 enum "Name" : <underlyingKeyword>
+enum "Name" fixed <primitive>
+enum "Name" chosen <primitive>
 ```
 
 Examples:
@@ -171,9 +173,16 @@ Examples:
 ```
 enum "Color"              // underlying defaults to i32
 enum "Flags" : u8         // underlying = u8
+enum "Wide" fixed i64 "long"   // C23 `enum Wide : long` — the FIXED underlying type, `long`
+enum "Small" fixed u8     // C23 `enum Small : unsigned char`
+enum "Hue" chosen u32 "unsigned int"   // C `enum Hue { RED, GREEN }` — no fixed type; the language chose `unsigned int`
 ```
 
 When the `: <keyword>` suffix is present it is a **primitive type keyword**, the same spelling the primitive table prints — never a `TypeKind` *ordinal*, which is version-fragile and is deliberately not serialized anywhere in this format. A keyword the table does not carry is refused by name, with the accepted set. The suffix is omitted when the underlying type is the `i32` default, and the reader's default matches. Enumerator *names* are not stored in the type record — only the nominal name and the underlying kind round-trip here.
+
+**`fixed <primitive>`** spells an enumeration whose underlying type is FIXED (C23 6.7.3.3, `enum E : long`). The fixed type is part of the enumeration's identity — `enum E : long` and `enum E` are different types (C23 6.2.7p1), and a fixed `enum E : int` is not the plain `enum E` either — so it is written as the TYPE the clause named, with the primitive rule's optional vocabulary tag (`i64 "long"` is `long`; a bare `i64` is the anonymous 64-bit integer), and the underlying kind is that type's: no `:` follows. The `.dsshir` text carries the tag; the `.dssir` text, which carries no vocabulary tag on any primitive, writes `fixed i64` and reads back a fixed enumeration over the anonymous type. Added in `.dsshir` v6 and `.dssir` v3.
+
+**`chosen <primitive>`** spells the integer type an enumeration WITHOUT a fixed underlying type is compatible with, when its language CHOSE one (C 6.7.2.2p4, C23 6.7.3.3p13 — C's choice rule is the `enumerationCompatibleTypes` ladders of `c.lang.json`). It is a different record from `fixed` with the same type — `enum E : unsigned int` and an `enum E` whose compatible type is `unsigned int` are different types (C23 6.2.7p1) — hence a different word; the kind, the tag and the `.dssir` spelling (`chosen u32`) follow `fixed`'s rules. An enumeration of a language that declares no choice keeps the plain `enum "N"` / `enum "N" : <kind>` form. Added in `.dsshir` v6 and `.dssir` v3, with `fixed`.
 
 ### 2.8 `fn` — function signatures
 
@@ -255,6 +264,6 @@ This is the IR type-text for the C signature `int puts(const char *)`: a functio
 | struct / union (standalone text) | `struct "N" { T, ... }`, `union "N" { T, ... }`, `struct "N" opaque`, `struct "N" rec 1 { ptr<rec 1> }` |
 | recursive back-reference (standalone text) | `rec <H>` (in type position — names an enclosing `rec <H>` composite) |
 | composite reference (`.dsshir` module only) | `type <H>` (names entry `H` of the module's `types` section; refused by name in a standalone text) |
-| enum | `enum "N"`, `enum "N" : u8` |
+| enum | `enum "N"`, `enum "N" : u8`, `enum "N" fixed i64 "long"`, `enum "N" chosen u32 "unsigned int"` |
 | function | `fn(T, ...) -> R`, `fn(...) -> R cc <name>` |
 | extension | `ext "name" (T, ...)`, `ext "name" (...) [n, ...]` |

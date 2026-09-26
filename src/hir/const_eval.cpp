@@ -265,7 +265,23 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     if (!inner.value.has_value()) return inner;
     TypeId const targetTy = hir.typeId(expr);
     if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
-    TypeKind const toK = interner.kind(targetTy);
+    // ★ P68 round 12 (lane `cs`, the enumeration P1): a cast TO an ENUMERATED type
+    // converts as a cast to the integer type it is compatible with — C23 6.7.3.3p16:
+    // "Conversion to the enumerated type has the same semantics as conversion to the
+    // underlying type"; C 6.7.2.2p4 for one without a fixed type. The record's
+    // scalars[0] is that integer's kind for a fixed, a chosen and a kind-only record
+    // alike (the same projection the static-data producer's `materialScalarKind`
+    // makes). Without it every `enum E g = A;` (a constant is `int` now, so the
+    // initializer carries this Cast) became a runtime initializer the producer refuses
+    // — and `enum E g = 2;` already did before the P1 (✔MEASURED on the fold-7 build,
+    // `.temp/probe/ectG`, K_NoMatchingObjectFormat), where every reference folds it.
+    TypeKind toK = interner.kind(targetTy);
+    if (toK == TypeKind::Enum) {
+        auto const sc = interner.scalars(targetTy);
+        if (sc.empty() || sc[0] < 0 || sc[0] >= static_cast<std::int64_t>(TypeKind::Count_))
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        toK = static_cast<TypeKind>(sc[0]);
+    }
     // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a cast TO `_BitInt(N)` folds via the
     // wrap-aware bignum `convertTo(N, signed)` (mod-2^N) — narrow AND wide — so
     // `_Static_assert((_BitInt(4))15 + 1 == 0)` and `(_BitInt(40))2000000 * …` fold

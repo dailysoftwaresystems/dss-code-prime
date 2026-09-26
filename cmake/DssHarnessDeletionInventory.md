@@ -458,11 +458,15 @@ session trusts first.
 
 | Where | What it says | Wave | What must survive |
 |---|---|---|---|
-| `.claude/skills/dss-cycle/SKILL.md`, the macOS `run_gate_guard` paragraph of the CI-measurement block | `remote-leg.sh` passes `-LE repo-guard` while `wsl-leg.sh` defaults `DSS_LEG_GUARDS` to `1`; the 2207 / 2206 / 2167 split | `W-sync` | that a repo-guard is HOST-INDEPENDENT, so its leg set is a CONFIG decision, and a leg that skips it cannot see a guard-only defect — **re-derive the set from the run in front of you** |
-| `.claude/skills/dss-cycle/SKILL.md`, the *"local gate cannot substitute for CI"* hard-stop bullet | the same two script names | `W-sync` | the same principle |
+| `.claude/skills/dss-cycle/references/round-gate-and-ci.md`, the macOS `run_gate_guard` paragraph of the CI-measurement block | `remote-leg.sh` passes `-LE repo-guard` while `wsl-leg.sh` defaults `DSS_LEG_GUARDS` to `1`; the 2207 / 2206 / 2167 split | `W-sync` | that a repo-guard is HOST-INDEPENDENT, so its leg set is a CONFIG decision, and a leg that skips it cannot see a guard-only defect — **re-derive the set from the run in front of you** |
+| `.claude/skills/dss-cycle/references/triggers-and-hard-stops.md`, the *"local gate cannot substitute for CI"* hard-stop bullet | the same two script names | `W-sync` | the same principle |
 
-Both blocks already carry a `⏳ SCRIPT-ERA` marker naming this wave, so the deletion commit can find
-them by grepping `SCRIPT-ERA`.
+✔RE-VERIFIED 2026-09-25 (P68 round 12's independent audit): neither block names the two scripts any
+more and neither carries a `⏳ SCRIPT-ERA` marker — the skills rewrite kept each block's principle
+(the fourth column; both files state that a repo-guard is HOST-INDEPENDENT) and dropped the
+script-era text. So these two rows need no deletion-wave edit; they stay as the record of what had
+to survive. (Until that date this paragraph claimed both blocks carried the marker, which no block
+did, so a deletion commit grepping `SCRIPT-ERA` would have found nothing and read it as done.)
 
 ★ **The reason worth carrying into the commit message:** that leg-set divergence existed BECAUSE three
 hand-written scripts each decided it independently, with different defaults — which is why the skill
@@ -1027,7 +1031,7 @@ or inside WSL, a real compile), so every leg runs them.
 - `pragma-profile-census.py` could not decode `c.lang.json` under cp1252 and did not find `dsscp.exe`;
   `corpus-census.py` died with `NameError` at import in a tree without `parse_diagnostic.cpp`.
 - `sqlite_compiler`'s candidate search missed every DssHarness build directory (`build/<processor>-<toolchain>-
-  <config>`), while the benchmark searched them on its own: one owner now (`search_roots`), both callers.
+  <config>`), while the benchmark searched them on its own: one owner now (`search_roots`); since 2026-09-26 its one caller is the benchmark (`select_dss`), because the driver takes only a named compiler.
 - `cmake-import` wrote paths relative to the PROJECT ROOT into a manifest that may live elsewhere (its own runner
   writes into the step's build directory): relative now to the MANIFEST's directory, absolute outside it.
 - The driver's provenance count excluded CR-only changes by `diff --ignore-cr-at-eol --name-only`, which still lists

@@ -1301,6 +1301,29 @@ private:
             case TypeKind::Enum: {
                 out_ += "enum ";
                 out_ += quote(in.name(t));
+                // ★ A FIXED UNDERLYING TYPE IS SPELLED AS THE TYPE IT IS (v6, P68
+                // round 12, lane `cs`). `enum E : long` and `enum E` are different
+                // types (C23 6.2.7p1), and the enum record keeps the type the
+                // clause NAMED — its vocabulary identity (`long`, not only i64),
+                // which C 6.3.1.1p1 ranks the enumeration by. So the fixed form is
+                // `enum "E" fixed <the declared type>`, printed by the primitive arm
+                // below, tag included: `enum "E" fixed i64 "long"`. The kind is the
+                // declared type's, so no `:` follows. The reader rebuilds the same
+                // record, and a module that spells it reads back the same TypeId.
+                if (TypeId const declared = in.enumDeclaredUnderlying(t); declared.valid()) {
+                    out_ += " fixed ";
+                    pushType(declared);
+                    return;
+                }
+                // ★ …and the compatible type the language CHOSE for an enumeration
+                // without a fixed one (the enumeration P1, same round): `enum "E"
+                // chosen u32 "unsigned int"`. A different record from `fixed` with
+                // the same type (C23 6.2.7p1), so a different word.
+                if (TypeId const chosen = in.enumChosenUnderlying(t); chosen.valid()) {
+                    out_ += " chosen ";
+                    pushType(chosen);
+                    return;
+                }
                 auto sc = in.scalars(t);
                 if (!sc.empty() && static_cast<TypeKind>(sc[0]) != TypeKind::I32) {
                     std::string_view const n = primName(static_cast<TypeKind>(sc[0]));
@@ -5935,6 +5958,36 @@ private:
         // only the nominal name + underlying TypeKind round-trip here.
         if (kw == "enum") {
             std::string name = takeStr();
+            // ★ `fixed <primitive> ["tag"]` — a FIXED underlying type (v6, P68 round
+            // 12, lane `cs`; the printer's arm says why it is spelled as a type). It
+            // is read by the primitive arm's own rule, so the vocabulary tag rides
+            // exactly as it does anywhere else (`fixed i64 "long"`), and the kind is
+            // the declared type's. A name that is not a primitive is refused with the
+            // accepted set, as the `:` form's is.
+            if (acceptKeyword("fixed")) {
+                std::string const n = takeIdent();
+                TypeKind const k = orMalformed(kHirTextPrimTable, n,
+                                               "fixed enum underlying type", TypeKind::I32);
+                TypeId const declared = peekIs(Tk::Str)
+                                            ? interner_.primitive(k, lex_.take().text)
+                                            : interner_.primitive(k);
+                out = interner_.enumType(name, k, declared);
+                return true;
+            }
+            // ★ `chosen <primitive> ["tag"]` — the compatible type a language CHOSE
+            // for an enumeration without a fixed underlying type (the enumeration
+            // P1, same round), read by the same primitive rule.
+            if (acceptKeyword("chosen")) {
+                std::string const n = takeIdent();
+                TypeKind const k = orMalformed(kHirTextPrimTable, n,
+                                               "chosen enum compatible type", TypeKind::I32);
+                TypeId const chosen = peekIs(Tk::Str)
+                                          ? interner_.primitive(k, lex_.take().text)
+                                          : interner_.primitive(k);
+                out = interner_.enumType(name, k, chosen,
+                                         TypeInterner::EnumUnderlyingOrigin::Chosen);
+                return true;
+            }
             TypeKind underlying = TypeKind::I32;
             if (accept(Tk::Colon)) {
                 // ⚠ FAIL LOUD. This read an ordinal and kept `I32` when it fell

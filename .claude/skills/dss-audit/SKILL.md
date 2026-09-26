@@ -6,7 +6,7 @@ description: >
   audit, review, verify, judge, sanity-check, or double-check a cycle, a commit range, a branch, or
   the current state; asks "is this actually clean / did that really land / can we trust this green";
   asks to record an audit baseline before a /loop; or asks to design-review a plan before it is built
-  (dss-cycle Step 3.5) — even if they never say "skill". NEVER builds, NEVER edits src/, tests, or
+  (dss-cycle step 4) — even if they never say "skill". NEVER builds, NEVER edits src/, tests, or
   config; its only write authority is markdown (plan hygiene and the test-hardening ratchet). NOT for
   implementing or fixing anything (use dss-cycle) and NOT for systematic plan reconciliation (use
   dss-plan-sweep). Its integrity comes from not having written the code it judges, and from holding
@@ -24,7 +24,8 @@ role: **dss-cycle acts; dss-audit judges.**
 
 - After a cycle, a commit range, or a `/loop` run — verify what actually landed.
 - Before a `/loop`, to record a precise baseline the next audit measures from.
-- To design-review a plan *before* it is built (`dss-cycle` Step 3.5) — see the pre-build variant.
+- To design-review a plan *before* it is built (`dss-cycle` step 4, the design-audit — Step 3.5 in the
+  older numbering some of its references still use) — see the pre-build variant.
 
 **Not this skill:** implementing or fixing → `dss-cycle`. Systematic plan reconciliation →
 `dss-plan-sweep`.

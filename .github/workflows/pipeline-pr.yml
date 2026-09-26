@@ -250,6 +250,16 @@ jobs:
         # clang-tools-19 carries clang-scan-deps-19 which CMake needs for
         # C++20 modules dependency scanning; libclang-rt-19-dev carries
         # the ASan/UBSan runtime libs for clang-19.
+        #
+        # llvm-19 (added 2026-09-25, synced from DSS.DevOps a0d4abf): clang-19's
+        # sanitizer runtime probes /usr/bin/llvm-symbolizer-19 DIRECTLY, without
+        # consulting PATH, and that binary ships only in the llvm-19 package. The
+        # unversioned `llvm` below is llvm-18 on noble (1:18.0), and none of
+        # clang-19, clang-tools-19 or libclang-rt-19-dev depends on llvm-19, so
+        # the symbolizer was ABSENT and a sanitizer report printed bare addresses
+        # under "WARNING: invalid path to external symbolizer!"
+        # (D-CI-ASAN-LEG-SYMBOLIZER-PACKAGE-MISMATCH). Installing llvm-${VER}
+        # puts it where the runtime probes, inside the clang-* case only.
         # This keeps the ASan leg on libstdc++-13 — same stdlib as the
         # GCC release leg, so tests exercise the production stdlib rather
         # than libc++ (which has its own LLVM-18 alloc-dealloc ABI bug).
@@ -271,7 +281,7 @@ jobs:
           case "${{ matrix.cc }}" in
             clang-*)
               VER="${{ matrix.cc }}"; VER="${VER#clang-}"
-              PKGS+=("clang-tools-${VER}" "libclang-rt-${VER}-dev")
+              PKGS+=("clang-tools-${VER}" "libclang-rt-${VER}-dev" "llvm-${VER}")
               ;;
           esac
           sudo apt-get update -y

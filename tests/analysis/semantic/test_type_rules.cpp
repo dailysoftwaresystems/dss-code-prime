@@ -418,14 +418,21 @@ TEST(TypeRules, IsAssignableIntToEnumWhenGated) {
     EXPECT_FALSE(isAssignable(in, color, i32))
         << "RED-ON-DISABLE: ungated, int does not flow into enum";
 }
-// SCOPE GUARD: the arm admits enum↔INT only — NEVER enum↔DIFFERENT-enum, even
-// gated (a cross-enum assignment is a C constraint violation that stays loud).
-TEST(TypeRules, IsAssignableDifferentEnumsRemainMismatch) {
+// P68 round 12 (lane `cs`, the enumeration P1): enum ← a DIFFERENT enum is admitted
+// when gated. This test used to pin the opposite, calling the pair "a C constraint
+// violation" — it is not: C 6.5.16.1p1 admits arithmetic ← arithmetic and an
+// enumerated type is an integer type (6.2.5p17); gcc 13.3.0, clang 18.1.3, mingw-w64
+// 13.2.0 and MSVC 19.51 all build `e = f;` (lane `cs`'s `.temp/probe/eec`,
+// [[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]). Ungated, the pair
+// stays distinct — the red-on-disable control.
+TEST(TypeRules, IsAssignableBetweenTwoEnumerationsWhenGated) {
     auto in = makeInterner();
     auto a  = in.enumType("A", TypeKind::I32);
     auto b  = in.enumType("B", TypeKind::I32);
-    EXPECT_FALSE(isAssignable(in, a, b, {}, false, false, /*enum=*/true))
-        << "different enums stay a mismatch even gated (no over-admission)";
+    EXPECT_TRUE(isAssignable(in, a, b, {}, false, false, /*enum=*/true))
+        << "enum ← another enum converts as integer ← integer does";
+    EXPECT_FALSE(isAssignable(in, a, b))
+        << "RED-ON-DISABLE: ungated, two enumerations stay distinct";
     EXPECT_TRUE(isAssignable(in, a, a, {}, false, false, /*enum=*/true))
         << "same enum is the identity path";
 }

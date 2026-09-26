@@ -9,21 +9,32 @@ description: >-
   logs on its host with no verb to read them. The program documents itself in its own header; this
   file declares only how a runner starts it and what witnesses that it ran.
   Bring the kept file back with `dssharness sync --legs <leg> --pull <its path>`.
-inputs:
-  path:
-    description: 'a path RELATIVE to the leg tree, e.g. .harness-config/runs/<run id>/<leg>/build.log'
-    required: true
-  lines:
-    description: 'how many trailing lines of a file, or newest entries of a directory'
-    default: '200'
-  match:
-    description: 'a Python regular expression; a file prints only its lines that match it'
-    default: '.'
+  The SELF-TEST is a manual step, so it runs on ANY leg's host with no build:
+  `dssharness run read-leg-path --legs <leg> --manual-step self-test`. What the redactor may keep
+  or must hide depends on the host's own account and machine names, so a host is where it is
+  proven (✔MEASURED 2026-09-25: only the arm64 VPS legs ran it red, and there ctest was the one
+  way to reach it, which needs a build).
 steps:
   - name: read
     workingDirectoryRoot: action
+    inputs:
+      path:
+        description: 'a path RELATIVE to the leg tree, e.g. .harness-config/runs/<run id>/<leg>/build.log'
+      lines:
+        description: 'how many trailing lines of a file, or newest entries of a directory'
+        default: '200'
+      match:
+        description: 'a Python regular expression; a file prints only its lines that match it'
+        default: '.'
     run: |
       python3 ./read-leg-path.py --tree "{treeDir}" --path "{path}" --lines "{lines}" --match "{match}" --out "{stepBuild}/read-leg-path.txt"
     outputs: [read-leg-path.txt]
     persist: true
     successPattern: 'read-leg-path: OK '
+
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./read-leg-path.py --selftest
+    successPattern: '^read-leg-path selftest: OK\b'

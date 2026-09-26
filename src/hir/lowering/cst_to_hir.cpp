@@ -811,6 +811,22 @@ struct Lowerer {
                                                  interner.stripVolatile(toElem[0]))) {
                     admit = true;
                 }
+                // ★ P68 round 12 (lane `cs`, the enumeration P1): two POINTERS whose
+                // pointees are compatible through an ENUMERATION — `unsigned *pu = &e;`
+                // for an `enum E` compatible with `unsigned int`, the reverse, and the
+                // same pair one or more pointer levels down (C 6.2.7p1, 6.7.6.1p2). The
+                // REALIZE half of the Ptr/Ptr admission `isAssignable` gained through
+                // the ONE relation, `sameOrEnumCompatible`: without it the store reached
+                // MIR typed for the other pointee (✔MEASURED on the P1 trial build,
+                // 2026-09-24: three `I_StoreValueTypeMismatch … Ptr<Enum 'Pos'> into …
+                // Ptr<U32>` for enum_compatible_type_gnu_rule). The same representation-
+                // free Bitcast the arms above share; volatile is stripped on both sides
+                // for the reason the VLA arm strips it.
+                else if (sameOrEnumCompatible(interner,
+                                              interner.stripVolatile(fromElem[0]),
+                                              interner.stripVolatile(toElem[0]))) {
+                    admit = true;
+                }
                 if (admit) {
                     HirNodeId const cast = builder.makeCast(
                         child.id, target, HirFlags::Synthetic);
@@ -944,9 +960,12 @@ struct Lowerer {
         // kinds), so this arm runs BEFORE the gate below — which would
         // otherwise pass an enum-typed mismatch straight through uncoerced.
         // The semantic tier already admitted the assignment (isAssignable's
-        // enum arm); coerce only realizes it. Different-enum mismatches
-        // never reach here as a coerce target (semantic rejects them).
-        if ((ck == TypeKind::Enum && isArithmeticCore(tk))
+        // enum arm); coerce only realizes it. ★ P68 round 12 (lane `cs`, the
+        // enumeration P1): so is enum ← a DIFFERENT enum now — C 6.5.16.1p1
+        // admits arithmetic ← arithmetic, and every reference builds `e = f;`
+        // ([[D-C-AN-ASSIGNMENT-BETWEEN-TWO-ENUMERATED-TYPES-IS-REFUSED]]) — and it
+        // is realized by the same width-exact Cast.
+        if ((ck == TypeKind::Enum && (isArithmeticCore(tk) || tk == TypeKind::Enum))
             || (tk == TypeKind::Enum && isArithmeticCore(ck))) {
             HirNodeId const cast =
                 builder.makeCast(child.id, target, HirFlags::Synthetic);
@@ -7068,11 +7087,10 @@ struct Lowerer {
                 StmtFrame fr{.kind = StmtFrame::Kind::SehTry, .node = n};
                 NodeId finallyArm{};
                 if (!sehPrologue(n, fr.n0, fr.condNode, fr.n1, finallyArm)) {
+                    // Anchored: D-CSUBSET-SEH-FINALLY (open since its 2026-09-24 re-verdict: MSVC runs the handler).
                     unsupported(finallyArm.valid() ? finallyArm : n,
                                 "SEH '__try { } __finally { }' termination handlers "
-                                "are not supported (D-CSUBSET-SEH-FINALLY: "
-                                "trigger-gated — no shipped consumer; sqlite uses "
-                                "only __except)");
+                                "are not supported yet");
                     stmtResult = errorNode(n);
                     return;
                 }
@@ -7080,9 +7098,8 @@ struct Lowerer {
                 return;
             }
             if (k == "SehLeave") {
-                unsupported(n, "SEH '__leave' is not supported "
-                               "(D-CSUBSET-SEH-LEAVE: trigger-gated — no shipped "
-                               "consumer; sqlite does not use it)");
+                // Anchored: D-CSUBSET-SEH-LEAVE (open since its 2026-09-24 re-verdict: MSVC runs it).
+                unsupported(n, "SEH '__leave' is not supported yet");
                 stmtResult = errorNode(n);
                 return;
             }
@@ -8807,14 +8824,9 @@ struct Lowerer {
             auto const folded = evalCstConstInt(valueNode);
             if (folded.has_value() && *folded == 0) return;   // a null pointer constant
         }
-        std::string_view text = tree().text(valueNode);
-        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
-            text.remove_suffix(1);
-        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
-            text.remove_prefix(1);
         emitHAt(diagnosedConversionCode(cls), DiagnosticSeverity::Warning, valueNode,
                 diagnosedConversionSentence(cls, DiagnosedConversionSite::Initialization,
-                                            text));
+                                            tree().text(valueNode)));
     }
 
     // The scalar arm of a brace element: lower, report a diagnosed conversion, then
@@ -8969,6 +8981,10 @@ struct Lowerer {
     // the postfix classifier `postfixFlattenPlan`.
     [[nodiscard]] SymbolId vlaObjectOperandSymbol(NodeId operand) {
         NodeId cur = operand;
+        // P68 round 12 (lane `cs`): the indirections (subscripts and unary `*`) consumed
+        // on the way to the root — a POINTER to a variable-length array answers after
+        // exactly one of them (`sizeof *p`, `sizeof p[i]`: the pointee), see below.
+        int indirections = 0;
         for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
             if (isToken(cur)) return SymbolId{};   // a bare non-identifier token operand
             // VLA C3: a postfix subscript (`a[0]`, `a[i][j]`) — descend the BASE
@@ -8981,47 +8997,72 @@ struct Lowerer {
                 if (postfixFlattenPlan(cur, baseN, subscriptN, e)
                         == PostfixFlatten::Index
                     && baseN.valid()) {
+                    ++indirections;
                     cur = baseN;
                     continue;
                 }
             }
             // Classify children: SUB-EXPRESSION nodes vs. a direct identifier token.
-            // (Operator/punctuation tokens — `(`, `)`, `,`, `?` — are neither.)
+            // (Operator/punctuation tokens — `(`, `)`, `,`, `?` — are neither; the unary
+            // operator that DEREFERENCES is counted, the language's own `Deref` target.)
             NodeId identTok{}, sub{};
             int subCount = 0;
+            bool derefHere = false;
             for (NodeId c : visible(cur)) {
                 if (isToken(c)) {
                     if (sem.identifierToken.valid()
-                        && tree().tokenKind(c).v == sem.identifierToken.v)
+                        && tree().tokenKind(c).v == sem.identifierToken.v) {
                         identTok = c;
+                    } else if (auto const it = unOp_.find(tree().tokenKind(c).v);
+                               it != unOp_.end()
+                               && cfg.unaryOps[it->second].target == "Deref") {
+                        derefHere = true;
+                    }
                 } else {
                     ++subCount;
                     sub = c;
                 }
             }
+            if (derefHere) ++indirections;
             // Terminal: a bare identifier operand (no sub-expressions). Resolve it to a
-            // VLA OBJECT via the symbol's own DECLARED type (stamp-independent + precise)
-            // — this rejects a VLA-yielding-but-non-object operand like `sizeof *p` (the
-            // identifier `p` is a pointer whose pointee is a VLA). VLA C3: accept
-            // `typeContainsVla` too so a FIXED-outer VLA object (`int a[5][n]` — declared
-            // type array(vlaArray,5), not isVlaArray) is a valid `sizeof a` object.
+            // VLA OBJECT via the symbol's own DECLARED type (stamp-independent + precise).
+            // VLA C3: accept `typeContainsVla` too so a FIXED-outer VLA object (`int
+            // a[5][n]` — declared type array(vlaArray,5), not isVlaArray) is a valid
+            // `sizeof a` object.
+            // ★ P68 round 12 (lane `cs`): and a POINTER to a variable-length array reached
+            // through EXACTLY ONE indirection — `sizeof *p`, `sizeof p[i]` — whose operand
+            // is the pointee, the size the pointer froze as its row stride at its own
+            // declaration (`storePtrToVlaStride`, or the typedef's copied down): the MIR
+            // SizeOf arm reads the SAME `(p, pointee)` slot the pointer's arithmetic
+            // steps by. This used to be rejected here on purpose ("a VLA-yielding-but-
+            // non-object operand") and then refused at the static fold; gcc 13.3.0, clang
+            // 18.1.3 and mingw-w64 13.2.0 answer the pointee's size (✔MEASURED 2026-09-24,
+            // lane `cs`'s `.temp/probe/vtp`). Deeper indirections through a pointer stay
+            // unrecorded, and so stay refused loudly by that fold.
             if (subCount == 0) {
                 if (!identTok.valid()) return SymbolId{};
                 SymbolId const sym = model.symbolAt(identTok);
                 SymbolRecord const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
-                return (rec != nullptr
-                        && (interner.isVlaArray(rec->type)
-                            || interner.typeContainsVla(rec->type)))
-                           ? sym
-                           : SymbolId{};
+                if (rec == nullptr) return SymbolId{};
+                if (interner.isVlaArray(rec->type) || interner.typeContainsVla(rec->type))
+                    return sym;
+                if (indirections == 1 && interner.kind(rec->type) == TypeKind::Ptr) {
+                    auto const pointee = interner.operands(rec->type);
+                    if (!pointee.empty()
+                        && (interner.isVlaArray(pointee[0])
+                            || interner.typeContainsVla(pointee[0])))
+                        return sym;
+                }
+                return SymbolId{};
             }
-            // Transparent grouping wrapper (parens / operand / postfix): exactly ONE
-            // sub-expression and no stray identifier — descend. Anything else (≥2
-            // sub-expressions = a comma/ternary/binary composite, or an identifier
-            // alongside a sub-expression) is NOT a direct object reference → reject: the
-            // caller records nothing and the existing fail-loud static path stands (so
-            // `sizeof(b, a)` / `sizeof(0, a)` fail loud rather than silently loading a
-            // VLA's frozen size — C decays a composite operand to a pointer).
+            // Transparent grouping wrapper (parens / operand / postfix / a unary `*` over
+            // a sub-expression): exactly ONE sub-expression and no stray identifier —
+            // descend. Anything else (≥2 sub-expressions = a comma/ternary/binary
+            // composite, or an identifier alongside a sub-expression) is NOT a direct
+            // object reference → reject: the caller records nothing and the existing
+            // fail-loud static path stands (so `sizeof(b, a)` / `sizeof(0, a)` fail loud
+            // rather than silently loading a VLA's frozen size — C decays a composite
+            // operand to a pointer).
             if (subCount == 1 && !identTok.valid()) { cur = sub; continue; }
             return SymbolId{};
         }
@@ -9236,6 +9277,15 @@ struct Lowerer {
             builder.makeSizeOf(track(builder.makeTypeRef(elem), node), sizeType,
                                HirFlags::Synthetic),
             node);
+        // P68 round 12 (lane `cs`): an element that is STILL variable-length after
+        // the type name's own suffixes came from a typedef (`typedef int V[n];
+        // sizeof(V[3])`) — its size is the one that typedef FROZE (C17 6.7.8p3),
+        // so the element's SizeOf reads that slot at MIR, exactly as `sizeof v`
+        // of a `V v;` object does. No typedef found is left to the static fold,
+        // which keeps refusing loudly.
+        if (interner.isVlaArray(elem) || interner.typeContainsVla(elem))
+            if (SymbolId const owner = vlaTypedefOwnerOfTypeName(scan); owner.valid())
+                sizeofVlaSymAcc.emplace_back(elemSize.v, owner.v);
         HirNodeId const total =
             product.valid()
                 ? track(builder.makeBinaryOp(HirOpKind::Mul, product, elemSize,
@@ -9336,12 +9386,97 @@ struct Lowerer {
             NodeId operandN{};
             for (NodeId c : visible(scan))
                 if (tree().kind(c) == NodeKind::Internal) { operandN = c; break; }
+            SymbolId recorded{};
             if (operandN.valid())
                 if (SymbolId const opSym = vlaObjectOperandSymbol(operandN);
-                    opSym.valid())
+                    opSym.valid()) {
                     sizeofVlaSymAcc.emplace_back(so.v, opSym.v);
+                    recorded = opSym;
+                }
+            // P68 round 12 (lane `cs`): the TYPE form with no suffix of its own
+            // (`lowerVlaTypeNameSizeof` declined) — `sizeof(V)`, `sizeof(volatile V)`
+            // of a variable-length typedef. Its size was FROZEN when the typedef was
+            // reached (C17 6.7.8p3), so the SizeOf reads the owning typedef's slot,
+            // keyed by shape at MIR, as `sizeof v` of a `V v;` object does.
+            // ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/vt` vt09 / vt11): gcc
+            // 13.3.0 and clang 18.1.3, both modes, answer V's frozen size; DSS
+            // refused "sizeof of an incomplete or un-sizeable type".
+            if (!recorded.valid() && !valueForm)
+                if (SymbolId const owner = vlaTypedefOwnerOfTypeName(scan); owner.valid())
+                    sizeofVlaSymAcc.emplace_back(so.v, owner.v);
         }
         return {so, u64};
+    }
+
+    // P68 round 12 (lane `cs`): the typedef that OWNS the frozen size of the
+    // variable-length level a TYPE NAME reaches through a typedef name — the name
+    // its specifier writes (the semantic tier records which typedef each such
+    // token names), through the chain rule `vlaTypedefOrigin` already keeps
+    // (`typedef R S;` names R's slot). The walk skips every array suffix: a bound
+    // expression may name a variable or a cast's typedef, and neither is the
+    // type's head. Iterative and budgeted; InvalidSymbol when no typedef name in
+    // the head owns a variable-length type.
+    [[nodiscard]] SymbolId vlaTypedefOwnerOfTypeName(NodeId typeName) {
+        if (!sem.declarators.has_value() || !sem.identifierToken.valid())
+            return SymbolId{};
+        DeclaratorConfig const& dc = *sem.declarators;
+        std::vector<NodeId> stack{typeName};
+        for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (isToken(c)) {
+                if (tree().tokenKind(c).v != sem.identifierToken.v) continue;
+                SymbolId const named = model.typedefNamedAt(c);
+                if (!named.valid()) continue;
+                SymbolRecord const* rec = model.recordFor(named);
+                if (rec == nullptr) continue;
+                SymbolId const owner =
+                    rec->vlaTypedefOrigin.valid() ? rec->vlaTypedefOrigin : named;
+                SymbolRecord const* ownerRec = model.recordFor(owner);
+                if (ownerRec != nullptr && ownerRec->type.valid()
+                    && (interner.isVlaArray(ownerRec->type)
+                        || interner.typeContainsVla(ownerRec->type)))
+                    return owner;
+                continue;
+            }
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == dc.arraySuffixRule.v) continue;
+            auto const kids = visible(c);
+            for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+        }
+        return SymbolId{};
+    }
+
+    // P68 round 12 (lane `cs`): `t` with every VARIABLE-LENGTH level's length replaced by one — the `_Alignof`
+    // operand of a type whose layout a runtime length would otherwise deny (see `lowerAlignof`). ITERATIVE over
+    // the array spine (no recursion proportional to the declarator's depth): each level's qualifier skin and
+    // type-level alignment are read off the level itself and re-applied to the rebuilt level, fixed lengths are
+    // kept, and the element under the last array level is kept as it is. An INCOMPLETE level (no length at all)
+    // returns `t` unchanged: that type has no alignment to give, and the MIR fold keeps refusing it loudly.
+    [[nodiscard]] TypeId withEveryRuntimeLengthOne(TypeId const original) {
+        struct Level {
+            std::int64_t  length;
+            std::int64_t  skinBits;
+            std::uint32_t skinAlign;
+        };
+        std::vector<Level> levels;
+        TypeId t = original;
+        while (t.valid() && interner.kind(t) == TypeKind::Array) {
+            auto const sc  = interner.scalars(t);
+            auto const ops = interner.operands(t);
+            if (sc.empty() || ops.empty()) return original;
+            bool const runtime = interner.isVlaArray(t);
+            if (!runtime && sc[0] < 0) return original;
+            levels.push_back(Level{runtime ? std::int64_t{1} : sc[0],
+                                   interner.qualifierBits(t), interner.typeAlignOverride(t)});
+            t = ops[0];
+        }
+        for (std::size_t i = levels.size(); i-- > 0;) {
+            t = interner.array(t, levels[i].length);
+            if (levels[i].skinBits != 0 || levels[i].skinAlign != 0)
+                t = interner.qualified(t, levels[i].skinBits, levels[i].skinAlign);
+        }
+        return t;
     }
 
     // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `_Alignof unary-expression` →
@@ -9406,6 +9541,17 @@ struct Lowerer {
         if (!sized.valid()) {
             return exprError(node, "_Alignof operand did not resolve to a type");
         }
+        // P68 round 12 (lane `cs`): the alignment of a type holding a VARIABLE-LENGTH array level. C 6.5.3.4p3 gives
+        // an array type its element type's alignment and does not evaluate the operand, so the answer is static
+        // even where the length is not — but the MIR fold reads it through a LAYOUT, and a runtime-sized level has
+        // none. An array's alignment never depends on its length, so the operand that reaches MIR is the same type
+        // with every runtime length replaced by one: every level, qualifier skin and type-level alignment (a
+        // typedef's `aligned`) kept, so the layout answers exactly what the variable-length type would.
+        // ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/vt` vt15 / vt16): gcc 13.3.0 and clang 18.1.3, at
+        // -std=c17 -pedantic-errors and -std=c2x, give `_Alignof(int)` for `_Alignof(int[n])` and for a VLA
+        // typedef's name; DSS refused both ("_Alignof of an incomplete or un-alignable type").
+        if (interner.isVlaArray(sized) || interner.typeContainsVla(sized))
+            sized = withEveryRuntimeLengthOne(sized);
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         // `size_t`, the same declared entry `lowerSizeof` mints (C 6.5.3.4p5).
         TypeId const u64 = synthesizedType(sem.alignofResultType, TypeKind::U64);
@@ -11690,6 +11836,10 @@ struct Lowerer {
     // correct here for the same reason it is correct for a direct call: the
     // declaration says the callee does not return.
     [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
+        // P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE): GNU
+        // `__builtin_unreachable()` terminates like a direct noreturn call.
+        if (builder.kind(id) == HirKind::BuiltinCall)
+            return static_cast<BuiltinLowering>(builder.payload(id)) == BuiltinLowering::Unreachable;
         if (builder.kind(id) != HirKind::Call) return false;
         auto const kids = builder.children(id);
         if (kids.empty() || builder.kind(kids.front()) != HirKind::Ref) return false;

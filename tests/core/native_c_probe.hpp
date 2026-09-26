@@ -219,22 +219,27 @@ struct ProbeResult {
 #endif
 }
 
-// The tail of a captured log, folded into a failure detail.
+// The tail of a captured log, folded into a failure detail. `producer` names what wrote
+// the log — a build, unless the caller says otherwise (the developer-environment entry
+// names its vcvars64.bat). The bytes are carried as they were written, in the console's
+// code page, like any tool output this file captures.
 //
 // ★ THE THREE OUTCOMES ARE KEPT APART — unreadable, empty, and present are three
 //   different facts about a failed build, and collapsing them into "" would put the
 //   reader back where this whole file started.
-[[nodiscard]] inline std::string tailOf(fs::path const& p, std::size_t maxLines) {
+[[nodiscard]] inline std::string tailOf(fs::path const& p, std::size_t maxLines,
+                                        std::string_view producer = "build") {
+    std::string const who{producer};
     std::ifstream in{p};
     if (!in) {
-        return "\n  (no build output: the capture log `" + p.string()
+        return "\n  (no " + who + " output: the capture log `" + p.string()
              + "` could not be opened, so WHY it failed is not known here)";
     }
     std::vector<std::string> lines;
     for (std::string l; std::getline(in, l);) lines.push_back(l);
-    if (lines.empty()) return "\n  (the build command produced NO output at all)";
+    if (lines.empty()) return "\n  (the " + who + " command produced NO output at all)";
     std::size_t const from = lines.size() > maxLines ? lines.size() - maxLines : 0;
-    std::string out = "\n  --- build output, last " + std::to_string(lines.size() - from)
+    std::string out = "\n  --- " + who + " output, last " + std::to_string(lines.size() - from)
                     + " of " + std::to_string(lines.size()) + " line(s) ---";
     for (std::size_t i = from; i < lines.size(); ++i) out += "\n  " + lines[i];
     return out;
@@ -393,6 +398,57 @@ namespace internal {
 // ⚠ `/d` ON EVERY cmd.exe STARTED HERE: an AutoRun command (the `Command Processor`
 // registry key) would otherwise run before the capture and again before every tool line —
 // a host setting deciding what environment a witness measured.
+//
+// ★★★ THE ENTRY STARTS FROM WHAT THE PARENT WAS BEFORE ITS OWN ENTRY. A process started
+// from a developer environment — a gate leg imports vcvars64 into the shell that runs
+// ctest — hands that environment to this entry, and vcvars64 does not replace what an
+// earlier entry added: it PREPENDS again. ✔MEASURED 2026-09-24 on the Windows gate host:
+// PATH 2,655 → 4,328 → 6,001 → 7,674 characters over three nested entries, INCLUDE,
+// LIB, LIBPATH and EXTERNAL_INCLUDE growing alike, and the entry from 7,674 dies inside
+// VsDevCmd: cmd.exe prints its line-too-long message (a line expanded past its 8,191
+// characters), then a syntax error, and exits 255 before `set` runs. A gate chain that
+// imported vcvars64 three times into one PowerShell reddened six native witnesses
+// NATIVE-PROBE-ENVIRONMENT-FAILED that way, and this file could not say why: the entry's
+// `>nul 2>&1` had thrown cmd's two lines away. PAST the limit it is worse, because it is
+// silent: cmd.exe expands a variable longer than 8,191 characters to NOTHING, so an entry from
+// such a parent SUCCEEDS with every inherited PATH directory dropped (✔MEASURED from Git Bash,
+// whose longer PATH put three nested entries at 8,387 characters: the entry left 1,486). The
+// undo below cures both for a parent that entered before; for one whose OWN PATH is past the
+// limit nothing can, and the entry refuses the environment rather than hand it on (the check
+// at the end of `enterMsvcEnvironment`).
+//
+// So the batch first undoes a prior entry the way VsDevCmd's own `-clean_env` does
+// (vsdevcmd_end.bat), keyed on `__VSCMD_PREINIT_PATH` — the variable vsdevcmd_start.bat
+// keys its capture on, set by every entry and never overwritten by a nested one:
+//   * it clears the four variables that name an installation — vsdevcmd_start.bat TRUSTS
+//     an inherited VSINSTALLDIR, so a parent that entered another installation would
+//     otherwise choose the tools this one reports;
+//   * it sets PATH, INCLUDE, LIB, LIBPATH and EXTERNAL_INCLUDE back to their pre-entry
+//     values and CLEARS the ones that had none, as clean_env does. ✔MEASURED: after an
+//     entry from the gate host's shell only `__VSCMD_PREINIT_PATH` is defined, so a
+//     restore of each list "when its PREINIT variable is defined" would have left
+//     INCLUDE, LIB, LIBPATH and EXTERNAL_INCLUDE growing;
+//   * it clears those PREINIT variables, so the entry captures them afresh.
+// Like `-clean_env`, the undo also drops what the parent put on PATH AFTER its own entry —
+// the CI workflow's Ninja and CMake steps run after its `msvc-dev-cmd` step: the entered
+// PATH is the installation's around the pre-entry one. Every tool a native witness runs
+// under it is the installation's own (`cl`, `lib`, `link`) or a program it built.
+// ✔MEASURED: an entry from a three-times-nested parent then leaves every variable a tool
+// reads identical to an entry from the shell; only VsDevCmd's restore bookkeeping (the
+// `__VSCMD_PREINIT_` variables its components add) differs. NOT undone, deliberately: a
+// component's own state — vcvars.bat still honours an inherited VCToolsVersion, as it
+// does for any entry, and in a nest of one installation that IS its default toolset.
+//
+// ★ vcvars64's own output goes to `dss_msvc_environment.log` in `work`, and a failed
+// entry's detail carries its last lines. The ENTERING cmd.exe runs WITHOUT `/u` so that
+// log is in ONE encoding: ✔MEASURED, under `/u` cmd's own lines were UTF-16 while a child
+// process's (the `for /F` cmd.exe inside VsDevCmd) were 8-bit, and an 8-bit run of odd
+// length shifts every later line. `set` still prints UTF-16, from a child
+// `cmd /d /u /c set` — ✔MEASURED to print the same variables as the entering cmd.exe's own.
+//
+// ★ `VSCMD_SKIP_SENDTELEMETRY=1` is VsDevCmd.bat's own switch. Without it every entry
+// STARTs a detached powershell.exe that inherits the batch's handles and outlives it —
+// ✔MEASURED, it still held the vcvars log open after cmd.exe had exited.
 
 // What entering vcvars64.bat produced: the environment every MSVC tool this process starts
 // runs in, or WHY there is none.
@@ -433,6 +489,18 @@ namespace internal {
 #else
     return {};
 #endif
+}
+
+// One of this process's own environment variables, or nullopt when it has none (always off
+// Windows, where no entry is ever made). Only NAMES a length in a diagnostic.
+[[nodiscard]] inline std::optional<std::wstring> thisProcessVariable(wchar_t const* name) {
+#if defined(_WIN32)
+    wchar_t const* const v = _wgetenv(name);
+    if (v != nullptr) return std::wstring{v};
+#else
+    (void)name;
+#endif
+    return std::nullopt;
 }
 
 // The NAME of a `NAME=VALUE` entry, for ordering an environment block.
@@ -569,25 +637,72 @@ variableIn(std::vector<std::wstring> const& vars, std::wstring_view name) {
     return std::nullopt;
 }
 
+// What an entry does with a parent that already entered a developer environment.
+// `Undone` is the only mode `msvcEnvironment` uses. `Kept` is the batch without the undo —
+// what every entry was before it — and exists for one caller: the control arm that proves
+// a nested parent still breaks an entry that does not undo it, so the pin beside it
+// cannot pass on a parent too short to break anything.
+enum class PriorEntry : std::uint8_t { Undone, Kept };
+
+// The lists VsDevCmd prepends to and its `-clean_env` restores (vsdevcmd_end.bat), each
+// saved before an entry as `__VSCMD_PREINIT_<name>`.
+inline constexpr char const* kVsDevCmdRestoredLists[] = {"PATH", "INCLUDE", "LIB", "LIBPATH",
+                                                         "EXTERNAL_INCLUDE"};
+
+// The entry batch: undo a prior entry (`prior == Undone`; the block above says what and
+// why), enter `vcvars` with its output kept in `log`, then print the environment it left
+// into `out` as UTF-16.
+[[nodiscard]] inline std::string entryBatch(fs::path const& vcvars, fs::path const& log,
+                                            fs::path const& out, PriorEntry prior) {
+    std::string b = "@echo off\r\n"
+                    "set VSCMD_SKIP_SENDTELEMETRY=1\r\n";
+    if (prior == PriorEntry::Undone) {
+        b += "if not defined __VSCMD_PREINIT_PATH goto :enter\r\n"
+             "set DevEnvDir=\r\n"
+             "set VSINSTALLDIR=\r\n"
+             "set VSCMD_VER=\r\n"
+             "set VisualStudioVersion=\r\n";
+        for (char const* list : kVsDevCmdRestoredLists)
+            b += std::string{"set \""} + list + "=%__VSCMD_PREINIT_" + list + "%\"\r\n";
+        for (char const* list : kVsDevCmdRestoredLists)
+            b += std::string{"set __VSCMD_PREINIT_"} + list + "=\r\n";
+        b += ":enter\r\n";
+    }
+    b += "call \"" + vcvars.string() + "\" > \"" + log.string() + "\" 2>&1\r\n";
+    b += "\"%ComSpec%\" /d /u /c set > \"" + out.string() + "\"\r\n";
+    return b;
+}
+
 // Enter `loc`'s vcvars64.bat and read back the environment it left — the step
-// `msvcEnvironment` runs ONCE per process. `work` receives its two files: the batch, and
-// what `set` printed. Counted by `msvcEnvironmentEntries` before cmd.exe starts, so an
-// entry that fails still counts as the cost it was.
-[[nodiscard]] inline MsvcEnvironment enterMsvcEnvironment(MsvcLocation const& loc,
-                                                          fs::path const&     work) {
+// `msvcEnvironment` runs ONCE per process. `work` receives its three files: the batch,
+// vcvars64's own output, and what `set` printed. `parent` is the environment cmd.exe is
+// handed (null: this process's own, which is all `msvcEnvironment` ever passes). Counted
+// by `msvcEnvironmentEntries` before cmd.exe starts, so an entry that fails still counts
+// as the cost it was.
+[[nodiscard]] inline MsvcEnvironment
+enterMsvcEnvironment(MsvcLocation const& loc, fs::path const& work,
+                     std::vector<std::wstring> const* parent = nullptr,
+                     PriorEntry                       prior  = PriorEntry::Undone) {
     MsvcEnvironment e;
     e.vcvars = loc.vcvars;
     e.status = ProbeStatus::EnvironmentFailed;
     fs::path const bat = work / "dss_msvc_environment.bat";
+    fs::path const log = work / "dss_msvc_environment.log";
     fs::path const out = work / "dss_msvc_environment.txt";
+    // A file left by an earlier entry in the same `work` would be read as THIS entry's
+    // answer — a failed entry reported with a previous one's environment or output.
+    for (fs::path const& stale : {log, out}) {
+        std::error_code ec;
+        fs::remove(stale, ec);
+        if (ec) {
+            e.detail = "could not remove `" + stale.string() + "`, left by an earlier entry: "
+                     + ec.message();
+            return e;
+        }
+    }
     {
-        // `call vcvars` keeps the silencer every copy of this batch had: its banner is
-        // noise, and what it DID is read back below rather than trusted. `set` runs in the
-        // SAME cmd.exe, after it — the environment a tool line used to inherit from it.
         std::ofstream b{bat, std::ios::binary};
-        b << "@echo off\r\n"
-          << "call \"" << loc.vcvars.string() << "\" >nul 2>&1\r\n"
-          << "set > \"" << out.string() << "\"\r\n";
+        b << entryBatch(loc.vcvars, log, out, prior);
         b.close();
         if (!b) {
             e.detail = "could not write the environment-capture batch `" + bat.string() + "`";
@@ -602,19 +717,23 @@ variableIn(std::vector<std::wstring> const& vars, std::wstring_view name) {
     }
     ++msvcEnvironmentEntryTally();
     std::intptr_t const rc =
-        spawnInterpreter(comspec, L"/d /u /c \"\"" + bat.wstring() + L"\"\"", nullptr);
+        spawnInterpreter(comspec, L"/d /c \"\"" + bat.wstring() + L"\"\"", parent);
     if (rc == -1) {
         e.detail = "`" + asciiOf(comspec) + "` could not be started to enter `"
                  + loc.vcvars.string() + "`";
         return e;
     }
+    // What vcvars64 SAID, for every failure below: the reason an entry failed is in its
+    // own output, and a detail without it names the step and not the cause.
+    auto const said = [&] { return tailOf(log, 12, loc.vcvars.filename().string()); };
     // The batch's exit code is NOT the verdict, and deliberately: no copy of this batch
     // ever read vcvars64's own exit code — the tools' exit codes decided, and still do.
     // What `set` printed decides here; the exit code is only reported.
     std::ifstream in{out, std::ios::binary};
     if (!in) {
         e.detail = "cmd.exe entered `" + loc.vcvars.string() + "` (exit "
-                 + std::to_string(rc) + ") but `set` left nothing at `" + out.string() + "`";
+                 + std::to_string(rc) + ") but `set` left nothing at `" + out.string() + "`"
+                 + said();
         return e;
     }
     std::string const bytes{std::istreambuf_iterator<char>(in),
@@ -623,15 +742,50 @@ variableIn(std::vector<std::wstring> const& vars, std::wstring_view name) {
     e.variables = parseSetOutput(bytes, why);
     if (e.variables.empty()) {
         e.detail = "`set` after `" + loc.vcvars.string() + "` (exit " + std::to_string(rc)
-                 + ") did not print an environment into `" + out.string() + "`: " + why;
+                 + ") did not print an environment into `" + out.string() + "`: " + why
+                 + said();
         return e;
     }
     std::optional<std::wstring> const shell = variableIn(e.variables, L"ComSpec");
-    if (!shell || shell->empty() || !variableIn(e.variables, L"PATH")) {
+    std::optional<std::wstring> const path  = variableIn(e.variables, L"PATH");
+    if (!shell || shell->empty() || !path) {
         e.variables.clear();
         e.detail = "the environment `" + loc.vcvars.string() + "` left (exit "
                  + std::to_string(rc) + ", `" + out.string()
-                 + "`) has no ComSpec or no PATH, so no tool could be started in it";
+                 + "`) has no ComSpec or no PATH, so no tool could be started in it"
+                 + said();
+        return e;
+    }
+    // ★★ THE ENTRY MUST KEEP THE PATH IT WAS ENTERED FROM, and a successful exit does not say
+    // it did. cmd.exe expands a variable longer than its 8,191-character line limit to NOTHING,
+    // silently, so from a parent whose PATH is past the limit — with no shorter saved one for
+    // the undo to restore — vcvars64 builds its PATH from an empty one, saves no pre-entry PATH
+    // and exits 0. ✔MEASURED 2026-09-24 from a parent that never entered, PATH 8,607
+    // characters: exit 0, the entered PATH 1,486 characters, the installation's directories
+    // only, System32 gone. vsdevcmd_start.bat saves the PATH it was entered from as
+    // `__VSCMD_PREINIT_PATH`, and an entry that kept it holds that value whole — the one trailing
+    // `;` VsDevCmd's normalization may take off it aside.
+    std::optional<std::wstring> const saved = variableIn(e.variables, L"__VSCMD_PREINIT_PATH");
+    bool kept = saved.has_value() && !saved->empty() && path->find(*saved) != std::wstring::npos;
+    if (!kept && saved && saved->size() > 1 && saved->back() == L';')
+        kept = path->find(saved->substr(0, saved->size() - 1)) != std::wstring::npos;
+    if (!kept) {
+        std::size_t const from = [&]() -> std::size_t {
+            std::optional<std::wstring> const p =
+                parent != nullptr ? variableIn(*parent, L"PATH") : thisProcessVariable(L"PATH");
+            return p ? p->size() : 0;
+        }();
+        e.variables.clear();
+        e.detail = "the environment `" + loc.vcvars.string() + "` left (exit " + std::to_string(rc)
+                 + ", `" + out.string() + "`) did not keep the PATH it was entered from: "
+                 + (saved ? "its PATH (" + std::to_string(path->size())
+                                + " characters) does not hold the pre-entry PATH vcvars64 saved ("
+                                + std::to_string(saved->size()) + " characters)"
+                          : std::string{"vcvars64 saved no pre-entry PATH"})
+                 + ". The PATH it was entered from was " + std::to_string(from)
+                 + " characters; cmd.exe expands a variable longer than its 8,191-character line "
+                   "limit to nothing, so a tool run in this environment would find none of it"
+                 + said();
         return e;
     }
     e.comspec = *shell;
@@ -641,7 +795,7 @@ variableIn(std::vector<std::wstring> const& vars, std::wstring_view name) {
 
 }  // namespace internal
 
-// THE ONE ENTRY. The first call in a process enters `loc`'s vcvars64.bat (writing its two
+// THE ONE ENTRY. The first call in a process enters `loc`'s vcvars64.bat (writing its three
 // files into `work`); every later call returns that same environment without starting
 // anything, and one naming a DIFFERENT vcvars64.bat is refused rather than entered — one
 // process, one developer environment. A location that is not `ok()` is answered with its

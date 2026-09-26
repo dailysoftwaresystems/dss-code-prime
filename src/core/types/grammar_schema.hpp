@@ -436,7 +436,7 @@ struct DSS_EXPORT GrammarSchemaData {
     // never mentioned is absent from `emptySpaceTokens` for the same reason a
     // deliberately-significant one is. The parser needs to tell "declared and
     // NOT trivia" from "never declared", since only the first may override the
-    // core-kind default (see `isSkippableTrivia`).
+    // core-kind default (see `isTriviaToken`, core/types/trivia_token.hpp).
     std::unordered_set<std::uint32_t>                 declaredLexemeTokens;
 
     // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: the set of SchemaTokenId

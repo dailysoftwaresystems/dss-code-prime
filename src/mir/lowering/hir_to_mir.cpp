@@ -252,10 +252,45 @@ struct Lowerer {
     // intermediate VLA row is (sym, rowType) = the runtime stride an index steps by
     // AND `sizeof a[0]`. Materialized once at the decl by `vlaAllocaForLocal`. The MIR
     // SizeOf case Loads (sym, sized-type); `scaleIndexToBytes` Loads (root-sym,
-    // Index-result-type). Cleared per function. `pack` = (uint64(sym)<<32)|typeId.
+    // Index-result-type). Cleared per function. `pack` = (uint64(sym)<<32)|shape.
+    // ★ P68 round 12 (lane `cs`): THE KEY IS THE LEVEL'S UNQUALIFIED SHAPE, NOT THE TYPE THE
+    // CALLER HOLDS. A qualifier never changes a size, and a qualified USE of a variable-length
+    // typedef (`typedef int V[n]; volatile V v;`, `volatile V *p`, `volatile V a[3]`) holds
+    // level types that differ from the ones the typedef froze under — C 6.7.3p10 puts the
+    // `volatile` on the element, so every level's TypeId moves. Keyed by the held TypeId,
+    // every such use missed the typedef's frozen slots and failed loud ("origin froze no
+    // whole-object size slot"); gcc 13.3.0, clang 18.1.3 and mingw-w64 13.2.0 build and run
+    // all of them (✔MEASURED 2026-09-24, lane `cs`'s `.temp/probe/vt`). One symbol's levels
+    // stay distinct under the shape (each has a different number of array levels), so the
+    // key still names exactly one slot. `vlaLevelShape` is the ONE place the shape is
+    // taken; every freezer and every reader asks through this key.
     std::unordered_map<std::uint64_t, MirInstId> vlaStrideSlot;
-    static std::uint64_t vlaSlotKey(std::uint32_t symV, std::uint32_t typeV) {
-        return (static_cast<std::uint64_t>(symV) << 32) | typeV;
+    std::unordered_map<std::uint32_t, TypeId> vlaLevelShapeMemo_;
+    // `levelTy` with every qualifier skin (and type-level alignment) removed from every
+    // array level and from the element under the last one; lengths — fixed, runtime,
+    // incomplete — kept. ITERATIVE over the spine (no recursion proportional to the
+    // declarator's depth); memoized per module, because the interner never re-uses an id.
+    [[nodiscard]] TypeId vlaLevelShape(TypeId levelTy) {
+        if (!levelTy.valid()) return levelTy;
+        if (auto it = vlaLevelShapeMemo_.find(levelTy.v); it != vlaLevelShapeMemo_.end())
+            return it->second;
+        std::vector<std::int64_t> lengths;
+        TypeId t = levelTy;
+        while (t.valid() && interner.kind(t) == TypeKind::Array) {
+            auto const sc  = interner.scalars(t);
+            auto const ops = interner.operands(t);
+            if (sc.empty() || ops.empty()) break;
+            lengths.push_back(sc[0]);
+            t = ops[0];
+        }
+        TypeId shape = interner.stripVolatile(t);
+        for (std::size_t i = lengths.size(); i-- > 0;)
+            shape = interner.array(shape, lengths[i]);
+        vlaLevelShapeMemo_.emplace(levelTy.v, shape);
+        return shape;
+    }
+    [[nodiscard]] std::uint64_t vlaSlotKey(std::uint32_t symV, TypeId levelTy) {
+        return (static_cast<std::uint64_t>(symV) << 32) | vlaLevelShape(levelTy).v;
     }
     // FC7 (D-FC7-MEMBER-ACCESS): per-CU memoized struct/union layouts keyed
     // by TypeId.v. `computeLayout` is PURE and a TypeId's layout is
@@ -2825,20 +2860,25 @@ struct Lowerer {
         return i64bin(MirOpcode::Add, ci64(hi), i64bin(MirOpcode::And, diff, m));
     }
 
-    // `2^k` as an F64, for a RUNTIME k ≥ 0, EXACT. One `UIToFP(1 << e)` factor per
-    // 62 bits of range, each factor's exponent clamped into [0, 62] so the chain's
-    // exponents SUM to k whenever k ≤ 62·factors. 62 rather than 63 keeps every
-    // shifted i64 POSITIVE, so the factor is the same value whichever int→float
-    // opcode a future reader expects; a product of powers of two is exact until it
-    // overflows, and an overflow to +inf is the arithmetically correct answer for a
-    // magnitude a `double` cannot hold. `factors` is capped at 18 (18·62 = 1116 >
-    // 1024 = the double exponent ceiling), so a `_BitInt` of any width — up to
-    // `kBitIntMaxWidth` — emits a bounded chain rather than one factor per limb.
-    [[nodiscard]] MirInstId emitPow2F64(MirInstId kI64, std::int64_t maxK) {
-        TypeId const f64 = interner.primitive(TypeKind::F64);
+    // `2^k` as a float of kind `fk` (F64 or F32), for a RUNTIME k ≥ 0, EXACT. One
+    // `UIToFP(1 << e)` factor per 62 bits of range, each factor's exponent clamped
+    // into [0, 62] so the chain's exponents SUM to k whenever k ≤ 62·factors. 62
+    // rather than 63 keeps every shifted i64 POSITIVE, so the factor is the same
+    // value whichever int→float opcode a future reader expects; a product of powers
+    // of two is exact until it overflows, and an overflow to +inf is the
+    // arithmetically correct answer for a magnitude the type cannot hold.
+    // `factors` is capped just past the type's exponent ceiling — 18 for a
+    // `double` (18·62 = 1116 > 1024), 3 for a `float` (3·62 = 186 > 128) — so a
+    // `_BitInt` of any width, up to `kBitIntMaxWidth`, emits a bounded chain rather
+    // than one factor per limb; a k past the cap still overflows to +inf, which is
+    // the right answer there too.
+    [[nodiscard]] MirInstId emitPow2Float(MirInstId kI64, std::int64_t maxK,
+                                          TypeKind fk) {
+        TypeId const fty = interner.primitive(fk);
+        std::int64_t const cap = (fk == TypeKind::F32) ? 3 : 18;
         std::int64_t factors = (maxK + 61) / 62;
-        if (factors < 1)  factors = 1;
-        if (factors > 18) factors = 18;
+        if (factors < 1)   factors = 1;
+        if (factors > cap) factors = cap;
         MirInstId pow = InvalidMirInst;
         for (std::int64_t f = 0; f < factors; ++f) {
             MirInstId const raw = i64bin(MirOpcode::Sub, kI64, ci64(62 * f));
@@ -2846,28 +2886,33 @@ struct Lowerer {
             MirInstId const p2  = i64bin(MirOpcode::Shl, ci64(1), e);
             if (!p2.valid()) return InvalidMirInst;
             std::array<MirInstId, 1> c{p2};
-            MirInstId const fv = mir.addInst(MirOpcode::UIToFP, c, f64);
+            MirInstId const fv = mir.addInst(MirOpcode::UIToFP, c, fty);
             if (!fv.valid()) return InvalidMirInst;
             if (!pow.valid()) { pow = fv; continue; }
             std::array<MirInstId, 2> m{pow, fv};
-            pow = mir.addInst(MirOpcode::FMul, m, f64);
+            pow = mir.addInst(MirOpcode::FMul, m, fty);
             if (!pow.valid()) return InvalidMirInst;
         }
         return pow;
     }
 
-    // wide integer → `double`, CORRECTLY ROUNDED, for any limb count.
+    // wide integer → `double` or `float` (`fk`), CORRECTLY ROUNDED, for any limb
+    // count.
     //
     // ★★ THE ROUNDING ARGUMENT, because "close enough" is the failure mode this
     // whole emitter exists to avoid. The obvious two-step — `(double)hi · 2^64 +
     // (double)lo` — rounds TWICE and can land a full ulp off the correctly-rounded
     // result. Instead the value is first reduced to its top 64 bits with a STICKY
     // bit ORed into the low bit (ROUND-TO-ODD), and only then handed to the
-    // hardware's 64→53 round-to-nearest-even. Round-to-odd at an intermediate
-    // precision p' ≥ p+2 followed by round-to-nearest at p is provably equal to
-    // rounding the exact value once at p (Boldo–Melquiond); here p' = 64 and
-    // p = 53, so 64 ≥ 55 holds with room. The final scaling by 2^shift is exact
-    // (a power of two), so nothing after the single rounding perturbs it.
+    // hardware's round-to-nearest-even into the destination. Round-to-odd at an
+    // intermediate precision p' ≥ p+2 followed by round-to-nearest at p is provably
+    // equal to rounding the exact value once at p (Boldo–Melquiond); here p' = 64,
+    // and p = 53 for a `double` or 24 for a `float`, so p' ≥ p+2 holds for both. The
+    // final scaling by 2^shift is exact (a power of two), so nothing after the
+    // single rounding perturbs it — and it is why a `float` must NOT be reached as
+    // a rounding of the `double` result: that rounds twice (P68 round 12,
+    // D-CSUBSET-INT-TO-F32-CODEGEN; ✔MEASURED, 2^100 + 2^76 + 1 goes to 2^100
+    // through `double` and to 2^100 + 2^77 correctly).
     //
     // Shape, with `sd` = the number of significant bits of the magnitude:
     //     shift = max(sd - 64, 0)
@@ -2880,8 +2925,9 @@ struct Lowerer {
     // the full capacity, sd is 0, shift is 0, the limb is 0, and 0.0 · 1.0 is +0.0.
     // The sign is applied as a multiplication by ±1.0, which is exact and keeps the
     // whole emitter branch-free.
-    [[nodiscard]] MirInstId emitFloatFromWide(MirInstId srcAddr, TypeId wideTy) {
-        TypeId const f64 = interner.primitive(TypeKind::F64);
+    [[nodiscard]] MirInstId emitFloatFromWide(MirInstId srcAddr, TypeId wideTy,
+                                              TypeKind fk) {
+        TypeId const fty = interner.primitive(fk);
         std::int64_t const limbCount = wideLimbCount(wideTy);
         std::int64_t const capacity  = 64 * limbCount;
         std::int64_t const n         = wideIntWidthBits(interner, wideTy);
@@ -2920,12 +2966,12 @@ struct Lowerer {
             i64bin(MirOpcode::Or, loadLimb(limbAddrConst(t, 0)), sticky);
         if (!t0.valid()) return InvalidMirInst;
         std::array<MirInstId, 1> cv{t0};
-        MirInstId d = mir.addInst(MirOpcode::UIToFP, cv, f64);
+        MirInstId d = mir.addInst(MirOpcode::UIToFP, cv, fty);
         if (!d.valid()) return InvalidMirInst;
-        MirInstId const pow = emitPow2F64(shift, capacity);
+        MirInstId const pow = emitPow2Float(shift, capacity, fk);
         if (!pow.valid()) return InvalidMirInst;
         std::array<MirInstId, 2> sc{d, pow};
-        d = mir.addInst(MirOpcode::FMul, sc, f64);
+        d = mir.addInst(MirOpcode::FMul, sc, fty);
         if (!d.valid()) return InvalidMirInst;
         if (!signd) return d;
         // ±1.0 from an INTEGER `1 - 2·signBit`, then one exact multiplication.
@@ -2933,10 +2979,10 @@ struct Lowerer {
             i64bin(MirOpcode::Sub, ci64(1), i64bin(MirOpcode::Mul, ci64(2), sgn));
         if (!sgnI.valid()) return InvalidMirInst;
         std::array<MirInstId, 1> sv{sgnI};
-        MirInstId const sgnF = mir.addInst(MirOpcode::SIToFP, sv, f64);
+        MirInstId const sgnF = mir.addInst(MirOpcode::SIToFP, sv, fty);
         if (!sgnF.valid()) return InvalidMirInst;
         std::array<MirInstId, 2> mm{d, sgnF};
-        return mir.addInst(MirOpcode::FMul, mm, f64);
+        return mir.addInst(MirOpcode::FMul, mm, fty);
     }
 
     // `double` → wide integer, TRUNCATING toward zero (C 6.3.1.4p1), EXACT.
@@ -2988,7 +3034,7 @@ struct Lowerer {
         if (!cur.valid()) return false;
         std::int64_t const top = (limbCount < 16 ? limbCount : 16);
         for (std::int64_t j = top - 1; j >= 0; --j) {
-            MirInstId const scale = emitPow2F64(ci64(64 * j), 64 * j);
+            MirInstId const scale = emitPow2Float(ci64(64 * j), 64 * j, TypeKind::F64);
             if (!scale.valid()) return false;
             MirInstId const q = f64bin(MirOpcode::FDiv, cur, scale);
             if (!q.valid()) return false;
@@ -3943,6 +3989,29 @@ struct Lowerer {
                                        /*payload=*/kAtomicOrderSeqCst,
                                        MirInstFlags::None);
                 }
+                case BuiltinLowering::Unreachable: {
+                    // P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE):
+                    // GNU `__builtin_unreachable()`. Reaching it is undefined
+                    // behaviour and the program asserts it never happens, so the
+                    // open block ENDS here with MIR's own `Unreachable` terminator —
+                    // the one a noreturn call's `Block{ExprStmt(call), Unreachable}`
+                    // produces — which mir_to_lir lowers to the target's declared
+                    // `unreachable` opcode (`ud2` / `brk #0`): a TRAP, never a
+                    // fall-through into whatever the layout puts next. Whatever the
+                    // enclosing expression still emits goes into a fresh DEAD block,
+                    // exactly what the statement driver opens after a sealing
+                    // statement; the unreachable-prune drops it. The terminator's id
+                    // is the (void) expression's result, as Barrier returns its op's.
+                    if (!operands.empty()) {
+                        unsupported(node,
+                            "__builtin_unreachable expects exactly 0 args");
+                        return InvalidMirInst;
+                    }
+                    MirInstId const term = mir.addUnreachable();
+                    MirBlockId const dead = mir.createBlock(StructCfMarker::Linear);
+                    mir.beginBlock(dead);
+                    return term;
+                }
                 case BuiltinLowering::Barrier:
                     // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
                     // a 0-operand, void, side-effecting compiler fence
@@ -4220,7 +4289,7 @@ struct Lowerer {
                     if (auto it = sizeofVlaSymMap->find(node.v);
                         it != sizeofVlaSymMap->end()) {
                         auto slotIt =
-                            vlaStrideSlot.find(vlaSlotKey(it->second, sized.v));
+                            vlaStrideSlot.find(vlaSlotKey(it->second, sized));
                         if (slotIt == vlaStrideSlot.end()) {
                             // The VLA's decl (which materializes the slot) dominates every
                             // use of the object, so the slot MUST exist. Absent ⇒ an
@@ -5438,38 +5507,47 @@ struct Lowerer {
             // cycle. NARROW (N<=64) _BitInt->float rides the container and never gets here.
             if (isFloatingKind(toK)) {
                 // ── D-CSUBSET-INT128-FLOAT-CONV: THE OTHER DIRECTION, ALSO LIVE ──
-                // `emitFloatFromWide` is CORRECTLY ROUNDED at F64 (round-to-odd at
-                // 64 bits, then one hardware rounding to 53 — the argument is on the
-                // emitter). It reads EVERY limb, which is what the old refusal's
-                // "emitScalarFromWide reads only limb 0" objection was about.
+                // `emitFloatFromWide` is CORRECTLY ROUNDED into a `double` or a
+                // `float` (round-to-odd at 64 bits, then ONE hardware rounding into
+                // the destination — the argument is on the emitter). It reads EVERY
+                // limb, which is what the old refusal's "emitScalarFromWide reads
+                // only limb 0" objection was about.
                 //
-                // ⚠ ONLY F64 IS PRODUCED, AND THE OTHERS STAY LOUD FOR THREE
-                // DIFFERENT REASONS — a single "not supported" would hide all three:
-                //   * F32: reachable only as `FPTrunc(F64)`, which ROUNDS TWICE and
-                //     can land outside the two values C 6.3.1.4p2 permits. It is
-                //     also already walled one tier down for a plain 64-bit source
-                //     (D-CSUBSET-INT-TO-F32-CODEGEN has no int→F32 encoding at all),
-                //     so admitting it here would only move the wall, not remove it.
-                //   * F16: the same double-rounding objection, and no encoded form.
-                //   * F80/F128: the long-double deferral — the F64 result cannot be
-                //     widened into extra precision it never had.
-                if (toK != TypeKind::F64) {
+                // ★ F32 IS PRODUCED DIRECTLY SINCE P68 round 12
+                // (D-CSUBSET-INT-TO-F32-CODEGEN): the round-to-odd value converts
+                // straight to a `float` — never through the `double` result, which
+                // would round TWICE — now that the integer→F32 conversion exists one
+                // tier down. ✔MEASURED before: DSS refused `(float)` of an
+                // `__int128`, `unsigned __int128` and `_BitInt(128)`; gcc 13.3.0,
+                // clang 18.1.3 and aarch64-linux-gnu-gcc 13.3.0 convert each
+                // correctly rounded, the double-rounding values included.
+                //
+                // ⚠ THE OTHERS STAY LOUD, EACH FOR ITS OWN REASON (ids here, not in
+                // the message: operator output states the condition and the action):
+                //   * F16: no half-precision conversion is realized on any shipped
+                //     target (the F16 arc, D-LK4-RODATA-PRODUCER-EXOTIC);
+                //   * F80/F128: a `long double` carries more precision than the
+                //     64-bit round-to-odd intermediate keeps, so this emitter's
+                //     argument does not cover it
+                //     (D-C-WIDE-INTEGER-LONG-DOUBLE-CONVERSIONS-REFUSED).
+                if (toK != TypeKind::F64 && toK != TypeKind::F32) {
                     diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
                         std::format(
-                            "conversion from {} to a non-`double` floating type is not "
-                            "supported — only the `double` conversion can be produced "
-                            "with a single correctly-rounded step; narrower targets "
-                            "would round twice and wider ones have no encoded form "
-                            "(D-CSUBSET-INT128-FLOAT-CONV / "
-                            "D-CSUBSET-INT-TO-F32-CODEGEN / D-CSUBSET-LONG-DOUBLE)",
+                            "conversion from {} to this floating type is not "
+                            "supported — a `double` or a `float` destination is "
+                            "produced with one correctly-rounded step, a half-"
+                            "precision one has no conversion on this target, and a "
+                            "`long double` one needs more precision than this "
+                            "conversion keeps; convert to `double` first if that "
+                            "rounding is acceptable",
                             wideIntSpelling(fromTy)));
                     return InvalidMirInst;
                 }
-                MirInstId const d = emitFloatFromWide(operand, fromTy);
+                MirInstId const d = emitFloatFromWide(operand, fromTy, toK);
                 if (!d.valid()) {
                     unsupported(node, std::format(
-                        "{} → `double` conversion could not be emitted "
-                        "(D-CSUBSET-INT128-FLOAT-CONV)", wideIntSpelling(fromTy)));
+                        "{} → floating conversion could not be emitted",
+                        wideIntSpelling(fromTy)));
                     return InvalidMirInst;
                 }
                 return d;
@@ -7134,8 +7212,8 @@ struct Lowerer {
     // fully-FIXED intermediate level is deliberately never slotted (its stride is a
     // compile-time `elementStride`) — so this reports nothing and leaves the judgement
     // to the caller.
-    [[nodiscard]] MirInstId frozenVlaLevelSlot(SymbolId sym, TypeId levelTy) const {
-        auto const it = vlaStrideSlot.find(vlaSlotKey(sym.v, levelTy.v));
+    [[nodiscard]] MirInstId frozenVlaLevelSlot(SymbolId sym, TypeId levelTy) {
+        auto const it = vlaStrideSlot.find(vlaSlotKey(sym.v, levelTy));
         return it == vlaStrideSlot.end() ? InvalidMirInst : it->second;
     }
 
@@ -7156,7 +7234,7 @@ struct Lowerer {
         if (!slot.valid()) return InvalidMirInst;
         std::array<MirInstId, 2> st{val, slot};
         mir.addInst(MirOpcode::Store, st, InvalidType);
-        vlaStrideSlot[vlaSlotKey(to.v, levelTy.v)] = slot;
+        vlaStrideSlot[vlaSlotKey(to.v, levelTy)] = slot;
         return val;
     }
 
@@ -7326,7 +7404,7 @@ struct Lowerer {
                 if (!slot.valid()) return std::nullopt;
                 std::array<MirInstId, 2> stOps{acc, slot};
                 mir.addInst(MirOpcode::Store, stOps, InvalidType);
-                vlaStrideSlot[vlaSlotKey(sym.v, levelTypes[L].v)] = slot;
+                vlaStrideSlot[vlaSlotKey(sym.v, levelTypes[L])] = slot;
             }
         }
         if (!acc.valid()) return std::nullopt;
@@ -7355,7 +7433,7 @@ struct Lowerer {
         if (!slot.valid()) return false;
         std::array<MirInstId, 2> stOps{sz->totalBytes, slot};
         mir.addInst(MirOpcode::Store, stOps, InvalidType);
-        vlaStrideSlot[vlaSlotKey(sym.v, pointeeTy.v)] = slot;
+        vlaStrideSlot[vlaSlotKey(sym.v, pointeeTy)] = slot;
         return true;
     }
 
@@ -7399,8 +7477,11 @@ struct Lowerer {
     // (C99 §6.7.7p2: the size was frozen ONCE, when R was reached; `n` may have changed
     // since — the freeze-once invariant). `a`'s type ENDS in R's (the semantic
     // `declaredTypeDerivesFromAliasHead` gate), so the interned level-type peel yields
-    // the SAME TypeIds R froze under → the copied keys EXACTLY match what `a[i]` /
-    // `sizeof a`(/`sizeof a[0]`) later Load (I3, no depth arithmetic). Only the levels R
+    // the SAME level SHAPES R froze under — the same TypeIds for `R a;`, and for a
+    // QUALIFIED use (`volatile R a;`, whose element C 6.7.3p10 makes volatile) TypeIds
+    // that differ only by qualifiers, which `vlaSlotKey` drops — so the copied keys
+    // EXACTLY match what `a[i]` / `sizeof a`(/`sizeof a[0]`) later Load (I3, no depth
+    // arithmetic). Only the levels R
     // ACTUALLY froze are copied (a FIXED intermediate level — `R[n][5]`'s `int[5]` — was
     // never slotted; its stride is compile-time). The SEAM level (the alias's own whole
     // object) is a VLA by construction, so it is always frozen. ★ `R a[m];` ADDS the
@@ -7416,8 +7497,8 @@ struct Lowerer {
                                                  TypeId ptrTy, HirNodeId anchor) {
         // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
         // each next via ops[0]) down to the non-array base — the SAME walk
-        // `computeVlaByteSize` used when it froze R's slots (so the level TypeIds, hence
-        // the slot keys, are identical).
+        // `computeVlaByteSize` used when it froze R's slots (so the level SHAPES, hence
+        // the slot keys, are identical; the TypeIds too unless the use is qualified).
         std::vector<TypeId> levelTypes;
         TypeId const baseElemTy = peelArrayLevels(ty, anchor, levelTypes);
         if (!baseElemTy.valid()) return InvalidMirInst;   // belt already reported
@@ -8586,7 +8667,7 @@ struct Lowerer {
                                   "runtime row stride cannot be recovered");
                 return InvalidMirInst;
             }
-            auto const it = vlaStrideSlot.find(vlaSlotKey(root.v, elemTy.v));
+            auto const it = vlaStrideSlot.find(vlaSlotKey(root.v, elemTy));
             if (it == vlaStrideSlot.end()) {
                 // A DECLARED VLA object, and a pointer that FROZE a pointee row stride
                 // at its own declaration, each materialize their stride slots at the
@@ -9438,7 +9519,7 @@ struct Lowerer {
     // desync: fail LOUD (never a partial or zero-length fill of a live object).
     [[nodiscard]] bool lowerVlaZeroFill(HirNodeId anchor, SymbolId sym, TypeId ty,
                                         MirInstId dstPtr, MirInstFlags vf) {
-        auto const it = vlaStrideSlot.find(vlaSlotKey(sym.v, ty.v));
+        auto const it = vlaStrideSlot.find(vlaSlotKey(sym.v, ty));
         if (it == vlaStrideSlot.end()) {
             unsupported(anchor, "empty-initializing a variable length array found no "
                                 "whole-object runtime size slot (internal side-table "

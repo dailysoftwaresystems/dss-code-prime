@@ -1,5 +1,23 @@
 # The bar — non-negotiable, re-read every cycle
 
+## Contents
+A. The bar — non-negotiable, re-read every cycle:
+- §A.1 Source / target / linker agnostic — §A.1b reuse the pipeline's existing verbs
+- §A.2 Best long-term solution, no workarounds
+- §A.3 No follow-ups for the hard part — §A.3b the goal is to WORK
+- §A.4 Fail loud
+- §A.5 Strict-assertion tests — aggregate op-count pins · the red-on-disable demonstration needs its
+  own guard · a green red-on-disable is unproven until the mutant was READ · the restored bytes too · a
+  vacuous asm pin can survive both arms · drive the subject's real input path · multi-site contracts ·
+  the real-execution corpus example · cross-target runtime closure
+- §A.6 The full commit gate
+- §A.7 No un-anchored issue — (a) anchor it now · (b) address it properly · (c) the quick-fix rule
+
+This file numbers the steps the older way (Step 6 = `SKILL.md`'s step 7, Step 10 = its step 12); the
+crosswalk is at the top of `workflow-steps.md`.
+
+AMENDED 2026-09-21 by "you do everything. I'm not your babysitter." — where this file sends a FORK to the user as a §B decision, a meaning fork or a documented-behaviour change included, or a new engine mechanism at the plan's design audit, `SKILL.md`'s step 4, the agent now decides it by measurement and the references' own documentation, writes the rationale into the row and reports it veto-able. The gates' three ESCAPE HATCHES stay the operator's — a deferral, §A.7 clause c; carrying a net-open rise, the balance gate's escalation; growing a ratchet baseline, `UNCOVERED_BASELINE` and its kind — because standing orders govern all three: close, do not file; no follow-ups; a ratchet only comes down. Each is a PAUSE with one crisp question, never an agent decision (see SKILL.md, the decision gate)
+
 ## A. The bar — NON-NEGOTIABLE (re-read every cycle)
 
 These hold for every line of code, every test, every commit. A cycle that cannot meet the
@@ -9,7 +27,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    `if (schema.name() == "...")`, `if (arch == "...")`, `if (format == "...")`. Vocabulary
    is config-driven (`.lang.json` / `.target.json` / `.format.json`); the engine walks a
    closed verb set, never a language/CPU/format identity. This is a hard veto: if the only
-   way you see forward is an identity branch, that is a **decision gate** (§B), not a cycle.
+   way you see forward is an identity branch, that is a **decision gate** (§B), not a cycle. AMENDED 2026-09-21 by the decision gate — the only admissible decision here is NO identity branch, because this is a hard veto: the agent designs the config-driven form, and a case it cannot design is pause case a (see SKILL.md)
    - **★★★ 1b. REUSE THE PIPELINE'S EXISTING VERBS — a language-private verb set is the SLOW
      form of this same violation, and the grep above CANNOT SEE IT.** A new source language
      lands by binding its surface names to vocabulary that **already exists** in the
@@ -156,7 +174,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
        test `.exe` **directly** takes the cwd-walk and silently reads whichever tree the shell stands
        in, so a worktree binary run from the shared tree's cwd read the *shared* config and never saw
        the mutant. ⇒ **a config-level
-       red-on-disable MUST run through `ctest`, never a bare `.exe`.**
+       red-on-disable MUST run through `ctest`, never a bare `.exe`.** [→ today that is `dssharness test --filter <regex>`, which runs ctest — one mutant per call](dss-harness.md)
      - **The mutant was COMPILED IN — TO THE WRONG BINARY.** ✔MEASURED 2026-08-20 (cycle P23): the
        mutated predicate was a **header inline**. A narrow build rebuilt the shared library and its
        mtime advanced — the instrument the clause above prescribes, behaving exactly as written
@@ -292,9 +310,11 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      proof" that byte-pinned green then SIGSEGV'd on the native-arm64 leg; `dbf84b0` was the x30
      fix). So such a feature is **NOT `✅ CLOSED` on local-green + byte-pins** — it stays
      *runtime-pending* until the binary has actually **executed on the target** and produced the
-     asserted exit/stdout. Each cross-target has a matching CI leg that builds AND runs `ctest`
-     **natively** — gate the closure on that leg going **green** (push, confirm via next cycle's
-     Step 0 baseline or `gh run watch`, then mark CLOSED; never on the push alone):
+     asserted exit/stdout. Gate the closure on the round's eight-run gate — `{Debug, Release} ×
+     four legs`, whose macOS arm64 and arm64 VPS legs build AND run `ctest` **natively** — going **green**,
+     plus a read of CI (`dssharness check-ci-legs`) when the operator has run it; never on the push alone,
+     and a cycle never triggers CI. The matching CI legs, which run only when the operator adds the
+     `Run Pipes` label:
        - **ARM64-Linux** → the native `ubuntu-24.04-arm` leg (`run-linux-arm64: true`); RISC-V /
          WASM → an emulator-gated leg.
        - **macOS-ARM64** → the **`macos-latest` (Apple Silicon) leg** (`run-macos: true`) — it
@@ -308,7 +328,7 @@ bar **stops and reports** — it never pushes a partial or a workaround.
      one target with no off-Mac emulator** (nothing runs a Mach-O on Windows/Linux) — so from a
      non-Mac host (the loop's usual env) either hand the Mach-O to a Mac for a manual pre-push run
      (a 2-step, **§B** hand-off: present the binary + expected exit/stdout) or rely on the
-     `macos-latest` CI leg to execute it post-push.
+     `macos-latest` CI leg to execute it post-push. SUPERSEDED 2026-09-14 by the eight-run end-of-round gate — the macOS arm64 legs run on the Mac through dssharness, and CI runs only when the operator adds the Run Pipes label (see round-gate-and-ci.md)
      In every case ALSO ship a **host-independent** structural pin that is red-on-disable on
      *every* leg (e.g. the non-leaf frame puts the link register into `savedRegs`), so a
      regression is caught even when the one execution path is unavailable — the execution run is

@@ -1,5 +1,11 @@
 # Repository structure, toolchain, and header map
 
+## Contents
+- 2. Repository structure — 2.1 the real-world repository registry (`real-examples`)
+- 3. Build system and toolchain — 3.1 real non-x86-Windows hardware is reachable over SSH
+- 12. Where to look for canonical examples
+- 14. Quick-reference header map
+
 ## 2. Repository Structure
 
 | Directory | Purpose |
@@ -23,7 +29,7 @@
 | `.plans/` | Internal design records, roadmap, and `_deferred-anchor-registry*.md` |
 | `.harness-config/runner/actions/` | Every program this repository ships, as a DssHarness action — one directory per program holding its `<name>.yml` and every file it runs; started by `dssharness run <name>`. Index: `.harness-config/runner/actions/README.md` |
 | `packaging/` | Build/publish tooling |
-| `build*/` | CMake build dirs (gitignored). Windows Debug gate dir is **`build-dbg`** |
+| `build/` | The one build root (gitignored): DssHarness names each leg's variant-keyed directory under it — `build/x86_64-mingw-gcc-debug`, `build/x86_64-msvc-release` and so on |
 
 ### 2.1 `.harness-config/runner/actions/real-examples/` — the real-world repository registry
 
@@ -34,7 +40,7 @@ runs **that project's own test suite**, classifying every failure.
 
 | Entry | What it proves |
 |---|---|
-| [`.harness-config/runner/actions/real-examples/c/sqlite`](../../../.harness-config/runner/actions/real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The `sqlite3` CLI is ALSO built from full source — **103 TUs**, not the amalgamation (`.harness-config/runner/actions/real-examples/c/sqlite/gen-pe64-manifest.py` emits its manifest). The single-file amalgamation is compiled and run as a separate, much faster probe — an ADDITIONAL check, never a stand-in for the real build |
+| [`.harness-config/runner/actions/real-examples/c/sqlite`](../../../../.harness-config/runner/actions/real-examples/c/sqlite) | SQLite, full upstream source — **189 translation units** through one `--project` manifest → SQLite's own `testfixture` → SQLite's own unit corpus. `full` tier green on three legs — Linux x86_64 **7 / 1,061,830**, Linux arm64-under-qemu **12 / 1,060,828**, Windows pe64 **0 / 979,736** (the pe64 count is lower because platform gating reaches fewer test files, not because anything was skipped). Every residual failure is a matched-control confound. The `sqlite3` CLI is ALSO built from full source — **103 TUs**, not the amalgamation (`.harness-config/runner/actions/real-examples/c/sqlite/gen-pe64-manifest.py` emits its manifest). The single-file amalgamation is compiled and run as a separate, much faster probe — an ADDITIONAL check, never a stand-in for the real build |
 
 Each entry ships **one driver**, `build_and_test.py`, the same program on every host: its legs come
 from the entry's catalogue (`legs.json`, resolved by `harness_legs.py`), never from the host, and a
@@ -65,17 +71,23 @@ Non-negotiable rules for anything under `.harness-config/runner/actions/real-exa
 - **Public include path** is set once via `target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)`
   — header-only additions (`tree_visitor.hpp`, `tree_attrs.hpp`, `tree_views.hpp`, `well_known_names.hpp`)
   don't need explicit registration.
-- **Build commands** (Windows / PowerShell). ⚠ **Use `build-dbg`, not `build`.** `build-dbg` is the
+- **Build and test through DssHarness — never `cmake --build` or `ctest` from a shell** (operator,
+  2026-09-24). Each leg builds in its own variant-keyed directory under `build/`:
+  `build/x86_64-mingw-gcc-debug` for the MinGW Debug leg, `build/x86_64-msvc-release` for MSVC.
+  ⏳ SCRIPT-ERA (superseded 2026-09-24: build and test run through dssharness in variant-keyed directories under build/; see dss-cycle/references/dss-harness.md) `build-dbg` is the
   healthy single-config Ninja + g++ gate dir (no `-C <config>`); the `build` dir is an MSVC
   configuration that goes stale and is bigobj-fragile. Building the wrong one is a recurring
   source of false reds.
   ```powershell
-  cmake --build C:\Source\DailySoftware\dss-code-prime\build-dbg
-  cmake --build C:\Source\DailySoftware\dss-code-prime\build-dbg --target dss_core_test_tree_views
-  ctest --test-dir C:\Source\DailySoftware\dss-code-prime\build-dbg --output-on-failure
+  dssharness build --legs windows-x86_64-debug                          # a build alone
+  dssharness test --legs windows-x86_64-debug --json --time             # baseline or verify: builds first
+  dssharness test --legs windows-x86_64-debug --filter test_tree_cursor # iterate; never concludes
+  dssharness test --legs gate                                           # the round gate: all eight legs
   ```
+  Underneath, for reading only: each leg configures and builds its variant directory with CMake and runs
+  `ctest` there — never type those commands yourself.
   Test targets are `dss_<dir>_test_<x>`; the matching ctest names are `<dir>/test_<x>`.
-  **Run a FULL build (no `--target`) whenever a shared header struct changed.**
+  **Run a FULL build (no `--target`) whenever a shared header struct changed.** ⏳ SCRIPT-ERA (superseded 2026-09-24: `dssharness build` and `test` build the whole leg and take no --target; see dss-cycle/references/dss-harness.md)
 
 ### 3.1 Real non-x86-Windows hardware is reachable over SSH (added 2026-08-04)
 
@@ -92,16 +104,20 @@ they can carry.
 **Contract, and it is not optional:**
 
 - **Connection data is NEVER tracked.** Precedence is CLI parameter → env → `.secrets/<name>.env`
-  → **fail loud naming what to set**. `.secrets/` is gitignored; this repo is slated to go
+  → **fail loud naming what to set**. ⏳ SCRIPT-ERA (superseded 2026-09-16: connection data lives under .harness-config/sshItems/<host>/, read by DssHarness and excluded from git; see dss-cycle/references/dss-harness.md) `.secrets/` is gitignored; this repo is slated to go
   public (PR #37). It holds host names, logins and key **PATHS** — never key material, never
   a password.
 - **Key-based auth only.** Both helpers pass `BatchMode=yes` so ssh **fails** rather than
-  hanging at a prompt. Password auth is not supported by design: it cannot be automated
+  hanging at a prompt. ⏳ SCRIPT-ERA (superseded 2026-09-16: ssh runs through DssHarness's hosts.ssh configuration, which bounds a dead host with connectTimeoutSeconds; see dss-cycle/references/dss-harness.md) Password auth is not supported by design: it cannot be automated
   without putting the secret in the environment, and a credential in a repo script is a
   committed secret.
-- **★★ THE MAC IS A PERSONAL MACHINE, NOT CI. It is usually OFF. ASK THE OPERATOR TO TURN IT
-  ON BEFORE USING IT.** Never wake it, never poll for it. "Cannot reach" is the EXPECTED
-  state, not an error to route around.
+- **★★ THE MAC IS A PERSONAL MACHINE, NOT CI** — which is why the tool, never a loop, touches it. Its
+  availability is PROBED, not asked (operator, 2026-09-21):
+  `dssharness legs --legs macos-arm64-debug,macos-arm64-release` answers whether it is reachable, and a
+  refused connection costs nothing. Its `hosts.ssh` entry in `.harness-config/config.json` says how the
+  tool meets a Mac that sleeps: `wakeWaitSeconds` (how long a command waits for it to wake before skipping
+  its legs), `holdAwakeSeconds` (how long it is held awake after each command) and `keepAwake` (what holds
+  it). "Cannot reach" is an answer to report, not an error to route around.
 - Use a **temp directory** for build experiments on either host; do not scribble in the repo.
 
 **Two measured traps, both already cost time:**

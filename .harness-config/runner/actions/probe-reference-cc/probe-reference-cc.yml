@@ -4,35 +4,41 @@ description: >-
   Compiles ONE probe with the reference compiler of the host the leg runs on (a bare program name
   found on that host's PATH, `cc` by default) and keeps what happened: the compiler's identity, the
   compile's exit code and diagnostics, and, by mode, the program's output and exit code, the
-  assembly it wrote, a dump tool's reading of the object, or what the compiler printed. The probe's
-  source travels as base64 in `src_b64`, never as a file in the tree, because a synced file would
-  overwrite the ONE copy of the repository that host keeps, under whatever lane is using it. Built
+  assembly it wrote, a dump tool's reading of the object or of the linked image, or what the
+  compiler printed. The probe's source travels as base64 in `src_b64`, never as a file in the tree,
+  because a synced file would overwrite the ONE copy of the repository that host keeps, under
+  whatever lane is using it. Built
   2026-09-23 because a Mach-O row's reference, Apple's clang with the SDK's headers, exists only on
   the Mac, and no runner could measure it there. A refused compile is a measurement: the step
   succeeds whenever the probe ran, and the report carries the verdict. The program documents itself
   in its own header; this file declares only how a runner starts it and what witnesses that it ran.
   Bring the kept report back with `dssharness sync --legs <leg> --pull <its path>`.
+  MSVC's cl speaks its own command line (the `msvc` dialect: /c, /FA, /Fe /Fo /Fa); it is on PATH
+  on a leg whose developer environment is Visual Studio (windows-x86_64-release).
 inputs:
   src_b64:
     description: "ONE probe's source text, base64 (standard or URL-safe alphabet, padding optional); this or batch_b64"
     default: ''
   batch_b64:
-    description: 'a BATCH: base64 of a UTF-8 JSON array of {name, src, ext?, cc?, flags?, mode?, dump?}, run in turn in ONE run; this or src_b64'
+    description: 'a BATCH: base64 of a UTF-8 JSON array of {name, src, ext?, cc?, flags?, mode?, dump?, dialect?}, run in turn in ONE run; this or src_b64 (an EMPTY translation unit, a stdout-mode probe, travels only here, as "src": "")'
     default: ''
   ext:
-    description: 'the source file extension: c, s, S or cpp'
+    description: 'the source file extension: c, s, S or cpp (the msvc dialect: c or cpp; cl does not assemble)'
     default: 'c'
   cc:
-    description: "the compiler, a bare program name on the host's PATH (cc, gcc, clang, aarch64-linux-gnu-gcc ...)"
+    description: "the compiler, a bare program name on the host's PATH (cc, gcc, clang, aarch64-linux-gnu-gcc, cl ...)"
     default: 'cc'
   flags:
-    description: 'comma-separated compiler flags, each percent-decoded (a comma inside one flag is %2C); -o is refused'
+    description: 'comma-separated compiler flags, each percent-decoded (a comma inside one flag is %2C); an option placing a product this program reads is refused: -o, and msvc /Fe /Fo /Fa, its deprecated /o or a linker /OUT:'
     default: ''
   mode:
-    description: 'run (compile, link, run), link, object (-c, then dump), asm (-S) or stdout (-E, -dM,-E)'
+    description: 'run (compile, link, run), link, object (-c, msvc /c; then dump), asm (-S, msvc /c /FA) or stdout (-E, -dM,-E; msvc /E or /EP)'
     default: 'run'
   dump:
-    description: 'object mode only: a comma-separated argv of objdump, llvm-objdump, otool, nm, llvm-nm, readelf, llvm-readelf, size or llvm-size'
+    description: 'object, link or run mode (the object, or the linked image): a comma-separated argv of objdump, llvm-objdump, otool, nm, llvm-nm, readelf, llvm-readelf, size, llvm-size or dumpbin'
+    default: ''
+  dialect:
+    description: "the compiler's command-line dialect, gnu or msvc; empty = by the compiler's name (cl and clang-cl speak msvc, every other name gnu)"
     default: ''
 steps:
   - name: probe
@@ -40,7 +46,16 @@ steps:
     # ★ EVERY OPTION IS SPELLED `--name=value`: a flag list, a URL-safe base64 source and a dump argv can each BEGIN
     # with `-`, and argparse reads `--flags -std=c2x` as a second option (exit 2). ✔MEASURED 2026-09-23, first run.
     run: |
-      python3 ./probe-reference-cc.py --tree="{treeDir}" --src-b64="{src_b64}" --batch-b64="{batch_b64}" --ext="{ext}" --cc="{cc}" --flags="{flags}" --mode="{mode}" --dump="{dump}" --out="{stepBuild}/probe-reference-cc.txt"
+      python3 ./probe-reference-cc.py --tree="{treeDir}" --src-b64="{src_b64}" --batch-b64="{batch_b64}" --ext="{ext}" --cc="{cc}" --flags="{flags}" --mode="{mode}" --dump="{dump}" --dialect="{dialect}" --out="{stepBuild}/probe-reference-cc.txt"
     outputs: [probe-reference-cc.txt]
     persist: true
     successPattern: 'probe-reference-cc: OK '
+  # The SELF-TEST, run only where a run names it (`dssharness run probe-reference-cc --legs <leg> --manual-step
+  # self-test`): the same arms ctest runs as `harness/probe_reference_cc_selftest`, in the leg's own environment and
+  # without a build -- so the real cl arms run wherever a leg's developer environment is Visual Studio.
+  - name: self-test
+    manual: true
+    workingDirectoryRoot: action
+    run: |
+      python3 ./probe-reference-cc.py --selftest
+    successPattern: 'probe-reference-cc selftest: OK'

@@ -3125,24 +3125,14 @@ encodeExec(AssembledModule const&    module,
                  codeSignatureRequestKeys(im)));
         return {};
     }
-    // LC_BUILD_VERSION is emitted only on the dynamic exec path
-    // (encodeExecDynamic) — the sole path the runnable arm64-darwin
-    // corpus uses. A static exec carrying `image.buildVersion` is a
-    // legitimate future combination (e.g. an x86_64-darwin static exec
-    // wanting a platform LC), but it has no shipped consumer today; fail
-    // loud here rather than silently drop the platform command.
-    // D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION (trigger: first static
-    // Mach-O exec format that declares image.buildVersion).
-    if (im.buildVersion.has_value()) {
-        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-             "macho::encodeExec: 'image.buildVersion' (LC_BUILD_VERSION) "
-             "is currently emitted only on the dynamic Mach-O exec path "
-             "(encodeExecDynamic). The static path does not yet emit it "
-             "— route through the dynamic exec path or omit "
-             "image.buildVersion. Anchored "
-             "D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION.");
-        return {};
-    }
+    // LC_BUILD_VERSION is emitted on BOTH exec arms, through the one
+    // `appendBuildVersionCommand` chokepoint, whenever the format declares
+    // `image.buildVersion` — D-LK10-ENTRY-MACHO-STATIC-BUILD-VERSION, closed
+    // when the x86_64 darwin exec format came to declare it: this arm used
+    // to REFUSE such a schema, which was correct only while no shipped
+    // static-reachable document carried the key. Placed after the
+    // LC_SEGMENT_64 commands exactly as the dynamic arm places it.
+    bool const emitBuildVersion = im.buildVersion.has_value();
     // The trailing LC_UUID term — D-LK-MACHO-EMITS-NO-LC-UUID. Keyed on the
     // format document exactly as LC_BUILD_VERSION and LC_CODE_SIGNATURE are,
     // because ✔MEASURED on Apple Silicon the reference exposes this command's
@@ -3154,9 +3144,11 @@ encodeExec(AssembledModule const&    module,
     // key, matching `clang -c`.
     bool const emitUuid = im.uuid.has_value();
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        2u + 1u + 1u + im.loadDylibs.size() + 1u + (emitUuid ? 1u : 0u));
+        2u + (emitBuildVersion ? 1u : 0u) + 1u + 1u + im.loadDylibs.size() + 1u
+        + (emitUuid ? 1u : 0u));
     std::size_t const sizeofcmds =
-        kSegCmdPageZeroSize + kSegCmdTextSize + dylinkerCmdSize
+        kSegCmdPageZeroSize + kSegCmdTextSize
+        + (emitBuildVersion ? kBuildVersionCommandSize : 0u) + dylinkerCmdSize
         + kLcMainSize + totalDylibCmdSize + kSymtabCommandSize
         + (emitUuid ? kUuidCommandSize : 0u);
 
@@ -3351,6 +3343,12 @@ encodeExec(AssembledModule const&    module,
     appendU32LE(bytes, 0);                 // reserved1
     appendU32LE(bytes, 0);                 // reserved2
     appendU32LE(bytes, 0);                 // reserved3
+
+    // LC_BUILD_VERSION — after the LC_SEGMENT_64 commands, as on the
+    // dynamic arm, and counted in ncmds / sizeofcmds above.
+    if (emitBuildVersion) {
+        appendBuildVersionCommand(bytes, *im.buildVersion);
+    }
 
     // LC_LOAD_DYLINKER
     {

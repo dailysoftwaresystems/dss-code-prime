@@ -18,7 +18,7 @@ This is the property that distinguishes a *sweep* from a spot-fix. It is proven,
 
 Three habits address plan drift at three different scopes:
 
-- **`dss-cycle` step 8** updates the plans *in the same commit as the code*, per cycle — tactical,
+- **`dss-cycle` step 9** updates the plans *in the same commit as the code*, per cycle — tactical,
   keeps things tidy as work lands.
 - **`dss-audit` §I** fixes trivial staleness it *happens* to trip over — incidental, a side effect of
   auditing something else.

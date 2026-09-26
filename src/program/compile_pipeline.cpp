@@ -2565,7 +2565,7 @@ realizePlatformExternsByOnBinaryName(std::span<std::string const> onBinaryNames,
     // SAME `cc->vaListLayout->strategy`, so the descriptor read here sees the
     // identical type the `#include` path would give it on this (target, format)
     // — Win64's `char*` is 8 bytes and SysV's `__va_list_tag[1]` is 24, and a
-    // corpus row that ever gained a `signatureByDataModel` arm keyed on the
+    // corpus row that ever gained a `signature` variant keyed on the
     // difference would otherwise decode one way here and another way there.
     // Hard-coding one arm would be a platform GUESS in shared substrate; asking
     // the ABI is a fact lookup, with no `if (arch)` and no `if (format)`.

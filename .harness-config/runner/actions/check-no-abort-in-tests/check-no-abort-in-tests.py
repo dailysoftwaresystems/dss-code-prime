@@ -155,12 +155,16 @@ ALLOWLIST: dict[str, str] = {}
 #   this guard, and the per-file count that caught it would NOT have caught the same
 #   site added while one neighbour was fixed — a same-file swap keeps the count. At
 #   a ceiling of 0 that blind spot is gone for the file. 44 -> 39 sites, 24 -> 23 files.
+# ⇣ BURN-DOWN, 2026-09-24 (P68 round 11, lane `xa`): `tests/analysis/semantic/
+#   test_fc3_width_semantics.cpp` came OFF this list -- its one site, the perturbed-schema
+#   helper, now throws with the loader's diagnostics. It was found by a config mutant that
+#   made the shipped C document refusable: the binary died at 0xC0000409 on the helper's
+#   first caller and 33 of its 71 tests lost their verdicts. 39 -> 38 sites, 23 -> 22 files.
 INVENTORY: dict[str, int] = {
     'tests/analysis/compilation_unit/test_compilation_unit.cpp': 2,
     'tests/analysis/compilation_unit/toy_cu_fixture.hpp': 1,
     'tests/analysis/preprocess/test_preprocessor.cpp': 1,
     'tests/analysis/semantic/test_declarator_engine.cpp': 1,
-    'tests/analysis/semantic/test_fc3_width_semantics.cpp': 1,
     'tests/analysis/semantic/test_semantic_analyzer_genericity.cpp': 8,
     'tests/analysis/syntactic/test_corpus.cpp': 1,
     'tests/analysis/syntactic/test_parser_commit_polarity.cpp': 1,

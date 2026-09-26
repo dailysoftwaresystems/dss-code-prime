@@ -3,6 +3,7 @@
 #include "core/substrate/mint_monotonic_id.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/trivia_token.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -518,8 +519,21 @@ void TreeBuilder::closeFrame_(std::uint32_t cookie, bool /*synthetic*/) noexcept
         for (std::uint32_t i = fr.pendingStart; i < pendEnd; ++i) {
             NodeId child = pendingChildren_[i];
             childIndex_.push(child);
-            // Roll the span up from this child onto our node.
-            node.span = SourceSpan::join(node.span, arena_.at(child).span);
+            // Roll the span up from this child onto our node — from a SIGNIFICANT
+            // child only. ★ A NODE'S SPAN ENDS AT ITS LAST TOKEN, NEVER ON TRIVIA.
+            // The parser pushes trivia into whichever frame is open, and a rule
+            // ending in an OPTIONAL tail must look past the trivia to decide the
+            // tail is empty, so that trivia lands inside the rule's frame; joined
+            // in, it ran the node's span (and every `tree.text` of it) on to the
+            // next token — a diagnostic's range, an LSP range and a quoted operand
+            // all carried the whitespace, and code had grown to trim it. The leaf
+            // stays a CHILD (the tree still covers every byte); it just does not
+            // widen the span. A frame with no significant child keeps its empty
+            // opener span.
+            if (!(arena_.at(child).kind == NodeKind::Token
+                  && isEmptySpace(arena_.at(child).flags))) {
+                node.span = SourceSpan::join(node.span, arena_.at(child).span);
+            }
             // OR-reduce HasError. The attach paths already propagated
             // eagerly, but synthetic Missing inserted directly into
             // pendingChildren_ by finish() bypasses attachToCurrentFrame_;
@@ -987,7 +1001,13 @@ void TreeBuilder::pushToken(Token const& tok) {
     // body-mode emissions where the LexerMode declared
     // `defaultToken.flags`). Both sources of flag intent reach the
     // AST; closes the v2-gap-catalog row 3 path end-to-end.
-    const NodeFlags effectiveFlags = resolved.meaning.flagsApplied | tok.flags;
+    // ★ A TOKEN THE PARSER SKIPS AS TRIVIA IS AN `EmptySpace` LEAF, whatever path
+    // resolved it: `isTriviaToken` is the parser's own test, so a whitespace byte
+    // the lexeme table does not list (a form feed, resolved through a synthetic
+    // meaning that carries no flags) is marked like every declared one. The mark
+    // is what keeps it off every node's span (`closeFrame_`) and off the walker.
+    NodeFlags effectiveFlags = resolved.meaning.flagsApplied | tok.flags;
+    if (isTriviaToken(tok, *schema_)) effectiveFlags |= NodeFlags::EmptySpace;
     detail::Node leaf{};
     leaf.kind      = NodeKind::Token;
     leaf.tokenKind = resolved.meaning.id;

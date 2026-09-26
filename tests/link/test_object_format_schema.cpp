@@ -220,6 +220,62 @@ TEST(ObjectFormatSchemaLoader, ShippedFormatsDeclareTheAbiTruthTable) {
     }
 }
 
+// ── P68 round 12 (lane `cs`): the optional `enumCompatibleTypeRule` axis ──
+//
+// Which integer type an enumeration without a fixed underlying type is compatible
+// with is the platform ABI's choice (C 6.7.2.2p4): `int` on the Microsoft x64 ABI
+// ("msvc"), `unsigned int` for a non-negative enumeration on SysV / AAPCS / Darwin
+// ("gnu"). RED-ON-DISABLE: drop the loader's arm and every spelling reads `None`.
+TEST(ObjectFormatSchemaLoader, EnumCompatibleTypeRuleParsesClosedSet) {
+    struct Row { char const* spelling; EnumCompatibleTypeRule expected; };
+    for (Row const row : {Row{"msvc", EnumCompatibleTypeRule::Msvc},
+                          Row{"gnu", EnumCompatibleTypeRule::Gnu}}) {
+        std::string json{kElfMinimal};
+        json.insert(json.rfind('}'),
+                    std::string{",\"enumCompatibleTypeRule\":\""} + row.spelling + "\"");
+        auto r = ObjectFormatSchema::loadFromText(json);
+        ASSERT_TRUE(r.has_value()) << row.spelling;
+        EXPECT_EQ((*r)->enumCompatibleTypeRule(), row.expected) << row.spelling;
+    }
+    // Omission = None (the honest undeclared state — wasm/spirv).
+    auto r = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->enumCompatibleTypeRule(), EnumCompatibleTypeRule::None);
+}
+
+TEST(ObjectFormatSchemaLoader, UnknownEnumCompatibleTypeRuleRejected) {
+    // A typo'd spelling is a HARD reject — silently un-declaring the rule would
+    // turn every enumeration without a fixed type on the format into a spurious
+    // S_EnumCompatibleTypeRuleUndeclared; a non-string is refused the same way.
+    for (char const* bad : {"\"gcc\"", "\"\"", "1"}) {
+        std::string json{kElfMinimal};
+        json.insert(json.rfind('}'), std::string{",\"enumCompatibleTypeRule\":"} + bad);
+        EXPECT_FALSE(ObjectFormatSchema::loadFromText(json).has_value()) << bad;
+    }
+}
+
+TEST(ObjectFormatSchemaLoader, ShippedFormatsDeclareTheEnumCompatibleTypeRule) {
+    // pe64 follows the Microsoft x64 ABI (beside its `msvc_straddle` bit-fields and
+    // `f64` long double); every ELF and Mach-O format the SysV / AAPCS / Darwin one;
+    // the wasm / spirv skeletons OMIT it, as they omit `longDoubleFormat`.
+    struct Row { char const* name; EnumCompatibleTypeRule expected; };
+    for (Row const row : {
+             Row{"pe64-x86_64-windows-exec", EnumCompatibleTypeRule::Msvc},
+             Row{"pe64-x86_64-windows", EnumCompatibleTypeRule::Msvc},
+             Row{"pe64-x86_64-windows-dll", EnumCompatibleTypeRule::Msvc},
+             Row{"pe64-x86_64-windows-staticlib", EnumCompatibleTypeRule::Msvc},
+             Row{"macho64-arm64-darwin-exec", EnumCompatibleTypeRule::Gnu},
+             Row{"macho64-x86_64-darwin", EnumCompatibleTypeRule::Gnu},
+             Row{"elf64-x86_64-linux-exec", EnumCompatibleTypeRule::Gnu},
+             Row{"elf64-aarch64-linux", EnumCompatibleTypeRule::Gnu},
+             Row{"wasm32-v1", EnumCompatibleTypeRule::None},
+             Row{"spirv-1.6", EnumCompatibleTypeRule::None}}) {
+        auto r = ObjectFormatSchema::loadShipped(row.name);
+        ASSERT_TRUE(r.has_value()) << row.name;
+        EXPECT_EQ((*r)->enumCompatibleTypeRule(), row.expected) << row.name;
+    }
+}
+
 // D-LK-ARM64-EXTERN-DATA-ADDR-PIE-GOT (TF-C52): the arm64 relocatable +
 // static-archive formats declare `externAddrBinding: "got"` AND the two
 // GOT-address reloc rows (R_AARCH64_ADR_GOT_PAGE kind 7 nativeId 311,

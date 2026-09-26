@@ -41,6 +41,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: SysV x86_64 `long double` is the x87 80-bit extended format stored 16/16. The axis resolves the c row to F80 — declarations, layout, `sizeof` and value arithmetic all work: the x87 arithmetic landed with D-CSUBSET-LONG-DOUBLE-X87-ARITH (closed 2026-07-18). ⓘ CORRECTED P68 round 8 part 4: this note went on saying arithmetic walled loud after that row closed. OS/format-determined (the same x86_64 target serves pe64's f64), so the axis lives here next to dataModel.",
   "longDoubleFormat": "x87-80",
+  "$enumCompatibleTypeRuleComment": "P68 round 12 (lane `cs`): the integer type an enumeration without a fixed underlying type is compatible with (C 6.7.2.2p4) is the platform ABI's choice — this ABI's (gcc's and clang's documented rule): `unsigned int` when no value is negative, else `int`, wider when the values need it; the language's `enumerationCompatibleTypes.gnu` ladders say which C types that is.",
+  "enumCompatibleTypeRule": "gnu",
 
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention). Once D-LK1-1 closes (real symbol-name thread through HIR→LIR→AssembledFunction), this field will name the entry symbol (e.g. '_start' for Linux/glibc, 'main' for hand-rolled execs) and the walker will resolve it by name. When D-LK10-ENTRY Slice C lands, the linker prepends a synthetic `_start` trampoline as module.functions[0] and the schema's entryPoint names the USER fn (the trampoline's call target).",
   "entryPoint": "",

@@ -41,6 +41,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: Apple arm64 `long double` IS `double` (64-bit IEEE, 8/8) — one of Apple's DOCUMENTED divergences from generic AAPCS64 (which uses binary128; see the elf64-aarch64 formats). The f64 axis collapses the c `long double` row to F64, so the full double machinery serves it end-to-end.",
   "longDoubleFormat": "f64",
+  "$enumCompatibleTypeRuleComment": "P68 round 12 (lane `cs`): the integer type an enumeration without a fixed underlying type is compatible with (C 6.7.2.2p4) is the platform ABI's choice — this ABI's (gcc's and clang's documented rule): `unsigned int` when no value is negative, else `int`, wider when the values need it; the language's `enumerationCompatibleTypes.gnu` ladders say which C types that is.",
+  "enumCompatibleTypeRule": "gnu",
 
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start.",
   "entryPoint": "",

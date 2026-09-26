@@ -115,7 +115,7 @@ TEST(HirText, EmitMinimalModule) {
     HirTextContext ctx;  // no interner/symbols needed for an empty module
     DiagnosticReporter r;
     std::string const text = emitHir(hir, ctx, r);
-    EXPECT_NE(text.find("dsshir 5\nproducer \"\"\n"), std::string::npos);
+    EXPECT_NE(text.find("dsshir 6\nproducer \"\"\n"), std::string::npos);
     EXPECT_NE(text.find("module \"toy\" {"), std::string::npos);
     expectRoundTrip(hir, ctx);
 }
@@ -248,7 +248,7 @@ TEST(HirText, MalformedLiteralValuesFailLoud) {
     // never silently default. Pins the bool/overflow/unknown-tag guards.
     auto parseFails = [](std::string_view body) {
         std::string const text =
-            std::string("dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+            std::string("dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
                         "  function %1 : fn() -> void {\n    block {\n      expr ")
             + std::string(body) + "\n      return void\n    }\n  }\n}\n";
         DiagnosticReporter r;
@@ -554,7 +554,7 @@ TEST(HirText, ParseMalformedEnumReports) {
     // An unrecognized enum name must report, not silently coerce to a default.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  @ffi(link bogus)\n  extern_global %1 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
@@ -566,7 +566,7 @@ TEST(HirText, ParseStuckTokenDoesNotHang) {
     // never spin (regression: the progress guard was dead). Reaching the assert
     // at all proves termination.
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 5\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 6\nproducer \"\"\nmodule \"toy\" {\n  $ % :\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -580,7 +580,7 @@ TEST(HirText, ParseVersionMismatch) {
 
 TEST(HirText, ParseMalformedReports) {
     DiagnosticReporter r;
-    auto res = parseHir("dsshir 5\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
+    auto res = parseHir("dsshir 6\nproducer \"\"\nmodule \"x\" {\n  @@@ garbage\n}\n", CompilationUnitId{1}, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextMalformed), 0u);
 }
@@ -589,7 +589,7 @@ TEST(HirText, ParseUnknownSymbolReports) {
     // %9 referenced but only %1 declared.
     DiagnosticReporter r;
     auto res = parseHir(
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"a\"\n}\nmodule \"toy\" {\n"
         "  global %9 : i32\n}\n",
         CompilationUnitId{1}, r);
     EXPECT_GT(countCode(r, DiagnosticCode::H_TextUnknownName), 0u);
@@ -634,7 +634,7 @@ TEST(HirText, VerifyOnLoadCatchesUntypedExpr) {
 namespace {
 
 std::string moduleWithDecls(std::string_view decls) {
-    return std::string{"dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"}
+    return std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"}
          + std::string{decls} + "}\n";
 }
 
@@ -1686,6 +1686,180 @@ TEST(HirText, VocabularyTagEmitsAndSurvivesReparse) {
     (void)only;
 }
 
+// P68 round 12 (lane `cs`, D-C-AN-ENUMS-FIXED-UNDERLYING-TYPE-LOST-ITS-NAME-IN-THE-CONVERSIONS) — the
+// FIXED UNDERLYING TYPE is part of an enumeration's identity: `enum E : long` and `enum E` are different
+// types (C23 6.2.7p1), and the record keeps the type the clause NAMED, vocabulary included, because C
+// 6.3.1.1p1 ranks the enumeration by it. The decoder reads `fixed <primitive> ["tag"]` into exactly that
+// record: each spelling is its own TypeId, the same spelling is the same TypeId, and a name that is not a
+// primitive is refused with the accepted set.
+TEST(ParseTypeFromText, AFixedUnderlyingTypeIsItsOwnIdentityAndReadsBack) {
+    TypeInterner       interner{CompilationUnitId{14}};
+    TypeRegistry       reg;
+    DiagnosticReporter rep;
+
+    TypeId const longFixed = parseTypeFromText("enum \"E\" fixed i64 \"long\"", interner, reg, rep);
+    ASSERT_TRUE(longFixed.valid());
+    ASSERT_EQ(interner.kind(longFixed), TypeKind::Enum);
+    TypeId const declared = interner.enumDeclaredUnderlying(longFixed);
+    ASSERT_TRUE(declared.valid()) << "the fixed form must read back FIXED";
+    EXPECT_EQ(interner.kind(declared), TypeKind::I64);
+    EXPECT_EQ(std::string{interner.vocabularyName(declared)}, "long")
+        << "the declared type is `long`, not the anonymous 64-bit integer";
+    EXPECT_EQ(declared.v, interner.primitive(TypeKind::I64, "long").v);
+    EXPECT_EQ(static_cast<TypeKind>(interner.scalars(longFixed)[0]), TypeKind::I64);
+
+    // The same spelling is the same type; every other spelling is another type.
+    EXPECT_EQ(parseTypeFromText("enum \"E\" fixed i64 \"long\"", interner, reg, rep).v, longFixed.v);
+    TypeId const plainWide = parseTypeFromText("enum \"E\" : i64", interner, reg, rep);
+    ASSERT_TRUE(plainWide.valid());
+    EXPECT_FALSE(interner.enumDeclaredUnderlying(plainWide).valid());
+    EXPECT_NE(plainWide.v, longFixed.v) << "`: i64` is an enumeration WITHOUT a fixed underlying type";
+    EXPECT_NE(parseTypeFromText("enum \"E\" fixed i64 \"long long\"", interner, reg, rep).v, longFixed.v)
+        << "`enum E : long long` is not `enum E : long`";
+    EXPECT_NE(parseTypeFromText("enum \"E\" fixed i64", interner, reg, rep).v, longFixed.v)
+        << "a fixed type over the anonymous i64 is not one over `long`";
+
+    // `enum E : int` is fixed at the DEFAULT width — still a different type from `enum E`.
+    TypeId const intFixed = parseTypeFromText("enum \"E\" fixed i32", interner, reg, rep);
+    TypeId const plain    = parseTypeFromText("enum \"E\"", interner, reg, rep);
+    ASSERT_TRUE(intFixed.valid() && plain.valid());
+    EXPECT_NE(intFixed.v, plain.v);
+    EXPECT_TRUE(interner.enumDeclaredUnderlying(intFixed).valid());
+    EXPECT_FALSE(interner.enumDeclaredUnderlying(plain).valid());
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // A name that is not a primitive is refused, naming the accepted set.
+    DiagnosticReporter bad;
+    TypeId const refused = parseTypeFromText("enum \"E\" fixed bogus", interner, reg, bad);
+    EXPECT_FALSE(refused.valid());
+    bool named = false;
+    for (auto const& d : bad.all())
+        named = named || d.actual.find("fixed enum underlying type") != std::string::npos;
+    EXPECT_TRUE(named) << "the refusal must say which slot the unknown name was in";
+}
+
+// ... and through a whole module: each enumeration below is emitted, read back and re-emitted
+// byte-identically, and the module read back holds the SAME three records — the fixed one over `long`
+// with its tag, the fixed one at the default width, and the plain one.
+TEST(HirText, AFixedUnderlyingTypeEmitsAndSurvivesReparse) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const longT   = in.primitive(TypeKind::I64, "long");
+    TypeId const wide    = in.enumType("Wide", TypeKind::I64, longT);
+    TypeId const intT    = in.primitive(TypeKind::I32);
+    TypeId const atInt   = in.enumType("AtInt", TypeKind::I32, intT);
+    TypeId const plain   = in.enumType("Plain", TypeKind::I32);
+    TypeId const voidT   = in.primitive(TypeKind::Void);
+    TypeId const sig     = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{
+        b.makeExprStmt(b.makeTypeRef(wide)), b.makeExprStmt(b.makeTypeRef(atInt)),
+        b.makeExprStmt(b.makeTypeRef(plain)), b.makeReturn()});
+    HirNodeId const fn   = b.makeFunction(sig, 1, {}, body);
+    Hir hir = std::move(b).finish(b.makeModule(std::vector<HirNodeId>{fn}));
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("enum \"Wide\" fixed i64 \"long\""), std::string::npos) << text;
+    EXPECT_NE(text.find("enum \"AtInt\" fixed i32"), std::string::npos) << text;
+    EXPECT_NE(text.find("enum \"Plain\""), std::string::npos) << text;
+    EXPECT_EQ(text.find("enum \"Plain\" fixed"), std::string::npos) << text;
+
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{7}, r);
+    ASSERT_TRUE(res->ok) << text;
+    std::vector<TypeId> refs;
+    // Arena slot 0 is the reserved sentinel; real ids run [1, nodeCount()).
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i)
+        if (res->hir.kind(HirNodeId{i}) == HirKind::TypeRef) refs.push_back(res->hir.typeId(HirNodeId{i}));
+    ASSERT_EQ(refs.size(), 3u) << text;
+    TypeInterner const& back = res->interner;
+    TypeId const wideDecl = back.enumDeclaredUnderlying(refs[0]);
+    ASSERT_TRUE(wideDecl.valid());
+    EXPECT_EQ(std::string{back.vocabularyName(wideDecl)}, "long");
+    EXPECT_EQ(back.kind(wideDecl), TypeKind::I64);
+    ASSERT_TRUE(back.enumDeclaredUnderlying(refs[1]).valid());
+    EXPECT_TRUE(back.vocabularyName(back.enumDeclaredUnderlying(refs[1])).empty());
+    EXPECT_FALSE(back.enumDeclaredUnderlying(refs[2]).valid());
+    EXPECT_NE(refs[1].v, refs[2].v) << "a fixed `enum E : int` and a plain `enum E` are two types";
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1) — the compatible type a language CHOSE for an enumeration
+// without a fixed underlying type (C23 6.7.3.3p13) is spelled `chosen <primitive> ["tag"]`: a different
+// record from `fixed` with the same type (C23 6.2.7p1), read by the same primitive rule, the vocabulary tag
+// riding. The same spelling is the same TypeId; `fixed`, `chosen` and the plain form are three types.
+TEST(ParseTypeFromText, AChosenCompatibleTypeIsItsOwnIdentityAndReadsBack) {
+    TypeInterner       interner{CompilationUnitId{15}};
+    TypeRegistry       reg;
+    DiagnosticReporter rep;
+
+    TypeId const chosen = parseTypeFromText("enum \"E\" chosen u32 \"unsigned int\"", interner, reg, rep);
+    ASSERT_TRUE(chosen.valid());
+    ASSERT_EQ(interner.kind(chosen), TypeKind::Enum);
+    TypeId const under = interner.enumChosenUnderlying(chosen);
+    ASSERT_TRUE(under.valid()) << "the chosen form must read back CHOSEN";
+    EXPECT_FALSE(interner.enumDeclaredUnderlying(chosen).valid()) << "…and not fixed";
+    EXPECT_EQ(interner.enumUnderlyingType(chosen).v, under.v);
+    EXPECT_EQ(interner.kind(under), TypeKind::U32);
+    EXPECT_EQ(std::string{interner.vocabularyName(under)}, "unsigned int");
+    EXPECT_EQ(static_cast<TypeKind>(interner.scalars(chosen)[0]), TypeKind::U32);
+
+    EXPECT_EQ(parseTypeFromText("enum \"E\" chosen u32 \"unsigned int\"", interner, reg, rep).v, chosen.v);
+    TypeId const fixedSame = parseTypeFromText("enum \"E\" fixed u32 \"unsigned int\"", interner, reg, rep);
+    ASSERT_TRUE(fixedSame.valid());
+    EXPECT_NE(fixedSame.v, chosen.v)
+        << "`enum E : unsigned int` and an `enum E` compatible with `unsigned int` are two types";
+    TypeId const plain = parseTypeFromText("enum \"E\" : u32", interner, reg, rep);
+    ASSERT_TRUE(plain.valid());
+    EXPECT_NE(plain.v, chosen.v) << "a kind-only record chose nothing";
+    EXPECT_FALSE(interner.enumUnderlyingType(plain).valid());
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    DiagnosticReporter bad;
+    TypeId const refused = parseTypeFromText("enum \"E\" chosen bogus", interner, reg, bad);
+    EXPECT_FALSE(refused.valid());
+    bool named = false;
+    for (auto const& d : bad.all())
+        named = named || d.actual.find("chosen enum compatible type") != std::string::npos;
+    EXPECT_TRUE(named) << "the refusal must say which slot the unknown name was in";
+}
+
+// ... and through a whole module, beside a fixed one: emitted, read back, re-emitted byte-identically.
+TEST(HirText, AChosenCompatibleTypeEmitsAndSurvivesReparse) {
+    TypeInterner in{CompilationUnitId{2}};
+    TypeId const uintT  = in.primitive(TypeKind::U32, "unsigned int");
+    TypeId const hue    = in.enumType("Hue", TypeKind::U32, uintT, TypeInterner::EnumUnderlyingOrigin::Chosen);
+    TypeId const fixedU = in.enumType("FixedU", TypeKind::U32, uintT);
+    TypeId const voidT  = in.primitive(TypeKind::Void);
+    TypeId const sig    = in.fnSig({}, voidT, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{
+        b.makeExprStmt(b.makeTypeRef(hue)), b.makeExprStmt(b.makeTypeRef(fixedU)), b.makeReturn()});
+    HirNodeId const fn = b.makeFunction(sig, 1, {}, body);
+    Hir hir = std::move(b).finish(b.makeModule(std::vector<HirNodeId>{fn}));
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    std::string const text = expectRoundTrip(hir, ctx);
+    EXPECT_NE(text.find("enum \"Hue\" chosen u32 \"unsigned int\""), std::string::npos) << text;
+    EXPECT_NE(text.find("enum \"FixedU\" fixed u32 \"unsigned int\""), std::string::npos) << text;
+
+    DiagnosticReporter r;
+    auto res = parseHir(text, CompilationUnitId{8}, r);
+    ASSERT_TRUE(res->ok) << text;
+    std::vector<TypeId> refs;
+    for (std::uint32_t i = 1; i < res->hir.nodeCount(); ++i)
+        if (res->hir.kind(HirNodeId{i}) == HirKind::TypeRef) refs.push_back(res->hir.typeId(HirNodeId{i}));
+    ASSERT_EQ(refs.size(), 2u) << text;
+    TypeInterner const& back = res->interner;
+    ASSERT_TRUE(back.enumChosenUnderlying(refs[0]).valid());
+    EXPECT_EQ(std::string{back.vocabularyName(back.enumChosenUnderlying(refs[0]))}, "unsigned int");
+    ASSERT_TRUE(back.enumDeclaredUnderlying(refs[1]).valid());
+    EXPECT_NE(refs[0].v, refs[1].v);
+}
+
 // ── inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS) ───────────────────────────
 
 // The BARE BARRIER must render EXACTLY as it did before P5 -- a lone
@@ -2053,7 +2227,7 @@ TEST(HirText, InlineAsmTemplateWithANewlineStillRoundTripsByteIdentically) {
 // exactly the reason that row exists.
 TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
     std::string const text =
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"m\" "
         "operand_kind not_a_form -> lit int 0 : i32 ) }\n"
@@ -2077,7 +2251,7 @@ TEST(HirText, InlineAsmOperandKindThatNamesNoFormIsRefusedWithTheAcceptedSet) {
 // indistinguishable from one analyzed with no target in scope.
 TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
     std::string const text =
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"i\" "
         "operand_kind imm32 -> lit int 7 : i32 ) }\n"
@@ -2107,7 +2281,7 @@ TEST(HirText, InlineAsmImmediateFormOperandSurvivesTheTextTier) {
 // emits and what stored goldens carry. Only the acceptance changed.
 TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
     std::string const text =
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 200 -> lit int 0 : i32 ) }\n"
@@ -2127,7 +2301,7 @@ TEST(HirText, InlineAsmRegisterClassOrdinalOutsideTheEnumIsRefused) {
 // and still round-trips its value.
 TEST(HirText, InlineAsmRegisterClassOrdinalInsideTheEnumStillLoads) {
     std::string const text =
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\nmodule \"toy\" {\n"
         "  function %1 : fn() -> void {\n    block {\n"
         "      inline_asm \"nop %0\" { extended outputs 0 operands ( \"r\" "
         "class 1 -> lit int 0 : i32 ) }\n"
@@ -2231,7 +2405,7 @@ TEST(HirText, ASelfReferentialStructIsOneTableEntryThatNamesItself) {
     // THE WHOLE ARTIFACT, byte for byte: one definition, the self-reference a
     // plain `type 1`, and the signature naming the same handle.
     EXPECT_EQ(text,
-              "dsshir 5\n"
+              "dsshir 6\n"
               "producer \"\"\n"
               "types {\n"
               "  type 1 = struct \"S\" {i32, ptr<type 1>}\n"
@@ -2587,7 +2761,7 @@ TEST(HirText, ATypesEntryOrReferenceTheWriterCannotProduceIsRefusedByName) {
          "  type 1 = struct \"S\" {i32, ptr<rec 1>}\n", "type 1", "DEFINED ONCE"},
     }};
     auto const wrap = [](char const* types, char const* ty) {
-        std::string s{"dsshir 5\nproducer \"\"\n"};
+        std::string s{"dsshir 6\nproducer \"\"\n"};
         if (*types != '\0') s += std::string{"types {\n"} + types + "}\n";
         s += "symbols {\n  %1 \"S\"\n}\nmodule \"toy\" {\n  type_decl %1 : ";
         return s + ty + "\n}\n";
@@ -2897,7 +3071,7 @@ TEST(HirText, AValueLessReturnFollowedByAStatementRoundTripsWithEverySpan) {
 // as the statement it is.
 TEST(HirText, ABareReturnIsRefusedByNameAndNeverTakesTheNextNodeAsItsValue) {
     std::string const head =
-        "dsshir 5\nproducer \"\"\nbuffers {\n  buf 1 \"t.c\"\n}\n"
+        "dsshir 6\nproducer \"\"\nbuffers {\n  buf 1 \"t.c\"\n}\n"
         "symbols {\n  %1 \"g\"\n  %2 \"f\"\n}\nmodule \"toy\" {\n"
         "  extern_function %1 : fn() -> void {\n  }\n"
         "  function %2 : fn() -> void {\n    block {\n";
@@ -2965,7 +3139,7 @@ TEST(HirText, AStatementInAnExpressionSlotIsRefusedByName) {
     for (Arm const& arm : arms) {
         SCOPED_TRACE(arm.what);
         std::string const text =
-            std::string{"dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\n"
+            std::string{"dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"f\"\n}\n"
                         "module \"toy\" {\n  function %1 : fn() -> void {\n    block {\n      "}
             + arm.line + "\n      return void\n    }\n  }\n}\n";
         DiagnosticReporter r;
@@ -3200,7 +3374,7 @@ TEST(HirTextDeepNesting, PastTheFormatDepthLimitTheWriterRefusesByNameAndPoisons
 // treatment of `?`, and it does not need the depth to be exercised.
 TEST(HirTextDeepNesting, ThePoisonTokenTheDepthRefusalWritesIsRefusedOnTheWayBackIn) {
     std::string const text =
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
         "module \"toy\" {\n  ?\n}\n";
     DiagnosticReporter r;
     auto res = parseHir(text, CompilationUnitId{91}, r);
@@ -3208,7 +3382,7 @@ TEST(HirTextDeepNesting, ThePoisonTokenTheDepthRefusalWritesIsRefusedOnTheWayBac
 
     // CONTROL: the identical artifact with a real statement in that slot loads.
     std::string const ok =
-        "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+        "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
         "module \"toy\" {\n  unreachable\n}\n";
     DiagnosticReporter cr;
     auto good = parseHir(ok, CompilationUnitId{92}, cr);
@@ -3239,7 +3413,7 @@ namespace {
 [[nodiscard]] std::string deepChainArtifact(std::size_t depth) {
     std::string s;
     s.reserve(depth * 32 + 256);
-    s += "dsshir 5\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
+    s += "dsshir 6\nproducer \"\"\nsymbols {\n  %1 \"main\"\n}\n"
          "module \"toy\" {\n  function %1 : fn() -> i32 {\n    block {\n      return ";
     for (std::size_t i = 0; i < depth; ++i) s += "binop Add : i32 (";
     s += "lit #0 : i32";

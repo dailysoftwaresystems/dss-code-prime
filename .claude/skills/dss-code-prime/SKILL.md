@@ -47,110 +47,8 @@ hardening (SH1–SH4) are the substrate underneath it, not the whole product.
 
 **Stack:** C++23, CMake 4.0+, FetchContent for `nlohmann/json` 3.12.0 and GoogleTest 1.17.0. Local
 Windows dev uses MinGW GCC 13.2 (ucrt); CI exercises Linux/GCC-13, Linux/Clang-19+ASan,
-Windows/MSVC and macOS/AppleClang on every PR.
-
-## ★★★ TWO ANCHOR REGISTRIES — ONE WORKING LIST AND AN ARCHIVE
-
-Deferrals live in **two** files under `.plans/`. The archive was carved out on 2026-09-01 (*"split
-what's done from what's to be done. this way we adjust our skills to only read what's yet to be
-done"*). ⚠ **It was three until 2026-09-16**, when the harness registry retired with the move to
-`DssHarness` — the production/harness split of 2026-08-25 (*"the priority is real errors, not
-cosmetics"*) survives as a PRIORITY, not as a second document:
-
-| file | holds |
-|---|---|
-| `_deferred-anchor-registry-production.md` | every **still-open** row. Since 2026-09-16 that is ALL of them: the harness registry retired with the move to `DssHarness`, and a defect only we can hit is now either that tool's to fix or a production row here |
-| `_deferred-anchor-registry-done.md` | every **CLOSED** row, in one table. **Nothing here is work.** |
-
-⚠ A row's bucket follows the **DEFECT, never the instrument that found it**. `D-CONFIG-*` and
-`D-DIAG-*` are PRODUCTION deliberately: in this architecture a `.lang/.target/.format.json` document
-IS the compiler's behaviour, and a diagnostic IS its output to a user.
-
-### The row shape is SIX cells, and two of them are declarations
-
-    | Anchor | Priority | Status | Trigger | Closing work | Cross-refs |
-
-`Priority` is `P0`..`P5`; `Status` is `✅ CLOSED` / `🟠 OPEN` / `⏳ GATED` / `🔵 DISCLOSED`, and
-`--status` or a `--status-file` holds one of those cells or its bare word (`closed`, `open`, `gated`,
-`disclosed`); `DssHarness write-anchor` refuses anything else, the retired `🔵 🟠 OPEN (DISCLOSED)`
-included.
-The status cell keeps its glyph because the project's one definition of closed is *"the cell OPENS
-with ✅"* — a column holding the bare word would make that test false for every closed row at once.
-`DISCLOSED` marks OPEN work whose debt PRE-DATES this cycle: it counts as open everywhere and is
-exempt only from the balance gate's net-increase refusal, so writing up a defect you merely FOUND is
-not punished like shipping a new deferral.
-
-### Move on close, and never hand-write a row
-
-- **Closing a row MOVES it** out of its working registry into the archive; reopening moves it back.
-  `check-anchor-balance` fails the tree for a closed row left behind, for an open row filed in the
-  archive, and for a `Status` column that contradicts its own `Trigger` prose.
-- **`dssharness`** is the door — `write-anchor`, `set-anchor`, `read-anchor`, `read-anchors`. The
-  writer takes the FIELDS, so a wrapped anchor id (invisible to every grep, and it mints a false
-  id), an unescaped `|` and a wrong cell count are inexpressible. ⚠ The registry selector is
-  `--pending`, not `--production`; `--done` is unchanged.
-  ⏳ **SCRIPT-ERA, and the predicate has fired:** the eight `.harness-config/runner/actions/anchors/*.{sh,ps1}` launchers
-  this line used to name are DELETED. `.harness-config/runner/actions/anchors/anchors.py` itself survives — it is still the
-  subject of `anchors_selftest_guard` — but it is no longer a door anyone should reach for.
-- ★ **RESOLUTION reads both files; ORIENTATION reads only the working one.** A `D-*` cited in `src/`
-  must resolve wherever its row lives, so resolvers glob `_deferred-anchor-registry*.md`. Anything
-  asking *what is left* reads production and stops there.
-- ⚠ **`--harness` is no longer a flag.** ✔MEASURED 2026-09-16 at `305604f1`: every verb's usage line
-  reads `(--production | --done)`, and nothing else is accepted.
-
-**★★★ THE RULE (operator, 2026-08-25):** *"the priority is always production anchors. ALWAYS.
-harness we fix as we need when we face the problem (NEVER LATER)."*
-
-- **Production is the only queue.** Harness work is never picked *because it is next*.
-- **A harness defect is fixed AT THE MOMENT IT IS FACED** — in that cycle, in that lane. "NEVER
-  LATER" is the whole instruction: a gate that lies, a guard blind to its subject, a script that
-  blocks the work in front of you, gets fixed NOW. Filing it and routing around it is the failure
-  the ruling names. ⚠ **Since 2026-09-16 a defect in `DssHarness` ITSELF is repo-harness's to fix
-  and is reported there** — reproduce it, state the measurement, and never work around it here.
-- **So a harness row is a RECORD, not a backlog entry** — drained by encounter, not by scheduling,
-  and normally written already ✅ CLOSED, naming a fix that landed the same cycle. It goes in the
-  production registry now; there is no separate list for it.
-- ⚠ **This does not repeal "anchor every issue found".** Still file the row: a harness defect fixed
-  silently teaches nobody. The ruling governs what gets **SCHEDULED**, not what gets **RECORDED**.
-- ★ **The measure of a cycle is its production movement.** One whose closures are all harness-shaped
-  rows has hardened the workshop and shipped nothing.
-
-Every RESOLVER globs `_deferred-anchor-registry*.md`, so `check-anchor-balance` and the registry
-guard read both with no flag — but **a human reading the archive is not reading what is left**.
-⚠ `burndown-queue` deliberately does NOT band a row from the archive: it exits loudly instead,
-because a live row filed there is invisible to every queue in the project and quietly coping is how
-an invariant stops being one. ⚠ **Never quote a count from prose; re-derive it**
-(`check-anchor-balance.py --breakdown --denominator registry`) — the P34 handoff's own production
-figure was wrong by 20, and the breakdown is what caught it.
-
-## ★★★★ NO FOLLOW-UPS — A ROW YOU OPEN, YOU CLOSE (operator ruling 2026-08-26)
-
-> *"THIS MUST STOP NOW."* — *"opened anchors that are not closed in the immediate cycle or the
-> next are brutally rare exceptions now, not the rule. found something new that must be done? DO
-> IT."* — *"If I keep seeing anchors rising after implementations or fixes I'll be really
-> pissed!"*
-
-**The full ruling, the gate command, and the shipped-but-unmarked failure class live in
-`dss-cycle` SKILL.md — this is the same rule, restated where a reader of THIS skill will meet it.**
-It was a standing operator ruling from 2026-08-24 (*"every time opens more anchors than closes"*)
-that had never been written into either skill; ✔MEASURED 2026-08-26. That omission is why it kept
-eroding.
-
-- **Close it this cycle, or the next.** Anything longer is a rare exception that must NAME itself
-  as one, with the predicate that will close it.
-- **Found new work? DO IT.** A new row is the LAST RESORT, not the first response to a finding.
-- **Production first, then harness — and a harness defect that BLOCKS you is fixed the moment you
-  face it,** in the lane that hit it, never later. A defect in `DssHarness` itself is reported to
-  repo-harness instead, and still never routed around here.
-- **"Refused but not fixed" is not closed.** Nor is "measured", nor "the row now states the real
-  scope". A row closes when the BEHAVIOUR changed.
-- **NET OPEN must be ≤ 0 for the cycle**, measured — not asserted — against the cycle's own start
-  commit, and reported as closed / opened / net rather than one flattering total:
-  `python .harness-config/runner/actions/check-anchor-balance/check-anchor-balance.py --base <cycle-start-sha> --breakdown`
-- ⚠ **Mark a shipped row ✅ THE MOMENT IT SHIPS.** The gate counts a row OPEN unless its status
-  cell explicitly says closed — correct polarity, never to be softened — so a 🟢 "DESIGN RECORD —
-  SHIPPED" row inflates the OPEN count for free. Three `D-OPT*` rows were doing exactly that on
-  2026-08-26.
+Windows/MSVC and macOS/AppleClang when the operator adds the `Run Pipes` label to a PR — a cycle never
+triggers it, and reads it with `dssharness check-ci-legs`.
 
 ## The rules that actually break things when ignored
 
@@ -168,28 +66,23 @@ Everything else — strongly-typed IDs, immutable post-build `Tree`, `DSS_EXPORT
 `[[nodiscard]]`, comment policy, move semantics, no abbreviations — is in
 `references/testing-and-conventions.md` and is equally mandatory, just less explosive.
 
-### Program conventions (`.harness-config/runner/actions/`)
+## Standing rules kept in the references — one line each
 
-**Layout.** Every program this repository ships is a DssHarness ACTION: one directory per program,
-named for it, holding its `<name>.yml` and every file it runs —
-`.harness-config/runner/actions/[<group>/...]<name>/<name>.{yml,py}`, assets alongside, started by
-`dssharness run <name>` through a `predefinedRunners` entry in `.harness-config/config.json`. There is no
-`scripts/` and no `real-examples/`. Nothing loose in a group directory, no program buried a level
-deeper, no action inside another. A program that another LOADS is loaded as a sibling of the loader's
-own directory, and a program finds the tree it lives in through the one owner, `owning-tree`, never
-by counting `..`. Each action declares its purpose once, in a
-`PURPOSE:` comment line in its `<name>.yml`; both indexes
-(`.harness-config/runner/actions/README.md`, `dss-cycle/references/actions.md`) are generated from it and held to the
-tree — and to the runners — by `scripts_index_guard`.
-
-**No `.sh` and no `.ps1` under `.harness-config/runner/actions` — one Python program per action.**
-Operator ruling 2026-09-21: *"I don't want .sh/.ps1 files inside .harness-config\runner\actions.
-entrypoint is .yml, you can call .py files, BUT NOT .sh/.ps1 please. They are specific per OS. I
-don't want this anymore"*. Every step of every action starts `python3 <file>.py`, and one program
-runs on every host, so there is no twin to keep in step. `scripts_index_guard` refuses a `.sh` or a
-`.ps1` anywhere under the actions root, by name. The 2026-08-19 convention it replaced — a `.ps1`
-twin for every `.sh` that had to reach the Windows leg, their parity checked in review — retired with
-the last pair on 2026-09-21.
+- ★★★ **Two anchor registries** — `_deferred-anchor-registry-production.md` holds every still-open row
+  and is the only one read to see what is left; `_deferred-anchor-registry-done.md` is the archive of
+  CLOSED rows. A row is six cells; closing a row MOVES it; `dssharness` (`write-anchor`, `set-anchor`,
+  `read-anchor`, `read-anchors`) is the door, and a row is never hand-written →
+  [references/anchor-registries.md](references/anchor-registries.md).
+- ★★★ **Production anchors are the priority, ALWAYS** (operator, 2026-08-25); a harness defect is fixed
+  at the moment it is faced, and a defect in `DssHarness` itself is reported to repo-harness → same file.
+- ★★★★ **No follow-ups** (operator ruling 2026-08-26) — a row you open, you close, this cycle or the
+  next; NET OPEN ≤ 0 per cycle; mark a shipped row ✅ the moment it ships → same file.
+- **Every program is a DssHarness action** — one directory per action holding its `<name>.yml` and the
+  files it runs; no `.sh` and no `.ps1` under `.harness-config/runner/actions` (operator ruling
+  2026-09-21); both indexes are generated from each action's `PURPOSE:` line →
+  [references/program-conventions.md](references/program-conventions.md).
+- **Status is never written into this skill** — ask `dss-state`, `.plans/_handoff.md`, or the row
+  itself → [references/workflows-and-status.md](references/workflows-and-status.md) §11.
 
 ## Workflow
 
@@ -227,6 +120,12 @@ The full checklist, including the per-pattern recipes, is in `references/workflo
 - Read `references/workflows-and-status.md` for the step-by-step recipes (adding a type, a typed
   view, a grammar, a diagnostic code, driving `TreeBuilder` from tests), the `.plans/` system, the
   honest done/not-done status, and the contribution checklist.
+- Read `references/anchor-registries.md` before touching a registry row or judging what is left — the
+  two registry files, the six-cell row, move-on-close, the production-first priority, and the
+  no-follow-ups rule.
+- Read `references/program-conventions.md` before adding or changing a program under
+  `.harness-config/runner/actions/` — the one-directory-per-action layout, the `PURPOSE:` line that
+  feeds both indexes, and the no-`.sh`/`.ps1` ruling.
 
 ## Failure modes this skill exists to prevent
 

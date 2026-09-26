@@ -54,6 +54,15 @@ dss_add_test(NAME ffi/test_environ_data_object_binding
 target_link_libraries(dss_ffi_test_environ_data_object_binding
                       PRIVATE nlohmann_json::nlohmann_json)
 
+# ── D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES (P68 round 12, lane `lm`, fold S1) ──
+# <stdlib.h>'s C23 7.24 surface, per executable PAIR: the descriptor read through
+# the real reader with each pair's own facts (every S1 value, accessor, version and
+# mapping), and one probe per pair compiled in process whose image must import the
+# pair's own entry points. Reads images through
+# tests/test_support/image_dependency_table.hpp; needs no json link.
+dss_add_test(NAME ffi/test_stdlib_h_iso_surface
+             SOURCES test_stdlib_h_iso_surface.cpp)
+
 # D-FF1-AR-BSD-VARIANT (P31): the BSD `ar` variant -- "__.SYMDEF" /
 # "__.SYMDEF SORTED" ranlib tables and "#1/N" inline member names. Split from
 # its GNU sibling because it reads REAL committed fixtures (tests/ffi/data/

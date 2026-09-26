@@ -40,6 +40,9 @@ dss_add_test(NAME test_support/test_host_native_target
 # the strict-mode guard would have no witness on that leg at all.
 dss_add_test(NAME test_support/test_arm_verdict_ledger
              SOURCES test_arm_verdict_ledger.cpp)
+# The cross-arch gate's table is JSON (host_translations.hpp).
+target_link_libraries(dss_test_support_test_arm_verdict_ledger
+                      PRIVATE nlohmann_json::nlohmann_json)
 # `runBinary` is the ONE spawn
 # chokepoint both corpus harnesses use, and its capture path used to drain the
 # pipe only after the child exited — a deadlock for any child bigger than the

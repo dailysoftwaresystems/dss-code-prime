@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/variant_when.hpp"   // WhenSpec — a builtin signature arm's `when`
 #include "core/types/data_model.hpp"
 #include "core/types/entry_shape.hpp"     // EntryFunctionShape (program-entry vocabulary)
 #include "core/types/enum_name_table.hpp"  // EnumNameTable (kDeclarationKindTable)
@@ -1646,6 +1647,12 @@ enum class BuiltinLowering : std::uint16_t {
     // (the weak form is permitted, never required, to fail spuriously), so both
     // spellings share this verb.
     AtomicCompareExchange,
+    // P68 round 12 (D-C-STDDEF-H-LACKS-UNREACHABLE): GNU
+    // `__builtin_unreachable()` — no operands, no value. It ENDS the open block with
+    // MIR's own `Unreachable` terminator (a trap at the target: `ud2` / `brk #0`),
+    // never a fall-through; code the expression still emits lowers into a fresh
+    // dead block the unreachable-prune drops.
+    Unreachable,
 };
 
 // ── THE ONE OWNER OF THE `lowering` SPELLINGS ────────────────────────────
@@ -1656,7 +1663,7 @@ enum class BuiltinLowering : std::uint16_t {
 // level up: the grammar loader's refusal for an unrecognized `lowering`
 // (`unknown builtin lowering '<x>'`) NAMED NO ACCEPTED SET AT ALL. A config
 // author who wrote `popcnt` was told their name was wrong and never told what
-// the loader would have taken — for a closed set of THIRTY-SEVEN verbs, most of them
+// the loader would have taken — for a closed set of THIRTY-EIGHT verbs, most of them
 // `stdc_*` names that differ by one word. Nothing could render the set, because
 // an if-chain is not enumerable.
 //
@@ -1670,7 +1677,7 @@ enum class BuiltinLowering : std::uint16_t {
 // `enum_name_table.hpp`'s `nameOrEmpty` note describes, so the projection below
 // uses `nameOrEmpty`: an unlisted value renders EMPTY rather than wearing row
 // 0's spelling (`"umulh"`), which is what `name()` would have done.
-inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
+inline constexpr EnumNameTable<BuiltinLowering, 38> kBuiltinLoweringTable{{{
     { BuiltinLowering::UMulHigh,              "umulh"                    },
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS)
     { BuiltinLowering::AtomicCas,             "atomic_cas"               },
@@ -1685,6 +1692,8 @@ inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
     { BuiltinLowering::ComplexImag,           "complex_imag"             },
     { BuiltinLowering::ComplexConj,           "complex_conj"             },
     { BuiltinLowering::Barrier,               "barrier"                  },
+    // P68 round 12: GNU `__builtin_unreachable` — the block-ending trap.
+    { BuiltinLowering::Unreachable,           "unreachable"              },
     { BuiltinLowering::SehExceptionCode,      "seh_exception_code"       },
     { BuiltinLowering::SehExceptionInfo,      "seh_exception_info"       },
     // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 width-blind bit-count
@@ -1725,9 +1734,9 @@ inline constexpr EnumNameTable<BuiltinLowering, 37> kBuiltinLoweringTable{{{
     { BuiltinLowering::AtomicExchange,        "atomic_exchange"          },
     { BuiltinLowering::AtomicCompareExchange, "atomic_compare_exchange"  },
 }}};
-// ★ THE UNDER-FILL GUARD, and for a 37-row hand-written table it is not
-// ceremony: `EnumNameTable<BuiltinLowering, 37>` with 36 initializers is legal
-// C++ — it value-initializes the tail, so row 36 becomes
+// ★ THE UNDER-FILL GUARD, and for a hand-written table this long it is not
+// ceremony: `EnumNameTable<BuiltinLowering, N>` with N-1 initializers is legal
+// C++ — it value-initializes the tail, so the last row becomes
 // `{ BuiltinLowering(0), "" }` and `builtinLoweringFromName("")` starts
 // RESOLVING, to `None`, which is the sentinel meaning "this knob does nothing".
 // A dropped row would therefore not break the build; it would make an empty
@@ -1853,18 +1862,27 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // signatures decode. Mutually exclusive with params/result (fail-loud at
     // decode if both are present); must decode to an FnSig (fail-loud else).
     std::string           signatureText;
-    // D-LANG-TYPE-IDENTITY-VOCABULARY: OPTIONAL per-data-model REPLACEMENT for
-    // `signatureText` — the exact shape (and JSON key name) the shipped-lib
-    // reader's `signatureByDataModel` already uses. A platform intrinsic can
-    // carry a parameter C spells with a NAMED type whose vocabulary entry is
-    // data-model-dependent: `_InterlockedCompareExchange` takes a `LONG*`, i.e.
-    // `long*`, which is a 32-bit `long` on the LLP64 platform the intrinsic
-    // belongs to. A single FIXED signature cannot say that without lying on the
-    // other model, so the base text stays the model-agnostic one and each
-    // declared model overrides it. EAGER: every declared override is decoded at
-    // the injection site regardless of which model is active, so a malformed
-    // INACTIVE override fails on EVERY target (anti-lurking).
-    std::unordered_map<DataModel, std::string> signatureTextByDataModel;
+    // P68 round 12 (S2a-1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES): the
+    // OPTIONAL per-pair form of `signatureText` — the SAME shape and the SAME
+    // `when` selector (core/types/variant_when.hpp) as a shipped descriptor
+    // symbol's `signature`: `"signature": { "variants": [ { "when": {…},
+    // "value": "fn(…)" }, …, { "default": true, "value": "fn(…)" } ] }`. A
+    // platform intrinsic can carry a parameter C spells with a NAMED type whose
+    // vocabulary entry is per-pair: `_InterlockedCompareExchange` takes a
+    // `LONG*`, i.e. `long*`, a 32-bit `long` on the LLP64 platform the intrinsic
+    // belongs to. Under this form `signatureText` holds the DEFAULT arm's text
+    // (empty when the row declares none) and the analyzer SELECTS at injection
+    // with the pair it has: exactly one arm matches, or none and the default
+    // serves; otherwise the builtin is refused for that pair — no silent
+    // fallback. EAGER: every arm is decoded at injection, selected or not, so a
+    // malformed arm fails on EVERY pair (anti-lurking). It replaced the
+    // data-model-only `signatureByDataModel` map.
+    struct SignatureArm {
+        WhenSpec    when;
+        std::string text;
+    };
+    std::vector<SignatureArm> signatureArms;
+    bool                      signatureIsPerPair = false;   // the `variants` form
     // D-CSUBSET-ATOMIC-MONOMORPH-I32: OPTIONAL. Present ⇒ `signatureText` is the
     // EXEMPLAR and the real signature is derived per call site by the rule the
     // struct above documents. Absent (the default) ⇒ the declared signature binds
@@ -2287,6 +2305,43 @@ struct DSS_EXPORT SynthesizedTypeRule {
         if (it == byDataModel.end()) return std::nullopt;
         return std::pair<TypeKind, std::string_view>{
             it->second.resolveCore(dm), it->second.vocabularyName};
+    }
+};
+
+// ── P68 round 12 (lane `cs`): the type an enumeration without a fixed underlying
+//    type is COMPATIBLE with (`semantics.enumerationCompatibleTypes`) ──
+//
+// C 6.7.2.2p4 / C23 6.7.3.3p13: each enumerated type without a fixed underlying
+// type is compatible with an integer type the IMPLEMENTATION chooses, able to
+// represent every value (C23 6.7.3.3p2 calls it the enumeration's underlying type),
+// and a PLATFORM ABI fixes that choice — so the OBJECT FORMAT names the convention
+// (`EnumCompatibleTypeRule`, core/types/data_model.hpp) and the LANGUAGE declares,
+// per convention, two ORDERED ladders of its own types (the shape
+// `integerLiteralTyping` has, resolved through the same `DataModelTypeRef`
+// machinery at load, so each rung's representation follows the data model):
+//   * `unsignedLadder` — when no value is negative;
+//   * `signedLadder`   — otherwise (every rung SIGNED: an unsigned one could never
+//                        hold what it is chosen for).
+// The FIRST rung whose range (under the active data model) holds every value wins.
+// While the list is being processed, an implicit `previous + 1` that leaves the
+// previous constant's type walks the ladder of the PREVIOUS constant's signedness
+// (C23 6.7.3.3p12). The CONSTANTS' type is a separate question
+// (`enumerationConstantType`: `int` when every value fits it, else the enumerated
+// type, p15). A declared block covers EVERY rule (the loader enforces it), so a
+// format's rule always finds its ladders. UNDECLARED ⇒ the enum keeps the kind-only
+// record, and a value its kind cannot hold fails loud (S_EnumeratorValueOutOfRange)
+// — never a silent wrap.
+struct DSS_EXPORT EnumerationLadders {
+    std::vector<DataModelTypeRef> unsignedLadder;
+    std::vector<DataModelTypeRef> signedLadder;
+};
+struct DSS_EXPORT EnumerationCompatibleTypes {
+    std::unordered_map<EnumCompatibleTypeRule, EnumerationLadders> byRule;
+    [[nodiscard]] bool declared() const noexcept { return !byRule.empty(); }
+    // The ladders the format's `rule` selects; nullptr when undeclared or `None`.
+    [[nodiscard]] EnumerationLadders const* ladders(EnumCompatibleTypeRule rule) const {
+        auto const it = byRule.find(rule);
+        return it == byRule.end() ? nullptr : &it->second;
     }
 };
 
@@ -3146,6 +3201,17 @@ struct DSS_EXPORT SemanticConfig {
     // answers to "what type does THIS operator have" with no cross-reference.
     SynthesizedTypeRule offsetofResultType;
     SynthesizedTypeRule typesCompatibleResultType;
+    // P68 round 12 (lane `cs`, the enumeration P1): the type of an ENUMERATION
+    // CONSTANT of an enumeration without a fixed underlying type whose values it
+    // holds — C17 6.4.4.3p2 and C23 6.7.3.3p12, p15 say `int`. The source never
+    // spells a constant's type, so it is an engine-synthesized type like
+    // `sizeof`'s, named per data model. UNDECLARED ⇒ a constant keeps its
+    // enumeration's type, as before, for a language that ships no row.
+    SynthesizedTypeRule enumerationConstantType;
+    // …and, per format convention, the ladders the type such an enumeration is
+    // COMPATIBLE with is chosen from (C23 6.7.3.3p13) — see
+    // `EnumerationCompatibleTypes`.
+    EnumerationCompatibleTypes enumerationCompatibleTypes;
 
     // ── P31: the three GNU compile-time OPERATORS ────────────────────────────
     // All three are OPERATORS, not builtin FUNCTIONS, and the distinction is

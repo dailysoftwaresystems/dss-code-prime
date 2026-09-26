@@ -88,6 +88,21 @@
 # the other two through <getopt.h>. NONE diverges: the plain decorated
 # identifier on BOTH arches, so all three imply an ABSENT `linkName`.
 # [[D-CONFIG-NO-SHIPPED-GETOPT-ON-ANY-FORMAT]]
+#
+# EXTENDED 2026-09-24 (P68 round 12, lane `lm`) by TWELVE rows — the <stdlib.h>
+# functions fold S1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES imports on
+# Mach-O: _Exit aligned_alloc at_quick_exit atoll div ldiv llabs lldiv mblen
+# quick_exit strtof strtoull — measured on the
+# operator's Mac (Darwin 25.6.0, arm64 host), Apple clang 21.0.0
+# (clang-2100.1.1.101), by THIS file's method (default flags, `-fno-builtin
+# -fno-stack-protector -w -c`, `nm -u`), two batches of sixteen probes (one per
+# arch), each returning exactly one undefined symbol. NONE diverges: the plain
+# decorated identifier on BOTH arches, so all twelve imply an ABSENT
+# `linkName`. (MB_CUR_MAX's `__mb_cur_max` is a DATUM, not a function, and so
+# has no row here; the batches' four wide-character probes — mbstowcs mbtowc
+# wcstombs wctomb, the same plain names — wait for S2 to import them.)
+# [[D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES]]
+_Exit	stdlib.h	__Exit	__Exit
 __error	errno.h	___error	___error
 abort	stdlib.h	_abort	_abort
 abs	stdlib.h	_abs	_abs
@@ -95,9 +110,11 @@ access	unistd.h	_access	_access
 acos	math.h	_acos	_acos
 acosf	math.h	_acosf	_acosf
 acosh	math.h	_acosh	_acosh
+aligned_alloc	stdlib.h	_aligned_alloc	_aligned_alloc
 asin	math.h	_asin	_asin
 asinf	math.h	_asinf	_asinf
 asinh	math.h	_asinh	_asinh
+at_quick_exit	stdlib.h	_at_quick_exit	_at_quick_exit
 atan	math.h	_atan	_atan
 atan2	math.h	_atan2	_atan2
 atan2f	math.h	_atan2f	_atan2f
@@ -107,6 +124,7 @@ atexit	stdlib.h	_atexit	_atexit
 atof	stdlib.h	_atof	_atof
 atoi	stdlib.h	_atoi	_atoi
 atol	stdlib.h	_atol	_atol
+atoll	stdlib.h	_atoll	_atoll
 bsearch	stdlib.h	_bsearch	_bsearch
 cabs	tgmath.h	_cabs	_cabs
 cacos	tgmath.h	_cacos	_cacos
@@ -131,6 +149,7 @@ cpow	tgmath.h	_cpow	_cpow
 csin	tgmath.h	_csin	_csin
 csqrt	tgmath.h	_csqrt	_csqrt
 ctan	tgmath.h	_ctan	_ctan
+div	stdlib.h	_div	_div
 dlclose	dlfcn.h	_dlclose	_dlclose
 dlerror	dlfcn.h	_dlerror	_dlerror
 dlopen	dlfcn.h	_dlopen	_dlopen
@@ -206,6 +225,9 @@ isxdigit	ctype.h	_isxdigit	_isxdigit
 labs	stdlib.h	_labs	_labs
 ldexp	math.h	_ldexp	_ldexp
 ldexpf	math.h	_ldexpf	_ldexpf
+ldiv	stdlib.h	_ldiv	_ldiv
+llabs	stdlib.h	_llabs	_llabs
+lldiv	stdlib.h	_lldiv	_lldiv
 localtime	time.h	_localtime	_localtime
 localtime_r	time.h	_localtime_r	_localtime_r
 log	math.h	_log	_log
@@ -224,6 +246,7 @@ malloc_size	malloc/malloc.h	_malloc_size	_malloc_size
 malloc_zone_free	malloc/malloc.h	_malloc_zone_free	_malloc_zone_free
 malloc_zone_malloc	malloc/malloc.h	_malloc_zone_malloc	_malloc_zone_malloc
 malloc_zone_realloc	malloc/malloc.h	_malloc_zone_realloc	_malloc_zone_realloc
+mblen	stdlib.h	_mblen	_mblen
 memchr	memory.h	_memchr	_memchr
 memcmp	memory.h	_memcmp	_memcmp
 memcpy	memory.h	_memcpy	_memcpy
@@ -265,6 +288,7 @@ putchar	stdio.h	_putchar	_putchar
 puts	stdio.h	_puts	_puts
 pwrite	unistd.h	_pwrite	_pwrite
 qsort	stdlib.h	_qsort	_qsort
+quick_exit	stdlib.h	_quick_exit	_quick_exit
 raise	signal.h	_raise	_raise
 rand	stdlib.h	_rand	_rand
 random	stdlib.h	_random	_random
@@ -314,9 +338,11 @@ strrchr	string.h	_strrchr	_strrchr
 strspn	string.h	_strspn	_strspn
 strstr	string.h	_strstr	_strstr
 strtod	stdlib.h	_strtod	_strtod
+strtof	stdlib.h	_strtof	_strtof
 strtol	stdlib.h	_strtol	_strtol
 strtoll	stdlib.h	_strtoll	_strtoll
 strtoul	stdlib.h	_strtoul	_strtoul
+strtoull	stdlib.h	_strtoull	_strtoull
 swab	unistd.h	_swab	_swab
 symlink	unistd.h	_symlink	_symlink
 sysconf	unistd.h	_sysconf	_sysconf

@@ -9,7 +9,7 @@
     "kind": "pe"
   },
 
-  "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c long binds I32 here, the literal ladder + descriptor signatureByDataModel resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "$dataModelComment": "FC3 c1: 64-bit Windows is LLP64 (int 32, long 32, long long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c long binds I32 here, the literal ladder + a descriptor `signature` variant keyed `when: {dataModel}` resolve their LLP64 arms. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LLP64",
   "$headerNameMatchingComment": "D-PP-HEADER-CASE-INSENSITIVE-PE: Windows filesystems (NTFS, FAT) match file names case-INSENSITIVELY, and the Windows SDK depends on it -- sqlite3.c:67322 spells `#include <Windows.h>` with a capital W while the shipped descriptor is `windows.json`. REQUIRED closed-enum field. DSS ASCII-folds the comparison ITSELF per path component (core/types/include_path_resolve.cpp) instead of asking fs::exists, so this resolves identically whether the build host is NTFS or ext4 -- MEASURED before the axis existed: rc=0 through /mnt/c, rc=1 error[F001A] on ext4, SAME binary, SAME commit.",
   "headerNameMatching": "case-insensitive",
@@ -33,6 +33,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c `long double` row to F64, so the full double machinery serves it end-to-end (the LLP64 long==int identity-collapse precedent). OS/format-determined (the same x86_64 target serves ELF-SysV's x87-80), so the axis lives here next to dataModel.",
   "longDoubleFormat": "f64",
+  "$enumCompatibleTypeRuleComment": "P68 round 12 (lane `cs`): the integer type an enumeration without a fixed underlying type is compatible with (C 6.7.2.2p4) is the platform ABI's choice — the Microsoft x64 ABI's `int` (MSVC's documented rule), beside this format's `msvc_straddle` bit-fields and `f64` long double; the language's `enumerationCompatibleTypes.msvc` ladders say which C types that is.",
+  "enumCompatibleTypeRule": "msvc",
 
   "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] (cycle-2 convention — same as LK1 ELF ET_EXEC). Real-name resolution closes with D-LK1-1 (HIR→LIR symbol-name thread). D-LK10-ENTRY Slice C (CLOSED 2026-06-02, commit 1a0b414): the linker prepends a synthetic `_start` trampoline as module.functions[0]; the schema's empty entryPoint resolves to functions[0] = the trampoline, which then calls the USER fn (the post-prepend functions[1+]). See plan 14 §2.13 — Stage 1 closed.",
   "entryPoint": "",

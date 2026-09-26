@@ -40,8 +40,8 @@
 // the change these pins guard. Before it, deleting a name from a message
 // reddened nothing anywhere. Now deleting a row from `kDataModelTable` reds
 // (A) immediately, because the shipped `c.lang.json` declares
-// `coreByDataModel: {"LLP64": …}` at seven pointers and a
-// `signatureByDataModel: {"LLP64": …}` at an eighth; the message follows the
+// `coreByDataModel: {"LLP64": …}` at seven pointers and a `signature` arm
+// keyed `when: {"dataModel": "LLP64"}` at an eighth; the message follows the
 // table automatically, so it can no longer be wrong on its own.
 //
 // ⚠ MUST run through ctest, never a bare `.exe`: `findShippedConfig` walks the
@@ -182,12 +182,14 @@ constexpr char const* kIgnoreProbeOnly[]  = {kBadSpelling};
 // map: `coreByDataModel` occurs at 7 pointers, `coreByLongDoubleFormat` at 2,
 // `signatureByDataModel` at 1, `synthesizedTypes` at 1 (three roles). One
 // representative pointer of each is probed here, and `at()` re-validates it on
-// every run. `elementCoreByFormat` — the one map keyed on OBJECT-FORMAT names —
+// every run (P68 round 12: `enumerationCompatibleTypes`, keyed by format convention,
+// at 1). `elementCoreByFormat` — the one map keyed on OBJECT-FORMAT names —
 // occurred at 2 until P68 round 9 deleted it (the loader refuses it now), so it
 // occurs at 0 and its probe site is gone with it.
 inline std::vector<KeyedMapSite> keyedMapSites() {
     static constexpr auto kDataModelNames  = allNames(dss::kDataModelTable);
     static constexpr auto kLongDoubleNames = allNames(dss::kLongDoubleFormatTable);
+    static constexpr auto kEnumRuleNames   = allNames(dss::kEnumCompatibleTypeRuleTable);
     return {
         {"c", {"/semantics/builtinTypes/1/coreByDataModel"}, "\"I32\"",
          "coreByDataModel", kDataModelNames, kIgnoreProbeOnly},
@@ -199,6 +201,11 @@ inline std::vector<KeyedMapSite> keyedMapSites() {
         {"c", {"/semantics/synthesizedTypes/pointerDifference"},
          "\"int\"", "synthesizedTypes/pointerDifference", kDataModelNames,
          kIgnoreProbeOnly},
+        // P68 round 12 (lane `cs`): keyed by the FORMAT CONVENTION an object format
+        // names in `enumCompatibleTypeRule` — every convention the table spells.
+        {"c", {"/semantics/enumerationCompatibleTypes"},
+         "{\"unsigned\": [\"unsigned int\"], \"signed\": [\"int\"]}",
+         "enumerationCompatibleTypes", kEnumRuleNames, kIgnoreProbeOnly},
     };
 }
 

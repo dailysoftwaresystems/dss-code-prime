@@ -57,13 +57,16 @@ token means a leg vanished without a verdict, which is a harness defect.
 
 ## 3. Running it
 
-Per host, drive the client's own driver. **Do not delegate the runs to an agent** — a
-delegated build agent reliably yields mid-build and leaves an orphaned job. Drive them
-foreground-blocking or via a harness-tracked background command that re-invokes you on exit.
+Drive the client's action through DssHarness: ONE invocation runs the `sqlite` runner's
+`build-and-test` step on every host it declares (Windows, Linux/WSL, macOS, the arm64 VPS — each
+host's release leg, with that leg's own dsscp, which the runner builds first). The tier, the dsscp
+configuration and a single test file are the step's inputs, carried on its command line. **Do not
+delegate the run to an agent** — a delegated build agent reliably yields mid-build and leaves an
+orphaned job. Drive it foreground-blocking or via a harness-tracked background command that
+re-invokes you on exit.
 
 ```bash
-# every host (Windows, Linux/WSL, macOS, VPS), from the action's own directory
-DSS_TIER=veryquick DSS_CONFIG=release python3 ./build_and_test.py
+dssharness run sqlite --input tier=veryquick --input dssConfig=release
 ```
 
 ## 4. Adjudicating the result

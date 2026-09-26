@@ -975,7 +975,11 @@ enum class DiagnosticCode : std::uint16_t {
     // representable in the underlying type. The `.actual` names the enumerator.
     // Unsuppressable — a suppressed diagnostic would let the out-of-range value be
     // truncated/wrapped into the underlying type silently (a wrong constant value).
-    // Only fires for the EXPLICIT-underlying case; a default-int enum is unchanged.
+    // P68 round 12 (lane `cs`, the enumeration P1): also an enumeration WITHOUT a
+    // fixed type whose values no type the language can choose holds all at once
+    // (C23 6.7.3.3p4 — `enum { A = -1, B = 0xFFFFFFFFFFFFFFFFULL }`), and an
+    // implicit `previous + 1` past every 64-bit value; the value is read with its
+    // own signedness, so 0xFFFFFFFFFFFFFFFFULL in `unsigned long long` is in range.
     S_EnumeratorValueOutOfRange   = 0xE035,
     // C23 §6.7.2.5 (D-CSUBSET-TYPEOF): the operand of a `typeof`/`typeof_unqual`
     // is a BIT-FIELD member access (`typeof(s.flag)` where `flag` is a bit-field).
@@ -2543,6 +2547,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   `--warnings-as-errors` restores the refusal (-pedantic-errors' posture). A
     //   DESIGNATED index past the end stays refused, as gcc refuses it.
     S_ExcessInitializerElements           = 0xE087,
+    // P68 round 12 (lane `cs`, the enumeration P1): an enumeration WITHOUT a fixed
+    // underlying type is declared, the language declares which type each platform
+    // convention makes it compatible with (`semantics.enumerationCompatibleTypes`),
+    // and the active object format names NO convention (`enumCompatibleTypeRule`:
+    // wasm / spirv skeletons). C 6.7.2.2p4 requires SOME compatible integer type, and
+    // which one is the platform ABI's (`int` on Microsoft x64, `unsigned int` for a
+    // non-negative enumeration on SysV / AAPCS / Darwin), so none can be picked here.
+    // The `.actual` names the enumeration's tag (empty for an anonymous one).
+    // UNSUPPRESSABLE: a suppressed emission would leave the enumeration on a guessed
+    // type that reaches codegen — the `long double` axis's sibling, one step further.
+    S_EnumCompatibleTypeRuleUndeclared    = 0xE088,
+    // P68 round 12 (lane `cs`): a NEGATIVE enumerator value for an enumeration whose
+    // FIXED underlying type is UNSIGNED, and which the SIGNED type of the same width
+    // holds (`enum E : unsigned char { X = -1 }`), is CONVERTED modulo 2^N as a
+    // conversion to the underlying type is (X == 255). C23 6.7.3.3p3 makes the value a
+    // constraint violation; clang 18.1.3 builds exactly this extent and gcc 13.3.0
+    // refuses it, so the union ACCEPTS it and this warning is the diagnostic the
+    // constraint asks for. A WARNING, suppressible; `--warnings-as-errors` restores
+    // the refusal. Every other out-of-range value stays S_EnumeratorValueOutOfRange.
+    S_EnumeratorValueConvertedToUnderlyingType = 0xE089,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -3714,17 +3738,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   the goto — entering a guarded PC range sideways would give it a filter
     //   it must never have (MSVC rejects the construct too).
     H_SehJumpIntoRegion           = 0xF00F,
-    // H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, trigger-gated): a return /
-    //   goto-out / break-out / continue-out from INSIDE a __try guarded body.
-    //   Option (C) of the c115 design-audit: the guarded body has exactly ONE
-    //   exit (the fall-through) so c116's scope-table region membership stays
-    //   CFG-derivable; sqlite's ~13 SEH sites have ZERO early exits
-    //   (amalgamation-swept). MSVC-legal — the anchor carries the
-    //   mark-every-exit design for when a real consumer fires the trigger.
+    // H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, open): a return / goto-out /
+    //   break-out / continue-out from INSIDE a __try guarded body. Option (C)
+    //   of the c115 design-audit: the guarded body has exactly ONE exit (the
+    //   fall-through) so c116's scope-table region membership stays
+    //   CFG-derivable. MSVC and clang run every such exit (measured
+    //   2026-09-24), so the row is owed work; it carries the mark-every-exit
+    //   design.
     H_SehEarlyExit                = 0xF010,
-    // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, trigger-gated): `&&label`
-    //   naming a label inside any part of a __try statement — a computed goto
-    //   could then enter the guarded range undetectably at compile time.
+    // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, open since its 2026-09-24
+    //   re-verdict: clang runs the region-internal form): `&&label` naming a
+    //   label inside any part of a __try statement — a computed goto could then
+    //   enter the guarded range undetectably at compile time.
     H_SehLabelAddress             = 0xF011,
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5): a wide/UTF string literal
     //   whose CST→HIR lowering could not represent its (escape-decoded) body in the

@@ -36,7 +36,7 @@ class TargetSchema;
 // analysis is per-(CU × target) so the model is always in scope there.
 // It drives every `coreByDataModel` override (builtinTypes /
 // typeSpecifiers), the integer-literal ladder, and the shipped-lib
-// descriptor `signatureByDataModel` resolution. The returned
+// descriptor `signature` variants' `when: {dataModel}` selection. The returned
 // SemanticModel CARRIES the model (`SemanticModel::dataModel()`) so the
 // HIR lowering reads the SAME value by construction — the two tiers can
 // never diverge.
@@ -154,6 +154,17 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // (`buildCuMir`), and with one in hand an unanswerable role REFUSES
         // the read rather than binding a guess. Non-owning; must outlive the
         // call (it is consulted only during analysis, never republished).
-        RuntimeLibraryRoleResolver const* roleResolver = nullptr);
+        RuntimeLibraryRoleResolver const* roleResolver = nullptr,
+        // P68 round 12 (lane `cs`): the ACTIVE FORMAT's enumeration compatible-type
+        // rule (`effectiveEnumCompatibleTypeRule(format)`, threaded by the pair
+        // derivation like `longDoubleFormat`) — which of the language's
+        // `enumerationCompatibleTypes` ladders chooses the integer type an
+        // enumeration without a fixed underlying type is compatible with. `None`
+        // (a format that declares none: wasm / spirv skeletons) fails loud on such
+        // an enumeration (S_EnumCompatibleTypeRuleUndeclared). The DEFAULT, `Gnu`,
+        // serves direct-API callers (unit tests) and pairs with the default
+        // `dataModel` (LP64): the platform those callers model is an LP64 one, whose
+        // ABIs all use this rule — the same reason `dataModel` defaults to LP64.
+        EnumCompatibleTypeRule enumCompatibleTypeRule = EnumCompatibleTypeRule::Gnu);
 
 } // namespace dss

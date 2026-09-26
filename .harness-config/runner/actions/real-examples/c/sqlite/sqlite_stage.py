@@ -625,8 +625,13 @@ def parse_stage_build(obj):
         C.die("harness_legs.py --stage-build returned makeOptions/capabilityWitnesses/optionDefines of "
               "the wrong type (%s/%s/%s). %s" % (type(mo).__name__, type(wit).__name__,
                                                   type(opt).__name__, _CONTRACT))
+    commit = obj.get("sqliteCommit")
+    if not isinstance(commit, str) or not re.match(r"^[0-9a-f]{40}$", commit):
+        C.die("harness_legs.py --stage-build returned no FULL sqliteCommit (got %r). %s\n      It is the ONE "
+              "sqlite revision every stage compiles; without it the stage pulls whatever upstream's default "
+              "branch is that day, and the round-close recompile's subject moves under it." % (commit, _CONTRACT))
     return {"configure_flags": list(flags), "make_options": mo, "required_defines": list(req),
-            "witnesses": dict(wit), "option_defines": list(opt)}
+            "witnesses": dict(wit), "option_defines": list(opt), "sqlite_commit": commit}
 
 
 def _parse_jobs(value):
@@ -665,6 +670,7 @@ class StageConfig:
         self.required_defines = sb["required_defines"]
         self.witnesses = sb["witnesses"]
         self.option_defines = sb["option_defines"]
+        self.sqlite_commit = sb["sqlite_commit"]
         self.tier = (tier or DEFAULT_TIER).strip()
         if not self.tier or "/" in self.tier or any(ch.isspace() for ch in self.tier):
             C.die("DSS_TIER='%s' is not a tier name (it names <sqlite>/test/<tier>.test)." % tier)
@@ -1311,7 +1317,50 @@ def remote_head_branch(d, env=None):
     return ""
 
 
-def clone_or_update(url, dest, want="", log=None, env=None):
+def _has_commit(dest, commit, genv):
+    """Whether the checkout at `dest` already holds `commit` (a local object lookup; no network)."""
+    r = C.capture(["git", "-C", dest, "cat-file", "-e", commit + "^{commit}"], env_=genv, timeout=120)
+    return r.rc == 0
+
+
+def _pinned_checkout(url, dest, commit, log, genv):
+    """THE PINNED CHECKOUT (2026-09-25): `dest` on EXACTLY `commit`, DETACHED. The commit is fetched only
+    when the clone does not hold it -- `fetch --all` first (the pin lies on upstream's history), then the
+    sha itself -- and nothing is pulled, so a fetch can never move a pinned subject. A populated directory
+    that is not a checkout cannot be put on a commit, so it is REFUSED (the unpinned path uses such a
+    source tree as-is). -> [] (no warning: the subject is exactly the declared one)."""
+    name = posixpath.basename(dest.rstrip("/"))
+    if os.path.exists(_j(dest, ".git")):
+        log.info("pinning %s in %s to %s" % (name, dest, commit[:12]))
+    elif os.path.isdir(dest) and os.listdir(dest):
+        C.die("%s is not a git checkout, and the sqlite subject is PINNED to %s (legs.json "
+              "stageBuild.sqliteCommit): a source tree of unknown revision cannot be put on a commit.\n"
+              "      Point the run at a clone, or remove this directory by hand once you have confirmed what "
+              "it is." % (dest, commit))
+    else:
+        log.info("cloning %s -> %s" % (url, dest))
+        os.makedirs(posixpath.dirname(dest.rstrip("/")) or "/", exist_ok=True)
+        C.run_checked(["git", "clone", "--quiet", url, dest], "git clone %s" % url, env_=genv)
+    if not _has_commit(dest, commit, genv):
+        log.info("  the pinned %s is not in the clone: fetching" % commit[:12])
+        C.run_checked(["git", "-C", dest, "fetch", "--all", "--prune", "--quiet"],
+                      "git fetch (for the pinned %s, in %s)" % (commit[:12], dest), env_=genv)
+        if not _has_commit(dest, commit, genv):
+            C.run_checked(["git", "-C", dest, "fetch", "--quiet", "origin", commit],
+                          "git fetch origin %s (the pin, in %s)" % (commit, dest), env_=genv)
+    if not _has_commit(dest, commit, genv):
+        C.die("the pinned sqlite commit %s is not in %s even after fetching %s: legs.json "
+              "stageBuild.sqliteCommit names a revision its origin does not have." % (commit, dest, url))
+    C.run_checked(["git", "-C", dest, "checkout", "--quiet", "--detach", commit],
+                  "git checkout --detach %s (in %s)" % (commit[:12], dest), env_=genv)
+    got = C.capture(["git", "-C", dest, "rev-parse", "HEAD"], env_=genv, timeout=120).out.strip()
+    if got != commit:
+        C.die("the pinned checkout of %s in %s landed on %s" % (commit, dest, got or "<nothing>"))
+    log.info("  at %s (DETACHED, pinned by legs.json stageBuild.sqliteCommit)" % commit[:12])
+    return []
+
+
+def clone_or_update(url, dest, want="", log=None, env=None, commit=""):
     """A checkout, current -- the ONE implementation (the sqlite clone here; the driver's opt-in
     fresh DSS clone too). An existing checkout (`.git` a dir OR a file) is fetched, put on `want`
     or on origin's DEFAULT branch (the two old drivers shared the sqlite clone, so without the
@@ -1320,9 +1369,13 @@ def clone_or_update(url, dest, want="", log=None, env=None):
     checkout while the report names a version the run never got is the silent-provenance defect
     this closes. A populated directory that is not a checkout is refused, unless it holds a
     `./configure` (a source tree, e.g. a tarball), which is used as-is with a warning.
-    -> the warning reasons it logged ([] normally)."""
+    -> the warning reasons it logged ([] normally).
+    `commit` (2026-09-25) PINS the checkout instead: the ONE sqlite revision the harness compiles
+    (legs.json `stageBuild.sqliteCommit`), put on EXACTLY, detached (`_pinned_checkout`)."""
     log = log if log is not None else C.LOG
     genv = _git_env(env)
+    if commit:
+        return _pinned_checkout(url, dest, commit, log, genv)
     if os.path.exists(_j(dest, ".git")):
         log.info("updating %s in %s" % (posixpath.basename(dest.rstrip("/")), dest))
         C.run_checked(["git", "-C", dest, "fetch", "--all", "--prune", "--quiet"],
@@ -1664,8 +1717,9 @@ def _stage_locked(cfg, log, lock):
     else:
         os.makedirs(out, exist_ok=True)
 
-    # ── Step 3: the clone, current; the tier exists ───────────────────────────────────
-    ctx.warnings.extend(clone_or_update(cfg.sqlite_repo_url, clone, "", log=log, env=ctx.env))
+    # ── Step 3: the clone, on the PINNED commit; the tier exists ─────────────────────
+    ctx.warnings.extend(clone_or_update(cfg.sqlite_repo_url, clone, log=log, env=ctx.env,
+                                        commit=cfg.sqlite_commit))
     configure = _j(clone, "configure")
     if not (os.path.isfile(configure) and os.access(configure, os.X_OK)):
         C.die("no ./configure in %s — not a SQLite checkout" % clone)
@@ -1918,7 +1972,7 @@ def _stage_locked(cfg, log, lock):
               "      which fails as 'error[F001A] got unicode/utypes.h' — a derivation bug wearing a\n"
               "      missing-dependency costume. It is contributed by the library COMPILE lines, so\n"
               "      this means the -D tokens were read from the link line alone: check that\n"
-              "      --always-make and --token-scope recipe survived. Derived from: %s"
+              "      always_make and token_scope='recipe' survived. Derived from: %s"
               % (len(cli_defs), ctx.host(c_recipe)))
     assert_recipe_capabilities("testfixture", ctx.host(f_recipe), fix_defs, cfg.required_defines, mo)
     assert_recipe_capabilities("sqlite3 CLI", ctx.host(c_recipe), cli_defs, cfg.required_defines, mo)
@@ -2165,7 +2219,8 @@ ARMS = ("mk_var", "tcl_h_version", "tcl_select", "pin_shim", "stamp", "required_
 _GOOD_SB = {"configureFlags": ["--enable-all", "--fts3"], "makeOptions": "-DSQLITE_ENABLE_STAT4",
             "optionDefines": ["SQLITE_ENABLE_STAT4"],
             "requiredDefines": ["SQLITE_ENABLE_FTS5", "SQLITE_ENABLE_RTREE", "SQLITE_ENABLE_STAT4"],
-            "capabilityWitnesses": {"fts5": {"define": "SQLITE_ENABLE_FTS5", "file": "fts5aa"}}}
+            "capabilityWitnesses": {"fts5": {"define": "SQLITE_ENABLE_FTS5", "file": "fts5aa"}},
+            "sqliteCommit": "0123456789abcdef0123456789abcdef01234567"}
 
 
 class _T:
@@ -2516,6 +2571,13 @@ def _st_pure(t):
         t.check("a flag carrying whitespace is refused (one argv word each)", _dies(parse_stage_build, bad)[0])
         bad = dict(_GOOD_SB, makeOptions=["-DX"])
         t.check("a non-string makeOptions is refused", _dies(parse_stage_build, bad)[0])
+        bad = dict(_GOOD_SB)
+        bad.pop("sqliteCommit")
+        died, msg, _ = _dies(parse_stage_build, bad)
+        t.check("no sqliteCommit is a contract break (the subject would be whatever master is that day)",
+                died and "sqliteCommit" in msg, msg[:160])
+        died, msg, _ = _dies(parse_stage_build, dict(_GOOD_SB, sqliteCommit="d21bd37c7c"))
+        t.check("... and an ABBREVIATED one too: the pin is the FULL sha", died and "sqliteCommit" in msg, msg[:160])
         t.check("a UTF-8 BOM is tolerated (a file written on Windows)", parse_stage_build(b"\xef\xbb\xbf" + json.dumps(_GOOD_SB).encode())["required_defines"][0] == "SQLITE_ENABLE_FTS5")
 
     with t.arm("config"):
@@ -2912,6 +2974,33 @@ def _st_git(t):
                 git_head_branch(dest, env) == "wanted")
         _git(env, "-C", dest, "checkout", "--quiet", "--detach")
         t.check("a detached HEAD reads DETACHED-HEAD", git_head_branch(dest, env) == "DETACHED-HEAD")
+        # ── THE PIN (2026-09-25): EXACTLY the declared commit, DETACHED; fetched only when absent; never pulled ──
+        pinned = _j(tmp, "dest", "pinned")
+        t.check("a PINNED fresh clone answers no warning", clone_or_update(bare, pinned, log=log, env=env,
+                                                                          commit=c2) == [])
+        t.check("... and sits on EXACTLY the pin, detached",
+                _git(env, "-C", pinned, "rev-parse", "HEAD") == c2
+                and git_head_branch(pinned, env) == "DETACHED-HEAD")
+        _git(env, "-C", work, "checkout", "--quiet", "trunk")
+        _w(_j(work, "README"), "z\n")
+        _git(env, "-C", work, "commit", "--quiet", "-am", "c3")
+        _git(env, "-C", work, "push", "--quiet", "origin", "trunk")
+        c3 = _git(env, "-C", work, "rev-parse", "HEAD")
+        clone_or_update(bare, pinned, log=log, env=env, commit=c2)
+        t.check("a pinned clone is NOT moved when origin moves on (nothing is pulled)",
+                _git(env, "-C", pinned, "rev-parse", "HEAD") == c2)
+        t.check("... and a pin the clone already holds fetches NOTHING (origin's new commit is not in it)",
+                C.capture(["git", "-C", pinned, "cat-file", "-e", c3 + "^{commit}"], env_=env,
+                          timeout=120).rc != 0)
+        clone_or_update(bare, pinned, log=log, env=env, commit=c3)
+        t.check("a pin the clone LACKS is fetched, then checked out", _git(env, "-C", pinned, "rev-parse", "HEAD") == c3)
+        died, msg, _ = _dies(clone_or_update, bare, pinned, log=log, env=env, commit="de" * 20)
+        t.check("a pin origin does not have is REFUSED, naming it", died and "de" * 20 in msg, msg[:200])
+        pinned_tree = _j(tmp, "pinned-tarball")
+        _w(_j(pinned_tree, "configure"), "#!/bin/sh\n", 0o755)
+        died, msg, _ = _dies(clone_or_update, bare, pinned_tree, log=log, env=env, commit=c2)
+        t.check("a source tree that is not a checkout is REFUSED under a pin (it cannot be put on a commit)",
+                died and "PINNED" in msg and not os.path.exists(_j(pinned_tree, ".git")), msg[:200])
         _git(env, "-C", dest, "checkout", "--quiet", "trunk")
         _git(env, "-C", dest, "remote", "set-url", "origin", _j(tmp, "no-such-origin.git"))
         died, msg, _ = _dies(clone_or_update, bare, dest, log=log, env=env)
@@ -3258,6 +3347,8 @@ def _st_orchestration_body(t):
              "ext/rtree/r.c": ("/* r */\n", None), "ext/fts5/test/f.test": ("# f\n", None),
              "ext/session/s.c": ("/* s */\n", None), "test/veryquick.test": ("# vq\n", None)}
     bare, _work = _make_origin(_j(tmp, "o"), env, files, branch="master")
+    # the stage is PINNED (2026-09-25): here, to the fake origin's one commit
+    sb_pin = dict(_GOOD_SB, sqliteCommit=_git(env, "-C", _work, "rev-parse", "HEAD"))
     clone = _j(tmp, "clone")
     installs = []
     emits, cohs, locks = [], [], []
@@ -3269,7 +3360,7 @@ def _st_orchestration_body(t):
     procs = _stub_procs(locks)
     tcl_inc_real = ""
     with _stub_modules(sqlite_base=base, sqlite_coherence=coh, sqlite_procs=procs):
-        cfg = StageConfig(sqlite_dir=clone, out_dir=_j(tmp, "out"), stage_build=_GOOD_SB,
+        cfg = StageConfig(sqlite_dir=clone, out_dir=_j(tmp, "out"), stage_build=sb_pin,
                           sqlite_repo_url=bare, jobs=2, host_os=C.host_os(), environ=env,
                           pkg_install=lambda a, b=None: installs.append((a, b)))
         log = C.Log(io.StringIO())
@@ -3326,7 +3417,7 @@ def _st_orchestration_body(t):
         # the derive CLI over the SAME clone: stamp kept, staged, translated, gated twice
         del cohs[:]
         base.incs[:] = [tcl_inc_real]
-        sbj = _w(_j(tmp, "sb.json"), json.dumps(_GOOD_SB))
+        sbj = _w(_j(tmp, "sb.json"), json.dumps(sb_pin))
         stage_dir = _j(tmp, "stage")
         lk = _FakeLock()
         out, err = io.StringIO(), io.StringIO()
@@ -3383,7 +3474,7 @@ def _st_orchestration_body(t):
         died, msg, _ = _dies(stage, cfg, C.Log(io.StringIO()))
         t.check("a CLI define set without SQLITE_CORE is refused", died and "no SQLITE_CORE" in msg, msg[:120])
         base.defs["sqlite3d"] = req + ["SQLITE_CORE"]
-        sb_bad = dict(_GOOD_SB, requiredDefines=req + ["SQLITE_ENABLE_NOTHING"])
+        sb_bad = dict(sb_pin, requiredDefines=req + ["SQLITE_ENABLE_NOTHING"])
         cfg_bad = StageConfig(sqlite_dir=clone, out_dir=_j(tmp, "out"), stage_build=sb_bad, sqlite_repo_url=bare,
                               jobs=2, host_os=C.host_os(), environ=env, pkg_install=lambda a, b=None: None)
         died, msg, _ = _dies(stage, cfg_bad, C.Log(io.StringIO()))

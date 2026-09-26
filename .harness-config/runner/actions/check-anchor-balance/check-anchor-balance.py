@@ -22,7 +22,9 @@ question a reader actually has, and a count cannot answer it.
 
 star star star WHAT THE DENOMINATOR IS, AND WHY IT IS NOT JUST THE REGISTRY (2026-08-13)
 ------------------------------------------------------------------------------------
-`dss-cycle` SKILL.md section F.2 sanctions MORE THAN ONE HOME for a deferral:
+`dss-cycle` references/anchors-and-deferrals.md section F.2 sanctioned MORE THAN ONE HOME for a deferral
+until 2026-09-25 -- since then the two registries are the only home a row can have, and the live
+balance is `dssharness check-anchor-balance`:
 a feature-area anchor belongs in its plan's own deferred-items table, a project-level
 known-open item in plan-00 section 0.2, an orphan/cross-cutting anchor in
 `_deferred-anchor-registry*.md`.  Section F.4 then lets a `src/` citation resolve to
@@ -2796,7 +2798,7 @@ def main():
                     default="registry+plans",
                     help="which home(s) the gate counts. 'registry' reproduces the "
                          "pre-2026-08-13 headline; the default counts every home "
-                         "SKILL.md section F.2 sanctions.")
+                         "dss-cycle's anchors-and-deferrals.md section F.2 sanctioned until 2026-09-25.")
     ap.add_argument("--breakdown", action="store_true",
                     help="also print OPEN rows per plan file")
     ap.add_argument("--per-bucket", action="store_true",
@@ -2822,7 +2824,7 @@ def main():
     a_reg, a_plan = split_homes(after.rows)
     bal = balance(before, after, after.bookkeeping, args.denominator)
 
-    print("anchor-balance: denominator = %s   (SKILL.md sec F.2 sanctions BOTH homes; "
+    print("anchor-balance: denominator = %s   (dss-cycle anchors-and-deferrals.md sec F.2 sanctioned BOTH homes until 2026-09-25; "
           "use --denominator registry for the pre-2026-08-13 headline)" % args.denominator)
     print("anchor-balance: OPEN at %-10s registry=%-5d plans=%-5d total=%d"
           % (args.base, len(b_reg), len(b_plan), len(before.rows)))

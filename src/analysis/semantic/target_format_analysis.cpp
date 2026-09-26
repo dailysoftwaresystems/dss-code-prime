@@ -30,6 +30,13 @@ effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
     return format.longDoubleFormat();
 }
 
+EnumCompatibleTypeRule
+effectiveEnumCompatibleTypeRule(ObjectFormatSchema const& format) noexcept {
+    // P68 round 12 (lane `cs`): FORMAT-only (see the header docblock); `None`
+    // propagates as the undeclared state and the semantic tier fails loud on it.
+    return format.enumCompatibleTypeRule();
+}
+
 UnnamedBitFieldAlignment
 effectiveUnnamedBitFieldAlignment([[maybe_unused]] TargetSchema const& target,
                                   ObjectFormatSchema const&            format) noexcept {
@@ -76,7 +83,7 @@ analyzeForTargetFormat(std::shared_ptr<CompilationUnit const> cu,
     // `dataModel` field) into the per-(CU × target) analysis — the
     // single source for every width-dependent resolution downstream
     // (builtinTypes/typeSpecifiers `coreByDataModel`, the integer-
-    // literal ladder, descriptor `signatureByDataModel`). The HIR
+    // literal ladder, a descriptor `signature` variant's `when: {dataModel}`). The HIR
     // lowering reads the SAME value back off the SemanticModel.
     // FC6 deferral-close: also thread the target's aggregate-layout params so a
     // `sizeof` in an array-dimension const-expression (`int a[sizeof(T)]`) folds
@@ -153,7 +160,9 @@ analyzeForTargetFormat(std::shared_ptr<CompilationUnit const> cu,
         /*deepRecursionReserveBytes=*/0,
         // Consulted during analysis only, never republished by the model, so a
         // reference to a local outlives every read of it.
-        &roleResolver);
+        &roleResolver,
+        // P68 round 12 (lane `cs`): the format's enumeration compatible-type rule.
+        effectiveEnumCompatibleTypeRule(format));
     return TargetFormatAnalysis{std::move(model), std::move(analyzeVaLayout)};
 }
 

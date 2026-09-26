@@ -7,18 +7,22 @@ that dsscp refuses is a MERGE BLOCKER. ✔MEASURED P68 round 8: a green unit gat
 const-qualification regression (`T *const p[]` then `p++`) that broke every leg's testfixture,
 and the unit gate compiles none of sqlite's 189 TUs. This mode is that check as ONE command:
 
-    DSS_BIN=<the dsscp under review> python3 build_and_test.py --recompile <leg>
+    python3 build_and_test.py --recompile <leg> --dss <the dsscp under review>
+
+(the `recompile` manual step of sqlite.yml, whose `--dss` is the leg's own, {product}; DSS_BIN by hand),
 
   R0  Step 0 (the harness's own self-tests), exactly as a run applies it;
   R1  the leg, from the resolver's plan (the SAME legs on every host; an unknown label refused);
-  R2  the dsscp DSS_BIN names -- REQUIRED: never searched for and never built -- paired with the
+  R2  the dsscp `--dss` (or DSS_BIN) names -- REQUIRED: never searched for and never built -- paired with the
       config tree it was built with (DSS_CONFIG_ROOT, else the source tree its OWN build tree was
       configured from), and the pair PROVED by the driver's currency pre-flight: ✔MEASURED P68
       round 8, a fold landed between a build and its recompile and the binary refused the live
       config at load. Its build type is printed and NOT gated: this verdict is acceptance, not time;
-  R3  the STAGED sqlite state a run left under OUT_DIR, reused only when it is CURRENT
-      (`stage_findings`), refused otherwise with every reason named -- this mode never re-derives,
-      and it holds the output tree's RUN LOCK so a run cannot re-stage it underneath;
+  R3  THIS tree's staged sqlite state (OUT_DIR, else the tree's own output directory), reused when it
+      is CURRENT (`stage_findings`) and otherwise RE-STAGED here by the driver's own Steps 3-4 and
+      Step 6's per-target headers, then judged again -- still not current is refused with every
+      reason named; the output tree's RUN LOCK is held throughout, so a run cannot re-stage it
+      underneath;
   R4  the leg's include list, composed from its VERIFIED per-target headers exactly as Step 7
       composes it, and its (tcl, z) libraries resolved exactly as Step 6 resolves them;
   R5  the manifest through `sqlite_build.fixture_manifest` (the ONE composition Step 7 uses), the
@@ -26,7 +30,8 @@ and the unit gate compiles none of sqlite's 189 TUs. This mode is that check as 
       (`sqlite_base.build_artifact`, which asks EVERY build for its whole diagnostic stream);
   R6  the per-TU census, asked of its owner (`harness_legs.py --recompile-verdicts`) and printed
       verbatim: the table, every INCOMPLETE reason, and the summary line LAST --
-      `recompile: <leg> tus=N reference_ok=N dss_ok=N blockers=N`.
+      `recompile: <leg> sqlite=<sha12> tus=N reference_ok=N dss_ok=N blockers=N`, the commit named being the
+      pinned one (legs.json `stageBuild.sqliteCommit`) the stage was verified to hold.
 
 Everything it writes is under `<OUT_DIR>/recompile/<leg>/`, never a run's own leg directory.
 Exit 0 only when the census is clean (no blocker, and nothing it could not see); 1 otherwise, every
@@ -65,19 +70,21 @@ ORACLE_NOT_RUN = "not-run"
 
 # ── R2: the dsscp under review, and the config tree it was built with ─────────────────
 
-def given_compiler(log):
-    """The binary DSS_BIN names, as a `sqlite_compiler.Compiler`. REQUIRED, used as named: a
+def given_compiler(cfg, log):
+    """The binary the run's Config names (`--dss`, what the `recompile` step passes -- the leg's own,
+    {product} -- or DSS_BIN by hand), as a `sqlite_compiler.Compiler`. REQUIRED, used as named: a
     recompile that SEARCHED for a binary would judge a compiler nobody put under review."""
-    named = C.env("DSS_BIN").strip()
+    named, by = (cfg.dss_bin or "").strip(), cfg.by["dss_bin"]
     if not named:
-        C.die("--recompile compiles with a GIVEN dsscp: set DSS_BIN to the binary under review.\n"
+        C.die("--recompile compiles with a GIVEN dsscp: name the binary under review with --dss <path> "
+              "(the `recompile` step passes the leg's own, {product}) or DSS_BIN.\n"
               "      It is never searched for and never built here -- a recompile that picked a binary "
               "would judge a compiler nobody named.")
     if not os.path.isfile(named):
-        C.die("DSS_BIN='%s' does not name an existing file." % named)
+        C.die("%s='%s' does not name an existing file." % (by, named))
     info = CMP.build_type(named)
     comp = CMP.Compiler(info.path, info.type, info.source, info.detail, info.tree,
-                        "named by DSS_BIN -- NOT built by this run", CMP.built_stamp(info),
+                        "named by %s -- NOT built by this run" % by, CMP.built_stamp(info),
                         "  (compiler build type: %s)" % info.type)
     log.info("compiler  : %s  (built %s)" % (comp.path, comp.built))
     log.info("build type: %s  -- read from %s; printed, NOT gated: a recompile judges which TUs "
@@ -109,7 +116,7 @@ def pair_config_root(compiler, log):
     if not C.env("DSS_CONFIG_ROOT").strip():
         own = own_source_tree(compiler)
         if not own:
-            C.die("DSS_BIN=%s has no build tree that names the source tree it was built from (no "
+            C.die("the dsscp %s has no build tree that names the source tree it was built from (no "
                   "CMakeCache.txt above it, or one without CMAKE_HOME_DIRECTORY), so the config tree "
                   "it pairs with is unknown.\n      Set DSS_CONFIG_ROOT to the checkout whose "
                   "src/dss-config that binary was built with." % compiler.path)
@@ -155,6 +162,13 @@ def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherenc
     stage-zinc's own verifiers; `coherence(dirs) -> (ok, text)` runs the one-vintage gate."""
     why = []
     sb = stage_build
+    # ★ THE SUBJECT FIRST (2026-09-25): a stage of another sqlite revision than the pin compiles another
+    # program. MEASURED before the pin: a stage two days old (b943fa1288) was judged current while the
+    # clone stood 21 upstream commits later, and the round-close recompile compiled it.
+    pin, head = sb.get("sqlite_commit") or "", st.sqlite_head or ""
+    if not (len(head) >= 7 and pin.startswith(head)):
+        why.append("the stage's sqlite is %s, not the pinned %s (legs.json stageBuild.sqliteCommit): a "
+                   "stage of another revision compiles another subject" % (head or "<unrecorded>", pin[:12]))
     if not configure_flags_applied(st.configure_args, sb["configure_flags"]):
         why.append("the stage was configured with %s, and the catalogue now declares the configure "
                    "flags %s" % (" ".join(st.configure_args) or "<nothing>",
@@ -222,18 +236,48 @@ def coherence_gate(label, checkout=None):
     return run
 
 
-def load_stage(run, leg):
-    """R3: the stage a run left at `<stage root>/stage/` (`sqlite_stage.stage_dir_of`, every host), refused
-    unless it is current."""
+def refresh_stage(run, leg, driver, why):
+    """R3b: re-stage THIS tree's stage with the driver's own steps -- Steps 3-4 (fetch, derive, stage; on
+    a Windows host the derive runs in WSL) and Step 6's per-target headers -- because `why` says the stage
+    is missing or not current. The stage root is this run's (`run.stage_root`), never another tree's. The
+    clone lock Steps 3-4 take for WRITE is released before the stage is judged again (R3 re-takes it for
+    READ when the stage is built in place)."""
     log = run.log
+    log.warn("the staged sqlite state is NOT usable for leg %s -- re-staging it in %s:\n%s"
+             % (leg.label, run.stage_root, "\n".join("      - %s" % w for w in why)))
+    saved_out, saved_legs = run.out_dir, run.legs
+    run.out_dir = run.stage_root
+    try:
+        driver.step34(run)
+        BLD.stage_headers(run)
+    finally:
+        run.out_dir, run.legs = saved_out, saved_legs
+        if run.clone_lock is not None:
+            run.clone_lock.release()
+            run.clone_lock = None
+
+
+def stage_verdict(run, leg):
+    """-> (StageResult or None, every reason it is not usable for `leg`; [] = current)."""
     path = os.path.join(S.stage_dir_of(run.stage_root), S.RESULT_FILE)
     if not os.path.isfile(path):
-        C.die("no staged sqlite state at %s.\n      A run of this driver writes it (Steps 3-4 persist the "
-              "stage's result there, on every host); the recompile reuses it and never re-derives. Run "
-              "the driver once for this output tree, or point OUT_DIR at the output tree of a run "
-              "that staged it." % path)
+        return None, ["no staged sqlite state at %s" % path]
     with open(path, "r", encoding="utf-8") as fh:
         st = S.StageResult.from_json(fh.read())
+    return st, []
+
+
+def load_stage(run, leg, driver=None):
+    """R3: the stage at `<stage root>/stage/` (`sqlite_stage.stage_dir_of`, every host) when it is current;
+    otherwise -- given the driver -- re-staged here once (`refresh_stage`) and judged again."""
+    log = run.log
+    path = os.path.join(S.stage_dir_of(run.stage_root), S.RESULT_FILE)
+    st, missing = stage_verdict(run, leg)
+    if st is None:
+        if driver is None:
+            C.die("%s.\n      The recompile re-stages it itself when it is given the driver." % missing[0])
+        refresh_stage(run, leg, driver, missing)
+        return load_stage(run, leg, None)
     checkout = None
     if not st.copy_to_stage:
         # ★ IN PLACE (a POSIX host's stage): its sources and its build dir ARE the shared clone, which any run
@@ -251,10 +295,15 @@ def load_stage(run, leg):
     zinc = _stage_zinc()
     why = stage_findings(st, S.parse_stage_build(run.stage_build), leg, zinc.verify_guards,
                          zinc.verify_answers, coherence_gate("staged sqlite (recompile)", checkout))
+    if why and driver is not None:
+        if run.clone_lock is not None:
+            run.clone_lock.release()
+            run.clone_lock = None
+        refresh_stage(run, leg, driver, why)
+        return load_stage(run, leg, None)
     if why:
-        C.die("the staged sqlite state at %s is NOT CURRENT for leg %s -- %d reason(s):\n%s\n      "
-              "The recompile never re-derives. Re-stage it with a run of this driver (its Steps 3-6), "
-              "then recompile." % (path, leg.label, len(why),
+        C.die("the staged sqlite state at %s is STILL NOT CURRENT for leg %s after re-staging it -- %d "
+              "reason(s):\n%s" % (path, leg.label, len(why),
                                    "\n".join("      - %s" % w for w in why)))
     log.info("stage     : %s" % path)
     log.info("            sqlite %s (%s), %s; %d fixture TU(s); CURRENT for %s"
@@ -280,8 +329,8 @@ def recompile(run, label, driver):
     run.plan, run.legs = plan, [leg]
     run.ledger = C.Ledger(driver.read_vocabulary(run.resolver), log)
     log.info("leg       : %s  %s" % (leg.label, leg.spec))
-    log.step("R2  The dsscp under review (DSS_BIN) and the config tree it was built with")
-    run.compiler = given_compiler(log)
+    log.step("R2  The dsscp under review (%s) and the config tree it was built with" % run.cfg.by["dss_bin"])
+    run.compiler = given_compiler(run.cfg, log)
     run.config_root = pair_config_root(run.compiler, log)
     proved = CMP.assert_current(C.BENCH_CORE, run.compiler, run.config_root, [leg.spec],
                                 CMP.rebuild_command(run.compiler, run.repo_root))
@@ -291,7 +340,7 @@ def recompile(run, label, driver):
     stolen = run.run_lock.acquire(log)
     if stolen:
         log.warn("took over a STALE run lock left by PID %s" % stolen)
-    run.stage = load_stage(run, leg)
+    run.stage = load_stage(run, leg, driver)
     log.step("R4  The leg's build inputs (its verified headers, its libraries)")
     zinc, cfgd = header_stage_dirs(run.stage, leg)
     run.zinc_stage_dirs = {leg.build.get("headerStageKey"): zinc.replace("\\", "/")}
@@ -337,6 +386,7 @@ def recompile(run, label, driver):
                 res.path or res.error or log_path))
     log.step("R6  The per-TU census")
     r = run.resolver.call(["--recompile-verdicts", leg.label, "--manifest", manifest,
+                           "--sqlite-head", S.parse_stage_build(run.stage_build)["sqlite_commit"][:12],
                            "--compile-log", log_path, "--dss-build", dss_build,
                            "--dss-build-detail", res.error or "",
                            "--oracle-log", leg.oracle.get("log") or os.path.join(
@@ -355,12 +405,13 @@ def recompile(run, label, driver):
     return 0 if (r.rc == 0 and rec.get("clean") is True) else 1
 
 
-def main(label, driver):
-    """`build_and_test.py --recompile <leg>`. `driver` is the build_and_test module that called
-    (its Step 0, its vocabulary reader and its placement rule), passed rather than re-imported."""
+def main(label, driver, knobs=None):
+    """`build_and_test.py --recompile <leg> [--dss PATH] [--dss-config C]`. `driver` is the build_and_test
+    module that called (its Step 0, its Steps 3-4, its vocabulary reader and its placement rule), passed
+    rather than re-imported; `knobs` the command-line values `sqlite_common.Config` takes."""
     run = None
     try:
-        run = C.Run(C.Config())
+        run = C.Run(C.Config(knobs))
         driver.place_run(run)
         run.stage_root = run.out_dir
         run.out_dir = os.path.join(run.stage_root, RECOMPILE_DIR)

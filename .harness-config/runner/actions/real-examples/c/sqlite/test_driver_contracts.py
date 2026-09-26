@@ -8,9 +8,10 @@ pinned by CALLING the driver's own functions -- the very function objects produc
 driving the real resume loop, the real ledger and the real gates -- and every pin is proven
 non-vacuous by MUTATING a temporary COPY of the module that owns the guard (red-on-disable):
 
-  DC-01 .. DC-26  green pins; each carries the UNION of both twins' arms for its subject, plus
+  DC-01 .. DC-30  green pins; each carries the UNION of both twins' arms for its subject, plus
                   the negatives neither twin had (report 09, section E.4);
-  RD-01 .. RD-52  red arms; each MUTATES a copy of one driver module -- fail-closed: the witness
+  RD-01 .. RD-80  red arms (a retired arm's id is never reused, so the range has gaps; the
+                  registry below counts them); each MUTATES a copy of one driver module -- fail-closed: the witness
                   occurs EXACTLY once, the mutant bytes (or AST) differ, the witness is absent,
                   it parses, compiles and IMPORTS under a unique module name kept out of
                   sys.modules -- and re-runs the SAME pin, which must go red ON A CHECK THE ARM
@@ -26,7 +27,8 @@ Usage: `python test_driver_contracts.py` (no arguments). ASCII output, flushed p
 LAST line is exactly `passed=N failed=N skipped=N` -- one per check of a green pin, one per red
 arm, one per mutator arm, one for the arm registry -- and the exit code is 0 only when failed=0.
 `--child <scenario> <spec.json> ...` is internal: the pins whose property is "the PROCESS stops"
-(DC-11, DC-18) and the one that needs a process chain (DC-20) re-enter this file in a child.
+(DC-11, DC-18, DC-21, DC-30) and the one that needs a process chain (DC-20) re-enter this file in a
+child.
 
 Nothing runs at import beyond `sys.dont_write_bytecode = True` (the action is
 `requireInputsUnmoved`: no __pycache__ may appear beside it). Every temporary file lives under
@@ -38,8 +40,9 @@ RETIRED with the second driver (report 09, section D), each property carried as 
 the cross-driver parity readings D2/C2 -> DC-06 over the one driver; the `.ps1` region-marker
 arms -> there is nothing to pair; I2/G2 as twins -> DC-11; the "byte-identical in bash and
 PowerShell" sentinel parity -> the literal itself, pinned behaviourally in DC-07; P6b/c/d's
-PowerShell pipeline-leak shape -> DC-21 keeps the non-integer refusal it grew into; every
-bash/pwsh extraction mechanism -> importing the module.
+PowerShell pipeline-leak shape -> DC-21 kept the non-integer refusal it grew into until
+2026-09-26, when the refresh it guarded was removed (Step 5 builds nothing, so no builder
+answers it); every bash/pwsh extraction mechanism -> importing the module.
 """
 from __future__ import annotations
 
@@ -61,7 +64,6 @@ import re  # noqa: E402
 import shutil  # noqa: E402
 import stat  # noqa: E402
 import subprocess  # noqa: E402
-import sysconfig  # noqa: E402
 import tempfile  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
@@ -1151,6 +1153,11 @@ def pin_dc06(t, x):
         (n, "-lpinlib" if n == "TCL_LIBS" else "") for n in names)
     Sg.probe_link_l = lambda ctx, probe_cc, args: "-L/opt/pin/lib" in list(args)
     Sg.libdir_for = lambda ctx, name, probe_cc: "/opt/pin/lib"
+    # Step 3 (2026-09-25): the clone goes on the DECLARED pin -- recorded here; the checkout itself is
+    # sqlite_stage's own self-test's (its git arm), and this fixture's tree is no git checkout.
+    clones = []
+    Sg.clone_or_update = lambda url, dest, want="", log=None, env=None, commit="": (
+        clones.append((dest, commit)), [])[1]
     cfg = Sg.StageConfig(sqlite_dir=clone, out_dir=os.path.join(root, "out"), stage_build=sb, jobs=2,
                          tcl_version="8.6", host_os="linux", environ=dict(os.environ),
                          pkg_install=lambda a, b=None: None)
@@ -1180,6 +1187,8 @@ def pin_dc06(t, x):
     t.eq("S06", "both recipe derivations pass OPTIONS=<makeOptions> as a make variable",
          [("testfixture", True), ("sqlite3d", True)],
          [(d["make_target"], ("OPTIONS=" + mo) in tuple(d.get("make_vars") or ())) for d in derivations])
+    t.eq("S07", "Step 3 puts the clone on the DECLARED sqlite pin (legs.json stageBuild.sqliteCommit), never "
+         "unpinned", [sb["sqliteCommit"]], [c for _d, c in clones])
     cen = stage_census(source_of(Sg))
     t.ck("C01", "census: the matcher still FINDS make spawn sites (it can see its subject)",
          len(cen["make"]) >= 1, cen["make"])
@@ -1201,7 +1210,8 @@ def pin_dc06(t, x):
 # DC-07 -- the precondition discriminator, and the REAL resume loop driven by scripted logs
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
-def drive_corpus(x, U, tag, write_segment, patterns=(), leg_over=None, answer=None, kentry=()):
+def drive_corpus(x, U, tag, write_segment, patterns=(), leg_over=None, answer=None, kentry=(),
+                 single_file=None):
     """Drive `sqlite_units.run_corpus` -- the REAL resume engine and verdict -- with an INJECTED
     segment runner that writes a scripted log per segment. `kentry` is the plan's kernel entry
     (it only arms the in-kernel sweep, which the caller's procs stand-in answers). -> what it did."""
@@ -1228,6 +1238,15 @@ def drive_corpus(x, U, tag, write_segment, patterns=(), leg_over=None, answer=No
            "base_env": {"PATH": os.environ.get("PATH", ""),
                         "SQLITE_TEST_PATTERN_LIST": "stale-selection-in-the-driver-environment",
                         "LD_LIBRARY_PATH": "/host/lib"}}
+    if single_file:
+        # A SINGLE-FILE run (DSS_TEST_FILE), handed over as step8 hands it: the segment sources this one
+        # file, which has no `run_test_suite` line (so no tier permutation), and the run's config names it.
+        tf = os.path.join(testdir, single_file)
+        write_bytes(tf, b"# one corpus file, sourced directly by the fixture\n")
+        ctx["test_file"] = tf
+        ctx["tier_perms"] = U.K.tier_permutations(tf)
+        run.cfg.test_file = tf
+        corpus.append(single_file)
     rundir = os.path.join(root, "run")
     os.makedirs(rundir)
     plan = {"launcher": [], "launcherPath": "", "kernelEntryArgv": list(kentry)}
@@ -2090,13 +2109,14 @@ def pin_dc18(t, x):
     # "The run STOPS at Step 5" is a property of a PROCESS: build_and_test.run_all's own call site runs
     # in a child per arm. The classification arms call assert_current in THIS process meanwhile (its
     # pre-flights are real child processes either way; a refusal is the HarnessDie it raises).
+    # (The third site, a stale binary under SKIP_DSS_BUILD=1, retired with that knob on 2026-09-26: every compiler
+    # is NAMED now, and the refusal says a named one is not exempt -- O23.)
     jobs = []
-    for key, dss, extra in (("site-stale", stale, None), ("site-current", ok, None),
-                            ("site-skip", stale, {"SKIP_DSS_BUILD": "1"})):
+    for key, dss in (("site-stale", stale), ("site-current", ok)):
         spec = write_json(os.path.join(root, key + ".json"), {
             "dsscp": dss, "config_root": cfgroot, "legs": legs, "tree": tree, "repo_root": repo,
             "override": x.M.override_spec()})
-        jobs.append((key, [sys.executable, THIS_FILE, "--child", "currency", spec], child_env(x, extra)))
+        jobs.append((key, [sys.executable, THIS_FILE, "--child", "currency", spec], child_env(x)))
     running = start_children(jobs)
     CMP = x.M.mod("sqlite_compiler")
     res = {}
@@ -2105,7 +2125,7 @@ def pin_dc18(t, x):
                                   ("call-noroot", ok, noroot, core), ("call-rc2", ok, cfgroot, stub),
                                   ("call-nocore", ok, cfgroot, os.path.join(root, "no-such-core.py"))):
             comp = CMP.Compiler(path=dss, type="Release", source="the contract suite", detail="", tree=tree,
-                                origin="LOCATED under an eligible build root %s NOT built by this run" % DASH,
+                                origin="named by --dss %s NOT built by this run" % DASH,
                                 built="2026-08-28 09:30:36", build_type_note="")
             r, v = refused(CMP.assert_current, cr, comp, cfg, specs, CMP.rebuild_command(comp, repo))
             res[key] = (1, "DIE: %s" % v) if r else (0, "REACHED-NEXT-STATEMENT ok=[%s]" % v)
@@ -2116,18 +2136,19 @@ def pin_dc18(t, x):
     t.has("O02", "...naming the BINARY", out, stale)
     t.has("O03", "...naming WHEN it was built", out, "built     : 2026-08-28 09:30:36")
     t.has("O04", "...naming how it was obtained", out, "NOT built by this run")
-    t.has("O05", "...naming the REBUILD command for the tree THIS binary came from", out, "REBUILD IT: cmake --build " + tree)
+    t.ck("O05", "...naming the REBUILD as DssHarness's build of the leg, in the tree under test, and the tree THIS "
+         "binary came from", ("REBUILD IT: dssharness build --legs <leg> -C %s" % repo) in out
+         and ("whose build made %s" % tree) in out, out[-1500:])
+    t.lacks("O05b", "...and never a build outside the harness (the advice was `cmake --build <tree>` until "
+            "2026-09-26)", out, "cmake --build")
+    t.has("O23", "...and saying a NAMED binary is not exempt: naming a compiler is not trusting it", out,
+          "A NAMED BINARY IS NOT EXEMPT FROM THIS CHECK")
     t.has("O06", "...quoting the compiler's own diagnostic", out, "unknown key 'restrictMarker'")
     t.lacks("O07", "...and the statement AFTER Step 5 never ran", out, "REACHED-NEXT-STATEMENT")
     rc, out = res["site-current"]
     t.eq("O08", "a CURRENT compiler is let through Step 5 (rc)", 0, rc)
     t.has("O09", "...reaching the next statement having proved BOTH selected targets, in order", out,
           "x86_64:elf64-x86_64-linux-exec, x86_64:pe64-x86_64-windows-exec")
-    rc, out = res["site-skip"]
-    t.eq("O10", "SKIP_DSS_BUILD=1 does NOT exempt a stale binary (rc)", 1, rc)
-    t.ck("O11", "...and the refusal says a reused binary is not exempt, naming SKIP_DSS_BUILD=1",
-         "DOES NOT EXEMPT IT FROM THIS CHECK" in out and "SKIP_DSS_BUILD=1" in out, out[-1500:])
-    t.lacks("O12", "...and the statement AFTER Step 5 never ran", out, "REACHED-NEXT-STATEMENT")
     rc, out = res["call-stale"]
     t.ck("O13", "only rc 1 of the pre-flight ACCUSES: THE COMPILER CANNOT COMPILE THREE LINES",
          rc == 1 and "CANNOT COMPILE THREE LINES" in out, (rc, out[-1200:]))
@@ -2334,7 +2355,8 @@ def pin_dc20(t, x):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
-# DC-21 -- a LOCATED compiler is REFRESHED, not trusted (Step 5, with an injected builder)
+# DC-21 -- Step 5's compiler is GIVEN: none named is REFUSED (before Step 0 spends anything), a named one is
+# used as given -- never searched for, never built -- and its stamp is its code's (in-process, and children)
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
 def fake_tree(root, rel, btype):
@@ -2345,124 +2367,93 @@ def fake_tree(root, rel, btype):
     return tree, binary
 
 
-def pin_dc21(t, x):
-    CMP = x.M.mod("sqlite_compiler")
-    seen = []
+def spawn_recorder(x):
+    """-> (a stand-in for sqlite_common whose two spawning verbs RECORD instead of running, the list they record
+    into). `capture` and `run_checked` are what the retired default ran its configure, its `cmake --build` and its
+    nested `dssharness build` through; handed to a private copy of sqlite_compiler, this makes "nothing was built
+    or run" something the pin OBSERVES rather than an absence of evidence."""
+    ran = []
 
-    def ok_build(tree, jobs):
-        seen.append((tree, jobs))
-        return 0
-    ret = CMP.refresh_located("T:/rel", "T:/rel/bin/dss/dsscp.exe", "2026-08-31 23:25:16", 7, ok_build)
-    t.eq("P1", "the LOCATED tree is what gets rebuilt, with this run's job count", [("T:/rel", 7)], seen)
-    t.eq("P2", "...and the refresh reports back the tree it built", "T:/rel", ret)
-    r, msg = refused(CMP.refresh_located, "T:/rel", "T:/rel/bin/dss/dsscp.exe", "2026-08-31", 7, lambda tr, j: 1)
-    t.ck("P3", "a FAILED rebuild REFUSES, never falls back to the located binary", r, msg)
-    t.has("P4", "...saying which defect a fallback would reinstate", msg, "older than the sources it compiles")
-    r, msg = refused(CMP.refresh_located, "", "T:/somewhere/dsscp.exe", "2026-08-31", 7, ok_build)
-    t.ck("P5", "a binary with NO build tree REFUSES, and is not silently reused", r, msg)
-    t.has("P6", "...and the two refusals are told apart", msg, "build TREE could not be determined")
-    r, msg = refused(CMP.refresh_located, "T:/rel", "T:/rel/dsscp", "w", 7, lambda tr, j: "0")
-    t.ck("P6b", "a builder answering no EXIT CODE (a string) is refused in its own words", r and
-         "did not return an EXIT CODE" in str(msg), msg)
-    r, msg = refused(CMP.refresh_located, "T:/rel", "T:/rel/dsscp", "w", 7, lambda tr, j: True)
-    t.ck("P6c", "...and so is a boolean (True is not an exit code)", r and "did not return an EXIT CODE" in str(msg), msg)
-    repo = x.sub("repo")
-    tree, binary = fake_tree(repo, "build/rel", "Release")
-    spy = []
+    def record(argv, *_a, **_kw):
+        ran.append([str(a) for a in argv])
+        return x.C.Result(0, "", "")
+    return Proxy(x.C, capture=record, run_checked=record), ran
+
+
+def pin_dc21(t, x):
+    """MEASURED (P68 round 12's independent audit, 2026-09-25): every sqlite step named `{product}`, yet Step 5 --
+    for any run WITHOUT --dss / DSS_BIN -- still searched build/*/bin/dss for the newest Release dsscp and
+    REFRESHED the tree it found from inside the step (a plain `cmake --build`, or a nested `dssharness build` of a
+    developer-environment leg), or configured and built build/rel; and this pin called that default correct. The
+    compiler is now GIVEN, or the run is refused. The negative is SYNTHESIZED: a Release dsscp sits in build/, a
+    NEWER one than the compiler named, where the retired search would have picked it."""
+    fake_c, ran = spawn_recorder(x)
+    CMP = x.M.fresh("sqlite_compiler", C=fake_c)
+    Cm = x.M.mod("sqlite_common")
+    repo = x.sub("given")
+    _rt, searched_bin = fake_tree(repo, "build/rel", "Release")
+    _lt, leg_bin = fake_tree(repo, "build/x86_64-gcc-release", "Release")
+    now = time.time()
+    os.utime(leg_bin, (now - 100, now - 100))
+    os.utime(searched_bin, (now + 5, now + 5))     # the retired search's pick: the NEWEST Release binary
+
+    # ── (A) THE NEGATIVE: no compiler named -> REFUSED, and nothing built or run in its place ──────────────
     with patched_environ(unset=x.suite.knobs):
-        r, comp = refused(CMP.obtain, repo, 7, False, log=x.log(),
-                          invoke_build=lambda tr, j: (spy.append((os.path.normcase(tr), j)), 0)[1])
-    t.eq("P7", "Step 5 rebuilds the LOCATED Release tree with the run's job count (the call site CALLS the "
-         "refresh)", [(os.path.normcase(os.path.abspath(tree)), 7)], spy)
-    t.eq("P8", "...and the origin says the run rebuilt it", "LOCATED under an eligible build root, then REBUILT by "
-         "this run (incremental)", getattr(comp, "origin", comp))
+        nameless = Cm.Config()
+    with patched_environ(unset=x.suite.knobs, DSS_BIN="   "):
+        blank = Cm.Config()
+    r1, why1 = refused(CMP.obtain, nameless, log=x.log())
+    r2, why2 = refused(CMP.obtain, blank, log=x.log())
+    t.ck("N01", "a run naming NO compiler is REFUSED in its own words -- and so is a DSS_BIN of blanks",
+         r1 and r2 and "no dsscp was named" in str(why1) and "no dsscp was named" in str(why2), (why1, why2))
+    t.ck("N02", "...naming both channels, and that the harness step passes the leg's own {product}",
+         r1 and all(s in str(why1) for s in ("--dss <path>", "DSS_BIN", "{product}")), why1)
+    t.eq("N03", "...and NOTHING was built or run in its place: no configure, no cmake --build, no nested dssharness",
+         [], ran)
     with patched_environ(unset=x.suite.knobs):
-        r, msg = refused(CMP.obtain, repo, 7, False, log=x.log(), invoke_build=lambda tr, j: 3)
-    t.ck("P9", "a failed refresh through Step 5 is FATAL", r and "older than the sources it compiles" in str(msg), msg)
-    spy2 = []
-    with patched_environ(unset=x.suite.knobs, SKIP_DSS_BUILD="1"):
-        r, comp = refused(CMP.obtain, repo, 7, False, log=x.log(),
-                          invoke_build=lambda tr, j: (spy2.append(tr), 0)[1])
-    t.eq("P10", "SKIP_DSS_BUILD=1 reuses the located Release binary and NEVER builds",
-         ([], "REUSED under SKIP_DSS_BUILD=1 %s NOT built by this run" % DASH), (spy2, getattr(comp, "origin", comp)))
-    with patched_environ(unset=x.suite.knobs, DSS_BIN=os.path.join(repo, "no-such-dsscp")):
-        r, msg = refused(CMP.obtain, repo, 7, False, log=x.log(), invoke_build=ok_build)
-    t.ck("P11", "DSS_BIN naming a missing file is REFUSED (never replaced by a searched binary)",
-         r and "does not name an existing file" in str(msg), msg)
-    spy3 = []
-    with patched_environ(unset=x.suite.knobs, DSS_BIN=binary):
-        r, comp = refused(CMP.obtain, repo, 7, False, log=x.log(), invoke_build=lambda tr, j: (spy3.append(tr), 0)[1])
-    t.eq("P12", "DSS_BIN naming a binary uses it and never builds",
-         ([], "named by DSS_BIN %s NOT built by this run" % DASH), (spy3, getattr(comp, "origin", comp)))
-    repo2 = x.sub("repo-debug")
-    fake_tree(repo2, "build/rel", "Debug")
-    with patched_environ(unset=x.suite.knobs, SKIP_DSS_BUILD="1"):
-        r, msg = refused(CMP.obtain, repo2, 7, False, log=x.log(), invoke_build=ok_build)
-    t.ck("P13", "a Debug-only tree under SKIP_DSS_BUILD=1 is REFUSED: only a Release compiler is eligible",
-         r and "rejected on BUILD TYPE" in str(msg), msg)
+        r, why = refused(CMP.obtain, Cm.Config({"dss_bin": os.path.join(repo, "no-such-dsscp")}), log=x.log())
+    t.ck("N04", "--dss naming a file that does not exist is REFUSED -- never replaced by a binary found in build/",
+         r and "does not name an existing file" in str(why), why)
+
+    # ── (B) THE POSITIVE: a named compiler is used AS GIVEN, though a newer one sits in build/ ────────────
+    del ran[:]
+    with patched_environ(unset=x.suite.knobs):
+        r, comp = refused(CMP.obtain, Cm.Config({"dss_bin": leg_bin}), log=x.log())
+    t.eq("N05", "a compiler named by --dss is the one used -- not the newer Release dsscp in build/rel -- and its "
+         "origin names the channel", (os.path.normcase(os.path.abspath(leg_bin)),
+                                      "named by --dss %s NOT built by this run" % DASH),
+         (os.path.normcase(os.path.abspath(getattr(comp, "path", str(comp)))), getattr(comp, "origin", comp)))
+    t.eq("N06", "...and nothing was built or run for it: a named compiler is never refreshed", [], ran)
+    with patched_environ(unset=x.suite.knobs, DSS_BIN=leg_bin):
+        r, comp_env = refused(CMP.obtain, Cm.Config(), log=x.log())
+    t.eq("N07", "control: by hand, DSS_BIN names it, and the origin says DSS_BIN",
+         "named by DSS_BIN %s NOT built by this run" % DASH, getattr(comp_env, "origin", comp_env))
+
+    # ── (C) A RUN THAT NAMES NONE STOPS BEFORE STEP 0 (a property of a PROCESS: build_and_test.run_all in a child,
+    # Step 0 a marker that stops it, the driver's spawning verbs recorders -- so no mutant can start a real build)
+    jobs = []
+    for key, dss in (("nameless", ""), ("named", leg_bin)):
+        spec = write_json(os.path.join(repo, "fail-fast-%s.json" % key), {"dss": dss, "override": x.M.override_spec()})
+        jobs.append((key, [sys.executable, THIS_FILE, "--child", "fail-fast", spec], child_env(x)))
+    res = run_children(jobs)
+    rc, out = res["nameless"]
+    t.ck("N08", "build_and_test.run_all naming NO compiler is REFUSED before Step 0 runs, and starts no process",
+         rc == 1 and "no dsscp was named" in out and "STEP0-REACHED" not in out and "SPAWN " not in out,
+         (rc, out[-1500:]))
+    rc, out = res["named"]
+    t.ck("N09", "control: naming one (--dss), the run goes on into Step 0", rc == 0 and "STEP0-REACHED" in out,
+         (rc, out[-1500:]))
+
+    # ── (D) THE CANDIDATE SEARCH IS THE BENCHMARK'S BY-HAND DEFAULT, NEVER STEP 5'S ───────────────────────
     repo3 = x.sub("repo-variant")
     vtree, _vb = fake_tree(repo3, "build/x86_64-mingw-release", "Release")
     fake_tree(repo3, "out/rel", "Release")
     cands, _searched = CMP.find_candidates(repo3)
-    t.eq("P14", "a Release tree under ANY build/<name> (DssHarness's variant layout) is found; one outside "
-         "build/ is not", [os.path.normcase(os.path.abspath(vtree))],
+    t.eq("P14", "the benchmark's by-hand search finds a Release tree under ANY build/<name> (DssHarness's variant "
+         "layout), and not one outside build/", [os.path.normcase(os.path.abspath(vtree))],
          [os.path.normcase(c.tree) for c in cands])
 
-    # ── (A) THE REFRESH ROUTE COMES FROM THE TREE'S OWNER, AND FROM CONFIG ───────────────────────
-    # ✔MEASURED 2026-09-22: without DSS_BIN on Windows, Step 5 refreshed build/x86_64-msvc-release with a
-    # plain `cmake --build`, which needs the Visual Studio developer environment whenever anything is
-    # stale. The route is now read from the tree's DssHarness marker, the leg declared for its variant on
-    # this host, and that leg's toolchain's `developerEnvironment` -- the fixture's toolchains are named
-    # `tc-env` / `tc-plain` so nothing here can pass by a toolchain name. ⓘ `dssharness build` rebuilds a
-    # leg's whole project from CLEAN when any input changed (DssHarness report #2): the tool's route can
-    # cost a full build where `cmake --build` is incremental -- the cost is upstream's, the route correct.
-    here = CMP._host_leg_os(x.C.host_os())
-    repo4 = x.sub("repo-owner")
-
-    def harness_cfg(env_declared):
-        write_bytes(os.path.join(repo4, ".harness-config", "config.json"), json.dumps({
-            "legs": {"leg-env": {"os": here, "processor": "x86_64", "toolchain": "tc-env", "config": "release"},
-                     "leg-plain": {"os": here, "processor": "x86_64", "toolchain": "tc-plain",
-                                   "config": "release"},
-                     "leg-elsewhere": {"os": "plan9", "processor": "x86_64", "toolchain": "tc-env",
-                                       "config": "debug"}},
-            "toolchains": {"tc-env": {"developerEnvironment": "env-x"} if env_declared else {},
-                           "tc-plain": {}}}))
-    harness_cfg(True)
-    env_tree, env_bin = fake_tree(repo4, "build/x86_64-tc-env-release", "Release")
-    write_bytes(os.path.join(env_tree, ".harness-build"), b"clean\nx86_64-tc-env-release\nin 00 CMakeLists.txt\n")
-    plain_tree, _pb = fake_tree(repo4, "build/x86_64-tc-plain-release", "Release")
-    write_bytes(os.path.join(plain_tree, ".harness-build"), b"clean\nx86_64-tc-plain-release\n")
-    bare_tree, _bb = fake_tree(repo4, "build/rel", "Release")
-    odd_tree, _ob = fake_tree(repo4, "build/x86_64-tc-env-debug", "Release")
-    write_bytes(os.path.join(odd_tree, ".harness-build"), b"clean\nx86_64-tc-env-debug\n")
-    tool = "/fixture/dssharness"
-    t.eq("P15", "a tree DssHarness built for a leg whose toolchain DECLARES a developer environment is refreshed "
-         "by the tool, which enters it", [tool, "build", "--legs", "leg-env", "-C", repo4, "--no-prompt"],
-         CMP.refresh_argv(repo4, env_tree, 7, harness=tool)[0])
-
-    def plain(tree_):
-        return ["cmake", "--build", tree_, "--config", "Release", "--target", "dsscp", "-j", "7"]
-    t.eq("P16", "CONTROL: a DssHarness tree whose toolchain declares none, a tree with no marker, and a variant no "
-         "leg on this host declares each take the plain incremental build",
-         [plain(plain_tree), plain(bare_tree), plain(odd_tree)],
-         [CMP.refresh_argv(repo4, tr, 7, harness=tool)[0] for tr in (plain_tree, bare_tree, odd_tree)])
-    harness_cfg(False)
-    t.eq("P17", "THE ROUTE IS CONFIG: the same tree, its toolchain no longer declaring the environment, takes the "
-         "plain build -- nothing in code names a toolchain", plain(env_tree),
-         CMP.refresh_argv(repo4, env_tree, 7, harness=tool)[0])
-    harness_cfg(True)
-    newest = time.time() + 5
-    os.utime(env_bin, (newest, newest))
-    ran = []
-    fake_c = Proxy(x.C, capture=lambda argv, **_kw: (ran.append(list(argv)), x.C.Result(0, "", ""))[1])
-    CMPx = x.M.fresh("sqlite_compiler", C=fake_c, harness_executable=lambda environ=None: tool)
-    with patched_environ(unset=x.suite.knobs):
-        r, comp = refused(CMPx.obtain, repo4, 7, False, log=x.log())
-    t.eq("P18", "Step 5's DEFAULT refresh of that located tree runs the tool's command (the call site takes the "
-         "owner's route)", [[tool, "build", "--legs", "leg-env", "-C", repo4, "--no-prompt"]], ran)
-
-    # ── (B) THE STAMP IS THE CODE'S, NAMED, AND IT ORDERS THE CANDIDATES ─────────────────────────
+    # ── (E) THE STAMP IS THE CODE'S, NAMED, AND IT ORDERS THE CANDIDATES ─────────────────────────
     repo5 = x.sub("repo-stamp")
     tree_a, bin_a = fake_tree(repo5, "build/a-rel", "Release")
     lib_a = write_bytes(os.path.join(tree_a, "bin", "dss", "libdsscp.so"), b"code a\n")
@@ -2491,34 +2482,6 @@ def pin_dc21(t, x):
     cand_c = CMP.build_type(bin_c)
     t.ck("P21", "CONTROL: with no library beside it the executable IS the code, and its own time is the stamp",
          cand_c.image == os.path.abspath(bin_c) and abs(cand_c.mtime - os.path.getmtime(bin_c)) < 1, cand_c)
-
-    # ── (C) THE TOOL IS FOUND WHERE ITS INSTALLER PUTS IT, UNDER THIS HOST'S OWN FILE NAME ───────────
-    # ✔MEASURED 2026-09-23: the first form of this search spelled a Windows suffix beside the name, which
-    # `HarnessLegs.NeitherDriverNamesTheArtefactTheCompilerDoes` refuses. The fixture's file takes Python's
-    # own platform executable suffix (`sysconfig` EXE: '.exe' on Windows, '' on Linux), so the arm names
-    # none either. ⚠ NOT the interpreter's file name: under ctest on Linux that is `python3.12`, whose
-    # ".12" the first draft of this arm took for a suffix (✔MEASURED red in the WSL proof tree).
-    home = x.sub("home-with-tool")
-    tools = os.path.join(home, ".dotnet", "tools")
-    installed = write_bytes(os.path.join(tools, "DssHarness" + (sysconfig.get_config_var("EXE") or "")),
-                            b"tool\n")
-    os.chmod(installed, 0o755)
-    # ⚠ BY FILE IDENTITY, NOT BY SPELLING: on a case-INSENSITIVE filesystem (macOS's default APFS, Windows' NTFS)
-    # the FIRST spelling, `dssharness`, already names the file installed as `DssHarness`, so the search answers that
-    # spelling -- the installed tool under another name. `os.path.normcase` folds case on Windows only, so comparing
-    # the two strings was red on macOS alone (✔MEASURED 2026-09-24, P68 round-9 gate, both macOS legs: expected
-    # `.../.dotnet/tools/DssHarness`). On a case-sensitive filesystem the first spelling is absent and the second is
-    # the one found, as the label says.
-    found = CMP.harness_executable({"PATH": "", "HOME": home})
-    t.ck("P22", "with nothing on PATH, the tool is found in <home>/.dotnet/tools under its second spelling (the "
-         "installed FILE, whatever case the filesystem folds)",
-         bool(found) and os.path.samefile(installed, found)
-         and os.path.normcase(os.path.dirname(os.path.abspath(found))) == os.path.normcase(os.path.abspath(tools)),
-         "installed=%r found=%r" % (installed, found))
-    empty_home = x.sub("home-without-tool")
-    os.makedirs(os.path.join(empty_home, ".dotnet", "tools"))
-    t.eq("P22b", "CONTROL: an empty tools directory finds nothing", "",
-         CMP.harness_executable({"PATH": "", "HOME": empty_home}))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -2933,7 +2896,8 @@ def _dc27_stage(x, root, leg, sb, zinc_mod):
     for k in S.StageResult.POSIX_PATHS:
         d[k] = "/dc27/" + k
     for k in S.StageResult.STRINGS:
-        d.setdefault(k, {"sqlite_head": "dc27head", "sqlite_branch": "master", "tier": "veryquick",
+        d.setdefault(k, {"sqlite_head": sb["sqlite_commit"][:10], "sqlite_branch": "DETACHED-HEAD",
+                         "tier": "veryquick",
                          "tcl_version": "8.6", "stage_identity": "dc27 identity"}.get(k, ""))
     write_json(os.path.join(st, S.RESULT_FILE), d)
     return d
@@ -2993,6 +2957,11 @@ def pin_dc27(t, x):
         ("A09", "a stage whose sources are not one vintage", None, None, False, "not ONE vintage"),
         ("A10", "the DERIVING host's sqlite_cfg.h still in the build dir",
          lambda dd: write_bytes(host_cfg, DC27_CFG), None, True, "DERIVING host's sqlite_cfg.h"),
+        # the pin (2026-09-25): a head that is NOT a prefix of the pinned commit, by construction
+        ("A12", "a stage of ANOTHER sqlite revision than the pin (legs.json stageBuild.sqliteCommit)",
+         lambda dd: dd.__setitem__("sqlite_head", sb["sqlite_commit"][:9]
+                                   + ("0" if sb["sqlite_commit"][9] != "0" else "1")),
+         None, True, "not the pinned"),
     )
     tus_text = read_text(d["fixture_recipe"]["tus"])
     for key, label, mut, lb, coherent, needle in cases:
@@ -3057,14 +3026,18 @@ def pin_dc27(t, x):
 
     comp = types.SimpleNamespace(path=[sys.executable, dsscp], type="Debug", tree="", built="dc27",
                                  origin="the contract suite")
+    # A stage that is not current is RE-STAGED (2026-09-25): the driver's Steps 3-4 and Step 6's per-target
+    # headers, each recorded here and left undone, so the stage is judged again -- and refused, still stale.
+    restaged = []
     mod = x.M.fresh("sqlite_recompile",
-                    given_compiler=lambda _log: comp, pair_config_root=lambda _c, _log: root,
+                    given_compiler=lambda _cfg, _log: comp, pair_config_root=lambda _c, _log: root,
+                    BLD=Proxy(x.M.mod("sqlite_build"), stage_headers=lambda _run: restaged.append("headers")),
                     coherence_gate=lambda _label, _checkout=None: (lambda _dirs: (True, "")),
                     CMP=Proxy(importlib.import_module("sqlite_compiler"),
                               assert_current=lambda *_a, **_k: leg_plan["spec"], rebuild_command=lambda *_a: ""),
                     LIBS=Proxy(importlib.import_module("sqlite_libs"), resolve_leg=resolve_leg,
                                library_providers=lambda _run: "", tcl_coherence=lambda _run: None))
-    driver = types.SimpleNamespace(step0=lambda _run: None,
+    driver = types.SimpleNamespace(step0=lambda _run: None, step34=lambda run_: restaged.append(run_.out_dir),
                                    read_vocabulary=importlib.import_module("build_and_test").read_vocabulary)
 
     def drive(tag, refuse="", reference=True):
@@ -3090,7 +3063,8 @@ def pin_dc27(t, x):
 
     rc, lines, why, clog, outd, logtext = drive("clean")
     t.ck("B01", "a pair that accepts every TU: exit 0, and the LAST line printed is exactly the summary",
-         rc == 0 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=3 dss_ok=3 blockers=0" % DC27_LEG,
+         rc == 0 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=3 dss_ok=3 blockers=0"
+         % (DC27_LEG, sb["sqlite_commit"][:12]),
          "rc=%r why=%s\n%s\n%s" % (rc, why, "\n".join(lines[-6:]), logtext[-1500:]))
     argv = next((json.loads(ln[len("DTC-DSSCP-ARGV "):]) for ln in clog.splitlines()
                  if ln.startswith("DTC-DSSCP-ARGV ")), [])
@@ -3106,13 +3080,15 @@ def pin_dc27(t, x):
          == list(DC27_TUS), rec.get("tus"))
     rc, lines, why, clog, outd, logtext = drive("blocker", refuse="src/test1.c")
     t.ck("B04", "a TU the reference BUILT and dsscp refused is a BLOCKER: exit 1, and the summary COUNTS it",
-         rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=3 dss_ok=2 blockers=1" % DC27_LEG
+         rc == 1 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=3 dss_ok=2 blockers=1"
+         % (DC27_LEG, sb["sqlite_commit"][:12])
          and any("BLOCKER" in ln and ln.endswith("src/test1.c") for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-8:])))
     rc, lines, why, clog, outd, logtext = drive("wrapped", refuse="ext/misc/fileio.c")
     t.ck("B05", "a refusal inside a TU compiled through its prelude WRAPPER is placed in that TU (dsscp names the "
          "real file): a BLOCKER, counted",
-         rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=3 dss_ok=2 blockers=1" % DC27_LEG
+         rc == 1 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=3 dss_ok=2 blockers=1"
+         % (DC27_LEG, sb["sqlite_commit"][:12])
          and any("BLOCKER" in ln and ln.endswith("ext/misc/fileio.c") for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-8:])))
     write_bytes(host_cfg, DC27_CFG)
@@ -3120,13 +3096,16 @@ def pin_dc27(t, x):
         rc, lines, why, clog, outd, logtext = drive("stale")
     finally:
         os.remove(host_cfg)
-    t.ck("B06", "a stage that is NOT current is REFUSED before either compiler runs, naming the reason",
-         rc == 1 and "NOT CURRENT" in why and "DERIVING host's sqlite_cfg.h" in why
-         and not any(ln.startswith("recompile: ") for ln in lines), "rc=%r why=%s" % (rc, why))
+    t.ck("B06", "a stage that is NOT current is RE-STAGED once -- the driver's Steps 3-4 in THIS tree's stage "
+         "root, then the per-target headers -- and, still not current, REFUSED before either compiler runs, "
+         "naming the reason", rc == 1 and "STILL NOT CURRENT" in why and "DERIVING host's sqlite_cfg.h" in why
+         and restaged == [root, "headers"] and not any(ln.startswith("recompile: ") for ln in lines),
+         "rc=%r restaged=%r why=%s" % (rc, restaged, why))
     rc, lines, why, clog, outd, logtext = drive("no-reference", reference=False)
     t.ck("B07", "with NO reference on this host (no log written): exit 1, INCOMPLETE says so, and the summary "
          "counts NO TU as accepted by the reference",
-         rc == 1 and lines and lines[-1] == "recompile: %s tus=3 reference_ok=0 dss_ok=3 blockers=0" % DC27_LEG
+         rc == 1 and lines and lines[-1] == "recompile: %s sqlite=%s tus=3 reference_ok=0 dss_ok=3 blockers=0"
+         % (DC27_LEG, sb["sqlite_commit"][:12])
          and any("INCOMPLETE: NO REFERENCE RAN" in ln for ln in lines),
          "rc=%r why=%s\n%s" % (rc, why, "\n".join(lines[-6:])))
 
@@ -3170,6 +3149,322 @@ def pin_dc27(t, x):
          not r_in and held_in == [("read", d["sqlite_dir_posix"])] and asked_in == [d["sqlite_dir"]]
          and lock_in is not None and not r_cp and held_cp == [] and asked_cp == [None] and lock_cp is None,
          (r_in, got_in if r_in else "", held_in, asked_in, r_cp, got_cp if r_cp else "", held_cp, asked_cp))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-28 -- a SINGLE-FILE run (DSS_TEST_FILE) is judged on its own terms (lane xa's finding, 2026-09-24)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+_SF_SUMMARY = b"0 errors out of %d tests on HOST Linux 64-bit\n"
+_SF_RAN = (b"select1-1.1... Ok\nselect1-1.2... Ok\nselect1.test-closeallfiles... Ok\n"
+           b"select1.test-sharedcachesetting... Ok\n" + _SF_SUMMARY % 4)
+_SF_INERT = b"select1.test-closeallfiles... Ok\nselect1.test-sharedcachesetting... Ok\n" + _SF_SUMMARY % 2
+_SF_ABORT = b"select1-1.1... Ok\nselect1-1.2... Ok\nchild killed: segmentation violation\n"
+
+
+def pin_dc28(t, x):
+    """A single-file run sources its one `.test` file directly, so sqlite's tier runner never prints the
+    `Time: <file> <n> ms` line the parser counts a completed file by; `finish_test` prints the summary and ends
+    the file. MEASURED by lane xa (select1.test, both ELF legs): `0 errors out of 199 tests`, judged FAIL as
+    ZERO files. Pinned BOTH ways: the single file's summary completes it, and the SAME log from a tier still
+    fails as zero files -- the rule stays armed for the case it exists for."""
+    K = x.M.mod("sqlite_corpus")
+    work = x.sub("dc28")
+
+    def facts(name, data):
+        p = os.path.join(work, name)
+        write_bytes(p, data)
+        return K.parse_segment(p)
+    ran = facts("ran.log", _SF_RAN)
+    t.eq("SF01", "R: a log with no `Time:` line keeps its counted results as TRAILING (teardown excluded)",
+         (0, 2), (ran.n_files, ran.trailing))
+    K.credit_single_file(ran, "select1.test")
+    t.eq("SF02", "a single file's summary with results of its own credits ONE completed file, not inert",
+         (["select1.test"], []), (ran.files, ran.inert))
+    inert = K.credit_single_file(facts("inert.log", _SF_INERT), "select1.test")
+    t.eq("SF03", "...and one whose only results are the teardown pair is credited INERT",
+         (["select1.test"], ["select1.test"]), (inert.files, inert.inert))
+    ab = K.credit_single_file(facts("abort.log", _SF_ABORT), "select1.test")
+    t.eq("SF04", "an ABORTED single file (no summary) is never credited", ([], []), (ab.files, ab.inert))
+    tl = K.credit_single_file(facts("tier.log", b"select1-1.1... Ok\nTime: select1.test 3 ms\n"
+                                                + _SF_SUMMARY % 1), "other.test")
+    t.eq("SF05", "a log that already credits its files is left as it is", ["select1.test"], tl.files)
+    one = drive_corpus(x, x.M.fresh("sqlite_units", P=fake_procs(x)), "single", lambda k: _SF_RAN,
+                       single_file="select1.test")
+    ov = one.leg.unit_verdict or ""
+    rep = one.leg.unit_report if isinstance(one.leg.unit_report, dict) else {}
+    t.ck("SF10", "a SINGLE-FILE run whose file completed is judged PASS, on its own terms", ov.startswith("PASS"), ov)
+    t.eq("SF11", "...its one file counted, not inert, in ONE segment, with no resume",
+         (1, 0, 1, 0), (rep.get("files_done"), rep.get("files_inert"), one.segments, one.resumes))
+    t.ck("SF12", "...and the run names the FILE it ran, not the tier",
+         "running select1.test — ONE file, DSS_TEST_FILE" in one.log and "running veryquick.test" not in one.log,
+         [ln for ln in one.log.splitlines() if "running " in ln][:2])
+    tier = drive_corpus(x, x.M.fresh("sqlite_units", P=fake_procs(x)), "tier-zero", lambda k: _SF_RAN)
+    tv = tier.leg.unit_verdict or ""
+    t.ck("SF13", "the SAME log from a TIER run still FAILS as ZERO files: the credit is the single-file run's only",
+         tv.startswith("FAIL:the fixture completed ZERO test files"), tv)
+    dull = drive_corpus(x, x.M.fresh("sqlite_units", P=fake_procs(x)), "single-inert", lambda k: _SF_INERT,
+                        single_file="select1.test")
+    dv = dull.leg.unit_verdict or ""
+    t.ck("SF14", "a single file that asserted NOTHING is a FAIL, never a pass",
+         dv.startswith("FAIL:the single file select1.test asserted NOTHING"), dv)
+    crash = drive_corpus(x, x.M.fresh("sqlite_units", P=fake_procs(x)), "single-abort", lambda k: _SF_ABORT,
+                         single_file="select1.test")
+    cv = crash.leg.unit_verdict or ""
+    t.ck("SF15", "a single file that ABORTED fails in ONE segment and says there is nothing to resume",
+         cv.startswith("FAIL:") and crash.segments == 1 and "nothing to resume" in crash.log,
+         (cv[:160], crash.segments))
+    with patched_environ(unset=x.suite.knobs):
+        cfg = x.M.mod("sqlite_common").Config()
+    tier_label = cfg.corpus_label()
+    cfg.test_file = os.path.join(work, "select1.test")
+    t.eq("SF16", "ONE helper names the corpus at every reporting site: the tier file, or the ONE file",
+         ("veryquick.test", "select1.test — ONE file, DSS_TEST_FILE"), (tier_label, cfg.corpus_label()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-29 -- the MANUAL steps: the recompile compiles with the compiler it is GIVEN and re-stages ITS OWN tree;
+#          the benchmark measures ONE compiler, named once (2026-09-25, v2: `{product}`)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+class _Dc29Refresh(Exception):
+    """The stub driver's sentinel: the recompile reached Steps 3-4 (the re-stage) -- recorded, then stopped."""
+
+
+def pin_dc29(t, x):
+    """sqlite.yml's `recompile` and `benchmark-speedtest1` manual steps pass the leg's own dsscp as `--dss="{product}"`
+    (DssHarness's one declared build output); the recompile REQUIRES a named compiler and re-stages a missing or stale
+    stage in THIS tree through the driver's own Steps 3-4. MEASURED: until 2026-09-25 the round close ran a wrapper
+    that pointed DSS_BIN at one tree's dsscp and OUT_DIR at another lane's output. The benchmark measures the PINNED
+    sqlite -- its default checkout put on legs.json stageBuild.sqliteCommit, an explicit one as-is -- and its report
+    names the head it measured and whether it IS the pin: MEASURED, the Mac's run of 2026-09-25 benchmarked
+    4ebc78674d while the round-close recompile compiled d21bd37c7c."""
+    Cm = x.M.mod("sqlite_common")
+    RC = x.M.use("sqlite_recompile")
+    work = x.sub("dc29")
+    _tree, exe = fake_tree(work, "build/x86_64-leg-release", "Release")
+    log = x.log()
+    with patched_environ(unset=x.suite.knobs):
+        comp = RC.given_compiler(Cm.Config({"dss_bin": exe}), log)
+    t.eq("MS01", "the recompile compiles with the compiler --dss names, and says which channel named it",
+         (os.path.abspath(exe), "named by --dss -- NOT built by this run"),
+         (os.path.abspath(comp.path), comp.origin))
+    with patched_environ(unset=x.suite.knobs, DSS_BIN=exe):
+        comp_env = RC.given_compiler(Cm.Config(), log)
+    t.eq("MS02", "control: by hand, DSS_BIN names it, and the origin says DSS_BIN",
+         "named by DSS_BIN -- NOT built by this run", comp_env.origin)
+    with patched_environ(unset=x.suite.knobs):
+        r, why = refused(RC.given_compiler, Cm.Config(), log)
+    t.ck("MS03", "a recompile with NO named compiler is REFUSED, naming --dss (never a search)",
+         r and "--dss <path>" in why and "never searched for" in why, why)
+    drv = x.M.mod("build_and_test")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = drv.main(["--recompile", "pe64-x86_64", "--tier", "quick"])
+    t.ck("MS04", "a recompile given a corpus knob is a USAGE error (it runs no corpus)",
+         rc == 2 and "runs no corpus" in err.getvalue(), (rc, err.getvalue()[:200]))
+
+    class _Driver:
+        calls = []
+
+        @staticmethod
+        def step34(run):
+            _Driver.calls.append(run.out_dir)
+            raise _Dc29Refresh()
+    run = make_run(x, log, os.path.join(work, "out"))
+    run.stage_root = os.path.join(work, "out")
+    run.out_dir = os.path.join(run.stage_root, "recompile")
+    leg = x.C.Leg(leg_d("pe64-x86_64", fmt="pe64-x86_64-windows-exec", os_key="windows",
+                        spec="x86_64:pe64-x86_64-windows-exec"))
+    try:
+        refused(RC.load_stage, run, leg, _Driver)   # a refusal here means "not re-staged": a red, never a crash
+        reached = False
+    except _Dc29Refresh:
+        reached = True
+    t.ck("MS06", "a MISSING stage is re-staged through the driver's Steps 3-4, in THIS tree's stage root",
+         reached and _Driver.calls == [run.stage_root], (_Driver.calls, run.stage_root))
+    t.eq("MS07", "...and the run's own output directory is restored afterwards",
+         os.path.join(run.stage_root, "recompile"), run.out_dir)
+    r, why = refused(RC.load_stage, run, leg, None)
+    t.ck("MS08", "without the driver, a missing stage is still REFUSED by name", r and "no staged sqlite state" in why,
+         why)
+    B = x.M.mod("benchmark_speedtest1")
+
+    def usage_of(argv, **env):
+        with patched_environ(unset=x.suite.knobs, **env):
+            try:
+                B.parse_args(argv)
+                return ""
+            except B.UsageError as exc:
+                return str(exc)
+    other = os.path.join(work, "elsewhere", "dsscp")
+    both = usage_of(["--dss", exe], DSS_BIN=other)
+    t.ck("MS09", "the benchmark refuses --dss beside a DSS_BIN naming ANOTHER binary -- one compiler, named once",
+         "one compiler, named once" in both and exe in both and other in both, both)
+    same = usage_of(["--dss", exe], DSS_BIN=exe)
+    alone = usage_of(["--dss", exe])
+    t.ck("MS10", "control: the SAME binary in both, and --dss alone (the step's command line), are accepted",
+         same == "" and alone == "", (same, alone))
+    # THE SUBJECT IS THE PIN (2026-09-25): the default checkout goes on it through the stage's own checkout
+    pin = "0123456789abcdef0123456789abcdef01234567"
+    events, checkouts = [], []
+
+    class _Lock:
+        def __init__(self, path):
+            events.append(("lock", path))
+
+        def write(self, what, log=None):
+            events.append("write")
+
+        def read(self, what, log=None):
+            events.append("read")
+
+        def release(self):
+            events.append("release")
+
+    def spy_checkout(url, dest, log=None, commit=""):
+        events.append("checkout")
+        checkouts.append((dest, commit))
+    held = {"linux": [], "windows": []}
+    got = {h: B.measured_subject("", h, pin, log, held[h], checkout=spy_checkout, lock_factory=_Lock)
+           for h in ("linux", "windows")}
+    t.ck("MS11", "the benchmark's DEFAULT checkout goes on the pin through the stage's own checkout: on a POSIX host "
+         "under the shared clone's WRITE lock, then held READ while it is measured; a Windows host's takes no lock",
+         checkouts == [(got["linux"], pin), (got["windows"], pin)]
+         and events == [("lock", got["linux"]), "write", "checkout", "read", "checkout"]
+         and len(held["linux"]) == 1 and held["windows"] == [], (checkouts, events, held))
+    explicit = os.path.join(work, "explicit-sqlite")
+    del events[:], checkouts[:]
+    held_x = []
+    as_is = [B.measured_subject(explicit, h, pin, log, held_x, checkout=spy_checkout, lock_factory=_Lock)
+             for h in ("linux", "windows")]
+    t.ck("MS12", "control: an EXPLICIT --sqlite-dir is measured AS-IS -- no checkout, no lock",
+         as_is == [os.path.abspath(explicit)] * 2 and checkouts == [] and events == [] and held_x == [],
+         (as_is, checkouts, events))
+
+    class _Held:
+        released = 0
+
+        def release(self):
+            _Held.released += 1
+
+    def failing_body(args, host, log_, held_):
+        held_.append(_Held())
+        raise Cm.HarnessDie("the measurement stopped part-way")
+    r, why = refused(B.run_measuring_host, None, "linux", log, body=failing_body)
+    t.ck("MS13", "a lock the subject took is RELEASED however the run ends (here, a refusal part-way)",
+         r and "part-way" in why and _Held.released == 1, (why, _Held.released))
+    # ...and the report names WHICH sqlite it measured (the core's R10)
+    core = x.M.mod("speedtest1_bench")
+    plan_subject = {"tus": ["/s/src/a.c", "/s/test/speedtest1.c"], "sqliteSrc": "/s", "defines": ["X"],
+                    "sqlitePin": pin}
+
+    def named(head):
+        subj = core.report_subject(dict(plan_subject, upstreamCommit=head))
+        return subj, core.render_markdown({"host": {"system": "S", "release": "R", "machine": "M", "cpus": 1},
+                                           "subject": subj, "workload": {"size": 1},
+                                           "repeats": {"build": 1, "run": 1}, "jobsArms": [1], "arms": []})
+    off, off_md = named("4ebc78674d")
+    t.ck("MS14", "the report names an OFF-pin head as NOT the pin, in the .json (onPin false, the pin named) and the "
+         ".md alike -- an off-pin number cannot pass for an on-pin one",
+         off["onPin"] is False and off["sqlitePin"] == pin and off["upstreamCommit"] == "4ebc78674d"
+         and "NOT the pinned `%s`" % pin[:12] in off_md and "4ebc78674d" in off_md, (off, off_md[:400]))
+    on, on_md = named(pin[:10])
+    t.ck("MS15", "control: the pinned head is named the pinned revision, in the .json and the .md",
+         on["onPin"] is True and "the pinned revision" in on_md and "NOT the pinned" not in on_md, (on, on_md[:400]))
+    # ...and a blocked shared clone keeps the lock's contract, with an exit code of the benchmark's own
+    Bf = x.M.fresh("benchmark_speedtest1")
+
+    def blocked(args, host, log=None, body=None):
+        raise Bf.C.CloneLockBlocked("DSS-CLONE-LOCK-BLOCKED\n\n [X] ERROR: another dss harness run is MUTATING "
+                                    "this sqlite clone")
+    Bf.run_measuring_host = blocked
+    err16 = io.StringIO()
+    with contextlib.redirect_stderr(err16):
+        rc16 = Bf.main([])
+    t.ck("MS16", "a blocked shared clone exits 5 with DSS-CLONE-LOCK-BLOCKED first on stderr -- never 3, the "
+         "measurement core's 'no compiler produced a binary'",
+         rc16 == 5 and err16.getvalue().splitlines()[:1] == ["DSS-CLONE-LOCK-BLOCKED"], (rc16, err16.getvalue()[:200]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-30 -- a step's knobs travel on its COMMAND LINE, read ONCE by Config, and Step 5 takes the compiler from it
+# (2026-09-25, the coordinator's rulings on the entry-point audit's finding (d) and on `{product}`)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+def pin_dc30(t, x):
+    """sqlite.yml's build-and-test step passes its `tier`, `dssConfig` and `testFile` inputs as --tier /
+    --dss-config / --test-file, and every step the leg's own dsscp as --dss="{product}". MEASURED (the audit,
+    2026-09-25): the only documented way to choose a tier was `DSS_TIER=veryquick DSS_CONFIG=release python3
+    ./build_and_test.py` by hand -- a harness run on a remote leg could set neither -- and Step 5 re-read DSS_BIN
+    itself and otherwise SEARCHED `build/*/bin/dss` and refreshed what it found from inside the step."""
+    C = x.M.mod("sqlite_common")
+    B = x.M.mod("build_and_test")
+    CMP = x.M.mod("sqlite_compiler")
+    with patched_environ(unset=x.suite.knobs):
+        cfg = C.Config({"tier": "quick", "dss_config": "debug"})
+    t.eq("KN01", "a flag's value IS the run's (tier, configuration), and `by` names the flag",
+         ("quick", "debug", "--tier"), (cfg.tier, cfg.dss_config, cfg.by["tier"]))
+    with patched_environ(unset=x.suite.knobs, DSS_TIER="full"):
+        r, why = refused(C.Config, {"tier": "quick"})
+    t.ck("KN02", "a flag and its variable naming DIFFERENT values is REFUSED, naming both",
+         r and "--tier='quick'" in why and "DSS_TIER='full'" in why, why)
+    with patched_environ(unset=x.suite.knobs, DSS_TIER="quick"):
+        r, same = refused(C.Config, {"tier": "quick"})
+    t.ck("KN03", "control: the SAME value in both is one value, accepted", not r and same.tier == "quick", same)
+    with patched_environ(unset=x.suite.knobs):
+        one = C.Config({"test_file": os.path.join(x.sub("kn"), "select1.test")})
+    t.eq("KN04", "a single file named by the flag is named BY THE FLAG in every report line",
+         "select1.test — ONE file, --test-file", one.corpus_label())
+    with patched_environ(unset=x.suite.knobs, DSS_TEST_FILE="/elsewhere/where1.test"):
+        r, why = refused(C.Config, {"test_file": ""})
+    t.ck("KN05", "the step's EMPTY test file (its default: the tier) beside a stray DSS_TEST_FILE is REFUSED",
+         r and "DSS_TEST_FILE" in why, why)
+    with patched_environ(unset=x.suite.knobs, DSS_TIER="quick"):
+        hand = C.Config()
+    t.eq("KN06", "control: with no flag a hand run reads the environment exactly as before, and `by` says so",
+         ("quick", "DSS_TIER"), (hand.tier, hand.by["tier"]))
+
+    def cli(args):
+        try:
+            return B.parse_cli(args)
+        except ValueError as exc:
+            return "REFUSED: %s" % exc
+    got = cli(["--tier=veryquick", "--dss-config", "release", "--test-file=", "--dss=/b/x86_64-rel/bin/dss/dsscp"])
+    t.eq("KN07", "the step's command line parses, `=` and space forms, an EMPTY test file allowed",
+         {"--tier": "veryquick", "--dss-config": "release", "--test-file": "", "--dss": "/b/x86_64-rel/bin/dss/dsscp"},
+         got)
+    bad = [cli(a) for a in (["--tier=a", "--tier=b"], ["--tier="], ["--tiers=a"], ["--tier"], ["--dss="],
+                            ["--recompile=pe64-x86_64", "--tier=quick"])]
+    t.ck("KN08", "twice, empty, unknown, valueless, an empty --dss and a recompile given a tier are each REFUSED by "
+         "name", all(isinstance(b, str) for b in bad) and "twice" in bad[0] and "names nothing" in bad[1]
+         and "unknown argument" in bad[2] and "needs a value" in bad[3] and "names nothing" in bad[4]
+         and "runs no corpus" in bad[5], bad)
+    repo = x.sub("kn-repo")
+    _lt, leg_bin = fake_tree(repo, "build/x86_64-gcc-release", "Release")
+    with patched_environ(unset=x.suite.knobs):
+        r, comp = refused(CMP.obtain, C.Config({"dss_bin": leg_bin}), log=x.log())
+    t.eq("KN09", "Step 5 given a compiler by the flag (--dss, the step's {product}) USES it, and its origin names "
+         "the channel (that nothing is searched for or rebuilt is DC-21's)",
+         (os.path.abspath(leg_bin), "named by --dss %s NOT built by this run" % DASH),
+         (os.path.abspath(getattr(comp, "path", str(comp))), getattr(comp, "origin", comp)))
+    with patched_environ(unset=x.suite.knobs, DSS_BIN=os.path.join(repo, "another", "dsscp")):
+        r, why = refused(C.Config, {"dss_bin": leg_bin})
+    t.ck("KN10", "--dss beside a DSS_BIN naming ANOTHER binary is REFUSED, naming both", r and "--dss=" in why
+         and "DSS_BIN=" in why, why)
+    _dt, debug_bin = fake_tree(repo, "build/x86_64-gcc-debug", "Debug")
+    with patched_environ(unset=x.suite.knobs):
+        r, why = refused(CMP.obtain, C.Config({"dss_bin": debug_bin}), log=x.log())
+    t.ck("KN11", "...and it still passes the ONE gate: a Debug leg's dsscp is refused like any other",
+         r and "NON-RELEASE" in why, why)
+    # "The run reaches Step 5" is a property of a PROCESS, as in DC-18: build_and_test.run_all's OWN call site runs in
+    # a child, the steps before it stubbed and obtain replaced by a recorder (the mutant, when there is one, bound).
+    spec5 = write_json(os.path.join(repo, "step5.json"), {"dss": leg_bin, "override": x.M.override_spec()})
+    rc, out = run_children([("step5", [sys.executable, THIS_FILE, "--child", "step5-knobs", spec5],
+                             child_env(x))])["step5"]
+    t.ck("KN12", "build_and_test's OWN Step 5 call hands obtain the run's OWN Config: the compiler --dss named, "
+         "and the channel", rc == 0 and ("OBTAIN named=%s by=--dss same=True" % leg_bin) in out,
+         (rc, out[-600:]))
 
 
 def _read_lines(path):
@@ -3231,17 +3526,18 @@ def child_supply(spec, _spec_path, _rest):
 
 def child_currency(spec, _spec_path, _rest):
     """DC-18: build_and_test.run_all's OWN Step-5 call site, the steps before it stubbed (Step 6's
-    first statement prints the marker), a refusal handled as the driver's main() does: exit 1."""
+    first statement prints the marker), a refusal handled as the driver's main() does: exit 1. The run
+    NAMES its compiler (--dss), as every run must: one naming none stops before Step 0 (DC-21)."""
     import sqlite_common as C
     import sqlite_compiler as CMP
     comp = CMP.Compiler(path=spec["dsscp"], type="Release", source="the contract suite", detail="",
-                        tree=spec["tree"], origin="LOCATED under an eligible build root %s NOT built by this run"
-                        % DASH, built="2026-08-28 09:30:36", build_type_note="")
+                        tree=spec["tree"], origin="named by --dss %s NOT built by this run" % DASH,
+                        built="2026-08-28 09:30:36", build_type_note="")
     try:
         import build_and_test as BT
         import sqlite_build as BLD
         log = C.Log(sys.stdout)
-        run = C.Run(C.Config(), log=log)
+        run = C.Run(C.Config({"dss_bin": spec["dsscp"]}), log=log)
         run.repo_root = spec["repo_root"]
         run.legs = [C.Leg(leg_d(lbl, spec=sp)) for lbl, sp in spec["legs"]]
         for step in ("step0", "step1", "step2", "step34"):
@@ -3309,8 +3605,60 @@ def child_sweep_probe(spec, _spec_path, rest):
     return 0
 
 
+def child_step5_knobs(spec, _spec_path, _rest):
+    """DC-30/KN12: build_and_test.run_all's OWN Step-5 call site, the steps before it stubbed, obtain replaced by a
+    recorder that prints what it was handed -- the compiler, its channel, and whether that Config IS the run's --
+    and stops the process."""
+    import sqlite_common as C
+    import sqlite_compiler as CMP
+    import build_and_test as BT
+    log = C.Log(sys.stdout)
+    run = C.Run(C.Config({"dss_bin": spec["dss"]}), log=log)
+    for step in ("step0", "step1", "step2", "step34"):
+        setattr(BT, step, lambda run_: None)
+
+    def recorder(cfg, log=None):
+        print("OBTAIN named=%s by=%s same=%s" % (cfg.dss_bin, cfg.by["dss_bin"], cfg is run.cfg), flush=True)
+        raise SystemExit(0)
+    CMP.obtain = recorder
+    BT.run_all(run)
+    print("run_all RETURNED without reaching Step 5", flush=True)
+    return 5
+
+
+def child_fail_fast(spec, _spec_path, _rest):
+    """DC-21/N08-N09: build_and_test.run_all from its FIRST statement, Step 0 replaced by a marker that stops the
+    process, and the driver's two spawning verbs (`capture`, `run_checked`) replaced by recorders that print what
+    they were asked to start -- so a mutant that builds from here starts nothing real. A refusal is handled as the
+    driver's main() does: exit 1."""
+    import sqlite_common as C
+    import build_and_test as BT
+    log = C.Log(sys.stdout)
+    run = C.Run(C.Config({"dss_bin": spec["dss"]} if spec["dss"] else None), log=log)
+
+    def spawn(argv, *_a, **_k):
+        print("SPAWN %s" % " ".join(str(a) for a in argv), flush=True)
+        return C.Result(0, "", "")
+    C.capture = C.run_checked = spawn
+
+    def step0(run_):
+        print("STEP0-REACHED", flush=True)
+        raise SystemExit(0)
+    BT.step0 = step0
+    for step in ("step1", "step2", "step34"):
+        setattr(BT, step, lambda run_: None)
+    try:
+        BT.run_all(run)
+    except C.HarnessDie as exc:
+        print("DIE: %s" % exc, flush=True)
+        return exc.exit_code
+    print("run_all RETURNED without reaching Step 0", flush=True)
+    return 5
+
+
 CHILD_SCENARIOS = {"supply": child_supply, "currency": child_currency, "sweep-parent": child_sweep_parent,
-                   "sweep-probe": child_sweep_probe}
+                   "sweep-probe": child_sweep_probe, "step5-knobs": child_step5_knobs,
+                   "fail-fast": child_fail_fast}
 
 
 def child_main(args):
@@ -3356,7 +3704,8 @@ PINS = (
     PinSpec("DC-18", "the compiler is PROVED current before the run is spent (child processes)", pin_dc18),
     PinSpec("DC-19", "execution evidence: monitors, attribution and the fold", pin_dc19),
     PinSpec("DC-20", "the leftover-fixture sweep (decoy, ancestors, UNVERIFIED)", pin_dc20),
-    PinSpec("DC-21", "a LOCATED compiler is REFRESHED, not trusted", pin_dc21),
+    PinSpec("DC-21", "Step 5's compiler is GIVEN: none named is REFUSED before Step 0, a named one used as given "
+            "(never searched for, never built)", pin_dc21),
     PinSpec("DC-22", "what a leftover sweep LEARNT reaches the leg's verdict (the REAL run_corpus)", pin_dc22),
     PinSpec("DC-23", "a failed self-test's report carries each failing arm's DETAIL", pin_dc23),
     PinSpec("DC-24", "Step 0 runs EVERY suite, then names every failure in ONE refusal", pin_dc24),
@@ -3364,6 +3713,12 @@ PINS = (
     PinSpec("DC-26", "a declared TU prelude reaches BOTH compilers (dsscp and the same-platform reference)", pin_dc26),
     PinSpec("DC-27", "the round-close RECOMPILE: a current stage only, the whole stream, every blocker COUNTED",
             pin_dc27),
+    PinSpec("DC-28", "a SINGLE-FILE run (DSS_TEST_FILE) is judged on its own terms, and a tier still is not",
+            pin_dc28),
+    PinSpec("DC-29", "the manual steps: the recompile's GIVEN compiler and its OWN stage; the benchmark's ONE "
+            "compiler", pin_dc29),
+    PinSpec("DC-30", "a step's knobs travel on its command line, read once by Config; Step 5 takes the compiler "
+            "from it", pin_dc30),
 )
 PIN_BY_ID = dict((p.id, p) for p in PINS)
 
@@ -3529,11 +3884,6 @@ REDS = (
     red("RD-25", "DC-18", "build_and_test", "H20/F20", "stop calling the currency check at Step 5",
         "proved = CMP.assert_current(C.BENCH_CORE, run.compiler, run.config_root, specs,", old=_STEP5_CALL,
         new='    proved = "(not checked)"\n', expect=("O01",)),
-    red("RD-26", "DC-18", "build_and_test", "H21/F21", "let SKIP_DSS_BUILD=1 bypass the currency check",
-        "proved = CMP.assert_current(C.BENCH_CORE, run.compiler, run.config_root, specs,", old=_STEP5_CALL,
-        new='    proved = ("(not checked under SKIP_DSS_BUILD=1)" if C.env("SKIP_DSS_BUILD") == "1" else '
-            'CMP.assert_current(C.BENCH_CORE, run.compiler, run.config_root, specs, '
-            'CMP.rebuild_command(run.compiler, run.repo_root)))\n', expect=("O10",)),
     red("RD-27", "DC-18", "sqlite_compiler", "H22/F22", "report an unrunnable check as a stale binary",
         "if r.rc != 1:", new="if False:", expect=("O17", "O20")),
     red("RD-28", "DC-19", "sqlite_units", "HP", "drop the fold of the resolver's EXCUSED names",
@@ -3543,8 +3893,6 @@ REDS = (
         new="", expect=("M03", "M05")),
     red("RD-30", "DC-20", "sqlite_procs", "F6", "blind the sweep's matcher",
         "row[0] not in skip and match(row[2])", new="row[0] not in skip and False", expect=("D02", "A02")),
-    red("RD-31", "DC-21", "sqlite_compiler", "F23", "let a failed rebuild fall back to the located binary",
-        "    if rc != 0:\n", new="    if False:\n", expect=("P3",)),
     red("RD-32", "DC-06", "sqlite_stage", "H10", "build the reference testfixture without the declared OPTIONS",
         '"testfixture", "USE_AMALGAMATION=0", "OPTIONS=" + mo', new='"testfixture", "USE_AMALGAMATION=0"',
         expect=("S05", "C03")),
@@ -3616,29 +3964,15 @@ REDS = (
             '                                leg.build.get("recipeTransform") or "none",\n'
             '                                leg.build.get("stackReserveBytes") or 0, tokens)\n',
         expect=("Q06",), stay_green=("Q00", "Q01", "Q02", "Q03", "Q04", "Q05", "Q07")),
-    red("RD-48", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
-        "route every DssHarness tree through the tool, whatever its toolchain declares",
-        "    if not environment:\n", new="    if False:\n", expect=("P16", "P17"),
-        stay_green=("P14", "P15", "P18", "P19", "P19b", "P20", "P21")),
-    red("RD-49", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
-        "refresh a located tree with a plain cmake build whoever owns it",
-        "        invoke_build = lambda tree, j: _refresh_build(repo_root, tree, j, log)  # noqa: E731\n",
-        new='        invoke_build = lambda tree, j: C.capture(["cmake", "--build", tree, "--target", "dsscp"]).rc\n',
-        expect=("P18",), stay_green=("P14", "P15", "P16", "P17", "P19", "P19b", "P20", "P21")),
     red("RD-50", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
         "stamp a candidate with its launcher's time again",
         "    return [p for p in beside if os.path.isfile(p)] or [path]\n", new="    return [path]\n",
-        expect=("P19", "P19b", "P20"), stay_green=("P14", "P15", "P16", "P17", "P18", "P21")),
+        expect=("P19", "P19b", "P20"), stay_green=("P14", "P21", "N05", "N06")),
     red("RD-51", "DC-21", "sqlite_compiler", "new (item 3, 2026-09-23)",
         "forget MinGW's spelling of the compiler's library (the one the first draft missed)",
         'COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")\n',
         new='COMPANION_LIBRARIES = ("{stem}.dll", "lib{stem}.so", "lib{stem}.dylib")\n',
-        expect=("P19b",), stay_green=("P14", "P15", "P16", "P17", "P18", "P19", "P20", "P21")),
-    red("RD-52", "DC-21", "sqlite_compiler", "new (item 3 repair, 2026-09-23)",
-        "stop looking in the tool installer's own directory",
-        '            hit = shutil.which(name, path=os.path.join(home, ".dotnet", "tools"))\n',
-        new="            hit = None\n",
-        expect=("P22",), stay_green=("P19", "P20", "P21", "P22b")),
+        expect=("P19b",), stay_green=("P14", "P19", "P20", "P21", "N05")),
     red("RD-53", "DC-27", "harness_legs", "new (round-close recompile, 2026-09-23)",
         "leave a BLOCKER out of the census's count",
         '"blockers": sum(1 for r in rows if r["verdict"] == "BLOCKER")}',
@@ -3664,6 +3998,112 @@ REDS = (
         "        checkout = st.sqlite_dir\n",
         new="        checkout = None\n", expect=("B08",),
         stay_green=("A01", "A10", "A11", "B01", "B02", "B04", "B07")),
+    red("RD-58", "DC-28", "sqlite_corpus", "new (lane xa's finding, 2026-09-24)",
+        "never credit a single file's summary as its completion",
+        "    if not facts.summary or facts.files:\n        return facts\n",
+        new="    return facts\n", expect=("SF02", "SF03", "SF10", "SF11", "SF14"),
+        stay_green=("SF01", "SF04", "SF05", "SF12", "SF13", "SF15")),
+    red("RD-59", "DC-28", "sqlite_units", "new (lane xa's finding, 2026-09-24)",
+        "credit a summary as a completed file in a TIER run too",
+        '        if single and seg.kind == "tier":\n',
+        new='        if seg.kind == "tier":\n', expect=("SF13",),
+        stay_green=("SF10", "SF11", "SF12", "SF14", "SF15")),
+    red("RD-60", "DC-28", "sqlite_units", "new (lane xa's finding, 2026-09-24)",
+        "let a single file that asserted nothing pass",
+        "    elif cfg.test_file and lr.files_inert >= lr.files_done:\n",
+        new="    elif False:\n", expect=("SF14",), stay_green=("SF10", "SF11", "SF13", "SF15")),
+    red("RD-61", "DC-28", "sqlite_units", "new (lane xa's finding, 2026-09-24)",
+        "treat a single file's abort like a tier's (look for something to resume)",
+        "        if single:\n            lr.note(name,",
+        new="        if False:\n            lr.note(name,", expect=("SF15",),
+        stay_green=("SF10", "SF11", "SF13", "SF14")),
+    red("RD-62", "DC-28", "sqlite_common", "new (the e2e run, 2026-09-24)",
+        "name the tier at every reporting site of a single-file run",
+        '        if self.test_file:\n'
+        '            return "%s — ONE file, %s" % (os.path.basename(self.test_file), self.by["test_file"])\n',
+        new="", expect=("SF16",), stay_green=("SF10", "SF11", "SF12", "SF13", "SF14", "SF15")),
+    red("RD-63", "DC-28", "sqlite_units", "new (the e2e run, 2026-09-24)",
+        "let the running line name the tier in a single-file run",
+        "                leg.label, cfg.corpus_label(),\n",
+        new='                leg.label, "%s.test" % cfg.tier,\n', expect=("SF12",),
+        stay_green=("SF10", "SF11", "SF13", "SF14", "SF15", "SF16")),
+    red("RD-64", "DC-29", "sqlite_recompile", "new (2026-09-25)", "never re-stage a missing stage",
+        "        refresh_stage(run, leg, driver, missing)\n", new="        C.die(missing[0])\n",
+        expect=("MS06",), stay_green=("MS01", "MS08")),
+    red("RD-65", "DC-29", "sqlite_recompile", "new (2026-09-25)", "credit DSS_BIN whichever channel named the "
+        "compiler", '    named, by = (cfg.dss_bin or "").strip(), cfg.by["dss_bin"]\n',
+        new='    named, by = (cfg.dss_bin or "").strip(), "DSS_BIN"\n', expect=("MS01",),
+        stay_green=("MS02", "MS03")),
+    red("RD-66", "DC-29", "benchmark_speedtest1", "new (2026-09-25)",
+        "let a DSS_BIN naming another binary ride beside --dss",
+        "    if args.dss and dss_env and dss_env != args.dss:\n", new="    if False:\n",
+        expect=("MS09",), stay_green=("MS10",)),
+    red("RD-67", "DC-30", "sqlite_common", "new (2026-09-25)", "let a flag silently override a different variable",
+        "            if named and named != given:\n", new="            if False:\n",
+        expect=("KN02", "KN05", "KN10"), stay_green=("KN01", "KN03", "KN06")),
+    red("RD-68", "DC-30", "build_and_test", "new (2026-09-25)", "take the last of a flag given twice",
+        "        if name in got:\n", new="        if False:\n", expect=("KN08",), stay_green=("KN07",)),
+    red("RD-69", "DC-21", "sqlite_compiler", "new (2026-09-25; moved to DC-21 on 2026-09-26 with the retired default)",
+        "search build/ for a newer Release dsscp although one was named",
+        "    info = build_type(named)\n",
+        new="    info = select_compiler(find_candidates(os.path.dirname(os.path.dirname(build_tree(named))))[0],\n"
+            "                           cfg.allow_nonrelease) or build_type(named)\n",
+        expect=("N05",), stay_green=("N01", "N03", "N06")),
+    red("RD-70", "DC-30", "build_and_test", "new (2026-09-25)", "let Step 5 ignore the compiler the run was given",
+        "    run.compiler = CMP.obtain(run.cfg, log=run.log)\n",
+        new="    run.compiler = CMP.obtain(C.Config(), log=run.log)\n",
+        expect=("KN12",), stay_green=("KN07", "KN09")),
+    red("RD-71", "DC-27", "sqlite_recompile", "new (2026-09-25)",
+        "judge a stage current whatever sqlite revision it holds",
+        "    if not (len(head) >= 7 and pin.startswith(head)):\n", new="    if False:\n",
+        expect=("A12",), stay_green=("A01", "A10")),
+    red("RD-72", "DC-06", "sqlite_stage", "new (2026-09-25)",
+        "put the clone on origin's default branch, not the pin",
+        "                                        commit=cfg.sqlite_commit))\n",
+        new="                                        commit=\"\"))\n", expect=("S07",),
+        stay_green=("S01", "S03")),
+    red("RD-73", "DC-29", "benchmark_speedtest1", "new (2026-09-25)",
+        "measure the default checkout wherever it stands, not on the pin",
+        "    if not explicit:\n        subject_on_pin(d, pin, host, log, held, checkout, lock_factory)\n",
+        new="    if False:\n        subject_on_pin(d, pin, host, log, held, checkout, lock_factory)\n",
+        expect=("MS11",), stay_green=("MS12", "MS13")),
+    red("RD-74", "DC-29", "speedtest1_bench", "new (2026-09-25)", "call every measured head the pinned revision",
+        '    return bool(re.fullmatch(r"[0-9a-f]{7,40}", head or "")) and (pin or "").startswith(head)\n',
+        new="    return True\n", expect=("MS14",), stay_green=("MS15",)),
+    red("RD-75", "DC-29", "benchmark_speedtest1", "new (2026-09-25)",
+        "report a blocked shared clone as the measurement core's exit 3",
+        "        return EXIT_CLONE_BLOCKED\n", new="        return exc.exit_code\n",
+        expect=("MS16",), stay_green=("MS11", "MS12")),
+    # ── the compiler is GIVEN (2026-09-26, P68 round 12: the independent audit found Step 5 still building dsscp
+    # for any run that named none; RD-31/48/49/52 retired with the refresh they guarded, RD-26 with SKIP_DSS_BUILD)
+    red("RD-76", "DC-21", "sqlite_compiler", "new (the audit's finding, 2026-09-25)",
+        "take the no-compiler refusal away (a nameless run falls through to whatever follows it)",
+        "    if not named:\n", new="    if False:\n",
+        expect=("N01", "N02", "N08"), stay_green=("N03", "N05", "N06", "N09")),
+    red("RD-77", "DC-21", "sqlite_compiler", "new (the audit's finding, 2026-09-25)",
+        "refresh the named compiler before using it (a build from inside the step)",
+        "    info = build_type(named)\n",
+        new='    C.run_checked(["cmake", "--build", build_tree(named), "--config", "Release", "--target", "dsscp"],\n'
+            '                  "dsscp refresh")\n'
+            "    info = build_type(os.path.abspath(named))\n",
+        expect=("N06",), stay_green=("N01", "N03", "N05")),
+    red("RD-78", "DC-21", "build_and_test", "new (the audit's finding, 2026-09-25)",
+        "refuse a nameless run only at Step 5, after Steps 0-4 have spent their minutes",
+        "    CMP.named_compiler(run.cfg)\n", new="    pass\n",
+        expect=("N08",), stay_green=("N09",)),
+    red("RD-79", "DC-18", "sqlite_compiler", "new (the audit's finding, 2026-09-25)",
+        "advise a build outside the harness again (`cmake --build <tree>`)",
+        '    return ("dssharness build --legs <leg> -C %s -- <leg> being the one whose build made %s (dssharness "\n'
+        '            "legs lists them) -- then name that leg\'s dsscp with --dss, as every harness step does with "\n'
+        '            "{product}" % (repo_root, where))\n',
+        new='    return "cmake --build %s --config Release --target dsscp" % where\n',
+        expect=("O05", "O05b"), stay_green=("O01", "O02", "O03", "O04", "O06", "O07", "O23")),
+    red("RD-80", "DC-21", "sqlite_compiler", "new (the audit's finding, 2026-09-25)",
+        "build a compiler for a nameless run, then refuse it anyway",
+        "    if not named:\n        C.die(",
+        new='    if not named:\n        C.run_checked(["cmake", "--build", "build/rel", "--config", "Release", "--target", '
+            '"dsscp"],\n                      "dsscp build")\n        C.die(',
+        expect=("N03", "N08"), stay_green=("N01", "N02", "N05", "N06")),
 )
 
 
@@ -3772,9 +4212,11 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 27 pins + 64 red arms + 10 mutator arms. A registry that no longer
-# adds up to this -- an arm deleted, or one added without this line -- is a FAILURE.
-DECLARED_TOTAL = 101
+# Every arm this file registers: 30 pins + 82 red arms + 10 mutator arms. A registry that no longer
+# adds up to this -- an arm deleted, or one added without this line -- is a FAILURE. (2026-09-26: five red
+# arms retired with the code they guarded -- RD-26, RD-31, RD-48, RD-49, RD-52 -- and five added, RD-76..RD-80;
+# a retired arm's id is never reused.)
+DECLARED_TOTAL = 122
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

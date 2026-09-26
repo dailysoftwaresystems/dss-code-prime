@@ -64,14 +64,15 @@ means a leg vanished without a verdict, which is a harness defect.
 ## Workflow
 
 1. **Establish the client** (step 0 above). Ask if it was not named.
-2. **Per host, drive the client's own driver** — for sqlite, `build_and_test.py`, the same program
-   on every host (on Windows its POSIX half runs inside WSL through `wsl.exe -e`). **Do not delegate
-   the runs to an agent**: a delegated build agent reliably yields mid-build and leaves an orphaned
-   job. Drive them foreground-blocking, or via a harness-tracked background command that re-invokes
-   you on exit.
+2. **Drive the client's action through DssHarness, one invocation for every host** — for sqlite, the
+   `sqlite` runner runs the action's `build-and-test` step on each host's release leg, with that leg's
+   own dsscp (the runner builds it first); on Windows the driver's POSIX half runs inside WSL through
+   `wsl.exe -e`. The corpus tier, the dsscp configuration and a single test file are the step's
+   inputs, carried on its command line. **Do not delegate the run to an agent**: a delegated build
+   agent reliably yields mid-build and leaves an orphaned job. Drive it foreground-blocking, or via a
+   harness-tracked background command that re-invokes you on exit.
    ```bash
-   # from the action's own directory, on every host
-   DSS_TIER=veryquick DSS_CONFIG=release python3 ./build_and_test.py
+   dssharness run sqlite --input tier=veryquick --input dssConfig=release
    ```
 3. **Collect every cell** — host × leg × {BUILD, CLI run, UNITS run}, plus the round-trip rows.
 4. **Attribute every red cell** before blaming the compiler — DSS, upstream, or environment, with the

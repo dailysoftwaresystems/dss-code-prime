@@ -33,8 +33,8 @@ when-unsure-don't discipline, applied to that skill's standing test-discipline p
 | Priority spine | `.plans/00-compiler-implementation-plan - tbd.md` §0 / §0.1 |
 | Deferral registry + triggers — both documents | `.plans/_deferred-anchor-registry*.md` (`-production` holds OPEN rows; `-done` is the archive a closed row is MOVED to). ⚠ There were three until the harness registry retired on 2026-09-16 |
 | The implementer it checks | the `dss-cycle` skill |
-| Pre-build plan review (design GO) | apply the bar to the plan, not code — `dss-cycle` Step 3.5 (§C) |
-| Ratchet a recurring weak-test class | strengthen `dss-cycle` test-discipline prose · separate tagged commit (§J) |
+| Pre-build plan review (design GO) | apply the bar to the plan, not code — `dss-cycle` step 4 (Step 3.5 of its `references/full-procedure.md` §C) |
+| Ratchet a recurring weak-test class | strengthen `dss-cycle` test-discipline prose (`references/the-bar.md` §A.5) · separate tagged commit (§J) |
 | Conventions + strict tests | the `dss-code-prime` skill (§7, §9, §13) |
 
 **The auditor's creed:** *green is never clean until I have re-run it myself; a deferral is not a

@@ -23,7 +23,8 @@ The pipeline (each step in its own module beside this file):
   2  VERIFY the dsscp checkout (never switched or pulled), take the RUN LOCK;
   3–4 fetch sqlite, configure it, derive the full-source recipes, build the reference oracles,
      stage sources and headers (`sqlite_stage`, in WSL on Windows);
-  5  obtain the dsscp compiler by the ONE policy, prove it current (`sqlite_compiler`);
+  5  take the dsscp the run was GIVEN (--dss / DSS_BIN; REQUIRED, and a run naming none is refused
+     before Step 0), through the ONE Release gate, and prove it current (`sqlite_compiler`);
   6  stage the per-target headers, resolve each leg's DECLARED (tcl, z) libraries
      (`sqlite_build`, `sqlite_libs`);
   7/7b build the testfixture and the sqlite3 CLI per leg (`sqlite_build`);
@@ -32,18 +33,31 @@ The pipeline (each step in its own module beside this file):
   9  the ledger and the exit code (`sqlite_report`).
 
 Exit codes: 0 every selected leg verified green; 1 anything else (every reason printed);
-3 another run holds the shared sqlite clone (first stderr line `DSS-CLONE-LOCK-BLOCKED`).
-The environment knobs are read and validated up front (`sqlite_common.Config`).
+2 a malformed command line; 3 another run holds the shared sqlite clone (first stderr line
+`DSS-CLONE-LOCK-BLOCKED`). The environment knobs are read and validated up front
+(`sqlite_common.Config`).
+
+The command line (2026-09-25), what sqlite.yml's steps pass from their inputs -- each `--name=value`
+or `--name value`, at most once:
+  --tier T         the unit-corpus tier, <sqlite>/test/<T>.test (DSS_TIER by hand; veryquick)
+  --dss-config C   the dsscp configuration the artifacts are compiled with (DSS_CONFIG; release)
+  --test-file F    ONE .test file run alone instead of the tier; empty = the tier (DSS_TEST_FILE)
+  --dss PATH       the dsscp this run uses, as named -- never searched for, never rebuilt (DSS_BIN);
+                   REQUIRED, one channel or the other; every step passes the leg's own, `{product}`
+  --recompile L    the round-close recompile of leg L (below); it takes --dss and --dss-config
+A flag and its environment variable naming different values is refused.
 
 `--self-test` runs Step 0 ALONE and exits (0 every check held, 1 not): the gate's entry
 (`harness/sqlite_driver_selftest`) runs exactly the list and the judgement a real run applies
 before it starts, so the two cannot come to disagree about what is checked.
 
-`--recompile <leg>` is the ROUND-CLOSE RECOMPILE (`sqlite_recompile.py`): the leg's testfixture
-manifest, composed exactly as Step 7 composes it from the STAGED sqlite state (reused only when
-current, refused otherwise), compiled by the dsscp DSS_BIN names and by the leg's same-platform
-reference, then a per-TU census and ONE summary line
-`recompile: <leg> tus=N reference_ok=N dss_ok=N blockers=N`. A blocker is a TU the reference
+`--recompile <leg>` is the ROUND-CLOSE RECOMPILE (`sqlite_recompile.py`), the `recompile` manual step
+of sqlite.yml: the leg's testfixture manifest, composed exactly as Step 7 composes it from THIS
+tree's staged sqlite state (re-staged by the mode itself when missing or not current), compiled by
+the dsscp `--dss` names (the step passes the leg's own, `{product}`; DSS_BIN by hand) and by the
+leg's same-platform reference, then a per-TU census and ONE summary line
+`recompile: <leg> sqlite=<sha12> tus=N reference_ok=N dss_ok=N blockers=N`, naming the pinned sqlite
+commit (legs.json `stageBuild.sqliteCommit`). A blocker is a TU the reference
 compiles and dsscp refuses. Exit 0 only with no blocker and a census that saw every TU.
 """
 from __future__ import annotations
@@ -299,8 +313,8 @@ def select_legs(run):
                                       lg.spec))
                 log.warn("      %s (%s) — fidelity '%s', not built, not verified"
                          % (lg.label, lg.spec, lg.fidelity or "<never runs here>"))
-    log.info("legs selected: %s   tier: %s" % (" ".join(lg.label for lg in run.selected()),
-                                               cfg.tier))
+    log.info("legs selected: %s   corpus: %s" % (" ".join(lg.label for lg in run.selected()),
+                                                 cfg.corpus_label()))
     for lg in run.selected():
         log.info("   %s: run mode '%s', fidelity '%s'" % (lg.label, lg.run_mode or "<unset>",
                                                         lg.fidelity or "<never runs here>"))
@@ -539,7 +553,6 @@ def take_run_lock(run):
     crashed run never wedges the next one: a stale owner is taken over and SAID."""
     log = run.log
     import sqlite_procs as P
-    os.makedirs(run.out_dir, exist_ok=True)
     run.run_lock = P.RunLock(os.path.join(run.out_dir, ".harness-lock"))
     stolen = run.run_lock.acquire(log)
     if stolen:
@@ -637,12 +650,16 @@ def run_all(run):
     import sqlite_smoke as SMK
     import sqlite_units as UNITS
     import sqlite_base as B
+    # ★ THE COMPILER IS GIVEN, AND A RUN THAT NAMES NONE STOPS HERE: Step 5 uses the dsscp --dss or
+    # DSS_BIN names and never finds or builds one, so its absence is refused before Steps 0-4 spend
+    # their minutes on the self-tests, the leg plan and staging sqlite.
+    CMP.named_compiler(run.cfg)
     step0(run)
     step1(run)
     step2(run)
     step34(run)
-    run.log.step("5/9  Locate / build dsscp (RELEASE — build type READ from its own tree)")
-    run.compiler = CMP.obtain(run.repo_root, run.cfg.jobs, run.cfg.allow_nonrelease, log=run.log)
+    run.log.step("5/9  The dsscp this run was GIVEN (RELEASE — build type READ from its own tree)")
+    run.compiler = CMP.obtain(run.cfg, log=run.log)
     run.config_root = CMP.pin_config_root(run.repo_root, log=run.log)
     specs = [lg.spec for lg in run.selected()]
     proved = CMP.assert_current(C.BENCH_CORE, run.compiler, run.config_root, specs,
@@ -699,28 +716,64 @@ def place_run(run):
                                      ".plans", "_deferred-anchor-registry*.md")
 
 
+# ── the command line ──────────────────────────────────────────────────────────────────
+# The values a harness STEP hands this driver (sqlite.yml): a run's knobs and the leg's own dsscp, or a
+# recompile's leg. Every other knob of a run stays an environment variable (`sqlite_common.Config`).
+VALUE_FLAGS = ("--tier", "--dss-config", "--test-file", "--dss", "--recompile")
+KNOB_ATTRS = {"--tier": "tier", "--dss-config": "dss_config", "--test-file": "test_file", "--dss": "dss_bin"}
+EMPTY_MEANS_NONE = ("--test-file",)     # an empty test file runs the tier -- the step's default
+
+
+def parse_cli(args):
+    """-> {flag: value} for the VALUE_FLAGS `args` gives, each `--name=value` or `--name value` and at
+    most once; raises ValueError naming the first defect."""
+    got, i = {}, 0
+    while i < len(args):
+        name, eq, value = args[i].partition("=")
+        if name not in VALUE_FLAGS:
+            raise ValueError("unknown argument '%s'" % args[i])
+        if not eq:
+            if i + 1 >= len(args):
+                raise ValueError("%s needs a value" % name)
+            i += 1
+            value = args[i]
+        if name in got:
+            raise ValueError("%s is given twice" % name)
+        if not value.strip() and name not in EMPTY_MEANS_NONE:
+            raise ValueError("%s names nothing (an empty value)" % name)
+        got[name] = value
+        i += 1
+    if "--recompile" in got:
+        idle = [f for f in ("--tier", "--test-file") if f in got]
+        if idle:
+            raise ValueError("%s name%s nothing in a recompile, which runs no corpus"
+                             % (" and ".join(idle), "" if len(idle) > 1 else "s"))
+    return got
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
-    if args:
-        if args in (["-h"], ["--help"]):
-            print(__doc__)
-            return 0
-        if args == ["--self-test"]:
-            return self_test()
-        if args[:1] == ["--recompile"]:
-            if len(args) != 2 or not args[1] or args[1].startswith("-"):
-                print("build_and_test.py --recompile takes exactly ONE leg label (a label legs.json "
-                      "declares); got: %s" % " ".join(args), file=sys.stderr)
-                return 2
-            import sqlite_recompile as RC
-            return RC.main(args[1], sys.modules[__name__])
-        print("build_and_test.py takes no arguments but `--self-test` (Step 0 alone) or `--recompile "
-              "<leg>`; a run is configured by environment variables (see sqlite_common.Config). "
-              "Got: %s" % " ".join(args), file=sys.stderr)
+    if args in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    if args == ["--self-test"]:
+        return self_test()
+    try:
+        flags = parse_cli(args)
+    except ValueError as exc:
+        print("build_and_test.py: %s.\n      It takes `--self-test` (Step 0 alone); a run with --dss PATH "
+              "[--tier T] [--dss-config C] [--test-file F]; or `--recompile <leg> --dss PATH "
+              "[--dss-config C]` -- the compiler REQUIRED, by --dss or DSS_BIN. Every other knob is an "
+              "environment variable (sqlite_common.Config)."
+              % exc, file=sys.stderr)
         return 2
+    knobs = dict((KNOB_ATTRS[f], v) for f, v in flags.items() if f in KNOB_ATTRS)
+    if "--recompile" in flags:
+        import sqlite_recompile as RC
+        return RC.main(flags["--recompile"], sys.modules[__name__], knobs)
     run = None
     try:
-        cfg = C.Config()
+        cfg = C.Config(knobs)
         run = C.Run(cfg)
         place_run(run)
         return run_all(run)

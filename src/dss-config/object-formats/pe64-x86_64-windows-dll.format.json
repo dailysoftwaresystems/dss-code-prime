@@ -37,6 +37,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c `long double` row to F64, exactly as on the exec and staticlib siblings. ★ P68 round 8 (D-CONFIG-LONG-DOUBLE-REFUSED-ON-PIE-SHARED-AND-DLL-FORMATS): this document declared no axis, so `long double` was REFUSED in a DLL (S_LongDoubleFormatUndeclared) while the same source built as the exec or a static library compiled — a property of the ABI, not of the image kind. ✔MEASURED 2026-09-21: with the axis, a DLL exporting `long double` functions and a `long double` global, called by a DSS exe, exits 42 at debug and release (`examples/c/long_double_across_a_dynamic_library`).",
   "longDoubleFormat": "f64",
+  "$enumCompatibleTypeRuleComment": "P68 round 12 (lane `cs`): the integer type an enumeration without a fixed underlying type is compatible with (C 6.7.2.2p4) is the platform ABI's choice — the Microsoft x64 ABI's `int` (MSVC's documented rule), beside this format's `msvc_straddle` bit-fields and `f64` long double; the language's `enumerationCompatibleTypes.msvc` ladders say which C types that is.",
+  "enumCompatibleTypeRule": "msvc",
 
   "$externCallDispatchComment": "Same call-site shape as the exec image: one `jmp *[IAT slot]` code thunk per extern FUNCTION and a plain `call rel32 -> thunk` at the site -- pc-relative, so the code needs no fixup when the loader rebases the DLL. D-FFI-EXTERN-CALL-DISPATCH + D-FFI-PE-IMPORT-THUNK.",
   "externCallDispatch": "direct-plt",

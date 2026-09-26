@@ -42,6 +42,11 @@ add_library(core OBJECT
     # typeSpecifiers row): the grammar loader at LOAD and the shipped-descriptor
     # reader at USE (a lattice-derived constant's `of`), P68 round 9.
     types/type_name_resolve.cpp
+    # The ONE `when` selector (decode + validate, and the match against a pair):
+    # the shipped-descriptor reader at READ and the language document's builtin
+    # `signature` variants at LOAD + INJECTION — P68 round 12, S2a-1 of
+    # D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES.
+    types/variant_when.cpp
     # The ONE `.dss-project.json` reader. It lived in `src/program/` until
     # 2026-08-13, when the LSP tier's `workspace_project.cpp` — which reads the
     # same manifest to learn a workspace's assembly dialect — had to reach UP
@@ -121,6 +126,7 @@ target_compile_definitions(core PRIVATE DSS_BUILD_SOURCE_DIR="${CMAKE_SOURCE_DIR
 #     types/grammar_schema_json.cpp     types/target_schema_json.cpp
 #     types/project_config.cpp          types/predefined_macro_json.hpp
 #     substrate/relocation_table_json.hpp
+#     types/variant_when_json.hpp       (P68 round 12: the `when` decoder, `_json` shape)
 # Keep this list honest: `grep -rn '#include <nlohmann' src/core/` is the whole
 # instrument.
 #

@@ -81,6 +81,14 @@ effectiveBitFieldStrategy(TargetSchema const&       target,
 // (S_LongDoubleFormatUndeclared on use), never a silent width guess. The
 // (target, format) signature keeps the resolver-family shape so a future
 // target-side contribution slots in without touching the call sites.
+// P68 round 12 (lane `cs`): the effective ENUMERATION COMPATIBLE-TYPE RULE for the
+// active format — FORMAT-only, like `longDoubleFormat` (one x86_64 target serves
+// pe64's Microsoft rule AND ELF's SysV one). `None` (wasm / spirv skeletons)
+// propagates as the honest undeclared state; the semantic tier fails loud on it for
+// an enumeration without a fixed underlying type.
+[[nodiscard]] DSS_EXPORT EnumCompatibleTypeRule
+effectiveEnumCompatibleTypeRule(ObjectFormatSchema const& format) noexcept;
+
 [[nodiscard]] DSS_EXPORT LongDoubleFormat
 effectiveLongDoubleFormat(TargetSchema const&       target,
                           ObjectFormatSchema const& format) noexcept;

@@ -88,9 +88,10 @@ proof, absent hardening, or a test that stays green on a silently-broken impl �
 Render the verdict in the §G shape (verified-clean vs green-but-rule-breaking vs unverified). For
 every green-but-rule-breaking or unverified item, author the implementer prompt that closes it (§H).
 
-### Pre-build variant — the plan-lock design review (`dss-cycle` Step 3.5)
+### Pre-build variant — the plan-lock design review (`dss-cycle` step 4)
 The steps above audit *committed code*; the same bar also judges a **plan before it is built** — the
-gate `dss-cycle` runs at its Step 3.5, and the mode this skill applied to the linkage P1+P2 plan
+gate `dss-cycle` runs at its step 4 (Step 3.5 in its older numbering), and the mode this skill applied
+to the linkage P1+P2 plan
 (2026-06-04). What changes:
 
 - **No battery.** Nothing is built, so §D (build/ctest) does not apply. Apply the bar (§A), the

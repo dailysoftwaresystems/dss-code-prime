@@ -72,6 +72,7 @@
 // (`loader_search_path.hpp`); both runners honour it at their spawn sites.
 
 #include "arm_verdict_ledger.hpp"
+#include "host_translations.hpp"
 // THE INTEGRATED RUNNER BUILDS ONLY THE HOST-RUNNABLE SPEC, SO ONE RUNNER
 // SEES A CAPABILITY THE OTHER CANNOT.
 // The COVERAGE BOUNDARY vocabulary — one grammar, emitted by both runners and
@@ -2702,32 +2703,23 @@ compileAndRunArm(fs::path const& exampleDir,
     // the gate sets DSS_STRICT_ARM_VERDICTS=1 and the same skip becomes a RED.
     // Both are ledgered either way; neither can be read as a pass again.
     std::vector<std::string> launcherPrefix;
+    bool launcherExecsImage = false;   // runBinary's admission warm-up follows it
     if (std::string const targetArch = specTargetArch(t.spec);
         !targetArch.empty() && targetArch != currentHostArch()) {
-        if (t.emulator.empty()) {
-            std::ostringstream why;
-            why << "target arch '" << targetArch << "' != host arch '"
-                << currentHostArch() << "' and the manifest declares no"
-                   " 'emulator'";
+        // ONE decision for both runners (host_translations.hpp): the host's own
+        // translation first (D-TEST-EXAMPLES-X8664-MACHO-ARMS-NEVER-RUN-ON-THE-DARWIN-LEG),
+        // then the manifest's `emulator`, exactly as before.
+        auto const gate = crossArchDecisionForThisHost(targetArch, t.emulator);
+        if (!gate.runs) {
             GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
-                             << ' ' << why.str() << " — skipping run";
-            armResult.verdict = ArmVerdict::SkippedNoEmulatorDeclared;
-            armResult.detail  = why.str();
+                             << ' ' << gate.why << " — skipping run";
+            armResult.verdict = gate.skip;
+            armResult.detail  = gate.why;
             return armResult;
         }
-        auto const emuPath = findOnPath(t.emulator);
-        if (emuPath.empty()) {
-            std::ostringstream why;
-            why << "declared emulator '" << t.emulator
-                << "' is not on PATH (target arch '" << targetArch
-                << "' != host arch '" << currentHostArch() << "')";
-            GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel
-                             << ' ' << why.str() << " — skipping cross-arch run";
-            armResult.verdict = ArmVerdict::SkippedEmulatorMissing;
-            armResult.detail  = why.str();
-            return armResult;
-        }
-        launcherPrefix.push_back(emuPath);
+        GTEST_LOG_(INFO) << "spec=" << t.spec << " arm=" << armLabel << ' ' << gate.why;
+        launcherPrefix = gate.launcherPrefix;
+        launcherExecsImage = gate.launcherExecsImage;
     }
 
     // ── QEMU_LD_PREFIX IS AMBIENT-ONLY: closing-work item (2), first half ────
@@ -2801,7 +2793,9 @@ compileAndRunArm(fs::path const& exampleDir,
         result = runBinary(artifactPath,
                            kRunBudget,
                            captureStdout,
-                           launcherPrefix);
+                           launcherPrefix,
+                           /*programArgs=*/{},
+                           launcherExecsImage);
     }
     EXPECT_TRUE(result.spawned)
         << "spawn failed for " << artifactPath.generic_string()

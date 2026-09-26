@@ -22,8 +22,9 @@
  * Every value crosses a `volatile` sink before it is converted, so the
  * CONVERSION happens at run time on the target — the only place the defect
  * ever existed. (`io()` supplies the integer side; there is deliberately no
- * int->float cast anywhere, which is still a fail-loud refusal on both targets
- * under D-CSUBSET-INT-TO-F32-CODEGEN.)
+ * int->float cast anywhere: when this witness was written that conversion was a
+ * fail-loud refusal on both targets. It lowers since P68 round 12
+ * (D-CSUBSET-INT-TO-F32-CODEGEN), pinned by `int_to_float_every_width`.)
  *
  * RED-ON-DISABLE:
  *   x86  — restore either `ui_to_fp`/`fp_to_ui` single-instruction `encoding`

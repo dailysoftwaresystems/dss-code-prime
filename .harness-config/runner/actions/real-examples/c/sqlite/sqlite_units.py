@@ -367,8 +367,8 @@ def unit_leg(run, leg, ctx):
     if not corpus_entry(run, leg):
         return
     verb = L.path_verb(leg)
-    log.step("8/9  [%s] %s — %s.test (%s%s%s)"
-             % (leg.label, leg.spec, cfg.tier, leg.run_mode,
+    log.step("8/9  [%s] %s — %s (%s%s%s)"
+             % (leg.label, leg.spec, cfg.corpus_label(), leg.run_mode,
                 (": " + " ".join(leg.launcher)) if leg.launcher else "",
                 ("; paths -> '%s' via '%s'" % (verb, " ".join(leg.run.get("pathTranslator") or [])))
                 if verb != "none" else ""))
@@ -490,6 +490,9 @@ def run_corpus(run, leg, ctx, rundir, plan, launch_bin, kentry, patterns, runner
     tier_script = L.launch_path(run.resolver, verb, ctx["test_file"])
     perm_script = L.launch_path(run.resolver, verb, os.path.join(ctx["testdir"], "permutations.test"))
     tier_name = os.path.basename(ctx["test_file"])
+    # A SINGLE-FILE run (DSS_TEST_FILE): one segment sourcing one `.test` file, judged on its own terms --
+    # its summary completes its file (`credit_single_file`) and an abort inside it has nothing to resume.
+    single = bool(cfg.test_file)
     launcher = [str(a) for a in plan.get("launcher") or []] or list(leg.launcher)
     loader_dirs = [os.path.dirname(leg.tcl_lib), os.path.dirname(leg.z_lib)]
     base = ctx["base_env"]
@@ -500,7 +503,7 @@ def run_corpus(run, leg, ctx, rundir, plan, launch_bin, kentry, patterns, runner
     # fixture's own kernel).
     _sweep(run, leg, leg.fixture, launch_bin, kentry, "pre-corpus", lr)
     lr.hygiene += list(run.hygiene)
-    queue =[Segment("tier", "", "%s.test" % cfg.tier, None, tier_script, "")]
+    queue = [Segment("tier", "", tier_name, None, tier_script, "")]
     seg_i = 0
     last_boundary = ""
     prev_zero_sig = ""
@@ -509,8 +512,8 @@ def run_corpus(run, leg, ctx, rundir, plan, launch_bin, kentry, patterns, runner
         seg = queue[seg_i]
         if seg_i == 0:
             seglog = runlog
-            log.info("[%s] running %s.test%s…" % (
-                leg.label, cfg.tier,
+            log.info("[%s] running %s%s…" % (
+                leg.label, cfg.corpus_label(),
                 (" (under the declared launcher: %s%s)" % (" ".join(leg.launcher),
                                                            (", paths -> %s" % verb) if verb != "none"
                                                            else "")) if leg.launcher else ""))
@@ -534,6 +537,8 @@ def run_corpus(run, leg, ctx, rundir, plan, launch_bin, kentry, patterns, runner
         lr.seg_counts.append("tests: (none counted) / errors: (none counted)   [this segment produced "
                              "no countable output — see its log]")
         facts = K.parse_segment(seglog)
+        if single and seg.kind == "tier":
+            K.credit_single_file(facts, tier_name)
         lr.facts.append(facts)
         lr.files_done += facts.n_files
         lr.files_inert += facts.n_inert
@@ -615,6 +620,15 @@ def run_corpus(run, leg, ctx, rundir, plan, launch_bin, kentry, patterns, runner
                  % (ap.abort_file or "(unresolved)", facts.last_test or "(none)"))
         log.info("        how it was named   : %s" % (ap.abort_source or "(could not be named — no "
                                                     "traceback frame and no resolvable test name)"))
+        if single:
+            lr.note(name, "the REMAINDER of %s — a single-file run (DSS_TEST_FILE) aborted inside its one "
+                    "file (last test emitted: %s), and nothing is left to resume" % (tier_name,
+                                                                         facts.last_test or "none"))
+            for line in C.tail_file(seglog, 6).splitlines():
+                log.info("      %s" % line)
+            log.warn("[%s] a single-file run has nothing to resume: the abort inside %s IS its verdict."
+                     % (leg.label, tier_name))
+            continue
         if ap.abort_file:
             lr.note(name, "the REMAINDER of %s under permutation '%s' (%s; last test emitted: %s)"
                     % (ap.abort_file, ap.perm or "?", ap.abort_source or "source unrecorded",
@@ -739,7 +753,10 @@ def judge_leg(run, leg, ctx, lr, patterns, runlog, ledger_file):
         ran = [f for fx in lr.facts for f in fx.files]
         inert = [f for fx in lr.facts for f in fx.inert]
         w = V.witness_check(witnesses, ran, inert)
-        if w.absent:
+        if w.absent and cfg.test_file:
+            log.info("[%s] a single-file run (DSS_TEST_FILE) proves nothing about the %d capability witness(es) "
+                     "its file is not: %s" % (leg.label, len(w.absent), " ".join(w.absent)))
+        elif w.absent:
             log.warn("[%s] %d of %d capability witness(es) were NOT IN THIS RUN'S CORPUS, so nothing was "
                      "proved about them: %s\n      A witness file that never appears is not a passing "
                      "witness. Either the tier does not include\n      it, or the corpus this leg was "
@@ -826,6 +843,12 @@ def judge_leg(run, leg, ctx, lr, patterns, runlog, ledger_file):
                  "a run.")
         for line in C.tail_file(runlog, 4).splitlines():
             log.info("      %s" % line)
+    elif cfg.test_file and lr.files_inert >= lr.files_done:
+        verdict = ("FAIL:the single file %s asserted NOTHING (%s) — every result it printed was the "
+                   "harness's own teardown, so it returned at an `ifcapable` gate; a run that asserted "
+                   "nothing is not a pass; see %s" % (os.path.basename(cfg.test_file), summary, runlog))
+        log.warn("[%s] corpus FAIL — the single file asserted NOTHING, though the fixture printed '%s'."
+                 % (leg.label, summary))
     elif lr.total_errors > 0 and not faillist:
         verdict = ("FAIL:%d error(s) but no failure markers ('Failures on these tests:' / '! <name>') to "
                    "classify — see %s" % (lr.total_errors, runlog))
@@ -913,7 +936,7 @@ def write_ledger(run, leg, lr, summary, derivation, path):
 
 def step8(run):
     log, cfg, st = run.log, run.cfg, run.stage
-    log.step("8/9  Run SQLite unit corpus (%s.test) on each leg + classify failures" % cfg.tier)
+    log.step("8/9  Run SQLite unit corpus (%s) on each leg + classify failures" % cfg.corpus_label())
     if run.clone_lock is not None:
         run.clone_lock.read("build_and_test.py corpus run — tier %s, legs %s"
                             % (cfg.tier, " ".join(lg.label for lg in run.selected())), log)

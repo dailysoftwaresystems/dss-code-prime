@@ -1076,12 +1076,55 @@ TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> va
     return id;
 }
 
-TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
+TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying,
+                              TypeId declaredUnderlying, EnumUnderlyingOrigin origin) {
     // scalars=[(int)underlying]; no operands (enumerator symbols carry
     // the enum's TypeId individually as Variables; the enum type itself
     // is identified nominally by name + tagged with its underlying type).
     std::array<std::int64_t, 1> const sc{static_cast<std::int64_t>(underlying)};
-    return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+    if (!declaredUnderlying.valid())
+        return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+    // P68 round 12 (lane `cs`): a FIXED underlying type rides as the one operand,
+    // UNQUALIFIED — C23 6.7.2.2 makes the underlying type "the unqualified,
+    // non-atomic version" of what the clause names, so a `volatile` / `_Atomic`
+    // skin is peeled here, the one place the record is built — and it must be the
+    // kind the scalar states, or the record would state two types.
+    TypeId const declared = materialId_(declaredUnderlying);
+    if (kind(declared) != underlying)
+        latticeFatal("enumType: the declared underlying type's kind is not the enum's "
+                     "underlying kind");
+    std::array<TypeId, 1> const ops{declared};
+    // The enumeration P1: the CHOSEN compatible type of an enum without a fixed
+    // underlying type rides the same operand slot and a second scalar marks the
+    // origin, so the fixed record above is unchanged and the two can never intern
+    // to one TypeId.
+    if (origin == EnumUnderlyingOrigin::Chosen) {
+        std::array<std::int64_t, 2> const chosen{static_cast<std::int64_t>(underlying),
+                                                 std::int64_t{1}};
+        return internContent(TypeKind::Enum, {}, ops, chosen, names_.intern(name));
+    }
+    return internContent(TypeKind::Enum, {}, ops, sc, names_.intern(name));
+}
+
+TypeId TypeInterner::enumDeclaredUnderlying(TypeId id) const {
+    if (!id.valid() || kind(id) != TypeKind::Enum) return InvalidType;
+    auto const ops = operands(id);
+    if (ops.empty() || scalars(id).size() != 1) return InvalidType;
+    return ops[0];
+}
+
+TypeId TypeInterner::enumChosenUnderlying(TypeId id) const {
+    if (!id.valid() || kind(id) != TypeKind::Enum) return InvalidType;
+    auto const ops = operands(id);
+    auto const sc = scalars(id);
+    if (ops.empty() || sc.size() != 2 || sc[1] != 1) return InvalidType;
+    return ops[0];
+}
+
+TypeId TypeInterner::enumUnderlyingType(TypeId id) const {
+    if (!id.valid() || kind(id) != TypeKind::Enum) return InvalidType;
+    auto const ops = operands(id);
+    return ops.empty() ? InvalidType : ops[0];
 }
 
 TypeId TypeInterner::bitInt(std::int64_t widthBits, bool isSigned) {

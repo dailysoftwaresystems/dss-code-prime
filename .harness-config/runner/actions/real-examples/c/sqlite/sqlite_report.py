@@ -114,7 +114,7 @@ def leg_lines(run):
     log, cfg = run.log, run.cfg
     excl = ("  [NOT FULL COVERAGE: %d file pattern(s) EXCLUDED from the %s tier via QUICKTEST_OMIT -- %s]"
             % (len(cfg.tier_excludes), cfg.tier, " ".join(cfg.tier_excludes))) if cfg.tier_excludes else ""
-    log.info("tier     : %s.test   outputs: %s" % (cfg.tier, run.out_dir))
+    log.info("corpus   : %s   outputs: %s" % (cfg.corpus_label(), run.out_dir))
     log.info("excluded : %s" % (("%s   (operator DSS_TIER_EXCLUDES -> QUICKTEST_OMIT; dropped from every "
                                   "$allquicktests-derived permutation, still run under 'full')"
                                   % " ".join(cfg.tier_excludes)) if cfg.tier_excludes
@@ -281,10 +281,11 @@ def step9(run):
             log.warn("✗ %s" % r)
         log.warn("✗ sqlite harness FAILED — %s" % line)
         return 1
-    log.ok("%d of %d declared leg(s) VERIFIED: compiled the full-source testfixture + ran the %s unit corpus "
+    log.ok("%d of %d declared leg(s) VERIFIED: compiled the full-source testfixture + ran the unit corpus %s "
            "GREEN — SQLite units pass with dsscp.  (%d skipped: %d structural, %d environmental, %d harness "
            "— each named above; %d poisoned)"
-           % (lc.verified, lc.total, cfg.tier, lc.skipped, lc.structural, lc.environmental, lc.harness,
+           % (lc.verified, lc.total, cfg.corpus_label(), lc.skipped, lc.structural, lc.environmental,
+              lc.harness,
               lc.failed))
     built = [lg for lg in run.legs if lg.cli_bin]
     smoked = [lg for lg in built if (lg.smoke_verdict or "").startswith("PASS")]

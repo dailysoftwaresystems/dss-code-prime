@@ -97,10 +97,12 @@ TEST(SemanticAnalyzerC, FunctionLocalIntDeclTypedAsI32) {
     // `__FUNCTION__` (text "", bound once per configured spelling in the builtin
     // scope, what a use outside every function body resolves to — gcc's and
     // clang's meaning, S_PredefinedIdentifierOutsideFunction at each use).
-    ASSERT_EQ(model.symbols().size() - 1, 106u)
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    ASSERT_EQ(model.symbols().size() - 1, 107u)
         << "main + x + __va_list_tag + va_list + __builtin_va_list + __umulh + "
            "_InterlockedCompareExchange + _InterlockedCompareExchange64 + "
-           "_ReadWriteBarrier + __sync_synchronize + "
+           "_ReadWriteBarrier + __sync_synchronize + __builtin_unreachable + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
            "atomic_load_explicit + atomic_store_explicit + the 8 atomic RMW "
@@ -4151,7 +4153,9 @@ TEST(SemanticAnalyzerC, NestedBlocksShadowWithoutRedecl) {
     // so a second spelling rather than a new operation) + the 2 FILE-SCOPE twins of
     // `__func__` / `__FUNCTION__` (P68 round 9, lane `cs` — text "", bound in the
     // builtin scope for a use outside every function body).
-    EXPECT_EQ(model.symbols().size() - 1, 107u);
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    EXPECT_EQ(model.symbols().size() - 1, 108u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -4190,7 +4194,9 @@ TEST(SemanticAnalyzerC, ForwardReferenceWithinBlock) {
     // C11 *_explicit operations above — same lowering verbs, no new operation).
     // P68 round 9 (lane `cs`): +2 for the FILE-SCOPE twins of `__func__` /
     // `__FUNCTION__` (text "", bound in the builtin scope).
-    ASSERT_EQ(model.symbols().size() - 1, 106u);
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    ASSERT_EQ(model.symbols().size() - 1, 107u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -7230,9 +7236,12 @@ TEST(SemanticAnalyzerC, ValueStarValueStaysExpressionStatement) {
     // without minting an operation (they bind the C11 rows' own lowering verbs).
     // P68 round 9 (lane `cs`): + the 2 FILE-SCOPE twins of `__func__` /
     // `__FUNCTION__` (text "", bound in the builtin scope).
-    EXPECT_EQ(model.symbols().size() - 1, 107u)
+    // P68 round 12 (lane `lm`, D-C-STDDEF-H-LACKS-UNREACHABLE): + `__builtin_unreachable`
+    // (the GNU builtin C23's `unreachable()` expands to; a new `unreachable` verb).
+    EXPECT_EQ(model.symbols().size() - 1, 108u)
         << "main + a + b + __va_list_tag + va_list + __builtin_va_list + "
-           "the 6 intrinsic builtins + the 8 GNU value-form __atomic_* builtins + "
+           "the 6 intrinsic builtins + __builtin_unreachable + "
+           "the 8 GNU value-form __atomic_* builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
            "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
            "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
@@ -11240,10 +11249,18 @@ TEST(SemanticAnalyzerC, EnumExplicitUnderlyingTypeSetsScalars) {
         << "the enum underlying scalar must be U8, not the default I32";
 }
 
+// P68 round 12 (lane `cs`, the enumeration P1): the two ENUMERATED types are read from
+// objects declared with them. This test used to read them from the constants `WA` / `NA`,
+// which rested on a constant being typed as its enumeration — not C's for `WA` (C17
+// 6.4.4.3p2: `int`; only a FIXED-type enumeration's constant is the enumerated type) —
+// and it expected `enum Wide`'s kind to be the "default int": under the SysV convention
+// this analysis runs (the LP64 default, "gnu") an enumeration with no negative value is
+// `unsigned int`, gcc's and clang's documented choice (lane `cs`'s `.temp/probe/ect8`).
 TEST(SemanticAnalyzerC, EnumUnderlyingTypeDistinctFromDefault) {
     auto cu = buildShippedUnit("c", {
-        "enum Wide { WA };\n"                     // default int
+        "enum Wide { WA };\n"                     // no fixed type: the convention chooses
         "enum Narrow : unsigned char { NA };\n"   // explicit u8
+        "enum Wide w; enum Narrow n;\n"
         "int main(void) { return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
@@ -11253,13 +11270,16 @@ TEST(SemanticAnalyzerC, EnumUnderlyingTypeDistinctFromDefault) {
     TypeId wide{}, narrow{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         auto const& n = model.symbols()[i].name;
-        if (n == "WA") wide   = model.symbols()[i].type;
-        if (n == "NA") narrow = model.symbols()[i].type;
+        if (n == "w") wide   = model.symbols()[i].type;
+        if (n == "n") narrow = model.symbols()[i].type;
     }
     ASSERT_TRUE(wide.valid() && narrow.valid());
+    ASSERT_EQ(ti.kind(wide), TypeKind::Enum);
+    ASSERT_EQ(ti.kind(narrow), TypeKind::Enum);
     EXPECT_NE(wide.v, narrow.v)
         << "a different underlying type interns a DISTINCT enum TypeId";
-    EXPECT_EQ(ti.scalars(wide)[0],   static_cast<std::int64_t>(TypeKind::I32));
+    EXPECT_EQ(ti.scalars(wide)[0],   static_cast<std::int64_t>(TypeKind::U32))
+        << "no negative value: `unsigned int` under the gnu convention";
     EXPECT_EQ(ti.scalars(narrow)[0], static_cast<std::int64_t>(TypeKind::U8));
 }
 
@@ -13607,9 +13627,13 @@ TEST(SemanticAnalyzerC, AutoInfersExactKindsAcrossValueClasses) {
     };
     EXPECT_EQ(kindOf("s2"), TypeKind::Struct)
         << "a struct variable infers the struct type BY VALUE (no decay)";
-    EXPECT_EQ(kindOf("e"), TypeKind::Enum)
-        << "an enumerator infers the ENUM type (enumConvertsToArith covers "
-           "its uses; the type itself stays Enum)";
+    // P68 round 12 (lane `cs`, the enumeration P1): this pinned the ENUM type, which
+    // is not C's — an enumeration constant of an enumeration whose values fit `int` IS
+    // `int` (C17 6.4.4.3p2, C23 6.7.3.3p15), so `auto` infers `int`. ✔MEASURED
+    // 2026-09-24 (lane `cs`'s `.temp/probe/ectA`): `auto e = GREEN;` selects `int:` in
+    // `_Generic` under gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC 19.51.
+    EXPECT_EQ(kindOf("e"), TypeKind::I32)
+        << "an enumeration constant is `int`, so `auto` infers `int`";
     EXPECT_EQ(kindOf("b"), TypeKind::I32)
         << "a comparison infers int (C 6.5.8p6: the RESULT type of a relational "
            "operator is int, sourced config-drivenly — "
@@ -14703,6 +14727,151 @@ namespace {
                    std::nullopt, std::nullopt, axis);
 }
 } // namespace
+
+// P68 round 12 (lane `cs`, the enumeration P1): the integer type an enumeration without a
+// fixed underlying type is compatible with follows the ACTIVE FORMAT's convention
+// (`analyze()`'s trailing `EnumCompatibleTypeRule`): the Microsoft x64 ABI's `int` while
+// `int` holds every value, the SysV / AAPCS / Darwin `unsigned int` when no value is
+// negative — each the SAME TypeId the language gives that spelled type, so `_Generic`
+// and redeclarations can match it. `int` and `unsigned int` are their kinds' canonical
+// types (C's `typeSpecifiers` name only the types that SHARE a kind — `long`, `unsigned
+// long`, `long long` …), so the check that the vocabulary identity is carried is the
+// enumeration whose values need 64 bits: `unsigned long` under gnu (LP64), `unsigned long
+// long` under msvc — two U64 types C keeps distinct. An undeclared convention (wasm /
+// spirv) refuses such an enumeration — never a silent pick — while a FIXED underlying
+// type needs none.
+namespace {
+[[nodiscard]] SemanticModel analyzeWithEnumRule(std::initializer_list<std::string> sources,
+                                                EnumCompatibleTypeRule rule) {
+    auto cu = buildShippedUnit("c", sources);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DiagnosticBudget::libraryDefault(), DataModel::Lp64, std::nullopt,
+                   std::nullopt, std::nullopt, std::nullopt, LongDoubleFormat::None,
+                   /*target=*/nullptr, /*deepRecursionReserveBytes=*/0,
+                   /*roleResolver=*/nullptr, rule);
+}
+} // namespace
+
+TEST(SemanticAnalyzerC, AnEnumerationsCompatibleTypeFollowsTheFormatsConvention) {
+    struct Row { EnumCompatibleTypeRule rule; TypeKind pos; char const* bigName; };
+    for (Row const row : {Row{EnumCompatibleTypeRule::Msvc, TypeKind::I32, "unsigned long long"},
+                          Row{EnumCompatibleTypeRule::Gnu, TypeKind::U32, "unsigned long"}}) {
+        auto model = analyzeWithEnumRule({"enum Pos { PA = 1 };\n"
+                                          "enum Neg { NA = -1 };\n"
+                                          "enum Big { BA = 0x100000000 };\n"
+                                          "enum Pos p; enum Neg n; enum Big b;\n"
+                                          "int main(void) { return 0; }\n"}, row.rule);
+        ASSERT_FALSE(model.hasErrors()) << enumCompatibleTypeRuleName(row.rule);
+        auto& in = model.lattice().interner();
+        auto const* p = findSymbolNamed(model, "p");
+        auto const* n = findSymbolNamed(model, "n");
+        auto const* b = findSymbolNamed(model, "b");
+        ASSERT_NE(p, nullptr);
+        ASSERT_NE(n, nullptr);
+        ASSERT_NE(b, nullptr);
+        TypeId const pu = in.enumUnderlyingType(p->type);
+        TypeId const nu = in.enumUnderlyingType(n->type);
+        TypeId const bu = in.enumUnderlyingType(b->type);
+        ASSERT_TRUE(pu.valid() && nu.valid() && bu.valid())
+            << enumCompatibleTypeRuleName(row.rule)
+            << ": the enumeration records no compatible type";
+        EXPECT_EQ(pu, in.primitive(row.pos))
+            << enumCompatibleTypeRuleName(row.rule)
+            << ": a non-negative enumeration is compatible with the canonical `"
+            << (row.pos == TypeKind::U32 ? "unsigned int" : "int") << "`";
+        EXPECT_EQ(nu, in.primitive(TypeKind::I32))
+            << "a negative value makes it `int` under both conventions";
+        EXPECT_EQ(in.kind(bu), TypeKind::U64) << enumCompatibleTypeRuleName(row.rule);
+        EXPECT_EQ(std::string{in.vocabularyName(bu)}, row.bigName)
+            << "the chosen type keeps its VOCABULARY identity — two U64 types C keeps apart";
+        EXPECT_FALSE(in.enumDeclaredUnderlying(p->type).valid())
+            << "a CHOSEN compatible type is not a FIXED underlying type";
+    }
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1): a constant wider than `int` has ITS OWN
+// type while the list is processed (C23 6.7.3.3p12) — its constant expression's (`A =
+// 0x100000000` is `long` on LP64, `0xFFFFFFFFFFFFFFFF` is `unsigned long`) — and a later
+// enumerator's constant expression folds it at that type. Two defects of the P1's first
+// trial build made it wrong, each silent (✔MEASURED, `.temp/probe/ectE`; gcc 13.3.0 and
+// clang 18.1.3 give the values below): the value's literal was typed nowhere at Pass 1.5
+// (0xFFFF… read as -1, `FB` was 0), and the shared constant builder folded an
+// integer-typed enumerator at I32 (`B` wrapped to 1).
+TEST(SemanticAnalyzerC, AConstantWiderThanIntFoldsAtItsOwnTypeDuringTheList) {
+    auto model = analyzeWithEnumRule({"enum E { A = 0x100000000, B = A + 1, C = A * 2 };\n"
+                                      "enum F { FA = 0xFFFFFFFFFFFFFFFF, FB = FA > 0 };\n"
+                                      "int main(void) { return 0; }\n"},
+                                     EnumCompatibleTypeRule::Gnu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const* b = findSymbolNamed(model, "B");
+    auto const* c = findSymbolNamed(model, "C");
+    auto const* fb = findSymbolNamed(model, "FB");
+    ASSERT_NE(b, nullptr);
+    ASSERT_NE(c, nullptr);
+    ASSERT_NE(fb, nullptr);
+    EXPECT_EQ(b->enumValue, std::int64_t{0x100000001}) << "`A + 1` at `long`, not 32 bits";
+    EXPECT_EQ(c->enumValue, std::int64_t{0x200000000}) << "`A * 2` at `long`, not 32 bits";
+    EXPECT_EQ(fb->enumValue, 1) << "0xFFFFFFFFFFFFFFFF is an `unsigned long` above zero";
+}
+
+// …and a fixed UNSIGNED type's value above INT64_MAX is simply a value of that type:
+// no conversion, no diagnostic (the conversion warning is for a NEGATIVE value only).
+TEST(SemanticAnalyzerC, AnUnsignedFixedTypesValueAboveInt64MaxDrawsNoDiagnostic) {
+    auto model = analyzeWithEnumRule(
+        {"enum AllOnes : unsigned long long { X = 0xFFFFFFFFFFFFFFFFULL };\n"
+         "enum TopBit : unsigned long long { T = 0x8000000000000000ULL };\n"
+         "int main(void) { return 0; }\n"},
+        EnumCompatibleTypeRule::Gnu);
+    EXPECT_TRUE(model.diagnostics().all().empty())
+        << "first: " << (model.diagnostics().all().empty()
+                             ? std::string{}
+                             : std::string{diagnosticCodeName(model.diagnostics().all()[0].code)});
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1): a NEGATIVE value for an UNSIGNED fixed type that
+// the SIGNED type of the same width holds is converted modulo 2^N, with the warning C23
+// 6.7.3.3p3's constraint asks for — clang 18.1.3's measured extent (lane `cs`'s
+// `.temp/probe/ect7d`, `ectC`); a value beyond that range stays refused, as all four references
+// refuse `-200` for `unsigned char`
+// ([[D-C-A-NEGATIVE-VALUE-FOR-AN-UNSIGNED-FIXED-ENUMERATION-IS-REFUSED-WHERE-CLANG-CONVERTS-IT]]).
+TEST(SemanticAnalyzerC, ANegativeValueForAnUnsignedFixedTypeIsConvertedWithAWarning) {
+    auto converted = analyzeWithEnumRule({"enum E : unsigned char { A = -1, B = -128 };\n"
+                                          "int main(void) { return 0; }\n"},
+                                         EnumCompatibleTypeRule::Gnu);
+    EXPECT_FALSE(converted.hasErrors());
+    EXPECT_EQ(countCode(converted.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueConvertedToUnderlyingType), 2u)
+        << "one warning per converted enumerator";
+    auto const* a = findSymbolNamed(converted, "A");
+    auto const* b = findSymbolNamed(converted, "B");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    EXPECT_EQ(a->enumValue, 255) << "-1 converts to UCHAR_MAX, as a conversion to the type does";
+    EXPECT_EQ(b->enumValue, 128);
+    auto beyond = analyzeWithEnumRule({"enum E : unsigned char { A = -200 };\n"
+                                       "int main(void) { return 0; }\n"},
+                                      EnumCompatibleTypeRule::Gnu);
+    EXPECT_EQ(countCode(beyond.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueConvertedToUnderlyingType), 0u);
+    EXPECT_EQ(countCode(beyond.diagnostics(), DiagnosticCode::S_EnumeratorValueOutOfRange), 1u)
+        << "beyond the same-width signed range: refused";
+}
+
+TEST(SemanticAnalyzerC, AnEnumerationUnderAnUndeclaredConventionIsRefusedAFixedOneIsNot) {
+    auto undeclared = analyzeWithEnumRule({"enum E { A = 1 };\n"
+                                           "int main(void) { return A; }\n"},
+                                          EnumCompatibleTypeRule::None);
+    EXPECT_EQ(countCode(undeclared.diagnostics(),
+                        DiagnosticCode::S_EnumCompatibleTypeRuleUndeclared), 1u)
+        << "no convention, no compatible type: refused, never guessed";
+    auto fixed = analyzeWithEnumRule({"enum F : long { A = 1 };\n"
+                                      "int main(void) { return (int)A; }\n"},
+                                     EnumCompatibleTypeRule::None);
+    EXPECT_EQ(countCode(fixed.diagnostics(),
+                        DiagnosticCode::S_EnumCompatibleTypeRuleUndeclared), 0u)
+        << "a FIXED underlying type is its own compatible type (C23 6.7.3.3p16)";
+    EXPECT_FALSE(fixed.hasErrors());
+}
 
 TEST(SemanticAnalyzerC, LongDoubleResolvesPerAxis) {
     struct Row { LongDoubleFormat axis; TypeKind expected; };

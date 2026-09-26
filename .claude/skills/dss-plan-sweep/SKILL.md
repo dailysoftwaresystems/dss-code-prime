@@ -27,7 +27,7 @@ leave no divergence silently unaccounted for.
 
 **Not this skill:** implementing work → `dss-cycle`. Judging code against the bar → `dss-audit`.
 Incidental staleness tripped over mid-audit is already `dss-audit` §I's job; this skill is the
-systematic counterpart to `dss-cycle` step 8's per-cycle tidying.
+systematic counterpart to `dss-cycle` step 9's per-cycle tidying (the cross-plan update).
 
 ## The one decision that runs on every hit: fix or flag
 

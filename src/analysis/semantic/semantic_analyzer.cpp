@@ -58,6 +58,7 @@
 // the descriptor vocabulary this tier fills in for the HIR lowering to carry.
 #include "hir/hir_inline_asm.hpp"
 #include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
+#include "core/types/variant_when.hpp"   // whenMatches — a builtin's per-pair signature arm (S2a-1)
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
 
 #include <algorithm>
@@ -477,6 +478,9 @@ struct EngineState {
     // never base-core-resolved) and the float-literal ladder. Set ONCE before
     // any index is built, like `dataModel`.
     LongDoubleFormat           longDoubleFormat = LongDoubleFormat::None;
+    // P68 round 12 (lane `cs`): the active format's enumeration compatible-type
+    // rule — which `enumerationCompatibleTypes` ladders the enum arm reads.
+    EnumCompatibleTypeRule     enumCompatibleTypeRule = EnumCompatibleTypeRule::Gnu;
     // Inline-asm P5 (D-CSUBSET-INLINE-ASM-OPERANDS): the ACTIVE TARGET, or
     // nullptr when none is in scope. The ONLY thing it is asked is what a GNU
     // asm constraint LETTER and a clobber NAME mean on this processor —
@@ -15399,6 +15403,11 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                     // per-enumerator range check below).
                                     TypeKind underlyingKind = TypeKind::I32;
                                     bool hasExplicitUnderlying = false;
+                                    // P68 round 12 (lane `cs`): the clause's type AS
+                                    // DECLARED — its vocabulary identity (`long`), not
+                                    // only its kind — which the enum record keeps:
+                                    // C 6.3.1.1p1 ranks the enum by it.
+                                    TypeId declaredUnderlying = InvalidType;
                                     if (decl.enumUnderlyingType.has_value()
                                         && specNode.valid()) {
                                         NodeId const clauseNode =
@@ -15425,6 +15434,7 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                                     if (isIntegerKind(k)) {
                                                         underlyingKind = k;
                                                         hasExplicitUnderlying = true;
+                                                        declaredUnderlying = uTy;
                                                     } else {
                                                         ParseDiagnostic d;
                                                         d.code = DiagnosticCode::
@@ -15448,7 +15458,30 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                         }
                                     }
                                     compositeTy = s.lattice.interner().enumType(
-                                        srec.name, underlyingKind);
+                                        srec.name, underlyingKind, declaredUnderlying);
+                                    // ★ P68 round 12 (lane `cs`): C23 6.7.3.4p6 — an
+                                    // enumeration with a FIXED underlying type is complete
+                                    // immediately after its enum type specifier, so its
+                                    // own tag names the complete type INSIDE its list
+                                    // (6.7.3.3's EXAMPLE 3 spells `m40 = sizeof(enum E4)`
+                                    // as valid). Publish the record before the enumerators
+                                    // are evaluated; the tail below re-publishes the same
+                                    // TypeId. ✔MEASURED 2026-09-24 (lane `cs`'s
+                                    // `.temp/probe/ect6`): gcc 13.3.0, clang 18.1.3 and
+                                    // mingw-w64 13.2.0 build `enum F : long long { A =
+                                    // sizeof(enum F) }` and select `enum F:` for `A` in
+                                    // `_Generic` inside the list; DSS refused the first
+                                    // (S_NonConstantEnumeratorValue) and selected
+                                    // `default` in the second
+                                    // ([[D-C-AN-ENUMERATION-WITH-A-FIXED-TYPE-IS-INCOMPLETE-INSIDE-ITS-OWN-LIST]]).
+                                    // An enumeration WITHOUT a fixed type stays
+                                    // incomplete until its closing brace (6.7.3.4p5).
+                                    if (hasExplicitUnderlying) {
+                                        srec.type = compositeTy;
+                                        s.nodeToType.set(resolved.node, compositeTy);
+                                        s.compositeScopeByType[compositeTy.v] =
+                                            srec.structScope;
+                                    }
                                     if (srec.structScope.valid()) {
                                         // Republish enumerators into the SAME
                                         // namespace scope the enum TAG floats to
@@ -15480,6 +15513,106 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             ordered.emplace_back(er.fieldIndex, eSymId);
                                         }
                                         std::sort(ordered.begin(), ordered.end());
+                                        // ── P68 round 12 (lane `cs`), the enumeration P1:
+                                        // THE TYPE OF EACH ENUMERATION CONSTANT (C17
+                                        // 6.4.4.3p2; C23 6.4.4.3p2, 6.7.3.3p12-p16). With a
+                                        // fixed underlying type every constant is the
+                                        // enumerated type, as before. Without one, and when
+                                        // the language declares the `enumerationConstant`
+                                        // role (C: `int`), a constant is typed DURING the
+                                        // list by 6.7.3.3p12 — the role's type when its value
+                                        // fits it, else its constant expression's type
+                                        // (explicit) or a type of the previous constant's
+                                        // signedness able to hold `previous + 1` (implicit,
+                                        // along `enumerationCompatibleTypes`) — and AFTER it by
+                                        // p15: the role's type when every value fits it, else
+                                        // the enumerated type, whose compatible type is the
+                                        // first rung of the ladder for the values' sign that
+                                        // holds them all (p13). ✔MEASURED 2026-09-24 (lane `cs`'s
+                                        // `.temp/probe/ect`, `ect2`, `ect5`, `ect6`): gcc 13.3.0
+                                        // and clang 18.1.3 (LP64) and mingw-w64 13.2.0 (LLP64)
+                                        // type every measured constant exactly so; MSVC 19.51
+                                        // types every constant `int` and truncates a wider
+                                        // value (C4309). DSS typed every constant as its
+                                        // enumeration and wrapped a wider value to 32 bits,
+                                        // silently
+                                        // ([[D-C-AN-ENUMERATION-CONSTANT-IS-TYPED-AS-ITS-ENUMERATION-NOT-INT]]).
+                                        // An UNDECLARED role keeps the old typing (the
+                                        // enumeration), for a language that ships no row.
+                                        TypeInterner& enumIn = s.lattice.interner();
+                                        bool const typedConstants =
+                                            !hasExplicitUnderlying
+                                            && cfg.enumerationConstantType.declared();
+                                        TypeId const constantTy = typedConstants
+                                            ? synthesizedType(enumIn,
+                                                              cfg.enumerationConstantType,
+                                                              s.dataModel, TypeKind::I32)
+                                            : InvalidType;
+                                        // The ladders the ACTIVE FORMAT's convention selects
+                                        // (nullptr: the language declares none, or the
+                                        // format names no convention — the latter is loud,
+                                        // right below).
+                                        EnumerationLadders const* const ladders =
+                                            typedConstants
+                                                ? cfg.enumerationCompatibleTypes.ladders(
+                                                      s.enumCompatibleTypeRule)
+                                                : nullptr;
+                                        if (typedConstants
+                                            && cfg.enumerationCompatibleTypes.declared()
+                                            && ladders == nullptr) {
+                                            // A format with no convention (wasm / spirv
+                                            // skeletons): no compatible type can be chosen
+                                            // for this enumeration — say so, never pick one.
+                                            ParseDiagnostic du;
+                                            du.code = DiagnosticCode::
+                                                S_EnumCompatibleTypeRuleUndeclared;
+                                            du.severity = DiagnosticSeverity::Error;
+                                            du.buffer = tree.source().id();
+                                            du.span = tree.span(specNode.valid()
+                                                                    ? specNode
+                                                                    : resolved.node);
+                                            du.actual = std::string{srec.name};
+                                            s.reporter.report(std::move(du));
+                                        }
+                                        auto const isUnsignedType = [&](TypeId t) {
+                                            if (!t.valid()) return false;
+                                            TypeId const u = enumUnderlyingOrSelf(
+                                                enumIn, enumIn.stripVolatile(t));
+                                            return detail::type_rules::unsignedIntRank(
+                                                       enumIn.kind(u)) != 0;
+                                        };
+                                        // The first rung of `ladder` whose range holds every
+                                        // value in `held` under the active data model, or
+                                        // InvalidType.
+                                        auto const firstRungHolding =
+                                            [&](std::vector<DataModelTypeRef> const& ladder,
+                                                std::span<EnumeratorValue const> held) {
+                                            for (DataModelTypeRef const& rung : ladder) {
+                                                TypeKind const k = rung.resolveCore(s.dataModel);
+                                                bool holdsAll = true;
+                                                for (EnumeratorValue const& v : held)
+                                                    holdsAll = holdsAll
+                                                        && enumeratorValueFitsKind(v, k);
+                                                if (holdsAll)
+                                                    return enumIn.primitive(
+                                                        k, rung.vocabularyName);
+                                            }
+                                            return InvalidType;
+                                        };
+                                        auto const reportOutOfRange = [&](SymbolRecord const& er) {
+                                            ParseDiagnostic d3;
+                                            d3.code = DiagnosticCode::S_EnumeratorValueOutOfRange;
+                                            d3.severity = DiagnosticSeverity::Error;
+                                            d3.buffer = tree.source().id();
+                                            d3.span = tree.span(er.declRuleNode);
+                                            d3.actual = er.name;
+                                            s.reporter.report(std::move(d3));
+                                        };
+                                        std::vector<EnumeratorValue> values;
+                                        values.reserve(ordered.size());
+                                        EnumeratorValue previous{};
+                                        TypeId previousTy = InvalidType;
+                                        bool anyValueUnrepresentable = false;
                                         std::int64_t nextValue = 0;
                                         for (auto const& [_idx, eSymId] : ordered) {
                                             SymbolRecord& erec =
@@ -15544,33 +15677,147 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                             }
                                             erec.enumValue = value;
                                             erec.isEnumerator = true;
+                                            // The value WITH its signedness: an explicit
+                                            // value is read by its constant expression's
+                                            // type, an implicit one is `previous + 1`
+                                            // computed mathematically (C23 6.7.3.3p10, p12).
+                                            TypeId exprTy = InvalidType;
+                                            EnumeratorValue ev{value, false};
+                                            bool reportedThis = false;
+                                            if (hadExplicit && !explicitFailed) {
+                                                // This is a Pass-1.5 `subtreeType` call, so the
+                                                // value's LITERAL leaves are pre-stamped first
+                                                // through the ONE shared walk the `auto` and
+                                                // `typeof` arms use: unstamped, `0x100000000`
+                                                // typed as nothing and the constant took a ladder
+                                                // rung (`unsigned long`) instead of its
+                                                // expression's `long`, and 0xFFFFFFFFFFFFFFFF
+                                                // lost its signedness and read as -1 (✔MEASURED
+                                                // on the P1's trial build, `.temp/probe/ectE`,
+                                                // where gcc 13.3.0 and clang 18.1.3 agree with C).
+                                                preStampLiteralLeaves(s, cfg, tree, *valueExpr);
+                                                exprTy = enumIn.stripVolatile(subtreeType(
+                                                    s, tree, *valueExpr, erec.scope));
+                                                ev.isUnsigned = isUnsignedType(exprTy)
+                                                             && value < 0;
+                                            } else if (!hadExplicit && !values.empty()) {
+                                                // `previous + 1` past every 64-bit value:
+                                                // no type can hold it (C23 6.7.3.3p4, p3).
+                                                if (auto const nx = enumeratorSuccessor(previous)) {
+                                                    ev = *nx;
+                                                } else {
+                                                    reportOutOfRange(erec);
+                                                    reportedThis = true;
+                                                    anyValueUnrepresentable = true;
+                                                }
+                                            }
+                                            values.push_back(ev);
                                             // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE):
                                             // with an EXPLICIT
                                             // underlying type every enumerator
                                             // must be representable in it — fail
                                             // loud (S_EnumeratorValueOutOfRange)
                                             // on overflow (`enum E : unsigned char
-                                            // { A = 256 }` / `{ A = -1 }`).
-                                            // Default-int enums have
-                                            // hasExplicitUnderlying == false, so
-                                            // this check NEVER fires for them (the
-                                            // C classic wrap-around behavior is
-                                            // unchanged).
-                                            if (hasExplicitUnderlying
-                                                && !enumeratorValueFitsUnderlying(
-                                                       value, underlyingKind)) {
-                                                ParseDiagnostic d3;
-                                                d3.code = DiagnosticCode::
-                                                    S_EnumeratorValueOutOfRange;
-                                                d3.severity =
-                                                    DiagnosticSeverity::Error;
-                                                d3.buffer = tree.source().id();
-                                                d3.span =
-                                                    tree.span(erec.declRuleNode);
-                                                d3.actual = erec.name;
-                                                s.reporter.report(std::move(d3));
+                                            // { A = 256 }` / `{ A = -1 }`). The value is
+                                            // read with its signedness (P68 round 12).
+                                            if (hasExplicitUnderlying && !reportedThis
+                                                && !enumeratorValueFitsKind(
+                                                       ev, underlyingKind)) {
+                                                // ★ P68 round 12 (lane `cs`): a NEGATIVE value for an
+                                                // UNSIGNED fixed type of width N that the SIGNED type
+                                                // of width N holds is CONVERTED modulo 2^N, as a
+                                                // conversion to the underlying type is, with the
+                                                // diagnostic C23 6.7.3.3p3 asks for as a suppressible
+                                                // warning. ✔MEASURED 2026-09-24 (lane `cs`'s
+                                                // `.temp/probe/ect7`, `ect7c`, `ect7d`): clang 18.1.3
+                                                // builds `enum E : unsigned long long { X = -1 }` (X ==
+                                                // ULLONG_MAX) and exactly this extent — -128 for
+                                                // `unsigned char`, INT64_MIN for `unsigned long long` —
+                                                // and refuses -200 for `unsigned char`; gcc 13.3.0
+                                                // refuses every negative one
+                                                // ([[D-C-A-NEGATIVE-VALUE-FOR-AN-UNSIGNED-FIXED-ENUMERATION-IS-REFUSED-WHERE-CLANG-CONVERTS-IT]]).
+                                                int const width = intKindBits(underlyingKind);
+                                                bool const convertible =
+                                                    detail::type_rules::unsignedIntRank(
+                                                        underlyingKind) != 0
+                                                    && ev.isNegative()
+                                                    && (width >= 64
+                                                        || ev.bits >= -(std::int64_t{1}
+                                                                        << (width - 1)));
+                                                if (convertible) {
+                                                    std::uint64_t const mask =
+                                                        width >= 64 ? ~std::uint64_t{0}
+                                                                    : (std::uint64_t{1} << width) - 1;
+                                                    ev = EnumeratorValue{
+                                                        static_cast<std::int64_t>(
+                                                            static_cast<std::uint64_t>(ev.bits) & mask),
+                                                        true};
+                                                    values.back() = ev;
+                                                    erec.enumValue = ev.bits;
+                                                    ParseDiagnostic dw;
+                                                    dw.code = DiagnosticCode::
+                                                        S_EnumeratorValueConvertedToUnderlyingType;
+                                                    dw.severity = DiagnosticSeverity::Warning;
+                                                    dw.buffer = tree.source().id();
+                                                    dw.span = tree.span(erec.declRuleNode);
+                                                    dw.actual = erec.name;
+                                                    s.reporter.report(std::move(dw));
+                                                } else {
+                                                    reportOutOfRange(erec);
+                                                    reportedThis = true;
+                                                }
                                             }
-                                            nextValue = value + 1;
+                                            // The constant's type DURING the list (C23
+                                            // 6.7.3.3p12), so a later enumerator's
+                                            // constant expression reads it.
+                                            if (typedConstants) {
+                                                TypeKind const ck = enumIn.kind(constantTy);
+                                                TypeId during = InvalidType;
+                                                if (enumeratorValueFitsKind(ev, ck)
+                                                    && (hadExplicit || values.size() == 1
+                                                        || previousTy.v == constantTy.v)) {
+                                                    during = constantTy;
+                                                } else if (hadExplicit && exprTy.valid()
+                                                           && enumeratorValueFitsKind(
+                                                                  ev, enumIn.kind(
+                                                                      enumUnderlyingOrSelf(
+                                                                          enumIn, exprTy)))) {
+                                                    during = exprTy;
+                                                } else if (!hadExplicit && previousTy.valid()
+                                                           && enumeratorValueFitsKind(
+                                                                  ev, enumIn.kind(
+                                                                      enumUnderlyingOrSelf(
+                                                                          enumIn, previousTy)))) {
+                                                    during = previousTy;
+                                                } else if (ladders != nullptr) {
+                                                    bool const wantUnsigned = hadExplicit
+                                                        ? !ev.isNegative()
+                                                        : isUnsignedType(previousTy);
+                                                    EnumeratorValue const one[1]{ev};
+                                                    during = firstRungHolding(
+                                                        wantUnsigned ? ladders->unsignedLadder
+                                                                     : ladders->signedLadder,
+                                                        one);
+                                                }
+                                                if (!during.valid()) {
+                                                    // No type holds this value: C23
+                                                    // 6.7.3.3p4 (a constraint), or a
+                                                    // language that declares no ladders.
+                                                    if (!reportedThis) reportOutOfRange(erec);
+                                                    reportedThis = true;
+                                                    anyValueUnrepresentable = true;
+                                                    during = constantTy;
+                                                }
+                                                erec.type = during;
+                                                previousTy = during;
+                                            }
+                                            previous = ev;
+                                            // The next implicit value's bit pattern (its
+                                            // signedness rides `previous`): unsigned
+                                            // arithmetic, so INT64_MAX + 1 is 2^63's
+                                            // pattern rather than undefined behaviour.
+                                            nextValue = static_cast<std::int64_t>(
+                                                static_cast<std::uint64_t>(ev.bits) + 1u);
                                             // D5.5-FU2: only also-bind to the
                                             // enclosing scope when the config
                                             // opts in (`liftToEnclosingScope:
@@ -15601,6 +15848,69 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                                                         s, tree, enclosingId, erec.name,
                                                         SymbolNamespace::Ordinary, eSymId);
                                                 }
+                                            }
+                                        }
+                                        // ── the enumeration P1, AFTER the list (C23
+                                        // 6.7.3.3p13, p15). The enumeration's COMPATIBLE
+                                        // type is the first rung of the language's ladder
+                                        // for the values' sign that holds them all, kept in
+                                        // its record (origin `Chosen`); with no ladder
+                                        // declared the record minted above stands. Each
+                                        // constant is the role's type when every value fits
+                                        // it, else the enumerated type.
+                                        if (typedConstants && !anyValueUnrepresentable) {
+                                            TypeKind const ck = enumIn.kind(constantTy);
+                                            bool allFit = true;
+                                            bool anyNegative = false;
+                                            for (EnumeratorValue const& v : values) {
+                                                allFit = allFit && enumeratorValueFitsKind(v, ck);
+                                                anyNegative = anyNegative || v.isNegative();
+                                            }
+                                            static std::vector<DataModelTypeRef> const kNoLadder{};
+                                            auto const& ladder = ladders == nullptr
+                                                ? kNoLadder
+                                                : (anyNegative ? ladders->signedLadder
+                                                               : ladders->unsignedLadder);
+                                            TypeId const chosen = ladder.empty()
+                                                ? InvalidType
+                                                : firstRungHolding(ladder, values);
+                                            if (chosen.valid()) {
+                                                compositeTy = enumIn.enumType(
+                                                    srec.name, enumIn.kind(chosen), chosen,
+                                                    TypeInterner::EnumUnderlyingOrigin::Chosen);
+                                            }
+                                            bool const holdsAll = allFit || chosen.valid();
+                                            if (!holdsAll) {
+                                                // No type holds every value: report the
+                                                // first enumerator the widest rung (or, with
+                                                // no ladder, the role's type) cannot hold
+                                                // (C23 6.7.3.3p4).
+                                                TypeKind const widest = ladder.empty()
+                                                    ? ck
+                                                    : ladder.back().resolveCore(s.dataModel);
+                                                for (std::size_t i = 0; i < ordered.size(); ++i) {
+                                                    if (enumeratorValueFitsKind(values[i], widest))
+                                                        continue;
+                                                    reportOutOfRange(
+                                                        s.symbols.at(ordered[i].second));
+                                                    break;
+                                                }
+                                            }
+                                            TypeId const memberTy =
+                                                allFit || !holdsAll ? constantTy : compositeTy;
+                                            for (auto const& [_i, eSym] : ordered)
+                                                s.symbols.at(eSym).type = memberTy;
+                                        } else if (!hasExplicitUnderlying && !typedConstants) {
+                                            // A language with no constant role keeps each
+                                            // constant typed as its enumeration — but a value
+                                            // that enumeration's kind cannot hold is refused,
+                                            // never wrapped into a wrong constant.
+                                            for (std::size_t i = 0; i < ordered.size(); ++i) {
+                                                if (enumeratorValueFitsKind(values[i],
+                                                                            underlyingKind))
+                                                    continue;
+                                                reportOutOfRange(s.symbols.at(ordered[i].second));
+                                                break;
                                             }
                                         }
                                     }
@@ -16665,21 +16975,6 @@ stampedOperandMayBePointer(EngineState const& s, Tree const& tree, NodeId n) {
     return std::nullopt;
 }
 
-// P48: a node's source text with surrounding whitespace removed. A `tree.text`
-// span runs to the next token, so `*p = 'x'` renders the LHS as "*p " — and a
-// diagnostic that quotes the user's own expression must quote it the way the
-// user wrote it. Shared by the three P48 diagnostics that embed operand text.
-[[nodiscard]] std::string trimmedNodeText(Tree const& tree, NodeId node) {
-    std::string_view t = tree.text(node);
-    auto const isSpace = [](char c) {
-        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
-            || c == '\v';
-    };
-    while (!t.empty() && isSpace(t.front())) t.remove_prefix(1);
-    while (!t.empty() && isSpace(t.back()))  t.remove_suffix(1);
-    return std::string{t};
-}
-
 // ── P68 round 9 (lane `cs`): THE ONE REPORT OF A CONVERSION THE LANGUAGE ADMITS
 //    WITH A DIAGNOSTIC (D-C-INCOMPATIBLE-POINTER-CONVERSION-REFUSED-WHERE-EVERY-REFERENCE-WARNS)
 //
@@ -16703,7 +16998,7 @@ reportDiagnosedConversion(EngineState& s, Tree const& tree, NodeId at,
     d.severity   = DiagnosticSeverity::Warning;
     d.buffer     = tree.source().id();
     d.span       = tree.span(at);
-    d.actual     = diagnosedConversionSentence(cls, site, trimmedNodeText(tree, at));
+    d.actual     = diagnosedConversionSentence(cls, site, tree.text(at));
     d.suggestion = "cast the operand explicitly if the conversion is intended";
     s.reporter.report(std::move(d));
     return true;
@@ -17137,10 +17432,10 @@ void reportWriteToConstLvalue(EngineState& s, SemanticConfig const& cfg,
     d.buffer   = tree.source().id();
     d.span     = tree.span(lvalueNode);
     d.actual   = increment
-        ? "increment or decrement of `" + trimmedNodeText(tree, lvalueNode)
+        ? "increment or decrement of `" + std::string{tree.text(lvalueNode)}
               + "`, which designates a const-qualified object — C 6.5.2.4p1 / "
                 "6.5.3.1p1 require a MODIFIABLE lvalue as the operand"
-        : "assignment to `" + trimmedNodeText(tree, lvalueNode)
+        : "assignment to `" + std::string{tree.text(lvalueNode)}
               + "`, which designates a const-qualified object — C 6.5.16.1 "
                 "requires a MODIFIABLE lvalue as the left operand";
     s.reporter.report(std::move(d));
@@ -18641,9 +18936,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     d.span     = tree.span(intN);
                     d.actual   = "the second and third operands of this "
                                  "conditional are a pointer (`"
-                               + trimmedNodeText(tree, ptrN)
+                               + std::string{tree.text(ptrN)}
                                + "`) and an integer (`"
-                               + trimmedNodeText(tree, intN)
+                               + std::string{tree.text(intN)}
                                + "`), which is none of the operand pairings C "
                                  "6.5.15p3 admits";
                     d.suggestion =
@@ -18841,12 +19136,12 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             d.buffer   = tree.source().id();
             d.span     = tree.span(at);
             if (unary) {
-                d.actual = "`" + trimmedNodeText(tree, at) + "`: the operand of unary `"
+                d.actual = "`" + std::string{tree.text(at)} + "`: the operand of unary `"
                     + std::string{opText} + "` is " + std::string{category(lt)}
                     + ", and C23 6.5.4.3 requires an arithmetic operand ("
                       "an integer one for `~`)";
             } else {
-                d.actual = "`" + trimmedNodeText(tree, at) + "`: the operands of `"
+                d.actual = "`" + std::string{tree.text(at)} + "`: the operands of `"
                     + std::string{opText} + "` are " + std::string{category(lt)}
                     + " and " + std::string{category(rt)}
                     + ", which is none of the pairings C23 6.5.6-6.5.13 admit (a "
@@ -22578,8 +22873,15 @@ selectGenericAssociation(EngineState const& s, SemanticConfig const& cfg,
         // `const int:` beside it); DSS used to strip the association's own
         // top-level volatile and select it. A type-level ALIGNMENT skin is no
         // qualifier (`qualifierBits` is its test).
+        // P68 round 12 (lane `cs`, the enumeration P1): "the same material type"
+        // is C's COMPATIBILITY (6.5.1.1p3), which also pairs an enumerated type
+        // with its compatible integer type (`sameOrEnumCompatible`) — ✔MEASURED
+        // (lane `cs`'s `.temp/probe/ect4`, `ect8`): gcc 13.3.0, clang 18.1.3 and
+        // mingw-w64 13.2.0 select `int:` for an `enum { A = -1, B = 1 }` object,
+        // `unsigned int:` for an `enum { A = 1 }` one and `long:` for an `enum F :
+        // long` one; DSS selected `default` for all three.
         bool matches = assocTy.valid() && ctrlConv.valid()
-            && sameType(in.stripVolatile(assocTy), ctrlConv)
+            && sameOrEnumCompatible(in, in.stripVolatile(assocTy), ctrlConv)
             && in.qualifierBits(assocTy) == 0
             && !typeNameOutermostLayerIsVolatileOrAtomic(mutS, cfg, tree, typeNode);
         if (matches) {
@@ -22859,7 +23161,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<std::string_view> activeTarget,
                                  LongDoubleFormat longDoubleFormat,
                                  TargetSchema const* target,
-                                 RuntimeLibraryRoleResolver const* roleResolver);
+                                 RuntimeLibraryRoleResolver const* roleResolver,
+                                 EnumCompatibleTypeRule enumCompatibleTypeRule);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DiagnosticBudget budget,
@@ -22871,7 +23174,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       LongDoubleFormat longDoubleFormat,
                       TargetSchema const* target,
                       std::size_t deepRecursionReserveBytes,
-                      RuntimeLibraryRoleResolver const* roleResolver) {
+                      RuntimeLibraryRoleResolver const* roleResolver,
+                      EnumCompatibleTypeRule enumCompatibleTypeRule) {
     // ── D-CONFIG-DESCRIPTOR-LIBRARY-LITERAL-DUPLICATES-THE-FORMAT-ROLE-TABLE ──
     // `activeFormat` and `roleResolver` are two statements about the SAME format,
     // and nothing but this check makes them agree. A caller passing one format's
@@ -22921,7 +23225,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
             return analyzeImpl(std::move(cu), budget, dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
                                std::move(activeTarget), longDoubleFormat, target,
-                               roleResolver);
+                               roleResolver, enumCompatibleTypeRule);
         });
 }
 
@@ -22934,7 +23238,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<std::string_view> activeTarget,
                                  LongDoubleFormat longDoubleFormat,
                                  TargetSchema const* target,
-                                 RuntimeLibraryRoleResolver const* roleResolver) {
+                                 RuntimeLibraryRoleResolver const* roleResolver,
+                                 EnumCompatibleTypeRule enumCompatibleTypeRule) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
@@ -22942,6 +23247,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     EngineState s{*cu, budget};
     s.dataModel = dataModel;
     s.longDoubleFormat = longDoubleFormat;
+    s.enumCompatibleTypeRule = enumCompatibleTypeRule;
     s.target = target;
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
@@ -23125,50 +23431,82 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             // codec as shipped-lib symbol signatures. Fail loud on a non-FnSig
             // or malformed text (parseTypeFromText already reported the detail).
             TypeId fnTy = InvalidType;
-            if (!bf.signatureText.empty()) {
-                // D-LANG-TYPE-IDENTITY-VOCABULARY: decode EVERY declared
-                // per-data-model override, not just the active one — a malformed
-                // override under an inactive model would otherwise lurk until
-                // that model is first compiled (the shipped-lib
-                // `signatureByDataModel` anti-lurking rule). The ACTIVE model's
-                // text, when declared, is the one that binds.
-                bool decodeFailed = false;
-                for (auto const& [dm, text] : bf.signatureTextByDataModel) {
+            if (!bf.signatureText.empty() || bf.signatureIsPerPair) {
+                // P68 round 12 (S2a-1 of D-C-STDLIB-H-LACKS-THIRTY-FIVE-ISO-NAMES):
+                // a per-pair `signature` is SELECTED here, with the pair this CU is
+                // compiled for, by the ONE `when` matcher the shipped-descriptor
+                // reader uses (core/types/variant_when.hpp). EAGER: every text the
+                // row declares — the flat one, or the per-pair form's `default` arm
+                // (held in `signatureText`) and each `when` arm — is decoded here,
+                // selected or not: an arm decoded only when chosen would lurk until
+                // its pair is first compiled. NO SILENT FALLBACK: exactly one `when`
+                // arm matches, or none and the `default` serves; otherwise the
+                // builtin is refused here, naming the pair.
+                WhenFacts facts;
+                if (s.target != nullptr) facts.arch = s.target->name();
+                facts.format        = objectFormatKindOf(s.activeFormat);
+                facts.dataModelName = dataModelName(s.dataModel);
+                if (s.longDoubleFormat != LongDoubleFormat::None)
+                    facts.longDoubleFormatName = longDoubleFormatName(s.longDoubleFormat);
+                auto const decodeFnSig = [&](std::string const& text) -> TypeId {
                     TypeId const t = parseTypeFromText(text, s.lattice.interner(),
-                                                       s.lattice.registry(),
-                                                       s.reporter);
-                    bool const bad =
-                        !t.valid()
-                        || s.lattice.interner().kind(t) != TypeKind::FnSig;
-                    if (bad) {
-                        ParseDiagnostic d;
-                        d.code     = DiagnosticCode::C_InvalidSemantics;
-                        d.severity = DiagnosticSeverity::Error;
-                        d.actual   = std::format(
-                            "builtin function '{}': 'signatureByDataModel.{}' must "
-                            "decode to a function type, got '{}'",
-                            bf.name, dataModelName(dm), text);
-                        s.reporter.report(std::move(d));
-                        decodeFailed = true;
-                        continue;
-                    }
-                    if (dm == s.dataModel) fnTy = t;
-                }
-                if (decodeFailed) continue;
-                if (!fnTy.valid()) {
-                    fnTy = parseTypeFromText(bf.signatureText, s.lattice.interner(),
-                                             s.lattice.registry(), s.reporter);
-                }
-                if (!fnTy.valid()
-                 || s.lattice.interner().kind(fnTy) != TypeKind::FnSig) {
+                                                       s.lattice.registry(), s.reporter);
+                    if (t.valid() && s.lattice.interner().kind(t) == TypeKind::FnSig)
+                        return t;
                     ParseDiagnostic d;
                     d.code     = DiagnosticCode::C_InvalidSemantics;
                     d.severity = DiagnosticSeverity::Error;
                     d.actual   = std::format(
                         "builtin function '{}': 'signature' must decode to a "
-                        "function type, got '{}'", bf.name, bf.signatureText);
+                        "function type, got '{}'", bf.name, text);
+                    s.reporter.report(std::move(d));
+                    return InvalidType;
+                };
+                bool decodeFailed = false;
+                TypeId textTy = InvalidType;   // the flat text, or the `default` arm
+                if (!bf.signatureText.empty()) {
+                    textTy = decodeFnSig(bf.signatureText);
+                    if (!textTy.valid()) decodeFailed = true;
+                }
+                int matches = 0;
+                for (auto const& arm : bf.signatureArms) {
+                    TypeId const t = decodeFnSig(arm.text);
+                    if (!t.valid()) {
+                        decodeFailed = true;
+                        continue;
+                    }
+                    if (whenMatches(arm.when, WhenAxes::FullTarget, facts)) {
+                        ++matches;
+                        fnTy = t;
+                    }
+                }
+                if (decodeFailed) continue;
+                if (matches > 1) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::C_InvalidSemantics;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "builtin function '{}': {} 'signature' variants match this "
+                        "pair — each pair must select at most one", bf.name, matches);
                     s.reporter.report(std::move(d));
                     continue;
+                }
+                if (matches == 0) {
+                    if (!textTy.valid()) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::C_InvalidSemantics;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.actual   = std::format(
+                            "builtin function '{}': no 'signature' variant matches this "
+                            "pair (arch '{}', data model '{}', long-double format '{}') "
+                            "and the row declares no 'default' arm — refusing to bind "
+                            "another pair's signature",
+                            bf.name, facts.arch.value_or("<none>"), facts.dataModelName,
+                            facts.longDoubleFormatName.value_or("<none>"));
+                        s.reporter.report(std::move(d));
+                        continue;
+                    }
+                    fnTy = textTy;
                 }
             } else {
                 std::vector<TypeId> paramTypes;
@@ -23791,7 +24129,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             }
         }
         ffi::ShippedPairFacts pairFacts{descriptorConsumer, s.dataModel,
-                                        s.charIsUnsigned, {}};
+                                        s.charIsUnsigned, {},
+                                        // P68 round 12 (S2a-1): the pair's long-double
+                                        // format, what a `longDoubleFormat` arm selects by.
+                                        s.longDoubleFormat};
         // …and the target's platform ABI typedefs for this format, which a
         // descriptor `typedefs` entry may name (`<stddef.h>`'s `wchar_t`: P68
         // round 9, D-C-WCHAR-T-IS-SIGNED-ON-ARM64-LINUX) — resolved through the
@@ -24862,6 +25203,18 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 }
             }
             if (sRec.type.v == aRec.type.v) continue;   // compatible — merged
+            // P68 round 12 (lane `cs`, the enumeration P1): an enumerated type and
+            // its compatible integer type are compatible (C 6.2.7p1, 6.7.2.2p4), the
+            // top-level qualifiers equal — `extern int v;` then `enum E { A = -1, B =
+            // 42 } v = B;` builds and runs under gcc 13.3.0, clang 18.1.3, mingw-w64
+            // 13.2.0 and MSVC 19.51 (lane `cs`'s `.temp/probe/ect8`); DSS refused it.
+            {
+                auto& in = s.lattice.interner();
+                if (in.qualifierBits(sRec.type) == in.qualifierBits(aRec.type)
+                    && sameOrEnumCompatible(in, in.stripVolatile(sRec.type),
+                                            in.stripVolatile(aRec.type)))
+                    continue;
+            }
             // C 6.2.7 (D-CSUBSET-EXTERN-MULTI-DECLARATOR): two array types with the
             // SAME element type are compatible when ONE side is INCOMPLETE — the
             // composite is the completed array. `extern char v[]; char v[3];` (either
@@ -25492,6 +25845,10 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.nodeToSymbol),
         std::move(s.nodeToType),
         std::move(s.nodeToSelectedExpr),
+        // P68 round 12 (lane `cs`): which typedef each type-position token names —
+        // the record the CST→HIR lowering reads to find the typedef that owns a
+        // variable-length type a type NAME reaches (`sizeof(V)`).
+        std::move(s.typedefNamedByToken),
         std::move(s.nodeToFoldedConstant),
         std::move(s.reporter),
         std::move(s.usesBySymbol),

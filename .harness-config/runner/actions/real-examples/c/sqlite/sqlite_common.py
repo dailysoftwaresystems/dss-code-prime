@@ -529,9 +529,18 @@ def cpu_count():
 
 class Config:
     """Every environment knob of both old drivers, read and VALIDATED once, before Step 1 does
-    anything (a malformed number died in shell arithmetic or an `[int]` cast hours in)."""
+    anything (a malformed number died in shell arithmetic or an `[int]` cast hours in).
+    ★ FOUR OF THEM ALSO TAKE A COMMAND-LINE VALUE (2026-09-25), what the sqlite action's steps pass:
+    --tier, --dss-config and --test-file (the build-and-test step's inputs) and --dss (every step's
+    `{product}`, the one file the leg's build is declared to make). `knobs` maps each attribute to the
+    value its flag gave (a flag not given is absent); a flag and its environment variable naming
+    DIFFERENT values is refused -- one value, named once -- and `by` records which channel set each,
+    for the lines that report it."""
 
-    def __init__(self):
+    KNOBS = (("tier", "--tier", "DSS_TIER"), ("dss_config", "--dss-config", "DSS_CONFIG"),
+             ("test_file", "--test-file", "DSS_TEST_FILE"), ("dss_bin", "--dss", "DSS_BIN"))
+
+    def __init__(self, knobs=None):
         self.src_dir = env("SRC_DIR")                      # "" = the tree this harness ships in
         self.dss_repo_url = env("DSS_REPO_URL",
                                 "git@github.com:dailysoftwaresystems/dss-code-prime.git")
@@ -569,11 +578,35 @@ class Config:
         self.fidelity_filter = split_list(env("DSS_RUN_FIDELITY"))
         self.skip_selftest = env("DSS_SKIP_SELFTEST") == "1"
         self.config_root = env("DSS_CONFIG_ROOT")
+        # The compiler Step 5 USES, REQUIRED (`sqlite_compiler.named_compiler`): --dss (every harness step's
+        # `{product}`) or DSS_BIN by hand. There is no knob to search for or build one instead -- the old
+        # SKIP_DSS_BUILD only chose between those two, and both are gone (2026-09-26).
         self.dss_bin = env("DSS_BIN")
-        self.skip_dss_build = env("SKIP_DSS_BUILD") == "1"
         self.tcl_dll = env("TCL_DLL")
         self.zlib_dll = env("ZLIB_DLL")
         self.host_libdir = env("DSS_HOST_LIBDIR")
+        # LAST, over every value read above: a flag's value replaces its variable's, and a variable naming
+        # a DIFFERENT value beside it is refused rather than silently lost.
+        self.by = dict((attr, var) for attr, _flag, var in self.KNOBS)
+        knobs = dict(knobs or {})
+        for attr, flag, var in self.KNOBS:
+            if attr not in knobs:
+                continue
+            given, named = knobs[attr], env(var).strip()
+            if named and named != given:
+                die("%s='%s' and %s='%s' name two different values: the command line is the channel a "
+                    "harness step uses -- unset %s." % (flag, given, var, named, var))
+            setattr(self, attr, given)
+            self.by[attr] = flag
+
+    def corpus_label(self):
+        """What the unit corpus of this run IS, named ONCE for every line that reports it: the one file a
+        single-file run (DSS_TEST_FILE) sources, or the file of the tier. A single-file run that named the
+        tier in its header, its per-leg step and its verdict read as a tier run that passed (found by lane
+        xa, 2026-09-24: `veryquick.test` in six lines while select1.test ran)."""
+        if self.test_file:
+            return "%s — ONE file, %s" % (os.path.basename(self.test_file), self.by["test_file"])
+        return "%s.test" % self.tier
 
 
 class Run:

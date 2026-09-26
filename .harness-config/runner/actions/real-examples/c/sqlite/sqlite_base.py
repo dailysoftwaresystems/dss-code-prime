@@ -23,13 +23,8 @@ Nothing here exits the process either: a refusal is an exception the caller rend
 vocabulary (`RecipeRefused`, exit 1 on the CLI; `HarnessUsageError`, exit 2), and a build's
 outcome is a `BuildResult` value.
 
-CLI -- the Windows host's WSL hop runs it as `python3 <posix path>/sqlite_base.py emit-recipe ...`:
-  python sqlite_base.py emit-recipe --build-dir D --make-target T --recipe-file F
-         --out-tus F --out-defines F --out-includes F [--make-var NAME=VALUE]...
-         [--search-root R]... [--prereq-mode whole-blob|link-line] [--always-make 0|1]
-         [--token-scope all|recipe] [--archive A] [--archive-from-span 0|1]
-         [--min-tus N] [--min-defines N]
-      exit 0 and the one-line summary on stdout; 1 refused; 2 usage.
+CLI -- a LIBRARY, whose one verb is its self-test. (Its `emit-recipe` verb, the bash twin's function
+transcribed, left on 2026-09-25: no program ran it -- every caller imports `emit_recipe`.)
   python sqlite_base.py --self-test          (alias --selftest)
       `passed=N failed=N skipped=N`; exit 0 only when failed=0.
 
@@ -127,9 +122,7 @@ LAUNCH_FAILED = 6          # 5 stays the driver's own "reported but not executab
 DASH = "—"
 CR = "\r"
 THIS = os.path.realpath(__file__)
-REQUIRED_FLAGS = (("build_dir", "--build-dir"), ("make_target", "--make-target"),
-                  ("recipe_file", "--recipe-file"), ("out_tus", "--out-tus"),
-                  ("out_defines", "--out-defines"), ("out_includes", "--out-includes"))
+REQUIRED_ARGS = ("build_dir", "make_target", "recipe_file", "out_tus", "out_defines", "out_includes")
 
 Result = C.Result          # (rc, out, err): what `generate_manifest` returns
 
@@ -608,19 +601,19 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
     (`NoLinkLine` included); malformed arguments raise `HarnessUsageError` before make runs."""
     given = dict(build_dir=build_dir, make_target=make_target, recipe_file=recipe_file,
                  out_tus=out_tus, out_defines=out_defines, out_includes=out_includes)
-    for key, flag in REQUIRED_FLAGS:
+    for key in REQUIRED_ARGS:
         if not given[key]:
-            _usage("emit_recipe: %s is required" % flag)
+            _usage("emit_recipe: %s is required" % key)
     if prereq_mode not in PREREQ_MODES:
-        _usage("emit_recipe: unknown --prereq-mode '%s' (want whole-blob|link-line)" % prereq_mode)
+        _usage("emit_recipe: unknown prereq_mode '%s' (want whole-blob|link-line)" % prereq_mode)
     if token_scope not in TOKEN_SCOPES:
-        _usage("emit_recipe: unknown --token-scope '%s' (want all|recipe)" % token_scope)
-    always_make = _switch("--always-make", always_make)
-    archive_from_span = _switch("--archive-from-span", archive_from_span)
-    min_tus = _floor("--min-tus", min_tus)
-    min_defines = _floor("--min-defines", min_defines)
-    make_vars = _argv_list("--make-var", make_vars)
-    search_roots = _argv_list("--search-root", search_roots)
+        _usage("emit_recipe: unknown token_scope '%s' (want all|recipe)" % token_scope)
+    always_make = _switch("always_make", always_make)
+    archive_from_span = _switch("archive_from_span", archive_from_span)
+    min_tus = _floor("min_tus", min_tus)
+    min_defines = _floor("min_defines", min_defines)
+    make_vars = _argv_list("make_vars", make_vars)
+    search_roots = _argv_list("search_roots", search_roots)
     make_argv = _argv_list("make_argv", make_argv, allow_empty=False)
     target = make_target
 
@@ -653,15 +646,15 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
     except NoLinkLine as exc:
         hint = ("" if always_make else
                 "\n%smake -n prints only what REMAINS to be done: a target that is already "
-                "built prints no link line unless --always-make 1 is given." % PREFIX)
+                "built prints no link line unless always_make is set." % PREFIX)
         raise NoLinkLine("%s See %s%s" % (exc, recipe_file, hint)) from None
 
     # ── 3. where the -D / -I tokens come from ──
     tokens = lines if token_scope == "all" else recipe_token_span(lines, target)
     defines = recipe_defines(tokens)
     includes = recipe_includes(tokens)
-    _write_out(out_defines, defines, "--out-defines")
-    _write_out(out_includes, includes, "--out-includes")
+    _write_out(out_defines, defines, "out_defines")
+    _write_out(out_includes, includes, "out_includes")
 
     # ── 4. a NAMED archive that is not there is a named failure, never a quiet zero ──
     if archive and not os.path.isfile(archive):
@@ -694,7 +687,7 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
             ledger.write(drops_path)
         except OSError as exc:
             _refuse("cannot write the drop ledger '%s': %s" % (drops_path, exc))
-    _write_out(out_tus, tus, "--out-tus")
+    _write_out(out_tus, tus, "out_tus")
 
     # ── 7. THE BUILD-HOST TOOL GUARD -- a NAMED cause, ahead of the floors ──
     host_tools = [tu for tu in tus if _is_build_host_tool(tu, build_dir)]
@@ -713,7 +706,7 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
                 "is not",
                 "current puts those compile lines INTO the recipe %s the build directory is an "
                 "input." % DASH,
-                "REMEDY: derive with '--prereq-mode link-line --always-make 1' (deterministic, "
+                "REMEDY: derive with prereq_mode='link-line' and always_make set (deterministic, "
                 "and the",
                 "bootstrap is excluded structurally), or bring '%s' fully up to date before "
                 "deriving." % build_dir)
@@ -722,7 +715,7 @@ def emit_recipe(*, build_dir=None, make_target=None, recipe_file=None, out_tus=N
     n_lost = ledger.count("archive-member")
     if n_lost:
         _refuse("recipe derivation for '%s' LOST %d archive member(s): the object is in '%s' but "
-                "no matching .c exists under any --search-root." % (target, n_lost, archive),
+                "no matching .c exists under any of search_roots." % (target, n_lost, archive),
                 "Each one is a translation unit that would silently NOT be compiled, producing a "
                 "smaller program that fails much later at link. See %s" % drops_path)
 
@@ -1004,56 +997,19 @@ class VerdictLedger:
 # ── CLI ──────────────────────────────────────────────────────────────────────────────
 
 USAGE = """usage:
-  python sqlite_base.py emit-recipe --build-dir D --make-target T --recipe-file F
-         --out-tus F --out-defines F --out-includes F [--make-var NAME=VALUE]...
-         [--search-root R]... [--prereq-mode whole-blob|link-line] [--always-make 0|1]
-         [--token-scope all|recipe] [--archive A] [--archive-from-span 0|1]
-         [--min-tus N] [--min-defines N]
   python sqlite_base.py --self-test          (alias --selftest)
-exit: 0 derived (the one-line summary on stdout) · 1 refused · 2 usage"""
-
-_EMIT_FLAGS = {
-    "--build-dir": "build_dir", "--make-target": "make_target", "--recipe-file": "recipe_file",
-    "--make-var": "make_vars", "--prereq-mode": "prereq_mode", "--always-make": "always_make",
-    "--token-scope": "token_scope", "--archive": "archive",
-    "--archive-from-span": "archive_from_span", "--search-root": "search_roots",
-    "--min-tus": "min_tus", "--min-defines": "min_defines", "--out-tus": "out_tus",
-    "--out-defines": "out_defines", "--out-includes": "out_includes",
-}
-_REPEATABLE = ("make_vars", "search_roots")
-
-
-def parse_emit_recipe_args(args):
-    """The `emit-recipe` flags, spelled as the bash function took them (`--flag value`), into
-    `emit_recipe` keyword arguments. Values are validated by `emit_recipe` itself."""
-    kw = {"make_vars": [], "search_roots": []}
-    i = 0
-    while i < len(args):
-        flag = args[i]
-        if flag not in _EMIT_FLAGS:
-            _usage("emit_recipe: unknown argument '%s'" % flag)
-        if i + 1 >= len(args):
-            _usage("emit_recipe: %s needs a value" % flag)
-        key, value = _EMIT_FLAGS[flag], args[i + 1]
-        if key in _REPEATABLE:
-            kw[key].append(value)
-        else:
-            kw[key] = value
-        i += 2
-    return kw
+exit: 0 every arm passed · 1 an arm failed · 2 usage"""
 
 
 def cli_action(args):
-    """-> ("self-test",) | ("help",) | ("emit-recipe", args) | ("usage", message)."""
+    """-> ("self-test",) | ("help",) | ("usage", message)."""
     if args and args[0] in ("--self-test", "--selftest"):
         return ("self-test",) if len(args) == 1 else (
             "usage", "%s%s takes no further arguments" % (PREFIX, args[0]))
     if args and args[0] in ("-h", "--help"):
         return ("help",)
-    if args and args[0] == "emit-recipe":
-        return ("emit-recipe", args[1:])
-    return ("usage", "sqlite_base.py is a LIBRARY with one CLI verb (emit-recipe) and a "
-                     "self-test.")
+    return ("usage", "sqlite_base.py is a LIBRARY: its one CLI verb is --self-test (every caller "
+                     "imports emit_recipe).")
 
 
 def main(argv=None):
@@ -1063,20 +1019,9 @@ def main(argv=None):
     if act[0] == "help":
         print(USAGE)
         return 0
-    if act[0] == "usage":
-        print(act[1], file=sys.stderr)
-        print(USAGE, file=sys.stderr)
-        return 2
-    try:
-        result = emit_recipe(**parse_emit_recipe_args(act[1]))
-    except HarnessUsageError as exc:
-        print(exc, file=sys.stderr)
-        return 2
-    except RecipeRefused as exc:
-        print(exc, file=sys.stderr)
-        return 1
-    print(result.summary)
-    return 0
+    print(act[1], file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    return 2
 
 
 # ── SELF-TEST -- red-on-disable, by construction ─────────────────────────────────────
@@ -1088,7 +1033,7 @@ def main(argv=None):
 # generator is a Python script run by this interpreter; the REAL `make` and `ar` run where they
 # exist (a named SKIP, counted, where they do not).
 
-EXPECTED_ARMS = 141        # 41 sh + 23 ps + 77 new
+EXPECTED_ARMS = 138        # 41 sh + 23 ps + 74 new
 
 _SKIP = object()
 
@@ -1732,17 +1677,17 @@ def _st_floors(A, fx):
         full = dict(build_dir=t, make_target="prog", recipe_file="r", out_tus="a",
                     out_defines="b", out_includes="c")
         msgs = []
-        for key, _flag in REQUIRED_FLAGS:
+        for key in REQUIRED_ARGS:
             kw = dict(full)
             kw[key] = None
             msgs.append(str(_raised(lambda: emit_recipe(**kw), HarnessUsageError)))
-        want = ["%s is required" % flag for _key, flag in REQUIRED_FLAGS]
+        want = ["%s is required" % key for key in REQUIRED_ARGS]
         stale = ("--bld ", "--target ", "--recipe ", "--out-defs ", "--out-incs ")
         old_spelling = "base-harness: dss_bh_emit_recipe: --bld is required"
         return (all(w in m for w, m in zip(want, msgs))
                 and not any(s in m for s in stale for m in msgs)
                 and any(s in old_spelling for s in stale), "\n".join(msgs))
-    A.arm("n20 every 'is required' message names the REAL flag (5 of the bash twin's 6 did not) "
+    A.arm("n20 every 'is required' message names the REAL parameter (5 of the bash twin's 6 did not) "
           "(control: the stale-name needles do match the old spelling)", real_names)
 
     def floors_usage():
@@ -1771,12 +1716,12 @@ def _st_floors(A, fx):
                                      prereq_mode="bogus"), HarnessUsageError)
         refused_early = e1 is not None and not os.path.exists(recipe)
         fx.emit(t, "cc -o prog one.c\n", recipe_file=recipe)
-        return (refused_early and "unknown --prereq-mode 'bogus'" in str(e1)
+        return (refused_early and "unknown prereq_mode 'bogus'" in str(e1)
                 and os.path.exists(recipe), "raised %r" % e1)
-    A.arm("n23 an unknown --prereq-mode is refused BEFORE make runs (no recipe file written; "
+    A.arm("n23 an unknown prereq_mode is refused BEFORE make runs (no recipe file written; "
           "control: a valid call writes it)", before_make)
-    A.arm("n24 an unknown --token-scope is a USAGE error",
-          lambda: "unknown --token-scope 'nope'" in str(_raised(
+    A.arm("n24 an unknown token_scope is a USAGE error",
+          lambda: "unknown token_scope 'nope'" in str(_raised(
               lambda: fx.emit(t, "cc -o prog one.c\n", token_scope="nope"), HarnessUsageError)))
 
 
@@ -1851,7 +1796,7 @@ def _st_drops(A, fx):
                         "RecipeRefused naming 'LOST 1 archive member(s)'", got,
                         lambda: _archive_facts(libx))
     A.arm("sh40 emit_recipe FAILS on a LOST archive member", lost_refused)
-    A.arm("sh41 emit_recipe FAILS on an --archive that does not exist",
+    A.arm("sh41 emit_recipe FAILS on an archive that does not exist",
           lambda: "which does NOT exist" in str(_raised(
               lambda: fx.emit(t, "cc -o prog real.c\n", archive=os.path.join(t, "no-such.a"),
                               search_roots=[t]), RecipeRefused)))
@@ -2064,7 +2009,7 @@ def _st_archive(A, fx):
         want = sorted([os.path.join(bld, "shell.c"), os.path.join(root, "src", "a.c"),
                        os.path.join(root, "src", "c.c")])
         return _eq(want, res.tus)
-    A.arm("n37 emit_recipe --archive-from-span 1 recovers exactly the link line's objects",
+    A.arm("n37 emit_recipe archive_from_span recovers exactly the link line's objects",
           through_emit)
 
 
@@ -2116,7 +2061,7 @@ def _st_make(A, fx):
                 argvs.append(json.load(fh)["argv"])
         return _eq([["-n", "-o", "Makefile", "prog"], ["-n", "-B", "-o", "Makefile", "prog"]],
                    argvs)
-    A.arm("n39 without --always-make there is NO -B (control: with it, there is)", no_b)
+    A.arm("n39 without always_make there is NO -B (control: with it, there is)", no_b)
 
     def never_remakes():
         argvs = []
@@ -2156,9 +2101,9 @@ def _st_make(A, fx):
 
     def no_link_hint():
         exc = _raised(lambda: fx.emit(t, "cc -o other one.c\n"), NoLinkLine)
-        return (exc is not None and "recipe.txt" in str(exc) and "--always-make 1" in str(exc),
+        return (exc is not None and "recipe.txt" in str(exc) and "unless always_make is set" in str(exc),
                 "raised %r" % exc)
-    A.arm("n44 emit_recipe's NoLinkLine names the recipe file and the --always-make remedy",
+    A.arm("n44 emit_recipe's NoLinkLine names the recipe file and the always_make remedy",
           no_link_hint)
 
     def unresolved_note():
@@ -2189,59 +2134,22 @@ def _st_make(A, fx):
 
 
 def _st_cli(A, fx):
-    def real_cli():
-        if not fx.host_make:
-            return _SKIP, "no make on this PATH"
-        bld = fx.fresh("cli-make")
-        out = fx.fresh("cli-out")
-        _put(os.path.join(bld, "one.c"), "")
-        _put(os.path.join(bld, "Makefile"), "prog: one.c\n\tcc -DCLI -o prog one.c\n")
-        p = fx.cli(["emit-recipe", "--build-dir", bld, "--make-target", "prog",
-                    "--recipe-file", os.path.join(out, "r.txt"), "--prereq-mode", "link-line",
-                    "--always-make", "1", "--min-tus", "1", "--min-defines", "1",
-                    "--out-tus", os.path.join(out, "t"), "--out-defines", os.path.join(out, "d"),
-                    "--out-includes", os.path.join(out, "i")])
-        want = "prog: 1 TUs, 1 defines, 0 -I dirs (mode link-line)"
-        return (p.returncode == 0 and p.stdout.decode("utf-8").strip() == want,
-                "rc %d, stdout %r, stderr %r" % (p.returncode, p.stdout, p.stderr[-300:]))
-    A.arm("n48 CLI emit-recipe: exit 0 and the one-line summary on stdout (the real make)",
-          real_cli)
-
-    def cli_refused():
-        out = fx.fresh("cli-refused")
-        p = fx.cli(["emit-recipe", "--build-dir", os.path.join(out, "nope"), "--make-target",
-                    "prog", "--recipe-file", os.path.join(out, "r.txt"),
-                    "--out-tus", os.path.join(out, "t"), "--out-defines", os.path.join(out, "d"),
-                    "--out-includes", os.path.join(out, "i")])
-        err = p.stderr.decode("utf-8")
-        return (p.returncode == 1 and err.startswith(PREFIX) and "is not a directory" in err,
-                "rc %d, stderr %r" % (p.returncode, err))
-    A.arm("n49 CLI emit-recipe: a refusal is exit 1 with the base-harness: message on stderr",
-          cli_refused)
-
+    # ★ THE LIBRARY'S ONE VERB IS ITS SELF-TEST (2026-09-25): the `emit-recipe` verb left -- no program ran it,
+    # every caller imports `emit_recipe` -- and with it its three arms (n48 the real make through the CLI, n49 a
+    # refusal's exit code, n52 its repeatable flags). The library's own arms cover the derivation (n47 the real
+    # make, sh30-sh41 the refusals). What stays is the CLI's contract.
     def cli_usage():
-        p1 = fx.cli(["emit-recipe", "--bld", "x"])
-        p2 = fx.cli(["emit-recipe", "--build-dir"])
-        p3 = fx.cli(["emit-recipe", "--build-dir", "x"])
-        p4 = fx.cli([])
-        e1, e2, e3 = (p.stderr.decode("utf-8") for p in (p1, p2, p3))
-        return ([p.returncode for p in (p1, p2, p3, p4)] == [2, 2, 2, 2]
-                and "unknown argument '--bld'" in e1 and "--build-dir needs a value" in e2
-                and "--make-target is required" in e3,
-                "rcs %r\n%s\n%s\n%s" % ([p.returncode for p in (p1, p2, p3, p4)], e1, e2, e3))
-    A.arm("n50 CLI usage errors are exit 2: unknown argument, missing value, missing required, "
-          "no verb", cli_usage)
+        gone = fx.cli(["emit-recipe", "--build-dir", "x"])
+        none = fx.cli([])
+        err = gone.stderr.decode("utf-8")
+        return ([p.returncode for p in (gone, none)] == [2, 2] and "its one CLI verb is --self-test" in err,
+                "rcs %r\n%s" % ([p.returncode for p in (gone, none)], err))
+    A.arm("n50 CLI usage errors are exit 2: no verb, and the retired emit-recipe verb names the library's one "
+          "verb", cli_usage)
     A.arm("n51 CLI --selftest is an alias of --self-test, and extra arguments are usage",
           lambda: (cli_action(["--selftest"]) == ("self-test",)
                    and cli_action(["--self-test"]) == ("self-test",)
                    and cli_action(["--self-test", "x"])[0] == "usage"))
-
-    def cli_parse():
-        kw = parse_emit_recipe_args(["--make-var", "A=1", "--search-root", "r1", "--make-var",
-                                     "B=2", "--search-root", "r2", "--min-tus", "7"])
-        return _eq({"make_vars": ["A=1", "B=2"], "search_roots": ["r1", "r2"], "min_tus": "7"},
-                   kw)
-    A.arm("n52 CLI --make-var and --search-root repeat, in order", cli_parse)
 
 
 def _st_build(A, fx):

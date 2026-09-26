@@ -136,7 +136,11 @@ class TypeRegistry;
 // next statement's `@loc` took that statement for the return's VALUE — ✔MEASURED
 // on sqlite's `test/speedtest1.c`, whose `if (c) return;` then-arms made
 // `--emit-hir` refuse its own artifact (P68 round 8, lane `ht`).
-inline constexpr std::uint32_t kHirTextFormatVersion = 5;
+// v6 spelled an enumeration's FIXED underlying type, `enum "E" fixed i64 "long"`
+// (P68 round 12, lane `cs`): `enum E : long` and `enum E` are different types
+// (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. A v5 reader meeting the
+// v6 spelling reads `enum "E"` and then meets `fixed` with no rule for it.
+inline constexpr std::uint32_t kHirTextFormatVersion = 6;
 
 // ── kHirTextMaxNodeDepth — THE FORMAT'S DECLARED NESTING LIMIT ────────────────
 //

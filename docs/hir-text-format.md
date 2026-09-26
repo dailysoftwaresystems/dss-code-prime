@@ -150,7 +150,7 @@ int sum_fields(struct Point *p) {
 ```
 
 ```
-dsshir 5
+dsshir 6
 producer "0.5.0+nogit20260919T193847Z.5"
 buffers {
   buf 1 "/tmp/ht-doc/doc_example.c"
@@ -231,7 +231,7 @@ reader refuses a STATEMENT in any expression slot (an operand, a condition, a va
 by name, rather than building one there.
 
 ```
-      @loc(buf 3, 646..663)
+      @loc(buf 3, 646..660)
       if (@loc(buf 3, 650..651) binop Ne : bool (@loc(buf 3, 650..651) ref %3 : i32, lit [syn] int 0 : i32))
         @loc(buf 3, 653..660)
         return void
@@ -244,7 +244,7 @@ Sections are emitted **only when non-empty**, in the order shown. The two header
 
 ### 4.1 `dsshir <version>` — the format version
 
-The first line. **Currently `5`.** A reader that does not understand the version must **refuse**,
+The first line. **Currently `6`.** A reader that does not understand the version must **refuse**,
 not guess. Our own parser does exactly that: a version it does not know is a hard
 `H_TextVersionMismatch` error and no module is produced.
 
@@ -412,7 +412,7 @@ different place than you might look for it:
 
 | | |
 |---|---|
-| **enumerator names and values** | `enum "Color"` carries the enum's name, and its underlying width when that diverges from the default (`enum "E" : u8`). It does **not** carry `Red = 0, Green = 1`: enumerators are folded to literals at every use, so the *values* are in the body while the *names* are not. |
+| **enumerator names and values** | `enum "Color"` carries the enum's name, and its underlying width when that diverges from the default (`enum "E" : u8`); an enumeration with a FIXED underlying type (C23 `enum E : long`) carries that type as the type it is, vocabulary tag included (`enum "E" fixed i64 "long"`), because it is part of the enumeration's identity (v6); an enumeration WITHOUT one carries the compatible type its language chose the same way (`enum "E" chosen u32 "unsigned int"`, v6). It does **not** carry `Red = 0, Green = 1`: enumerators are folded to literals at every use, so the *values* are in the body while the *names* are not. |
 | **`const` and `restrict`** | Not interned — they never affect layout or codegen, so they are not part of type identity and cannot ride a type. (`volatile` and `_Atomic` *are* carried.) |
 | **`__attribute__((aligned(N)))` on a *typedef*** | Carried, as **`aligned<T, N>`** at the use — the `arr<T, N>` shape: the decorated type first, the byte count second. ⚠ Do not confuse it with the WHOLE-COMPOSITE `aligned N` of a `types` entry (§5.2): that one is part of the composite's definition, this one is a *decoration* on whatever type the alias names. Written by cycle P66 (lane `al`), when an over-aligned type alias became representable at all. It rides the same transparent skin as `volatile`/`_Atomic` (one record, distinct interned identity, `kind()`/`operands()`/`scalars()` see through it), so a type carrying both spells as `aligned<volatile<i32>, 8>` and the reader merges them back into **one** record — the round trip is an identity, not a nesting that grows per hop. It is a **decoration, not a derivation level**: it does not touch the declarator spine the way `ptr<…>` and `arr<…>` do. `sizeof` is unaffected (`aligned<i32, 8>` is still 4 bytes wide, aligned 8) — which is why both gcc and clang refuse an *array* of such an alias, and so does DSS. ⚠ **P66 (lane `ag`): `N` may be WEAKER than the decorated type's natural alignment** — `aligned<i32, 2>` is a real, round-trippable type whose layout alignment is 2, because gcc, clang, mingw-w64 gcc and aarch64-gcc all lower a typedef's alignment (measured; the whole-composite channel does *not*). So the byte count is the *answer*, not a floor, and a reader must not "correct" it upward. |
 | **aliasing information** | HIR has none. |
@@ -552,7 +552,7 @@ program. Output:
 
 ```
 dsshir-kinds 1
-dsshir-format-version 5
+dsshir-format-version 6
 producer "0.5.0+nogit20260919T193847Z.5"
 core-kind-count 54
 kind "Module" position non-expr typed no symbol no
@@ -618,7 +618,12 @@ window.** Concretely:
    N`, `pack N`, `bits N`, and `~N` on a union member — §5.2); and spelled a value-less return
    `return void` (§4). A v4 reader meets `types`, `type`, `aligned`, `pack`, `bits` and `void` with no
    rule for any of them — and the last one matters most: a v4 reader that skipped `void` would be back
-   to reading the next statement as the return's value.
+   to reading the next statement as the return's value. **v6** spelled an enumeration's FIXED
+   underlying type, `enum "E" fixed i64 "long"` (§5): `enum E : long` and `enum E` are different
+   types (C23 6.2.7p1), and v5 wrote both as `enum "E" : i64`. The same version spelled the compatible
+   type a language CHOSE for an enumeration without a fixed one, `enum "E" chosen u32 "unsigned int"`
+   (C23 6.7.3.3p13). A v5 reader meeting either spelling reads `enum "E"` and then meets `fixed` or
+   `chosen` with no rule for it.
 3. **We do not maintain a compatibility window.** This build understands **one** version and refuses
    every other, in both directions — a v1 file is refused by a v2 parser just as a v3 file is. One
    grammar, no conditional parsing, no "mostly works".
@@ -627,7 +632,7 @@ window.** Concretely:
    and plan to re-emit rather than to migrate files.
 5. **After C++ lands the format is expected to stabilise** and bumps to become rare.
 
-**What is stable today** (as stable as anything in a `5`): the mode and its exit-code contract, the
+**What is stable today** (as stable as anything in a `6`): the mode and its exit-code contract, the
 two header lines and their order, the section order, the type syntax (shared with FFI descriptors,
 see [`ir-type-text.md`](./ir-type-text.md) — a module differs only in naming every composite through
 its `types` table), and the self-containment rules in §5.

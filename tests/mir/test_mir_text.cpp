@@ -60,7 +60,7 @@ TEST(MirText, EmptyModuleRoundTrips) {
     DiagnosticReporter r;
     MirTextContext ctx{&ti};
     std::string out = emitMir(m, ctx, r);
-    EXPECT_NE(out.find("dssir 2"), std::string::npos);
+    EXPECT_NE(out.find("dssir 3"), std::string::npos);
     EXPECT_NE(out.find("module {"), std::string::npos);
 }
 
@@ -289,7 +289,7 @@ TEST(MirText, MalformedHeaderEmitsMalformedDiagnostic) {
 
 TEST(MirText, EmptyModuleParseRoundTripsToEmpty) {
     DiagnosticReporter r;
-    auto res = parseMir("dssir 2\nmodule { }\n", CompilationUnitId{1}, r);
+    auto res = parseMir("dssir 3\nmodule { }\n", CompilationUnitId{1}, r);
     EXPECT_TRUE(res->ok);
     EXPECT_EQ(res->mir.moduleFuncCount(), 0u);
 }
@@ -452,7 +452,7 @@ TEST(MirText, AVoidParameterIsSpelledAndReadDistinctFromNoParameter) {
 // diagnostics from the rest of the input).
 TEST(MirText, MissingFunctionLBraceDoesNotCascade) {
     std::string text =
-        "dssir 2\n"
+        "dssir 3\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32\n"   // <-- missing `{`
@@ -480,7 +480,7 @@ TEST(MirText, MalformedNumericLiteralEmitsDiagnostic) {
     // Integer-but-out-of-range case (e.g. 9999999999999999999 as int32),
     // parseNumber emits the malformed diagnostic. Use that case:
     std::string text =
-        "dssir 2\n"
+        "dssir 3\n"
         "symbols { %1 \"f\" }\n"
         "module {\n"
         "  function %1 : fn() -> i32 {\n"
@@ -938,7 +938,7 @@ TEST(MirText, NoSanitizeThreadAttributeSurvivesRoundTrip) {
 // permissive direction is closed by construction.
 TEST(MirText, UnknownFunctionAttributeIsMalformed) {
     char const* text =
-        "dssir 2\n"
+        "dssir 3\n"
         "module {\n"
         "  function %1 : fn() -> void [frobnicate] {\n"
         "    block %b0 [entry] {\n"
@@ -1170,17 +1170,17 @@ TEST(MirText, StaticInitScheduleSurvivesRoundTripWithItsPriority) {
 TEST(MirTextParse, TruncatedOperandListIsRefusedRatherThanLoopingForever) {
     struct Case { char const* name; char const* text; };
     Case const cases[] = {
-        {"tuple",  "dssir 2\nmodule {\n  global %1 : tuple<i32"},
+        {"tuple",  "dssir 3\nmodule {\n  global %1 : tuple<i32"},
         // v1's inline composite, refused at its head since v2 and still consumed.
-        {"struct", "dssir 2\nmodule {\n  global %1 : struct \"S\" { i32"},
-        {"union",  "dssir 2\nmodule {\n  global %1 : union \"U\" { i32"},
+        {"struct", "dssir 3\nmodule {\n  global %1 : struct \"S\" { i32"},
+        {"union",  "dssir 3\nmodule {\n  global %1 : union \"U\" { i32"},
         // v2's `types` table: a truncated entry, and a truncated section.
-        {"types-struct",  "dssir 2\ntypes {\n  type 1 = struct \"S\" { i32"},
-        {"types-union",   "dssir 2\ntypes {\n  type 1 = union \"U\" { i32, "},
-        {"types-section", "dssir 2\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
-        {"types-head",    "dssir 2\ntypes {\n  type 1 = struct"},
-        {"fn",     "dssir 2\nmodule {\n  function %2 : fn(i32"},
-        {"agg",    "dssir 2\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
+        {"types-struct",  "dssir 3\ntypes {\n  type 1 = struct \"S\" { i32"},
+        {"types-union",   "dssir 3\ntypes {\n  type 1 = union \"U\" { i32, "},
+        {"types-section", "dssir 3\ntypes {\n  type 1 = struct \"S\" {i32}\n"},
+        {"types-head",    "dssir 3\ntypes {\n  type 1 = struct"},
+        {"fn",     "dssir 3\nmodule {\n  function %2 : fn(i32"},
+        {"agg",    "dssir 3\nmodule {\n  global %1 : i64 = lit agg { lit int 1 : i64"},
     };
     for (Case const& c : cases) {
         DiagnosticReporter r;

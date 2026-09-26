@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# PURPOSE: refuse a documented figure that a census refutes, in prose or in a source comment, and repair it in place.
+# PURPOSE: refuse a documented figure a census refutes, or an unpinned quantified claim about the corpus in config prose, and repair figures in place.
 """check-doc-census.py -- THE DOCUMENTED-FIGURE GUARD.
 
 ★★★ WHY THIS EXISTS, and it is this repository's own measured failure rather
@@ -107,6 +107,35 @@ and arm 12 asserts one in the live tree beside it is still CAUGHT, so the
 exclusion is pinned in BOTH directions -- see
 `[[feedback-an-escape-every-row-triggers-disarms-the-guard]]`.
 
+★★★ THE SECOND CLAUSE: A QUANTIFIED CLAIM ABOUT THE CORPUS, IN CONFIG PROSE. A figure
+is one way a document states a measurement; a QUANTIFIER is the other -- "sqlite uses
+ONLY X", "the corpus NEVER spells Y", "shell.c references NOTHING from Z". Each is a
+count of zero or one with the number left out, so it rots exactly like a figure when
+the corpus moves -- and worse, because a config document writes it as the REASON for
+what a descriptor ships: a stale one does not merely misinform, it closes the audit
+that would have found the gap. The row's instance (e): `shippedLibs/sys/ioctl.json`
+said SQLite did not use that header's request macros, so none shipped, while
+os_unix.c used `_IOWR` -- and the macho build carried the miss as a parse death.
+⇒ In a config document's `$` prose (every string under a `$`-prefixed key of a
+`src/dss-config/**/*.json`), a sentence that puts a CORPUS name, a USAGE verb and an
+exclusivity or absence QUANTIFIER within `CLAIM_ROT_WINDOW` words of each other takes
+one of two forms, or is not written:
+  * PINNED -- it carries its measurement: a MEASURED/verified word AND a date
+    (YYYY-MM-DD) or a revision hash in the same sentence, so its age is visible and
+    re-running it is mechanical;
+  * HISTORY -- it quotes a retracted claim inside its own correction ("this comment
+    used to say ...", "the pre-c92 comment asserted '...'", RETRACTED).
+Anything else is a DECISION phrased as a measurement: state the decision, or measure
+it. There is no `--write` for prose.
+✔MEASURED 2026-09-24, when the clause landed (P68 round 11): 85 config documents held
+32 such sentences -- 29 refused, 1 pinned, 2 history -- and the 29 were rewritten in
+the same change, because a guard the tree fails is never shipped. ⓘ The predicate is
+a CUT, not a parser: a usage word right after an article is a noun ("the
+reference"), a multi-word quantifier ("exactly four", "no other", "doesn't use")
+sits at its first word, and the window is 8 words -- widening it to 10 on the same
+tree added three sentences, and in each the quantifier was a literal zero belonging
+to another clause (a value, a call argument, an array bound).
+
 Exit codes: 0 OK - 1 a document disagrees with the census - 2 the scan or a
 provider collapsed (structural: fix the scan, never lower the floor) - 3 usage.
 
@@ -123,6 +152,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -383,6 +413,98 @@ def provider_values(repo, name):
     return values
 
 
+# ── THE SECOND CLAUSE: A QUANTIFIED CLAIM ABOUT THE CORPUS, IN CONFIG PROSE ────────
+# The header says why. This is the predicate, spelled once; every word class is a
+# DECLARATION a reader can audit, and the self-test pins each allowed form in both
+# directions plus the window's edge.
+CLAIM_ROT_ROOT = os.path.join("src", "dss-config")
+CLAIM_ROT_WINDOW = 8        # the corpus word, the usage verb and the quantifier within this many words
+CLAIM_ROT_DOC_FLOOR = 1     # a walk that read no config document is a COLLAPSE, never a clean pass
+
+_CR_WORD = re.compile(r"[\w'`./<>*-]+")
+_CR_USAGE = re.compile(r"^(uses?|used|using|calls?|called|references?|referenced|needs?|needed|"
+                       r"touch(?:es|ed)?|reach(?:es|ed)?|consumes?|consumed|spells?|spelled)$", re.I)
+_CR_QUANT_1 = re.compile(r"^(only|solely|exclusively|nothing|none|never|zero|neither|0)$", re.I)
+_CR_QUANT_2 = re.compile(r"\b(exactly (?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)|no other|"
+                         r"no (?:consumer|caller|user|use|site|reference)s?|(?:does|do)(?:n't| not) "
+                         r"(?:use|call|reference|need|touch|reach|spell|include)|the (?:sole|whole) consumer)\b",
+                         re.I)
+_CR_CORPUS = re.compile(r"^(sqlite\w*|amalgamation|testfixture|tclsqlite\w*|os_unix\.c|os_win\.c|shell\.c|"
+                        r"sqlite3\.c|test\d+\.c|mem\d\.c|corpus)$", re.I)
+_CR_MEASURED = re.compile(r"✔\s*(?:RE-)?MEASURED|\bMEASURED\b|re-measured|grep-verified|\bverified\b", re.I)
+_CR_PINNED = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|[0-9a-f]{8,40})\b")
+_CR_ARTICLES = {"the", "a", "an", "this", "that", "each", "every", "its", "their", "one"}
+_CR_HISTORY = re.compile(r"\b(?:note|hand-?off|handover|brief)\b[^.]{0,40}\bsaid\b|used to (?:say|read|assert)|"
+                         r"previously read|\bIT READ\b|pre-\w+ comment|RETRACTED|WAS FALSE|asserted '|"
+                         r"earlier revision|It previously|this comment used to", re.I)
+_CR_SENTENCE = re.compile(r"(?<=[.!?])(?<!e\.g\.)(?<!i\.e\.)(?<!etc\.)(?<!vs\.)(?<!cf\.)\s+")
+
+
+def claim_rot_verdict(sentence, window=CLAIM_ROT_WINDOW):
+    """None (not a quantified corpus-usage claim), 'PINNED', 'HISTORY' or 'REFUSE'."""
+    toks = [m.group(0).strip(".,;:()[]{}\"'") for m in _CR_WORD.finditer(sentence)]
+    # A usage word right after an article is a NOUN ("the reference resolves"), not a
+    # claim about the corpus.
+    usage = [i for i, t in enumerate(toks) if _CR_USAGE.match(t)
+             and not (i and toks[i - 1].lower() in _CR_ARTICLES)]
+    corpus = [i for i, t in enumerate(toks) if _CR_CORPUS.match(t)]
+    quant = [i for i, t in enumerate(toks) if _CR_QUANT_1.match(t)]
+    for m in _CR_QUANT_2.finditer(sentence):          # a multi-word quantifier sits at its first word
+        quant.append(len(_CR_WORD.findall(sentence[:m.start()])))
+    if not (usage and quant and corpus):
+        return None
+    if not any(max(a, b, c) - min(a, b, c) <= window for a in usage for b in quant for c in corpus):
+        return None
+    if _CR_HISTORY.search(sentence):
+        return "HISTORY"
+    if _CR_MEASURED.search(sentence) and _CR_PINNED.search(sentence):
+        return "PINNED"
+    return "REFUSE"
+
+
+def _dollar_strings(node, in_dollar=False, path=""):
+    """Every string under a `$`-prefixed key -- a config document's prose -- with its JSON pointer."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _dollar_strings(v, in_dollar or k.startswith("$"), "%s/%s" % (path, k))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from _dollar_strings(v, in_dollar, "%s/%d" % (path, i))
+    elif isinstance(node, str) and in_dollar:
+        yield path, node
+
+
+def claim_rot_findings(repo):
+    """-> (config documents read, `$` sentences read, [(rel, json pointer, sentence)] refused)."""
+    root = os.path.join(repo, CLAIM_ROT_ROOT)
+    docs = sents = 0
+    refused = []
+    skip = SKIP_DIRS | scratch_dirs(repo)
+    for dp, dn, fn in os.walk(root):
+        dn[:] = sorted(d for d in dn if d not in skip)
+        for f in sorted(fn):
+            if not f.endswith(".json"):
+                continue
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, repo).replace(os.sep, "/")
+            try:
+                doc = json.load(io.open(p, encoding="utf-8"))
+            except ValueError as e:
+                raise Collapse("%s is not JSON (%s) -- its prose cannot be read, so it cannot be "
+                               "judged" % (rel, e))
+            docs += 1
+            for pointer, text in _dollar_strings(doc):
+                for s in _CR_SENTENCE.split(text):
+                    sents += 1
+                    if claim_rot_verdict(s) == "REFUSE":
+                        refused.append((rel, pointer, s.strip()))
+    if docs < CLAIM_ROT_DOC_FLOOR:
+        raise Collapse("the claim-rot clause read %d config document(s) under %s -- a walk that "
+                       "reads nothing is a structural failure, not a pass"
+                       % (docs, CLAIM_ROT_ROOT.replace(os.sep, "/")))
+    return docs, sents, refused
+
+
 # ── THE GUARD ──────────────────────────────────────────────────────────────────
 
 def run(repo, write):
@@ -443,6 +565,10 @@ def run(repo, write):
             if write:
                 repaired.setdefault(c.doc, []).append((c, actual))
 
+    # THE SECOND CLAUSE is read BEFORE anything is written, so its structural collapse
+    # (no config document read) stops a --write exactly as it stops a verify.
+    rot_docs, rot_sents, refused = claim_rot_findings(repo)
+
     if write and repaired:
         for doc, text in list(per_doc.items()):
             rel = os.path.relpath(doc, repo).replace(os.sep, "/")
@@ -461,6 +587,7 @@ def run(repo, write):
              ", plus %d quotation(s) of the marker syntax (vocabulary checked, figure "
              "not compared)" % len(quoted)))
 
+    rc = EXIT_OK
     if wrong and not write:
         print("check-doc-census: FAIL -- %d documented figure(s) the census refutes:"
               % len(wrong))
@@ -471,14 +598,28 @@ def run(repo, write):
         print("      python .harness-config/runner/actions/check-doc-census/check-doc-census.py --write")
         print("  ⚠ A figure is a DATED INVENTORY. If a SENTENCE around one has also gone "
               "false, --write will not notice -- read the claim, not only the number.")
-        return EXIT_DISAGREE
-
-    if wrong:
+        rc = EXIT_DISAGREE
+    elif wrong:
         print("check-doc-census: repaired %d figure(s). Re-run to verify." % len(wrong))
-        return EXIT_OK
 
-    print("check-doc-census: OK -- every documented figure matches the census.")
-    return EXIT_OK
+    # The second clause reports in BOTH modes: `--write` repairs figures, never prose, so
+    # a refused sentence keeps a --write red too.
+    if refused:
+        print("check-doc-census: FAIL -- %d quantified claim(s) about the corpus's usage in "
+              "config prose, neither pinned to a measurement nor quoted as history:" % len(refused))
+        for rel, pointer, sentence in refused:
+            print("    %s %s\n        %s" % (rel, pointer, sentence[:400]))
+        print("  State the DECISION the sentence argues, or pin it: a MEASURED/verified word and "
+              "a date (YYYY-MM-DD) or a revision in the SAME sentence. A retracted claim may be "
+              "quoted inside its own correction. `--write` does not touch prose.")
+        rc = EXIT_DISAGREE
+    else:
+        print("check-doc-census: %d config document(s), %d `$` sentence(s): no unpinned "
+              "corpus-usage claim" % (rot_docs, rot_sents))
+
+    if rc == EXIT_OK and not wrong:
+        print("check-doc-census: OK -- every documented figure matches the census.")
+    return rc
 
 
 def restyle(raw, value):
@@ -562,7 +703,26 @@ def _fixture(tmp, name, stub_body=None, doc_body=None, src_body=None,
         code = os.path.join(root, "src", "opt")
         os.makedirs(code, exist_ok=True)
         io.open(os.path.join(code, "rebuild.hpp"), "wb").write(src_body.encode("utf-8"))
+
+    # The config document THE SECOND CLAUSE reads. EVERY fixture carries one, because the
+    # clause refuses a walk that reads none (arm 41); its prose makes no claim, so the
+    # figure arms keep measuring exactly what they measured before the clause existed.
+    _say(root, _NEUTRAL_PROSE)
     return root
+
+
+# THE SECOND CLAUSE's fixture: one config document whose `$comment` is the sentence under test.
+_FIXTURE_CONFIG = "shippedLibs/fixture.json"
+_NEUTRAL_PROSE = "A neutral descriptor note: this header ships two constants, both measured."
+
+
+def _say(root, sentence, rel=_FIXTURE_CONFIG, doc=None):
+    """Write `doc` (default: a descriptor whose `$comment` is `sentence`) at the config `rel`."""
+    p = os.path.join(root, CLAIM_ROT_ROOT, *rel.split("/"))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    body = doc if doc is not None else {"$comment": sentence, "header": "fixture.h"}
+    _write(p, body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, indent=2))
+    return p
 
 
 def _src(root):
@@ -804,8 +964,106 @@ def selftest():
         # has stopped matching, each produce a tidy zero that a rotted figure agrees with.
         ok &= _source_provider_arms(tmp)
 
+        # 28-42 -- THE SECOND CLAUSE.
+        ok &= _claim_rot_arms(tmp)
+
     print("check-doc-census --selftest: %s" % ("PASS" if ok else "FAIL"))
     return EXIT_OK if ok else EXIT_DISAGREE
+
+
+# The sentence every claim-rot arm varies: an exclusivity claim about the corpus's usage.
+_CR_BARE = "sqlite uses only `_IOWR` from this header."
+
+
+def _rot(label, root, want_refused, says=None):
+    """One IN-PROCESS arm of the second clause: `claim_rot_findings` -- the function the
+    guard itself calls -- over the fixture root. `want_refused` is True (a refusal), False
+    (a clean walk) or a Collapse message fragment."""
+    try:
+        docs, _sents, refused = claim_rot_findings(root)
+        got = "refused %d of %d document(s)" % (len(refused), docs)
+        good = (bool(refused) == want_refused) if isinstance(want_refused, bool) else False
+        text = " ".join("%s %s %s" % r for r in refused)
+    except Collapse as e:
+        got = "COLLAPSE"
+        good = isinstance(want_refused, str) and want_refused in str(e)
+        text = str(e)
+    if good and says is not None:
+        good = says in text
+    print("  %-34s %s %s" % (label, got, "OK" if good else "FAIL"))
+    if not good:
+        print("      says: %s" % text[:900])
+    return good
+
+
+def _claim_rot_arms(tmp):
+    """Arms 28-42: the second clause, each allowed form pinned in BOTH directions.
+
+    ⚠ THE NEGATIVE COMES FIRST (arm 28): the bare claim must RED before any arm may show
+    a variant of it passing -- otherwise a clause that never ran would pass every green
+    arm below. ★ THREE ARMS RUN THE GUARD END TO END (28 red, 29 green, 34 the row's own
+    instance) and assert its exit code and its report; the predicate's other edges call
+    `claim_rot_findings`, the function the guard calls, in process -- the same code, at a
+    fraction of the cost of a subprocess per sentence (a guard's seconds are gate seconds).
+    """
+    ok = True
+    root = _fixture(tmp, "claimrot")
+
+    # 28 -- the bare claim REDS end to end, naming the document and the JSON pointer.
+    _say(root, _CR_BARE)
+    ok &= _arm("28 CLAIM-UNPINNED-REDS", root, EXIT_DISAGREE,
+               says="%s/%s /$comment" % (CLAIM_ROT_ROOT.replace(os.sep, "/"), _FIXTURE_CONFIG))
+    # 29 + 30 -- PINNED passes: a MEASURED word and a date (end to end, asserting the
+    #            clause's own success line), or a MEASURED word and a revision.
+    _say(root, _CR_BARE[:-1] + " (✔MEASURED 2026-09-24 over the staged tree).")
+    ok &= _arm("29 CLAIM-DATE-PIN-PASSES", root, EXIT_OK, says="no unpinned corpus-usage claim")
+    _say(root, _CR_BARE[:-1] + " (✔MEASURED at sqlite f544d3599a10).")
+    ok &= _rot("30 CLAIM-REVISION-PIN-PASSES", root, False)
+    # 31 + 32 -- ... and HALF a pin is no pin: the MEASURED word alone, or the date alone.
+    _say(root, _CR_BARE[:-1] + " (✔MEASURED over the staged tree).")
+    ok &= _rot("31 CLAIM-MEASURED-WORD-ALONE-REDS", root, True)
+    _say(root, _CR_BARE[:-1] + " (as of 2026-09-24).")
+    ok &= _rot("32 CLAIM-DATE-ALONE-REDS", root, True)
+    # 33 -- HISTORY passes: arm 28's sentence, verbatim, inside its own correction.
+    _say(root, "This comment used to say " + _CR_BARE[:-1] + "; os_unix.c reaches `_IO` and `_IOR` too.")
+    ok &= _rot("33 CLAIM-HISTORY-PASSES", root, False)
+
+    # 34 -- THE ROW'S INSTANCE (e), RE-PLANTED VERBATIM where it lived, end to end. The
+    #       sentence that shipped no request macro while os_unix.c used `_IOWR` reds today.
+    _say(root, _NEUTRAL_PROSE)
+    _say(root, "the _IOC/_IOR/_IOW request-ENCODING macros differ per-OS, but SQLite doesn't use "
+               "this header's macros, so none are shipped (no over-ship).", rel="shippedLibs/sys/ioctl.json")
+    ok &= _arm("34 INSTANCE-E-REPLANTED-REDS", root, EXIT_DISAGREE, says="shippedLibs/sys/ioctl.json")
+    os.remove(os.path.join(root, CLAIM_ROT_ROOT, "shippedLibs", "sys", "ioctl.json"))
+
+    # 35 + 36 -- a usage word after an article is a NOUN, and that rule is not an escape:
+    #            the same sentence with the VERB reds.
+    _say(root, "Only the reference compilers decide this layout; sqlite is never the reference here.")
+    ok &= _rot("35 USAGE-NOUN-PASSES", root, False)
+    _say(root, "Only the reference compilers decide this layout; sqlite never references it.")
+    ok &= _rot("36 USAGE-VERB-REDS", root, True)
+
+    # 37 + 38 -- prose is every string under a `$` key, at any depth, and ONLY there.
+    _say(root, None, doc={"$comment": _NEUTRAL_PROSE, "header": _CR_BARE})
+    ok &= _rot("37 NON-DOLLAR-VALUE-PASSES", root, False)
+    _say(root, None, doc={"$comment": _NEUTRAL_PROSE, "$notes": ["fine.", {"why": _CR_BARE}]})
+    ok &= _rot("38 DOLLAR-SUBTREE-REDS", root, True, says="/$notes/1/why")
+
+    # 39 + 40 -- THE WINDOW'S EDGE: corpus word and usage verb at 0 and 1, the quantifier
+    #            at CLAIM_ROT_WINDOW (red) and one past it (clean).
+    fill = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota"]
+    edge = CLAIM_ROT_WINDOW - 2
+    _say(root, "sqlite uses %s only." % " ".join(fill[:edge]))
+    ok &= _rot("39 WINDOW-EDGE-REDS", root, True)
+    _say(root, "sqlite uses %s only." % " ".join(fill[:edge + 1]))
+    ok &= _rot("40 WINDOW-PAST-EDGE-PASSES", root, False)
+
+    # 41 + 42 -- the clause's own collapses: no config document read, and one it cannot read.
+    shutil.rmtree(os.path.join(root, CLAIM_ROT_ROOT))
+    ok &= _rot("41 NO-CONFIG-COLLAPSES", root, "read 0 config document(s)")
+    _say(root, None, doc='{"$comment": "a truncated document"')
+    ok &= _rot("42 CONFIG-NOT-JSON-COLLAPSES", root, "is not JSON")
+    return ok
 
 
 def _source_provider_arms(tmp):

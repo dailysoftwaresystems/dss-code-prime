@@ -649,6 +649,30 @@ if(DSS_BUILD_TESTS)
     # snapshot; the proof's builds start in temporary directories no cwd walk can climb out of.
     dss_use_config_snapshot(harness/cmake_import_any_cwd)
 
+    # ── The two remote-leg readers check their own arms (2026-09-24, lane mig) ──
+    # `probe-reference-cc` measures a reference compiler on a leg's own host and `read-leg-path` reads a
+    # file back from one; both print what they measure through ONE redactor (read-leg-path owns it,
+    # probe-reference-cc inherits it). Their `--selftest`s hold the refusals, the redaction in both
+    # directions (a name inside `13.3.0-6ubuntu2` or `dsscp` survives; `<name>@h`, `/home/<name>/`
+    # and every other shape the old substring rule caught is still redacted), the empty-TU probe and
+    # the linked-image dump. ⓘ NEW: until now no gate ran either self-test.
+    # ★ NOT `repo-guard`, ON PURPOSE, like their neighbours above: the probe's arms compile, link,
+    # run and dump with the HOST's own compiler and dump tool, which differ per leg, so every leg
+    # runs them -- and a leg without a reference compiler or a dump tool is a named FAILURE there,
+    # never a skip.
+    add_test(
+        NAME harness/probe_reference_cc_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/probe-reference-cc/probe-reference-cc.py"
+                --selftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(
+        NAME harness/read_leg_path_selftest
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_SOURCE_DIR}/.harness-config/runner/actions/read-leg-path/read-leg-path.py"
+                --selftest
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     # ── The anchor CITATION question, asked by the tool ───────────────────────
     # ⛔⛔ THIS IS AN ADDITION, NOT A REPLACEMENT, AND THAT IS A MEASURED DECISION
     # RATHER THAN CAUTION. `DssHarness check-anchor-citations` answers *"does every

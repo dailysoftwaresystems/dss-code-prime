@@ -25,6 +25,7 @@
 #include "core/types/section_kind.hpp"         // dataSectionKindFromName — the ONE data-section taxonomy (`assembly.directives[].section`)
 #include "core/types/target_schema.hpp"        // targetRegClassFromName / kOperableTargetRegClassNames — `assembly.templateModifiers[].registerClass` names a row of the ONE register-class envelope
 #include "core/types/symbol_attrs.hpp"         // symbolBindingFromName / symbolVisibilityFromName
+#include "core/types/variant_when_json.hpp"   // decodeWhen — a builtin signature arm's `when` (S2a-1)
 #include "core/types/type_name_resolve.hpp"    // resolveLanguageTypeName — the ONE type-name resolver (shared with the shipped-descriptor reader, P68 round 9)
 
 #include <nlohmann/json.hpp>
@@ -8872,14 +8873,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // of pointer arithmetic. A sibling of `pointerAliasing` (a per-language
             // fact read at two tiers), NOT of `sizeof`/`alignof` (which name
             // GRAMMAR RULES, while this names a size).
-            static constexpr std::array<std::string_view, 63> kSemanticsKeys{
+            // ⓘ 63 → 64 (P68 round 12, lane `cs`): `enumerationCompatibleTypes` — the
+            // ladders an enumeration's compatible type is chosen from (C23
+            // 6.7.3.3p13); a sibling of `integerLiteralTyping`, whose shape it has.
+            static constexpr std::array<std::string_view, 64> kSemanticsKeys{
                 // declaration / reference / scope surface (plan 08.6)
                 "declarators", "declarations", "references", "memberAccesses",
                 "scopes",
                 // the type surface
                 "builtinTypes", "typeShapes", "literalTypes", "typeSpecifiers",
                 "integerLiteralTyping", "floatLiteralTyping", "parameters",
-                "arithmeticConversions", "synthesizedTypes",
+                "arithmeticConversions", "synthesizedTypes", "enumerationCompatibleTypes",
                 // SE4-SE7 expression facets
                 "assignments", "callRules", "casts",
                 // type-query operators + declaration specifiers
@@ -13135,13 +13139,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // rather than sharing sizeof's slot so this block answers the
             // question without a cross-reference) and `typesCompatible` (gcc
             // yields `int`).
-            static constexpr std::array<std::pair<std::string_view, RoleSlot>, 5>
+            // 5 -> 6 (P68 round 12, lane `cs`): `enumerationConstant` — the type
+            // of an enumeration constant (C17 6.4.4.3p2, C23 6.7.3.3: `int`).
+            static constexpr std::array<std::pair<std::string_view, RoleSlot>, 6>
                 kSynthesizedTypeRoleRows{{
-                    {"sizeof",            &SemanticConfig::sizeofResultType},
-                    {"alignof",           &SemanticConfig::alignofResultType},
-                    {"pointerDifference", &SemanticConfig::pointerDifferenceType},
-                    {"offsetof",          &SemanticConfig::offsetofResultType},
-                    {"typesCompatible",   &SemanticConfig::typesCompatibleResultType},
+                    {"sizeof",              &SemanticConfig::sizeofResultType},
+                    {"alignof",             &SemanticConfig::alignofResultType},
+                    {"pointerDifference",   &SemanticConfig::pointerDifferenceType},
+                    {"offsetof",            &SemanticConfig::offsetofResultType},
+                    {"typesCompatible",     &SemanticConfig::typesCompatibleResultType},
+                    {"enumerationConstant", &SemanticConfig::enumerationConstantType},
                 }};
             static constexpr auto kSynthesizedTypeRoles =
                 keysOf(kSynthesizedTypeRoleRows,
@@ -13246,6 +13253,139 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             break;
                         }
                     }
+                }
+            }
+
+            // ── P68 round 12 (lane `cs`): `enumerationCompatibleTypes` (C23 6.7.3.3p13)
+            //
+            // `{ "<rule>": { "unsigned": [type names…], "signed": [type names…] }, … }`
+            // — per format convention (`EnumCompatibleTypeRule`: "msvc", "gnu"), the
+            // two ORDERED ladders the type an enumeration without a fixed underlying
+            // type is compatible with is chosen from (see `EnumerationCompatibleTypes`).
+            // Each rung resolves through the SAME `resolveTypeName` the literal ladder
+            // uses, so its representation follows the data model. Fails loud on: a
+            // non-object block or rule entry, a key that is no rule spelling, a rule
+            // left uncovered (a format declaring it would silently find no ladders), a
+            // key outside `unsigned` / `signed`, a missing or empty ladder, a rung that
+            // is not an integer type under every data model, an UNSIGNED rung on the
+            // `signed` ladder (it could never hold a negative value), and a block
+            // declared without the `enumerationConstant` role it sits beside.
+            if (sem.contains("enumerationCompatibleTypes")) {
+                json const& obj = sem.at("enumerationCompatibleTypes");
+                std::string const base = "/semantics/enumerationCompatibleTypes";
+                static constexpr std::array<std::string_view, 2> kEnumerationLadderKeys{
+                    "unsigned", "signed"};
+                DSS_CHECK_KEY_VOCABULARY(kEnumerationLadderKeys);
+                auto const isUnsignedKind = [](TypeKind k) noexcept {
+                    return k == TypeKind::U8 || k == TypeKind::U16 || k == TypeKind::U32
+                        || k == TypeKind::U64 || k == TypeKind::U128;
+                };
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                              std::format("'enumerationCompatibleTypes' must be an object "
+                                          "keyed by format convention ({})",
+                                          renderAllowedList(allNames(
+                                              kEnumCompatibleTypeRuleTable))));
+                } else {
+                    bool widenOk = true;
+                    EnumerationCompatibleTypes block;
+                    for (auto const& [key, entry] : obj.items()) {
+                        if (isDocumentationKey(key)) continue;
+                        std::string const rulePath = base + "/" + key;
+                        auto const rule = enumCompatibleTypeRuleFromName(key);
+                        if (!rule.has_value()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, rulePath,
+                                      std::format("unknown format convention '{}' "
+                                                  "(expected one of {})", key,
+                                                  renderAllowedList(allNames(
+                                                      kEnumCompatibleTypeRuleTable))));
+                            widenOk = false;
+                            continue;
+                        }
+                        if (!entry.is_object()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics, rulePath,
+                                      "each convention's entry must be an object with an "
+                                      "'unsigned' and a 'signed' ladder of type names");
+                            widenOk = false;
+                            continue;
+                        }
+                        widenOk = checkKeysAgainst(
+                                      entry, kEnumerationLadderKeys, rulePath,
+                                      "an 'enumerationCompatibleTypes' convention",
+                                      DiagnosticCode::C_InvalidSemantics, coll,
+                                      "each key names the ladder for one sign of the values")
+                                  && widenOk;
+                        auto const readLadder = [&](char const* ladderKey, bool signedOnly,
+                                                    std::vector<DataModelTypeRef>& out) {
+                            std::string const path = rulePath + "/" + ladderKey;
+                            if (!entry.contains(ladderKey) || !entry.at(ladderKey).is_array()
+                                || entry.at(ladderKey).empty()) {
+                                coll.emit(DiagnosticCode::C_MissingField, path,
+                                          std::format("'{}' is required and must be a "
+                                                      "non-empty array of type names",
+                                                      ladderKey));
+                                return false;
+                            }
+                            for (auto const& nm : entry.at(ladderKey)) {
+                                if (!nm.is_string() || nm.get<std::string>().empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              "each rung must be a non-empty type-name "
+                                              "string");
+                                    return false;
+                                }
+                                DataModelTypeRef ref;
+                                if (!resolveTypeName(nm.get<std::string>(), path, ref))
+                                    return false;   // resolveTypeName already reported
+                                if (!isIntegerKindName(ref)) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("rung '{}' must resolve to an "
+                                                          "integer kind under every data "
+                                                          "model", nm.get<std::string>()));
+                                    return false;
+                                }
+                                bool anyUnsigned = isUnsignedKind(ref.core);
+                                for (auto const& [_, k] : ref.coreByDataModel)
+                                    anyUnsigned = anyUnsigned || isUnsignedKind(k);
+                                if (signedOnly && anyUnsigned) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                              std::format("rung '{}' is unsigned under some "
+                                                          "data model — the 'signed' ladder "
+                                                          "holds a NEGATIVE value, which an "
+                                                          "unsigned rung never can",
+                                                          nm.get<std::string>()));
+                                    return false;
+                                }
+                                out.push_back(std::move(ref));
+                            }
+                            return true;
+                        };
+                        EnumerationLadders ladders;
+                        widenOk = readLadder("unsigned", false, ladders.unsignedLadder)
+                                  && widenOk;
+                        widenOk = readLadder("signed", true, ladders.signedLadder)
+                                  && widenOk;
+                        block.byRule.emplace(*rule, std::move(ladders));
+                    }
+                    // Full coverage of the closed rule vocabulary: a format declaring an
+                    // uncovered convention would silently find no ladders.
+                    for (auto const& [rule, ruleName] : kEnumCompatibleTypeRuleTable.rows) {
+                        if (block.byRule.contains(rule)) continue;
+                        coll.emit(DiagnosticCode::C_MissingField, base,
+                                  std::format("'enumerationCompatibleTypes' declares no "
+                                              "ladders for the '{}' convention — a declared "
+                                              "block must cover EVERY convention a format "
+                                              "can name", ruleName));
+                        widenOk = false;
+                    }
+                    if (widenOk && !cfg.enumerationConstantType.declared()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics, base,
+                                  "'enumerationCompatibleTypes' chooses an enumeration's "
+                                  "compatible type beside its constants' type, so "
+                                  "'synthesizedTypes.enumerationConstant' must be "
+                                  "declared too");
+                        widenOk = false;
+                    }
+                    if (widenOk) cfg.enumerationCompatibleTypes = std::move(block);
                 }
             }
 
@@ -15746,9 +15886,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // 'name'; 'signature' and 'params'/'result' are mutually
                         // exclusive). `$`-prefixed keys are the codebase-wide
                         // documentation convention, never a role.
-                        static constexpr std::array<std::string_view, 8>
-                            kBuiltinFnKeys{"name", "signature",
-                                           "signatureByDataModel", "params",
+                        static constexpr std::array<std::string_view, 7>
+                            kBuiltinFnKeys{"name", "signature", "params",
                                            "result", "variadic", "lowering",
                                            // D-CSUBSET-ATOMIC-MONOMORPH-I32
                                            "genericPointee"};
@@ -15767,10 +15906,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // two forms must be used (both = an ambiguous declaration;
                         // fail loud rather than pick).
                         if (entry.contains("signature")) {
-                            if (!entry.at("signature").is_string()) {
+                            json const& sigNode = entry.at("signature");
+                            if (!sigNode.is_string() && !sigNode.is_object()) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/signature",
-                                          "'signature' must be a string");
+                                          "'signature' must be a type-text string or a "
+                                          "per-pair object with 'variants'");
                                 continue;
                             }
                             if (entry.contains("params") || entry.contains("result")) {
@@ -15781,51 +15922,83 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 continue;
                             }
                             BuiltinFunctionMapping m;
-                            m.name          = entry.at("name").get<std::string>();
-                            m.signatureText = entry.at("signature").get<std::string>();
-                            // D-LANG-TYPE-IDENTITY-VOCABULARY: the OPTIONAL
-                            // per-data-model signature override (same key name +
-                            // shape as the shipped-lib reader's). Keys are the
-                            // closed data-model vocabulary; an unknown key fails
-                            // loud rather than silently never applying.
-                            if (entry.contains("signatureByDataModel")) {
-                                json const& byDm = entry.at("signatureByDataModel");
-                                if (!byDm.is_object()) {
+                            m.name = entry.at("name").get<std::string>();
+                            if (sigNode.is_string()) {
+                                m.signatureText = sigNode.get<std::string>();
+                            } else {
+                                // P68 round 12 (S2a-1): the per-pair form — decoded
+                                // HERE, at load, by the ONE `when` decoder the
+                                // shipped-descriptor reader uses, and selected at
+                                // injection by the ONE matcher.
+                                std::string const sigPath = path + "/signature";
+                                bool armsOk = true;
+                                auto const bad = [&](std::string const& at, std::string msg) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics, at, std::move(msg));
+                                    armsOk = false;
+                                };
+                                detail::rejectUnknownKeys(
+                                    sigNode, std::array<std::string_view, 1>{"variants"},
+                                    "a per-pair 'signature'",
+                                    [&](std::string_view, std::string message) { bad(sigPath, std::move(message)); });
+                                if (!sigNode.contains("variants") || !sigNode.at("variants").is_array()
+                                    || sigNode.at("variants").empty()) {
+                                    bad(sigPath, "a per-pair 'signature' must carry a non-empty 'variants' array "
+                                                 "(or be a flat type-text string)");
+                                }
+                                bool haveDefault = false;
+                                if (armsOk) {
+                                    std::size_t vi = 0;
+                                    for (json const& arm : sigNode.at("variants")) {
+                                        std::string const at = sigPath + "/variants/" + std::to_string(vi++);
+                                        if (!arm.is_object()) { bad(at, "each arm must be an object"); continue; }
+                                        bool const isDefault = arm.contains("default");
+                                        auto const knownArmKeys = isDefault
+                                            ? std::array<std::string_view, 2>{"default", "value"}
+                                            : std::array<std::string_view, 2>{"when", "value"};
+                                        detail::rejectUnknownKeys(
+                                            arm, knownArmKeys, "a 'signature' arm",
+                                            [&](std::string_view, std::string message) { bad(at, std::move(message)); });
+                                        if (!arm.contains("value") || !arm.at("value").is_string()
+                                            || arm.at("value").get<std::string>().empty()) {
+                                            bad(at, "each arm must carry a non-empty string 'value'");
+                                            continue;
+                                        }
+                                        std::string text = arm.at("value").get<std::string>();
+                                        if (isDefault) {
+                                            if (!arm.at("default").is_boolean() || !arm.at("default").get<bool>()) {
+                                                bad(at, "'default' must be the literal true (a default arm has "
+                                                        "no 'when')");
+                                                continue;
+                                            }
+                                            if (haveDefault) {
+                                                bad(at, "at most one 'default' arm — it serves every pair no "
+                                                        "other arm selects");
+                                                continue;
+                                            }
+                                            haveDefault     = true;
+                                            m.signatureText = std::move(text);
+                                            continue;
+                                        }
+                                        if (!arm.contains("when")) { bad(at, "each arm needs a 'when'"); continue; }
+                                        auto spec = decodeWhen(
+                                            arm.at("when"), WhenAxes::FullTarget, at + "/when",
+                                            [&](std::string body) { bad(at + "/when", std::move(body)); },
+                                            [&](std::string sentence) { bad(at + "/when", std::move(sentence)); });
+                                        if (!spec.has_value()) continue;
+                                        m.signatureArms.push_back(
+                                            BuiltinFunctionMapping::SignatureArm{std::move(*spec), std::move(text)});
+                                    }
+                                }
+                                if (!armsOk) continue;
+                                m.signatureIsPerPair = true;
+                                if (entry.contains("genericPointee")) {
                                     coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                              path + "/signatureByDataModel",
-                                              "'signatureByDataModel' must be an "
-                                              "object keyed by data-model name");
+                                              path + "/genericPointee",
+                                              "'genericPointee' needs ONE exemplar signature; "
+                                              "a per-pair 'signature' has several — declare "
+                                              "the flat form");
                                     continue;
                                 }
-                                bool dmOk = true;
-                                for (auto const& [key, val] : byDm.items()) {
-                                    if (isDocumentationKey(key)) continue;
-                                    auto const dm = dataModelFromName(key);
-                                    if (!dm.has_value()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/signatureByDataModel/" + key,
-                                                  std::format("unknown data-model key "
-                                                              "'{}' (expected one "
-                                                              "of {})", key,
-                                                              renderAllowedList(
-                                                                  allNames(
-                                                                      kDataModelTable))));
-                                        dmOk = false;
-                                        continue;
-                                    }
-                                    if (!val.is_string()
-                                        || val.get<std::string>().empty()) {
-                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                                  path + "/signatureByDataModel/" + key,
-                                                  "each override must be a non-empty "
-                                                  "signature string");
-                                        dmOk = false;
-                                        continue;
-                                    }
-                                    m.signatureTextByDataModel.emplace(
-                                        *dm, val.get<std::string>());
-                                }
-                                if (!dmOk) continue;
                             }
                             if (entry.contains("variadic")) {
                                 if (!entry.at("variadic").is_boolean()) {
@@ -16014,9 +16187,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         // D-CSUBSET-ATOMIC-MONOMORPH-I32: `genericPointee` binds
                         // `T` from a POINTER parameter's pointee, and the scalar
                         // `params`/`result` axis cannot declare a pointer at all —
-                        // so on this branch it could never bind. Same fail-loud as
-                        // `signatureByDataModel` below, for the same reason: a knob
-                        // that loads clean and does nothing is the failure mode.
+                        // so on this branch it could never bind. A knob that loads
+                        // clean and does nothing is the failure mode.
                         if (entry.contains("genericPointee")) {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       path + "/genericPointee",
@@ -16024,22 +16196,6 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "mutually exclusive — it binds a POINTER "
                                       "parameter's pointee, which the scalar "
                                       "params/result axis cannot declare");
-                            continue;
-                        }
-                        // D-LANG-TYPE-IDENTITY-VOCABULARY: `signatureByDataModel`
-                        // is an override OF `signature` — the scalar
-                        // `params`/`result` form has nothing for it to override,
-                        // and this branch never reads it. Declaring both loaded
-                        // CLEAN and SILENTLY DID NOTHING, which is exactly the
-                        // knob-that-lies the `signature`-vs-`params` rejection
-                        // above exists to prevent. Same fail-loud, same wording.
-                        if (entry.contains("signatureByDataModel")) {
-                            coll.emit(DiagnosticCode::C_InvalidSemantics,
-                                      path + "/signatureByDataModel",
-                                      "'signatureByDataModel' and 'params'/'result' "
-                                      "are mutually exclusive — it overrides the "
-                                      "'signature' form, which this entry does not "
-                                      "declare");
                             continue;
                         }
                         if (!entry.contains("result") || !entry.at("result").is_string()) {

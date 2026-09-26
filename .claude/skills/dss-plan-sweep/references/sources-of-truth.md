@@ -40,6 +40,6 @@ it is always a flag rather than an auto-fix.
 | All plans | `.plans/` (numbered `00`–`22`, `08.x`, registry, `v2-gap-catalog`, `ZZ-final-goal`) |
 | Anchor registry — WORKING (open rows only) | `.plans/_deferred-anchor-registry-production.md` — the only one since the harness registry retired on 2026-09-16 |
 | Anchor registry — ARCHIVE (closed rows, moved on close) | `.plans/_deferred-anchor-registry-done.md` |
-| Sibling: per-cycle plan update | the `dss-cycle` skill, step 8 |
+| Sibling: per-cycle plan update | the `dss-cycle` skill, step 9 (the cross-plan update) |
 | Sibling: incidental plan hygiene | the `dss-audit` skill §I |
 | `.plans/` system + conventions | the `dss-code-prime` skill — **it wins on any conflict** |

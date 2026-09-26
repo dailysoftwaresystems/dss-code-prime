@@ -106,7 +106,7 @@ static_assert(Alignment::kMaxBytes == 2147483648u,
 }
 
 // ── the module texts ─────────────────────────────────────────────────────────
-constexpr std::string_view kHead = "dsshir 5\nproducer \"\"\n";
+constexpr std::string_view kHead = "dsshir 6\nproducer \"\"\n";
 constexpr std::string_view kBuffer1 = "buffers {\n  buf 1 \"a.c\"\n}\n";
 constexpr std::string_view kSymbols = "symbols {\n  %1 \"f\"\n  %2 \"g\"\n}\n";
 

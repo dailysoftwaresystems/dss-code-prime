@@ -27,6 +27,9 @@ map one to the other):
   P permutation    T last_test    G gave_up (`*** Giving up`: tester.tcl's --maxerror cap)
   N n_files   D last_file   M n_inert   K ok (` Ok` lines)   Q fail_markers (`! <n> expected:`)
   derived_count    K + Q + 1 -- an ABORTED segment's test count (it printed no summary)
+  R trailing       the results (K and Q, teardown excluded) counted after the LAST completed file:
+                   an aborted file's partial work, or -- no `Time:` line ending it -- a single-file run's
+                   whole file (see `credit_single_file`)
 
 Nothing runs at import. `python3 sqlite_corpus.py --self-test` prints `passed=N failed=N
 skipped=N` last and exits 0 only when nothing failed.
@@ -214,11 +217,11 @@ class SegmentFacts:
     """What ONE streaming pass over a segment log found (see the fact alphabet above)."""
 
     __slots__ = ("first_diag", "blamed", "files", "inert", "gave_up", "failures", "summary",
-                 "errors", "total", "permutation", "last_test", "ok", "fail_markers")
+                 "errors", "total", "permutation", "last_test", "ok", "fail_markers", "trailing")
 
     def __init__(self, first_diag="", blamed=None, files=None, inert=None, gave_up=False,
                  failures=None, summary="", errors=None, total=None, permutation="", last_test="",
-                 ok=0, fail_markers=0):
+                 ok=0, fail_markers=0, trailing=0):
         self.first_diag = first_diag            # A
         self.blamed = list(blamed or [])        # every B, in order
         self.files = list(files or [])          # F
@@ -232,6 +235,7 @@ class SegmentFacts:
         self.last_test = last_test              # T
         self.ok = ok                            # K
         self.fail_markers = fail_markers        # Q
+        self.trailing = trailing                # R
 
     @property
     def abort_file(self):
@@ -255,8 +259,8 @@ class SegmentFacts:
         return self.ok + self.fail_markers + 1
 
     def __repr__(self):
-        return ("SegmentFacts(N=%d D=%r M=%d K=%d Q=%d S=%r T=%r P=%r B=%r G=%r A=%r X=%d)"
-                % (self.n_files, self.last_file, self.n_inert, self.ok, self.fail_markers,
+        return ("SegmentFacts(N=%d D=%r M=%d K=%d Q=%d R=%d S=%r T=%r P=%r B=%r G=%r A=%r X=%d)"
+                % (self.n_files, self.last_file, self.n_inert, self.ok, self.fail_markers, self.trailing,
                    self.summary, self.last_test, self.permutation, self.abort_file, self.gave_up,
                    self.first_diag, len(self.failures)))
 
@@ -281,6 +285,7 @@ def parse_segment(log_path):
       S/E/C  the LAST line carrying `<n> errors out of <m> tests` (the whole line; consumed)
       P  `run_test_suite <p>` / `run_tests <p>` after optional blanks and ONE quote (consumed)
       T  the text before the first `...` of a `<name>...` line
+      R  the results counted since the last `Time:` line when the log ends
     A missing or unreadable log is refused (the segment runner always creates it)."""
     diag = ""
     blamed, files, inert, failures = [], [], [], []
@@ -358,7 +363,7 @@ def parse_segment(log_path):
     return SegmentFacts(first_diag=diag, blamed=blamed, files=files, inert=inert, gave_up=gave_up,
                         failures=failures, summary=summary,
                         errors=nerr if summary else None, total=ntest if summary else None,
-                        permutation=perm, last_test=last_test, ok=ok, fail_markers=fx)
+                        permutation=perm, last_test=last_test, ok=ok, fail_markers=fx, trailing=pend)
 
 
 def zero_progress_signature(facts):
@@ -379,6 +384,24 @@ def is_precondition_failure(prev_zero_sig, facts):
     crash moves (the boundary strictly advances), so it dies differently and stays resumable."""
     sig = zero_progress_signature(facts)
     return facts.n_files == 0 and sig != "" and sig == (prev_zero_sig or "")
+
+
+def credit_single_file(facts, name):
+    """A SINGLE-FILE run (DSS_TEST_FILE) sources its one `.test` file directly, so the tier runner that
+    prints `Time: <file> <n> ms` for each completed file (the F fact) never runs: tester.tcl's
+    `finish_test` prints the summary line (S) instead, and ends the file. For THAT run -- the caller
+    decides it is one; a tier's log never comes here -- the summary IS the file's completion: `name` is
+    credited as the one completed file, and as INERT when it counted no result of its own (R == 0: only
+    the teardown pair). A log that already credits a file, or that has no summary (the file aborted), is
+    left as it is -- an abort stays an abort. -> facts (updated in place).
+    ✔MEASURED 2026-09-24 (lane xa, select1.test on both ELF legs): `0 errors out of 199 tests` and not one
+    `Time:` line, which the ZERO-files rule, meant for a tier that selects nothing, judged FAIL."""
+    if not facts.summary or facts.files:
+        return facts
+    facts.files = [name]
+    if facts.trailing == 0:
+        facts.inert = [name]
+    return facts
 
 
 # ── naming the aborting file, and the ordinal helpers ─────────────────────────────────

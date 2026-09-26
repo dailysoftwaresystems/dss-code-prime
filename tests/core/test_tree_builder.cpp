@@ -245,6 +245,67 @@ TEST(TreeBuilder, EmptySpaceTokensCarryFlag) {
     EXPECT_FALSE(isEmptySpace(t.flags(vdKids[4])));    // ;
 }
 
+// ★ A NODE'S SPAN ENDS AT ITS LAST TOKEN, AND STARTS AT ITS FIRST (P68 round 12, lane `cs`,
+// D-PARSE-A-NODES-SPAN-RAN-ON-OVER-THE-TRIVIA-AFTER-ITS-LAST-TOKEN). The parser pushes trivia into
+// whichever frame is open, and a rule ending in an OPTIONAL tail looks past the trivia before it can
+// decide the tail is empty — so trivia lands INSIDE the frame after its last token (and, symmetrically,
+// can land before its first). The leaves stay children (the tree still covers every byte); they never
+// widen a span, so `text(node)` is exactly what the rule matched. Measured before the fix: C's
+// `enum E : struct Foo {` clause reported `: struct Foo ` — its range ran on over the space before `{`.
+TEST(TreeBuilder, ANodesSpanRunsFromItsFirstTokenToItsLastNeverOverTrivia) {
+    auto h = Harness::make(" var x; ");
+
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(h.tok(" ",   0, CoreTokenKind::Whitespace));   // trivia BEFORE the first token
+        b.pushToken(h.tok("var", CoreTokenKind::Word));
+        b.pushToken(h.tok(" ",   4, CoreTokenKind::Whitespace));
+        b.pushToken(h.tok("x",   CoreTokenKind::Word));
+        b.pushToken(h.tok(";"));
+        b.pushToken(h.tok(" ",   7, CoreTokenKind::Whitespace));   // trivia AFTER the last token
+    }
+    Tree t = std::move(b).finish();
+
+    NodeId const vd = t.children(t.children(t.root())[0])[0];
+    ASSERT_EQ(t.children(vd).size(), 6u) << "trivia stays a child — the tree covers every byte";
+    EXPECT_EQ(t.text(vd), "var x;");
+    EXPECT_EQ(t.span(vd), SourceSpan::of(1, 7));
+    EXPECT_EQ(t.text(t.root()), "var x;") << "every enclosing node's span ends where its content does";
+}
+
+// The same answer for a whitespace byte the lexeme table does NOT list (a form feed): the tokenizer
+// pre-resolves it to the language's Whitespace kind, which the parser skips as trivia, and the builder
+// resolves it through a synthetic meaning that carries no flags — so it is marked `EmptySpace` by the
+// parser's own test (`isTriviaToken`) and, like every declared whitespace, widens no span.
+TEST(TreeBuilder, AWhitespaceByteTheLexemeTableDoesNotListIsTriviaToo) {
+    auto h = Harness::make("var x;\f");
+
+    TreeBuilder b{h.src, h.schema, DiagnosticBudget::libraryDefault()};
+    {
+        auto root = b.open(h.schema->rules().find("root"));
+        auto stmt = b.open(h.schema->rules().find("statement"));
+        auto vd   = b.open(h.schema->rules().find("varDecl"));
+        b.pushToken(h.tok("var", CoreTokenKind::Word));
+        b.pushToken(h.tok(" ",   3, CoreTokenKind::Whitespace));
+        b.pushToken(h.tok("x",   CoreTokenKind::Word));
+        b.pushToken(h.tok(";"));
+        Token ff = h.tok("\f", 6, CoreTokenKind::Whitespace);
+        ff.schemaKind = h.schema->schemaTokens().find("Whitespace");
+        b.pushToken(ff);
+    }
+    Tree t = std::move(b).finish();
+
+    NodeId const vd = t.children(t.children(t.root())[0])[0];
+    auto const kids = t.children(vd);
+    ASSERT_EQ(kids.size(), 5u);
+    EXPECT_TRUE(isEmptySpace(t.flags(kids[4]))) << "the form feed is trivia, as the parser reads it";
+    EXPECT_EQ(t.text(vd), "var x;");
+    EXPECT_EQ(t.diagnostics().errorCount(), 0u);
+}
+
 // ── (e) Ambiguous-token tiebreak ─────────────────────────────────────────
 
 TEST(TreeBuilder, AmbiguousMeaningsTieBreakOnFirstDeclared) {

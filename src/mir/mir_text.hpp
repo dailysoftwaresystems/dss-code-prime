@@ -32,7 +32,7 @@
 //
 // Text grammar (representative):
 //
-//   dssir 2
+//   dssir 3
 //   types {
 //     type 1 = struct "Node" {i32, ptr<type 1>}
 //   }

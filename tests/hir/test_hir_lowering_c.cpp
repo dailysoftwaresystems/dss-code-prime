@@ -145,10 +145,16 @@ namespace {
     UnitBuilder builder{loaded, DiagnosticBudget::libraryDefault()};
     builder.addInMemory(std::move(src), "<mem>");
     auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // P68 round 12 (lane `cs`, the enumeration P1): the PE pair's enumeration
+    // compatible-type convention is the Microsoft x64 ABI's (every shipped pe64
+    // format declares `enumCompatibleTypeRule: "msvc"`) — `analyze()`'s default is
+    // the LP64 platforms' `Gnu`, which this pair is not.
     return analyze(cu, DiagnosticBudget::libraryDefault(),
                    DataModel::Llp64, std::nullopt, std::nullopt,
                    SelectableObjectFormatKind::of(ObjectFormatKind::Pe),
-                   std::nullopt, LongDoubleFormat::None, fixtureTarget());
+                   std::nullopt, LongDoubleFormat::None, fixtureTarget(),
+                   /*deepRecursionReserveBytes=*/0, /*roleResolver=*/nullptr,
+                   EnumCompatibleTypeRule::Msvc);
 }
 
 // Drive c → SemanticModel with the parser's expression-depth cap RAISED to
@@ -7601,24 +7607,34 @@ TEST(HirLoweringC, D5_5_EnumValuesComputed) {
     EXPECT_EQ(d->enumValue, 6) << "D implicit → C + 1 = 6";
 }
 
-// Enumerator type identity: each enumerator must be typed as the enum
-// (not as the underlying int). A regression that left enumerators
-// typed as I32 would pass count-only assertions but break downstream
-// type-equivalence checks.
-TEST(HirLoweringC, D5_5_EnumeratorTypedAsEnum) {
-    SemanticModel model = analyzeC("enum E { A };\n");
+// Enumerator type identity. P68 round 12 (lane `cs`, the enumeration P1): this test used
+// to be `D5_5_EnumeratorTypedAsEnum` and pinned the OPPOSITE — "enumerator must be typed
+// as the enum, not the underlying int", "MUST NOT carry the raw I32 TypeId" — which is
+// not C's: an identifier declared as an enumeration constant has type `int` (C17
+// 6.4.4.3p2), and C23 keeps `int` for an enumeration without a fixed underlying type
+// whose values fit it (6.7.3.3p15); gcc 13.3.0, clang 18.1.3, mingw-w64 13.2.0 and MSVC
+// 19.51 all select `int:` for such a constant in `_Generic` (lane `cs`'s `.temp/probe/ect`,
+// [[D-C-AN-ENUMERATION-CONSTANT-IS-TYPED-AS-ITS-ENUMERATION-NOT-INT]]). The constant of a
+// FIXED-type enumeration IS the enumerated type (6.7.3.3p12, p16) — the control.
+TEST(HirLoweringC, D5_5_EnumeratorOfAnIntValuedEnumerationIsIntAFixedOnesIsTheEnum) {
+    SemanticModel model = analyzeC("enum E { A };\n"
+                                   "enum F : long { FA };\n");
     ASSERT_FALSE(model.hasErrors());
     auto& interner = model.lattice().interner();
-    TypeId const enumTy = interner.enumType("E", TypeKind::I32);
-    // The enumerator A must carry the enum TypeId, not raw I32.
     SymbolRecord const* a = nullptr;
-    for (auto const& s : model.symbols())
-        if (s.name == "A") { a = &s; break; }
+    SymbolRecord const* fa = nullptr;
+    for (auto const& s : model.symbols()) {
+        if (s.name == "A") a = &s;
+        if (s.name == "FA") fa = &s;
+    }
     ASSERT_NE(a, nullptr);
-    EXPECT_EQ(a->type.v, enumTy.v)
-        << "enumerator must be typed as the enum, not the underlying int";
-    EXPECT_NE(a->type.v, interner.primitive(TypeKind::I32).v)
-        << "enumerator MUST NOT carry the raw I32 TypeId";
+    ASSERT_NE(fa, nullptr);
+    EXPECT_EQ(a->type.v, interner.primitive(TypeKind::I32).v)
+        << "an enumeration constant whose enumeration's values fit `int` IS `int`";
+    ASSERT_EQ(interner.kind(fa->type), TypeKind::Enum)
+        << "a fixed-type enumeration's constant is the enumerated type";
+    EXPECT_EQ(std::string{interner.name(fa->type)}, "F")
+        << "…the enumeration `F` itself";
 }
 
 // Lift-to-enclosing collision: `int A; enum E { A };` must emit
@@ -9974,7 +9990,12 @@ TEST(HirLoweringC, EnumConditionTakesTheTruthinessChokepointAtEverySite) {
                     // The projection target is the enum's UNDERLYING integer
                     // (C 6.7.2.2), and the test itself is Bool — the two
                     // properties the MIR CondBr invariant depends on.
-                    EXPECT_EQ(ti.kind(res->hir.typeId(kids[0])), TypeKind::I32)
+                    // P68 round 12 (lane `cs`, the enumeration P1): that integer
+                    // is the type C's rule CHOSE for this enumeration — `unsigned
+                    // int`, since no value is negative (gcc 13.3.0, clang 18.1.3,
+                    // mingw-w64 13.2.0; lane `cs`'s `.temp/probe/ect8`) — where it
+                    // used to be the `int` every enumeration was laid out as.
+                    EXPECT_EQ(ti.kind(res->hir.typeId(kids[0])), TypeKind::U32)
                         << "the enum must project to its underlying integer, "
                            "not to Bool: a Cast-to-Bool lowers as Trunc and "
                            "would report the EVEN=4 enumerator as false";

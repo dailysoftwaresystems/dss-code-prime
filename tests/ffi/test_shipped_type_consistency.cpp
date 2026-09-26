@@ -230,11 +230,23 @@ std::size_t checkOneTarget(fs::path const& root, GrammarSchema const& sch,
     auto const rows = vocab.rows();
     ShippedTypeConsistency checker{interner, rows, ax.format};
 
+    // The axis's long-double format reaches the reader too (P68 round 12, S2a-1):
+    // a typedef or `signature` arm keyed `when: {longDoubleFormat}` is selected
+    // by it — the axis this sweep already enumerates for the vocabulary, now
+    // carried to the descriptors it checks. No language (no derived constant is
+    // realized) and no ABI typedefs: this sweep crosses every arch with every
+    // axis, including pairs no target declares, so it keeps the reads it made.
+    ShippedPairFacts const pairFacts{
+        nullptr, ax.dm, std::nullopt, {},
+        ax.ldf == LongDoubleFormat::None ? std::optional<LongDoubleFormat>{}
+                                         : std::optional<LongDoubleFormat>{ax.ldf}};
+
     std::size_t checked = 0;
     for (auto const& path : descriptors) {
         DiagnosticReporter readRep;   // read failures are a DIFFERENT invariant
         auto desc = readShippedLibDescriptor(path, interner, typeReg, readRep,
-                                             ax.dm, arch, ax.format, named);
+                                             ax.dm, arch, ax.format, named,
+                                             nullptr, &pairFacts);
         // A descriptor that does not READ is a different invariant (pinned by
         // test_shipped_lib_descriptor) — but it MUST NOT silently shrink this
         // sweep, so it is surfaced here rather than skipped in silence.

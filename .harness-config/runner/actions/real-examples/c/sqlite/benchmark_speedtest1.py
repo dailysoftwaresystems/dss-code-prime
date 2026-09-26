@@ -60,6 +60,17 @@ WHAT THE UNION DECIDED (each pinned by a self-test arm):
     `is_release` -- the newest RELEASE wins; a non-Release one is eligible only under
     DSS_ALLOW_NONRELEASE_COMPILER and is then SAID; an explicit --dss / DSS_BIN passes the SAME
     gate and still reports its build type.
+  * `--dss` beside a DSS_BIN naming a DIFFERENT binary is a usage error (2026-09-25): the
+    `speedtest1` runner's step names the leg's own compiler, `{product}`, and a variable set outside
+    the run naming another would leave the measured compiler a matter of precedence.
+  * The dss arm is the plan's ONE `required` arm (2026-09-25): a run in which it was not measured
+    exits 4 though every reference arm was (the core's R9), its report still written.
+  * The subject is the PINNED sqlite (2026-09-25): the default checkout is put on legs.json
+    `stageBuild.sqliteCommit` -- the revision the corpus and the round-close recompile compile --
+    before anything reads it (`subject_on_pin`); an explicit --sqlite-dir / SQLITE_DIR is measured
+    as-is. The plan carries the pin beside the head it read, and the report names that head and
+    whether it IS the pin, in the .json and the .md alike (the core's R10): an off-pin number cannot
+    pass for an on-pin one.
   * `CC` still pins one reference (the .sh), but the NOT PROBED note names the variable that did
     it (the .sh blamed `--cc`); a pin that is neither a file nor a name on PATH is refused.
   * Every reference that resolved but would not answer `--version` is UNUSABLE, and "none usable"
@@ -77,9 +88,12 @@ Refusal ids of the plan writer: W1 no reference compiler record reached the writ
 manifest is unreadable or lacks sources/includes/defines · W3 the plan cannot be written.
 
 CLI (the .sh's flags): see USAGE below, or `--help`. Exit codes: 0 measured (or `--derive-only`
-complete) · 1 a refusal · 2 usage · 3 no compiler produced a binary (the measurement core's).
-Environment: SQLITE_DIR, SRC_DIR (default: the tree this file lives in), DSS_BIN, CC,
-DSS_ALLOW_NONRELEASE_COMPILER, DSS_CONFIG_ROOT.
+complete) · 1 a refusal · 2 usage · 3 no compiler produced a binary · 4 dsscp's arm was not
+measured, the report written and naming why (3 and 4 are the measurement core's) · 5 another
+harness run holds the shared sqlite clone the default checkout is (first stderr line
+`DSS-CLONE-LOCK-BLOCKED`, the clone lock's contract; not 3, which is the core's).
+Environment: SQLITE_DIR, SQLITE_REPO_URL (the origin a default checkout is cloned from), SRC_DIR
+(default: the tree this file lives in), DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER, DSS_CONFIG_ROOT.
 
 `--self-test` (alias `--selftest`): every check of both retired drivers plus the negatives they
 lacked, counted against EXPECTED_ARMS; summary `passed=N failed=N skipped=N`, exit 0 only when
@@ -160,7 +174,23 @@ def _stage():
     return _STAGE
 
 
+_PROCS = None
+
+
+def _procs():
+    """`sqlite_procs` -- the owner of the shared sqlite clone's lock -- loaded when a POSIX host's
+    default checkout, which IS that clone, is first put on the pin."""
+    global _PROCS
+    if _PROCS is None:
+        _PROCS = _sibling("sqlite_procs")
+    return _PROCS
+
+
 DASH = C.DASH
+# A blocked shared clone (`sqlite_procs.CloneLock`, taken for a POSIX host's default checkout): the lock's
+# contract puts DSS-CLONE-LOCK-BLOCKED first on stderr; the exit code is this program's own, since 3 is the
+# measurement core's "no compiler produced a binary".
+EXIT_CLONE_BLOCKED = 5
 ARTIFACT_NAME = "speedtest1"
 MAIN_TU = "speedtest1.c"
 CLI_MAIN_TU = "shell.c"
@@ -214,13 +244,19 @@ Benchmark DSS Code Prime against the reference C compilers (the catalogue gcc, c
 whichever this host has -- and MSVC cl.exe on Windows) building and running SQLite's own
 test/speedtest1.c FROM FULL SOURCE, and print the measurement.
 
-  --sqlite-dir DIR      the SQLite checkout, used AS-IS (never switched, pulled or cleaned).
-                        Default: $SQLITE_DIR, else ~/src/sqlite (POSIX) or C:\Source\sqlite
-                        (Windows). On Windows it must be on a LOCAL disk: a UNC path is refused.
+  --sqlite-dir DIR      the SQLite checkout, used AS-IS (never switched, pulled or cleaned); the
+                        report says when its head is NOT the pinned revision. Default: $SQLITE_DIR,
+                        likewise as-is; else ~/src/sqlite (POSIX) or C:\Source\sqlite (Windows),
+                        put on the pin first -- legs.json stageBuild.sqliteCommit, the revision the
+                        corpus and the round-close recompile compile (fetched only when absent,
+                        never pulled). On Windows it must be on a LOCAL disk: a UNC path is refused.
   --dss-src DIR         the DSS checkout whose build trees hold dsscp and whose src/dss-config is
                         the default config root. Default: $SRC_DIR, else the tree this file is in.
   --dss PATH            the dsscp to measure. Default: $DSS_BIN, else the newest RELEASE dsscp
-                        under <dss-src>/build, its build type READ from its own CMake tree.
+                        under <dss-src>/build, its build type READ from its own CMake tree. The
+                        `speedtest1` runner's step passes the leg's own, {product}; a DSS_BIN
+                        naming a DIFFERENT binary beside it is a usage error -- one compiler,
+                        named once.
   --out DIR             every derived file and the report. Default: <sqlite-dir>/bld-dss-bench.
   --plan FILE           where the plan is written. Default: <out>/benchmark-plan.json.
   --target SPEC         the <arch>:<format> of the DSS arm. Default: the one leg of legs.json that
@@ -241,11 +277,13 @@ test/speedtest1.c FROM FULL SOURCE, and print the measurement.
   --self-test           (alias --selftest) prove every check refuses what it must.
   -h, --help            this text.
 
-environment: SQLITE_DIR, SRC_DIR, DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER (1/true/yes: a
+environment: SQLITE_DIR, SQLITE_REPO_URL, SRC_DIR, DSS_BIN, CC, DSS_ALLOW_NONRELEASE_COMPILER (1/true/yes: a
 non-Release dsscp becomes ELIGIBLE, never preferred, and is said), DSS_CONFIG_ROOT (the directory
 that CONTAINS src/dss-config; honoured on every host).
 exit: 0 measured (or --derive-only complete) - 1 refused - 2 usage - 3 no compiler produced a
-binary (the measurement core's)."""
+binary - 4 dsscp's arm was not measured, the report written and naming why (3 and 4 are the
+measurement core's) - 5 another harness run holds the shared sqlite clone (first stderr line
+DSS-CLONE-LOCK-BLOCKED)."""
 
 
 class UsageError(Exception):
@@ -324,8 +362,9 @@ def check_subject(sqlite_dir):
     """-> the path of test/speedtest1.c, or a refusal naming what is missing."""
     if not os.path.isdir(sqlite_dir):
         die("no SQLite checkout at %s\n      Point --sqlite-dir (or $SQLITE_DIR) at one, or clone "
-            "https://github.com/sqlite/sqlite there.\n      The checkout is used AS-IS and never "
-            "switched or pulled -- a probe measures the tree exactly as it stands." % sqlite_dir)
+            "https://github.com/sqlite/sqlite there.\n      A checkout named so is used AS-IS and never "
+            "switched or pulled -- a probe measures the tree exactly as it stands (the default checkout "
+            "is put on the pin, and cloned when absent)." % sqlite_dir)
     speedtest = os.path.join(sqlite_dir, "test", MAIN_TU)
     if not os.path.isfile(speedtest):
         die("the benchmark's subject is missing: %s\n      That file IS SQLite's own performance "
@@ -347,6 +386,44 @@ def sqlite_head(sqlite_dir):
         return head[0].strip(), ""
     return "UNKNOWN", ("git rev-parse --short HEAD exited %d: %s"
                        % (r.rc, C.first_lines(r.err or r.out, 1) or "(no output)"))
+
+
+def subject_on_pin(sqlite_dir, pin, host, log, held, checkout=None, lock_factory=None):
+    """The DEFAULT checkout, put on the pin (2026-09-25): the benchmark measures the ONE sqlite revision
+    the corpus and the round-close recompile compile -- legs.json `stageBuild.sqliteCommit` -- through
+    the stage's own checkout (`sqlite_stage.clone_or_update(..., commit=)`: cloned when absent, the pin
+    fetched only when the clone lacks it, never pulled, DETACHED). On a POSIX host that checkout IS the
+    corpus's shared clone, so it moves under the clone's WRITE lock, which is then DOWNGRADED to READ
+    and kept -- in `held`, which the caller releases -- for as long as the benchmark compiles from it:
+    a run of another pin waits for the measurement instead of moving its subject underneath it. A
+    Windows host's default checkout is its own (the clone lock is POSIX-only), so it takes none.
+    `checkout` / `lock_factory` are the contract suite's stand-ins."""
+    url = C.env("SQLITE_REPO_URL").strip() or _stage().DEFAULT_SQLITE_REPO_URL
+    log.info("sqlite    : the default checkout %s goes on the pinned %s" % (sqlite_dir, pin[:12]))
+    lock = None
+    if host != "windows":
+        lock = (lock_factory or _procs().CloneLock)(sqlite_dir)
+        lock.write("benchmark_speedtest1.py (putting the default checkout on the pin)", log)
+        held.append(lock)
+        log.info("clone lock: WRITE on %s" % sqlite_dir)
+    (checkout or _stage().clone_or_update)(url, sqlite_dir, log=log, commit=pin)
+    if lock is not None:
+        lock.read("benchmark_speedtest1.py (measuring the pinned sqlite)", log)
+        log.info("clone lock: READ on %s, held until the measurement ends" % sqlite_dir)
+
+
+def measured_subject(explicit, host, pin, log, held, checkout=None, lock_factory=None):
+    """-> the sqlite checkout the benchmark measures. An EXPLICIT one -- --sqlite-dir, or SQLITE_DIR,
+    its variable (one knob, two channels: which channel named a tree must not decide whether it is
+    moved) -- is measured AS-IS, never switched, pulled or cleaned: a deliberate experiment on another
+    tree, which the report names as NOT the pin when it is not. With neither, this host's default
+    checkout, put on the pin first (`subject_on_pin`). A UNC path is refused before anything is
+    written."""
+    d = os.path.abspath(os.path.expanduser(explicit or default_sqlite_dir(host)))
+    refuse_unc(d, host, "the SQLite checkout")
+    if not explicit:
+        subject_on_pin(d, pin, host, log, held, checkout, lock_factory)
+    return d
 
 
 def require_tools(names, which=shutil.which):
@@ -774,7 +851,7 @@ def check_capabilities(defines, required, make_options, recipe):
     if missing_core:
         die("the derived define set has no %s. Without it ext/icu/icu.c demands <unicode/*.h>.\n"
             "      That means the -D tokens came off the link line alone: check that the recipe was "
-            "derived\n      with --always-make and the recipe token scope. Recipe: %s" % (CORE_DEFINE, recipe))
+            "derived\n      with always_make and token_scope='recipe'. Recipe: %s" % (CORE_DEFINE, recipe))
     missing = _stage().missing_capabilities(defines, required)
     if missing:
         die("the derived recipe is MISSING declared capabilities:%s\n      declared (legs.json "
@@ -1103,7 +1180,7 @@ def format_output_extension(config_root, spec):
     return ext
 
 
-def write_plan(path, *, manifest, sqlite_dir, sqlite_head, dss, config_root, target, refs,
+def write_plan(path, *, manifest, sqlite_dir, sqlite_head, sqlite_pin, dss, config_root, target, refs,
                link_flags, size, testset, build_repeats, run_repeats, jobs_arms, out_dir):
     """The plan `speedtest1_bench.py` reads. Its sources/includes/defines are READ BACK OUT OF THE
     MANIFEST -- the one set the declared transform produced, handed to every arm. One unix-cc arm
@@ -1129,9 +1206,13 @@ def write_plan(path, *, manifest, sqlite_dir, sqlite_head, dss, config_root, tar
             "defines": list(m["defines"]),
             "sqliteSrc": sqlite_dir,
             "upstreamCommit": sqlite_head,
+            # the pin (legs.json stageBuild.sqliteCommit): the core REPORTS whether the head above IS it (R10)
+            "sqlitePin": sqlite_pin,
         },
         "compilers": [
             {"id": "dss", "kind": "dss", "label": "DSS Code Prime", "bin": dss,
+             # the arm this benchmark is FOR: the core exits 4 when it was not measured (its R9)
+             "required": True,
              "manifest": manifest, "config": "release", "configRoot": config_root,
              # the artefact path is read back from `dsscp: artifact <spec> <path>`, keyed on it
              "target": target, "artifactName": ARTIFACT_NAME,
@@ -1163,7 +1244,8 @@ def write_plan(path, *, manifest, sqlite_dir, sqlite_head, dss, config_root, tar
 
 def measure(plan_path, out_dir, core=None, python=sys.executable):
     """`speedtest1_bench.py --plan`, natively, its output straight to this console -> its exit
-    code (0 measured, 1 refused, 2 usage, 3 no arm produced a binary)."""
+    code (0 every required arm measured, 1 refused, 2 usage, 3 no arm produced a binary, 4 the
+    required arm -- dsscp's -- was not measured; the report is still written and names why)."""
     argv = [python, core or C.BENCH_CORE, "--plan", plan_path,
             "--json-out", os.path.join(out_dir, "benchmark-speedtest1.json"),
             "--md-out", os.path.join(out_dir, "benchmark-speedtest1.md")]
@@ -1176,16 +1258,31 @@ def measure(plan_path, out_dir, core=None, python=sys.executable):
 
 # ── the two ways this program runs ───────────────────────────────────────────────────
 
-def run_measuring_host(args, host, log=C.LOG):
+def run_measuring_host(args, host, log=C.LOG, body=None):
+    """The measuring host's run. The clone lock its subject took -- a POSIX host's default checkout is
+    the corpus's shared clone (`subject_on_pin`) -- is released however the run ends. `body` is the
+    contract suite's stand-in."""
+    held = []
+    try:
+        return (body or _measure_on_host)(args, host, log, held)
+    finally:
+        for lock in reversed(held):
+            lock.release()
+
+
+def _measure_on_host(args, host, log, held):
     arch = C.host_arch()
     log.step("1/4  Resolve the subject, the compiler and the reference toolchains (%s/%s host)"
              % (host, arch))
-    sqlite_dir = os.path.abspath(os.path.expanduser(
-        args.sqlite_dir or C.env("SQLITE_DIR").strip() or default_sqlite_dir(host)))
-    refuse_unc(sqlite_dir, host, "the SQLite checkout")
+    resolver = C.Resolver(host, arch)
+    # the pin, read FIRST: the default checkout goes on it before anything reads the subject
+    stage = stage_build(resolver)
+    pin = stage["sqlite_commit"]
+    sqlite_dir = measured_subject(args.sqlite_dir or C.env("SQLITE_DIR").strip(), host, pin, log, held)
     check_subject(sqlite_dir)
     head, why = sqlite_head(sqlite_dir)
-    log.info("sqlite    : %s  (upstream %s%s)" % (sqlite_dir, head, (" %s %s" % (DASH, why)) if why else ""))
+    log.info("sqlite    : %s  (upstream %s%s; the pin is %s)"
+             % (sqlite_dir, head, (" %s %s" % (DASH, why)) if why else "", pin[:12]))
     if host == "windows":
         if not shutil.which("wsl.exe"):
             die("wsl.exe not found.\n      That is WHERE THIS HOST FINDS ITS POSIX TOOLCHAIN, not a "
@@ -1203,7 +1300,6 @@ def run_measuring_host(args, host, log=C.LOG):
     dss_flag, dss_env = args.dss, C.env("DSS_BIN").strip()
     compiler = select_dss(repo_root, dss_flag or dss_env, "--dss" if dss_flag else "DSS_BIN", allow, log)
     config_root = COMP.pin_config_root(repo_root, log)
-    resolver = C.Resolver(host, arch)
     legs = leg_catalogue(resolver)
     spec = args.target or native_leg(legs, "%s/%s" % (host, arch))["spec"]
     facts = with_overrides(leg_facts(legs, spec), args.recipe_transform, args.stack_reserve, log)
@@ -1242,14 +1338,13 @@ def run_measuring_host(args, host, log=C.LOG):
         log.ok("subject derived: %d TUs and %d include dirs, every one present on this host" % (n_src, n_inc))
     else:
         log.step("2/4  Derive the full-source subject (in this process)")
-        stage = stage_build(resolver)
         derived = derive(DeriveConfig(sqlite_dir, out_dir, spec, facts.transform, facts.reserve,
                                       stage, C.cpu_count(), "posix", default_tools(sqlite_dir),
                                       None, log))
         manifest = derived.manifest
 
     log.step("3/4  Write the benchmark plan")
-    plan = write_plan(plan_path, manifest=manifest, sqlite_dir=sqlite_dir, sqlite_head=head,
+    plan = write_plan(plan_path, manifest=manifest, sqlite_dir=sqlite_dir, sqlite_head=head, sqlite_pin=pin,
                       dss=compiler.path, config_root=config_root, target=spec, refs=refs,
                       link_flags=facts.link_flags,
                       size=args.size if args.size is not None else DEFAULTS["size"],
@@ -1358,6 +1453,10 @@ def parse_args(argv):
     args = build_parser().parse_args(list(argv))
     if args.self_test and len(argv) != 1:
         raise UsageError("--self-test takes no other argument")
+    dss_env = C.env("DSS_BIN").strip()
+    if args.dss and dss_env and dss_env != args.dss:
+        raise UsageError("--dss names %s and DSS_BIN names %s -- one compiler, named once: unset DSS_BIN "
+                         "or drop --dss" % (args.dss, dss_env))
     if args.recipe_transform is not None and args.recipe_transform not in generator_transforms():
         raise UsageError("--recipe-transform '%s' is not a transform the manifest generator implements "
                          "(%s)" % (args.recipe_transform, ", ".join(generator_transforms())))
@@ -1408,6 +1507,9 @@ def main(argv=None):
         if host != "windows" and style == "windows":
             return run_derive_half(args)
         return run_measuring_host(args, host)
+    except C.CloneLockBlocked as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return EXIT_CLONE_BLOCKED
     except C.HarnessDie as exc:
         print(" ✗ ERROR: %s" % exc, file=sys.stderr, flush=True)
         return exc.exit_code
@@ -1430,6 +1532,8 @@ def main(argv=None):
 # lacks is a NAMED, counted SKIP. An arm asserting an ABSENCE also proves its negative can occur.
 
 EXPECTED_ARMS = 105        # 22 sh + 6 ps + 1 core + 76 new
+# the pin the plan-writer arms hand over: a FULL sha, as legs.json declares one
+_PIN_FX = "0123456789abcdef0123456789abcdef01234567"
 
 _SKIP = object()
 
@@ -2287,7 +2391,7 @@ def _st_plan(A, fx):
     _write_json(os.path.join(fmts, "pe64-x86_64-windows-exec.format.json"),
                 {"outputExtension": ".pe-from-config"})
     path = os.path.join(d, PLAN_FILE)
-    plan = write_plan(path, manifest=man, sqlite_dir="/s", sqlite_head="abc1234", dss="/d/dsscp",
+    plan = write_plan(path, manifest=man, sqlite_dir="/s", sqlite_head="abc1234", sqlite_pin=_PIN_FX, dss="/d/dsscp",
                       config_root=cfg_root, target="x86_64:elf64-x86_64-linux-exec", refs=refs,
                       link_flags=["-lm", "-ldl", "-lpthread"], size=25, testset="", build_repeats=3,
                       run_repeats=5, jobs_arms=[1, 4], out_dir=d)
@@ -2296,33 +2400,37 @@ def _st_plan(A, fx):
     back = json.loads(raw.decode("utf-8"))
     ids = [c["id"] for c in back["compilers"]]
     A.arm("n61 the plan's subject is READ BACK from the manifest, one unix-cc arm per reference, the "
-          "msvc arm always, the dss arm pinned to its config root and target; LF, json round trip",
+          "msvc arm always, the dss arm pinned to its config root and target and the ONLY one REQUIRED "
+          "(the core's R9), and the subject names the pin (the core's R10); LF, json round trip",
           lambda: (back == plan and back["subject"]["tus"] == ["/s/a.c", "/s/test/speedtest1.c"]
                    and back["subject"]["defines"] == ["SQLITE_CORE", "X=1"] and ids == ["dss", "gcc", "clang", "msvc"]
                    and back["compilers"][0]["configRoot"] == cfg_root and back["compilers"][0]["manifest"] == man
+                   and back["compilers"][0]["required"] is True
+                   and back["subject"]["sqlitePin"] == _PIN_FX
+                   and not any("required" in c for c in back["compilers"][1:])
                    and back["compilers"][2]["version"] == "18.1.3" and back["compilers"][1]["linkFlags"]
                    == ["-lm", "-ldl", "-lpthread"] and back["workload"] == {"size": 25, "testset": None, "verify": True}
                    and b"\r" not in raw, ids))
-    w1 = _dies(lambda: write_plan(os.path.join(d, "p1.json"), manifest=man, sqlite_dir="/s", sqlite_head="x",
+    w1 = _dies(lambda: write_plan(os.path.join(d, "p1.json"), manifest=man, sqlite_dir="/s", sqlite_head="x", sqlite_pin=_PIN_FX,
                                   dss="/d", config_root="/r", target="t", refs=[], link_flags=[], size=1,
                                   testset="", build_repeats=1, run_repeats=1, jobs_arms=[1], out_dir=d))
     A.arm("n62 an empty reference list is refused under the WRITER's own id (W1), not R7",
           lambda: (w1 is not None and w1.startswith("W1 ") and "R7" not in w1, w1))
     bad = os.path.join(d, "bad.json")
     _write_json(bad, {"sources": ["/s/a.c"], "defines": []})
-    w2 = _dies(lambda: write_plan(os.path.join(d, "p2.json"), manifest=bad, sqlite_dir="/s", sqlite_head="x",
+    w2 = _dies(lambda: write_plan(os.path.join(d, "p2.json"), manifest=bad, sqlite_dir="/s", sqlite_head="x", sqlite_pin=_PIN_FX,
                                   dss="/d", config_root="/r", target="t", refs=refs, link_flags=[], size=1,
                                   testset="", build_repeats=1, run_repeats=1, jobs_arms=[1], out_dir=d))
     A.arm("n63 a manifest without its includes list is refused (W2)",
           lambda: (w2 is not None and w2.startswith("W2 ") and "'includes'" in w2, w2))
 
     def exe_suffix_from_config():
-        pe = write_plan(os.path.join(d, "p-pe.json"), manifest=man, sqlite_dir="/s", sqlite_head="x",
+        pe = write_plan(os.path.join(d, "p-pe.json"), manifest=man, sqlite_dir="/s", sqlite_head="x", sqlite_pin=_PIN_FX,
                         dss="/d", config_root=cfg_root, target="x86_64:pe64-x86_64-windows-exec",
                         refs=refs, link_flags=[], size=1, testset="", build_repeats=1,
                         run_repeats=1, jobs_arms=[1], out_dir=d)
         gone = _dies(lambda: write_plan(os.path.join(d, "p-w4.json"), manifest=man, sqlite_dir="/s",
-                                        sqlite_head="x", dss="/d", config_root=cfg_root,
+                                        sqlite_head="x", sqlite_pin=_PIN_FX, dss="/d", config_root=cfg_root,
                                         target="arm64:macho64-arm64-darwin-exec", refs=refs,
                                         link_flags=[], size=1, testset="", build_repeats=1,
                                         run_repeats=1, jobs_arms=[1], out_dir=d))

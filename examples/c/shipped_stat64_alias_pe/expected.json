@@ -1,0 +1,13 @@
+{
+  "$comment": "P68 round 11. `struct stat64`, `stat64()` and `fstat64()` on pe: mingw-w64's `_mingw_stat64.h` maps the POSIX spellings onto the UCRT's 64-bit record and entry points (`#define stat64 _stat64` and `#define fstat64 _fstat64`, both marked \"for POSIX\"), the UCRT's own headers spell neither, and under the disjunction the one reference that accepts the program makes it required. ✔MEASURED 2026-09-24: this main.c builds with no diagnostic under mingw-w64 gcc 13.2.0 `-std=c17 -Wall -Wextra -pedantic` and exits 42; MSVC refuses it (C2079, `uses undefined struct 'stat64'`). DSS models the reference's mechanism: two `when:{format:pe}` rows in sys/stat.json's `macros`, beside `__stat64`. RED-ON-DISABLE: deleting either row is a REFUSED compile (an incomplete `struct stat64`, an undeclared `stat64`/`fstat64`); the three cells aim at an alias present but WRONG — a pointer crossing between the two spellings with no cast, `stat64(\".\")` reading a directory mode, and `fstat64` on a stream this program wrote three bytes to reading `st_size == 3` — each worth 7 off 42. pe only: both names are pe aliases, and off pe `struct stat64` is glibc's different LFS record.",
+  "language": "c",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release", "mustDifferFromBaseline": true}
+  ]
+}

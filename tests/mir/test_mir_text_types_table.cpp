@@ -315,7 +315,7 @@ TEST(MirTextTypesTable, ATypesEntryOrReferenceTheWriterCannotProduceIsRefusedByN
         {"an INLINE union in a module (v1's spelling)", "", "union \"U\" {i32}", "defined once in the `types`"},
     }};
     auto const wrap = [](char const* types, char const* ty) {
-        std::string s{"dssir 2\n"};
+        std::string s{"dssir 3\n"};
         if (*types != '\0') s += std::string{"types {\n"} + types + "}\n";
         s += "symbols {\n  %1 \"g\"\n}\nmodule {\n  global %1 : ";
         return s + ty + " = zero\n}\n";
@@ -349,8 +349,72 @@ TEST(MirTextTypesTable, AVersionOneTextIsRefusedByTheVersionCheck) {
     bool named = false;
     for (auto const& d : r.all())
         named = named || (d.code == DiagnosticCode::I_TextVersionMismatch
-                          && d.actual.find("expected version 2") != std::string::npos);
+                          && d.actual.find("expected version 3") != std::string::npos);
     EXPECT_TRUE(named);
+}
+
+// P68 round 12 (lane `cs`, D-C-AN-ENUMS-FIXED-UNDERLYING-TYPE-LOST-ITS-NAME-IN-THE-CONVERSIONS): an
+// enumeration's FIXED underlying type is part of its identity — `enum E : long` and `enum E` are different
+// types (C23 6.2.7p1) — so v3 spells it, `enum "E" fixed i64`: the HIR tier's spelling without the vocabulary
+// tag, which no `.dssir` primitive carries. The module reads back with each enumeration fixed or not exactly
+// as it was written, at its width, and re-emits byte-identically; v2 wrote the fixed `enum E : int` and the
+// plain `enum E` as one `enum "E"`.
+TEST(MirTextTypesTable, AFixedUnderlyingTypeIsSpelledAndReadsBackFixed) {
+    TypeInterner in{CompilationUnitId{52}};
+    TypeId const wide  = in.enumType("Wide", TypeKind::I64, in.primitive(TypeKind::I64, "long"));
+    TypeId const atInt = in.enumType("AtInt", TypeKind::I32, in.primitive(TypeKind::I32));
+    TypeId const plain = in.enumType("Plain", TypeKind::I32);
+    TypeId const small = in.enumType("Small", TypeKind::U8);
+    std::array<TypeId, 4> const params{wide, atInt, plain, small};
+
+    RoundTrip const rt = roundTrip(moduleTaking(in, params), in);
+    ASSERT_EQ(rt.emitErrors, 0u) << rt.text;
+    ASSERT_TRUE(rt.parsed->ok) << rt.text;
+    EXPECT_EQ(rt.text, rt.again);
+    EXPECT_NE(rt.text.find("enum \"Wide\" fixed i64"), std::string::npos) << rt.text;
+    EXPECT_NE(rt.text.find("enum \"AtInt\" fixed i32"), std::string::npos) << rt.text;
+    EXPECT_NE(rt.text.find("enum \"Small\" : u8"), std::string::npos) << rt.text;
+    EXPECT_EQ(rt.text.find("enum \"Plain\" fixed"), std::string::npos) << rt.text;
+
+    TypeInterner const& back = rt.parsed->interner;
+    auto const ps = back.fnParams(rt.parsed->mir.funcSignature(rt.parsed->mir.funcAt(0)));
+    ASSERT_EQ(ps.size(), 4u);
+    ASSERT_TRUE(back.enumDeclaredUnderlying(ps[0]).valid());
+    EXPECT_EQ(back.kind(back.enumDeclaredUnderlying(ps[0])), TypeKind::I64);
+    ASSERT_TRUE(back.enumDeclaredUnderlying(ps[1]).valid());
+    EXPECT_EQ(back.kind(back.enumDeclaredUnderlying(ps[1])), TypeKind::I32);
+    EXPECT_FALSE(back.enumDeclaredUnderlying(ps[2]).valid());
+    EXPECT_FALSE(back.enumDeclaredUnderlying(ps[3]).valid());
+    EXPECT_EQ(static_cast<TypeKind>(back.scalars(ps[3])[0]), TypeKind::U8);
+    EXPECT_NE(ps[1].v, ps[2].v) << "a fixed `enum E : int` and a plain `enum E` are two types";
+}
+
+// P68 round 12 (lane `cs`, the enumeration P1): the compatible type a language CHOSE for an enumeration
+// without a fixed underlying type is spelled `enum "E" chosen <primitive>` (no tag, as every `.dssir`
+// primitive), a different record from `fixed` over the same type (C23 6.2.7p1); it reads back chosen, at its
+// width, and re-emits byte-identically.
+TEST(MirTextTypesTable, AChosenCompatibleTypeIsSpelledAndReadsBackChosen) {
+    TypeInterner in{CompilationUnitId{53}};
+    TypeId const u32   = in.primitive(TypeKind::U32);
+    TypeId const hue   = in.enumType("Hue", TypeKind::U32, u32, TypeInterner::EnumUnderlyingOrigin::Chosen);
+    TypeId const fixedU = in.enumType("FixedU", TypeKind::U32, u32);
+    std::array<TypeId, 2> const params{hue, fixedU};
+
+    RoundTrip const rt = roundTrip(moduleTaking(in, params), in);
+    ASSERT_EQ(rt.emitErrors, 0u) << rt.text;
+    ASSERT_TRUE(rt.parsed->ok) << rt.text;
+    EXPECT_EQ(rt.text, rt.again);
+    EXPECT_NE(rt.text.find("enum \"Hue\" chosen u32"), std::string::npos) << rt.text;
+    EXPECT_NE(rt.text.find("enum \"FixedU\" fixed u32"), std::string::npos) << rt.text;
+
+    TypeInterner const& back = rt.parsed->interner;
+    auto const ps = back.fnParams(rt.parsed->mir.funcSignature(rt.parsed->mir.funcAt(0)));
+    ASSERT_EQ(ps.size(), 2u);
+    ASSERT_TRUE(back.enumChosenUnderlying(ps[0]).valid());
+    EXPECT_FALSE(back.enumDeclaredUnderlying(ps[0]).valid());
+    EXPECT_EQ(back.kind(back.enumChosenUnderlying(ps[0])), TypeKind::U32);
+    ASSERT_TRUE(back.enumDeclaredUnderlying(ps[1]).valid());
+    EXPECT_NE(ps[0].v, ps[1].v) << "a chosen and a fixed `unsigned int` are two enumerations";
 }
 
 // ═══ ONE SPELLING, TWO TIERS ═════════════════════════════════════════════════════════════════════════════

@@ -558,7 +558,7 @@ TEST(EmitHirMode, VersionAndRealProducerRevisionHeadTheArtifact) {
     ASSERT_EQ(r.rc, 0) << r.err;
     // The version is the FIRST line, so a reader can decide whether to continue
     // before it has parsed anything it might misread.
-    EXPECT_TRUE(r.artifact.starts_with("dsshir 5\n")) << r.artifact.substr(0, 64);
+    EXPECT_TRUE(r.artifact.starts_with("dsshir 6\n")) << r.artifact.substr(0, 64);
     EXPECT_NE(r.artifact.find("\nproducer \""), std::string::npos) << r.artifact;
     // ⚠ NOT MERELY "a producer line exists". The emitter accepts an EMPTY
     // producer (hand-built test modules use it), so a routing defect that never
@@ -592,8 +592,8 @@ TEST(EmitHirMode, AMalformedOrAbsentVersionIsRefusedLoudlyOnRead) {
         {"the superseded v1", "dsshir 1\nsymbols {\n}\nmodule \"toy\" {\n}\n"},
         {"no version at all", "module \"toy\" {\n}\n"},
         {"a non-numeric version", "dsshir vNext\nmodule \"toy\" {\n}\n"},
-        {"no producer line", "dsshir 5\nmodule \"toy\" {\n}\n"},
-        {"an unquoted producer", "dsshir 5\nproducer 7\nmodule \"toy\" {\n}\n"},
+        {"no producer line", "dsshir 6\nmodule \"toy\" {\n}\n"},
+        {"an unquoted producer", "dsshir 6\nproducer 7\nmodule \"toy\" {\n}\n"},
     };
     for (auto const& arm : arms) {
         DiagnosticReporter r;
@@ -606,7 +606,7 @@ TEST(EmitHirMode, AMalformedOrAbsentVersionIsRefusedLoudlyOnRead) {
     // it, six failures are equally consistent with "this parser refuses
     // everything".
     DiagnosticReporter ok;
-    auto good = parseHir(std::string{"dsshir 5\nproducer \"ctl\"\nmodule \"toy\" {\n}\n"},
+    auto good = parseHir(std::string{"dsshir 6\nproducer \"ctl\"\nmodule \"toy\" {\n}\n"},
                          CompilationUnitId{1}, ok);
     EXPECT_TRUE(good->ok);
     EXPECT_EQ(good->producer, "ctl");
@@ -736,7 +736,7 @@ TEST(EmitHirMode, DashWritesTheArtifactToTheGivenStreamAndNoFile) {
     int const rc = p.emitHirText({src.string()}, "c", std::string{kTarget}, "-",
                                  out, err);
     EXPECT_EQ(rc, 0) << err.str();
-    EXPECT_TRUE(out.str().starts_with("dsshir 5\n")) << out.str().substr(0, 64);
+    EXPECT_TRUE(out.str().starts_with("dsshir 6\n")) << out.str().substr(0, 64);
     EXPECT_TRUE(err.str().empty()) << err.str();
     // A file literally named `-` is the failure this arm exists to catch.
     EXPECT_FALSE(fs::exists(fs::path{"-"}));
@@ -751,7 +751,7 @@ TEST(DumpHirKinds, InventoryNamesEveryCoreKindAndIsAttributed) {
     // It reports the format version too, because a consumer generating a
     // build-time coverage table needs to know which artifact grammar these kinds
     // belong to.
-    EXPECT_NE(text.find("dsshir-format-version 5\n"), std::string::npos) << text;
+    EXPECT_NE(text.find("dsshir-format-version 6\n"), std::string::npos) << text;
 
     // ★ THE COUNT LINE MUST AGREE WITH THE ROWS. A truncated enumeration is the
     // dangerous failure here: a consumer treats this list as EXHAUSTIVE and
@@ -843,7 +843,7 @@ TEST(HirArtifactRoundTrip, AnArtifactCarryingATokenTheGrammarHasNoRuleForIsRefus
     // had no token for at all, and four shipped artifacts were refused by name.
     // Reproduced synthetically, because that particular hole is now closed.
     std::string const bad =
-        "dsshir 5\n"
+        "dsshir 6\n"
         "producer \"planted\"\n"
         "module \"C\" {\n"
         "  \x01\x02 not a production this grammar has\n"

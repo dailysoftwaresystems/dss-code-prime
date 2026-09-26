@@ -21,7 +21,7 @@
 // type tables (`builtinTypes` / `typeSpecifiers` `coreByDataModel`
 // overrides), the integer-literal ladder (`integerLiteralTyping`), the
 // usual-arithmetic-conversions block, and the shipped-lib descriptor
-// reader (`signatureByDataModel`) all resolve dataModel-dependent names
+// reader (a `signature` variant's `when: {dataModel}`) all resolve dataModel-dependent names
 // through the active model. The engine never branches on the format
 // NAME — only on this closed enum, which the format JSON declares.
 //
@@ -31,7 +31,7 @@
 // — the `object_format_kind.hpp` extraction precedent.
 //
 // Closed vocabulary (C-family width triples; values match the JSON
-// spellings used by `coreByDataModel` / `signatureByDataModel` keys):
+// spellings used by `coreByDataModel` keys and `when: {dataModel}` selectors):
 //   * LP64  — int 32, long 64, pointer 64. Linux / macOS / *BSD 64-bit.
 //   * LLP64 — int 32, long 32 (long long 64), pointer 64. 64-bit Windows.
 //   * ILP32 — int 32, long 32, pointer 32. 32-bit targets + wasm32.
@@ -177,6 +177,60 @@ longDoubleFormatName(LongDoubleFormat f) noexcept {
 [[nodiscard]] constexpr std::optional<LongDoubleFormat>
 longDoubleFormatFromName(std::string_view s) noexcept {
     return kLongDoubleFormatTable.fromName(s);
+}
+
+// ── P68 round 12 (lane `cs`): the per-format ENUMERATION COMPATIBLE-TYPE RULE ──
+//
+// C 6.7.2.2p4 (C23 6.7.3.3p13) leaves to the implementation which integer type an
+// enumeration WITHOUT a fixed underlying type is compatible with, and a PLATFORM
+// ABI fixes it: the Microsoft x64 ABI makes such an enumeration `int` (MSVC,
+// documented), while the SysV / AAPCS / Darwin conventions make it `unsigned int`
+// when no value is negative (gcc and clang, documented: "unsigned int if there are
+// no negative values in the enumeration, otherwise int"). The choice is observable
+// — an enum bit-field's SIGNEDNESS (a struct shared with code another compiler
+// built), the enumeration's arithmetic, `_Generic`, redeclarations — so, like
+// `bitFieldStrategy` and `longDoubleFormat`, it is a property of the OBJECT FORMAT,
+// declared as an OPTIONAL `"enumCompatibleTypeRule"` on `.format.json` (closed
+// enum; an unknown spelling fails the load). The FORMAT names the convention; the
+// LANGUAGE says which of its types each convention chooses
+// (`semantics.enumerationCompatibleTypes`, keyed by these spellings).
+//
+// ✔MEASURED 2026-09-24 (lane `cs`'s `.temp/probe/ect3`, `ect8`): gcc 13.3.0 and
+// clang 18.1.3 (LP64 ELF) and mingw-w64 13.2.0 choose `unsigned int` for `enum {
+// A = 1 }` (`_Generic`, `e > -1` false, a two-bit bit-field holds 3); MSVC 19.51
+// gives it `int` arithmetic (`e > -1` true, the bit-field reads -1).
+//
+// **`None` is the UNDECLARED sentinel** (wasm / spirv skeletons): a language that
+// declares ladders reports `S_EnumCompatibleTypeRuleUndeclared` for an enumeration
+// without a fixed type there, never a silent pick (the `LongDoubleFormat` shape).
+enum class EnumCompatibleTypeRule : std::uint8_t {
+    None = 0,  // format declares no rule
+    Msvc = 1,  // the Microsoft x64 ABI's: `int` while `int` holds every value
+    Gnu  = 2,  // SysV / AAPCS / Darwin (gcc, clang): `unsigned int` when no value is negative
+};
+
+// The ONE owner of the rule spellings — `None` deliberately NOT a row (see
+// `kLongDoubleFormatTable`'s note: omission is the only way to leave it undeclared).
+inline constexpr EnumNameTable<EnumCompatibleTypeRule, 2> kEnumCompatibleTypeRuleTable{{{
+    { EnumCompatibleTypeRule::Msvc, "msvc" },
+    { EnumCompatibleTypeRule::Gnu,  "gnu"  },
+}}};
+DSS_CHECK_ENUM_NAME_TABLE(kEnumCompatibleTypeRuleTable);
+
+[[nodiscard]] constexpr std::string_view
+enumCompatibleTypeRuleName(EnumCompatibleTypeRule r) noexcept {
+    // The `-Werror=switch` backstop — see `dataModelName`.
+    switch (r) {
+        case EnumCompatibleTypeRule::None:
+        case EnumCompatibleTypeRule::Msvc:
+        case EnumCompatibleTypeRule::Gnu:
+            break;
+    }
+    return kEnumCompatibleTypeRuleTable.nameOrEmpty(r);
+}
+[[nodiscard]] constexpr std::optional<EnumCompatibleTypeRule>
+enumCompatibleTypeRuleFromName(std::string_view s) noexcept {
+    return kEnumCompatibleTypeRuleTable.fromName(s);
 }
 
 } // namespace dss
