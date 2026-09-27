@@ -82,6 +82,73 @@ below is IN it.
 
 ## §0.0 — STATE
 
+### ★ P68 PR EXIT — READ THIS FIRST: the migrated sqlite action runs its own exit on all four hosts, SQLite's corpus is green everywhere at one pinned revision, and the benchmark found DSS compiling a fifth to a quarter slower than a month ago
+
+**THE PR EXIT, after round 13's commit `737078de`** — the regime of this PR's handoff: units on every leg, `veryquick`
+and `speedtest1` on the four release legs, the README; then PR #58 goes to the operator for merge (no auto-merge;
+`Run Pipes` is the operator's). Round 13's gate is the units (eight runs: 2539 / 2539 on the two Windows legs,
+2506 / 2506 on the six others). After it, only the sqlite action's Python (X1) and one C++ test file (X2, below)
+changed, and the eight `harness/` entries that read them were rebuilt and re-run on all eight legs: 8 of 8 on each
+(runs 20260927-031841-37f6aa2c and 20260927-032333-31eab60f).
+
+- **Two defects stopped the exit's first `veryquick` run on two of its four legs, and both are fixed in this commit**
+  (fold X1, lane `mig`, eleven files of the sqlite action, 14 mutants red on exactly their checks, controls green on the
+  Windows, Linux and Mac hosts):
+  - **The Mac's stage took Homebrew's newer Tcl 9.0 while every leg's pinned library is 8.6**, so the driver refused to
+    build, correctly (`D-HARNESS-SQLITE-STAGE-TCL-FOLLOWS-THE-HOST-NOT-THE-LEGS-PINNED-LIBRARIES`, P3, born closed). The
+    stage's unpinned choice followed whatever the host upgraded to. It now pins the Tcl that the legs' pinned library
+    names declare (`libtcl8.6.so`, `tcl86t.dll`, `libtcl8.6.dylib`), DERIVED rather than declared a second time;
+    disagreeing legs are refused, and `DSS_TCL_VERSION` may only restate it.
+  - **On the arm64 VPS the driver printed nothing while a qemu-launched corpus ran**, so DssHarness's 30-minute stall bound
+    ended a step that was progressing (`D-HARNESS-SQLITE-CORPUS-SILENT-ON-THE-DRIVER-OUTPUT-WHILE-IT-RUNS`, P3, born
+    closed). The corpus now reports progress only when its log grows — never a heartbeat — so silence still means no
+    progress; the driver's own per-segment bound fires first and names the stuck test, and the step declares its bound
+    above it. MEASURED: `fpconv1` under qemu takes about a minute; the tool's bound had counted thirty minutes of the
+    driver's silence.
+  - **X1 then broke a pin nobody had run**: `harness/test_sqlite_harness_legs` asserted that the Tcl refusal's advice
+    says `DSS_TCL_VERSION=8.6`, and X1 had changed that advice, on purpose, to name the legs' `libraries` block. Lane
+    `mig`'s controls ran the action's own self-tests and the repo-guard label, and my post-fold checks the same; neither
+    runs the C++ `harness/` entries, and a re-run of them on all eight legs found the red. Fold X2 points the pin's
+    needle at the new advice (its red-on-disable, run 20260927-025201-1e564c82, reddened exactly that test). ⚠ A fold
+    of the sqlite action's Python owes the `harness/` ctest entries too, not only the action's self-tests.
+- **`veryquick` on all four hosts, DSS `737078de`, `sqlite=d21bd37c7cfc`, 0 poisoned on every one, every numerator a named
+  non-DSS confound:** Windows 6 / 395,500 (elf64-x86_64) + 11 / 395,504 (elf64-arm64) + 3 / 394,554 (pe64); WSL
+  11 / 395,500 + 8 / 395,504 + 3 / 393,044 (pe64 under wine, three unit groups not reached, as before); the arm64 VPS
+  3 / 395,478 (elf64-x86_64 under qemu) + 3 / 395,482 (elf64-arm64); macOS 3 / 395,107 (arm64) + 3 / 395,103 (x86_64
+  under Rosetta). The CLI built on 5 of 5 targets on every host, its smoke gate 14 / 14 wherever it can run. Runs: the
+  four-leg run 20260926-232858-f49c4631; the WSL leg again alone, 20260927-005006-530766c5, because its first start
+  was refused by the shared sqlite clone's lock while the Windows leg's derive re-staged that clone once for the Tcl pin
+  (the lock is right to refuse; the harness's own four-leg run refusing its own leg is a disclosed row,
+  `D-HARNESS-SQLITE-FOUR-LEG-RUN-REFUSES-ITS-OWN-LEG-AT-THE-SHARED-WSL-CLONE`, P2).
+- **`speedtest1` on all four hosts, the first real run since the benchmark moved into DssHarness** (the tables are in the
+  README; the two local legs ran one at a time): DSS is behind every reference on every axis on every host, and DSS's
+  own `-j1` build is 21–25% slower than on 2026-08-28 on the three hosts whose toolchain did not change, while every
+  reference moved less than 2%; Windows rose 63%, but its dsscp is MSVC-built now and was MinGW-built then. It was already there at round 12's commit: a measurement-only worktree at `547f316f` built the same benchmark on WSL in 18.41 s against round 13's 18.68 s, within the references' spread in the same runs, so the rise is disclosed debt this exit found (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`, P2), not attributed to a commit yet.
+- **README**: the test bullet (2,539 on the Windows legs, 2,506 on the others, 33 guards; the line counts re-measured), the
+  sqlite paragraph (the pin replaces "re-clones upstream on every run"; the new `veryquick` figures), and the four
+  benchmark tables at one revision, with every claim the new numbers falsified removed ("fastest single-threaded on
+  Linux x86_64", "faster than gcc on Windows and arm64") and the `-j4` Amdahl figure corrected (25–29% serial, not half).
+- **The operator asked whether read-leg-path's host-name over-masking is a quick fix.** MEASURED: no. The redactor
+  already keeps a longer word; what it masks is a directory named exactly like the VPS's short name and a
+  hyphen-bounded prefix, and that over-masking is deliberate and pinned by a self-test arm, so a host name never slips
+  through. Changing it is a design decision about where a bare host name may stay unmasked: the next PR
+  (`D-HARNESS-READ-LEG-PATH-MASKS-A-SHORT-HOST-NAME-INSIDE-LONGER-WORDS`, P3, disclosed, its text corrected).
+- **DssHarness.** A second report is pending delivery beside the first: DssHarness honours a STEP-level `stallSeconds`
+  and `env` (X1 relies on the first), but `dssharness help runners` documents neither, nor their precedence over the
+  runner's and config's. The repo-harness session is not reachable from this session, so both reports wait in
+  `.temp/dssharness-reports/` for the operator to forward.
+- **Slips (mine):** twice an unpiped Python traceback printed the interpreter's path, which names the Windows account,
+  into my tool output (no file); two ledger notes and one row carried a hand-typed date one day ahead (the run ids are
+  UTC), corrected, and a stamp's date is now read too.
+
+**Registry.** ✔MEASURED at this commit against round 13's `737078de`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 617 at 737078de" — 5 new rows: 2 born closed (X1's, P3) and 3 `🔵 DISCLOSED` rows of debt this exit found and did not create (the compile-time rise, P2, measured at round 12's commit; the four-leg run's clone contention, P2; read-leg-path's over-masking, P3), 0 closed, 0 reopened, 0 dropped; counted 611 → 611. Against round 12's `547f316f`, the base of round 13's balance: 615 → 620 raw, 5 closed, 10 opened (1 created, 9 disclosed), counted −4. Banding **P0 0 · P1 62 · P2 211 · P3 332 · P4 11 · P5 4**; `read-anchors --lint` 0 findings.
+
+**NEXT — THE OPERATOR MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
+found: the compile-time rise (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`),
+the four-leg run refusing its own leg at the shared WSL clone, and read-leg-path's over-masking.
+
+---
+
 ### ★ P68 ROUND 13 — READ THIS FIRST: MSVC's sized integer suffixes compile with MSVC's meaning, a static initializer is folded by one constant evaluator or refused where it stands (`static int *p = &local;` no longer crashes the compiler), a fold's registry rows land as one rehearsed batch, and speedtest1 measures the pinned sqlite from inside the tree
 
 **THE LANES THIS COMMIT CARRIES**, in seven folds (F1–F7; F6 and F7 are the independent audit's fixes, below) and the

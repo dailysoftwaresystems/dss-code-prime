@@ -2437,7 +2437,7 @@ def ev_normal():
     def build():
         seen = {}
 
-        def runner(argv, cwd, env, log_path, stall, cap, settle, kill_tree, sweep, any_left):
+        def runner(argv, cwd, env, log_path, stall, cap, settle, kill_tree, sweep, any_left, progress=None):
             seen.update(argv=list(argv), log_path=log_path, size=os.path.getsize(log_path),
                         timeline=read(paths_box[0].timeline) if os.path.exists(paths_box[0].timeline) else "",
                         done=os.path.exists(paths_box[0].done))

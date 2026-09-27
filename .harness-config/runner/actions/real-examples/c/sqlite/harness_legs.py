@@ -7962,11 +7962,17 @@ def tcl_coherence(header_version, entries):
                     "TCL_MAJOR_VERSION>8); the library decides which it can "
                     "RESOLVE. Building anyway produces undefined-symbol errors "
                     "that read like a compiler defect.\n"
-                    "      Fix: DSS_TCL_VERSION=%s (stage the header this leg's "
-                    "PINNED library matches), then re-run. Pinning the header to "
-                    "the library is correct; pinning the library to this host is "
-                    "not — every leg's library is target-keyed and this host is "
-                    "not a target."
+                    "      Fix: the staged header follows the Tcl the legs' "
+                    "pinned libraries DECLARE (`--stage-build` tclVersion, "
+                    "derived by declared_tcl_version), so a library measuring "
+                    "Tcl %s under it is either DECLARED as another Tcl than its "
+                    "file is -- correct that leg's `libraries` block (its "
+                    "archive, member and importName) to the file it acquires -- "
+                    "or found on this host (a host-system / search-paths leg), "
+                    "whose Tcl the header then follows only when no leg pins "
+                    "one. Pinning the header to the library is correct; pinning "
+                    "the library to this host is not — every leg's library is "
+                    "target-keyed and this host is not a target."
                     % (label, why, _fwd(path), header_version,
                        facts["version"]))
     return (True, lines, warnings, "")
@@ -8547,7 +8553,8 @@ _STAGE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def stage_build(path=CATALOGUE):
-    """The declared sqlite stage build configuration. Raises LegError rather
+    """The declared sqlite stage build configuration, plus the Tcl version its headers
+    follow (`tclVersion`, derived from the legs by `declared_tcl_version`). Raises LegError rather
     than returning a default: a MISSING declaration must never read as "no
     extensions were wanted", which is precisely the state that let 362 of 1,241
     corpus files complete without asserting anything."""
@@ -8633,12 +8640,15 @@ def stage_build(path=CATALOGUE):
             "revision every stage compiles (got %r). Without it a stage pulls "
             "whatever upstream's default branch is that day, and the round-close "
             "recompile's subject moves under it." % (commit,))
+    # The Tcl the stage's headers follow: DERIVED from the legs, never declared here.
+    tcl_version, _tcl_rows = declared_tcl_version(load_catalogue(path))
     return {
         "configureFlags": flags,
         "optionDefines": defines,
         "requiredDefines": sorted(required),
         "capabilityWitnesses": dict(wit),
         "sqliteCommit": commit,
+        "tclVersion": tcl_version,
         # The single string handed to `make`. Assembled HERE so the
         # `-D` prefix is applied in exactly one place: a driver that spelled it
         # itself could disagree, and `make OPTIONS=SQLITE_ENABLE_STAT4` (no -D)
@@ -8646,6 +8656,45 @@ def stage_build(path=CATALOGUE):
         # ignored — a capability lost with no error anywhere.
         "makeOptions": " ".join("-D" + d for d in defines),
     }
+
+
+# ── THE Tcl THE STAGE COMPILES AGAINST: DERIVED from the legs' pinned libraries ──
+# ✔MEASURED 2026-09-26 (the PR exit, macos-arm64-release, host run 20260926-200852-837c9bd4): an UNPINNED
+# stage took its Tcl from the HOST -- PATH's tclsh, else the NEWEST installed one -- and once Homebrew's
+# `tcl-tk` was 9.0.3 the Mac's stage took it (the previous run took `tcl-tk@8` 8.6.18, still installed), so
+# the header followed the host's upgrade while every leg's library stayed the Tcl 8.6 its provider pins, and
+# the per-leg check (`tcl_coherence`) refused the run. Which Tcl the fixture is compiled against is a fact
+# the legs ALREADY DECLARE: each `pinned-archive` leg names its Tcl library, and that name carries its
+# version (`libtcl8.6.so`, `tcl86t.dll`, `@loader_path/libtcl8.6.dylib`). So it is DERIVED here, once, for
+# `--stage-build` (`tclVersion`), and never declared a second time: the library declarations own it.
+def declared_tcl_version(legs):
+    """The ONE Tcl version the stage's headers must follow -> (version, [(label, identity)]): the version
+    every `pinned-archive` leg's acquired Tcl library DECLARES, read from its declared identity (the member
+    `acquired_import_names` picks, parsed by `tcl_identity_version` -- the reader the coherence check applies
+    to the library's own bytes, which still vetoes a declaration its file does not bear out). ("", []) when
+    no leg pins a Tcl library: a `host-system` / `search-paths` leg's library is found on the host, whose Tcl
+    its header then follows. Raises LegError when a pinned Tcl library's identity names no version, or two
+    legs pin different versions: the headers are staged ONCE for every leg."""
+    rows = []
+    for leg in legs:
+        libs = (leg.get("build") or {}).get("libraries") or {}
+        if libs.get("provider") != "pinned-archive":
+            continue
+        ident, _z = acquired_import_names(leg)
+        ver = tcl_identity_version(ident)
+        if not ver:
+            raise LegError(
+                "leg '%s' pins a Tcl library whose declared identity %r names no Tcl version, so the stage "
+                "cannot follow it: the Tcl the fixture is compiled against is DERIVED from the legs' pinned "
+                "libraries (libtcl<X.Y>.so / .dylib, tcl<XY>[t].dll)" % (leg.get("label"), ident))
+        rows.append((leg.get("label"), ident, ver))
+    versions = sorted(set(v for _l, _i, v in rows))
+    if len(versions) > 1:
+        raise LegError(
+            "the legs pin %d DIFFERENT Tcl versions (%s), and the Tcl headers are staged ONCE for every leg, "
+            "so no header can match every leg's library:\n%s"
+            % (len(versions), ", ".join(versions), "\n".join("  %-16s %s (Tcl %s)" % r for r in rows)))
+    return (versions[0] if versions else ""), [(label, ident) for label, ident, _v in rows]
 
 
 def stage_build_json(sb):
@@ -12169,7 +12218,7 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     check("the stage-build JSON carries exactly the fields the driver reads",
           sorted(_sb_wire) == ["capabilityWitnesses", "configureFlags",
                                "makeOptions", "optionDefines", "requiredDefines",
-                               "sqliteCommit"],
+                               "sqliteCommit", "tclVersion"],
           "keys=%r" % (sorted(_sb_wire),))
     # And the values SURVIVE the round trip. "the fields are there" was already
     # true of an emitter that dropped the -D prefix; only reading the value back
@@ -12206,6 +12255,53 @@ def self_test(path=CATALOGUE, out=sys.stdout):
                 _pin_why = str(_exc)
             check("a stageBuild whose sqliteCommit is %s is REFUSED, naming the key" % _pin_label,
                   "sqliteCommit" in _pin_why, _pin_why or "accepted")
+        # ★ THE Tcl THE STAGE FOLLOWS (2026-09-26, the PR exit: an unpinned Mac stage took the host's Tcl
+        # 9.0.3 over the 8.6 every leg's library pins). DERIVED from the legs' pinned libraries -- the
+        # shipped catalogue's answer is every pinned leg's own declared Tcl, and a catalogue whose legs
+        # disagree, or whose pinned Tcl names no version, is REFUSED (the lint reports it: stage_build is
+        # its first finding).
+        _tcl_legs = load_catalogue(path)
+        _tcl_pinned = [(_l["label"], acquired_import_names(_l)[0]) for _l in _tcl_legs
+                       if ((_l.get("build") or {}).get("libraries") or {}).get("provider") == "pinned-archive"]
+        check("the stage-build's tclVersion is the ONE Tcl every pinned leg's library declares (the shipped "
+              "legs pin one: it is never empty here)",
+              bool(_tcl_pinned) and bool(sb.get("tclVersion"))
+              and all(tcl_identity_version(_i) == sb["tclVersion"] for _l, _i in _tcl_pinned)
+              and declared_tcl_version(_tcl_legs) == (sb["tclVersion"], _tcl_pinned),
+              "tclVersion=%r pinned=%r" % (sb.get("tclVersion"), _tcl_pinned))
+        _tcl_first = _tcl_pinned[0][0] if _tcl_pinned else ""
+        for _tcl_label, _tcl_ident, _tcl_need in (
+                ("a leg pinning ANOTHER Tcl (9.0)", "libtcl9.0.so", ("DIFFERENT Tcl versions", "9.0", "8.6")),
+                ("a pinned Tcl whose identity names NO version", "libtcl.so", ("names no Tcl version",))):
+            _tcl_cat = json.loads(json.dumps(_pin_doc))
+            for _l in _tcl_cat["legs"]:
+                if _l.get("label") != _tcl_first:
+                    continue
+                _tcl_names = set(((_l.get("build") or {}).get("libraries") or {}).get("tclNames") or [])
+                for _a in _l["build"]["libraries"]["acquire"]["archives"]:
+                    for _m in _a.get("members") or []:
+                        if _m.get("as") in _tcl_names:
+                            _m["importName"] = _tcl_ident
+            _tcl_path = os.path.join(_pin_dir, "legs-tcl-%d.json" % len(_tcl_ident))
+            with open(_tcl_path, "w", encoding="utf-8") as _fh:
+                json.dump(_tcl_cat, _fh)
+            try:
+                stage_build(_tcl_path)
+                _tcl_why = ""
+            except LegError as _exc:
+                _tcl_why = str(_exc)
+            check("%s is REFUSED by the stage build, naming it" % _tcl_label,
+                  bool(_tcl_first) and all(_n in _tcl_why for _n in _tcl_need + (_tcl_first,)),
+                  _tcl_why or "accepted")
+            check("... and the lint reports it", any("stageBuild:" in _f and _tcl_first in _f
+                                                     for _f in lint(_tcl_path)),
+                  "the catalogue copy %s" % os.path.basename(_tcl_path))
+        _tcl_host = json.loads(json.dumps(_tcl_legs))
+        for _l in _tcl_host:
+            _l["build"]["libraries"] = {"provider": "host-system", "tclNames": ["libtcl8.6.so"],
+                                        "zNames": ["libz.so.1"]}
+        check("no leg pinning a Tcl library derives NO version (the host's Tcl, which such a leg's library "
+              "follows)", declared_tcl_version(_tcl_host) == ("", []), repr(declared_tcl_version(_tcl_host)))
     finally:
         shutil.rmtree(_pin_dir, ignore_errors=True)
 
@@ -17705,9 +17801,10 @@ def self_test(path=CATALOGUE, out=sys.stdout):
     _ok, _lines, _warn, _fatal = tcl_coherence(
         "9.0", [_entry("elf64-arm64", "elf 8.6"), _entry("macho64-arm64", "macho 8.6")])
     check("a 9.0 header over a PINNED 8.6 library is FATAL", not _ok)
-    check("the refusal names the leg, both versions and the remedy",
+    check("the refusal names the leg, both versions and the remedy (the header "
+          "follows the legs' DECLARED Tcl; a skew is a declaration to correct)",
           all(t in _fatal for t in ("elf64-arm64", "9.0", "8.6",
-                                    "DSS_TCL_VERSION=8.6")),
+                                    "declared_tcl_version", "`libraries` block")),
           _fatal)
     check("the refusal names the SYMBOLS the skew is made of",
           all(n in _fatal for n in TCL9_ONLY_EXPORTS), _fatal)
@@ -18172,8 +18269,11 @@ def main(argv=None):
     p.add_argument("--stage-build", action="store_true",
                    help="print the declared sqlite stage build configuration — "
                         "the configure flags, the `make OPTIONS=` defines, the "
-                        "defines that MUST show up in the derived recipe, and "
-                        "the per-capability witness files. RUN-WIDE, not "
+                        "defines that MUST show up in the derived recipe, "
+                        "the per-capability witness files, the pinned sqlite "
+                        "commit, and the Tcl version the stage's headers follow "
+                        "(`tclVersion`, DERIVED from the legs' pinned Tcl "
+                        "libraries: `declared_tcl_version`). RUN-WIDE, not "
                         "per-leg: one staged tree feeds every leg, so the "
                         "capability set cannot be a leg property and must not "
                         "be a driver property. JSON on stdout "

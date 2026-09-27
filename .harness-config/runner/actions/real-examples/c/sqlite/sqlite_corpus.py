@@ -15,6 +15,10 @@ The RESUME DECISION (the strictly advancing boundary, the two inserted segments,
 reasons) is deliberately NOT here: it lives in `sqlite_units.py`, on top of these primitives,
 so there is one copy of the decision.
 
+The parser is ONE `SegmentParser` fed a line at a time (2026-09-26): `parse_segment` feeds it a whole
+log after the segment, and `LogFollower` feeds it the log AS IT GROWS for the corpus run's progress
+relay (`sqlite_units.CorpusProgress`), so a progress line and the verdict read one alphabet.
+
 THE FACT ALPHABET of one segment (the old .sh parser's letters, kept so a reader of either can
 map one to the other):
   A first_diag     the first non-blank line that is NOT the fixture doing its job
@@ -265,8 +269,157 @@ class SegmentFacts:
                    self.first_diag, len(self.failures)))
 
 
+class SegmentParser:
+    """THE rules of `parse_segment`, fed ONE line at a time -> `facts()` at any point.
+
+    ★ ONE PARSER, TWO READERS (2026-09-26, P68 PR exit): `parse_segment` feeds it a whole log after
+    the segment, and the corpus run's progress relay (`sqlite_units.CorpusProgress`) feeds it each
+    line AS THE FIXTURE WRITES IT, so what a progress line reports and what the verdict is judged on
+    are one alphabet read by one set of rules -- never a second, lighter reader that could count a
+    file the verdict does not. `last_file_ms` is the `<n>` of the last completed file's
+    `Time: <f> <n> ms` line (what a progress line prints beside the file). The rules and their ORDER
+    are `parse_segment`'s docstring's."""
+
+    def __init__(self):
+        self.diag = ""
+        self.blamed, self.files, self.inert, self.failures = [], [], [], []
+        self.summary, self.nerr, self.ntest = "", None, None
+        self.perm = self.last_test = ""
+        self.gave_up = False
+        self.ok = self.fx = self.pend = 0
+        self.tbseen = False
+        self.last_file_ms = ""
+
+    def feed_raw(self, raw):
+        """One line as a BINARY read yields it (its LF, when it has one, included)."""
+        self.feed_line(_strip_eol(raw).decode("utf-8", "replace"))
+
+    def feed_line(self, line):
+        """One decoded line, its end already removed: every rule, in order; a rule that consumes the
+        line returns (it hides the line from every rule below it)."""
+        is_time = line.startswith("Time: ")
+        is_ok = line.endswith(" Ok")
+        is_test = "..." in line and _RE_TESTNAME.match(line) is not None
+        if not self.diag and not is_time and not is_ok and not is_test \
+                and _RE_NONBLANK.search(line) and not _RE_SUMMARY.search(line):
+            d = line.replace("\t", " ")
+            self.diag = d[:DIAG_LIMIT] + TRUNCATION_SUFFIX if len(d) > DIAG_LIMIT else d
+        if is_time or is_ok or is_test:
+            self.tbseen = False
+        if '(file "' in line and not self.tbseen:
+            m = _RE_BLAME.search(line)
+            if m:
+                self.tbseen = True
+                b = m.group(1).replace("\t", " ")
+                if b:
+                    self.blamed.append(b)
+        if is_time:
+            f = _fields(line)
+            if len(f) == 4 and f[3] == "ms":
+                self.files.append(f[1])
+                self.last_file_ms = f[2]
+                if self.pend == 0:
+                    self.inert.append(f[1])
+                self.pend = 0
+                return
+        if line.startswith("*** Giving up"):
+            self.gave_up = True
+            return
+        if line.startswith("Failures on these tests:") \
+                or line.startswith("!Failures on these tests:"):
+            rest = line[_RE_FAILS_HEAD.match(line).end():]
+            self.failures.extend(n for n in _RE_BLANKS.split(rest) if n)
+            return
+        if is_ok:
+            self.ok += 1
+            first = _fields(line)
+            if not (first and first[0].endswith(TEARDOWN_TAILS)):
+                self.pend += 1
+        if line.startswith("! "):
+            m = _RE_BANG.match(line)
+            if m:
+                if m.group(1) == "expected":
+                    self.fx += 1
+                    self.pend += 1
+                f = _fields(line)
+                self.failures.append(f[1] if len(f) > 1 else "")
+                return
+        if " out of " in line:
+            m = _RE_SUMMARY.search(line)
+            if m:
+                self.summary, self.nerr, self.ntest = line, int(m.group(1)), int(m.group(2))
+                return
+        if "run_test" in line:
+            rest = line[_RE_PERM_LEAD.match(line).end():]
+            m = _RE_PERM.match(rest)
+            if m:
+                self.perm = m.group(1)
+                return
+        if is_test:
+            self.last_test = line.split("...", 1)[0]
+
+    def facts(self):
+        """The SegmentFacts of every line fed so far."""
+        return SegmentFacts(first_diag=self.diag, blamed=self.blamed, files=self.files, inert=self.inert,
+                            gave_up=self.gave_up, failures=self.failures, summary=self.summary,
+                            errors=self.nerr if self.summary else None,
+                            total=self.ntest if self.summary else None, permutation=self.perm,
+                            last_test=self.last_test, ok=self.ok, fail_markers=self.fx, trailing=self.pend)
+
+
+def running_test(partial):
+    """The test a fixture is RUNNING, from the log's unterminated last line: tester.tcl prints
+    `<name>...` with no newline before the test runs and its result (` Ok`, or a failure on the next
+    lines) after, so a partial line of that shape names the test in flight; "" otherwise."""
+    line = _strip_eol(partial or b"").decode("utf-8", "replace")
+    if line.endswith(" Ok") or "..." not in line or _RE_TESTNAME.match(line) is None:
+        return ""
+    return line.split("...", 1)[0]
+
+
+class LogFollower:
+    """A segment log read AS IT GROWS (the corpus run's progress relay reads it at every poll):
+    `feed(chunk)` takes the bytes the log gained since the previous call and feeds every line they
+    complete to ONE `SegmentParser`, keeping the unterminated tail; `finish()` feeds that tail as a
+    line (the segment has ended, and `parse_segment` reads an unterminated last line as one). After
+    `finish()`, `facts()` IS `parse_segment` over the same bytes, however they were chunked (this
+    module's self-test proves it over every chunk size). `running` names the test in flight."""
+
+    def __init__(self):
+        self.parser = SegmentParser()
+        self._pending = []          # the unterminated tail, as the chunks that carried it
+
+    def feed(self, chunk):
+        start = 0
+        while chunk:
+            nl = chunk.find(b"\n", start)
+            if nl < 0:
+                if start < len(chunk):
+                    self._pending.append(chunk[start:])
+                return
+            piece = chunk[start:nl + 1]
+            if self._pending:
+                piece = b"".join(self._pending) + piece
+                self._pending = []
+            self.parser.feed_raw(piece)
+            start = nl + 1
+
+    def finish(self):
+        if self._pending:
+            self.parser.feed_raw(b"".join(self._pending))
+            self._pending = []
+
+    def facts(self):
+        return self.parser.facts()
+
+    @property
+    def running(self):
+        return running_test(b"".join(self._pending))
+
+
 def parse_segment(log_path):
-    """ONE streaming pass over a segment log -> SegmentFacts. The logs reach 150 MB / 3.6M lines,
+    """ONE streaming pass over a segment log -> SegmentFacts (a `SegmentParser` fed every line). The
+    logs reach 150 MB / 3.6M lines,
     so the file is read in BINARY, line by line (LF only; one trailing CR removed; a lone CR does
     not end a line), each line decoded with errors replaced. The rules and their ORDER are the old
     bash parser's (a rule that consumed a line hid it from every rule below it):
@@ -287,83 +440,15 @@ def parse_segment(log_path):
       T  the text before the first `...` of a `<name>...` line
       R  the results counted since the last `Time:` line when the log ends
     A missing or unreadable log is refused (the segment runner always creates it)."""
-    diag = ""
-    blamed, files, inert, failures = [], [], [], []
-    summary, nerr, ntest = "", None, None
-    perm = last_test = ""
-    gave_up = False
-    ok = fx = pend = 0
-    tbseen = False
+    parser = SegmentParser()
     try:
         fh = open(log_path, "rb")
     except OSError as exc:
         C.die("could not read the segment log %s: %s" % (log_path, exc))
     with fh:
         for raw in fh:
-            line = _strip_eol(raw).decode("utf-8", "replace")
-            is_time = line.startswith("Time: ")
-            is_ok = line.endswith(" Ok")
-            is_test = "..." in line and _RE_TESTNAME.match(line) is not None
-            if not diag and not is_time and not is_ok and not is_test \
-                    and _RE_NONBLANK.search(line) and not _RE_SUMMARY.search(line):
-                d = line.replace("\t", " ")
-                diag = d[:DIAG_LIMIT] + TRUNCATION_SUFFIX if len(d) > DIAG_LIMIT else d
-            if is_time or is_ok or is_test:
-                tbseen = False
-            if '(file "' in line and not tbseen:
-                m = _RE_BLAME.search(line)
-                if m:
-                    tbseen = True
-                    b = m.group(1).replace("\t", " ")
-                    if b:
-                        blamed.append(b)
-            if is_time:
-                f = _fields(line)
-                if len(f) == 4 and f[3] == "ms":
-                    files.append(f[1])
-                    if pend == 0:
-                        inert.append(f[1])
-                    pend = 0
-                    continue
-            if line.startswith("*** Giving up"):
-                gave_up = True
-                continue
-            if line.startswith("Failures on these tests:") \
-                    or line.startswith("!Failures on these tests:"):
-                rest = line[_RE_FAILS_HEAD.match(line).end():]
-                failures.extend(n for n in _RE_BLANKS.split(rest) if n)
-                continue
-            if is_ok:
-                ok += 1
-                first = _fields(line)
-                if not (first and first[0].endswith(TEARDOWN_TAILS)):
-                    pend += 1
-            if line.startswith("! "):
-                m = _RE_BANG.match(line)
-                if m:
-                    if m.group(1) == "expected":
-                        fx += 1
-                        pend += 1
-                    f = _fields(line)
-                    failures.append(f[1] if len(f) > 1 else "")
-                    continue
-            if " out of " in line:
-                m = _RE_SUMMARY.search(line)
-                if m:
-                    summary, nerr, ntest = line, int(m.group(1)), int(m.group(2))
-                    continue
-            if "run_test" in line:
-                rest = line[_RE_PERM_LEAD.match(line).end():]
-                m = _RE_PERM.match(rest)
-                if m:
-                    perm = m.group(1)
-                    continue
-            if is_test:
-                last_test = line.split("...", 1)[0]
-    return SegmentFacts(first_diag=diag, blamed=blamed, files=files, inert=inert, gave_up=gave_up,
-                        failures=failures, summary=summary,
-                        errors=nerr if summary else None, total=ntest if summary else None,
-                        permutation=perm, last_test=last_test, ok=ok, fail_markers=fx, trailing=pend)
+            parser.feed_raw(raw)
+    return parser.facts()
 
 
 def zero_progress_signature(facts):
@@ -891,6 +976,59 @@ def _selftest_parser_edges(t, work):
     t.check("X21 a MISSING segment log is refused, never parsed as an empty one", refused)
 
 
+def _follower_facts(data, size):
+    """A LogFollower fed `data` in chunks of `size` bytes, then finished -> (facts, the `running` seen
+    just before the finish, the last file's ms)."""
+    fo = LogFollower()
+    for k in range(0, len(data), size):
+        fo.feed(data[k:k + size])
+    running = fo.running
+    fo.finish()
+    return fo.facts(), running, fo.parser.last_file_ms
+
+
+def _selftest_follower(t, work):
+    t.section("F   the log READ AS IT GROWS (the progress relay's reader) reaches parse_segment's facts")
+    logs = {"mirror": _MIRROR_SEGMENT_LOG,
+            "real wine abort (CRLF)": b"\r\n".join(_REAL_ABORT_SEGMENT_LOG) + b"\r\n",
+            "inert (LF)": ("\n".join(_INERT_LINES) + "\n").encode("utf-8"),
+            "crash, unterminated": ("\n".join(_CRASH_LINES)).encode("utf-8"),
+            "healthy (CRLF)": ("\r\n".join(_HEALTHY_LINES) + "\r\n").encode("utf-8")}
+    for name, data in sorted(logs.items()):
+        whole = parse_segment(_write(os.path.join(work, "follow-%d.log" % len(data)), data))
+        want = _project_parse(whole) + ["R %d" % whole.trailing]
+        sizes = sorted(set([1, 2, 3, 7, 64, len(data) or 1]))
+        got = dict((n, _follower_facts(data, n)) for n in sizes)
+        t.eq("F01 %s: fed in chunks of %s byte(s), every fact equals parse_segment's" % (name, sizes),
+             dict((n, want) for n in sizes),
+             dict((n, _project_parse(g[0]) + ["R %d" % g[0].trailing]) for n, g in got.items()))
+    t.eq("F02 the last completed file's `ms` is kept for the progress line",
+         ["12", "34", "7", "2"], [_follower_facts(b"Time: a.test 12 ms\n", 5)[2],
+                                  _follower_facts(b"Time: a.test 12 ms\nTime: b.test 34 ms\n", 3)[2],
+                                  _follower_facts(_MIRROR_SEGMENT_LOG[:_MIRROR_SEGMENT_LOG.index(b"*** Giving")]
+                                                  .replace(b"Time: swarmvtab.test 2 ms\n", b""), 9)[2],
+                                  _follower_facts(_MIRROR_SEGMENT_LOG, 11)[2]])
+    fo = LogFollower()
+    fo.feed(b"fpconv1-2.0... Ok\nfpconv1-3")
+    early = fo.running
+    fo.feed(b".0...")
+    mid, done_before = fo.running, fo.facts().ok
+    fo.feed(b" Ok\n")
+    t.eq("F03 the unterminated `<name>...` line names the test IN FLIGHT, and only that shape does",
+         ["", "fpconv1-3.0", 1, "", 2, "fpconv1-3.0"],
+         [early, mid, done_before, fo.running, fo.facts().ok, fo.facts().last_test])
+    t.eq("F04 running_test: a result line, a Time line, a diagnostic and nothing name no test",
+         ["", "", "", "", "a-1.1", "a-1.1"],
+         [running_test(b"a-1.1... Ok"), running_test(b"Time: a.test 1 ms"), running_test(b"boom"),
+          running_test(b""), running_test(b"a-1.1..."), running_test(b"a-1.1...\r")])
+    fo = LogFollower()
+    fo.feed(b"x-1... Ok\ny-2...")
+    before = fo.facts().ok
+    fo.finish()
+    t.eq("F05 finish() feeds the unterminated tail as a line (an aborted segment's last test is named)",
+         [1, 1, "y-2", ""], [before, fo.facts().ok, fo.facts().last_test, fo.running])
+
+
 def _selftest_resolver_and_lists(t):
     t.section("R   the aborting-file resolver")
     t.eq("R01 an empty name resolves to nothing", "", resolve_abort_file("", _MIRROR_LIST))
@@ -982,6 +1120,7 @@ def self_test():
                          ("parser pins", lambda: _selftest_parser_pins(t, work)),
                          ("discriminator", lambda: _selftest_discriminator(t, work)),
                          ("parser edges", lambda: _selftest_parser_edges(t, work)),
+                         ("follower", lambda: _selftest_follower(t, work)),
                          ("resolver", lambda: _selftest_resolver_and_lists(t)),
                          ("tree readers", lambda: _selftest_tree_readers(t, work))):
             try:

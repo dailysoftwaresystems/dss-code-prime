@@ -50,9 +50,12 @@ genuinely declaration-driven rather than "worked because the host happened to ma
   which is portable and self-excluding. ★ And keep the probe's own command line clear of the
   marker: `pgrep -f <marker>` matches the shell that carries `<marker>` in its argv and
   reports itself as a survivor, and it bites the status probes exactly the same way.
-- **Pin Tcl when the host's default disagrees with the legs' libraries** (`DSS_TCL_VERSION=8.6`).
-  Every leg's libtcl is 8.6; a host whose default Tcl is 9.0 will otherwise compile against a
-  9.0 header and link an 8.6 library. The per-leg coherence check now catches this and says so.
+- **The Tcl header follows the legs' pinned libraries, on every host, with no knob.** The stage
+  pins the Tcl every leg's pinned library declares (legs.json; `--stage-build` derives it), so a
+  host whose default Tcl is 9.0 still stages 8.6 headers while every libtcl is 8.6, and a host
+  without that Tcl installed is refused, naming what to install. `DSS_TCL_VERSION` may only
+  restate the legs' version (another value is refused). The per-leg coherence check still
+  measures each library's own bytes against the staged header.
 - **Capture rc DIRECTLY, never after a pipe.** `cmd | head; echo $?` reports *head's* status.
   This has produced false "clean" readings in this project more than once.
 - **A machine run must pull COMMITTED state**, so it cannot race local edits. That is also

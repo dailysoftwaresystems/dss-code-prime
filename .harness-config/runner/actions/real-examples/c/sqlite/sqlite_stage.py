@@ -630,8 +630,15 @@ def parse_stage_build(obj):
         C.die("harness_legs.py --stage-build returned no FULL sqliteCommit (got %r). %s\n      It is the ONE "
               "sqlite revision every stage compiles; without it the stage pulls whatever upstream's default "
               "branch is that day, and the round-close recompile's subject moves under it." % (commit, _CONTRACT))
+    # The Tcl the stage's headers follow, DERIVED by the resolver from the legs' pinned libraries ("" when no
+    # leg pins one). REQUIRED as a key: an answer without it cannot say whether the legs pin a Tcl.
+    tcl = obj.get("tclVersion")
+    if not isinstance(tcl, str) or (tcl and not re.match(r"^[0-9]+\.[0-9]+$", tcl)):
+        C.die("harness_legs.py --stage-build returned no usable tclVersion (got %r). %s\n      It is the Tcl every "
+              "leg's pinned library declares, which the staged headers must follow; without it the stage takes "
+              "whatever Tcl this host has." % (tcl, _CONTRACT))
     return {"configure_flags": list(flags), "make_options": mo, "required_defines": list(req),
-            "witnesses": dict(wit), "option_defines": list(opt), "sqlite_commit": commit}
+            "witnesses": dict(wit), "option_defines": list(opt), "sqlite_commit": commit, "tcl_version": tcl}
 
 
 def _parse_jobs(value):
@@ -671,6 +678,23 @@ class StageConfig:
         self.witnesses = sb["witnesses"]
         self.option_defines = sb["option_defines"]
         self.sqlite_commit = sb["sqlite_commit"]
+        # ★ THE Tcl THE STAGE COMPILES AGAINST (2026-09-26, the PR exit: an unpinned Mac stage took the host's
+        # newest Tcl, 9.0.3, over the 8.6 every leg's library pins, and the per-leg coherence check refused the
+        # run): the version every leg's pinned library DECLARES (`--stage-build` tclVersion, derived by the
+        # resolver), so the header follows the libraries the legs LINK and never the host's upgrades.
+        # DSS_TCL_VERSION (`tcl_version`) may restate it and is REFUSED when it names another; it is the pin
+        # only when no leg pins a Tcl library (their libraries are the host's, whose Tcl they follow).
+        self.tcl_declared = sb["tcl_version"]
+        explicit = (tcl_version or "").strip()
+        if self.tcl_declared and explicit and explicit != self.tcl_declared:
+            C.die("DSS_TCL_VERSION=%s names another Tcl than the %s every leg's pinned library declares (legs.json, "
+                  "derived by harness_legs.py --stage-build). The staged header must follow the library the legs "
+                  "LINK -- a header of another Tcl gates code on symbols that library does not export -- so the "
+                  "legs' version is the pin: unset DSS_TCL_VERSION, or set it to %s."
+                  % (explicit, self.tcl_declared, self.tcl_declared))
+        self.tcl_version = self.tcl_declared or explicit
+        self.tcl_pin_by = ("legs.json (the Tcl every leg's pinned library declares)" if self.tcl_declared
+                           else ("DSS_TCL_VERSION" if explicit else ""))
         self.tier = (tier or DEFAULT_TIER).strip()
         if not self.tier or "/" in self.tier or any(ch.isspace() for ch in self.tier):
             C.die("DSS_TIER='%s' is not a tier name (it names <sqlite>/test/<tier>.test)." % tier)
@@ -678,7 +702,6 @@ class StageConfig:
         self.jobs = default_jobs() if jobs is None else int(jobs)
         if self.jobs < 1:
             C.die("jobs=%d is below its minimum of 1." % self.jobs)
-        self.tcl_version = (tcl_version or "").strip()
         self.sqlite_repo_url = sqlite_repo_url or DEFAULT_SQLITE_REPO_URL
         self.copy_to_stage = bool(copy_to_stage)
         self.translate_for_host = translate_for_host or identity
@@ -1084,11 +1107,14 @@ def choose_tclsh(ctx):
 
 
 def ensure_tclsh(ctx):
-    """R56-R59. PINNED (DSS_TCL_VERSION): EXACTLY that version on PATH, through the shim when the
-    plain name is another one; nothing installed (an absent pin is the operator's decision).
-    UNPINNED: `choose_tclsh` -- PATH's tclsh >= 8.6, else an INSTALLED one >= 8.6 put first on the
-    run's PATH through the same shim a pin uses (and carried into configure, like a pin), else
-    install tcl. -> (sh, cfg): what configure must be told, ("", "") when PATH's tclsh is used."""
+    """R56-R59. PINNED -- by the Tcl every leg's pinned library declares (`--stage-build` tclVersion), or
+    by DSS_TCL_VERSION when no leg pins one (`StageConfig.tcl_pin_by` says which): EXACTLY that version
+    on PATH, through the shim when the plain name is another one; nothing installed (a pin the host
+    cannot satisfy is refused, naming it).
+    UNPINNED (no leg pins a Tcl and no DSS_TCL_VERSION): `choose_tclsh` -- PATH's tclsh >= 8.6, else an
+    INSTALLED one >= 8.6 put first on the run's PATH through the same shim a pin uses (and carried into
+    configure, like a pin), else install tcl. -> (sh, cfg): what configure must be told, ("", "") when
+    PATH's tclsh is used."""
     pin = ctx.cfg.tcl_version
     ver = tclsh_version(ctx) if ctx.which("tclsh") else ""
     if pin:
@@ -1096,18 +1122,20 @@ def ensure_tclsh(ctx):
         if ver != pin:
             pin_sh = tclsh_bin_for(ctx, pin)
             if not pin_sh:
-                C.die("DSS_TCL_VERSION=%s is pinned, but NO tclsh reporting %s was found.\n"
+                C.die("Tcl %s is pinned by %s, but NO tclsh reporting %s was found.\n"
                       "      tclsh on PATH  : %s (reports %s)\n"
                       "      tclConfig.sh   : %s\n"
                       "      searched       : each config's TCL_EXEC_PREFIX/bin + <prefix>/bin, 'tclsh%s' on\n"
                       "                       PATH, %s, then PATH 'tclsh'\n"
                       "      Install it (apt: tcl%s — brew: 'tcl-tk@8' for 8.6 / 'tcl-tk' for 9.x, both\n"
-                      "      KEG-ONLY), or unset DSS_TCL_VERSION. NOT continuing on a different Tcl: sqlite's configure,\n"
+                      "      KEG-ONLY)%s. NOT continuing on a different Tcl: sqlite's configure,\n"
                       "      make -n and mksqlite3c.tcl all run under this interpreter and bake ITS -I dirs into the\n"
                       "      recipe, so a mismatched tclsh silently builds the fixture against two different Tcls."
-                      % (pin, pin, ctx.which("tclsh") or "none", ver or "none",
+                      % (pin, ctx.cfg.tcl_pin_by, pin, ctx.which("tclsh") or "none", ver or "none",
                          ";".join("%s %s" % e for e in ctx.inventory) or "<none>", pin,
-                         " ".join(ctx.extra_bin) or "<no keg bin roots>", pin))
+                         " ".join(ctx.extra_bin) or "<no keg bin roots>", pin,
+                         ", or unset DSS_TCL_VERSION" if ctx.cfg.tcl_pin_by == "DSS_TCL_VERSION" else
+                         " -- the legs' libraries are this Tcl, so the host must have its headers"))
             d = write_pin_shim(pin_sh, ctx.cfg.out_dir, ctx.env)
             ctx.path_prefix.insert(0, d)
             ver = tclsh_version(ctx)
@@ -1116,7 +1144,7 @@ def ensure_tclsh(ctx):
         if ver != pin:
             C.die("tclsh is STILL %s after pinning to %s (shim: %s) — refusing to continue."
                   % (ver or "<none>", pin, _j(ctx.cfg.out_dir, "tcl-pin")))
-        ctx.log.info("tclsh %s (%s) — PINNED by DSS_TCL_VERSION" % (ver, ctx.which("tclsh")))
+        ctx.log.info("tclsh %s (%s) — PINNED by %s" % (ver, ctx.which("tclsh"), ctx.cfg.tcl_pin_by))
         return pin_sh, pin_cfg
     chosen_sh, chosen_ver, how = choose_tclsh(ctx)
     if how == "installed":
@@ -1481,7 +1509,9 @@ def run_configure(ctx, sqlite_dir, bld, args, log_path):
 
 def check_tcl_headers(tcl_inc, ver, cfg_path, recipe_dirs, why):
     """R94-R96 -> the staged Tcl version (the header's own when no tclConfig.sh named one).
-    `why` supplies the message context: roots, tclsh, tclsh_ver, bld."""
+    `why` supplies the message context: roots, tclsh, tclsh_ver, bld, and pin_by -- what pinned the
+    Tcl ("" unpinned), so the advice never offers a pin the stage would refuse."""
+    pin_by = why.get("pin_by") or ""
     if not (tcl_inc and os.path.isfile(_j(tcl_inc, "tcl.h"))):
         C.die("tcl.h not found — install the Tcl DEV files (apt: tcl-dev / tcl8.6-dev; brew: tcl-tk).\n"
               "      This is fatal for the ENTIRE run, not for one leg: every leg parses this same header.\n"
@@ -1490,8 +1520,11 @@ def check_tcl_headers(tcl_inc, ver, cfg_path, recipe_dirs, why):
     if ver and inc_ver and ver != inc_ver:
         C.die("Tcl staging is INCOHERENT: tclConfig.sh reports %s (%s) but %s/tcl.h reports %s.\n"
               "      A fixture built against one Tcl's headers and another's library links clean and then fails at\n"
-              "      run time. Pin one with DSS_TCL_VERSION, or remove the stray installation."
-              % (ver, cfg_path or "<none>", tcl_inc, inc_ver))
+              "      run time. %s"
+              % (ver, cfg_path or "<none>", tcl_inc, inc_ver,
+                 ("Pin one with DSS_TCL_VERSION, or remove the stray installation." if not pin_by else
+                  "The Tcl is pinned by %s: repair or remove the installation whose tclConfig.sh and tcl.h "
+                  "disagree." % pin_by)))
     ver = ver or inc_ver
     for d in recipe_dirs:
         if not d or not os.path.isfile(_j(d, "tcl.h")):
@@ -1503,12 +1536,15 @@ def check_tcl_headers(tcl_inc, ver, cfg_path, recipe_dirs, why):
                   "      staged Tcl    : %s  (%s)\n"
                   "      The recipe dir comes FIRST in the Step-7 include list, so its headers would WIN over the\n"
                   "      staged ones while the fixture links %s's library.\n"
-                  "      'configure' chose that dir; it follows the tclsh on PATH (%s, %s).\n"
-                  "      Fix: run with DSS_TCL_VERSION=%s (stage what the recipe uses) or DSS_TCL_VERSION=%s\n"
-                  "      (which also passes --with-tclsh/--with-tcl to configure so the recipe follows the pin), then\n"
-                  "      delete %s so configure re-runs."
+                  "      'configure' chose that dir; it follows the tclsh on PATH (%s, %s).\n%s"
                   % (d, rv, ver, cfg_path or "<none>", ver, why["tclsh"] or "none",
-                     why["tclsh_ver"] or "none", rv, ver, why["bld"]))
+                     why["tclsh_ver"] or "none",
+                     ("      Fix: run with DSS_TCL_VERSION=%s (stage what the recipe uses) or DSS_TCL_VERSION=%s\n"
+                      "      (which also passes --with-tclsh/--with-tcl to configure so the recipe follows the pin), "
+                      "then\n      delete %s so configure re-runs." % (rv, ver, why["bld"])) if not pin_by else
+                     ("      The Tcl is pinned by %s, and configure was told it (--with-tclsh/--with-tcl), yet its "
+                      "recipe\n      names another Tcl's headers: delete %s so configure re-runs, and if it "
+                      "recurs, remove the\n      installation whose headers it found." % (pin_by, why["bld"]))))
     return ver
 
 
@@ -1996,16 +2032,18 @@ def _stage_locked(cfg, log, lock):
     tclsh_ver = tclsh_version(ctx)
     tcl_ver, tcl_cfg, how = select_tcl(ctx.inventory, cfg.tcl_version, tclsh_ver)
     if how == "pin-missing":
-        C.die("DSS_TCL_VERSION=%s is pinned, but no Tcl %s is installed.\n"
+        C.die("Tcl %s is pinned by %s, but no Tcl %s is installed.\n"
               "      tclConfig.sh found: %s\n"
               "      roots searched   : %s\n"
               "      Install it (apt: tcl%s-dev — brew: 'tcl-tk' for 9.x, 'tcl-tk@8' for 8.6; both are\n"
-              "      KEG-ONLY, which is why their own prefixes are searched), or unset DSS_TCL_VERSION to take\n"
-              "      whatever Tcl this host has."
-              % (tcl_ver, tcl_ver, ";".join("%s %s" % e for e in ctx.inventory) or "<none>",
-                 " ".join(ctx.cfg_roots), tcl_ver))
+              "      KEG-ONLY, which is why their own prefixes are searched)%s."
+              % (tcl_ver, cfg.tcl_pin_by, tcl_ver, ";".join("%s %s" % e for e in ctx.inventory) or "<none>",
+                 " ".join(ctx.cfg_roots), tcl_ver,
+                 ", or unset DSS_TCL_VERSION to take\n      whatever Tcl this host has"
+                 if cfg.tcl_pin_by == "DSS_TCL_VERSION" else
+                 ": the legs' libraries are Tcl %s, so its headers are what the fixture compiles against" % tcl_ver))
     if how == "pinned":
-        log.info("tcl: PINNED to %s by DSS_TCL_VERSION" % tcl_ver)
+        log.info("tcl: PINNED to %s by %s" % (tcl_ver, cfg.tcl_pin_by))
     elif how == "highest":
         ctx.warn("no tclConfig.sh matches the tclsh on PATH (%s) — falling back to the highest installed Tcl (%s)."
                  % (tclsh_ver or "none", tcl_ver))
@@ -2030,7 +2068,8 @@ def _stage_locked(cfg, log, lock):
         hit = find_first(ctx.inc_roots, "tcl.h")
         tcl_inc = posixpath.dirname(hit) if hit else ""
     tcl_ver = check_tcl_headers(tcl_inc, tcl_ver, tcl_cfg, fix_incs, {
-        "roots": ctx.inc_roots, "tclsh": ctx.which("tclsh"), "tclsh_ver": tclsh_ver, "bld": bld})
+        "roots": ctx.inc_roots, "tclsh": ctx.which("tclsh"), "tclsh_ver": tclsh_ver, "bld": bld,
+        "pin_by": cfg.tcl_pin_by})
     zinc_src, zh, _zch = stage_zlib_headers(ctx.inc_roots, bld)
     sqlite_cfg_h = _j(bld, "sqlite_cfg.h")
     if not os.path.isfile(sqlite_cfg_h):
@@ -2230,7 +2269,9 @@ _GOOD_SB = {"configureFlags": ["--enable-all", "--fts3"], "makeOptions": "-DSQLI
             "optionDefines": ["SQLITE_ENABLE_STAT4"],
             "requiredDefines": ["SQLITE_ENABLE_FTS5", "SQLITE_ENABLE_RTREE", "SQLITE_ENABLE_STAT4"],
             "capabilityWitnesses": {"fts5": {"define": "SQLITE_ENABLE_FTS5", "file": "fts5aa"}},
-            "sqliteCommit": "0123456789abcdef0123456789abcdef01234567"}
+            "sqliteCommit": "0123456789abcdef0123456789abcdef01234567",
+            # no leg pins a Tcl here: the arms that are about the legs' pin say so with their own value
+            "tclVersion": ""}
 
 
 class _T:
@@ -2588,6 +2629,16 @@ def _st_pure(t):
                 died and "sqliteCommit" in msg, msg[:160])
         died, msg, _ = _dies(parse_stage_build, dict(_GOOD_SB, sqliteCommit="d21bd37c7c"))
         t.check("... and an ABBREVIATED one too: the pin is the FULL sha", died and "sqliteCommit" in msg, msg[:160])
+        t.check("the Tcl the legs' pinned libraries declare crosses as tclVersion ('' when no leg pins one)",
+                (parse_stage_build(dict(_GOOD_SB, tclVersion="8.6"))["tcl_version"],
+                 parse_stage_build(_GOOD_SB)["tcl_version"]) == ("8.6", ""))
+        bad = dict(_GOOD_SB)
+        bad.pop("tclVersion")
+        died, msg, _ = _dies(parse_stage_build, bad)
+        t.check("no tclVersion is a contract break (it cannot say whether the legs pin a Tcl)",
+                died and "tclVersion" in msg, msg[:160])
+        t.check("... and one that is not X.Y is refused (8, 8.6.13, a number)",
+                all(_dies(parse_stage_build, dict(_GOOD_SB, tclVersion=v))[0] for v in ("8", "8.6.13", 8.6)))
         t.check("a UTF-8 BOM is tolerated (a file written on Windows)", parse_stage_build(b"\xef\xbb\xbf" + json.dumps(_GOOD_SB).encode())["required_defines"][0] == "SQLITE_ENABLE_FTS5")
 
     with t.arm("config"):
@@ -2634,6 +2685,30 @@ def _st_pure(t):
         died, msg, _ = _dies(StageConfig.from_run, run)
         t.check("from_run refuses an unset clone path by name (never a silent default)",
                 died and "run.sqlite_dir_posix" in msg, msg)
+        # ★ THE Tcl THE STAGE COMPILES AGAINST follows the legs' pinned libraries (2026-09-26, the PR exit).
+        legs86 = dict(_GOOD_SB, tclVersion="8.6")
+        c = _cfg(tmp, stage_build=legs86)
+        t.check("the Tcl every leg's pinned library declares IS the stage's pin, and the stage says where it "
+                "came from", (c.tcl_version, c.tcl_pin_by.startswith("legs.json")) == ("8.6", True),
+                (c.tcl_version, c.tcl_pin_by))
+        c = _cfg(tmp, stage_build=legs86, tcl_version=" 8.6 ")
+        t.check("DSS_TCL_VERSION restating it is accepted, and the legs stay the source",
+                (c.tcl_version, c.tcl_pin_by.startswith("legs.json")) == ("8.6", True), (c.tcl_version, c.tcl_pin_by))
+        died, msg, _ = _dies(_cfg, tmp, stage_build=legs86, tcl_version="9.0")
+        t.check("DSS_TCL_VERSION naming ANOTHER Tcl than the legs pin is REFUSED, naming both (it cannot move the "
+                "header off the libraries the legs link)", died and "DSS_TCL_VERSION=9.0" in msg and "8.6" in msg,
+                msg[:200])
+        c = _cfg(tmp, tcl_version="9.0")
+        t.check("with no leg pinning a Tcl, DSS_TCL_VERSION is the pin, and says so",
+                (c.tcl_version, c.tcl_pin_by) == ("9.0", "DSS_TCL_VERSION"), (c.tcl_version, c.tcl_pin_by))
+        c = _cfg(tmp)
+        t.check("with neither, the stage is unpinned (the host's Tcl, which only a host-found library follows)",
+                (c.tcl_version, c.tcl_pin_by) == ("", ""), (c.tcl_version, c.tcl_pin_by))
+        run.sqlite_dir_posix = _j(tmp, "s")
+        run.stage_build = dict(legs86)
+        run.cfg.tcl_version = ""
+        t.check("from_run: the driver's run follows the legs' Tcl with no knob set",
+                StageConfig.from_run(run).tcl_version == "8.6")
         # stage_and_persist: the ONE writer of the result, for a POSIX host's driver as for the WSL derive.
         pcfg = _cfg(tmp)
         _w(_j(pcfg.out_dir, RESULT_FILE), '{"stale": true}\n')
@@ -3117,6 +3192,46 @@ def _st_posix_only(t):
             ctx3, _i3 = ctx_for(base_path, roots=(_j(tmp, "no-such-root"),))
             t.check("with no installed Tcl >= 8.6 the choice is `none` -- the caller installs",
                     choose_tclsh(ctx3)[2] == "none", choose_tclsh(ctx3))
+            # ★ THE PR EXIT'S MAC (2026-09-26): PATH's tclsh 8.5, Homebrew's tcl-tk 9.0 AND tcl-tk@8 8.6 both
+            # installed, every leg's library pinned at 8.6. Unpinned, the stage takes the NEWEST -- 9.0, the
+            # header the per-leg coherence check then refused; with the legs' Tcl it runs 8.6 and configure is
+            # told the 8.6 installation, so the header follows the libraries, whatever the host upgraded to.
+            keg8 = _j(tmp, "keg8")
+            sh8 = _w(_j(keg8, "bin", "tclsh8.6"), "#!/bin/sh\necho 8.6\n", 0o755)
+            cfg8 = _w(_j(keg8, "lib", "tclConfig.sh"), "TCL_VERSION='8.6'\nTCL_EXEC_PREFIX='%s'\n" % keg8)
+            both = (_j(keg, "lib"), _j(keg8, "lib"))
+            ctx4, inst4 = ctx_for(base_path, roots=both)
+            t.check("CONTROL (the defect's mechanism): unpinned, the NEWEST installed Tcl wins -- 9.0",
+                    choose_tclsh(ctx4)[1:] == ("9.0", "installed"), choose_tclsh(ctx4))
+            # A PATH holding `sh` and the 8.5 tclsh and nothing else, so no tclsh of this HOST can answer:
+            # what the stage finds is exactly the two installations the arm made.
+            shonly = _j(tmp, "shonly")
+            os.makedirs(shonly)
+            os.symlink(shutil.which("sh"), _j(shonly, "sh"))
+            bare_path = os.pathsep.join([_j(tmp, "old"), shonly])
+            c5, _l5 = _ctx(tmp, environ=dict(os.environ, PATH=bare_path), host_os="linux",
+                           stage_build=dict(_GOOD_SB, tclVersion="8.6"), out_dir=_j(tmp, "out-legs86"),
+                           pkg_install=lambda a, b=None: inst4.append((a, b)))
+            c5.cfg_roots = both
+            c5.inventory = tcl_inventory(c5)
+            chosen5 = ensure_tclsh(c5)
+            t.check("the legs' 8.6 is the Tcl the stage runs, nothing installed, and configure is told the 8.6 "
+                    "installation -- never the newer one beside it",
+                    chosen5 == (sh8, cfg8) and inst4 == [] and tclsh_version(c5) == "8.6"
+                    and tcl_configure_args(*chosen5) == ["--with-tclsh=" + sh8, "--with-tcl=" + _j(keg8, "lib")],
+                    (chosen5, inst4, tclsh_version(c5)))
+            t.check("... and the header half selects the SAME installation (select_tcl with the pin)",
+                    select_tcl(c5.inventory, c5.cfg.tcl_version, tclsh_version(c5)) == ("8.6", cfg8, "pinned"),
+                    select_tcl(c5.inventory, c5.cfg.tcl_version, tclsh_version(c5)))
+            c6, _l6 = _ctx(tmp, environ=dict(os.environ, PATH=bare_path), host_os="linux",
+                           stage_build=dict(_GOOD_SB, tclVersion="8.6"), out_dir=_j(tmp, "out-legs86-none"),
+                           pkg_install=lambda a, b=None: inst4.append((a, b)))
+            c6.cfg_roots = (_j(keg, "lib"),)
+            c6.inventory = tcl_inventory(c6)
+            died, msg, _ = _dies(ensure_tclsh, c6)
+            t.check("a host with only Tcl 9.0 cannot satisfy the legs' 8.6: REFUSED, naming the pin's source -- "
+                    "never staged on the 9.0 it has", died and "Tcl 8.6 is pinned by legs.json" in msg
+                    and inst4 == [], msg[:220])
             zkeg = _j(tmp, "zlib-keg")
             _w(_j(zkeg, "include", "zlib.h"), "/* zlib */\n")
             libz = _w(_j(zkeg, "lib", "libz.a"), "")

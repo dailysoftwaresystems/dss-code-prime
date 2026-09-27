@@ -24,6 +24,9 @@ permutation segment (an empty-but-set one selected ZERO files and read as green 
 the launcher's carrier forwards only what is SET in that segment's dict.
 ★ A leg that cannot run records a NAMED not-run from the closed vocabulary (`Ledger.unit_not_run`)
 and the run continues to every other leg.
+★ Every segment's corpus reaches the driver's own output AS IT RUNS (`CorpusProgress`, 2026-09-26): a
+line when its log grew, at most one a minute, and none while the fixture is silent -- so a bound on the
+driver's silence (the step's `stallSeconds`) bounds the corpus's, and means it.
 
 The union of `build-and-test.sh` and `build-and-test.ps1` Step 8 (lane mig, part 4, 2026-09-21),
 with the .sh's verdict ladder (the .ps1 tested segment 0's summary alone, which made an
@@ -36,6 +39,7 @@ import json
 import os
 import shutil
 import sys
+import time
 
 import sqlite_common as C
 
@@ -437,13 +441,116 @@ def _any_left(fixture, launch_bin, kentry):
     return bool(kentry) and bool(P.our_fixture_pids(launch_bin, launcher_prefix=kentry).procs)
 
 
+# ── the corpus's progress, on the driver's own output, as it happens ──────────────────
+
+def _elapsed(seconds):
+    s = max(0, int(seconds))
+    return "%d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60)
+
+
+class CorpusProgress:
+    """ONE segment's corpus progress, reported on THIS DRIVER'S OWN OUTPUT while the fixture runs:
+    `sqlite_launch.run_segment` hands it the segment log's size at every poll, tells it when a kill is
+    decided, and closes it when the segment ends. `what` names the segment (its queue label).
+
+    ★ WHY (✔MEASURED 2026-09-26, the PR exit's four-leg veryquick; host run 20260926-200856-37d3d895 on
+    linux-arm64-release): the fixture writes into the segment log, never to this driver's stdout, so the
+    driver printed NOTHING while a corpus ran -- and DssHarness, which ends a step whose output is silent
+    for its stall bound (1800 s), ended the arm64 VPS's step 38 minutes in while its elf64-x86_64 corpus,
+    under qemu-x86_64, was passing test after test (its corpus.log ended at `fpconv1-3.0...`). The step's
+    silence has to mean that the CORPUS is silent.
+    ★ NEVER A HEARTBEAT: a line is printed only when the log GREW since the previous line -- the measure
+    the segment's own stall bound (DSS_SEGMENT_STALL, `run_segment`) kills on -- so a fixture that stops
+    writing leaves this driver silent and a stuck test still meets a bound: the segment's, which kills it,
+    says so at the decision (`killing`) and makes it an ABORT in its leg's verdict, the corpus resumed past
+    it; and behind that the step's (sqlite.yml `stallSeconds`, set above the segment's so the driver's
+    named abort comes first).
+    ★ THE VOLUME: at most one line per DSS_PROGRESS_INTERVAL (60 s) per segment, the first output of a
+    segment reported at once and one line when the segment ends -- a veryquick leg (~1,000 files) prints
+    about a line a minute however long it runs, where a line per file would print a thousand. Each line is
+    the corpus so far as the SAME parser the verdict uses reads it (`sqlite_corpus.LogFollower`): counts,
+    file and test names, never the fixture's own text (its summary line names the host).
+    Every leg's segments get one, native or launched: it reads the driver's own log file, which is where
+    every launcher's output lands."""
+
+    def __init__(self, label, what, log_path, interval_s, log=C.LOG, clock=time.monotonic):
+        self.label, self.what, self.path = label, what, log_path
+        self.interval_s = interval_s
+        self.log = log
+        self.t0 = clock()
+        self.follower = K.LogFollower()
+        self.offset = 0            # bytes of the log already read
+        self.said_size = 0         # the log's size when the last line was printed
+        self.said_at = None        # when that was (None: nothing printed yet)
+
+    def _read(self, size):
+        if size <= self.offset:
+            return
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self.offset)
+                chunk = fh.read(size - self.offset)
+        except OSError:
+            return
+        self.offset += len(chunk)
+        self.follower.feed(chunk)
+
+    def _state(self):
+        f = self.follower.facts()
+        text = "%s file(s) completed" % K.group_digits(f.n_files)
+        if f.n_files:
+            text += " (latest %s, %s ms)" % (f.last_file, self.follower.parser.last_file_ms or "?")
+        text += ", %s result(s) Ok, %d failed" % (K.group_digits(f.ok), f.fail_markers)
+        running = self.follower.running
+        if running:
+            text += "; running %s" % running
+        elif f.last_test:
+            text += "; last test %s" % f.last_test
+        return text
+
+    def _say(self, now, size, lead):
+        self.log.info("[%s] %s +%s — %s%s" % (self.label, self.what, _elapsed(now - self.t0), lead,
+                                              self._state()))
+        self.said_size, self.said_at = size, now
+
+    def poll(self, now, size):
+        """The log's size at one poll: read what it gained; print ONE line when it GREW since the last
+        line and the interval has passed (a segment's first output is printed at once)."""
+        if size is None or size < 0:
+            return
+        self._read(size)
+        if size == self.said_size:
+            return                 # nothing moved: nothing is printed
+        if self.said_at is not None and now - self.said_at < self.interval_s:
+            return                 # it moved, and rides on the next line
+        self._say(now, size, "")
+
+    def killing(self, now, reason):
+        """The runner has DECIDED to kill the fixture: said now, before the kill starts."""
+        self.log.warn("[%s] %s +%s — KILLING the fixture: it %s; the corpus had reached: %s"
+                      % (self.label, self.what, _elapsed(now - self.t0), reason, self._state()))
+
+    def close(self, now):
+        """The segment has ended: the rest of the log, its unterminated last line included, and one
+        closing line when anything moved since the last line."""
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            size = self.offset
+        self._read(size)
+        self.follower.finish()
+        if size != self.said_size:
+            self._say(now, size, "segment ended: ")
+
+
 def run_one_segment(run, leg, seg, seglog, rundir, launcher, launch_bin, kentry, loader_dirs, base,
                     omit, lr, runner=None):
     """ONE fixture invocation: its environment built by the ONE builder (SQLITE_TEST_PATTERN_LIST
     only for a permutation segment; QUICKTEST_OMIT only when exclusions were asked for), every
     argument asserted to be in the launcher's namespace, the execution monitors armed on the
-    emptied log BEFORE the fixture starts and stopped AFTER it -- even when the run raises.
-    `runner` is `sqlite_launch.run_segment` (injectable)."""
+    emptied log BEFORE the fixture starts and stopped AFTER it -- even when the run raises -- and a
+    `CorpusProgress` of its own handed to the runner, so the corpus reaches this driver's output as
+    it runs, on every leg. `runner` is `sqlite_launch.run_segment` (injectable)."""
     log, cfg = run.log, run.cfg
     runner = runner or L.run_segment
     verb = L.path_verb(leg)
@@ -459,11 +566,12 @@ def run_one_segment(run, leg, seg, seglog, rundir, launcher, launch_bin, kentry,
     argv = L.launch_argv(launcher, launch_bin, argv_rest)
     mons = L.evidence_start(run.resolver, leg, seglog, cfg.segment_timeout,
                             cfg.confounds_override is not None, log)
+    progress = CorpusProgress(leg.label, seg.label, seglog, cfg.progress_interval, log)
     try:
         return runner(argv, rundir, env, seglog, cfg.segment_stall, cfg.segment_timeout,
                       cfg.kill_settle, P.kill_tree,
                       lambda: _sweep(run, leg, leg.fixture, launch_bin, kentry, "segment timeout", lr),
-                      lambda: _any_left(leg.fixture, launch_bin, kentry))
+                      lambda: _any_left(leg.fixture, launch_bin, kentry), progress=progress)
     finally:
         L.evidence_stop(leg.label, mons, log)
 

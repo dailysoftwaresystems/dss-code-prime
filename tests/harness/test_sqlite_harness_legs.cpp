@@ -6086,8 +6086,11 @@ TEST_F(HarnessLegs, AStagedTclHeaderThatDisagreesWithALegsLibraryIsRefused) {
            " first native macOS run.\n"
         << bad.output;
     // The diagnostic has to be actionable without reading the driver: the leg,
-    // both versions, and the remedy the operator actually used.
-    for (char const* needle : {"elf64-arm64", "9.0", "8.6", "DSS_TCL_VERSION=8.6",
+    // both versions, and where the fix is. Since the PR exit's X1 (2026-09-26)
+    // the staged header follows the Tcl the legs' pinned libraries DECLARE, so the
+    // remedy is the leg's `libraries` block, never DSS_TCL_VERSION (which may only
+    // restate the legs' version and cannot move the header).
+    for (char const* needle : {"elf64-arm64", "9.0", "8.6", "`libraries` block",
                                "Tcl_GetBytesFromObj"}) {
         EXPECT_NE(bad.output.find(needle), std::string::npos)
             << "the refusal never says `" << needle

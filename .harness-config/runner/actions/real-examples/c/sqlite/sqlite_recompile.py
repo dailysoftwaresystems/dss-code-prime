@@ -169,6 +169,13 @@ def stage_findings(st, stage_build, leg, verify_guards, verify_answers, coherenc
     if not (len(head) >= 7 and pin.startswith(head)):
         why.append("the stage's sqlite is %s, not the pinned %s (legs.json stageBuild.sqliteCommit): a "
                    "stage of another revision compiles another subject" % (head or "<unrecorded>", pin[:12]))
+    # The Tcl the stage's headers follow (2026-09-26, the PR exit): the one every leg's pinned library
+    # declares. A stage staged against another Tcl compiles references that library cannot resolve.
+    tcl = sb.get("tcl_version") or ""
+    if tcl and (st.tcl_version or "") != tcl:
+        why.append("the stage's Tcl headers are %s, and every leg's pinned library declares Tcl %s (legs.json, "
+                   "--stage-build tclVersion): a fixture compiled against them references symbols its library "
+                   "may not export" % (st.tcl_version or "<unrecorded>", tcl))
     if not configure_flags_applied(st.configure_args, sb["configure_flags"]):
         why.append("the stage was configured with %s, and the catalogue now declares the configure "
                    "flags %s" % (" ".join(st.configure_args) or "<nothing>",

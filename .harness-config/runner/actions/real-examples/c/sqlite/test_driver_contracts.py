@@ -8,9 +8,9 @@ pinned by CALLING the driver's own functions -- the very function objects produc
 driving the real resume loop, the real ledger and the real gates -- and every pin is proven
 non-vacuous by MUTATING a temporary COPY of the module that owns the guard (red-on-disable):
 
-  DC-01 .. DC-30  green pins; each carries the UNION of both twins' arms for its subject, plus
+  DC-01 .. DC-31  green pins; each carries the UNION of both twins' arms for its subject, plus
                   the negatives neither twin had (report 09, section E.4);
-  RD-01 .. RD-84  red arms (a retired arm's id is never reused, so the range has gaps; the
+  RD-01 .. RD-91  red arms (a retired arm's id is never reused, so the range has gaps; the
                   registry below counts them); each MUTATES a copy of one driver module -- fail-closed: the witness
                   occurs EXACTLY once, the mutant bytes (or AST) differ, the witness is absent,
                   it parses, compiles and IMPORTS under a unique module name kept out of
@@ -1252,9 +1252,9 @@ def drive_corpus(x, U, tag, write_segment, patterns=(), leg_over=None, answer=No
     plan = {"launcher": [], "launcherPath": "", "kernelEntryArgv": list(kentry)}
     segs = []
 
-    def runner(argv, cwd, env, seglog, stall_s, cap_s, settle_s, kill_tree, sweep, any_left):
+    def runner(argv, cwd, env, seglog, stall_s, cap_s, settle_s, kill_tree, sweep, any_left, progress=None):
         k = len(segs)
-        segs.append({"argv": [str(a) for a in argv], "env": dict(env), "log": seglog})
+        segs.append({"argv": [str(a) for a in argv], "env": dict(env), "log": seglog, "progress": progress})
         write_bytes(seglog, write_segment(k))
         return U.L.SegmentResult(1, "", 0.0)
     U.run_corpus(run, leg, ctx, rundir, plan, leg.fixture, list(kentry), list(patterns), runner=runner)
@@ -1759,7 +1759,7 @@ def pin_dc14(t, x):
     run2.resolver = FakeResolver(lambda a: None, C)
     got = []
 
-    def runner(argv, cwd, env2, seglog, *rest):
+    def runner(argv, cwd, env2, seglog, *rest, **kw):
         got.append(dict(env2))
         write_bytes(seglog, b"")
         return la.SegmentResult(0, "", 0.0)
@@ -2886,7 +2886,7 @@ def _dc27_stage(x, root, leg, sb, zinc_mod):
     for k in S.StageResult.STRINGS:
         d.setdefault(k, {"sqlite_head": sb["sqlite_commit"][:10], "sqlite_branch": "DETACHED-HEAD",
                          "tier": "veryquick",
-                         "tcl_version": "8.6", "stage_identity": "dc27 identity"}.get(k, ""))
+                         "tcl_version": sb.get("tcl_version") or "8.6", "stage_identity": "dc27 identity"}.get(k, ""))
     write_json(os.path.join(st, S.RESULT_FILE), d)
     return d
 
@@ -2950,6 +2950,10 @@ def pin_dc27(t, x):
          lambda dd: dd.__setitem__("sqlite_head", sb["sqlite_commit"][:9]
                                    + ("0" if sb["sqlite_commit"][9] != "0" else "1")),
          None, True, "not the pinned"),
+        # the Tcl (2026-09-26, the PR exit): a stage staged against another Tcl than every leg's pinned library
+        ("A13", "a stage whose Tcl headers are not the Tcl every leg's pinned library declares",
+         lambda dd: dd.__setitem__("tcl_version", "9.0" if sb["tcl_version"] != "9.0" else "8.6"),
+         None, True, "every leg's pinned library declares Tcl"),
     )
     tus_text = read_text(d["fixture_recipe"]["tus"])
     for key, label, mut, lb, coherent, needle in cases:
@@ -3464,6 +3468,135 @@ def pin_dc30(t, x):
          (rc, out[-600:]))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# DC-31 -- the corpus reaches the driver's output AS IT RUNS, and nothing is printed while nothing moves
+# (2026-09-26, the PR exit: the driver printed nothing for a whole corpus, and DssHarness's stall bound
+# ended the arm64 VPS's step 38 minutes into a qemu-launched corpus that was passing test after test)
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+# A live child that writes NOTHING itself: it waits for its stop file. The segment log grows only through
+# the pin's scripted sleep, the way a fixture's writes arrive between two of the runner's polls.
+PROGRESS_CHILD = "import os, sys, time\nwhile not os.path.exists(sys.argv[1]):\n    time.sleep(0.01)\n"
+
+
+def drive_progress(x, tag, script, stall_s=0, interval=60, poll_s=5.0):
+    """The REAL `sqlite_launch.run_segment` with the REAL `sqlite_units.CorpusProgress` (the mutant, when a red
+    arm mutated either), over a live child, on a SCRIPTED clock: each `sleep(dt)` of the runner moves the clock
+    dt and appends the script's next step to the segment log (None: the fixture wrote nothing in that span).
+    When the script is spent the child is told to exit, and the clock stands still while it does -- so every
+    line's time is exact on any host. -> what the driver's output said, when, and what the runner returned."""
+    L = x.M.mod("sqlite_launch")
+    U = x.M.use("sqlite_units")
+    root = x.sub("progress-" + tag)
+    log_path, stop = os.path.join(root, "corpus.log"), os.path.join(root, "stop")
+    clock = types.SimpleNamespace(t=1000.0)
+    steps = list(script)
+    log = x.log()
+    swept = []
+
+    def now():
+        return clock.t
+
+    def sleep(dt):
+        if steps:
+            clock.t += dt
+            step = steps.pop(0)
+            if step:
+                with open(log_path, "ab") as fh:
+                    fh.write(step)
+        elif not os.path.exists(stop):
+            clock.t += dt
+            write_bytes(stop, b"the script is spent\n")
+        else:
+            time.sleep(0.01)
+    progress = U.CorpusProgress("dc31", "veryquick.test", log_path, interval, log=log, clock=now)
+    res = L.run_segment([sys.executable, "-B", "-c", PROGRESS_CHILD, stop], root, child_env(x), log_path, stall_s, 0,
+                        0, lambda proc: swept.append(("kill_tree", text(log))),
+                        lambda: swept.append(("sweep", text(log))), lambda: False, poll_s=poll_s, clock=now,
+                        sleep=sleep, progress=progress)
+    if not os.path.exists(stop):
+        write_bytes(stop, b"the pin is done\n")
+    lines = []
+    for ln in text(log).splitlines():
+        m = re.search(r"\[dc31\] veryquick\.test \+(\d+):(\d\d):(\d\d) ", ln)
+        if m:
+            lines.append((int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)), ln))
+    return types.SimpleNamespace(lines=lines, times=[s for s, _l in lines], text=text(log), res=res, swept=swept)
+
+
+def step_stall_seconds(yml_text, step):
+    """The `stallSeconds` an action file's step declares (the step's own block: from its `- name:` line to the
+    next one), or None when it declares none -- read from the TEXT, as the tool reads it."""
+    block = re.search(r"(?ms)^  - name: %s[ \t]*\n(.*?)(?=^  - name: |\Z)" % re.escape(step), yml_text)
+    if not block:
+        return None
+    m = re.search(r"(?m)^    stallSeconds:[ \t]*(\d+)[ \t]*$", block.group(1))
+    return int(m.group(1)) if m else None
+
+
+def pin_dc31(t, x):
+    """The relay, driven end to end: 5 minutes of a corpus writing every poll, 25 minutes of silence, a test in
+    flight, the segment's end -- then a fixture that stops writing and is killed by the segment's own bound."""
+    grow = [b"a-1.1... Ok\nTime: a.test 12 ms\n"]
+    for k in range(2, 61):
+        grow.append(b"b-%d... Ok\n" % k + (b"Time: b%d.test 50 ms\n" % k if k % 12 == 0 else b""))
+    script = (grow + [None] * 300 + [b"c-1.1... Ok\n", b"fpconv1-3.0..."] + [None] * 18
+              + [b" Ok\nTime: fpconv1.test 4903 ms\n"])
+    a = drive_progress(x, "a", script)
+    t.ck("P01", "a segment's FIRST output reaches the driver's output at the first poll that sees it (+0:00:05)",
+         a.times[:1] == [5], a.lines[:2])
+    t.eq("P02", "while the log grows at every poll (5 s) for five minutes, the driver reports it at most once per "
+         "interval and never lets it go unreported longer: exactly +5, +65, +125, +185, +245 and the deferred +305",
+         [5, 65, 125, 185, 245, 305], [s for s in a.times if s <= 305])
+    t.eq("P03", "NOTHING is printed while nothing moves: 25 minutes of a silent log (300 polls) add no line",
+         [], [ln for s, ln in a.lines if 305 < s < 1805])
+    t.ck("P04", "the first growth after the silence is reported at the poll that sees it (+0:30:05)",
+         1805 in a.times, a.times)
+    t.ck("P05", "a line carries the corpus as the verdict's parser reads it: files (the latest, its ms), results, "
+         "failures, and the test IN FLIGHT", any("6 file(s) completed (latest b60.test, 50 ms), 61 result(s) Ok, 0 "
+                                                 "failed; running fpconv1-3.0" in ln for _s, ln in a.lines), a.lines)
+    t.ck("P06", "the segment's end is reported once, with its final counts",
+         bool(a.lines) and a.lines[-1][0] == 1910 and "segment ended: 7 file(s) completed (latest fpconv1.test, "
+         "4903 ms), 62 result(s) Ok, 0 failed; last test fpconv1-3.0" in a.lines[-1][1], a.lines[-3:])
+    b = drive_progress(x, "b", [b"x-1.1... Ok\n"] + [None] * 30, stall_s=60)
+    at_sweep = [txt for what, txt in b.swept if what == "sweep"]
+    t.ck("P07", "a fixture that stops writing is killed by the segment's own bound, and the kill is SAID when it is "
+         "DECIDED -- on the output before the sweep starts -- naming the bound and how far the corpus got",
+         getattr(b.res, "kill_reason", "") == "produced no output for 60s (DSS_SEGMENT_STALL)" and len(at_sweep) == 1
+         and "KILLING the fixture: it produced no output for 60s (DSS_SEGMENT_STALL); the corpus had reached: 0 "
+             "file(s) completed, 1 result(s) Ok, 0 failed; last test x-1.1" in at_sweep[0],
+         (getattr(b.res, "kill_reason", b.res), b.swept or b.text[-800:]))
+    U = x.M.fresh("sqlite_units", P=fake_procs(x))
+    s = drive_corpus(x, U, "dc31", lambda k: b"")
+    rel = [seg.get("progress") for seg in s.segs]
+    t.ck("P08", "EVERY segment of the REAL resume loop hands its runner a relay of its OWN, bound to that segment's "
+         "log (every leg's segments pass here, native or launched)",
+         len(rel) >= 2 and all(isinstance(p, U.CorpusProgress) and p.path == seg["log"] for p, seg in zip(rel, s.segs))
+         and len(set(id(p) for p in rel)) == len(rel),
+         [(type(p).__name__, getattr(p, "path", None), seg["log"]) for p, seg in zip(rel, s.segs)])
+    Cm = x.M.mod("sqlite_common")
+    with patched_environ(unset=x.suite.knobs):
+        cfg = Cm.Config()
+    yml = read_text(os.path.join(HERE, "sqlite.yml"))
+    step_stall = step_stall_seconds(yml, "build-and-test")
+    t.ck("P09", "the corpus step declares its OWN stall bound, above the driver's segment stall by more than a "
+         "progress interval and two polls: the driver names a silent fixture (an abort, resumed past) before the "
+         "tool could end the step", step_stall is not None and cfg.segment_stall > 0
+         and step_stall > cfg.segment_stall + cfg.progress_interval + 2 * 5,
+         "sqlite.yml build-and-test stallSeconds=%r; DSS_SEGMENT_STALL default %r; DSS_PROGRESS_INTERVAL default %r"
+         % (step_stall, cfg.segment_stall, cfg.progress_interval))
+    with patched_environ(unset=x.suite.knobs, DSS_SEGMENT_STALL="100", DSS_PROGRESS_INTERVAL="100"):
+        r_eq, why = refused(Cm.Config)
+    with patched_environ(unset=x.suite.knobs, DSS_SEGMENT_STALL="100", DSS_PROGRESS_INTERVAL="99"):
+        r_ok, _c = refused(Cm.Config)
+    with patched_environ(unset=x.suite.knobs, DSS_SEGMENT_STALL="0", DSS_PROGRESS_INTERVAL="600"):
+        r_off, _c = refused(Cm.Config)
+    t.ck("P10", "a progress interval as long as the segment's stall bound is REFUSED up front (a moving corpus would "
+         "report nothing for the whole bound); a shorter one, or no stall bound at all, is accepted",
+         r_eq and "DSS_PROGRESS_INTERVAL=100" in why and "DSS_SEGMENT_STALL=100" in why and not r_ok and not r_off,
+         (r_eq, why, r_ok, r_off))
+
+
 def _read_lines(path):
     return [ln.rstrip("\r\n") for ln in read_text(path).splitlines() if ln.strip()]
 
@@ -3716,6 +3849,8 @@ PINS = (
             "compiler, its pinned checkout INSIDE the tree, and the tree's run lock", pin_dc29),
     PinSpec("DC-30", "a step's knobs travel on its command line, read once by Config; Step 5 takes the compiler "
             "from it", pin_dc30),
+    PinSpec("DC-31", "the corpus reaches the driver's output AS IT RUNS, nothing is printed while nothing moves, "
+            "and a silent fixture meets the driver's bound before the step's", pin_dc31),
 )
 PIN_BY_ID = dict((p.id, p) for p in PINS)
 
@@ -3805,14 +3940,16 @@ REDS = (
     red("RD-02", "DC-04", "sqlite_units", "H2", "restore the control-compiler gate",
         "no CONTROL compiler on this host", old=_CONTROL_CC_INFO, new="    if not leg.cc:\n        return False\n",
         expect=("E01",)),
+    # (RD-03 / RD-04 re-aimed 2026-09-26, the PR exit's X1: the parser's rules moved, unchanged, into
+    # sqlite_corpus.SegmentParser.feed_line -- the same two statements, now on the parser's own state.)
     red("RD-03", "DC-05", "sqlite_corpus", "H3/F2", "remove the first-diagnostic capture",
-        "diag = d[:DIAG_LIMIT] + TRUNCATION_SUFFIX if len(d) > DIAG_LIMIT else d",
-        old="                diag = d[:DIAG_LIMIT] + TRUNCATION_SUFFIX if len(d) > DIAG_LIMIT else d\n",
-        new='                diag = ""\n', expect=("D01",)),
+        "self.diag = d[:DIAG_LIMIT] + TRUNCATION_SUFFIX if len(d) > DIAG_LIMIT else d",
+        old="            self.diag = d[:DIAG_LIMIT] + TRUNCATION_SUFFIX if len(d) > DIAG_LIMIT else d\n",
+        new='            self.diag = ""\n', expect=("D01",)),
     red("RD-04", "DC-05", "sqlite_corpus", "H9", "count the harness's teardown results as coverage",
         "first[0].endswith(TEARDOWN_TAILS)",
-        old="                if not (first and first[0].endswith(TEARDOWN_TAILS)):\n                    pend += 1\n",
-        new="                pend += 1\n", expect=("D14",)),
+        old="            if not (first and first[0].endswith(TEARDOWN_TAILS)):\n                self.pend += 1\n",
+        new="            self.pend += 1\n", expect=("D14",)),
     red("RD-05", "DC-07", "sqlite_corpus", "H4/F17", "weaken the discriminator to 'zero files'",
         'sig == (prev_zero_sig or "")',
         old='    return facts.n_files == 0 and sig != "" and sig == (prev_zero_sig or "")\n',
@@ -4118,6 +4255,38 @@ REDS = (
         new='    if not named:\n        C.run_checked(["cmake", "--build", "build/rel", "--config", "Release", "--target", '
             '"dsscp"],\n                      "dsscp build")\n        C.die(',
         expect=("N03", "N08"), stay_green=("N01", "N02", "N05", "N06")),
+    # ── the corpus on the driver's output as it runs (2026-09-26, the PR exit's X1: a silent driver let
+    # DssHarness's stall bound end a qemu-launched corpus that was passing test after test)
+    red("RD-85", "DC-31", "sqlite_launch", "new (PR exit X1, 2026-09-26)",
+        "run a segment without the relay (the corpus reaches the driver's output only when the segment ends)",
+        "                progress.poll(now, size)\n", new="                pass\n",
+        expect=("P01", "P02", "P04"), stay_green=("P03", "P06")),
+    red("RD-86", "DC-31", "sqlite_units", "new (PR exit X1, 2026-09-26)",
+        "print once an interval whether the log moved or not (a heartbeat that disarms the stall bound)",
+        "        if size == self.said_size:\n", new="        if False:\n",
+        expect=("P03",), stay_green=("P01", "P02")),
+    red("RD-87", "DC-31", "sqlite_units", "new (PR exit X1, 2026-09-26)",
+        "print every growth of the log, unthrottled (a line per poll)",
+        "        if self.said_at is not None and now - self.said_at < self.interval_s:\n", new="        if False:\n",
+        expect=("P02",), stay_green=("P01", "P03", "P04", "P05")),
+    red("RD-88", "DC-31", "sqlite_units", "new (PR exit X1, 2026-09-26)",
+        "hand the segment runner no relay (the production path loses it, whatever the runner can do)",
+        "lambda: _any_left(leg.fixture, launch_bin, kentry), progress=progress)",
+        new="lambda: _any_left(leg.fixture, launch_bin, kentry), progress=None)",
+        expect=("P08",), stay_green=("P01", "P07")),
+    red("RD-89", "DC-31", "sqlite_launch", "new (PR exit X1, 2026-09-26)",
+        "kill a stalled fixture without saying so when the kill is decided",
+        "                progress.killing(clock(), kill_reason)\n", new="                pass\n",
+        expect=("P07",), stay_green=("P01", "P03")),
+    red("RD-90", "DC-31", "sqlite_common", "new (PR exit X1, 2026-09-26)",
+        "accept a progress interval as long as the segment's stall bound",
+        "        if self.segment_stall and self.progress_interval >= self.segment_stall:\n", new="        if False:\n",
+        expect=("P10",), stay_green=("P09",)),
+    # ── the Tcl the stage follows (2026-09-26, the PR exit's X1: an unpinned Mac stage took the host's newest Tcl)
+    red("RD-91", "DC-27", "sqlite_recompile", "new (PR exit X1, 2026-09-26)",
+        "judge a stage current whatever Tcl its headers are",
+        "    if tcl and (st.tcl_version or \"\") != tcl:\n", new="    if False:\n",
+        expect=("A13",), stay_green=("A01", "A12")),
 )
 
 
@@ -4226,12 +4395,12 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 30 pins + 85 red arms + 10 mutator arms. A registry that no longer
+# Every arm this file registers: 31 pins + 92 red arms + 10 mutator arms. A registry that no longer
 # adds up to this -- an arm deleted, or one added without this line -- is a FAILURE. (2026-09-26: five red
 # arms retired with the code they guarded -- RD-26, RD-31, RD-48, RD-49, RD-52 -- and five added, RD-76..RD-80;
-# then, P68 round 13, RD-75 retired with the benchmark's clone lock and four added, RD-81..RD-84;
-# a retired arm's id is never reused.)
-DECLARED_TOTAL = 125
+# then, P68 round 13, RD-75 retired with the benchmark's clone lock and four added, RD-81..RD-84; then, the PR
+# exit's X1, DC-31 and its six arms RD-85..RD-90, and RD-91 on DC-27; a retired arm's id is never reused.)
+DECLARED_TOTAL = 133
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════

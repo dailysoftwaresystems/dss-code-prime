@@ -603,6 +603,17 @@ class Config:
         self.tier_excludes = ex.split() if ex.strip() else []
         self.max_resumes = int_env("DSS_MAX_RESUMES", 10, 0)
         self.segment_stall = int_env("DSS_SEGMENT_STALL", 1800, 0)
+        # How often, at MOST, a running corpus reports its progress on this driver's output
+        # (`sqlite_units.CorpusProgress`: a line only when the segment log GREW since the last one). It
+        # must stay well under every silence bound a caller applies to that output -- the step's
+        # (sqlite.yml build-and-test `stallSeconds`) and the segment's own (DSS_SEGMENT_STALL), which is
+        # refused here: an interval as long as the stall would let the output fall silent for the
+        # whole bound while the corpus moves.
+        self.progress_interval = int_env("DSS_PROGRESS_INTERVAL", 60, 1)
+        if self.segment_stall and self.progress_interval >= self.segment_stall:
+            die("DSS_PROGRESS_INTERVAL=%d is not shorter than DSS_SEGMENT_STALL=%d: a corpus that moves would "
+                "then report nothing for as long as the stall bound, and a bound on this driver's silence "
+                "(the step's) would end a run that is working." % (self.progress_interval, self.segment_stall))
         self.segment_timeout = int_env("DSS_SEGMENT_TIMEOUT", 0, 0)
         self.kill_settle = int_env("DSS_KILL_SETTLE", 20, 0)
         self.strict = tristate("DSS_STRICT_ARM_VERDICTS")

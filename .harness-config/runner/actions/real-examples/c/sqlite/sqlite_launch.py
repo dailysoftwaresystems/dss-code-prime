@@ -26,9 +26,9 @@ resolved per host by `harness_legs.py`) and this module only ASKS -- it knows no
     LD_LIBRARY_PATH, dyld DYLD_LIBRARY_PATH and ignores the ELF one), built element by element
     through the same path door, joined by the TARGET's separator.
 
-Plus the segment RUNNER (stall/cap bounds on the log's byte size, tree kill, sweep, settle) and
-the execution-evidence MONITORS (a clock row excuses a failure only on evidence from that
-failure's own execution). The union of `build-and-test.sh` and `build-and-test.ps1` (lane mig,
+Plus the segment RUNNER (stall/cap bounds on the log's byte size, tree kill, sweep, settle, and
+the corpus progress it hands the driver's output as the log grows) and the execution-evidence
+MONITORS (a clock row excuses a failure only on evidence from that failure's own execution). The union of `build-and-test.sh` and `build-and-test.ps1` (lane mig,
 part 4, 2026-09-21: no `.sh`/`.ps1` under the actions directory).
 
 Nothing here runs at import.
@@ -420,10 +420,17 @@ def _terminate(proc):
 
 
 def run_segment(argv, cwd, env, log_path, stall_s, cap_s, settle_s, kill_tree, sweep,
-                any_left, poll_s=5.0, clock=time.monotonic, sleep=time.sleep):
+                any_left, poll_s=5.0, clock=time.monotonic, sleep=time.sleep, progress=None):
     """Run ONE fixture segment: stdin at EOF, stdout+stderr MERGED into `log_path` (the order the
     fixture wrote them -- the Tcl traceback the parser reads is part of that stream), killed when
     the log stops GROWING for `stall_s` seconds or the segment exceeds `cap_s` (0 disables each).
+
+    `progress` (`sqlite_units.CorpusProgress`, one per segment) is how the corpus reaches THIS
+    driver's output while it runs: handed the log's size at every poll (it prints only when the log
+    grew), told the moment a kill is DECIDED -- before the kill starts, so the decision is on the
+    output before anything that may hang -- and closed when the segment has ended. ✔MEASURED
+    2026-09-26: without it the driver printed nothing for a whole corpus, and a step bound on its
+    silence ended a qemu-launched corpus that was passing test after test.
 
     On a kill: TERM, 2 s, the whole tree (`kill_tree(proc)`), a sweep by PATH (`sweep()` -- a
     launched fixture can be a process the launcher's own tree does not contain), then SETTLE up
@@ -454,6 +461,8 @@ def run_segment(argv, cwd, env, log_path, stall_s, cap_s, settle_s, kill_tree, s
             except OSError:
                 size = last_len
             now = clock()
+            if progress is not None:
+                progress.poll(now, size)
             if size != last_len:
                 last_len, last_grow = size, now
             elif stall_s > 0 and now - last_grow >= stall_s:
@@ -463,6 +472,8 @@ def run_segment(argv, cwd, env, log_path, stall_s, cap_s, settle_s, kill_tree, s
                 kill_reason = "exceeded the absolute cap of %ds (DSS_SEGMENT_TIMEOUT)" % cap_s
                 break
         if kill_reason:
+            if progress is not None:
+                progress.killing(clock(), kill_reason)
             _terminate(proc)
             try:
                 proc.wait(timeout=2)
@@ -486,6 +497,8 @@ def run_segment(argv, cwd, env, log_path, stall_s, cap_s, settle_s, kill_tree, s
         except subprocess.TimeoutExpired:
             kill_tree(proc)
             rc = proc.wait()
+    if progress is not None:
+        progress.close(clock())
     return SegmentResult(rc, kill_reason, clock() - t0)
 
 

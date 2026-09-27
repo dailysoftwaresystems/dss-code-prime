@@ -64,6 +64,16 @@ steps:
     # read as a flag of its own.
     run: |
       python3 ./build_and_test.py --tier="{tier}" --dss-config="{dssConfig}" --test-file="{testFile}" --dss="{product}"
+    # ★ THE STEP'S STALL BOUND, AND WHY IT SITS ABOVE THE DRIVER'S OWN (2026-09-26, the PR exit). DssHarness
+    # ends a step whose output is silent this long. The driver reports a running corpus on its output as the
+    # segment log grows -- a line at most every DSS_PROGRESS_INTERVAL (60 s), and none while the fixture is
+    # silent -- so this silence means no progress. A silent FIXTURE meets the driver's own bound first,
+    # DSS_SEGMENT_STALL (1800 s): the driver says so at once, kills it, names it an ABORT in its leg's verdict
+    # and resumes past it, keeping every other leg's verdict; this bound, 300 s above it (the poll, the
+    # interval and the kill all fit inside), is for a driver that is stuck itself. Equal bounds raced: the
+    # tool's could end the whole step on the fixture the driver was about to name. The driver's Step 0 checks
+    # this figure against its own two (test_driver_contracts.py, DC-31).
+    stallSeconds: 2100
     # The driver's closing claim, printed only after every declared leg's verdict is
     # counted from the ledger -- a run that verified nothing exits 1 before reaching it.
     successPattern: 'declared leg\(s\) VERIFIED'
