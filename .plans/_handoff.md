@@ -136,7 +136,17 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
 - **DssHarness.** A second report is pending delivery beside the first: DssHarness honours a STEP-level `stallSeconds`
   and `env` (X1 relies on the first), but `dssharness help runners` documents neither, nor their precedence over the
   runner's and config's. The repo-harness session is not reachable from this session, so both reports wait in
-  `.temp/dssharness-reports/` for the operator to forward.
+  `.temp/dssharness-reports/` for the operator to forward. **2026-09-28:** 0.5.15 (repo-harness #16) ships the first
+  report's fix: by its help and source, a host now writes its own home as `~` in every line of DssHarness's own and in
+  every path its ledger holds. Nothing in this tree reads those paths (`read-leg-path` takes only a tree-relative
+  path). `dssharness help runners` at 0.5.15 still documents no step-level key, so the second report stands. The CI
+  install was still pinned to 0.5.8, as set on 2026-09-19, while every gate since ran 0.5.10–0.5.14 and no pipes run
+  on this branch ever exercised the pin. By the operator's ruling the same day ("we should never pin a version, always
+  use the latest"), CI pins no DssHarness version now: it installs the newest release and prints which one, as the
+  local gate runs the newest. `repo-guard`, which holds the four entries that drive DssHarness, passed with 0.5.15,
+  today's newest, on this tree: 33 / 33 on both Windows legs (run 20260928-125026-16c2ff87). The sqlite harness's
+  revision pin fixes the test's subject rather than a tool, and is unchanged unless the operator extends the ruling
+  to it.
 - **Slips (mine):** twice an unpiped Python traceback printed the interpreter's path, which names the Windows account,
   into my tool output (no file); two ledger notes and one row carried a hand-typed date one day ahead (the run ids are
   UTC), corrected, and a stamp's date is now read too.

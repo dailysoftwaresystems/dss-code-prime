@@ -212,23 +212,24 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Install DssHarness
-        # PINNED to the version this tree's gate ran, and bumped WITH the tree:
-        # a floating install would let a tool release change a gate verdict on a
-        # commit that changed nothing. The version the tool REPORTS is compared,
-        # not only the exit code, so an install that resolved anything else
-        # fails here by name instead of as a puzzling guard failure later. The
-        # tool is called by the path `dotnet tool install --global` gives it,
-        # because that directory is not on PATH until a later step.
-        env:
-          DSS_HARNESS_VERSION: '0.5.8'
+        # The NEWEST release, never a pinned one (the operator's ruling,
+        # 2026-09-28). A pin is bumped by hand or not at all: this one sat at
+        # 0.5.8 from 2026-09-19 while every local gate ran 0.5.10 to 0.5.14, so
+        # CI would have judged the tree with a tool no gate had run. The local
+        # gate runs the newest release too: DssHarness warns when the build
+        # running trails the newest listed release, and brings every host it
+        # reaches to the dispatcher's build. So both judge the tree with the
+        # same tool, and a release that changes a verdict on an unchanged commit
+        # is a finding about that release. The version installed is printed, so
+        # the log names the DssHarness that judged the tree. The tool is called
+        # by the path `dotnet tool install --global` gives it, because that
+        # directory is not on PATH until a later step.
         run: |
           set -euo pipefail
-          dotnet tool install --global DssHarness --version "$DSS_HARNESS_VERSION"
-          reported="$("$HOME/.dotnet/tools/dssharness" --version)"
-          if [ "$reported" != "$DSS_HARNESS_VERSION" ]; then
-            echo "::error::DssHarness reports '$reported', but this tree pins '$DSS_HARNESS_VERSION'."
-            exit 1
-          fi
+          dotnet tool install --global DssHarness
+          # An assignment, so a tool that cannot say its version fails the step.
+          installed="$("$HOME/.dotnet/tools/dssharness" --version)"
+          echo "DssHarness $installed, the newest release, judges this tree"
         timeout-minutes: 5
 
       - name: Configure Git for private dependencies
