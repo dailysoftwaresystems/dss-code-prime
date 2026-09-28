@@ -1575,6 +1575,22 @@ def pin_dc12(t, x):
 # DC-13 -- a launched leg's run environment ARRIVES (carrier, loader path, translation)
 # ═══════════════════════════════════════════════════════════════════════════════════════
 
+RT0_LABEL = "a WSL that translates answers: the windows-to-wsl translator's host"
+RT1_LABEL = "the REAL windows-to-wsl translator on the launched leg"
+
+
+def rt_capability(C, check, skip, usable, why):
+    """RT's gate -> True when the real translator may be asked. RT0 is its capability arm
+    (sqlite_common.capability_arm): a harness host whose WSL translates nothing FAILS it by name; a
+    test-only host -- GitHub's windows runner ships wsl.exe with no distribution -- SKIPS it. When it did
+    not pass, RT1 is a skip naming its judgement."""
+    verdict = C.capability_arm(check, skip, RT0_LABEL, "a WSL that translates (the windows-to-wsl translator)",
+                               usable, why)
+    if verdict != "ok":
+        skip(RT1_LABEL, "needs a WSL that translates, which RT0 judged: %s" % why)
+    return verdict == "ok"
+
+
 def pin_dc13(t, x):
     L = x.M.mod("sqlite_launch")
     C = x.C
@@ -1662,25 +1678,36 @@ def pin_dc13(t, x):
          r9 and "declares no carrier variable" in str(m9), m9)
     spec = x.suite.hl.PATH_TRANSLATIONS.get("windows-to-wsl", {})
     valid, xl = spec.get("validHostOs", ""), list(spec.get("translator") or [])
+    keyed = {RT0_LABEL: "RT0", RT1_LABEL: "RT1"}
     if x.suite.host != valid:
-        t.skip("RT1", "the REAL windows-to-wsl translator on the launched leg",
-               "that verb's translator exists only on a '%s' host (harness_legs PATH_TRANSLATIONS validHostOs); "
+        why = ("that verb's translator exists only on a '%s' host (harness_legs PATH_TRANSLATIONS validHostOs); "
                "this host is '%s'" % (valid, x.suite.host))
-    elif not xl or not shutil.which(xl[0]):
-        t.skip("RT1", "the REAL windows-to-wsl translator on the launched leg", "%s is not on PATH" % (xl[:1] or "?"))
-    elif not Rr.call(["--path-translation", "windows-to-wsl", "--translate-path",
-                      "C:\\dss\\pin\\probe"]).out.strip().startswith("/"):
-        probe = Rr.call(["--path-translation", "windows-to-wsl", "--translate-path", "C:\\dss\\pin\\probe"])
-        t.skip("RT1", "the REAL windows-to-wsl translator on the launched leg",
-               "%s is on PATH but translates nothing on this host (rc=%d: %s) -- no usable WSL distribution"
-               % (xl[0], probe.rc, " ".join((probe.err or probe.out).split())[:300]))
+        t.skip("RT0", RT0_LABEL, why)
+        t.skip("RT1", RT1_LABEL, why)
     else:
-        r10, got10 = refused(L.loader_search_path, Rr, arm, dirs, {}, x.log())
-        parts = got10[1].split(":") if (not r10 and got10) else []
-        t.ck("RT1", "the REAL translator (%s) spells both directories for the launcher: absolute, no backslash, "
-             "':'-joined, each the same directory" % " ".join(xl),
-             len(parts) == 2 and all(p.startswith("/") and "\\" not in p for p in parts)
-             and parts[0].endswith("/dss/pin/tcl/lib") and parts[1].endswith("/dss/pin/z/lib"), got10)
+        if not xl or not shutil.which(xl[0]):
+            usable, why = False, "%s is not on PATH" % (xl[:1] or "?")
+        else:
+            probe = Rr.call(["--path-translation", "windows-to-wsl", "--translate-path", "C:\\dss\\pin\\probe"])
+            usable = probe.out.strip().startswith("/")
+            why = "" if usable else ("%s is on PATH but translates nothing on this host (rc=%d: %s) -- no usable "
+                                     "WSL distribution"
+                                     % (xl[0], probe.rc, " ".join((probe.err or probe.out).split())[:300]))
+        if rt_capability(C, lambda label, ok, d: t.ck(keyed[label], label, ok, d),
+                         lambda label, w: t.skip(keyed[label], label, w), usable, why):
+            r10, got10 = refused(L.loader_search_path, Rr, arm, dirs, {}, x.log())
+            parts = got10[1].split(":") if (not r10 and got10) else []
+            t.ck("RT1", "the REAL translator (%s) spells both directories for the launcher: absolute, no backslash, "
+                 "':'-joined, each the same directory" % " ".join(xl),
+                 len(parts) == 2 and all(p.startswith("/") and "\\" not in p for p in parts)
+                 and parts[0].endswith("/dss/pin/tcl/lib") and parts[1].endswith("/dss/pin/z/lib"), got10)
+    # RT0's SITE, pinned on every host: the gate's Windows host translates, so its real RT0 never reaches the
+    # lack -- a site that mapped a harness host's lack to a skip would pass everywhere but here. Through the
+    # module a red arm may mutate (RD-92 reads the host declaration's default through it).
+    Cm, lack = x.M.mod("sqlite_common"), "injected: translates nothing"
+    held, detail = Cm.site_pinned(lambda rec: rt_capability(Cm, rec.check, rec.skip, False, lack), lack)
+    t.ck("RT2", "RT0's site: a harness host whose WSL translates nothing FAILS RT0 by name and skips RT1; a "
+         "test-only host skips both", held, detail)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -4287,6 +4314,15 @@ REDS = (
         "judge a stage current whatever Tcl its headers are",
         "    if tcl and (st.tcl_version or \"\") != tcl:\n", new="    if False:\n",
         expect=("A13",), stay_green=("A01", "A12")),
+    # ── the harness-host declaration (2026-09-28, the PR exit's lane ci59b: its review's MAJOR finding)
+    red("RD-92", "DC-13", "sqlite_common", "new (PR exit ci59b, 2026-09-28)",
+        "read an UNDECLARED host as a test-only host -- lane ci59's first draft, where a lost declaration failed "
+        "toward clean",
+        "    if value is None or value in (\"\", \"1\"):\n        return True\n"
+        "    if value == TEST_ONLY_HOST:\n        return False\n",
+        new="    if value == \"1\":\n        return True\n"
+            "    if value is None or value in (\"\", TEST_ONLY_HOST):\n        return False\n",
+        expect=("RT2",), stay_green=("D01", "N01")),
 )
 
 
@@ -4395,12 +4431,13 @@ MUTATOR_ARMS = (
               "each FAIL; only a pin skip skips", ms_red_verdict),
 )
 
-# Every arm this file registers: 31 pins + 92 red arms + 10 mutator arms. A registry that no longer
+# Every arm this file registers: 31 pins + 93 red arms + 10 mutator arms. A registry that no longer
 # adds up to this -- an arm deleted, or one added without this line -- is a FAILURE. (2026-09-26: five red
 # arms retired with the code they guarded -- RD-26, RD-31, RD-48, RD-49, RD-52 -- and five added, RD-76..RD-80;
 # then, P68 round 13, RD-75 retired with the benchmark's clone lock and four added, RD-81..RD-84; then, the PR
-# exit's X1, DC-31 and its six arms RD-85..RD-90, and RD-91 on DC-27; a retired arm's id is never reused.)
-DECLARED_TOTAL = 133
+# exit's X1, DC-31 and its six arms RD-85..RD-90, and RD-91 on DC-27; then its lane ci59b, RD-92 on DC-13; a
+# retired arm's id is never reused.)
+DECLARED_TOTAL = 134
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════
@@ -4532,6 +4569,12 @@ def run_suite(out):
         return 1
     out.line("test_driver_contracts.py -- pinning the ONE Python driver in %s (host %s/%s, Python %s)"
              % (HERE, suite.host, suite.arch, sys.version.split()[0]))
+    try:
+        out.line("   (%s)" % suite.C.harness_host_line())
+    except Exception as exc:  # noqa: BLE001 -- only a refusal is an answer here
+        if not is_refusal(exc):
+            raise
+        _fail(out, tally, "the harness-host declaration is REFUSED: %s" % exc)
     spent = []
 
     def timed(name, fn, *a):

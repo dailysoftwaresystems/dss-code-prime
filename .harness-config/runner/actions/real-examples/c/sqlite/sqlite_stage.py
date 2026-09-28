@@ -2263,7 +2263,7 @@ def derive_main(args, which=None, lock_factory=None, translator=None, stage_fn=N
 ARMS = ("mk_var", "tcl_h_version", "tcl_select", "pin_shim", "stamp", "required_defines",
         "capabilities", "ldflags", "find", "zlib_headers", "tcl_headers", "stage_build", "config",
         "stage_dir", "staging", "json", "translate", "derive_cli", "git", "sourcing", "tcl_choice",
-        "tclsh_real", "probe_link", "pin_exec", "orchestration")
+        "tclsh_real", "probe_link", "pin_exec", "orchestration", "capability_sites")
 
 _GOOD_SB = {"configureFlags": ["--enable-all", "--fts3"], "makeOptions": "-DSQLITE_ENABLE_STAT4",
             "optionDefines": ["SQLITE_ENABLE_STAT4"],
@@ -3017,9 +3017,7 @@ def _st_derive(t):
 
 def _st_git(t):
     with t.arm("git"):
-        git = shutil.which("git")
-        if not git:
-            t.skip("clone_or_update / default_branch against local repositories", "git is not on PATH")
+        if not _tool_gate(t, "clone_or_update / default_branch against local repositories", ("git",)):
             return
         tmp = _tmp("git")
         env = _hermetic_git_env(tmp)
@@ -3262,35 +3260,31 @@ def _st_posix_only(t):
             shutil.rmtree(tmp, ignore_errors=True)
 
     with t.arm("tclsh_real"):
-        why = _posix_skip_reason(have_sh, ("tclsh",))
-        if why:
-            t.skip("the real tclsh and Tcl inventory", why)
-        else:
+        if _posix_gate(t, "the real tclsh and Tcl inventory", have_sh, ()):
             tmp = _tmp("tr")
             ctx, _log = _ctx(tmp)
             discover_roots(ctx)
             ctx.inventory = inv = tcl_inventory(ctx)
             sh, ver, how = choose_tclsh(ctx)
-            t.check("the tclsh the stage would run (PATH's when it reports >= 8.6, else the newest INSTALLED Tcl "
-                    "whose own interpreter answers) reports a version >= 8.6",
-                    awk_num(ver) >= 8.6 and how != "none",
-                    "%r via %s (%s)%s" % (ver, sh or "nothing", how, _host_tcl_facts(ctx)))
-            if not inv:
-                t.skip("the inventory holds the tclsh's own installation", "no tclConfig.sh under the CFG roots")
-            else:
+            runs = _tcl_runs_arm(t, sh, ver, how, lambda: _host_tcl_facts(ctx))
+            if _tcl_dev_files_arm(t, "the inventory holds a Tcl's development files (a tclConfig.sh under the CFG "
+                                     "roots)", bool(inv), "no tclConfig.sh under the CFG roots: %s"
+                                  % " ".join(ctx.cfg_roots)) == "ok":
                 t.check("the inventory is in code-point path order", [c for _v, c in inv] == sorted(c for _v, c in inv))
                 t.check("every entry's version is what sourcing it says",
                         all(tcl_config_values(ctx, c, ("TCL_VERSION",))["TCL_VERSION"] == v for v, c in inv))
-                sel = select_tcl(inv, "", ver)
-                t.check("that tclsh's own installation is selected", sel[0] == ver and sel[2] == "tclsh",
-                        "%r%s" % (sel, _host_tcl_facts(ctx)))
+                label = "that tclsh's own installation is selected"
+                if runs != "ok":
+                    # it selects by the version of the Tcl the stage runs, which the arm above did not find
+                    t.skip(label, "needs the Tcl the stage runs, which the arm above judged: %r via %s (%s)"
+                           % (ver, sh or "nothing", how))
+                else:
+                    sel = select_tcl(inv, "", ver)
+                    t.check(label, sel[0] == ver and sel[2] == "tclsh", "%r%s" % (sel, _host_tcl_facts(ctx)))
             shutil.rmtree(tmp, ignore_errors=True)
 
     with t.arm("probe_link"):
-        why = _posix_skip_reason(have_sh, ("cc",))
-        if why:
-            t.skip("probe_link_l links for real", why)
-        else:
+        if _posix_gate(t, "probe_link_l links for real", have_sh, ("cc",)):
             cc = shutil.which("cc")
             tmp = _tmp("pl")
             ctx, _log = _ctx(tmp)
@@ -3307,10 +3301,8 @@ def _st_posix_only(t):
             shutil.rmtree(tmp, ignore_errors=True)
 
     with t.arm("pin_exec"):
-        why = _posix_skip_reason(have_sh, ("tclsh",))
-        if why:
-            t.skip("the pin shim EXECUTES the pinned interpreter", why)
-        else:
+        # the interpreters here are FAKE (`tclsh9.9`, `tclsh9.8`): the arm needs the POSIX side, not a real tclsh
+        if _posix_gate(t, "the pin shim EXECUTES the pinned interpreter", have_sh, ()):
             tmp = _tmp("pe")
             fake_bin = _j(tmp, "bin")
             _w(_j(fake_bin, "tclsh9.9"), "#!/bin/sh\ncat >/dev/null\necho 9.9\n", 0o755)
@@ -3426,12 +3418,49 @@ def _stub_procs(locks):
     return m
 
 
-def _posix_skip_reason(have_sh, tools):
-    """None when an arm that needs the POSIX side and `tools` can run here, else the NAMED reason."""
+def _posix_gate(t, label, have_sh, tools, which=shutil.which):
+    """An arm that needs the POSIX side and `tools` -> True when it may run. A host that is not the POSIX
+    side SKIPS it (the POSIX half runs elsewhere; this host never needs it); a tool the POSIX side lacks
+    is a missing CAPABILITY (`_tool_gate`)."""
     if not have_sh:
-        return "this host is not the POSIX side (no `sh`); the POSIX half runs there -- run this self-test in WSL"
-    absent = [n for n in tools if not shutil.which(n)]
-    return ("absent on PATH: %s" % ", ".join(absent)) if absent else None
+        t.skip(label, "this host is not the POSIX side (no `sh`); the POSIX half runs there -- run this self-test "
+                      "in WSL")
+        return False
+    return _tool_gate(t, label, tools, which)
+
+
+def _tool_gate(t, label, tools, which=shutil.which):
+    """An arm that needs `tools` on PATH -> True when it may run. Each is something the harness RUNS on
+    this host (git clones and pins the subject; make, cc and tclsh configure and derive it), so one that
+    is absent is a capability arm (sqlite_common.capability_arm): a harness host FAILS the arm by name, a
+    test-only host SKIPS it."""
+    absent = [n for n in tools if not which(n)]
+    if not absent:
+        return True
+    C.capability_arm(t.check, t.skip, label, "%s on PATH, which the harness runs here" % ", ".join(tools), False,
+                     "absent on PATH: %s" % ", ".join(absent))
+    return False
+
+
+_TCL_RUNS_LABEL = ("the tclsh the stage would run (PATH's when it reports >= 8.6, else the newest INSTALLED Tcl "
+                   "whose own interpreter answers) reports a version >= 8.6")
+
+
+def _tcl_runs_arm(t, sh, ver, how, facts):
+    """tclsh_real's capability arm (sqlite_common.capability_arm) -> its verdict. A harness host REQUIRES
+    a Tcl >= 8.6 the stage can run; a test-only host -- GitHub's macOS runner carries only Apple's Tcl
+    8.5 -- SKIPS it by name. No tclsh on PATH is the same lack, judged the same way: `choose_tclsh`
+    still reads the installed ones. `facts()` is what a failing host arm prints about the host."""
+    have = awk_num(ver) >= 8.6 and how != "none"
+    return C.capability_arm(t.check, t.skip, _TCL_RUNS_LABEL, "a Tcl >= 8.6 the stage can run", have,
+                            "%r via %s (%s)" % (ver, sh or "nothing", how), "" if have else facts())
+
+
+def _tcl_dev_files_arm(t, label, have, why):
+    """A capability arm for a Tcl's DEVELOPMENT FILES -- the tclConfig.sh sqlite's configure is handed
+    and the headers beside it -> its verdict: a harness host without them FAILS `label`, a test-only
+    host SKIPS it (sqlite_common.capability_arm)."""
+    return C.capability_arm(t.check, t.skip, label, "a Tcl's development files (its tclConfig.sh)", have, why)
 
 
 def _host_tcl_facts(ctx):
@@ -3459,18 +3488,20 @@ def _host_tcl_facts(ctx):
 
 
 def _st_orchestration(t, have_sh):
-    why = _posix_skip_reason(have_sh, ("git", "make", "tclsh", "cc"))
-    if why:
-        t.skip("stage() + the derive CLI end to end over a FAKE sqlite", why)
+    label = "stage() + the derive CLI end to end over a FAKE sqlite"
+    if not _posix_gate(t, label, have_sh, ("git", "make", "tclsh", "cc")):
         return
     # ONE full inventory walk (the tclsh_real arm proves it); every stage() below then searches only
     # the chosen installation's own directory -- the full walk crosses a Windows mount inside WSL.
     probe = _tmp("orch-inv")
     pctx, _pl = _ctx(probe)
-    chosen = select_tcl(tcl_inventory(pctx), "", tclsh_version(pctx))[1]
+    on_path = tclsh_version(pctx)
+    chosen = select_tcl(tcl_inventory(pctx), "", on_path)[1]
     shutil.rmtree(probe, ignore_errors=True)
-    if not chosen:
-        t.skip("stage() + the derive CLI end to end over a FAKE sqlite", "no tclConfig.sh for the tclsh on PATH")
+    # select_tcl answers nothing only for an EMPTY inventory: any installed Tcl is chosen before that
+    if _tcl_dev_files_arm(t, "a Tcl's development files are installed, which %s configures sqlite with" % label,
+                          bool(chosen), "no tclConfig.sh under the CFG roots (the tclsh on PATH reports %r)"
+                          % on_path) != "ok":
         return
     saved = globals()["BASE_CFG_ROOTS"]
     globals()["BASE_CFG_ROOTS"] = (posixpath.dirname(chosen),)
@@ -3625,12 +3656,43 @@ def _st_orchestration_body(t):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _st_capability_sites(t):
+    """Each capability SITE run under an injected lack, as a harness host and as a declared test-only
+    host (sqlite_common.site_pinned). The gate's hosts have everything these arms need, so their real
+    arms never reach the lack: a site that mapped a harness host's lack to a skip goes red HERE, on
+    every host, and nowhere else."""
+    with t.arm("capability_sites"):
+        lack = "'8.5' via nothing (none)"
+        held, detail = C.site_pinned(lambda rec: _tcl_runs_arm(rec, "", "8.5", "none", lambda: ""), lack)
+        t.check("tclsh_real's site: a harness host whose only Tcl is 8.5 FAILS the Tcl arm by name", held, detail)
+        lack = "injected: no tclConfig.sh"
+        held, detail = C.site_pinned(lambda rec: _tcl_dev_files_arm(rec, "the dev-files arm", False, lack), lack)
+        t.check("the dev-files site: a harness host without a tclConfig.sh FAILS the arm that needs one", held, detail)
+        held, detail = C.site_pinned(lambda rec: _posix_gate(rec, "the arm", True, ("git", "make"),
+                                                             lambda n: None if n == "make" else "/bin/" + n),
+                                     "absent on PATH: make")
+        t.check("_posix_gate's site: a harness host's POSIX side without `make` FAILS the arm that needs it, "
+                "naming only what is absent", held, detail)
+        rec = C.ArmRecorder()
+        with C.declared_host(None):
+            ran = _posix_gate(rec, "the arm", False, ("git",), lambda n: None)
+        t.check("CONTROL: a host that is not the POSIX side SKIPS a POSIX arm even as a harness host -- the POSIX "
+                "half runs elsewhere, and this host never needs it", not ran and rec.outcomes() == [("the arm", "skip")],
+                rec.rows)
+
+
 def self_test(out=None):
     out = out if out is not None else sys.stdout
     t = _T(out)
+    try:
+        out.write("   (%s)\n" % C.harness_host_line())
+    except C.HarnessDie as exc:
+        t.failed += 1
+        out.write("  FAIL the harness-host declaration is REFUSED: %s\n" % exc)
     _st_pure(t)
     _st_git(t)
     _st_posix_only(t)
+    _st_capability_sites(t)
     if sorted(t.ran) != sorted(ARMS) or len(t.ran) != len(set(t.ran)):
         t.failed += 1
         out.write("  FAIL the arms that ran (%s) are not the declared ARMS (%s)\n" % (t.ran, list(ARMS)))

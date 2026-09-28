@@ -114,9 +114,10 @@ jobs:
         #     windows-msvc-release     >45m (killed) never ran  RED - hit the 45-min cap
         #
         # The asan leg is not hung and windows is not broken: asan is Debug + ASan +
-        # UBSan, ✔11,314 CPU-seconds against gcc-release's 935 (12x), and at
-        # `--parallel 6` that is 47 minutes of PERFECT packing against a 50-minute
-        # budget. Windows compiled 453 of 786 ninja edges in 45 minutes from a cold
+        # UBSan, ✔11,314 CPU-seconds against gcc-release's 935 (12x), and on the
+        # runner's 4 cores that is 47 minutes of PERFECT packing (11,314 / 4 s)
+        # against a 50-minute budget -- an estimate; the run itself was killed at the cap.
+        # Windows compiled 453 of 786 ninja edges in 45 minutes from a cold
         # cache. Neither number was ever wrong about its own leg; one number for five
         # legs was.
         #
@@ -136,13 +137,22 @@ jobs:
         # ⚠ AND THE ASAN BUDGET IS A CEILING THE CORPUS IS WALKING TOWARDS: 62% of
         # those 11,314 CPU-seconds is the 1,231-entry example + integrated corpus, which
         # grows every cycle.
+        # ✔ RE-DERIVED 2026-09-28 from run 36427818588 (378c3faa, 2,539 tests): the asan
+        # Test step took 6,314 s of its 6,600 s budget (95.7%), green, and the step's own
+        # >80% warning asked for this. 110/120 -> 180/190: 1.71x the measured 105 min, and
+        # the job (a 45-min build cap + 190) stays well inside GitHub's 6-hour job limit.
+        # August's measured run was killed at its 50-minute cap (>2,999.79 s, above), so
+        # the wall clock grew by under 2.11x since (6,314 / 2,999.79). The corpus grew, and
+        # DSS's own compile got slower (P68's exit measured a 21-25% rise on sqlite,
+        # disclosed) -- so a budget that keeps being re-derived is a symptom to read, not a
+        # number to keep raising.
         run: |
           legs='[]'
           if [ "${{ true }}" = "true" ]; then
             legs=$(echo "$legs" | jq -c '. + [{"name":"linux-gcc-release","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":"","build_timeout_min":45,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
           fi
           if [ "${{ true }}" = "true" ]; then
-            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined","build_timeout_min":45,"ctest_budget_min":110,"ctest_step_timeout_min":120}]')
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined","build_timeout_min":45,"ctest_budget_min":180,"ctest_step_timeout_min":190}]')
           fi
           if [ "${{ true }}" = "true" ]; then
             legs=$(echo "$legs" | jq -c '. + [{"name":"windows-msvc-release","os":"windows-latest","cc":"","cxx":"","build_type":"Release","sanitizers":"","build_timeout_min":120,"ctest_budget_min":50,"ctest_step_timeout_min":60}]')
@@ -447,6 +457,13 @@ jobs:
           # surface in stdout but ctest still reports success.
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          # A CI runner only RUNS the tree's tests; the sqlite harness never runs here. Every host is a
+          # harness host until it declares otherwise, and there a missing capability (a usable WSL, a Tcl
+          # the stage can run) FAILS its self-test arm; declared `0`, the same arm is a named SKIP
+          # (`sqlite_common.harness_host`). ✔MEASURED 2026-09-28, Pipeline run 36427818588: the windows
+          # runner ships wsl.exe with no distribution, the macOS one only Apple's Tcl 8.5. Lose this line
+          # and those two legs go red naming what they lack -- the strict direction, on purpose.
+          DSS_SQLITE_HARNESS_HOST: "0"
         # `--parallel 6` runs the suite concurrently (the build step is already
         # parallel). Verified parallel-safe (isolated per-test temp dirs) at -j4;
         # cuts the wall time ~4x. `4` is portable across the Linux/Windows/macOS

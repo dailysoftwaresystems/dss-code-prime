@@ -3,7 +3,7 @@
 
 `build_and_test.py` is the ONE driver (it replaced `build-and-test.sh` and its Windows twin
 `build-and-test.ps1` on 2026-09-21, lane mig, part 4: no `.sh`/`.ps1` under the actions
-directory). Every module of the port imports this file for the same five things, so none of
+directory). Every module of the port imports this file for the same six things, so none of
 them grows a private copy:
   * the LOG vocabulary (`step`/`info`/`ok`/`warn` on stdout, `die` = `HarnessDie`, exit 1);
   * the CONFIGURATION read from the environment, validated up front (a malformed number or a
@@ -16,7 +16,10 @@ them grows a private copy:
     exit-code contracts (0/2/3/4) stay the ones its own self-test proves;
   * the LEG LEDGER: the closed verdict vocabulary guards BOTH recorders -- an empty or unknown
     token becomes `poisoned` with `HARNESS DEFECT: …`, is counted as unclassified, and the run
-    cannot exit 0 (the union of the .sh's unit-level guard and the .ps1's leg-level one).
+    cannot exit 0 (the union of the .sh's unit-level guard and the .ps1's leg-level one);
+  * the HOST'S CAPABILITIES: a WSL that is USABLE, not merely present (`wsl_usable`), and ONE
+    mapping of a missing capability (`capability_arm`) -- a FAIL on a harness host, which every host
+    is unless it declares `DSS_SQLITE_HARNESS_HOST=0`, and a named SKIP on a host that does.
 
 Nothing here runs at import (the programs beside it import it; `check-guard-output-encoding`
 imports every primary program in a child).
@@ -24,6 +27,7 @@ imports every primary program in a child).
 from __future__ import annotations
 
 import collections
+import contextlib
 import importlib.util
 import json
 import os
@@ -317,6 +321,176 @@ class PosixSide:
 
 def which(name):
     return shutil.which(name)
+
+
+# ── what this host can do, and whether it must ──────────────────────────────────────
+#
+# ★ PRESENCE IS NOT USE. Windows ships `wsl.exe` whether or not a distribution is installed:
+# ✔MEASURED 2026-09-28 on GitHub's windows-latest runner (Pipeline run 36427818588) --
+# `shutil.which("wsl.exe")` answered, and every command through it exited 4294967295 with
+# "Windows Subsystem for Linux has no installed distributions". Arms that asked only for the
+# program failed there, and a section crashed translating a path through it.
+#
+# ★ A HARNESS HOST REQUIRES WHAT A TEST HOST MAY LACK. The hosts this harness RUNS on -- the gate's
+# four -- need what it runs there: git on every one (it clones and pins the subject); a usable WSL on
+# Windows; on a POSIX host make, cc and a Tcl the stage can run, with its development files. There an arm that finds one missing FAILS, naming it: a
+# gate host that lost it is a red gate, not a quiet skip. A host that only runs the tree's tests -- a
+# CI runner -- DECLARES so with `DSS_SQLITE_HARNESS_HOST=0` (the CI workflow's Test step does), and
+# there the same arm is a counted SKIP that names what is missing, so the run says what it could not
+# prove instead of failing on a host the harness never runs on.
+# ★ EVERY HOST IS A HARNESS HOST UNTIL IT DECLARES OTHERWISE, because a declaration can be LOST. The
+# first draft (P68's PR exit, lane ci59) read an unset variable as "a test host" and gave each gate
+# host `=1` in its DssHarness `env`. Its independent review showed where that fails toward clean: a
+# host added without the entry, a more specific env layer replacing it, ctest run by hand on the gate
+# machine itself -- each turned every capability arm on a gate host into a skip, and the run stayed
+# green, which is the one outcome this policy exists to prevent. Now a lost declaration fails toward
+# RED: a CI runner that lost its `0` fails, naming the capability it lacks and the variable.
+# ★ ONE MAPPING, `capability_arm`: a site hands it its self-test's own check and skip, so no site
+# decides on its own what a missing capability means; each site's arm is pinned by injecting the lack.
+
+HARNESS_HOST_ENV = "DSS_SQLITE_HARNESS_HOST"
+TEST_ONLY_HOST = "0"
+# the words that end a test-only host's skip, and only that skip (`site_pinned` reads them)
+TEST_ONLY_SKIP_MARK = "UNPROVEN here rather than failed"
+WSL_ANSWER = "dss-wsl-answers"
+WSL_PROBE_TIMEOUT_S = 120
+_WSL_USABLE = None
+
+
+def harness_host():
+    """True unless this process DECLARES a host that only runs the tree's tests
+    (`DSS_SQLITE_HARNESS_HOST=0`, as the CI workflow's Test step does). Unset, empty and `1` all read as
+    a HARNESS HOST -- the strict reading, so a declaration that never arrives fails toward red. Any
+    other spelling is refused, never read as either."""
+    value = os.environ.get(HARNESS_HOST_ENV)
+    if value is None or value in ("", "1"):
+        return True
+    if value == TEST_ONLY_HOST:
+        return False
+    die("%s=%r: its only spellings are %s (a host that only runs the tree's tests, as the CI workflow's Test step "
+        "declares) and 1, empty or unset (a host this harness runs on, the default)"
+        % (HARNESS_HOST_ENV, value, TEST_ONLY_HOST))
+
+
+def harness_host_line():
+    """What a self-test prints FIRST about this host, read EAGERLY: a malformed declaration is refused
+    before any arm runs, not only where a capability happens to be missing."""
+    if harness_host():
+        return "a harness host: yes (%s declares no test-only host)" % HARNESS_HOST_ENV
+    return "a harness host: no (%s=%s: a host that only runs the tree's tests)" % (HARNESS_HOST_ENV, TEST_ONLY_HOST)
+
+
+def capability_verdict(what, have, why):
+    """One verdict for an arm that needs a HOST capability -> (verdict, detail): ("ok", "") when the
+    host has it; else ("fail", …) on a harness host, which needs it, and ("skip", …) on any other,
+    each naming `what` is missing and `why`, the measured reason."""
+    if have:
+        return "ok", ""
+    if harness_host():
+        return "fail", ("this is a HARNESS HOST (%s is not %s), and it lacks %s: %s -- a host that only runs "
+                        "the tree's tests declares %s=%s"
+                        % (HARNESS_HOST_ENV, TEST_ONLY_HOST, what, why, HARNESS_HOST_ENV, TEST_ONLY_HOST))
+    return "skip", ("this host lacks %s (%s); it declares that it only runs the tree's tests (%s=%s), so this is "
+                    "%s" % (what, why, HARNESS_HOST_ENV, TEST_ONLY_HOST, TEST_ONLY_SKIP_MARK))
+
+
+def capability_arm(check, skip, label, what, have, why, facts=""):
+    """Record ONE capability arm through a self-test's own `check(label, ok, detail)` and
+    `skip(label, why)` -> its verdict: a PASS where the host has `what`; a FAIL naming it on a
+    harness host that lacks it (`facts` appended: what a failing host arm prints about the host); a
+    counted SKIP naming it on a host that declares it only runs the tree's tests."""
+    verdict, detail = capability_verdict(what, have, why)
+    if verdict == "skip":
+        skip(label, detail)
+    else:
+        check(label, verdict == "ok", detail + (facts if verdict == "fail" else ""))
+    return verdict
+
+
+@contextlib.contextmanager
+def declared_host(value):
+    """The self-tests' injection: the body runs as a host whose `DSS_SQLITE_HARNESS_HOST` is `value`
+    (None = unset); the variable is restored however the body ends."""
+    saved = os.environ.get(HARNESS_HOST_ENV)
+    try:
+        if value is None:
+            os.environ.pop(HARNESS_HOST_ENV, None)
+        else:
+            os.environ[HARNESS_HOST_ENV] = value
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(HARNESS_HOST_ENV, None)
+        else:
+            os.environ[HARNESS_HOST_ENV] = saved
+
+
+class ArmRecorder:
+    """A self-test's `check` and `skip` that RECORD instead of reporting: a site's capability arm run
+    under an injected lack is read back from `rows` -- (label, "pass" | "fail" | "skip", detail) -- so
+    the site's own mapping is pinned without its injected FAIL reaching the run's report."""
+
+    def __init__(self):
+        self.rows = []
+
+    def check(self, label, ok, detail=""):
+        self.rows.append((label, "pass" if ok else "fail", str(detail)))
+
+    def skip(self, label, why):
+        self.rows.append((label, "skip", str(why)))
+
+    def outcomes(self):
+        return [(label, how) for label, how, _d in self.rows]
+
+
+def site_pinned(site, lack):
+    """A capability SITE, run twice under an injected lack -> (held, detail). `site(recorder)` records
+    through `recorder.check`/`recorder.skip`; `lack` is the reason text the injection hands it. It holds
+    when, as an undeclared host (a harness host), the site FAILS an arm naming the lack and passes none,
+    and, declared a test-only host, it SKIPS those arms naming the lack and fails none."""
+    runs = {}
+    for value in (None, TEST_ONLY_HOST):
+        rec = ArmRecorder()
+        with declared_host(value):
+            site(rec)
+        runs[value] = rec
+    strict, test_only = runs[None].rows, runs[TEST_ONLY_HOST].rows
+    failed = [label for label, how, d in strict if how == "fail" and lack in d and HARNESS_HOST_ENV in d]
+    skipped = [label for label, how, d in test_only if how == "skip" and lack in d]
+    # a harness host never takes the TEST-ONLY skip -- not even in a site with a second capability arm
+    # beside one that did fail (a site's dependent skips name the arm that judged, not the declaration)
+    strict_test_only_skips = [label for label, how, d in strict if how == "skip" and TEST_ONLY_SKIP_MARK in d]
+    held = (bool(failed) and not any(how == "pass" for _l, how, _d in strict) and not strict_test_only_skips
+            and set(failed) <= set(skipped) and not any(how == "fail" for _l, how, _d in test_only))
+    return held, "as a harness host: %r\ndeclared test-only: %r" % (runs[None].outcomes(),
+                                                                    runs[TEST_ONLY_HOST].outcomes())
+
+
+def wsl_usable(runner=None, which_=None):
+    """(usable, why) for this host's WSL: usable when `wsl.exe` is on PATH AND runs a command in a
+    distribution -- `wsl.exe -e echo <WSL_ANSWER>` exits 0 and prints the token. `why` is the measured
+    reason it is not, in wsl.exe's own words (its UTF-16 output read without the NULs). The real host
+    is probed once per process; `runner` (argv -> Result) and `which_` are the self-tests' injections."""
+    global _WSL_USABLE
+    real = runner is None and which_ is None
+    if real and _WSL_USABLE is not None:
+        return _WSL_USABLE
+    if not (which_ or shutil.which)("wsl.exe"):
+        got = (False, "wsl.exe is not on PATH")
+    else:
+        argv = ["wsl.exe", "-e", "echo", WSL_ANSWER]
+        r = (runner or (lambda a: capture(a, timeout=WSL_PROBE_TIMEOUT_S)))(argv)
+        if r.rc == 0 and WSL_ANSWER in (r.out or "").replace("\0", ""):
+            got = (True, "")
+        else:
+            said = " ".join(("%s %s" % (r.err or "", r.out or "")).replace("\0", "").split())[:300]
+            # rc 124 is `capture`'s timeout: a wsl.exe that never answered, not one that ran nothing
+            how = ("did not answer within %ds" % WSL_PROBE_TIMEOUT_S) if r.rc == 124 else "runs nothing"
+            got = (False, "wsl.exe is on PATH but %s: `%s` exited %d%s"
+                   % (how, " ".join(argv), r.rc, (": " + said) if said else " and printed nothing"))
+    if real:
+        _WSL_USABLE = got
+    return got
 
 
 # ── the tree this harness lives in ──────────────────────────────────────────────────

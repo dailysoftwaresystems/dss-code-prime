@@ -142,9 +142,19 @@ def _win():
                               ctypes.POINTER(FILETIME)),
         GetExitCodeProcess=proto("GetExitCodeProcess", wintypes.BOOL, h,
                                  ctypes.POINTER(wintypes.DWORD)),
-        WaitForSingleObject=proto("WaitForSingleObject", wintypes.DWORD, h, wintypes.DWORD))
+        WaitForSingleObject=proto("WaitForSingleObject", wintypes.DWORD, h, wintypes.DWORD),
+        GetShortPathNameW=proto("GetShortPathNameW", wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPWSTR,
+                                wintypes.DWORD))
     _WIN.append(ns)
     return ns
+
+
+def _win_short_path(path):
+    """`path` in its 8.3 SHORT spelling (GetShortPathNameW), or "" when the OS gives none."""
+    w = _win()
+    buf = w.ctypes.create_unicode_buffer(32768)
+    n = w.GetShortPathNameW(str(path), buf, len(buf))
+    return buf.value if 0 < n < len(buf) else ""
 
 
 def _win_open(pid, access):
@@ -359,14 +369,56 @@ def _win_path_key(path, keep_trailing):
 
 
 def _matcher(fixture_path, launched):
-    """Native Windows: the IMAGE path contains the fixture's path (both absolute, separators and
-    case normalised, a directory's trailing separator kept so `…\\pe64\\` never matches
-    `…\\pe64-x\\`). Everywhere else: the COMMAND LINE contains the path, byte for byte."""
+    """Native Windows: the IMAGE path contains the fixture's path, BOTH CANONICAL -- every link
+    resolved and every 8.3 short name expanded (`os.path.realpath`), then separators and case
+    normalised, a directory's trailing separator kept so `…\\pe64\\` never matches `…\\pe64-x\\`.
+    Everywhere else: the COMMAND LINE contains the path, byte for byte (a POSIX kernel reports argv
+    as the process was started).
+
+    ★ WHY BOTH SIDES: the kernel names an image by the path it OPENED -- every link on it resolved to
+    its target, every other component as it was SPELLED, 8.3 short names included. ✔MEASURED
+    2026-09-28: a process started as `<dir>\\junc\\python.exe` (a directory junction) or as
+    `<dir>\\python3.exe` (a file symlink to python.exe) has the image path of the link's TARGET, so a
+    needle spelled as given matched nothing and the sweep answered "verified, none found" over a live
+    fixture. ✔MEASURED again the same day by the change's independent review: GitHub's windows
+    runner's TEMP is `C:\\Users\\RUNNER~1\\…` (Pipeline run 36427818588's own log), and with a work
+    directory spelled that way a decoy started through a junction had its image in the SHORT
+    spelling -- which neither the needle as given (the link) nor the needle resolved (long names)
+    contains. Only a canonical image meets a canonical needle in every combination. (AN05's control
+    saw neither process on that runner, INFERRED because its `python3.exe` is a link to python.exe:
+    the review reproduced exactly that failure here with a relative `python3.exe` symlink.)
+    ⚠ A bare NAME is never canonicalised: the snapshot substitutes the exe name for a process whose
+    image path it may not read, and `realpath` would resolve that name against THIS process's
+    working directory -- a false match, and a kill.
+    ⚠ AND CANONICALISING ASKS THE FILE SYSTEM, which can fail or stall where string work could not:
+    `realpath` re-raises an OSError outside its short list (a network share gone away), so one
+    unrelated process's image must never crash the sweep (`_canonical` falls back to the path as
+    reported), and a NETWORK image is never canonicalised against a local needle -- no local
+    canonical path is a prefix of a UNC one, so nothing can be lost, and a dead share cannot stall
+    every sweep (the change's independent review, 2026-09-28)."""
     if launched or os.name != "nt":
         return lambda text: fixture_path in text
     trailing = str(fixture_path).endswith(("\\", "/"))
-    needle = _win_path_key(ntpath.abspath(fixture_path) + ("\\" if trailing else ""), True)
-    return lambda text: bool(text) and needle in _win_path_key(text, False)
+    target = _canonical(ntpath.abspath(fixture_path))
+    needle, remote = _win_path_key(target + ("\\" if trailing else ""), True), _win_unc(target)
+    return lambda text: (bool(text) and ntpath.isabs(text) and (remote or not _win_unc(text))
+                         and needle in _win_path_key(_canonical(text), False))
+
+
+def _canonical(path):
+    """`path` with every link resolved and every 8.3 short name expanded (`os.path.realpath`), or
+    as given when the file system cannot answer: `realpath` re-raises an OSError outside its short
+    list, and a sweep over every process on the host must not die of one unrelated image."""
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return path
+
+
+def _win_unc(path):
+    """Does `path` name a NETWORK location (`\\\\server\\share\\…` or `\\\\?\\UNC\\…`)?"""
+    p = str(path).replace("/", "\\")
+    return p[:8].upper() == "\\\\?\\UNC\\" or (p.startswith("\\\\") and p[2:3] not in ("?", "."))
 
 
 def our_fixture_pids(fixture_path, launcher_prefix=None, enumerator=None):
@@ -1221,17 +1273,230 @@ def _make_native_decoy(work):
     os.makedirs(ddir)
     ready = os.path.join(work, tag + ".ready")
     if os.name == "nt":
-        marker = os.path.join(ddir, "testfixture.exe")
-        shutil.copy2(sys.executable, marker)
-        exe_dir = os.path.dirname(sys.executable)
-        for name in os.listdir(exe_dir):
-            if name.lower().endswith(".dll"):
-                shutil.copy2(os.path.join(exe_dir, name), os.path.join(ddir, name))
+        marker = _copy_interpreter(ddir)
         proc = _popen([marker, "-c", _DECOY_CODE, ready], env={"PYTHONHOME": sys.base_prefix})
     else:
         marker = os.path.join(ddir, "testfixture")
         proc = _popen([sys.executable, "-c", _DECOY_CODE, ready, marker])
     return proc, marker, ready
+
+
+def _copy_interpreter(ddir):
+    """Windows: this interpreter copied to `ddir\\testfixture.exe`, its DLLs beside it -> that path."""
+    marker = os.path.join(ddir, "testfixture.exe")
+    shutil.copy2(sys.executable, marker)
+    exe_dir = os.path.dirname(sys.executable)
+    for name in os.listdir(exe_dir):
+        if name.lower().endswith(".dll"):
+            shutil.copy2(os.path.join(exe_dir, name), os.path.join(ddir, name))
+    return marker
+
+
+_LK_ARMS = ("LK01 a directory junction to the decoy's directory was made",
+            "LK02 the decoy started THROUGH the junction is alive",
+            "LK03 control: the kernel names its image by the junction's TARGET, not by the path it was started by",
+            "LK04 the sweep FINDS it by the path it was started by, the link's spelling",
+            "LK05 ...and by the target's spelling")
+# The same five with every path under a directory spelled in its 8.3 SHORT form: GitHub's windows runner's
+# TEMP carries that spelling (`C:\Users\RUNNER~1\…`), and the kernel KEEPS it in an image's path -- so LK08
+# also asserts the image is not canonical, the premise that makes this round reach the defect.
+_LK_SHORT_ARMS = tuple("LK%02d %s, in the 8.3 SHORT spelling" % (k + 6, label.split(" ", 1)[1])
+                       for k, label in enumerate(_LK_ARMS))
+_LK_LONG_NAME = "dss link long directory name"
+_LK_BARE = ("LK00 a bare image NAME -- the snapshot's stand-in for a denied path -- never matches, not even a "
+            "directory needle holding this process's working directory (control: the same name spelled "
+            "absolutely there does)")
+_LK_RAISES = ("LK11 an image the file system cannot resolve (realpath RAISES, as for a share gone away) is "
+              "compared as reported: the sweep never crashes on one unrelated process")
+_LK_UNC = ("LK12 a NETWORK image is never canonicalised against a local needle, so a dead share cannot stall a "
+           "sweep -- and it matches nothing")
+
+
+def _selftest_link(t, work):
+    t.section("LK  a fixture started through a LINK is found by the path it was started by, in either spelling")
+    if os.name != "nt":
+        for label in (_LK_BARE, _LK_RAISES, _LK_UNC) + _LK_ARMS + _LK_SHORT_ARMS:
+            t.skip(label, "a POSIX host matches the command line as the process was started, the spelling the "
+                          "harness holds; only a Windows kernel names an image by the path it opened")
+        return
+    here, name = os.getcwd(), os.path.basename(sys.executable)
+    cwd_needle = _matcher(os.path.join(here, ""), False)
+    t.check(_LK_BARE, not cwd_needle(name) and cwd_needle(os.path.join(here, name)),
+            "bare %r matched: %r / absolute matched: %r" % (name, cwd_needle(name),
+                                                           cwd_needle(os.path.join(here, name))))
+    # The file system, INJECTED: an image under `dss-unreachable` raises as a vanished share does (WinError
+    # 59), and a `dss-no-such-host` share is answered here, never asked of the network.
+    real_realpath, asked = os.path.realpath, []
+
+    def fake_realpath(path, *a, **kw):
+        asked.append(str(path))
+        if "dss-unreachable" in str(path):
+            raise OSError(59, "An unexpected network error occurred", str(path))
+        if "dss-no-such-host" in str(path):
+            return str(path)
+        return real_realpath(path, *a, **kw)
+    os.path.realpath = fake_realpath
+    try:
+        m = _matcher(os.path.join(here, ""), False)
+        try:
+            crashed, hit = "", m(os.path.join(here, "dss-unreachable", name))
+        except Exception as exc:  # noqa: BLE001 -- a raise out of the matcher is exactly what this arm pins
+            crashed, hit = repr(exc), None
+        del asked[:]
+        unc_hit = m("\\\\dss-no-such-host\\share\\" + name)
+        unc_asked = list(asked)
+    finally:
+        os.path.realpath = real_realpath
+    t.check(_LK_RAISES, not crashed and hit is True, "raised: %s / matched: %r" % (crashed or "nothing", hit))
+    t.check(_LK_UNC, unc_hit is False and not unc_asked, "matched: %r / asked the file system about: %r"
+            % (unc_hit, unc_asked))
+    _link_round(t, work, work, _LK_ARMS, short=False)
+    # A directory whose name no 8.3 form can spell, so a volume that generates short names gives it one.
+    long_dir = os.path.join(work, _LK_LONG_NAME)
+    os.makedirs(long_dir)
+    short = _win_short_path(long_dir)
+    if not short or _win_path_key(short, False) == _win_path_key(long_dir, False):
+        for label in _LK_SHORT_ARMS:
+            t.skip(label, "this volume gave a new directory named %r no 8.3 short name (GetShortPathNameW answered "
+                          "%r), so no path here can carry one" % (_LK_LONG_NAME, _masked(short, work) or "nothing"))
+        return
+    _link_round(t, short, work, _LK_SHORT_ARMS, short=True)
+
+
+def _masked(path, work):
+    """`path` with the self-test's work directory, in any of its spellings, shown as `<work>`: it lies
+    under the user's profile, and a failing arm's detail must not name the account in a run's log."""
+    key = _win_path_key(path, False) if path else ""
+    for spelled in sorted({work, os.path.realpath(work), _win_short_path(work) or work}, key=len, reverse=True):
+        key = key.replace(_win_path_key(spelled, False), "<work>")
+    return key
+
+
+def _link_round(t, base, work, labels, short):
+    """LK's five arms under `base`: a copy of the interpreter in a directory there, a junction to that
+    directory beside it, a decoy started THROUGH the junction, and the sweep by either spelling."""
+    import uuid
+    tag = "dss-link-%s" % uuid.uuid4().hex[:12]
+    ddir = os.path.join(base, tag)
+    os.makedirs(ddir)
+    real_marker = _copy_interpreter(ddir)
+    link_dir = os.path.join(base, tag + "-junction")
+    r = _run(["cmd", "/c", "mklink", "/J", link_dir, ddir], timeout=ENUM_TIMEOUT_S, c_locale=False)
+    t.check(labels[0], r.rc == 0 and os.path.isdir(link_dir), "mklink /J exited %d: %s"
+            % (r.rc, _clean(r.err or r.out)[:200]))
+    if not os.path.isdir(link_dir):
+        return
+    linked_marker = os.path.join(link_dir, "testfixture.exe")
+    ready = os.path.join(work, tag + ".ready")
+    proc = _popen([linked_marker, "-c", _DECOY_CODE, ready], env={"PYTHONHOME": sys.base_prefix})
+    try:
+        pid = _await_ready(ready, proc)
+        t.check(labels[1], pid is not None and proc.poll() is None,
+                ("the decoy exited %r" % proc.poll()) if proc.poll() is not None
+                else "the decoy never answered its handshake")
+        if pid is None:
+            return
+        image = _win_image_path(proc.pid)
+        canonical = _win_path_key(os.path.realpath(image), False) if image else ""
+        spelled = _win_path_key(image, False) if image else ""
+        t.check(labels[2], bool(image) and canonical == _win_path_key(os.path.realpath(real_marker), False)
+                and spelled != _win_path_key(linked_marker, False) and (spelled != canonical or not short),
+                "image %r (canonical %r) / started as %r" % (_masked(image, work), _masked(canonical, work),
+                                                             _masked(linked_marker, work)))
+        t.eq(labels[3], [proc.pid], [row[0] for row in our_fixture_pids(linked_marker).procs])
+        t.eq(labels[4], [proc.pid], [row[0] for row in our_fixture_pids(real_marker).procs])
+    finally:
+        _reap(proc)
+        try:
+            os.rmdir(link_dir)   # the junction alone, never its target
+        except OSError:
+            pass
+
+
+def _selftest_capabilities(t):
+    t.section("HC  a PRESENT wsl.exe is not a USABLE one, and a harness host REQUIRES what another host may lack")
+    asked = []
+
+    def runner(rc, out):
+        def run(argv):
+            asked.append(list(argv))
+            return C.Result(rc, out, "")
+        return run
+    no_distro = "\0".join("Windows Subsystem for Linux has no installed distributions.") + "\0"
+    ok, why = C.wsl_usable(runner=runner(4294967295, no_distro), which_=lambda _n: "wsl.exe")
+    t.check("HC01 a wsl.exe that runs nothing (no distribution: exit 4294967295, its words in UTF-16) is NOT usable, "
+            "and is named in its own words", not ok and "no installed distributions" in why and "4294967295" in why,
+            why)
+    del asked[:]
+    ok, why = C.wsl_usable(runner=runner(0, C.WSL_ANSWER + "\n"), which_=lambda _n: None)
+    t.check("HC02 no wsl.exe on PATH is NOT usable, and nothing is asked to run", not ok and "not on PATH" in why
+            and asked == [], repr((why, asked)))
+    ok, why = C.wsl_usable(runner=runner(0, C.WSL_ANSWER + "\n"), which_=lambda _n: "wsl.exe")
+    t.check("HC03 control: a wsl.exe that exits 0 printing the token IS usable, asked `wsl.exe -e echo <token>`",
+            ok and why == "" and asked == [["wsl.exe", "-e", "echo", C.WSL_ANSWER]], repr((ok, why, asked)))
+    ok, why = C.wsl_usable(runner=runner(0, ""), which_=lambda _n: "wsl.exe")
+    t.check("HC04 a wsl.exe that exits 0 WITHOUT the token is NOT usable: an exit code alone is no answer",
+            not ok and "printed nothing" in why, why)
+    lack, declare = "why-1", "%s=%s" % (C.HARNESS_HOST_ENV, C.TEST_ONLY_HOST)
+    got = {}
+    for value in (None, "", "1", C.TEST_ONLY_HOST):
+        with C.declared_host(value):
+            got[value] = (C.capability_verdict("a usable WSL", False, lack),
+                          C.capability_verdict("a usable WSL", True, ""))
+    with C.declared_host("yes"):
+        try:
+            C.harness_host()
+            refused = ""
+        except C.HarnessDie as exc:
+            refused = str(exc)
+    strict, test_only = got[None][0], got[C.TEST_ONLY_HOST][0]
+    t.check("HC05 a host that declares NOTHING is a harness host: a missing capability FAILS, naming it, its "
+            "reason and the declaration that would make it a test-only host",
+            strict[0] == "fail" and "a usable WSL" in strict[1] and lack in strict[1] and declare in strict[1],
+            repr(strict))
+    t.check("HC06 ...and so does one whose variable is EMPTY or 1: a spelling never loses the strict reading",
+            got[""][0] == strict == got["1"][0], repr((got[""][0], got["1"][0])))
+    t.check("HC07 a host that declares %s only runs the tree's tests: the same lack is a SKIP naming it, its "
+            "reason and the declaration" % declare,
+            test_only[0] == "skip" and "a usable WSL" in test_only[1] and lack in test_only[1]
+            and declare in test_only[1], repr(test_only))
+    t.check("HC08 a capability the host HAS is ok on either host", got[None][1] == ("ok", "") == got["0"][1],
+            repr((got[None][1], got["0"][1])))
+    t.check("HC09 any other spelling of the variable is REFUSED, naming it, and read as neither",
+            C.HARNESS_HOST_ENV in refused and "'yes'" in refused, refused)
+    arms = {}
+    for value in (None, C.TEST_ONLY_HOST):
+        for have in (False, True):
+            rec = C.ArmRecorder()
+            with C.declared_host(value):
+                verdict = C.capability_arm(rec.check, rec.skip, "X01 an arm", "a thing", have, lack, "\n  FACTS")
+            arms[(value, have)] = (verdict, rec.rows)
+    fail, skip = arms[(None, False)], arms[(C.TEST_ONLY_HOST, False)]
+    t.check("HC10 capability_arm, the ONE mapping: a harness host's lack is one FAILED check naming it with the "
+            "host's facts; a test-only host's is one SKIP without them; a capability the host has passes on either",
+            fail[0] == "fail" and [r[:2] for r in fail[1]] == [("X01 an arm", "fail")] and lack in fail[1][0][2]
+            and fail[1][0][2].endswith("FACTS") and skip[0] == "skip"
+            and [r[:2] for r in skip[1]] == [("X01 an arm", "skip")] and "FACTS" not in skip[1][0][2]
+            and arms[(None, True)] == ("ok", [("X01 an arm", "pass", "")]) == arms[(C.TEST_ONLY_HOST, True)],
+            repr(arms))
+    held, detail = C.site_pinned(lambda rec: _launched_capability(rec, False, "injected: " + lack),
+                                 "injected: " + lack)
+    t.check("HC11 the LA site: a harness host without a usable WSL FAILS LA0W by name and skips the section; a "
+            "test-only host skips all of it", held, detail)
+    lack2 = "injected: " + lack
+
+    def one_arm(rec):
+        C.capability_arm(rec.check, rec.skip, "A1 an arm", "a thing", False, lack2)
+
+    def two_arms(rec):
+        one_arm(rec)
+        # a SECOND capability arm that maps the lack to the test-only skip on its own, whatever the host
+        rec.skip("A2 another arm", "this host lacks another thing (%s); %s" % (lack2, C.TEST_ONLY_SKIP_MARK))
+    held1, detail1 = C.site_pinned(one_arm, lack2)
+    held2, detail2 = C.site_pinned(two_arms, lack2)
+    t.check("HC12 site_pinned itself: a site whose SECOND capability arm takes the test-only skip on a harness "
+            "host is NOT held, even beside one that fails (control: the one-arm site is held)",
+            held1 and not held2, "one arm: %s\ntwo arms: %s" % (detail1, detail2))
 
 
 def _selftest_decoy(t, work):
@@ -1327,14 +1592,27 @@ def _wsl_path(win_path):
     return out.splitlines()[-1].strip() if r.rc == 0 and out else ""
 
 
+_LA_WSL_ARM = "LA0W a usable WSL answers: the launched fixture's kernel"
+
+
+def _launched_capability(t, usable, why):
+    """LA's gate on Windows -> True when the section may run. LA0W is its capability arm
+    (sqlite_common.capability_arm): a harness host without a usable WSL FAILS it by name, a test-only
+    host SKIPS it; when it did not pass, every arm of the section is a skip naming its judgement."""
+    verdict = C.capability_arm(t.check, t.skip, _LA_WSL_ARM, "a usable WSL, the launched fixture's kernel",
+                               usable, why)
+    if verdict != "ok":
+        for k in range(1, 8):
+            t.skip("LA%02d" % k, "needs a usable WSL, which LA0W judged: %s" % why)
+    return verdict == "ok"
+
+
 def _selftest_launched(t, work):
     t.section("LA  a LAUNCHED fixture is swept inside its own kernel, matched by ITS spelling")
     import uuid
     tag = "dss-decoy-%s" % uuid.uuid4().hex[:12]
     if os.name == "nt":
-        if not shutil.which("wsl.exe"):
-            for k in range(1, 8):
-                t.skip("LA%02d" % k, "wsl.exe is not on PATH, so there is no WSL kernel to enter")
+        if not _launched_capability(t, *C.wsl_usable()):
             return
         prefix = ["wsl.exe", "-e"]
         ready_win = os.path.join(work, tag + ".ready")
@@ -1754,12 +2032,18 @@ def self_test():
     import traceback
     here = os.path.dirname(os.path.abspath(__file__))
     t = _Checks()
+    try:
+        print("   (%s)" % C.harness_host_line(), flush=True)
+    except C.HarnessDie as exc:
+        t.check("HH00 the harness-host declaration is readable", False, str(exc))
     work = tempfile.mkdtemp(prefix="dss-procs-selftest-")
     try:
         for name, fn in (("enumeration", lambda: _selftest_enumeration(t)),
                          ("ancestors", lambda: _selftest_ancestors(t, here)),
                          ("decoy", lambda: _selftest_decoy(t, work)),
                          ("unverified", lambda: _selftest_unverified(t)),
+                         ("link", lambda: _selftest_link(t, work)),
+                         ("capabilities", lambda: _selftest_capabilities(t)),
                          ("launched", lambda: _selftest_launched(t, work)),
                          ("kill_tree", lambda: _selftest_kill_tree(t)),
                          ("markers", lambda: _selftest_markers(t)),

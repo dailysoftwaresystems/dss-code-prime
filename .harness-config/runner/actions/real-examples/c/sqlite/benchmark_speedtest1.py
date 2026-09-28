@@ -1464,11 +1464,16 @@ def _measure_on_host(args, host, log, repo_root, tree_out, checkout=None):
     log.info("sqlite    : %s  (upstream %s%s; the pin is %s)"
              % (sqlite_dir, head, (" %s %s" % (DASH, why)) if why else "", pin[:12]))
     if host == "windows":
-        if not shutil.which("wsl.exe"):
-            die("wsl.exe not found.\n      That is WHERE THIS HOST FINDS ITS POSIX TOOLCHAIN, not a "
+        # USABLE, not merely present: Windows ships wsl.exe with no distribution (C.wsl_usable), and a run
+        # that took its presence for a carriage would stop later, at the first path it translated -- INFERRED
+        # from the self-test's `cli` section, which crashed there on GitHub's windows runner (Pipeline run
+        # 36427818588); no measuring run was made on such a host.
+        usable, why = C.wsl_usable()
+        if not usable:
+            die("no usable WSL: %s.\n      That is WHERE THIS HOST FINDS ITS POSIX TOOLCHAIN, not a "
                 "statement about any target:\n      deriving the SQLite recipe needs make + tclsh + "
                 "sqlite's autosetup configure, which\n      on a Windows host run in WSL. The "
-                "MEASUREMENT still runs natively, here.")
+                "MEASUREMENT still runs natively, here." % why)
     else:
         require_tools(DERIVE_TOOLS)
     allow = C.tristate("DSS_ALLOW_NONRELEASE_COMPILER")
@@ -1702,12 +1707,13 @@ def main(argv=None):
 # `make`, `wsl.exe` and the resolver run where they exist, and an arm that needs what this host
 # lacks is a NAMED, counted SKIP. An arm asserting an ABSENCE also proves its negative can occur.
 
-# 22 sh + 6 ps + 1 core + 88 new (P68 round 13 retired n16-n18 with the dsscp search they pinned, and added
+# 22 sh + 7 ps + 1 core + 88 new (P68 round 13 retired n16-n18 with the dsscp search they pinned, and added
 # n76-n82: a nameless run refused; the subject inside the tree, an explicit one only on the pin; one run per tree;
 # then its audit's fold F6 added n83-n90: an exported GIT_DIR steers no checkout; a nameless run refused first; the
 # core's temporaries in the tree's scratch, made fresh and removed; SQLITE_DIR not read; a changed tracked file
-# refused in an explicit checkout and in the harness's own; one normalisation of the path knobs)
-EXPECTED_ARMS = 117
+# refused in an explicit checkout and in the harness's own; one normalisation of the path knobs; P68's PR exit
+# added ps07: ps03's capability site pinned under an injected lack)
+EXPECTED_ARMS = 118
 # the pin the plan-writer arms hand over: a FULL sha, as legs.json declares one
 _PIN_FX = "0123456789abcdef0123456789abcdef01234567"
 
@@ -1779,6 +1785,14 @@ class _Arms:
             print("  [PASS] %s" % label, flush=True)
         else:
             self._fail(label, detail)
+
+    def check(self, label, ok, detail=""):
+        """One counted arm whose outcome is already known (sqlite_common.capability_arm's `check`)."""
+        self.arm(label, lambda: (ok, detail))
+
+    def skip(self, label, why):
+        """One counted, named SKIP (sqlite_common.capability_arm's `skip`)."""
+        self.arm(label, lambda: (_SKIP, why))
 
     def _fail(self, label, detail):
         self.failed += 1
@@ -1894,6 +1908,8 @@ class _Fx:
         self.cores = {rc: self.script("core_%d.py" % rc, _FAKE_CORE % (rc, rc)) for rc in (0, 1, 3)}
         self.make = shutil.which("make")
         self.wsl = shutil.which("wsl.exe") if self.host == "windows" else None
+        # USABLE, not merely present: Windows ships wsl.exe with no distribution (C.wsl_usable says why)
+        self.wsl_ok, self.wsl_why = C.wsl_usable() if self.host == "windows" else (False, "not a Windows host")
         self._legs = {}
 
     def script(self, name, src):
@@ -2092,6 +2108,22 @@ class _FakePosix:
         return ["wsl.exe", "-e"] + [str(a) for a in args]
 
 
+_PS03 = ("ps03 a usable WSL answers (this host can derive): `wsl.exe -e echo` prints its token, not merely "
+         "wsl.exe on PATH")
+
+
+def _carriage_capability(A, wsl_ok, wsl_why):
+    """ps03, the derive hop's capability arm (sqlite_common.capability_arm) -> its verdict: a harness host
+    without a usable WSL FAILS it by name, a test-only host SKIPS it; when it did not pass, ps04 and ps05,
+    which need the carriage, are skips naming ps03's judgement."""
+    verdict = C.capability_arm(A.check, A.skip, _PS03, "a usable WSL, the derive hop's carriage", wsl_ok, wsl_why)
+    if verdict != "ok":
+        why = "no usable WSL on this host, which ps03 judges: %s" % wsl_why
+        A.skip("ps04 the WSL carriage answers", why)
+        A.skip("ps05 wsl.exe -e suppresses the second expansion", why)
+    return verdict
+
+
 def _st_carriage(A, fx):
     posix, out = _FakePosix(), fx.fresh("hop-out")
     src = fx.fresh("hop-src")
@@ -2120,33 +2152,32 @@ def _st_carriage(A, fx):
           lambda: (r.rc == 0 and "--plan" in r.out, "rc=%d %s" % (r.rc, C.first_lines(r.err or r.out, 3))))
     if fx.host != "windows":
         why = "not a Windows host: the POSIX half runs in this process, no carriage is used"
-        A.arm("ps03 wsl.exe is reachable (this host can derive)", lambda: (_SKIP, why))
-        A.arm("ps04 the WSL carriage answers", lambda: (_SKIP, why))
-        A.arm("ps05 wsl.exe -e suppresses the second expansion", lambda: (_SKIP, why))
-    else:
-        A.arm("ps03 wsl.exe is reachable (this host can derive) (control: an empty PATH finds none)",
-              lambda: (bool(fx.wsl) and shutil.which("wsl.exe", path="") is None, "which: %r" % fx.wsl))
-        if not fx.wsl:
-            A.arm("ps04 the WSL carriage answers", lambda: (_SKIP, "no wsl.exe on this host"))
-            A.arm("ps05 wsl.exe -e suppresses the second expansion", lambda: (_SKIP, "no wsl.exe on this host"))
-        else:
-            side = C.PosixSide("windows")
+        A.skip(_PS03, why)
+        A.skip("ps04 the WSL carriage answers", why)
+        A.skip("ps05 wsl.exe -e suppresses the second expansion", why)
+    elif _carriage_capability(A, fx.wsl_ok, fx.wsl_why) == "ok":
+        side = C.PosixSide("windows")
 
-            def answers():
-                ok = C.capture(side.argv(["echo", "posix-ok"]), timeout=120)
-                bad = C.capture(side.argv(["false"]), timeout=120)
-                return (ok.rc == 0 and "posix-ok" in ok.out and bad.rc != 0 and "posix-ok" not in bad.out,
-                        "echo: rc=%d %r / false: rc=%d" % (ok.rc, ok.out[:80], bad.rc))
-            A.arm("ps04 the WSL carriage answers (control: a failing command fails through it)", answers)
+        def answers():
+            ok = C.capture(side.argv(["echo", "posix-ok"]), timeout=120)
+            bad = C.capture(side.argv(["false"]), timeout=120)
+            return (ok.rc == 0 and "posix-ok" in ok.out and bad.rc != 0 and "posix-ok" not in bad.out,
+                    "echo: rc=%d %r / false: rc=%d" % (ok.rc, ok.out[:80], bad.rc))
+        A.arm("ps04 the WSL carriage answers (control: a failing command fails through it)", answers)
 
-            def literal():
-                lit = C.capture(side.argv(["printf", "[%s]\\n", "echo A=$(uname -m)"]), timeout=120)
-                shell = C.capture(side.argv(["sh", "-c", 'printf "[%s]\\n" "echo A=$(uname -m)"']),
-                                  timeout=120)
-                return ("$(uname -m)" in lit.out and "$(uname" not in shell.out and "A=" in shell.out,
-                        "-e: %r / a shell inside WSL: %r" % (lit.out[:80], shell.out[:80]))
-            A.arm("ps05 wsl.exe -e suppresses the second expansion (control: a shell inside WSL DOES "
-                  "expand it, so an expansion is visible)", literal)
+        def literal():
+            lit = C.capture(side.argv(["printf", "[%s]\\n", "echo A=$(uname -m)"]), timeout=120)
+            shell = C.capture(side.argv(["sh", "-c", 'printf "[%s]\\n" "echo A=$(uname -m)"']),
+                              timeout=120)
+            return ("$(uname -m)" in lit.out and "$(uname" not in shell.out and "A=" in shell.out,
+                    "-e: %r / a shell inside WSL: %r" % (lit.out[:80], shell.out[:80]))
+        A.arm("ps05 wsl.exe -e suppresses the second expansion (control: a shell inside WSL DOES "
+              "expand it, so an expansion is visible)", literal)
+    # ps03's SITE, pinned on every host: the gate's hosts have a usable WSL, so their real ps03 never reaches
+    # the lack -- a site that mapped a harness host's lack to a skip would pass everywhere but here.
+    A.arm("ps07 ps03's site: a harness host without a usable WSL FAILS ps03 by name and skips ps04-ps05; a "
+          "test-only host skips all three", lambda: C.site_pinned(
+              lambda rec: _carriage_capability(rec, False, "injected: no distribution"), "injected: no distribution"))
     ok_py = C.capture([fx.py, "-c", "print('py-ok')"], timeout=60)
     missing_py = C.capture([os.path.join(fx.root, "no-such-python"), "-c", "print(1)"], timeout=60)
     A.arm("ps06 a native python is reachable (the measurement runs here; control: a missing one is "
@@ -3039,15 +3070,21 @@ def _st_cli(A, fx):
                    and "needs --derive-only" in res["half-no-derive"] and "--cc belongs to the MEASURING host"
                    in res["half-with-cc"] and "needs --target" in res["half-no-target"]
                    and res["half-ok"] == "windows" and res["posix-default"] == "posix", res))
-    if fx.host == "windows" and fx.wsl:
-        side = C.PosixSide("windows")
-        r = C.capture(side.argv(["python3", side.to_posix(THIS), "--help"]), timeout=300)
+    if fx.host == "windows" and fx.wsl_ok:
+        def loads():
+            # inside the arm: a WSL that answers `echo` yet cannot translate THIS path fails n75 by name,
+            # never the whole section
+            side = C.PosixSide("windows")
+            r = C.capture(side.argv(["python3", side.to_posix(THIS), "--help"]), timeout=300)
+            return r.rc == 0 and "--path-style" in r.out, "rc=%d %s" % (r.rc, C.first_lines(r.err or r.out, 4))
         A.arm("n75 the derive half LOADS inside WSL: THIS file and its siblings import under WSL's "
-              "python3 (`--help` through the carriage exits 0)",
-              lambda: (r.rc == 0 and "--path-style" in r.out, "rc=%d %s" % (r.rc, C.first_lines(r.err or r.out, 4))))
+              "python3 (`--help` through the carriage exits 0)", loads)
+    elif fx.host == "windows":
+        A.arm("n75 the derive half LOADS inside WSL (`--help` through the carriage)",
+              lambda: (_SKIP, "no usable WSL on this host, which ps03 judges: %s" % fx.wsl_why))
     else:
         A.arm("n75 the derive half LOADS inside WSL (`--help` through the carriage)",
-              lambda: (_SKIP, "not a Windows host with wsl.exe: this process IS the POSIX side"))
+              lambda: (_SKIP, "not a Windows host: this process IS the POSIX side"))
 
 
 _SECTIONS = (("substitution", _st_substitution), ("presence", _st_presence), ("label", _st_label),
@@ -3063,8 +3100,16 @@ def self_test():
     A = _Arms()
     root = tempfile.mkdtemp(prefix="dss-speedtest1-st-")
     try:
+        try:
+            host_line = C.harness_host_line()
+        except C.HarnessDie as exc:
+            A.failed += 1
+            host_line = "the harness-host declaration is REFUSED: %s" % exc
+            print("  [FAIL] %s" % host_line, flush=True)
         fx = _Fx(root)
-        print("   (host %s; make: %s; wsl.exe: %s)" % (fx.host, fx.make or "none", fx.wsl or "none"))
+        print("   (host %s; make: %s; wsl.exe: %s; a usable WSL: %s; %s)"
+              % (fx.host, fx.make or "none", fx.wsl or "none", "yes" if fx.wsl_ok else "no (%s)" % fx.wsl_why,
+                 host_line))
         for name, fn in _SECTIONS:
             A.section(name, fn, fx)
     finally:

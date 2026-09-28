@@ -135,8 +135,8 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
   (`D-HARNESS-READ-LEG-PATH-MASKS-A-SHORT-HOST-NAME-INSIDE-LONGER-WORDS`, P3, disclosed, its text corrected).
 - **DssHarness.** A second report is pending delivery beside the first: DssHarness honours a STEP-level `stallSeconds`
   and `env` (X1 relies on the first), but `dssharness help runners` documents neither, nor their precedence over the
-  runner's and config's. The repo-harness session is not reachable from this session, so both reports wait in
-  `.temp/dssharness-reports/` for the operator to forward. **2026-09-28:** 0.5.15 (repo-harness #16) ships the first
+  runner's and config's. The repo-harness session was not reachable from this session on 2026-09-26; both reports
+  were DELIVERED to it on 2026-09-28 and both are answered (0.5.15 and 0.5.16, below). **2026-09-28:** 0.5.15 (repo-harness #16) ships the first
   report's fix: by its help and source, a host now writes its own home as `~` in every line of DssHarness's own and in
   every path its ledger holds. Nothing in this tree reads those paths (`read-leg-path` takes only a tree-relative
   path). `dssharness help runners` at 0.5.15 still documents no step-level key, so the second report stands. The CI
@@ -147,13 +147,95 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
   today's newest, on this tree: 33 / 33 on both Windows legs (run 20260928-125026-16c2ff87). The sqlite harness's
   revision pin fixes the test's subject rather than a tool, and is unchanged unless the operator extends the ruling
   to it.
+- **2026-09-28, the first pipes run (Pipeline run 36427818588 on `378c3faa`): two legs red, every failure in the sqlite
+  harness's own self-tests, and all fixed (lanes `ci59` and `ci59b`, four rows born closed).** `dssharness check-ci-legs`
+  read windows-msvc-release and macos-clang-release RED (real failures, far inside their budgets), and the three Linux
+  legs green.
+  - **A PRESENT `wsl.exe` was read as a usable WSL** (`D-HARNESS-SQLITE-A-PRESENT-WSL-READ-AS-A-USABLE-ONE`, P2). GitHub's
+    windows runner ships `wsl.exe` with no distribution: every command exits 4294967295 ("no installed distributions").
+    Where it failed: benchmark ps04 and ps05; its `cli` section crashed in `PosixSide.to_posix`; `sqlite_procs` LA00; and
+    the benchmark's own preflight would have passed such a host. `sqlite_common.wsl_usable` (the program runs
+    `echo <token>`) is now the one answer, at every site, and n75 translates inside its own arm.
+  - **The self-tests could not tell a harness host from a test host**
+    (`D-HARNESS-SQLITE-SELF-TESTS-COULD-NOT-TELL-A-HARNESS-HOST-FROM-A-TEST-HOST`, P2). `tclsh_real` skipped a missing
+    tclsh but failed an old one, so the macOS runner, which has Apple's Tcl 8.5, failed; RT1 skipped an unusable WSL
+    everywhere, the gate included. Now EVERY host is a harness host unless it declares `DSS_SQLITE_HARNESS_HOST=0`,
+    which the CI workflow's Test step does: a missing capability FAILS on a harness host and is a named SKIP on a
+    declared test-only one, and a declaration that never arrives fails toward red. `sqlite_common.capability_arm` is the
+    one mapping every site uses — ps03, LA0W, RT0, the Tcl the stage runs, its development files, every POSIX tool an
+    arm runs — and each site is pinned under an injected lack (HC11, ps07, RT2, `sqlite_stage`'s `capability_sites`).
+    ✔MEASURED: runner `sqlite-self-test` passed on all eight legs as undeclared harness hosts (run
+    20260928-184926-7fa74c81). DECIDED by the agent, reversible: skipping everywhere would let a gate host that lost WSL
+    or Tcl stay green, and so would a lenient default (`ci59`'s first draft, below).
+  - **The leftover-fixture sweep was blind to a fixture started through a link**
+    (`D-HARNESS-SQLITE-FIXTURE-SWEEP-BLIND-TO-A-FIXTURE-STARTED-THROUGH-A-LINK`, P2). CI's AN05 got [] where it expected
+    both pids. ✔MEASURED here: Windows names a process's image by the path it OPENED — every link resolved to its
+    target, every other component as spelled, 8.3 short names included, which GitHub's windows runner's TEMP carries
+    (`C:\Users\RUNNER~1\…`). `_matcher` now compares CANONICAL paths on both sides; it never canonicalises a bare image
+    name, compares an image the file system cannot resolve as reported (never a crash of the sweep), and never
+    canonicalises a network image against a local needle. LK00–LK12 pin it, LK06–LK10 under an 8.3-spelled directory
+    (they ran and passed here). Known limit, not counted: a MAPPED network drive letter is not recognised as a network
+    path, so a dead mapped share could still stall a sweep, though no longer crash it.
+  - **linux-clang-asan was green at 95.7% of its ctest budget** (6,314 s of 6,600 s;
+    `D-CI-ASAN-LEG-USED-96-PERCENT-OF-ITS-CTEST-BUDGET`, P3). The budget was re-derived to 180/190 min under the
+    workflow's own rule. August's measured run was killed at its 50-min cap, so the wall clock grew by under 2.11x since
+    (6,314 / 2,999.79); the growth includes DSS's slower compile, so it is read beside the disclosed compile-time row,
+    not raised again blindly.
+  - **The independent review of `ci59`** found a BLOCKER — its first matcher compared the needle in two spellings
+    against the image as reported, which the 8.3 TEMP defeats (LK03/LK04 failed with TEMP spelled short) — a MAJOR —
+    its first draft read an UNSET declaration as a test host and gave each gate host `=1` in `config.json`, so a lost
+    declaration failed toward clean — and six MINORs: `tclsh_real`'s selection sub-check ungated; Tcl presence-skips
+    outside the verdict; n75 translating outside its arm; no site's FAIL branch ever exercised; comments that overstated
+    a measurement (the "2.2x", the "died later", a python3.exe link); the declaration read lazily. All are fixed in lane
+    `ci59b`; the review's text is `.temp/p68-orchestrator/ci59-review/findings.md`. Its re-review of `ci59b` found two
+    MINORs — the matcher's new `realpath` could raise (a crash of the sweep) or stall on a network image, and two budget
+    sentences overreached — and two nits, all fixed; its recheck confirmed the code and every run id and md5 below.
+    Known latent, not counted: `site_pinned` catches a second capability arm's harness-host skip only in the test-only
+    skip's own words, and no site has two capability arms today.
+  - **Red-on-disable** (lane `ci59b`, windows-x86_64-debug, runner `sqlite-self-test`, one mutant per run, md5 moved and
+    returned, every mutant run on the final bytes; the records of both lanes' runs are kept under
+    `.temp/p68-orchestrator/`):
+    - the probe reading presence as use went red on exactly HC01 and HC04;
+    - the image compared as reported went red on exactly LK09 and LK10; the bare-name guard removed, on LK00; `realpath`
+      unguarded, on LK11; the network-path rule removed, on LK12;
+    - the first draft's lenient default went red on ps07 — the step stops at the benchmark, which runs first, so the
+      contract suite now carries that mutant as RD-92, run against DC-13 on every gate, requiring RT2 red;
+    - each capability site mapping a lack to a skip on its own went red on exactly its own site arm (HC11, ps07, RT2,
+      and each of the three `capability_sites` checks), and `site_pinned` without its test-only-skip rule on HC12;
+    - the control was green (run 20260928-193003-3d81ed52).
+  - **Gate and registry at this commit** (✔MEASURED, on the final bytes unless said): `harness/` on all eight legs, 8
+    tests each (run 20260928-194529-fe35a791) — its `sqlite_driver_selftest` and `sqlite_benchmark_selftest` are runner
+    `sqlite-self-test`'s two lines, which passed on all eight legs as undeclared harness hosts before the re-review's
+    last fixes (run 20260928-184926-7fa74c81); `repo-guard` 33/33 on both Windows legs under DssHarness 0.6.0 (run
+    20260928-195333-96d4a2c9); `check-anchor-balance` against `378c3faa`: 620 → 620, four rows born closed, none counted;
+    `read-anchors --lint` 0 findings.
+  - **Two defects in the lane tooling, found folding `ci59b`, are this session's next lane:** `lane-fold land` removes a
+    worktree through `lane-worktree`'s `git worktree remove`, which leaves its DssHarness host copies behind (`ci59` was
+    removed with `dssharness delete-worktree` instead, its run records kept first); and `fold` never examines a SEEDED
+    path the lane restored to HEAD — `config.json` here: seeded with 9 paths, the fold accounted for 8 and wrote 6, and
+    the orchestrator restored `config.json` by hand (✔MEASURED md5 equal to `git show HEAD:`). Operator, 2026-09-28: a
+    lane's host copies go only after its LAST review — while modifications may still be needed, its files stay.
+  - **DssHarness 0.5.16** (repo-harness #17) lists every runner and action-file key in `help runners`, says which
+    stall bound applies, and refuses keys nothing reads. That answers the second report. ✔MEASURED that nothing of
+    ours trips its new refusals: `config.json` loads, and a static scan of 52 runners and 45 action files (62 steps)
+    found every key in its lists, no `uses:` step and no config phase. Both reports are delivered and answered; the
+    0.5.16 answers were sent to its session.
+  - **DssHarness 0.6.0** (repo-harness round twelve: the two wording points, a declared input with no value refused as
+    that, and four new refusals of names a step writes) was installed after the gate — the update had failed while
+    the gate's processes held 0.5.16. ✔MEASURED: `run rows --manual-step stage` without `--input only` is refused
+    before any step runs, naming this checkout's `.harness-config\runner\.env`; a static scan of the 45 action files
+    found no input a run line cannot write in braces, none named like one of the tool's own names, no braced name that
+    is neither an input nor one of its names, and no `{_…}`; this tree holds no runner `.env`. The rows batch and
+    `repo-guard` ran under it. A third report — nothing lists the worktree copies a host holds, so an orphan is
+    invisible until its name is guessed — was sent the same day; the operator says repo-harness has it in progress.
 - **Slips (mine):** twice an unpiped Python traceback printed the interpreter's path, which names the Windows account,
   into my tool output (no file); two ledger notes and one row carried a hand-typed date one day ahead (the run ids are
   UTC), corrected, and a stamp's date is now read too.
 
 **Registry.** ✔MEASURED at this commit against round 13's `737078de`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 617 at 737078de" — 5 new rows: 2 born closed (X1's, P3) and 3 `🔵 DISCLOSED` rows of debt this exit found and did not create (the compile-time rise, P2, measured at round 12's commit; the four-leg run's clone contention, P2; read-leg-path's over-masking, P3), 0 closed, 0 reopened, 0 dropped; counted 611 → 611. Against round 12's `547f316f`, the base of round 13's balance: 615 → 620 raw, 5 closed, 10 opened (1 created, 9 disclosed), counted −4. Banding **P0 0 · P1 62 · P2 211 · P3 332 · P4 11 · P5 4**; `read-anchors --lint` 0 findings.
 
-**NEXT — THE OPERATOR MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
+**NEXT — THE LANE TOOLING'S TWO DEFECTS (this session's next lane, above), THEN THE OPERATOR RUNS THE PIPES AGAIN, THEN
+MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
 found: the compile-time rise (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`),
 the four-leg run refusing its own leg at the shared WSL clone, and read-leg-path's over-masking.
 
