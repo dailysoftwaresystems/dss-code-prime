@@ -48,6 +48,14 @@ THE MANIFEST, and the one fact it records beside the paths
 paths it carried in. A FORMAT-1 manifest -- the flat `{path: md5}` map every lane carried
 before P66 -- is still read: its base is taken from the lane's HEAD, and the fold says so.
 
+`land` adds ONE key the moment before it asks for the worktree's removal, and drops it once
+the removal is complete: `"landed": {"at": "<UTC>", "evidence": "<where the evidence was kept>",
+"worktree": "<the identity of the lane's git worktree>", "lane": {"<path>": "<md5>" | null}}`.
+While it is there the lane is CLOSED: nothing folds it, applies its rows or seeds over it, and a
+re-run of `land` finishes the removal or names the command that does (see LANDING). `seed`
+resets it for a NEW worktree of the name (another identity) and, for the landed one, only while
+that lists no change.
+
 ────────────────────────────────────────────────────────────────────────────────
 THE FOLD'S REFUSALS -- each one is a way a fold can destroy work while looking clean
 
@@ -108,7 +116,7 @@ error: it SILENTLY OMITTED that path.
 ⚠ THE MANIFEST LIVES UNDER `.worktrees/`, NOT IN A SCRATCHPAD. `/.worktrees/` is
 gitignored (so the manifest never travels to a gate host and never lands in a commit),
 it is repo-relative (so a new session finds it), and it outlives the lane directory it
-describes -- which matters because `lane-worktree remove` deletes the lane.
+describes -- which matters because `land` deletes the lane.
 
 ────────────────────────────────────────────────────────────────────────────────
 LANDING -- `apply-rows` and `land`
@@ -149,21 +157,53 @@ The rules the two verbs encode:
   * EVERY ROW IS RE-READ after the write and compared field by field; the writer's exit
     code is not taken as proof.
   * REMOVAL IS GATED on all of that AND on the fold re-measuring as "nothing left to
-    fold", and it is done by `lane-worktree remove --discard-work --preserve-to`. The
-    discard flag is built from that measurement and nothing else -- `lane-worktree`
-    refuses a worktree whose own `git status` lists uncommitted work without it -- and the
-    preserve keeps the lane's WHOLE evidence set (`scratchpad/` and `.temp/`) and re-reads
-    every file; this
-    verb then re-checks each file's md5 at the destination itself. The default
+    fold". The lane's WHOLE evidence set is copied first, by `lane-worktree`'s own
+    copy-and-re-read, over the evidence roots the configuration named BEFORE the fold and
+    the ones it names AFTER it (a lane may change `worktrees.evidenceRoots`, and the fold
+    then carries that change into the tree DssHarness reads); then this verb re-reads every
+    file at the destination against the digests it took before the fold -- and only when
+    all of that holds does DssHarness remove the worktree and the copies its record holds on
+    hosts: `dssharness delete-worktree <lane> --discard-uncommitted --delete-evidence`.
+    ⚠ ✔MEASURED 2026-09-29 (P68's PR exit, the review of lane `lf`): the md5 check used to
+    run AFTER that removal, so evidence the copy missed was found missing only once
+    `--delete-evidence` had deleted it -- a check after an irreversible step is a
+    post-mortem. The discard flag is built from the measurement and nothing else --
+    DssHarness refuses a worktree whose own `git status` lists uncommitted work without it.
+    ★ ONLY `land` REMOVES, the step after the lane's LAST review: `fold` never does, so a
+    lane a review sends back keeps its worktree and its host copies. The default
     destination is `.worktrees/.evidence/<lane>-<UTC stamp>/` -- ignored, repo-relative,
     and outliving the lane, like `.manifests/`.
+  * ★★ THE MANIFEST IS MARKED LANDED BEFORE THE REMOVAL IS ASKED FOR, and a marked lane
+    is never folded again. A removal can stop part way -- ✔MEASURED 2026-09-29 with
+    DssHarness 0.6.1: a worktree holding a directory junction came back exit 20, "git
+    reported worktree 'jx' removed, but '<repo>/.worktrees/jx' still exists", its `.git` file
+    and git's record gone and the junction left -- and a re-run that folded what was left
+    would read DEBRIS as the lane's intent: missing files as its deletions, and, in a
+    directory that is no longer a worktree, the MAIN repository's own status, git having
+    walked up to it. So a re-run of a marked lane compares the lane with the mark's record of
+    it (a file deleted since is the removal's debris; one changed or new since is work, and
+    stops it), keeps the evidence again into a fresh directory beside the first, and asks for
+    the removal again -- never with `--force`: a directory with no `.git` of its own is named,
+    with the command, for a person to look at, since a directory made at that path since reads
+    the same. And EVERY verb refuses a lane directory that is not its own registered git
+    worktree, marked or not: `_require_worktree`.
+  * REMOVE, THEN VERIFY, THEN SPEAK: gone from disk, gone from git's worktree list, and no
+    copy of it left in DssHarness's record (`dssharness list-worktree --json`, which asks no
+    host). A copy DssHarness did not make, or one on a host no configuration declares, it
+    leaves in place and forgets, saying so in the lines this verb prints.
 
 Every write is write-temp + `os.replace`. This script NEVER runs a git write verb,
-never stages, and never touches `.git/`. (`land` asks `lane-worktree`, the one owner of
-removal, to remove the worktree; it does not remove anything itself.)
+never stages, and never touches `.git/`. (`land` asks DssHarness, the one owner of
+worktree removal, to remove the worktree and its host copies; it does not remove anything
+itself.)
 
-Exit codes: 0 OK · 2 refused (nothing written, or -- for `land` -- stopped with the
-worktree kept, and the message says what already landed) · 3 usage error.
+Exit codes: 0 OK · 2 refused, nothing removed (nothing written; or -- for `land` -- stopped
+before the removal with the worktree kept, and the message says what already landed; a
+re-run finishes it) · 3 usage error · 4 `land` only: LANDING INCOMPLETE -- the fold and the
+rows are in, the evidence is kept and the removal began, but something is left, which the
+message names with the command that settles it; re-running `land` is safe, because the lane
+is marked landed and is never folded again. (`land` on a marked lane whose directory is a NEW
+worktree of the name answers 2: it is not the landed lane, and `seed` starts it clean.)
 
 ⚠ THE TREE ACTED ON IS THE ONE THIS SCRIPT LIVES IN, never the caller's cwd (a
 cwd-keyed root was a measured defect here); see `repo_root`. `--repo <path>`
@@ -584,7 +624,12 @@ def lane_head(wt):
     return head
 
 
-Manifest = collections.namedtuple("Manifest", "base paths")
+# `landed`: None, or `Landed` -- set by `land` the moment before it asks for the removal.
+Manifest = collections.namedtuple("Manifest", "base paths landed", defaults=(None,))
+# `worktree`: the identity of the lane's git worktree when it was marked (`_worktree_identity`), which
+#   a new worktree of the same name does not share; `lane`: {path: md5, or None where the lane held no
+#   file} for every path the landing measured -- what a re-run compares the lane with, never the main tree.
+Landed = collections.namedtuple("Landed", "at evidence worktree lane")
 
 
 def _is_path_map(obj):
@@ -593,11 +638,14 @@ def _is_path_map(obj):
 
 
 def load_manifest(path):
-    """-> Manifest(base, paths). `base` is None for a FORMAT-1 manifest.
+    """-> Manifest(base, paths, landed). `base` is None for a FORMAT-1 manifest; `landed` is a
+    `Landed` once `land` began removing the lane, else None.
 
     ⚠ ANYTHING ELSE IS REFUSED, NEVER GUESSED AT. A manifest is the one record of what a
     lane was HANDED; reading a malformed one "as best we can" is how a fold ends up
-    subtracting the wrong set -- which drops a lane's work silently.
+    subtracting the wrong set -- which drops a lane's work silently. A malformed `landed`
+    is refused the same way: read as absent, it would let a lane whose removal began be
+    folded again.
     """
     try:
         with io.open(path, encoding="utf-8") as fh:
@@ -605,15 +653,25 @@ def load_manifest(path):
     except (OSError, ValueError) as exc:
         die("seed manifest %s is unreadable: %s" % (path, exc))
     if isinstance(data, dict) and "format" in data:
-        base, paths = data.get("base"), data.get("paths")
-        if (data.get("format") != MANIFEST_FORMAT or set(data) != {"format", "base", "paths"}
+        base, paths, landed = data.get("base"), data.get("paths"), data.get("landed")
+        if (data.get("format") != MANIFEST_FORMAT
+                or set(data) - {"landed"} != {"format", "base", "paths"}
                 or not isinstance(base, str) or not _SHA.match(base)
-                or not _is_path_map(paths)):
+                or not _is_path_map(paths)
+                or ("landed" in data and not (
+                    isinstance(landed, dict) and set(landed) == {"at", "evidence", "worktree", "lane"}
+                    and all(isinstance(landed[k], str) and landed[k] for k in ("at", "evidence", "worktree"))
+                    and isinstance(landed["lane"], dict)
+                    and all(isinstance(p, str) and p and (d is None or (isinstance(d, str) and _MD5.match(d)))
+                            for p, d in landed["lane"].items())))):
             die("seed manifest %s declares a format but is not a well-formed format-%d "
-                "manifest {\"base\": <commit>, \"format\": %d, \"paths\": {path: md5}}; "
-                "refusing to guess what this lane was handed."
-                % (path, MANIFEST_FORMAT, MANIFEST_FORMAT))
-        return Manifest(base, dict(paths))
+                "manifest {\"base\": <commit>, \"format\": %d, \"paths\": {path: md5}} "
+                "(with, while `land` is removing the lane, \"landed\": {\"at\": <UTC>, \"evidence\": "
+                "<directory>, \"worktree\": <identity>, \"lane\": {path: md5 or null}}); refusing to "
+                "guess what this lane was handed." % (path, MANIFEST_FORMAT, MANIFEST_FORMAT))
+        return Manifest(base, dict(paths),
+                        Landed(landed["at"], landed["evidence"], landed["worktree"], dict(landed["lane"]))
+                        if "landed" in data else None)
     if _is_path_map(data):
         return Manifest(None, dict(data))
     die("seed manifest %s is neither format %d nor the older flat {path: md5} map; "
@@ -622,9 +680,17 @@ def load_manifest(path):
 
 def save_manifest(path, manifest):
     # A format-1 manifest stays format 1: writing a base it never recorded would turn
-    # "unknown" into an assertion nobody measured.
-    body = manifest.paths if manifest.base is None else {
-        "format": MANIFEST_FORMAT, "base": manifest.base, "paths": manifest.paths}
+    # "unknown" into an assertion nobody measured. (A landing writes format 2 with the base
+    # `lane_base` MEASURED that moment -- see `cmd_land` -- so a mark never needs format 1.)
+    if manifest.base is None:
+        if manifest.landed is not None:
+            die("internal: a landing mark needs a format-2 manifest, with a measured base.", 70)
+        body = manifest.paths
+    else:
+        body = {"format": MANIFEST_FORMAT, "base": manifest.base, "paths": manifest.paths}
+        if manifest.landed is not None:
+            body["landed"] = {"at": manifest.landed.at, "evidence": manifest.landed.evidence,
+                              "worktree": manifest.landed.worktree, "lane": dict(manifest.landed.lane)}
     write_atomic(path, json.dumps(body, indent=1, sort_keys=True))
 
 
@@ -696,14 +762,53 @@ def lane_base(root, lane, wt, manifest):
 
 # ──────────────────────────────────── seed ─────────────────────────────────────
 
+def _landed_mark_of(mpath):
+    """-> the `Landed` mark the manifest at `mpath` carries, or None -- read TOLERANTLY: `seed`
+    exists to reset a manifest, so one it cannot parse is not a reason to refuse the reset."""
+    try:
+        with io.open(mpath, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    landed = data.get("landed") if isinstance(data, dict) else None
+    if isinstance(landed, dict):
+        lane = landed.get("lane")
+        return Landed(str(landed.get("at")), str(landed.get("evidence")), str(landed.get("worktree")),
+                      dict(lane) if isinstance(lane, dict) else {})
+    return None
+
+
+def _worktree_identity(wt):
+    """-> "<file id>:<mtime in ns>" of the `commondir` file in lane `wt`'s own git administrative
+    directory (`git rev-parse --absolute-git-dir`), or None when git cannot name one. Read, never
+    written.
+
+    ✔MEASURED 2026-09-29 (git for Windows, a scratch repository): that file keeps both across `git
+    worktree repair`, `git worktree move` and a rewrite of the lane's `.git` file, and a NEW worktree
+    at the same path gets another -- while the `.git` file's own time, the identity this used first,
+    moved on the rewrite and on the move (the re-review of lane `lf`: a lane repaired after its
+    removal stopped then read as a NEW lane, and `seed` would have wiped its mark). A time and a file
+    id together, because a directory's creation time is not readable on Linux and an inode number
+    alone can be reused there."""
+    proc = git_run(["-C", wt, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True,
+                   encoding="utf-8", errors="replace")
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        st = os.stat(os.path.join(proc.stdout.strip(), "commondir"))
+    except OSError:
+        return None
+    return "%d:%d" % (st.st_ino, st.st_mtime_ns)
+
+
 def cmd_seed(root, lane, empty=False, force=False):
     wt = worktree_path(root, lane)
     if not os.path.isdir(wt):
         die("no worktree at %s\n"
-            "  create it first: python3 .harness-config/runner/actions/lane-worktree/lane-worktree.py add %s"
-            % (wt, lane))
+            "  create it first: dssharness create-worktree %s" % (wt, lane))
     if not inside(root, wt):
         die("worktree escapes the repository: %s" % wt)
+    _require_worktree(root, lane, wt)
 
     # THE ONE WAY THIS TOOL CAN DESTROY A LANE IS SEEDING A WORKTREE THAT IS ALREADY
     # WORKING. The copy overwrites by path, so seeding a LIVE lane replaces files that
@@ -717,6 +822,20 @@ def cmd_seed(root, lane, empty=False, force=False):
     # deliberately re-seeding a lane that has started.
     lanes = layout(root).worktrees
     own = [q for q in changed_paths(wt) if not is_lane_tree(q, lanes)]
+    # ★ A MANIFEST MARKED LANDED IS RESET FOR A NEW WORKTREE OF THE NAME, AND FOR THE LANDED ONE ONLY
+    # WHILE IT HAS NOTHING TO FOLD. A new worktree has an identity of its own (`_worktree_identity`),
+    # so the reset P57 requires goes through for it whatever it holds; the landed lane itself, left
+    # by a removal that stopped part way, still lists its work or its debris, and wiping its mark
+    # would let the next fold carry that debris into the main tree. `--empty` and `--force` are NO
+    # exemption: the danger is the mark, not the copy (✔MEASURED, the re-review of lane `lf`:
+    # `seed --force` cleared the mark silently and the next fold REMOVED `tracked.txt` from the
+    # main tree, git having deleted it from the lane before the removal stopped). A worktree whose
+    # identity git cannot name cannot be told from the landed one, so it is refused like it.
+    marked = _landed_mark_of(manifest_path(root, lane))
+    if marked is not None and own:
+        ident = _worktree_identity(wt)
+        if ident is None or ident == marked.worktree:
+            _refuse_landed(lane, marked)
     if own and not force and not empty:
         die("worktree %s already carries %d changed path(s) of its own -- seeding "
             "now would OVERWRITE a running lane's work."
@@ -794,6 +913,9 @@ def cmd_refresh_plans(root, lane, apply_it):
         die("no seed manifest at %s -- refresh only makes sense for a seeded lane"
             % mpath)
     loaded = load_manifest(mpath)
+    if loaded.landed is not None:
+        _refuse_landed(lane, loaded.landed, wt)
+    _require_worktree(root, lane, wt)
     seed = loaded.paths
 
     live = sorted(q for q in set(changed_paths(root))
@@ -886,11 +1008,22 @@ def classify(root, wt, seed, settled=(), base=None):
 
     ⓘ An unseeded path is compared by BLOB ID, never by raw bytes: `_blob_ids` for the
     lane's base, `_worktree_ids` for the main tree's file -- see the latter for the
-    line-ending conversion that made raw bytes a false DRIFT."""
+    line-ending conversion that made raw bytes a false DRIFT.
+
+    ⚠⚠ EVERY SEEDED PATH IS A CANDIDATE, WHETHER OR NOT THE LANE'S `git status` LISTS IT -- the
+    same family as the deletion above, and it failed the same way. ✔MEASURED 2026-09-28 (P68's
+    PR exit, lane `ci59b`): seeded with 9 paths, the lane put `.harness-config/config.json` back
+    to HEAD's bytes, so its `git status` no longer listed it; the fold reported "2 inherited
+    path(s) skipped, 6 path(s) are this lane's" -- 8 of the 9 -- and wrote 6, keeping the main
+    tree's seeded bytes over the lane's revert, with no warning. A seeded path whose lane bytes
+    differ from its seed is the lane's change, HEAD's bytes included, under the same drift proof
+    as any copy. ★ So every seeded path now lands in exactly one list -- this lane's, deleted,
+    inherited, converged (absent on both sides included), settled, or refused -- and the fold's
+    plan counts the seeded ones by list, so the reader sees all of them go somewhere."""
     if base is None:
         base = lane_head(wt)
     lanes = layout(root).worktrees
-    candidates = sorted(q for q in set(changed_paths(wt)) if not is_lane_tree(q, lanes))
+    candidates = sorted(q for q in set(changed_paths(wt)) | set(seed) if not is_lane_tree(q, lanes))
     for rel in candidates:
         if "\n" in rel:
             die("a changed path contains a newline, which git's batch protocols cannot "
@@ -935,7 +1068,8 @@ def classify(root, wt, seed, settled=(), base=None):
             # The lane removed it (or it never existed). Only a path the MAIN TREE
             # still holds is a deletion this fold has to carry out.
             if not os.path.exists(dest):
-                continue                      # already absent both sides: nothing to do
+                converged.append(rel)         # absent on both sides: the main tree holds the lane's state
+                continue
             baseline = seed.get(rel)
             if baseline is None:
                 if base_ids.get(rel) is None:
@@ -988,17 +1122,115 @@ def classify(root, wt, seed, settled=(), base=None):
     return Classification(mine, deleted, inherited, refusals, settled_paths, converged)
 
 
-def _open_lane(root, lane):
+def _registered(root, wt):
+    """-> (does git still record `wt` as a worktree of `root`?, "") -- or (None, why) when git
+    cannot say. ⚠ A failing `git worktree list` is not "unregistered": read so, a removal that
+    left a registration would verify as complete (the review of lane `lf`, 2026-09-29)."""
+    proc = git_run(["-C", root, "worktree", "list", "--porcelain"], capture_output=True, text=True,
+                   encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        lines = (proc.stderr or "").strip().splitlines()
+        return None, "`git worktree list` exited %d%s" % (proc.returncode,
+                                                          ": " + lines[0] if lines else "")
+    return any(line.startswith("worktree ") and _owning_tree().same_path(line[len("worktree "):], wt)
+               for line in proc.stdout.replace("\r", "").split("\n")), ""
+
+
+def _worktree_state(root, wt):
+    """-> ("worktree", "") when git names `wt` its own top level AND `root` lists it among its
+    worktrees; ("husk", what git answers instead) when `wt` holds no `.git` of its own and git
+    answers for it with ANOTHER tree, or not at all; ("foreign", why) for a repository of its own
+    that `root` does not list; (None, why) when `root`'s own git cannot say, or when `wt`'s `.git`
+    is there and git still cannot read the worktree from it.
+
+    ⚠⚠ WHY A HUSK IS NEVER READ. A directory under the lanes' root whose `.git` file is gone is
+    no git repository, so git walks UP from it -- to the main checkout that contains the lanes'
+    root -- and every question a fold asks is answered by the MAIN TREE: its HEAD read as the
+    lane's base, its uncommitted changes read as the lane's. ✔MEASURED 2026-09-29 (the review of
+    lane `lf`, git 2.55.0.windows.5): folding such a directory removed an uncommitted edit and an
+    untracked file from the main tree; and DssHarness 0.6.1 leaves exactly that directory when a
+    worktree holds a directory junction ("git reported worktree 'jx' removed, but … still
+    exists")."""
+    listed, why = _registered(root, wt)
+    if listed is None:
+        return None, why
+    top, why_top = _owning_tree().git_top_level(wt)
+    if top is not None and _owning_tree().same_path(top, wt):
+        if listed:
+            return "worktree", ""
+        return "foreign", ("it is a git repository of its own, and %s does not list it among its "
+                           "worktrees" % root)
+    answer = ("git answers %s for it" % top) if top is not None else (
+        "git cannot answer from inside it (%s)" % why_top)
+    # ★ A HUSK HAS NO `.git` OF ITS OWN. One whose `.git` is there but unreadable -- a transient read
+    # failure, a gitdir spelled for another host -- is a worktree git cannot SEE right now, not a
+    # husk, and nothing may be forced over it (✔MEASURED, the re-review of lane `lf`: such a lane,
+    # still registered, was read as a husk and its later work would have gone with `--force`).
+    if os.path.lexists(os.path.join(wt, ".git")):
+        return None, "its `.git` is there, but %s%s" % (answer, "; git still lists it" if listed else "")
+    return "husk", answer
+
+
+def _require_worktree(root, lane, wt, husk_ok=False):
+    """Refuse (exit 2) unless `wt` is a registered git worktree of `root` that is its own top level;
+    -> True for a husk, which only `land`, finishing a lane it marked, passes `husk_ok` to accept."""
+    state, why = _worktree_state(root, wt)
+    if state == "worktree":
+        return False
+    if state == "husk" and husk_ok:
+        return True
+    if state is None:
+        die("cannot tell whether lane %s's %s is a worktree of this repository: %s. Nothing was "
+            "read, written or removed." % (lane, wt, why))
+    if state == "foreign":
+        die("lane %s: %s is not a worktree of this repository -- %s. Nothing was read, written or "
+            "removed; it is not this tool's to fold or delete." % (lane, wt, why))
+    die("lane %s: %s is not its own git worktree -- %s -- so every question a fold, a row or a "
+        "removal asks about it would be answered by that tree instead. Nothing was read, written or "
+        "removed. A worktree whose removal stopped part way (no `.git` file, no record) is finished "
+        "by `dssharness delete-worktree %s --force` once what it holds is kept; one that was only "
+        "moved is repaired by `git worktree repair`." % (lane, wt, why, lane))
+
+
+def _open_lane(root, lane, closed_ok=False):
+    """-> (worktree, manifest, state): state is "worktree", "husk" or "gone". Refuses a missing
+    manifest, a lane marked landed (unless `closed_ok`, which only `land` passes, to FINISH one), a
+    missing worktree (unless it is such a lane), and a directory that is not its own registered git
+    worktree (unless it is such a lane: `_require_worktree`)."""
     wt = worktree_path(root, lane)
     mpath = manifest_path(root, lane)
-    if not os.path.isdir(wt):
-        die("no worktree at %s" % wt)
     if not os.path.isfile(mpath):
         die("no seed manifest at %s\n"
             "  run `lane-fold.py seed %s` at the moment the worktree is created -- the "
             "manifest is what separates this lane's work from what it inherited."
             % (mpath, lane))
-    return wt, load_manifest(mpath)
+    manifest = load_manifest(mpath)
+    finishing = closed_ok and manifest.landed is not None
+    if manifest.landed is not None and not closed_ok:
+        _refuse_landed(lane, manifest.landed, wt)
+    if not os.path.isdir(wt):
+        if finishing:
+            return wt, manifest, "gone"
+        die("no worktree at %s" % wt)
+    return wt, manifest, ("husk" if _require_worktree(root, lane, wt, husk_ok=finishing)
+                          else "worktree")
+
+
+def _refuse_landed(lane, landed, wt=None):
+    """Refuse (exit 2) to fold, seed over or give rows to a lane marked landed -- naming, when `wt`
+    is a NEW worktree of the name (another identity), the `seed` that was skipped instead."""
+    if wt is not None and os.path.isdir(wt):
+        ident = _worktree_identity(wt)
+        if ident is not None and ident != landed.worktree:
+            die("lane %s: %s is a NEW worktree of this name, not the one landed at %s, and its seed "
+                "manifest still carries that landing's mark -- the mandatory `seed` was skipped. Nothing "
+                "was read, written or removed; `lane-fold.py seed %s` starts it clean."
+                % (lane, wt, landed.at, lane))
+    die("lane %s was LANDED at %s: its fold and its rows are in the main tree, its evidence is kept "
+        "at %s, and its removal began. A landed lane is never folded, seeded over or given rows "
+        "again -- what is left in it may be the debris of a removal that stopped part way. Finish "
+        "it with `lane-fold.py land %s production --apply`." % (lane, landed.at, landed.evidence,
+                                                                 lane))
 
 
 def _print_fold_refusals(refusals):
@@ -1025,6 +1257,13 @@ def _print_fold_plan(lane, seed, cls):
               "compared:" % len(cls.settled))
         for rel in cls.settled:
             print("   %s" % rel)
+    if seed:
+        # ★ EVERY SEEDED PATH, COUNTED BY WHERE IT WENT: a seeded path once vanished from both lists
+        # below, and the plan printed nothing that could show it (P68's PR exit).
+        where = [sum(1 for rel in group if rel in seed)
+                 for group in (cls.mine, cls.inherited, cls.converged, cls.deleted, cls.settled)]
+        print("lane-fold: %d seeded path(s): %d this lane's, %d inherited, %d already landed, %d deleted, "
+              "%d settled" % tuple([len(seed)] + where))
     print("lane-fold: lane %s -- %d inherited path(s) skipped, %d path(s) are this "
           "lane's:" % (lane, len(cls.inherited), len(cls.mine)))
     for rel in cls.mine:
@@ -1067,7 +1306,7 @@ def _apply_fold(root, wt, cls):
 
 
 def cmd_fold(root, lane, apply_it, settled=()):
-    wt, manifest = _open_lane(root, lane)
+    wt, manifest, _state = _open_lane(root, lane)
     base = lane_base(root, lane, wt, manifest)
     cls = classify(root, wt, manifest.paths, settled, base=base)
     if cls.refusals:
@@ -1466,6 +1705,11 @@ def cmd_apply_rows(root, lane, default_bucket, apply_it):
     wt = worktree_path(root, lane)
     if not os.path.isdir(wt):
         die("no worktree at %s" % wt)
+    # The mark read STRICTLY, as `fold` and `land` read it: a malformed one refused, never taken for none.
+    mpath = manifest_path(root, lane)
+    if os.path.isfile(mpath) and load_manifest(mpath).landed is not None:
+        _refuse_landed(lane, load_manifest(mpath).landed, wt)
+    _require_worktree(root, lane, wt)
     anchors = load_anchors_module(root)
     before = registry_md5(root, anchors)
     plans, problems = plan_rows(root, wt, lane, default_bucket, anchors)
@@ -1481,20 +1725,33 @@ def cmd_apply_rows(root, lane, default_bucket, apply_it):
     return _apply_and_verify_rows(root, plans, anchors, before)
 
 
+def _root_segments(roots):
+    """Evidence roots as tuples of path segments -- `lane-worktree`'s form -- from segments or from
+    forward-slashed strings (`layout`'s form)."""
+    return [tuple(r.split("/")) if isinstance(r, str) else tuple(r) for r in roots]
+
+
+def _evidence_root_union(*root_lists):
+    """Every evidence root any of `root_lists` names, once, in first-seen order."""
+    seen, out = set(), []
+    for roots in root_lists:
+        for segs in _root_segments(roots):
+            if segs not in seen:
+                seen.add(segs)
+                out.append(segs)
+    return out
+
+
 def evidence_digests(wt, roots):
-    """-> {worktree-relative path: md5} for every file under every evidence root (`roots`:
-    `layout(root).evidence_roots`, the `worktrees.evidenceRoots` lane-worktree gates)."""
-    found = {}
-    for top_name in roots:
-        top = _rel_path(wt, top_name)
-        if not os.path.isdir(top):
-            continue
-        for dirpath, _dirs, files in os.walk(top):
-            for name in files:
-                path = os.path.join(dirpath, name)
-                if os.path.isfile(path):
-                    found[os.path.relpath(path, wt).replace(os.sep, "/")] = md5_file(path)
-    return found
+    """-> {worktree-relative path: md5} for every evidence file under `roots` -- ENUMERATED BY
+    `lane-worktree`'s own `evidence_files`, the one list its count, its copy and its verify read,
+    so the digests this verb checks name exactly the files the preserve takes. ✔MEASURED
+    2026-09-29 (the review of lane `lf`): this used to be an `os.walk` of its own, which on
+    Python 3.14 descends into a Windows directory junction that `lane-worktree` rightly does not
+    follow -- counting files the copy never took, and then reporting them lost. A dangling link
+    has no bytes to digest and is left out; the preserve itself refuses it. Raises OSError."""
+    return {rel: md5_file(path) for rel, path in _lane_worktree().evidence_files(wt, _root_segments(roots))
+            if os.path.isfile(path)}
 
 
 def default_evidence_destination(root, lane):
@@ -1516,57 +1773,395 @@ def lane_worktree_path():
                         "lane-worktree", "lane-worktree.py")
 
 
-def lane_worktree_remove_argv(root, lane, destination, verified):
-    """-> the argv that asks `lane-worktree`, the ONE owner of removal, to preserve the lane's
-    evidence, DISCARD its uncommitted work, and remove its worktree: the same argv on every host,
-    started by THIS interpreter.
+def worktree_removal_argv(root, lane, verified, door):
+    """-> the argv that asks DssHarness, the ONE owner of worktree removal (`dssharness help
+    worktrees`), to delete lane `lane`'s worktree AND the copies its record holds on hosts
+    (`delete-worktree`), discarding its uncommitted work and its evidence roots -- `land` has folded
+    the one and preserved and re-read the other before it builds this.
 
-    ★★ `verified` IS WHAT THE DISCARD FLAG IS BUILT FROM. `lane-worktree remove` refuses
-    (exit 8) a worktree whose own `git status` lists uncommitted work -- every lane's does,
-    its own work and its seeded paths alike -- because it cannot tell folded work from
-    unfolded work, and only this file's measurement can. So `--discard-work` is added HERE,
-    and only when `verified` is the post-fold `classify` result with nothing left to fold: no
-    lane path still to write, none still to delete, no refusal. Anything else refuses, so no
-    caller can build a removal that discards work without that measurement in hand.
-    Self-test arms (l7a)-(l7c) pin the order and the refusal.
+    ⚠⚠ WHY DSSHARNESS, AND NOT `lane-worktree remove` ANY MORE. That verb ran `git worktree remove`,
+    which knows nothing of the copies DssHarness makes of a worktree on the hosts its legs run on.
+    ✔MEASURED 2026-09-28 (P68's PR exit): a probe lane synced to WSL was landed -- "LANDED lane
+    lfprobe" -- and `dssharness delete-worktree lfprobe` then still removed its copy at
+    `~/src/dss-code-prime.worktree-lfprobe`. Every landed lane had left a copy behind on every host
+    it ran on. DssHarness asks only the hosts it recorded a copy on ("Nothing recorded, so nothing
+    asked"), so a lane that never ran on a host costs no host a question.
 
-    ⚠ The same flag also discards the commits a lane's HEAD holds that no ref of the repository
-    reaches -- `lane-worktree` refuses those with exit 8 too, and a fold cannot see them. `land`
-    never builds it for such a lane: `lane_base` refuses first, a HEAD past the recorded base or,
-    for a format-1 manifest, a HEAD holding such commits. Self-test arms (l8) and (l8b) pin that
-    no removal is even built.
+    ★★ `verified` IS WHAT THE DISCARD FLAG IS BUILT FROM. `delete-worktree` refuses (exit 13) a
+    worktree whose own `git status` lists uncommitted work -- every lane's does, its own work and
+    its seeded paths alike -- because it cannot tell folded work from unfolded work, and only this
+    file's measurement can. So `--discard-uncommitted` is added HERE, and only when `verified` is
+    the post-fold `classify` result with nothing left to fold: no lane path still to write, none
+    still to delete, no refusal. Anything else refuses, so no caller can build a removal that
+    discards work without that measurement in hand. Self-test arms (l7a)-(l7c) pin the order and
+    the refusal. `--delete-evidence` stands on the same footing: `land` builds this only after
+    the evidence was copied and re-read at its destination.
 
-    ⓘ `lane-worktree` is one Python program on every host (2026-09-21, lane mig), so there is
-    nothing to probe: `sys.executable` runs it. A missing file stops the landing with the
-    worktree kept, rather than failing inside the child.
-    """
-    if (not isinstance(verified, Classification)
+    ⚠ A lane's HEAD holding commits no ref reaches is still REFUSED by `delete-worktree`, which
+    has no flag for it short of `--force` -- and `land` never gets that far: `lane_base` refuses
+    such a lane first. Self-test arms (l8) and (l8b) pin that no removal is even built.
+
+    ★ `verified` MAY ALSO BE THE LANE'S `Landed` MARK -- only when `land` FINISHES a removal that
+    stopped part way, and only once the lane measured unchanged against the mark's record. The mark
+    is written only after that same clean measurement, the rows re-read and the evidence verified,
+    so it is the measurement, persisted. ⛔ Never `--force`, which checks nothing: a directory git
+    no longer knows as a worktree is left for a person to look at (`_finish_landing`).
+    `--no-prompt`: nothing here can answer a question."""
+    if isinstance(verified, Landed):
+        pass
+    elif (not isinstance(verified, Classification)
             or verified.mine or verified.deleted or verified.refusals):
         die("refusing to build a removal that DISCARDS lane %s's uncommitted work: it was not "
             "handed a fold measurement showing nothing left to fold (%s). The worktree is kept."
             % (lane, "no measurement at all" if not isinstance(verified, Classification) else
                "%d path(s) still to write, %d to delete, %d refusal(s)"
                % (len(verified.mine), len(verified.deleted), len(verified.refusals))))
-    subject = lane_worktree_path()
-    if not os.path.isfile(subject):
-        die("cannot find %s -- the worktree cannot be removed by its owner, so the landing stops "
-            "here with the worktree kept." % subject)
-    return [sys.executable, subject, "--repo", root, "remove", lane, "--discard-work",
-            "--preserve-to", destination]
+    return [door, "delete-worktree", lane, "--discard-uncommitted", "--delete-evidence", "--no-prompt",
+            "-C", root]
+
+
+def _run_removal(argv, root):
+    """Runs `worktree_removal_argv`'s argv in the main checkout -> (exit code, what it printed).
+    ★ The child does NOT inherit the caller's git environment (`run_unsteered`: every name git
+    calls repository-local, which DssHarness's own git client clears only three of), and reads no
+    stdin. Module level, so the self-test can stand in for a host that cannot be reached; arm (e5)
+    pins the child's environment, (e4) the whole landing under a steering caller."""
+    proc = _owning_tree().run_unsteered(argv, cwd=root, capture_output=True)
+    return proc.returncode, (proc.stdout + proc.stderr).decode("utf-8", "replace")
+
+
+def _list_worktrees(argv, root):
+    """Runs `dssharness list-worktree --json` (`argv`, built by `copies_left`) in the main checkout
+    -> (exit code, stdout, stderr): DssHarness's RECORD of the copies hosts keep, read with no host
+    asked. Module level, so the self-test can stand in for a record that still holds a copy;
+    unsteered and stdin-less like `_run_removal` (arm (e5))."""
+    proc = _owning_tree().run_unsteered(argv, cwd=root, capture_output=True)
+    return (proc.returncode, proc.stdout.decode("utf-8", "replace"),
+            proc.stderr.decode("utf-8", "replace"))
+
+
+def copies_left(door, root, lane):
+    """-> ([(host, path)], "") for every copy of lane `lane` DssHarness's record still holds -- or
+    (None, why) when the record cannot be read, which is never taken for "none left".
+
+    ★ WHY `land` READS THE RECORD RATHER THAN TRUSTING THE EXIT CODE. `delete-worktree` exits 0
+    only once every copy it recorded was dealt with, and otherwise with the highest code a copy
+    was left with -- but "REMOVE, THEN VERIFY, THEN SPEAK" holds for what this verb claims, and
+    the record is where a copy left behind stays named (`gone`, with the command that removes it).
+    DssHarness 0.6.1 made it readable: `list-worktree --json`, `worktrees` and `gone` each listing
+    `copies` of `{host, path}`. ⓘ A copy DssHarness did not make, or one on a host no
+    configuration declares, it leaves in place and forgets, saying so in its own lines."""
+    rc, out, err = _list_worktrees([door, "list-worktree", "--json", "--no-prompt", "-C", root], root)
+    if rc != 0:
+        lines = (err or out).strip().splitlines()
+        return None, "`dssharness list-worktree --json` exited %d%s" % (rc, ": " + lines[-1] if lines else "")
+    try:
+        doc = json.loads(out)
+    except ValueError as exc:
+        return None, "`dssharness list-worktree --json` printed no JSON document (%s)" % exc
+    if not isinstance(doc, dict) or not all(isinstance(doc.get(k), list) for k in ("worktrees", "gone")):
+        return None, "`dssharness list-worktree --json` holds no `worktrees` and `gone` lists"
+    if doc.get("recordUnreadable"):
+        return None, "DssHarness could not read its record of host copies: %s" % doc["recordUnreadable"]
+    left = []
+    for key in ("worktrees", "gone"):
+        for entry in doc[key]:
+            if isinstance(entry, dict) and entry.get("name") == lane:
+                for copy in entry.get("copies") or []:
+                    if isinstance(copy, dict):
+                        left.append((str(copy.get("host")), str(copy.get("path"))))
+                    else:
+                        return None, "`dssharness list-worktree --json` lists a copy of %s that is " \
+                                     "not a {host, path} object: %r" % (lane, copy)
+    return left, ""
+
+
+def _keep_evidence(root, wt, roots, destination, expected, verdict="NOT LANDED"):
+    """Copy every evidence file under `roots` to `destination` through `lane-worktree`'s own
+    copy-and-re-read, then re-read each one there -> how many were kept, or None having said
+    `verdict` (NOT LANDED, or LANDING INCOMPLETE when finishing a marked lane).
+
+    `expected`: {path: md5} taken before anything was written; a file whose bytes moved since, or
+    that is gone, means the lane changed underneath the landing. ★ ALL OF IT BEFORE ANY REMOVAL
+    -- this check used to run after `delete-worktree --delete-evidence`, where a file the copy
+    missed was found missing only once it was gone (✔MEASURED, the review of lane `lf`)."""
+    lw = _lane_worktree()
+    rel = os.path.relpath(wt, root).replace(os.sep, "/")
+    try:
+        counted = sum(n for _top, n in lw.count_evidence(wt, roots))
+        if counted:
+            lw.preserve_evidence(wt, rel, destination, counted, roots)
+        now = evidence_digests(wt, roots)
+    except lw.Refused as exc:
+        print("lane-fold: %s -- the evidence could not be preserved, so nothing was removed. "
+              "The fold and the rows ARE landed; the worktree and its evidence are KEPT:" % verdict)
+        for ln in exc.lines:
+            print("      " + ln)
+        return None
+    except OSError as exc:
+        print("lane-fold: %s -- the evidence could not be re-read (%s), so nothing was removed. "
+              "The fold and the rows ARE landed; the worktree and its evidence are KEPT." % (verdict, exc))
+        return None
+    moved = sorted(p for p, digest in expected.items() if now.get(p) != digest)
+    lost = sorted(p for p, digest in now.items()
+                  if not os.path.isfile(os.path.join(destination, *p.split("/")))
+                  or md5_file(os.path.join(destination, *p.split("/"))) != digest)
+    if moved or lost:
+        why = []
+        if lost:
+            why.append("%d of %d file(s) are not at %s byte-identical (%s)"
+                       % (len(lost), len(now), destination, ", ".join(lost[:5])))
+        if moved:
+            why.append("%d file(s) changed in the lane since the landing measured them (%s)"
+                       % (len(moved), ", ".join(moved[:5])))
+        print("lane-fold: %s -- EVIDENCE CHECK FAILED, before any removal: %s. Nothing was "
+              "removed; the fold and the rows ARE landed, and the worktree and its evidence are KEPT."
+              % (verdict, "; ".join(why)))
+        return None
+    print("lane-fold:       the evidence: %d file(s) under %s kept at %s, each re-read"
+          % (len(now), " and ".join("/".join(r) + "/" for r in roots), destination))
+    return len(now)
+
+
+def _settle_removal(root, lane, wt, argv, door, destination, rows_line):
+    """Run the removal, then verify what `land` claims -> 0 LANDED, or 4 LANDING INCOMPLETE.
+
+    ⚠ REMOVE, THEN VERIFY, THEN SPEAK -- and this verb verifies what IT claims: the directory gone,
+    git's registration gone, and no copy left in DssHarness's record. Any of them left, or an exit
+    code DssHarness gave with none left, is INCOMPLETE -- never LANDED -- and names the one remedy
+    that is always safe from here: `land` again, which finishes a marked lane and folds nothing.
+    `argv` None: nothing is left for DssHarness to remove, and it is not asked (it would answer
+    "No worktree named '<lane>'", exit 13); the verification still runs."""
+    if argv is None:
+        print("lane-fold: [5/5] nothing is left to remove: no directory, no registration, no recorded copy")
+        rc, said = 0, ""
+    else:
+        print("lane-fold: [5/5] %s" % " ".join('"%s"' % a if " " in a else a for a in argv))
+        rc, said = _run_removal(argv, root)
+    for ln in said.splitlines():
+        print("      " + ln)
+    left_over = []
+    if os.path.lexists(wt):
+        left_over.append("%s is still on disk" % wt)
+    listed, why = _registered(root, wt)
+    if listed is None:
+        left_over.append("git cannot say whether it still records the worktree (%s)" % why)
+    elif listed:
+        left_over.append("git still records %s as a worktree" % wt)
+    copies, unread = copies_left(door, root, lane)
+    if copies is None:
+        left_over.append("DssHarness's record of host copies could not be read (%s)" % unread)
+    elif copies:
+        left_over.append("DssHarness's record still holds %d copy(ies) of it: %s"
+                         % (len(copies), ", ".join("%s: %s" % c for c in copies)))
+    if rc != 0 and not left_over:
+        left_over.append("DssHarness exited %d although the worktree, its registration and every "
+                         "recorded copy are gone -- its lines above say why" % rc)
+    if left_over:
+        print("lane-fold: LANDING INCOMPLETE -- %s%s. The fold and the rows are in the main tree and "
+              "the evidence is kept at %s; the lane is marked landed, so nothing will fold it again. "
+              "Settle what DssHarness names above, then run `lane-fold.py land %s production --apply` "
+              "again: it folds nothing, and finishes the removal or names the command that does."
+              % ("; ".join(left_over), " (DssHarness exited %d)" % rc if rc != 0 else "", destination, lane))
+        return 4
+    print("lane-fold: LANDED lane %s -- %s; the worktree, its registration and every copy DssHarness "
+          "recorded are gone, and the evidence is at %s." % (lane, rows_line, destination))
+    return 0
+
+
+def _refuse_standing_inside(lane, wt):
+    """Refuse (exit 2) a landing started from INSIDE the lane: a removal cannot take a directory a
+    process stands in -- DssHarness refuses one on Windows, naming its own directory rather than
+    the caller's, and elsewhere the caller is left standing in a directory that is gone."""
+    here = os.getcwd()
+    if _owning_tree().is_within(here, wt, strict=False):
+        die("this process's working directory %s is inside lane %s (%s), and the landing ends by "
+            "removing that directory. Nothing was written or removed; run `land` from the main tree."
+            % (here, lane, wt))
+
+
+def _lane_record(root, wt, paths):
+    """-> {path: md5, or None where the lane holds no file} for every path lane `wt`'s `git status`
+    lists and every one of `paths` -- read from the LANE. What `land` marks, and what a re-run
+    compares the lane with: never the main tree, which later lanes go on changing."""
+    lanes = layout(root).worktrees
+    record = {}
+    for rel in sorted(set(changed_paths(wt)) | set(paths)):
+        if is_lane_tree(rel, lanes):
+            continue
+        src = os.path.join(wt, *rel.split("/"))
+        record[rel] = md5_file(src) if os.path.isfile(src) else None
+    return record
+
+
+def _changed_since_mark(root, wt, seed, record):
+    """-> the paths lane `wt` holds NOW with bytes its landing did not measure: a file whose md5 is
+    not its record's, or one the record holds no file for. A file the lane no longer holds is NOT
+    listed: a removal only deletes, so a deletion since the mark is the debris of the removal that
+    stopped part way (✔MEASURED 2026-09-29 with DssHarness 0.6.1: git deleted a worktree's files and
+    then stopped), and taking it for work would leave every such lane unremovable."""
+    now = _lane_record(root, wt, set(seed) | set(record))
+    changed = sorted(rel for rel, digest in now.items() if digest is not None and record.get(rel) != digest)
+    # ⚠ A PATH THE MAIN TREE'S RULES IGNORE IS NEVER WORK: a fold would not carry it. Asked of the MAIN
+    # tree, because a removal that stops part way can delete the lane's own `.gitignore` first -- then
+    # every evidence file and build artefact reads as new (✔MEASURED, the re-review of lane `lf`: such a
+    # lane could never finish). The main tree's rules are the lane's, or what its fold made them.
+    if not changed:
+        return []
+    ignored = _ignored_by(root, changed)
+    return [rel for rel in changed if rel not in ignored]
+
+
+def _ignored_by(root, rels):
+    """-> the subset of `rels` (repository-relative) the tree at `root` ignores by its own rules,
+    whether or not a file is there -- and never a TRACKED one: git consults the index, so a file
+    tracked under an ignored directory, which a fold does carry, is not reported (✔MEASURED, the
+    re-review of lane `lf`: with `--no-index` it was, and an edit to it made after the mark would have
+    been removed with the lane). Refuses (exit 2) when git cannot say: an unknown answer is not
+    "nothing ignored"."""
+    proc = git_run(["-C", root, "check-ignore", "--stdin", "-z"], input="\0".join(rels),
+                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.returncode not in (0, 1):
+        die("`git check-ignore` exited %d in %s, so which of the lane's paths are ignored cannot be told: %s"
+            % (proc.returncode, root, (proc.stderr or "").strip()[:300]))
+    return set(p for p in proc.stdout.split("\0") if p)
+
+
+def _fresh_directory(parent, name):
+    """`<parent>/<name>`, or `<name>-2`, `-3` ... -- the first that does not exist yet."""
+    first = os.path.join(parent, name)
+    candidate, n = first, 1
+    while os.path.exists(candidate):
+        n += 1
+        candidate = "%s-%d" % (first, n)
+    return candidate
+
+
+def _clear_mark(root, lane, manifest):
+    """The lane is gone everywhere: its manifest keeps what it was seeded with and drops the mark, so
+    a new lane of the name starts unmarked."""
+    save_manifest(manifest_path(root, lane), Manifest(manifest.base, manifest.paths))
+
+
+def _finish_landing(root, lane, wt, manifest, state, door, apply_it, settled, preserve_to):
+    """`land` on a lane MARKED landed: its fold, rows and evidence were done and verified before
+    the mark was written, and its removal did not finish. -> 0 LANDED, 2 not this lane, 3 usage,
+    4 LANDING INCOMPLETE.
+
+    Nothing is folded again, and nothing is discarded unseen, measured against the LANE's own
+    record in the mark, never the main tree (which later lanes go on changing -- ✔MEASURED, the
+    re-review of lane `lf`: comparing with it refused a finished lane forever once another lane
+    edited a path it had landed): a file the lane holds with bytes its landing did not measure is
+    work done since, which a human copies out; a path the main tree's rules ignore never is. A NEW
+    worktree of the name (another identity) is not the landed lane at all -- `seed` starts it clean.
+    Evidence is kept again, into a FRESH directory beside the first (`--preserve-to` names another):
+    a run that held a log when the removal was refused goes on writing it, and one destination would
+    then refuse every re-run as a clash. A directory with no `.git` of its own has its evidence kept
+    and is left, with the `--force` removal named, for a person to look at."""
+    landed = manifest.landed
+    if settled:
+        die("--settled leaves paths out of a FOLD, and lane %s, landed at %s, is never folded again: "
+            "nothing was read, written or removed." % (lane, landed.at), 3)
+    print("lane-fold: LAND lane %s -- FINISHING: it was landed at %s (its fold and rows are in the main "
+          "tree, its evidence is kept at %s), and its removal did not finish; %s"
+          % (lane, landed.at, landed.evidence, {
+              "gone": "its directory is gone", "husk": "its directory is no longer a git worktree",
+              "worktree": "it is still a registered worktree"}[state]))
+    if state == "worktree":
+        ident = _worktree_identity(wt)
+        if ident is None:
+            print("lane-fold: NOT FINISHED -- git names no administrative directory for %s, so whether it is "
+                  "the worktree landed at %s or a NEW one of this name cannot be told. Its mark is kept and "
+                  "nothing of it was read or removed: a person decides, and once what it holds is copied out, "
+                  "`dssharness delete-worktree %s --discard-uncommitted --delete-evidence` removes it."
+                  % (wt, landed.at, lane))
+            return 2
+        if ident != landed.worktree:
+            print("lane-fold: NOT FINISHED -- %s is not the worktree landed at %s: git knows it as another "
+                  "worktree (its administrative directory was made since), so it is a NEW lane of this name "
+                  "that skipped the mandatory `seed`. Nothing of it was read or removed; `lane-fold.py seed "
+                  "%s` starts it clean (the landed lane's fold, rows and evidence are in already)."
+                  % (wt, landed.at, lane))
+            return 2
+        changed = _changed_since_mark(root, wt, manifest.paths, landed.lane)
+        if changed:
+            print("lane-fold: LANDING INCOMPLETE -- lane %s holds %d file(s) its landing did not measure, "
+                  "changed or new since %s: work done in a lane already landed, which nothing folds "
+                  "again and nothing discards unseen. Copy it out, then remove the lane with "
+                  "`dssharness delete-worktree %s --discard-uncommitted --delete-evidence`."
+                  % (lane, len(changed), landed.at, lane))
+            for rel in changed[:10]:
+                print("   %s" % rel)
+            return 4
+    if not apply_it:
+        print("lane-fold: dry run -- pass --apply to %s." % (
+            "keep its evidence again and have the `--force` removal named for you: nothing here removes a "
+            "directory with no `.git`" if state == "husk" else "finish the removal"))
+        return 0
+    destination = landed.evidence
+    if state != "gone":
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = preserve_to or _fresh_directory(landed.evidence, "finish-" + stamp)
+        roots = _lane_worktree().load_settings(root).evidence_roots
+        try:
+            expected = evidence_digests(wt, roots)
+        except OSError as exc:
+            print("lane-fold: LANDING INCOMPLETE -- the evidence left in %s cannot be read (%s); nothing "
+                  "was removed." % (wt, exc))
+            return 4
+        if _keep_evidence(root, wt, roots, destination, expected, "LANDING INCOMPLETE") is None:
+            return 4
+    if state == "husk":
+        # ★ NEVER FORCED FROM HERE. `--force` checks nothing, and a directory with no `.git` of its own
+        # is the husk a stopped removal leaves -- or a directory somebody made at that path since, which
+        # nothing here can tell apart (✔MEASURED, the re-review of lane `lf`: a plain directory made
+        # there after the worktree was gone read as a husk, and its files went with a forced delete).
+        print("lane-fold: LANDING INCOMPLETE -- %s is no longer a git worktree (it holds no `.git` of its own): "
+              "what a removal that stopped part way leaves, or a directory made there since. Its evidence is "
+              "kept at %s (each run keeps a fresh copy). Look at what else it holds; once nothing in it is "
+              "needed, `dssharness delete-worktree %s --force` removes it (DssHarness refuses it without "
+              "`--force`, and nothing here forces it), and `lane-fold.py land %s production --apply` then "
+              "drops the mark." % (wt, destination, lane, lane))
+        return 4
+    argv = worktree_removal_argv(root, lane, landed, door)
+    if state == "gone" and _registered(root, wt)[0] is False and copies_left(door, root, lane)[0] == []:
+        argv = None
+    rc = _settle_removal(root, lane, wt, argv, door, destination,
+                         "finished the removal its landing at %s began" % landed.at)
+    if rc == 0:
+        _clear_mark(root, lane, manifest)
+    return rc
 
 
 def cmd_land(root, lane, default_bucket, apply_it, settled=(), preserve_to=None):
-    wt, manifest = _open_lane(root, lane)
-    base = lane_base(root, lane, wt, manifest)
+    wt, manifest, state = _open_lane(root, lane, closed_ok=True)
+    if apply_it:
+        _refuse_standing_inside(lane, wt)
     anchors = load_anchors_module(root)
+    try:
+        door = anchors.door_executable()
+    except anchors.Refused as exc:
+        print("lane-fold: NOT LANDED -- %s Nothing was written or removed." % exc)
+        return 2
+    if manifest.landed is not None:
+        return _finish_landing(root, lane, wt, manifest, state, door, apply_it, settled, preserve_to)
+    base = lane_base(root, lane, wt, manifest)
     print("lane-fold: LAND lane %s (base %s)" % (lane, base[:12]))
+    lw = _lane_worktree()
 
     # ── 1. MEASURE EVERYTHING; WRITE NOTHING ────────────────────────────────────
     cls = classify(root, wt, manifest.paths, settled, base=base)
     before = registry_md5(root, anchors)
     plans, problems = plan_rows(root, wt, lane, default_bucket, anchors)
-    evidence_roots = layout(root).evidence_roots
-    evidence = evidence_digests(wt, evidence_roots)
+    # ★ The evidence roots the configuration names NOW, before the fold -- step 4 adds the ones it
+    #   names after it -- enumerated the way `lane-worktree` enumerates them (`evidence_digests`).
+    roots_before = lw.load_settings(root).evidence_roots
+    try:
+        evidence = evidence_digests(wt, roots_before)
+    except OSError as exc:
+        print("lane-fold: NOT LANDED -- the lane's evidence cannot be read (%s); nothing written, nothing "
+              "removed." % exc)
+        return 2
     destination = preserve_to or default_evidence_destination(root, lane)
     print("lane-fold: [1/5] the fold")
     if not cls.refusals:
@@ -1574,7 +2169,7 @@ def cmd_land(root, lane, default_bucket, apply_it, settled=(), preserve_to=None)
     print("lane-fold: [2/5] the rows (%d)" % len(plans))
     _print_row_plans(plans)
     print("lane-fold: [3/5] the evidence: %d file(s) under %s, to be kept at %s"
-          % (len(evidence), " and ".join(r + "/" for r in evidence_roots), destination))
+          % (len(evidence), " and ".join("/".join(r) + "/" for r in roots_before), destination))
     if cls.refusals or problems:
         if cls.refusals:
             _print_fold_refusals(cls.refusals)
@@ -1605,40 +2200,46 @@ def cmd_land(root, lane, default_bucket, apply_it, settled=(), preserve_to=None)
     print("lane-fold: [4/5] the fold re-measured: nothing left to fold (%d path(s) landed)"
           % len(after.converged))
 
-    # ── 4. THE EVIDENCE KEPT AND THE WORKTREE REMOVED -- BY THE OWNER OF REMOVAL ──
-    # ★ `after` is handed over: the discard-work flag is built from it and from nothing else.
-    argv = lane_worktree_remove_argv(root, lane, destination, after)
-    print("lane-fold: [5/5] %s" % " ".join('"%s"' % a if " " in a else a for a in argv))
-    # ★ THE CHILD DOES NOT INHERIT THE CALLER'S GIT ENVIRONMENT: handed a steering GIT_DIR, its
-    # own `git worktree remove` and `prune` would act on another repository and leave this one
-    # registering a worktree that is gone. Self-test arm (e4).
-    proc = subprocess.run(argv, capture_output=True, env=_owning_tree().git_environment())
-    for ln in (proc.stdout + proc.stderr).decode("utf-8", "replace").splitlines():
-        print("      " + ln)
-    if proc.returncode != 0:
-        print("lane-fold: NOT LANDED -- lane-worktree declined to remove the worktree (rc=%d). "
-              "The fold and the rows ARE landed; the worktree and its evidence are KEPT. "
-              "Fix the cause and re-run `land`." % proc.returncode)
+    # ── 4. THE EVIDENCE KEPT AND RE-READ, THE LANE MARKED, THEN THE REMOVAL -- BY DSSHARNESS ──
+    # ★ ONLY HERE, the step after the lane's LAST review. The operator, 2026-09-28: "only removes
+    #   copies after last review is fine: while modifications are needed the files can't be removed"
+    #   -- `fold` never removes anything, so a lane a review sends back keeps its worktree and copies.
+    # The evidence FIRST, through `lane-worktree`'s own copy-and-re-read (its gate: a destination
+    # inside the lane, a same-named file with other bytes, a count that moved -- each refused), over
+    # the roots named before the fold AND after it: a lane that changed `worktrees.evidenceRoots`
+    # has now carried that change into the tree DssHarness reads, and a root it dropped would
+    # otherwise die unkept (✔MEASURED, the review of lane `lf`: `scratchpad/pad.log`, announced at
+    # [3/5], was never copied and was gone after the removal). Every file is re-read against the
+    # digests step 1 took BEFORE any removal is asked for.
+    roots = _evidence_root_union(roots_before, lw.load_settings(root).evidence_roots)
+    kept = _keep_evidence(root, wt, roots, destination, evidence)
+    if kept is None:
         return 2
-    # ⚠ REMOVE, THEN VERIFY, THEN SPEAK -- and this verb verifies what IT claims.
-    if os.path.exists(wt):
-        print("lane-fold: NOT LANDED -- lane-worktree exited 0 but %s is still on disk." % wt)
-        return 2
-    lost = [rel for rel, digest in sorted(evidence.items())
-            if not os.path.isfile(os.path.join(destination, *rel.split("/")))
-            or md5_file(os.path.join(destination, *rel.split("/"))) != digest]
-    if lost:
-        print("lane-fold: ⚠⚠ EVIDENCE CHECK FAILED -- %d of %d file(s) are not at %s "
-              "byte-identical: %s" % (len(lost), len(evidence), destination,
-                                      ", ".join(lost[:5])))
-        return 2
-    print("lane-fold: LANDED lane %s -- %d path(s) written and %d removed; %d row(s) applied "
-          "and %d already landed, every row re-read; %d evidence file(s) at %s, each "
-          "re-read." % (lane, len(cls.mine), len(cls.deleted),
-                        sum(1 for p in plans if p.action != "landed"),
-                        sum(1 for p in plans if p.action == "landed"),
-                        len(evidence), destination))
-    return 0
+    # ★ `after` is handed over: the discard flag is built from it and from nothing else.
+    argv = worktree_removal_argv(root, lane, after, door)
+    # ★★ THE MARK, BEFORE THE REMOVAL IS ASKED FOR. From here a re-run of `land` finishes the
+    #   removal and folds nothing (`_finish_landing`), and no verb folds this lane again: a removal
+    #   that stops part way leaves debris a second fold would read as the lane's intent. It records
+    #   which worktree this is (`_worktree_identity`) and the lane's own bytes, which a re-run compares the lane
+    #   with; the base is the one `lane_base` measured above, so a format-1 lane's mark is format 2.
+    #   A landing that completes clears it again (`_clear_mark`).
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    identity = _worktree_identity(wt)
+    if identity is None:
+        die("lane %s measured as a worktree, but git names no administrative directory for it to mark; "
+            "nothing was removed." % lane)
+    save_manifest(manifest_path(root, lane),
+                  Manifest(base, manifest.paths,
+                           Landed(stamp, destination, identity, _lane_record(root, wt, manifest.paths))))
+    rc = _settle_removal(root, lane, wt, argv, door, destination,
+                         "%d path(s) written and %d removed; %d row(s) applied and %d already landed, "
+                         "every row re-read; %d evidence file(s) kept, each re-read"
+                         % (len(cls.mine), len(cls.deleted),
+                            sum(1 for p in plans if p.action != "landed"),
+                            sum(1 for p in plans if p.action == "landed"), kept))
+    if rc == 0:
+        _clear_mark(root, lane, Manifest(base, manifest.paths))
+    return rc
 
 
 # ──────────────────────────────────── list ─────────────────────────────────────
@@ -1660,7 +2261,13 @@ def cmd_list(root):
     # ★ A manifest with no worktree is not junk -- it is the record of a lane that was
     # folded and removed, and deleting it would erase what that lane was seeded with.
     for lane in manifests:
-        if lane not in lanes:
+        # ★ The mark first: a landing that completes drops it, so a marked lane -- directory or not --
+        # is one whose removal did not finish (a registration or a host copy can outlive the directory).
+        if _landed_mark_of(os.path.join(mdir, "seed-%s.json" % lane)) is not None:
+            print("   ⚠ %s: LANDED, but its removal did not finish%s -- `land %s production --apply` "
+                  "finishes it or names what does" % (lane, "" if lane in lanes else " (its directory is gone)",
+                                                     lane))
+        elif lane not in lanes:
             print("   ⓘ %s: manifest kept, worktree already removed" % lane)
     for lane in lanes:
         if lane not in manifests:
@@ -1751,16 +2358,11 @@ def self_test():
         write_atomic(os.path.join(root, "shared.json"), '{"from":"lane-one"}\n')
 
         wt = worktree_path(root, "x")
-        os.makedirs(wt)
-        # A worktree is a checkout; the self-test only needs a directory git can read,
-        # so make it a repository of its own at the same content.
-        git_run(["init", "-q", wt], capture_output=True, check=True)
-        for rel in ("tracked.txt", "a file - with spaces.md"):
-            copy_atomic(os.path.join(root, rel), os.path.join(wt, rel))
-        git_run(["-C", wt, "config", "user.email", "s@e.invalid"], capture_output=True, check=True)
-        git_run(["-C", wt, "config", "user.name", "s"], capture_output=True, check=True)
-        git_run(["-C", wt, "add", "-A"], capture_output=True, check=True)
-        git_run(["-C", wt, "commit", "-q", "-m", "base"], capture_output=True, check=True)
+        # ★ A REAL `git worktree` of this repository, as every lane is. This fixture used to make
+        # the lane a repository of its own at the same content, which every verb now refuses
+        # (`_require_worktree`): a directory that is not a registered worktree of the tree it
+        # folds into is exactly what a removal that stopped part way leaves behind.
+        run("worktree", "add", "--detach", wt, "HEAD")
 
         cmd_seed(root, "x")
         seed = load_manifest(manifest_path(root, "x")).paths
@@ -1938,9 +2540,10 @@ def self_test():
         # lane and requires the fold to SEE it, then dirties the main tree's copy and
         # requires the fold to REFUSE. A pin that only checked the happy path would
         # pass over a tool that deletes drifted work.
-        # ⓘ The fixture's root and worktree are INDEPENDENT repositories, so the
-        # subject has to be committed in each before the lane can delete it -- that
-        # is what makes `git status` in the lane say `D` rather than "untracked".
+        # ⓘ The subject is committed on BOTH sides -- the main tree's branch and the lane's
+        # detached HEAD, two commits of one repository -- before the lane deletes it: that is
+        # what makes `git status` in the lane say `D` rather than "untracked", and the lane's
+        # own HEAD the base `classify` measures it against.
         # ⚠ Assertions here name the SUBJECT PATH rather than requiring an empty
         # refusal set: arm (b) deliberately leaves the main tree drifted, and a pin
         # that demanded global cleanliness would be measuring that instead of this.
@@ -2030,8 +2633,54 @@ def self_test():
             return rv, sink.getvalue()
 
         def text(path):
+            """The file's text, or None when there is none: a pin reading what a broken subject never
+            wrote must come out red, not stop every arm after it with a traceback."""
+            if not os.path.isfile(path):
+                return None
             with io.open(path, encoding="utf-8", newline="") as fh:
                 return fh.read()
+
+        # (v1)-(v2) A SEEDED PATH THE LANE RESTORED TO HEAD'S BYTES IS THE LANE'S CHANGE. ✔MEASURED 2026-09-28
+        # (P68's PR exit, lane `ci59b`): `classify` read only the lane's `git status`, which lists no path
+        # whose bytes equal HEAD's, so the fold accounted for 8 of 9 seeded paths and kept the main
+        # tree's seeded bytes over the lane's revert, saying nothing. The negative is measured first:
+        # the lane's own status does not list the reverted path.
+        rq = os.path.join(top, "revert")
+        make_repo(rq, [(".gitignore", IGNORE), ("cfg.json", "{}\n"), ("kept.txt", "base\n")])
+        write_atomic(os.path.join(rq, "cfg.json"), '{"seeded": true}\n')    # the main tree's uncommitted state
+        write_atomic(os.path.join(rq, "kept.txt"), "main edit\n")
+        write_atomic(os.path.join(rq, "gone.txt"), "a new file\n")         # untracked: seeded too
+        write_atomic(os.path.join(rq, "drop.txt"), "another new file\n")   # untracked, seeded, and...
+        git(rq, "worktree", "add", "--detach", "%s/q" % layout(rq).worktrees, "HEAD")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_seed(rq, "q")                                             # carries all four in
+        wq = worktree_path(rq, "q")
+        write_atomic(os.path.join(wq, "cfg.json"), "{}\n")                  # the lane puts it back to HEAD
+        for tree in (rq, wq):                                             # and the new file goes from BOTH
+            os.remove(os.path.join(tree, "gone.txt"))
+        os.remove(os.path.join(wq, "drop.txt"))                           # ...deleted by the lane alone
+        manifest_q = load_manifest(manifest_path(rq, "q"))
+        status_q = changed_paths(wq)
+        mine_q, del_q, inh_q, ref_q, _set_q, conv_q = classify(rq, wq, manifest_q.paths, base=manifest_q.base)
+        pin(sorted(manifest_q.paths) == ["cfg.json", "drop.txt", "gone.txt", "kept.txt"]
+            and "cfg.json" not in status_q and "drop.txt" not in status_q
+            and mine_q == ["cfg.json"] and inh_q == ["kept.txt"] and conv_q == ["gone.txt"] and not ref_q,
+            "(v1) a SEEDED path the lane restored to HEAD's bytes -- absent from its own git status -- is the "
+            "lane's change, not dropped; the one it never touched is inherited, and one gone from both "
+            "trees is already landed, not skipped unseen",
+            "seeded=%s status=%s mine=%s inherited=%s converged=%s refusals=%s"
+            % (sorted(manifest_q.paths), status_q, mine_q, inh_q, conv_q, ref_q))
+        pin(del_q == ["drop.txt"],
+            "(v3) a SEEDED untracked file the lane DELETED -- absent from its git status too, since git "
+            "never tracked it -- is the lane's deletion, not a path already landed",
+            "deleted=%s converged=%s" % (del_q, conv_q))
+        rv_q, out_q = quiet(cmd_fold, rq, "q", True)
+        pin(rv_q == 0 and text(os.path.join(rq, "cfg.json")) == "{}\n"
+            and text(os.path.join(rq, "kept.txt")) == "main edit\n"
+            and not os.path.exists(os.path.join(rq, "drop.txt"))
+            and "4 seeded path(s): 1 this lane's, 1 inherited, 1 already landed, 1 deleted, 0 settled" in out_q,
+            "(v2) ...the fold WRITES the revert, keeps the inherited edit, carries the deletion, and its plan "
+            "counts every seeded path by where it went", "rv=%r out=%s" % (rv_q, out_q[-500:]))
 
         # ── (y1)-(y7): WHERE THE LANES AND THE BOOKKEEPING LIVE IS READ, NEVER ASSUMED ───────
         # ★ The red-on-disable for `layout`: a tree whose files name OTHER directories -- lanes
@@ -2336,6 +2985,8 @@ def self_test():
                 "# p", "", HDR, SEP,
                 "| `%s-EXISTING` | P2 | 🟠 OPEN | 🟠 **OPEN** existing row | w | r |" % FX,
                 "| `%s-SECOND` | P2 | 🟠 OPEN | 🟠 **OPEN** second existing row | w | r |" % FX,
+                # declared by the arms whose subject is not the rows (`existing_row`); no arm changes it
+                "| `%s-STANDING` | P2 | 🟠 OPEN | 🟠 **OPEN** a row no arm changes | w | r |" % FX,
                 ""])),
             (".plans/_deferred-anchor-registry-done.md", "\n".join([
                 "# d", "", "## Closed — Production", "", HDR, SEP,
@@ -2591,7 +3242,7 @@ def self_test():
               priority="P3")
         dest1 = os.path.join(top, "evidence-land1")
         real_classify = globals()["classify"]
-        real_remove_argv = globals()["lane_worktree_remove_argv"]
+        real_remove_argv = globals()["worktree_removal_argv"]
         events = []
 
         def spy_classify(*a, **k):
@@ -2599,20 +3250,20 @@ def self_test():
             events.append(("classify", result))
             return result
 
-        def spy_remove_argv(root_, lane_, destination_, verified_):
+        def spy_remove_argv(root_, lane_, verified_, door_):
             # Recorded BEFORE delegating, so a call that then refuses is still seen.
             events.append(("remove-argv", verified_))
-            argv_ = real_remove_argv(root_, lane_, destination_, verified_)
+            argv_ = real_remove_argv(root_, lane_, verified_, door_)
             events.append(("remove-argv-built", argv_))
             return argv_
 
         globals()["classify"] = spy_classify
-        globals()["lane_worktree_remove_argv"] = spy_remove_argv
+        globals()["worktree_removal_argv"] = spy_remove_argv
         try:
             rv, out = quiet(cmd_land, r3, "land1", "production", True, (), dest1)
         finally:
             globals()["classify"] = real_classify
-            globals()["lane_worktree_remove_argv"] = real_remove_argv
+            globals()["worktree_removal_argv"] = real_remove_argv
         got = A3.find(r3, FX + "-LANDONE")
         pin(rv == 0 and os.path.isfile(os.path.join(r3, "work-land1.txt"))
             and len(got) == 1 and got[0].table == "production" and not os.path.exists(wl1),
@@ -2625,10 +3276,14 @@ def self_test():
             "destination byte-identical", "found=%s" % sorted(
                 os.path.relpath(os.path.join(dp, f), dest1).replace(os.sep, "/")
                 for dp, _d, fs in os.walk(dest1) for f in fs)[:8])
+        man1 = load_manifest(manifest_path(r3, "land1"))
+        pin(man1.landed is None and man1.base is not None and "LANDED lane land1" in out,
+            "(l1c) ...and a landing that completes drops the mark it wrote: the manifest keeps what the lane "
+            "was seeded with, and a new lane of the name starts unmarked", "manifest=%r" % (man1,))
 
         # (l7b) THE DISCARD FLAG IS BUILT FROM THE POST-FOLD MEASUREMENT, RIGHT AFTER IT IS TAKEN.
-        # `lane-worktree remove` refuses a worktree whose own `git status` lists uncommitted work
-        # -- every lane's does -- unless told --discard-work. So the order must be:
+        # `dssharness delete-worktree` refuses a worktree whose own `git status` lists uncommitted
+        # work -- every lane's does -- unless told --discard-uncommitted. So the order must be:
         # the post-fold `classify` finds nothing left to fold, and the removal is built from THAT
         # result object, with the flag in it.
         kinds = [e[0] for e in events]
@@ -2637,9 +3292,11 @@ def self_test():
         post = events[at - 1][1] if at >= 1 and events[at - 1][0] == "classify" else None
         pin(kinds.count("remove-argv") == 1 and post is not None and events[at][1] is post
             and not (post.mine or post.deleted or post.refusals) and len(built) == 1
-            and "--discard-work" in built[0],
-            "(l7b) land builds its removal, WITH the discard-work flag, from the post-fold "
-            "measurement that found nothing left to fold, immediately after taking it",
+            and built[0][1:3] == ["delete-worktree", "land1"] and "--discard-uncommitted" in built[0]
+            and built[0][0] == A3.door_executable(),
+            "(l7b) land builds its removal -- DssHarness's delete-worktree, through the door the anchors "
+            "module resolves, WITH the discard flag -- from the post-fold measurement that found nothing "
+            "left to fold, immediately after taking it",
             "events=%s" % kinds)
 
         # (l2) A ROW THAT CANNOT BE APPLIED STOPS THE LANDING BEFORE THE FOLD WRITES.
@@ -2720,18 +3377,18 @@ def self_test():
         real_apply_fold = globals()["_apply_fold"]
         calls7 = []
 
-        def spy_remove_argv7(root_, lane_, destination_, verified_):
+        def spy_remove_argv7(root_, lane_, verified_, door_):
             calls7.append(verified_)
-            return real_remove_argv(root_, lane_, destination_, verified_)
+            return real_remove_argv(root_, lane_, verified_, door_)
 
         globals()["_apply_fold"] = lambda root_, wt_, cls_: None
-        globals()["lane_worktree_remove_argv"] = spy_remove_argv7
+        globals()["worktree_removal_argv"] = spy_remove_argv7
         try:
             rv, out = quiet(cmd_land, r3, "land7", "production", True, (),
                             os.path.join(top, "evidence-land7"))
         finally:
             globals()["_apply_fold"] = real_apply_fold
-            globals()["lane_worktree_remove_argv"] = real_remove_argv
+            globals()["worktree_removal_argv"] = real_remove_argv
         pin(rv == 2 and "FOLD VERIFY FAILED" in out and not calls7 and os.path.isdir(wl7)
             and os.path.isfile(os.path.join(wl7, "work-land7.txt")),
             "(l7a) when the post-fold measurement still finds the lane's work unfolded, land stops "
@@ -2746,24 +3403,28 @@ def self_test():
 
         # (l7c) THE REMOVAL BUILDER ITSELF REFUSES A MEASUREMENT THAT IS NOT "NOTHING LEFT".
         dirty = Classification(["work.txt"], [], [], [], [], [])
-        rv_dirty, out_dirty = quiet(lane_worktree_remove_argv, r3, "x",
-                                    os.path.join(top, "e7c"), dirty)
-        rv_none, out_none = quiet(lane_worktree_remove_argv, r3, "x",
-                                  os.path.join(top, "e7c"), None)
+        rv_dirty, out_dirty = quiet(worktree_removal_argv, r3, "x", dirty, "DOOR")
+        rv_none, out_none = quiet(worktree_removal_argv, r3, "x", None, "DOOR")
         pin(rv_dirty == 2 and "DISCARDS" in out_dirty and rv_none == 2 and "DISCARDS" in out_none,
             "(l7c) the removal builder REFUSES a measurement with work left, and no measurement "
             "at all", "dirty=%r none=%r" % (rv_dirty, rv_none))
         clean = Classification([], [], [], [], [], ["converged.txt"])
-        rv_clean, _out_clean = quiet(lane_worktree_remove_argv, r3, "x",
-                                     os.path.join(top, "e7c"), clean)
-        pin(rv_clean == [sys.executable, lane_worktree_path(), "--repo", r3, "remove", "x",
-                         "--discard-work", "--preserve-to", os.path.join(top, "e7c")],
-            "(l7c2) CONTROL: handed nothing left to fold, it builds the removal with the discard "
-            "flag -- the one argv, on every host, through this interpreter", "got=%r" % (rv_clean,))
+        rv_clean, _out_clean = quiet(worktree_removal_argv, r3, "x", clean, "DOOR")
+        pin(rv_clean == ["DOOR", "delete-worktree", "x", "--discard-uncommitted", "--delete-evidence",
+                         "--no-prompt", "-C", r3],
+            "(l7c2) CONTROL: handed nothing left to fold, it builds DssHarness's removal of the worktree "
+            "and its host copies, with the discard flags", "got=%r" % (rv_clean,))
+        # (l7d) A REMOVAL BUILT FROM A LANDING MARK IS THE SAME CHECKED ONE: nothing here builds `--force`.
+        mark7 = Landed("2026-09-29T00:00:00Z", os.path.join(top, "e7d"), "1:2", {})
+        rv_fl, _out_fl = quiet(worktree_removal_argv, r3, "x", mark7, "DOOR")
+        pin(rv_fl == ["DOOR", "delete-worktree", "x", "--discard-uncommitted", "--delete-evidence",
+                      "--no-prompt", "-C", r3],
+            "(l7d) a removal built from a landing mark is the same checked removal -- never `--force`",
+            "mark=%r" % (rv_fl,))
 
-        # (l8) A COMMIT INSIDE A LANE NEVER REACHES A REMOVAL THROUGH `land`. `land` builds
-        # --discard-work, and `lane-worktree remove` lets that flag discard commits no ref reaches,
-        # so `land` must refuse such a lane before it writes anything -- with the base RECORDED
+        # (l8) A COMMIT INSIDE A LANE NEVER REACHES A REMOVAL THROUGH `land`. `land` builds a
+        # removal that discards the lane's uncommitted work, and a commit no ref reaches would go
+        # with the worktree, so `land` must refuse such a lane before it writes anything -- with the base RECORDED
         # (format 2), and with it NOT recorded (format 1, what every live lane carried).
         # ✔REPRODUCED before the fix: the format-1 half exited 0 "LANDED" and orphaned the commit.
         wl8 = make_lane(r3, "land8")
@@ -2778,18 +3439,18 @@ def self_test():
         before_l8 = reg_now()
         calls8 = []
 
-        def spy_remove_argv8(root_, lane_, destination_, verified_):
+        def spy_remove_argv8(root_, lane_, verified_, door_):
             calls8.append(verified_)
-            return real_remove_argv(root_, lane_, destination_, verified_)
+            return real_remove_argv(root_, lane_, verified_, door_)
 
         def land8():
             calls8[:] = []
-            globals()["lane_worktree_remove_argv"] = spy_remove_argv8
+            globals()["worktree_removal_argv"] = spy_remove_argv8
             try:
                 return quiet(cmd_land, r3, "land8", "production", True, (),
                              os.path.join(top, "evidence-land8"))
             finally:
-                globals()["lane_worktree_remove_argv"] = real_remove_argv
+                globals()["worktree_removal_argv"] = real_remove_argv
 
         def kept8():
             return (not calls8 and os.path.isdir(wl8) and lane_head(wl8) == head8
@@ -2808,6 +3469,605 @@ def self_test():
             "(l8b) ...and with a FORMAT-1 manifest, which records no base, land REFUSES it too, "
             "naming the commit no ref reaches, before any write or removal",
             "rv=%r removal-calls=%d out=%s" % (rv, len(calls8), out[-400:]))
+
+        # (l10) A HOST DSSHARNESS CANNOT REACH. The real removal runs -- the worktree goes here -- and only its
+        # exit code is the unreachable host's (15), while its record still holds that host's copy: `land`
+        # must say the landing is INCOMPLETE, naming the copy and how to finish, never "LANDED".
+        def existing_row(wt_, lane_):
+            """The cells of a row the registry already holds, exactly: the landing plans it ALREADY
+            LANDED and asks the door nothing -- for the arms whose subject is not the rows (each row
+            written costs two `dssharness` runs, its dry run and its write)."""
+            cells(wt_, lane_, FX + "-STANDING", "🟠 OPEN", "🟠 **OPEN** a row no arm changes", closing="w",
+                  crossrefs="r")
+
+        wl10 = make_lane(r3, "land10")
+        write_atomic(os.path.join(wl10, "work-land10.txt"), "w10\n")
+        write_atomic(os.path.join(wl10, ".temp", "land10-scratch", "findings.log"), "f10\n")
+        existing_row(wl10, "land10")
+        real_run_removal = globals()["_run_removal"]
+        real_list = globals()["_list_worktrees"]
+
+        def record_holding(name, host):
+            """A record that still holds `host`'s copy of worktree `name`, as `list-worktree --json`
+            prints one: under `gone`, with the command that removes it."""
+            doc = {"worktrees": [], "elsewhere": [], "gone": [
+                {"name": name, "tree": "t", "copies": [{"host": host, "path": "~/src/r.worktree-" + name}],
+                 "deletedBy": "dssharness delete-worktree " + name}]}
+            return lambda door_, root_: (0, json.dumps(doc), "")
+
+        # ⓘ TWO TEST DOUBLES for arms whose subject is neither DssHarness's removal nor its record: git
+        # removes the worktree (as DssHarness's own removal does, without a host to ask), and the record
+        # holds nothing. Each real `delete-worktree` costs about 2 s; the arms that pin the real removal
+        # and the real record keep them -- (l1), (l3b), (l4b), (l7a2), (l10e), (l11b), (l11d), (l14d),
+        # (l15b), (e4).
+        def fast_removal(argv_, root_):
+            git(root_, "worktree", "remove", "--force", worktree_path(root_, argv_[2]))
+            return 0, ""
+
+        def empty_record(argv_, root_):
+            return 0, json.dumps({"worktrees": [], "elsewhere": [], "gone": []}), ""
+
+        def unreachable_host(argv_, root_):
+            _rc, said_ = fast_removal(argv_, root_)
+            return 15, said_ + "delete-worktree: ssh macos: could not be reached; its copy stays recorded\n"
+
+        globals()["_run_removal"] = unreachable_host
+        globals()["_list_worktrees"] = record_holding("land10", "ssh macos")
+        try:
+            rv, out = quiet(cmd_land, r3, "land10", "production", True, (),
+                            os.path.join(top, "evidence-land10"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        kept10 = os.path.join(top, "evidence-land10", ".temp", "land10-scratch", "findings.log")
+        pin(rv == 4 and not os.path.exists(wl10) and "LANDING INCOMPLETE" in out
+            and "ssh macos: ~/src/r.worktree-land10" in out and "could not be reached" in out
+            and "land land10 production --apply" in out
+            and os.path.isfile(kept10) and text(kept10) == "f10\n",
+            "(l10) a host DssHarness cannot reach: the worktree is removed here and its evidence kept, and "
+            "land says the landing is INCOMPLETE, naming the copy DssHarness's record still holds and the "
+            "command that finishes it", "rv=%r out=%s" % (rv, out[-600:]))
+        rv_ls, out_ls = quiet(cmd_list, r3)
+        pin(rv_ls == 0 and "land10: LANDED, but its removal did not finish (its directory is gone)" in out_ls,
+            "(l10f) list names a landing whose removal did not finish, its directory gone or not",
+            "out=%s" % out_ls[-400:])
+        # (l10e) ...and `land` again, the record holding nothing now, finishes the removal and folds nothing.
+        rv, out = quiet(cmd_land, r3, "land10", "production", True, (), None)
+        pin(rv == 0 and "FINISHING" in out and "LANDED lane land10" in out and "WROTE" not in out
+            and "the rows (" not in out,
+            "(l10e) ...and `land` again finishes the removal a marked lane began, folding and applying "
+            "nothing", "rv=%r out=%s" % (rv, out[-500:]))
+
+        # (l10b) DSSHARNESS EXITS 0 AND ITS RECORD STILL HOLDS A COPY: only reading the record sees it.
+        wl10b = make_lane(r3, "land10b")
+        write_atomic(os.path.join(wl10b, "work-land10b.txt"), "w10b\n")
+        existing_row(wl10b, "land10b")
+        globals()["_run_removal"] = fast_removal
+        globals()["_list_worktrees"] = record_holding("land10b", "wsl Ubuntu")
+        try:
+            rv, out = quiet(cmd_land, r3, "land10b", "production", True, (),
+                            os.path.join(top, "evidence-land10b"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 4 and not os.path.exists(wl10b) and "record still holds 1 copy" in out
+            and "wsl Ubuntu: ~/src/r.worktree-land10b" in out and "LANDED lane" not in out,
+            "(l10b) DssHarness exiting 0 while its record still holds a copy is INCOMPLETE, never LANDED -- "
+            "the exit code alone could not have seen it", "rv=%r out=%s" % (rv, out[-500:]))
+
+        # (l10c) A RECORD THAT CANNOT BE READ IS NEVER "NO COPY LEFT".
+        wl10c = make_lane(r3, "land10c")
+        write_atomic(os.path.join(wl10c, "work-land10c.txt"), "w10c\n")
+        existing_row(wl10c, "land10c")
+        globals()["_run_removal"] = fast_removal
+        globals()["_list_worktrees"] = lambda argv_, root_: (12, "", "list-worktree: FAIL - unreadable\n")
+        try:
+            rv, out = quiet(cmd_land, r3, "land10c", "production", True, (),
+                            os.path.join(top, "evidence-land10c"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 4 and not os.path.exists(wl10c) and "could not be read" in out
+            and "exited 12" in out and "LANDED lane" not in out,
+            "(l10c) a record of host copies that cannot be read makes the landing INCOMPLETE, never LANDED",
+            "rv=%r out=%s" % (rv, out[-500:]))
+
+        # (l10d) A NON-ZERO EXIT WITH NOTHING LEFT ANYWHERE IS STILL SAID, NEVER READ AS SUCCESS.
+        wl10d = make_lane(r3, "land10d")
+        write_atomic(os.path.join(wl10d, "work-land10d.txt"), "w10d\n")
+        existing_row(wl10d, "land10d")
+
+        def fails_after(argv_, root_):
+            _rc, said_ = fast_removal(argv_, root_)
+            return 20, said_ + "delete-worktree: FAIL - after the removal\n"
+
+        globals()["_run_removal"] = fails_after
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land10d", "production", True, (),
+                            os.path.join(top, "evidence-land10d"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 4 and not os.path.exists(wl10d) and "DssHarness exited 20 although" in out
+            and "LANDED lane" not in out,
+            "(l10d) DssHarness exiting non-zero with the worktree, its registration and every recorded copy "
+            "gone is INCOMPLETE, and says so", "rv=%r out=%s" % (rv, out[-500:]))
+
+        # (l11) DSSHARNESS DECLINES THE REMOVAL (a run holds the worktree): nothing is removed; the lane is
+        # marked already, so `land` says INCOMPLETE with DssHarness's exit code, and a re-run, DssHarness
+        # willing, FINISHES it -- measuring the intact worktree "nothing left to fold" and folding nothing.
+        wl11 = make_lane(r3, "land11")
+        write_atomic(os.path.join(wl11, "work-land11.txt"), "w11\n")
+        existing_row(wl11, "land11")
+        globals()["_run_removal"] = lambda argv_, root_: (13, "delete-worktree: FAIL - a run holds it\n")
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land11", "production", True, (),
+                            os.path.join(top, "evidence-land11"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 4 and os.path.isdir(wl11) and "LANDING INCOMPLETE" in out and "still on disk" in out
+            and "(DssHarness exited 13)" in out
+            and load_manifest(manifest_path(r3, "land11")).landed is not None,
+            "(l11) DssHarness declining the removal leaves the worktree, marked landed, and land says "
+            "INCOMPLETE with its exit code", "rv=%r out=%s" % (rv, out[-400:]))
+        rv, out = quiet(cmd_land, r3, "land11", "production", True, (), None)
+        pin(rv == 0 and not os.path.exists(wl11) and "FINISHING" in out and "WROTE" not in out
+            and load_manifest(manifest_path(r3, "land11")).landed is None,
+            "(l11b) ...and a re-run, DssHarness willing, finishes it without folding anything again, and "
+            "drops the mark", "rv=%r out=%s" % (rv, out[-300:]))
+
+        # (l11f)-(l11h) FINISHING MEASURES THE LANE AGAINST ITS OWN RECORD, KEEPS LATER EVIDENCE APART, AND
+        # REFUSES A FOLD OPTION. ✔MEASURED (the re-review of lane `lf`): compared with the MAIN tree, a
+        # declined lane stayed unfinishable once another lane edited a path it had landed; and a log a run
+        # went on writing after the refusal made every re-run clash with the first evidence copy.
+        wl11f = make_lane(r3, "land11f")
+        write_atomic(os.path.join(wl11f, "work-land11f.txt"), "w11f\n")
+        write_atomic(os.path.join(wl11f, ".temp", "land11f-scratch", "run.log"), "line 1\n")
+        existing_row(wl11f, "land11f")
+        dest11f = os.path.join(top, "evidence-land11f")
+        globals()["_run_removal"] = lambda argv_, root_: (13, "delete-worktree: FAIL - a run holds it\n")
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land11f", "production", True, (), dest11f)
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        write_atomic(os.path.join(r3, "work-land11f.txt"), "a later lane's edit\n")          # the main tree moves on
+        write_atomic(os.path.join(wl11f, ".temp", "land11f-scratch", "run.log"), "line 1\nline 2\n")  # the run goes on
+        rv_h, out_h = quiet(cmd_land, r3, "land11f", "production", True, ("work-land11f.txt",), None)
+        rv_f, out_f = quiet(cmd_land, r3, "land11f", "production", True, (), None)
+        finished = sorted(n for n in os.listdir(dest11f) if n.startswith("finish-")) if os.path.isdir(dest11f) else []
+        pin(rv == 4 and rv_h == 3 and "never folded again" in out_h and rv_f == 0 and not os.path.exists(wl11f)
+            and text(os.path.join(r3, "work-land11f.txt")) == "a later lane's edit\n",
+            "(l11f) a declined lane FINISHES although the main tree moved on under it -- measured against its "
+            "own record -- and nothing of it is folded over the later edit; a --settled on it is refused",
+            "rv=%r settled=%r finish=%r out=%s" % (rv, rv_h, rv_f, out_f[-400:]))
+        pin(text(os.path.join(dest11f, ".temp", "land11f-scratch", "run.log")) == "line 1\n"
+            and len(finished) == 1
+            and text(os.path.join(dest11f, finished[0], ".temp", "land11f-scratch", "run.log"))
+            == "line 1\nline 2\n",
+            "(l11g) ...its evidence written since is kept apart, in a fresh directory beside the first copy, "
+            "never refused as a clash with it", "finish-dirs=%r" % (finished,))
+
+        # (l11c) THE DIRECTORY GONE WHILE GIT STILL RECORDS THE WORKTREE IS NOT A LANDING.
+        wl11c = make_lane(r3, "land11c")
+        write_atomic(os.path.join(wl11c, "work-land11c.txt"), "w11c\n")
+        existing_row(wl11c, "land11c")
+
+        def removes_only_the_directory(argv_, root_):
+            _owning_tree().remove_tree(wl11c)          # the files go; git's record of the worktree stays
+            return 0, ""
+
+        globals()["_run_removal"] = removes_only_the_directory
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land11c", "production", True, (),
+                            os.path.join(top, "evidence-land11c"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 4 and not os.path.exists(wl11c) and "git still records" in out and "LANDED lane" not in out,
+            "(l11c) the worktree's directory gone while git still records it is INCOMPLETE, never LANDED",
+            "rv=%r out=%s" % (rv, out[-400:]))
+        rv, out = quiet(cmd_land, r3, "land11c", "production", True, (), None)
+        pin(rv == 0 and _registered(r3, wl11c) == (False, "") and "LANDED lane land11c" in out,
+            "(l11d) ...and `land` again has DssHarness clear git's record of it", "rv=%r out=%s"
+            % (rv, out[-400:]))
+        # (l11e) A `git worktree list` THAT FAILS IS "CANNOT SAY", NEVER "UNREGISTERED" -- asked of a
+        # directory outside every repository, where git exits 128.
+        with _owning_tree().sandbox() as sb11:
+            listed11, why11 = _registered(sb11.box, wl11c)
+            state11, swhy11 = _worktree_state(sb11.box, wl11c)
+        pin(listed11 is None and "exited" in why11 and state11 is None and swhy11 == why11,
+            "(l11e) a worktree list git cannot give is reported as unknown, never as unregistered",
+            "listed=%r why=%r state=%r" % (listed11, why11, state11))
+
+        # (l12) ONLY `land` REMOVES. A fold is the step a lane takes before its last review, and a review may
+        # still send it back (the operator, 2026-09-28): the fold writes the lane's work and asks for no
+        # removal, so the worktree -- and every host's copy of it -- stays.
+        wl12 = make_lane(r3, "land12")
+        write_atomic(os.path.join(wl12, "work-land12.txt"), "w12\n")
+        asked12 = []
+        globals()["_run_removal"] = lambda argv_, root_: asked12.append(argv_) or (0, "")
+        try:
+            rv, out = quiet(cmd_fold, r3, "land12", True)
+        finally:
+            globals()["_run_removal"] = real_run_removal
+        pin(rv == 0 and os.path.isdir(wl12) and not asked12
+            and os.path.isfile(os.path.join(r3, "work-land12.txt")),
+            "(l12) a FOLD writes the lane's work and asks for no removal: the worktree and its host copies "
+            "stay for a review that may send the lane back", "rv=%r asked=%r out=%s" % (rv, asked12, out[-300:]))
+
+        # (l13) EVIDENCE THE COPY DID NOT TAKE STOPS THE LANDING BEFORE ANY REMOVAL IS ASKED FOR. ✔MEASURED
+        # (the review of lane `lf`): the md5 check ran after `delete-worktree --delete-evidence`, so a
+        # file the copy missed was found missing once it was gone. A copy that takes nothing stands in.
+        wl13 = make_lane(r3, "land13")
+        write_atomic(os.path.join(wl13, "work-land13.txt"), "w13\n")
+        write_atomic(os.path.join(wl13, ".temp", "land13-scratch", "findings.log"), "f13\n")
+        existing_row(wl13, "land13")
+        lw13 = _lane_worktree()
+        real_preserve = lw13.preserve_evidence
+        asked13 = []
+        lw13.preserve_evidence = lambda *a_, **k_: None
+        globals()["_run_removal"] = lambda argv_, root_: asked13.append(argv_) or (0, "")
+        try:
+            rv, out = quiet(cmd_land, r3, "land13", "production", True, (),
+                            os.path.join(top, "evidence-land13"))
+        finally:
+            lw13.preserve_evidence = real_preserve
+            globals()["_run_removal"] = real_run_removal
+        pin(rv == 2 and os.path.isdir(wl13) and not asked13
+            and "EVIDENCE CHECK FAILED, before any removal" in out
+            and load_manifest(manifest_path(r3, "land13")).landed is None
+            and text(os.path.join(wl13, ".temp", "land13-scratch", "findings.log")) == "f13\n",
+            "(l13) evidence the copy did not take stops the landing BEFORE any removal is asked for: the "
+            "worktree, its evidence and its unmarked manifest are kept",
+            "rv=%r asked=%d out=%s" % (rv, len(asked13), out[-500:]))
+        dest13 = os.path.join(top, "evidence-land13b")
+        globals()["_run_removal"] = fast_removal
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land13", "production", True, (), dest13)
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 0 and not os.path.exists(wl13)
+            and text(os.path.join(dest13, ".temp", "land13-scratch", "findings.log")) == "f13\n",
+            "(l13b) ...and a re-run with the real copy lands it", "rv=%r out=%s" % (rv, out[-300:]))
+
+        # (l14) A REMOVAL THAT STOPS PART WAY LEAVES DEBRIS A SECOND FOLD WOULD READ AS THE LANE'S INTENT.
+        # git deleted one file of a still-registered worktree and stopped; the lane is marked, so nothing
+        # folds it again -- the file stays in the main tree -- and `land` again finishes the removal, the
+        # deletion being the removal's own debris.
+        wl14 = make_lane(r3, "land14")
+        write_atomic(os.path.join(wl14, "work-land14.txt"), "w14\n")
+        existing_row(wl14, "land14")
+
+        def deletes_part(argv_, root_):
+            os.remove(os.path.join(wl14, "tracked.txt"))
+            return 20, "delete-worktree: FAIL - git could not remove worktree 'land14'\n"
+
+        globals()["_run_removal"] = deletes_part
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land14", "production", True, (),
+                            os.path.join(top, "evidence-land14"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        pin(rv == 4 and os.path.isdir(wl14) and not os.path.exists(os.path.join(wl14, "tracked.txt"))
+            and "LANDING INCOMPLETE" in out,
+            "(l14) a removal that stopped part way leaves the lane marked and the landing INCOMPLETE",
+            "rv=%r out=%s" % (rv, out[-400:]))
+        tracked14 = text(os.path.join(r3, "tracked.txt"))
+        rv_f, out_f = quiet(cmd_fold, r3, "land14", True)
+        rv_a, out_a = quiet(cmd_apply_rows, r3, "land14", "production", True)
+        pin(rv_f == 2 and "was LANDED" in out_f and rv_a == 2 and "was LANDED" in out_a
+            and text(os.path.join(r3, "tracked.txt")) == tracked14,
+            "(l14c) fold and apply-rows refuse a lane marked landed: the file the stopped removal deleted is "
+            "never carried into the main tree", "fold=%r rows=%r out=%s" % (rv_f, rv_a, out_f[-300:]))
+        rv, out = quiet(cmd_land, r3, "land14", "production", True, (), None)
+        pin(rv == 0 and not os.path.exists(wl14) and text(os.path.join(r3, "tracked.txt")) == tracked14
+            and "FINISHING" in out and "WROTE" not in out,
+            "(l14b) ...and `land` again finishes the removal: the file git deleted is its debris, and it "
+            "stays in the main tree", "rv=%r out=%s" % (rv, out[-500:]))
+
+        # (l14f) A STOPPED REMOVAL THAT DELETED THE LANE'S OWN `.gitignore` STILL FINISHES. ✔MEASURED (the
+        # re-review of lane `lf`): read through the lane's own rules, every evidence file and build artefact
+        # then looked new since the mark, and the lane could never finish. The main tree's rules decide.
+        wl14f = make_lane(r3, "land14f")
+        write_atomic(os.path.join(wl14f, "work-land14f.txt"), "w14f\n")
+        write_atomic(os.path.join(wl14f, ".temp", "land14f-scratch", "notes.log"), "n14f\n")
+        write_atomic(os.path.join(wl14f, "__pycache__", "m.pyc"), "bytecode\n")
+        existing_row(wl14f, "land14f")
+
+        def deletes_the_ignore_file(argv_, root_):
+            for rel in (".gitignore", "tracked.txt"):
+                os.remove(os.path.join(wl14f, rel))
+            return 20, "delete-worktree: FAIL - git could not remove worktree 'land14f'\n"
+
+        globals()["_run_removal"] = deletes_the_ignore_file
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land14f", "production", True, (),
+                            os.path.join(top, "evidence-land14f"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        rv2, out2 = quiet(cmd_land, r3, "land14f", "production", True, (), None)
+        pin(rv == 4 and rv2 == 0 and not os.path.exists(wl14f) and text(os.path.join(r3, ".gitignore")) == IGNORE
+            and os.path.isfile(os.path.join(r3, "tracked.txt")),
+            "(l14f) a removal that stopped after deleting the lane's own .gitignore still finishes: the main "
+            "tree's rules say what is ignored, and neither deletion reaches the main tree",
+            "first=%r again=%r out=%s" % (rv, rv2, out2[-500:]))
+
+        # (l14e) A FILE CHANGED OR NEW SINCE THE MARK IS WORK, NEVER DISCARDED UNSEEN.
+        wl14e = make_lane(r3, "land14e")
+        write_atomic(os.path.join(wl14e, "work-land14e.txt"), "w14e\n")
+        existing_row(wl14e, "land14e")
+        globals()["_run_removal"] = lambda argv_, root_: (13, "delete-worktree: FAIL - a run holds it\n")
+        globals()["_list_worktrees"] = empty_record
+        try:
+            quiet(cmd_land, r3, "land14e", "production", True, (), os.path.join(top, "evidence-land14e"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        write_atomic(os.path.join(wl14e, "work-land14e.txt"), "w14e, edited after the landing\n")
+        write_atomic(os.path.join(wl14e, "late.txt"), "written after the landing\n")
+        rv, out = quiet(cmd_land, r3, "land14e", "production", True, (), None)
+        pin(rv == 4 and os.path.isdir(wl14e) and "did not measure" in out and "late.txt" in out
+            and "work-land14e.txt" in out
+            and text(os.path.join(wl14e, "late.txt")) == "written after the landing\n",
+            "(l14e) a marked lane holding a file changed or new since the mark is INCOMPLETE and kept, the "
+            "files named", "rv=%r out=%s" % (rv, out[-500:]))
+        rm14 = _owning_tree().run_unsteered(
+            [A3.door_executable(), "delete-worktree", "land14e", "--discard-uncommitted", "--delete-evidence",
+             "--no-prompt", "-C", r3], cwd=r3, capture_output=True)
+        pin(rm14.returncode == 0 and not os.path.exists(wl14e),
+            "(l14d) ...and the removal that refusal names settles it once the work is kept",
+            "rc=%r said=%s" % (rm14.returncode, (rm14.stdout + rm14.stderr).decode("utf-8", "replace")[-300:]))
+
+        # (l15) A HUSK: git deleted the `.git` file and its record and left the directory -- ✔MEASURED with
+        # DssHarness 0.6.1 on a worktree holding a directory junction. Git walks UP from such a directory,
+        # so read as a lane it would answer with the MAIN TREE. `land` again keeps its evidence and names the
+        # `--force` removal for a person -- a directory made at that path since reads the same (the
+        # re-review of lane `lf`) -- touching nothing of the main tree; once it is gone, `land` finishes.
+        wl15 = make_lane(r3, "land15")
+        write_atomic(os.path.join(wl15, "work-land15.txt"), "w15\n")
+        existing_row(wl15, "land15")
+        write_atomic(os.path.join(r3, "main-only.txt"), "the main tree's own untracked file\n")
+
+        def husk_of(wt_, lane_):
+            os.remove(os.path.join(wt_, ".git"))
+            git(r3, "worktree", "prune")
+            return 20, ("delete-worktree: FAIL - git reported worktree '%s' removed, but '%s' still exists.\n"
+                        % (lane_, wt_))
+
+        globals()["_run_removal"] = lambda argv_, root_: husk_of(wl15, "land15")
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land15", "production", True, (),
+                            os.path.join(top, "evidence-land15"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        main15 = {rel: text(os.path.join(r3, rel)) for rel in ("tracked.txt", "main-only.txt")}
+        pin(rv == 4 and os.path.isdir(wl15) and not os.path.exists(os.path.join(wl15, ".git"))
+            and "still on disk" in out,
+            "(l15) a removal that left a husk -- no `.git` file, no record -- is INCOMPLETE",
+            "rv=%r out=%s" % (rv, out[-400:]))
+        asked15 = []
+        globals()["_run_removal"] = lambda argv_, root_: asked15.append(argv_) or (0, "")
+        try:
+            rv, out = quiet(cmd_land, r3, "land15", "production", True, (), None)
+        finally:
+            globals()["_run_removal"] = real_run_removal
+        pin(rv == 4 and os.path.isdir(wl15) and not asked15 and "no longer a git worktree" in out
+            and "delete-worktree land15 --force" in out and "WROTE" not in out
+            and all(text(os.path.join(r3, rel)) == body for rel, body in main15.items()),
+            "(l15b) ...and `land` again asks for no removal of the husk: it names the `--force` removal for "
+            "a person, and the main tree is untouched", "rv=%r asked=%d out=%s" % (rv, len(asked15), out[-500:]))
+        rm15 = _owning_tree().run_unsteered(
+            [A3.door_executable(), "delete-worktree", "land15", "--force", "--no-prompt", "-C", r3],
+            cwd=r3, capture_output=True)
+        rv, out = quiet(cmd_land, r3, "land15", "production", True, (), None)
+        pin(rm15.returncode == 0 and rv == 0 and not os.path.exists(wl15)
+            and load_manifest(manifest_path(r3, "land15")).landed is None
+            and all(text(os.path.join(r3, rel)) == body for rel, body in main15.items()),
+            "(l15c) ...and once that removal is run, `land` again finds nothing left and drops the mark",
+            "rm=%r rv=%r out=%s" % (rm15.returncode, rv, out[-400:]))
+        # (l15e) A `.git` THAT IS THERE BUT UNREADABLE IS NO HUSK: nothing is forced over it. ✔MEASURED (the
+        # re-review of lane `lf`): a still-registered lane whose `.git` git could not read was taken for a
+        # husk and would have been removed with `--force`, work written after the mark and all. The file is
+        # broken, then REWRITTEN with its own bytes -- a new time, as `git worktree repair` leaves it -- and
+        # the lane must still be the worktree the mark names (its identity is git's, not the `.git` file's).
+        wl15e = make_lane(r3, "land15e")
+        write_atomic(os.path.join(wl15e, "work-land15e.txt"), "w15e\n")
+        existing_row(wl15e, "land15e")
+        globals()["_run_removal"] = lambda argv_, root_: (13, "delete-worktree: FAIL - a run holds it\n")
+        globals()["_list_worktrees"] = empty_record
+        try:
+            quiet(cmd_land, r3, "land15e", "production", True, (), os.path.join(top, "evidence-land15e"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        gitfile15e = os.path.join(wl15e, ".git")
+        with io.open(gitfile15e, "rb") as fh:
+            good15e = fh.read()
+        asked15e = []
+        globals()["_run_removal"] = lambda argv_, root_: asked15e.append(argv_) or (0, "")
+        try:
+            with io.open(gitfile15e, "r+b") as fh:
+                fh.truncate(0)
+                fh.write(("gitdir: %s\n" % os.path.join(top, "no-such-gitdir")).encode("utf-8"))
+            rv, out = quiet(cmd_land, r3, "land15e", "production", True, (), None)
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            write_atomic(gitfile15e, good15e.decode("utf-8"))      # its own bytes, as a NEW file
+        pin(rv == 2 and not asked15e and "cannot tell" in out and os.path.isdir(wl15e),
+            "(l15e) a still-registered lane whose `.git` git cannot read is no husk: land cannot tell, and "
+            "forces nothing over it", "rv=%r asked=%d out=%s" % (rv, len(asked15e), out[-400:]))
+        rv, out = quiet(cmd_land, r3, "land15e", "production", True, (), None)
+        pin(rv == 0 and not os.path.exists(wl15e) and "FINISHING" in out,
+            "(l15f) ...and once git can read it again -- its `.git` a new file with its own bytes -- the SAME "
+            "worktree finishes: the identity is git's administrative directory, not the `.git` file",
+            "rv=%r out=%s" % (rv, out[-400:]))
+        # (l15d) AN UNMARKED HUSK IS REFUSED BY EVERY VERB BEFORE GIT IS ASKED ANYTHING ABOUT IT.
+        wl15d = make_lane(r3, "land15d")
+        write_atomic(os.path.join(wl15d, "work-land15d.txt"), "w15d\n")
+        os.remove(os.path.join(wl15d, ".git"))
+        git(r3, "worktree", "prune")
+        rv_f, out_f = quiet(cmd_fold, r3, "land15d", True)
+        rv_l, out_l = quiet(cmd_land, r3, "land15d", "production", True, (),
+                            os.path.join(top, "evidence-land15d"))
+        rv_s, out_s = quiet(cmd_seed, r3, "land15d", True)
+        pin(all(r == 2 for r in (rv_f, rv_l, rv_s))
+            and all("is not its own git worktree" in o for o in (out_f, out_l, out_s))
+            and all(text(os.path.join(r3, rel)) == body for rel, body in main15.items())
+            and not os.path.exists(os.path.join(r3, "work-land15d.txt")) and os.path.isdir(wl15d),
+            "(l15d) a lane directory that is not its own git worktree is refused by fold, land and seed "
+            "alike, before git is asked anything about it: the main tree is untouched",
+            "fold=%r land=%r seed=%r out=%s" % (rv_f, rv_l, rv_s, out_f[-300:]))
+        _owning_tree().remove_tree(wl15d)
+        os.remove(os.path.join(r3, "main-only.txt"))
+
+        # (l16) A LANE WHOSE FOLD DROPS AN EVIDENCE ROOT KEEPS THAT ROOT'S EVIDENCE TOO. ✔MEASURED (the
+        # review of lane `lf`): the lane set `worktrees.evidenceRoots` without `scratchpad`, the fold
+        # carried that into the main tree, and the copy -- reading the roots only after the fold -- never
+        # took `scratchpad/pad.log`, which the removal then deleted. The roots before AND after are kept.
+        cfg16 = os.path.join(r3, ".harness-config", "config.json")
+        with io.open(cfg16, "rb") as fh:
+            cfg16_bytes = fh.read()
+        cfg16_doc = _owning_tree().load_jsonc(cfg16)
+        roots16 = list(cfg16_doc["worktrees"]["evidenceRoots"])
+        wl16 = make_lane(r3, "land16")
+        cfg16_doc["worktrees"]["evidenceRoots"] = [r for r in roots16 if r != "scratchpad"]
+        write_atomic(os.path.join(wl16, ".harness-config", "config.json"), json.dumps(cfg16_doc, indent=2) + "\n")
+        write_atomic(os.path.join(wl16, "scratchpad", "pad.log"), "pad16\n")
+        write_atomic(os.path.join(wl16, ".temp", "land16-scratch", "f.log"), "f16\n")
+        existing_row(wl16, "land16")
+        dest16 = os.path.join(top, "evidence-land16")
+        globals()["_run_removal"] = fast_removal
+        globals()["_list_worktrees"] = empty_record
+        try:
+            rv, out = quiet(cmd_land, r3, "land16", "production", True, (), dest16)
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+            with io.open(cfg16, "wb") as fh:           # the fixture's own roots back, for every arm after
+                fh.write(cfg16_bytes)
+        pad16 = os.path.join(dest16, "scratchpad", "pad.log")
+        pin("scratchpad" in roots16 and rv == 0 and not os.path.exists(wl16)
+            and os.path.isfile(pad16) and text(pad16) == "pad16\n"
+            and text(os.path.join(dest16, ".temp", "land16-scratch", "f.log")) == "f16\n",
+            "(l16) a lane whose fold drops an evidence root keeps that root's evidence too: the roots the "
+            "configuration names before the fold AND after it are copied, before any removal",
+            "roots=%r rv=%r out=%s" % (roots16, rv, out[-500:]))
+
+        # (l17) A LANDING STARTED FROM INSIDE THE LANE IS REFUSED BEFORE IT WRITES ANYTHING: its last step
+        # removes the directory the process stands in.
+        wl17 = make_lane(r3, "land17")
+        write_atomic(os.path.join(wl17, "work-land17.txt"), "w17\n")
+        existing_row(wl17, "land17")
+        before_l17 = reg_now()
+        here17 = os.getcwd()
+        os.chdir(wl17)
+        try:
+            rv, out = quiet(cmd_land, r3, "land17", "production", True, (),
+                            os.path.join(top, "evidence-land17"))
+        finally:
+            os.chdir(here17)
+        pin(rv == 2 and "is inside lane land17" in out and os.path.isdir(wl17)
+            and not os.path.exists(os.path.join(r3, "work-land17.txt")) and reg_now() == before_l17
+            and load_manifest(manifest_path(r3, "land17")).landed is None,
+            "(l17) land started from inside the lane is refused before it writes anything",
+            "rv=%r out=%s" % (rv, out[-300:]))
+
+        # (lm1)-(lm4) THE LANDED MARK: read back exactly, a malformed one refused, and `seed` resetting it for a
+        # NEW worktree of the name, and for the landed one only while it lists no change. (Not (m1)-(m4): those
+        # labels are refresh-plans' arms, and one label on two arms leaves a red ambiguous.)
+        mp_m = os.path.join(top, "mark-seed.json")
+        mark_m = Landed("2026-09-29T00:00:00Z", "C:/kept/evidence", "1:2", {"a.txt": "d" * 32, "b.txt": None})
+        save_manifest(mp_m, Manifest("0" * 40, {"p.txt": "d" * 32}, mark_m))
+        back_m = load_manifest(mp_m)
+        with io.open(mp_m, encoding="utf-8") as fh:
+            doc_m = json.load(fh)
+        doc_m["landed"]["lane"] = ["a.txt"]                      # a list where the record belongs
+        write_atomic(mp_m, json.dumps(doc_m))
+        bad_rv, bad_out = quiet(load_manifest, mp_m)
+        pin(back_m == Manifest("0" * 40, {"p.txt": "d" * 32}, mark_m) and bad_rv == 2
+            and "not a well-formed" in bad_out,
+            "(lm1) a manifest's landed mark is read back exactly, and a malformed one is refused",
+            "back=%r bad=%r" % (back_m, bad_rv))
+        wm = make_lane(r3, "markm")
+        mpath_m = manifest_path(r3, "markm")
+        base_m = load_manifest(mpath_m).base
+        own_m = Landed("2026-09-29T00:00:00Z", "C:/kept", _worktree_identity(wm), {})
+        save_manifest(mpath_m, Manifest(base_m, {}, own_m))
+        rv_m2, _out_m2 = quiet(cmd_seed, r3, "markm", True)
+        pin(rv_m2 == 0 and load_manifest(mpath_m).landed is None,
+            "(lm2) seed RESETS the landed lane's mark while it lists no change -- nothing to fold",
+            "rv=%r" % (rv_m2,))
+        write_atomic(os.path.join(wm, "work-markm.txt"), "debris or work\n")
+        save_manifest(mpath_m, Manifest(base_m, {}, own_m))
+        rv_m3, out_m3 = quiet(cmd_seed, r3, "markm", True)
+        rv_m3b, out_m3b = quiet(cmd_seed, r3, "markm", False, True)
+        pin(rv_m3 == 2 and "was LANDED" in out_m3 and rv_m3b == 2 and "was LANDED" in out_m3b
+            and load_manifest(mpath_m).landed is not None,
+            "(lm3) ...and REFUSES to, `--empty` and `--force` alike, for the landed lane while it lists "
+            "changes: wiping its mark would let the next fold carry them", "empty=%r force=%r out=%s"
+            % (rv_m3, rv_m3b, out_m3b[-300:]))
+        real_identity = _worktree_identity
+        globals()["_worktree_identity"] = lambda wt_: None                 # git names no administrative directory
+        try:
+            rv_m3c, out_m3c = quiet(cmd_seed, r3, "markm", False, True)
+            rv_m3d, out_m3d = quiet(cmd_land, r3, "markm", "production", True, (), None)
+        finally:
+            globals()["_worktree_identity"] = real_identity
+        pin(rv_m3c == 2 and "was LANDED" in out_m3c and rv_m3d == 2 and "cannot be told" in out_m3d
+            and load_manifest(mpath_m).landed == own_m
+            and text(os.path.join(wm, "work-markm.txt")) == "debris or work\n",
+            "(lm3b) ...and when git cannot name the lane's identity, `seed --force` refuses too and `land` will "
+            "not finish it: a worktree that cannot be told from the landed one is never taken for a new one",
+            "seed=%r land=%r out=%s" % (rv_m3c, rv_m3d, out_m3d[-300:]))
+        other_m = Landed("2026-09-29T00:00:00Z", "C:/kept", "0:0", {})    # the mark of an EARLIER worktree
+        save_manifest(mpath_m, Manifest(base_m, {}, other_m))
+        rv_m4, out_m4 = quiet(cmd_land, r3, "markm", "production", True, (), None)
+        rv_m4f, out_m4f = quiet(cmd_fold, r3, "markm", False)
+        rv_m4s, _out_m4s = quiet(cmd_seed, r3, "markm", True)
+        pin(rv_m4 == 2 and "NEW lane" in out_m4 and rv_m4f == 2 and "NEW worktree of this name" in out_m4f
+            and os.path.isdir(wm) and text(os.path.join(wm, "work-markm.txt")) == "debris or work\n"
+            and rv_m4s == 0 and load_manifest(mpath_m).landed is None,
+            "(lm4) a mark left by an EARLIER worktree of the name: land and fold refuse the new one, naming the "
+            "skipped seed, reading and removing nothing, and seed starts it clean whatever it holds",
+            "land=%r fold=%r seed=%r out=%s" % (rv_m4, rv_m4f, rv_m4s, out_m4f[-300:]))
+
+        # (l14g) A TRACKED FILE UNDER AN IGNORED DIRECTORY IS WORK A FOLD CARRIES, SO AN EDIT TO IT SINCE THE
+        # MARK STOPS THE FINISH. ✔MEASURED (the re-review of lane `lf`): asked with `--no-index`, git called
+        # such a file ignored, and the finish removed the lane edit and all. It commits to the fixture's main
+        # tree, so the lanes made after it -- (e4)'s, (l5)'s and (l6)'s -- start from that commit.
+        write_atomic(os.path.join(r3, "__pycache__", "kept-config.txt"), "v1\n")
+        git(r3, "add", "-f", "__pycache__/kept-config.txt")
+        git(r3, "-c", "user.email=s@e.invalid", "-c", "user.name=s", "commit", "-q", "-m", "a tracked file under an ignored directory")
+        wl14g = make_lane(r3, "land14g")
+        write_atomic(os.path.join(wl14g, "work-land14g.txt"), "w14g\n")
+        existing_row(wl14g, "land14g")
+        globals()["_run_removal"] = lambda argv_, root_: (13, "delete-worktree: FAIL - a run holds it\n")
+        globals()["_list_worktrees"] = empty_record
+        try:
+            quiet(cmd_land, r3, "land14g", "production", True, (), os.path.join(top, "evidence-land14g"))
+        finally:
+            globals()["_run_removal"] = real_run_removal
+            globals()["_list_worktrees"] = real_list
+        write_atomic(os.path.join(wl14g, "__pycache__", "kept-config.txt"), "v2, edited after the landing\n")
+        rv, out = quiet(cmd_land, r3, "land14g", "production", True, (), None)
+        pin(rv == 4 and os.path.isdir(wl14g) and "__pycache__/kept-config.txt" in out
+            and text(os.path.join(wl14g, "__pycache__", "kept-config.txt")) == "v2, edited after the landing\n",
+            "(l14g) a TRACKED file under an ignored directory, edited since the mark, stops the finish: the "
+            "main tree's rules ignore only what git does not track", "rv=%r out=%s" % (rv, out[-400:]))
 
         # (e1) EVERY GIT QUESTION A FOLD ASKS IS ASKED WITHOUT THE CALLER'S GIT ENVIRONMENT.
         # ✔MEASURED 2026-09-15 (P66 round 3), before the move: under a caller's GIT_DIR +
@@ -2840,15 +4100,19 @@ def self_test():
             % (real6, plain_rv, steered_rv, str(steered_out)[-300:]))
 
         # (e4) ...AND NO PROCESS `land` STARTS INHERITS IT EITHER. The removal runs
-        # `lane-worktree` as a child; handed a steering environment, that child's own
-        # `git worktree remove` and `prune` would act on another repository and leave THIS one
+        # DssHarness as a child; handed a steering environment, that child's own git
+        # would act on another repository and leave THIS one
         # registering a worktree that is gone. The negative is proven first: `worktree list`,
         # asked the defect's way, does not see this repository's lane at all.
+        # ⚠ GIT_COMMON_DIR joins the steering names here: DssHarness's own git client clears GIT_DIR,
+        # GIT_WORK_TREE and GIT_INDEX_FILE and nothing else, so with only those three this arm could
+        # not tell whether THIS program strips the environment (the review of lane `lf`).
         wl9 = make_lane(r3, "land9")
         write_atomic(os.path.join(wl9, "work-land9.txt"), "w9\n")
         cells(wl9, "land9", FX + "-LANDNINE", "✅ CLOSED", "✅ **CLOSED** land9",
               bucket="production", priority="P3")
         with ot.steering() as steer:
+            steer = dict(steer, GIT_COMMON_DIR=steer["GIT_DIR"])
             neg = ot.bare_git(["worktree", "list", "--porcelain"], r3, steer)
             real9 = neg.returncode != 0 or "land9" not in neg.stdout
             with ot.caller_environment(steer):
@@ -2861,9 +4125,27 @@ def self_test():
                           text=True, encoding="utf-8", errors="replace").stdout
         pin(real9 and rv == 0 and not os.path.exists(wl9) and "land9" not in listed9,
             "(e4) land under a caller's steering git environment removes the lane from THIS "
-            "repository's worktree registrations -- the lane-worktree child does not inherit it",
+            "repository's worktree registrations -- the DssHarness child does not inherit it",
             "negative-synthesized=%s rv=%r registered-after=%s out=%s"
             % (real9, rv, "land9" in listed9, str(out)[-400:]))
+
+        # (e5) ...AND EACH CHILD `land` STARTS SEES NONE OF THE NAMES GIT CALLS REPOSITORY-LOCAL, whatever
+        # DssHarness itself clears: a probe child stands in for it through both seams, under a caller
+        # exporting every such name.
+        probe_env = [sys.executable, "-c",
+                     "import json, os; print(json.dumps(sorted(k for k in os.environ if k.startswith('GIT'))))"]
+        local_names = sorted(ot.local_git_env_names())
+        with ot.caller_environment({n: os.path.join(top, "steer-" + n) for n in local_names}):
+            seen_here = sorted(n for n in local_names if n in os.environ)
+            rc_r, said_r = _run_removal(probe_env, r3)
+            rc_l, said_l, _err_l = _list_worktrees(probe_env, r3)
+        seen_r = json.loads(said_r.strip() or "null")
+        seen_l = json.loads(said_l.strip() or "null")
+        pin(seen_here == local_names and len(local_names) >= 3 and rc_r == 0 and rc_l == 0
+            and isinstance(seen_r, list) and isinstance(seen_l, list)
+            and not set(seen_r) & set(local_names) and not set(seen_l) & set(local_names),
+            "(e5) the removal's child and the record's child see none of git's repository-local names a "
+            "caller exported", "exported=%s removal-saw=%s record-saw=%s" % (seen_here, seen_r, seen_l))
 
         # (l5) a lane with no row/ directory is not landed.
         wl5 = make_lane(r3, "land5")

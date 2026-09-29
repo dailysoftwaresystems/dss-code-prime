@@ -27,8 +27,8 @@ complete). It is part of the fail-loud gate, not housekeeping advice.
    folded AND the gate that covers it is green. ⏳ SCRIPT-ERA (superseded 2026-09-24: a lane builds inside its own worktree, `<worktree>/build/<variant>`, which goes with the worktree when it is landed or deleted, so the completion check is that no lane worktree survives its landing; see worktrees.md) **A cycle may not be reported complete while any
    `build/lane-*` survives** — same shape as the anchor-balance gate: the report is a receipt, so the
    check has to be mechanical. SUPERSEDED 2026-09-24 by lane builds inside lane worktrees — the check is now that no lane worktree survives its landing, which `dssharness list-worktree` shows (see worktrees.md)
-5. **The same applies to agent worktrees.** A worktree whose work is folded is removed
-   (`lane-fold.py land`, then `dssharness delete-worktree` for its host copies), and its build tree goes with it. Verify the fold by **CONTAINMENT** of the
+5. **The same applies to agent worktrees.** A worktree whose work is folded is removed after its last
+   review by `lane-fold.py land`, which removes its host copies too, and its build tree goes with it. Verify the fold by **CONTAINMENT** of the
    lane's contribution, never by byte-identity with the main tree — later edits legitimately stack on
    top, so `diff -q` reporting DIFFERS proves nothing either way.
 

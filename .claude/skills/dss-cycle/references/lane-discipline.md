@@ -237,8 +237,8 @@ are in `delegation.md`; worktrees are in `worktrees.md`.
    ⇒ **The one-line test to put in the brief:** *if the orchestrator would have to open a file to
    fold your work — the registry rows excepted (rule 4) — the work is not reported yet.*
    ⇒ **A lane that uses a `git worktree` NAMES IT in its report**, because the orchestrator must
-   remove it at the fold — `lane-fold.py land`, then `dssharness delete-worktree` for its host copies — and
-   cannot remove one it does not know about.
+   remove it once its last review is done — `lane-fold.py land`, which removes its host copies too; a
+   fold never removes anything — and cannot remove one it does not know about.
 
 ### 10. Copy a file into your scratch directory before editing it — your only sanctioned undo
 

@@ -209,12 +209,52 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
     last fixes (run 20260928-184926-7fa74c81); `repo-guard` 33/33 on both Windows legs under DssHarness 0.6.0 (run
     20260928-195333-96d4a2c9); `check-anchor-balance` against `378c3faa`: 620 → 620, four rows born closed, none counted;
     `read-anchors --lint` 0 findings.
-  - **Two defects in the lane tooling, found folding `ci59b`, are this session's next lane:** `lane-fold land` removes a
-    worktree through `lane-worktree`'s `git worktree remove`, which leaves its DssHarness host copies behind (`ci59` was
-    removed with `dssharness delete-worktree` instead, its run records kept first); and `fold` never examines a SEEDED
-    path the lane restored to HEAD — `config.json` here: seeded with 9 paths, the fold accounted for 8 and wrote 6, and
-    the orchestrator restored `config.json` by hand (✔MEASURED md5 equal to `git show HEAD:`). Operator, 2026-09-28: a
-    lane's host copies go only after its LAST review — while modifications may still be needed, its files stay.
+  - **2026-09-29: the two lane-tooling defects found folding `ci59b` are fixed (lane `lf`, folded; three rows born
+    closed, all three debt found at HEAD, none created), and the independent review of the fix found the third.**
+    repo-harness is absorbing lane-fold and the orchestration support (operator, 2026-09-29), so this is lane-fold's
+    last round of work.
+    - **`fold` dropped a seeded path the lane restored to HEAD** (`D-HARNESS-LANE-FOLD-DROPPED-A-SEEDED-PATH-RESTORED-TO-HEAD`,
+      P2): `classify` read only the lane's `git status`; seeded with 9 paths, the `ci59b` fold wrote 6 and kept
+      `config.json` at the seeded bytes. Every seeded path is now a candidate and lands in exactly one list (a restored
+      path is the lane's change, a lane-deleted seeded untracked file its deletion, one gone from both already landed),
+      and the plan counts them. Arms (v1)–(v3).
+    - **`land` left a lane's host copies** (`D-HARNESS-LANE-FOLD-LAND-LEFT-A-LANES-HOST-COPIES`, P2): it removed through
+      `git worktree remove`. It now removes through `dssharness delete-worktree … --discard-uncommitted --delete-evidence`
+      and verifies the directory, git's registration and DssHarness's own record (`list-worktree --json`, 0.6.1) before
+      it says LANDED; anything left is LANDING INCOMPLETE, exit 4, with the command named. Before it asks, it marks the
+      seed manifest `landed` (the worktree's identity — git's `commondir`, ✔MEASURED stable across `worktree repair` and
+      `move` — and the lane's own md5 record), so a removal that stops part way (✔MEASURED with 0.6.1: a worktree holding a
+      directory junction came back from `delete-worktree` failed, with its `.git` and record gone) is never folded again:
+      `land` again finishes it against that record, a directory with no `.git` is left to a person with the `--force`
+      removal named, a worktree whose identity git cannot name is refused rather than taken for a new one, and every
+      verb refuses a directory that is not its own registered worktree. Only `land` removes, after the LAST review
+      (operator, 2026-09-28: *"only removes copies after last review is fine: while modifications are needed the files
+      can't be removed"*). ✔MEASURED end to end after the fold: probe `lfprobe2` synced to WSL, landed, and DssHarness
+      printed "wsl Ubuntu: removed its copy at '~/src/dss-code-prime.worktree-lfprobe2'".
+    - **`land` checked the evidence only after removing it** (`D-HARNESS-LANE-FOLD-LAND-CHECKED-EVIDENCE-ONLY-AFTER-REMOVING-IT`,
+      P2, debt found): a lane whose fold dropped `scratchpad` from `worktrees.evidenceRoots` lost `scratchpad/pad.log`,
+      reported only after the removal. The evidence is now copied over the roots named before AND after the fold and
+      re-read against pre-fold digests BEFORE any removal, through `lane-worktree`'s own enumerator.
+    - Four independent review rounds (12, 7, 5 and 2 findings, then one comment nit) are fixed except R2-7: a file
+      written into an evidence root after the re-read and before DssHarness deletes the worktree is lost under
+      `--delete-evidence`, a window only the remover can close. It was sent to repo-harness and is carried by
+      `D-HARNESS-ACTION-PROGRAM-VERBS-WITHOUT-A-HARNESS-STEP`, as is the one fix with no arm: `evidence_digests` reading
+      `lane-worktree`'s enumerator (a regression would refuse a landing, not lose a file). The step-10 audit (13
+      findings) corrected these records, renamed the landed-mark arms (lm1)–(lm4), whose labels had collided with
+      refresh-plans' (m2)–(m4), and made an unreadable identity refuse (arm (lm3b)). The self-test grew from 93 to 135
+      pins. Red-on-disable (one Edit-applied mutant per DssHarness run, md5 moved and returned): 31 mutants on the
+      pre-audit bytes `dccf3413…` each reddened exactly their named arms (control 134/0, run 20260929-143243-12f60cd2);
+      on the final bytes `196d4c69…` the control is 135/0 (20260929-151444-f885ef10) and both identity mutants redden
+      (lm3b) (20260929-151625-2e7c458d, 20260929-151744-6de31bae). The new arms have run on Windows and WSL only.
+  - **CI**: Pipeline run 36475613070 on `6181ba84` went **all five legs green** (linux-clang-asan 6,365 s of 10,800 s).
+  - **DssHarness 0.6.1** is installed. ✔MEASURED `list-worktree --hosts`: 15 copies on 3 hosts, every one a live
+    worktree's, none left by a gone worktree and none the record lacks — the orphan copies feared on 2026-09-28 are not
+    there. Three findings were sent to the repo-harness session: the junction (no remedy printed; the plain re-delete then
+    advises a `git worktree repair` that cannot help), its git inheriting a caller's `GIT_COMMON_DIR`, and R2-7's window.
+  - **Slips (disclosed):** `ci59b`'s red-on-disable was driven by a small loop script, which the skill forbids (each run's
+    md5 still moved and returned, and no build was involved); during `lf`, one inline heredoc writer edited the lane's
+    file (writers go in files), and once a mutant was applied before the previous restore's md5 had been read (reverted,
+    verified, re-applied).
   - **DssHarness 0.5.16** (repo-harness #17) lists every runner and action-file key in `help runners`, says which
     stall bound applies, and refuses keys nothing reads. That answers the second report. ✔MEASURED that nothing of
     ours trips its new refusals: `config.json` loads, and a static scan of 52 runners and 45 action files (62 steps)
@@ -232,10 +272,9 @@ changed, and the eight `harness/` entries that read them were rebuilt and re-run
   into my tool output (no file); two ledger notes and one row carried a hand-typed date one day ahead (the run ids are
   UTC), corrected, and a stamp's date is now read too.
 
-**Registry.** ✔MEASURED at this commit against round 13's `737078de`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 617 at 737078de" — 5 new rows: 2 born closed (X1's, P3) and 3 `🔵 DISCLOSED` rows of debt this exit found and did not create (the compile-time rise, P2, measured at round 12's commit; the four-leg run's clone contention, P2; read-leg-path's over-masking, P3), 0 closed, 0 reopened, 0 dropped; counted 611 → 611. Against round 12's `547f316f`, the base of round 13's balance: 615 → 620 raw, 5 closed, 10 opened (1 created, 9 disclosed), counted −4. Banding **P0 0 · P1 62 · P2 211 · P3 332 · P4 11 · P5 4**; `read-anchors --lint` 0 findings.
+**Registry.** ✔MEASURED at this commit against `6181ba84`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 620 at 6181ba84" — 3 rows born closed (the lane tooling's, P2), 0 counted; `read-anchors --lint` 0 findings; `check-anchor-citations --current-tree` OK. At `4a16954a`, against round 13's `737078de`: `check-anchor-balance` → "OK - the balance holds: 620 open now against 617 at 737078de" — 5 new rows: 2 born closed (X1's, P3) and 3 `🔵 DISCLOSED` rows of debt this exit found and did not create (the compile-time rise, P2, measured at round 12's commit; the four-leg run's clone contention, P2; read-leg-path's over-masking, P3), 0 closed, 0 reopened, 0 dropped; counted 611 → 611. Against round 12's `547f316f`, the base of round 13's balance: 615 → 620 raw, 5 closed, 10 opened (1 created, 9 disclosed), counted −4. Banding **P0 0 · P1 62 · P2 211 · P3 332 · P4 11 · P5 4**; `read-anchors --lint` 0 findings.
 
-**NEXT — THE LANE TOOLING'S TWO DEFECTS (this session's next lane, above), THEN THE OPERATOR RUNS THE PIPES AGAIN, THEN
-MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
+**NEXT — THE OPERATOR RUNS THE PIPES AGAIN, THEN MERGES PR #58.** Then the next PR takes round 13's NEXT list (above) and three rows this exit
 found: the compile-time rise (`D-PERF-DSS-FULL-SOURCE-SQLITE-COMPILE-TIME-ROSE-A-FIFTH-TO-A-QUARTER-SINCE-2026-08-28`),
 the four-leg run refusing its own leg at the shared WSL clone, and read-leg-path's over-masking.
 

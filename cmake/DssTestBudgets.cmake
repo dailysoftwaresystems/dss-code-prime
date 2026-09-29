@@ -172,7 +172,13 @@ set(_DSS_TB_NAMED
     # ⓘ Its 2026-09-18 neighbour `leg_tree_guard` (179.38 s) retired with its subject on
     # 2026-09-21 (lane mig, part 4: the bash tree helper became part of `owning-tree.py`,
     # proved by `owning_tree_selftest_guard`), and its row left with it.
-    "lane_fold_selftest_guard|53|50|221"
+    # ✔MEASURED 2026-09-29 (P68's PR exit, lane `lf`: the self-test went from 93 to 135 pins, its
+    # landing arms driving the real `dssharness delete-worktree` and `list-worktree`), repo-guard
+    # runs of both Windows legs at once, PASSING: 81.44 then 86.04 s MinGW Debug, 82.31 then
+    # 87.08 s MSVC Release (134, then 135 pins) -- 87.08 s the slowest release run measured
+    # (2026-09-28's took 44.59-54.62 s), above its unit ceiling: 88. Debug stays
+    # 221 (the loaded 2026-09-18 run is still the slowest); sanitized stays unmeasured.
+    "lane_fold_selftest_guard|53|88|221"
     # ★★ THE SAME CLASS AGAIN, THREE MORE ENTRIES. link/test_coff_object_reader,
     # link/test_pe_object_data_import_slot and core/test_include_path_rooted_resolution each
     # hit (Timeout) at 315 s in one -j10 full run on 2026-09-18, beside another lane's build,

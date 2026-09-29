@@ -27,15 +27,19 @@ orphaned checkouts under `.claude/worktrees/`, three full copies, one of them 28
 2026-09-24): **never hand-roll `git worktree add` in a lane.** Seeding, folding and landing run through the
 lane-fold action's own program — `lane-fold.py seed` and `land` — as a NAMED INTERIM until the action
 declares them as manual steps, the only route besides a reported DssHarness bug; `seed` is MANDATORY right
-after `create-worktree`, before any work. The `lane-worktree` action stays only for the VERIFIED evidence
-copy `land` asks it for (`--preserve-to`). Every directory they use is read from configuration
+after `create-worktree`, before any work. `land` keeps a lane's evidence through the `lane-worktree` action's
+VERIFIED copy and re-reads it, then has `dssharness delete-worktree` remove the worktree and the copies
+DssHarness recorded of it on hosts -- and only after the lane's LAST review (the operator, 2026-09-28: "only
+removes copies after last review is fine: while modifications are needed the files can't be removed"). A
+landing whose removal does not finish says LANDING INCOMPLETE (exit 4), and `land` again folds nothing and
+finishes it, or names the command that does. Every directory they use is read from configuration
 (`references/worktrees.md`).
 
 ```bash
 dssharness create-worktree k      # -> <repo>/.worktrees/k (worktrees.root); a name is at most 10 characters
 python3 .harness-config/runner/actions/lane-fold/lane-fold.py seed k   # MANDATORY, before any work: resets the seed manifest (P57)
-python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k production --apply   # a FINISHED lane leaves this way
-dssharness delete-worktree k      # after land, its host copies; a lane NOT landed, the worktree too
+python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k production --apply   # after its LAST review: the worktree and its recorded host copies
+dssharness delete-worktree k --discard-uncommitted --delete-evidence   # a lane NOT landed (abandoned), once what it holds is kept elsewhere
 ```
 
 ⚠ **`seed` is MANDATORY, right after `create-worktree` and before any work** — `seed k --empty` for a lane
@@ -59,8 +63,8 @@ Four clauses, and each is measured rather than asserted — detail in `reference
    `.harness-config/config.json` and named in the refusal — the defect it prevents fails as a per-TU
    compile error in files the lane never touched. ⏳ SCRIPT-ERA (superseded 2026-09-24: `dssharness create-worktree` holds each worktree's longest build path under worktrees.pathLimit, and a name within worktrees.maxNameLength, 10 characters; see dss-harness.md)
    ⇒ **Keep lane names SHORT** (`k`, `l`, `rod`); a descriptive name spends that margin.
-3. **The lane that takes a worktree owns removing it** — `lane-fold.py land` for a finished lane, then
-   `dssharness delete-worktree` for the host copies `land` leaves; `dssharness delete-worktree` alone
+3. **The lane that takes a worktree owns removing it** — `lane-fold.py land` for a finished lane, after its
+   last review (it removes the host copies DssHarness recorded too); `dssharness delete-worktree` alone
    otherwise — and the registration must go with it, because a stale
    registration lives in `.git/worktrees/` and **never appears in `git status`**.
 4. ⚠ **`-fd`, never `-fdx`.** `git clean -fd` does not delete ignored paths, so a live worktree
@@ -126,15 +130,26 @@ already records what happens to a rule that lives only in a document.
 ```bash
 dssharness create-worktree k                                                            # -> <repo>/.worktrees/k
 python3 .harness-config/runner/actions/lane-fold/lane-fold.py seed k                    # MANDATORY, before any work: resets the seed manifest (P57)
-python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k production --apply  # the way a FINISHED lane leaves
-dssharness delete-worktree k                                                            # after land, its host copies; a lane NOT landed, the worktree too
+python3 .harness-config/runner/actions/lane-fold/lane-fold.py land k production --apply  # the way a FINISHED lane leaves, after its LAST review
+dssharness delete-worktree k --discard-uncommitted --delete-evidence                    # a lane NOT landed (abandoned), once what it holds is kept elsewhere
+dssharness list-worktree                                                                # each worktree's host copies, and the copies gone worktrees left, from DssHarness's record; --hosts asks each host
 ```
+
+ⓘ Without its two flags `delete-worktree` refuses a worktree holding uncommitted work or evidence, and on
+Windows it refuses, whole and before anything is removed, one something holds -- a shell standing in it, a file
+open without delete sharing, a program running from it -- naming what holds it.
 
 ⚠ **`seed` is MANDATORY, right after `create-worktree` and before any work** — `seed k --empty` for a lane
 created at HEAD and given nothing. It carries the main tree's uncommitted state in, RESETS the lane's seed
 manifest and records its base. ✔MEASURED P57: a stale manifest left by an earlier lane of the same name makes
 the fold SILENTLY DROP the lane's work, and `create-worktree` does not reset it — it knows nothing of
-lane-fold's manifests, and lane-fold keeps a landed lane's manifest on purpose.
+lane-fold's manifests, and lane-fold keeps a landed lane's manifest on purpose. `land` marks the manifest
+LANDED while it removes a lane and drops the mark once the removal is complete; `seed` resets a mark for a
+NEW worktree of the name (git gives it an administrative directory of its own), and for the landed one only
+while it lists no change — never over what a removal that stopped part way left, `--force` included. A lane
+directory left with no `.git` at all is never force-removed by `land`: it keeps the evidence and names the
+`dssharness delete-worktree <lane> --force` for a person to run once they have looked, since a directory made
+at that path since reads the same.
 
 ⚠ `dssharness run lane-fold` runs that action's self-test and nothing else — its `.yml` declares no other step
 (✔MEASURED 2026-09-25, DssHarness 0.5.12) — so seeding, folding and landing run as its program's verbs, as
@@ -162,13 +177,13 @@ commit.
 `--discard-evidence`. ✔MEASURED P66: the gate used to count `scratchpad/` only, while
 every live lane kept its evidence under `.temp/<lane>-scratch/`, so it counted zero for all of them.
 A preserve refuses a destination inside the worktree or one already holding a same-named file with
-other bytes, and re-reads every file at the destination. `--discard-scratchpad` is retired and refused. [→ plain removal is `dssharness delete-worktree <name>`: without `--force` it refuses work that would be lost, a locked worktree, and a worktree whose evidence directories hold anything — `--delete-evidence` waives only that last check, `--force` all three — and it removes the worktree's host copies too; the action's `remove` stays for `--preserve-to`, and `land` calls it](dss-harness.md)
+other bytes, and re-reads every file at the destination. `--discard-scratchpad` is retired and refused. [→ plain removal is `dssharness delete-worktree <name>`: without `--force` it refuses work that would be lost, a locked worktree, and a worktree whose evidence directories hold anything — `--discard-uncommitted` waives the uncommitted changes (never a commit no ref reaches), `--delete-evidence` the evidence, `--force` every check — on Windows it refuses, whole, a worktree something holds, and it removes the copies of it DssHarness recorded on hosts; `land` keeps the evidence through the action's own verified copy, then calls it](dss-harness.md)
 
 ★ **A finished lane is LANDED, never removed by hand:** `lane-fold.py land <lane> production`
 folds it, applies its `row/` cells through the row writer all-or-nothing and re-reads each row, checks
 nothing is left to fold, keeps the whole evidence set under `.worktrees/.evidence/<lane>-<stamp>/`
 (the lanes' root and lane-fold's `evidence`, both read),
-and only then removes the worktree. Without `--apply` it is a dry run; a stopped landing can be re-run. SUPERSEDED 2026-09-25 by the one row format, anchor-rows' rows directory — until `land` switches to it in the next PR, it reads only `<ANCHOR>.<cell>` files under the lane's `.temp/<lane>-scratch/row/` and refuses, loudly, a lane without them; a lane's rows directory is applied by the anchor-rows action (see lane-discipline.md) [→ `land` leaves the worktree's host copies: follow it with `dssharness delete-worktree <lane>`, which removes them even for a name whose worktree is gone — `land` moves to `delete-worktree` in the next PR](dss-harness.md)
+and only then has DssHarness remove the worktree and the copies it recorded on hosts. Without `--apply` it is a dry run; a stopped landing can be re-run. SUPERSEDED 2026-09-25 by the one row format, anchor-rows' rows directory — until `land` switches to it in the next PR, it reads only `<ANCHOR>.<cell>` files under the lane's `.temp/<lane>-scratch/row/` and refuses, loudly, a lane without them; a lane's rows directory is applied by the anchor-rows action (see lane-discipline.md) [→ since 2026-09-29 `land` removes the worktree and its recorded host copies through `dssharness delete-worktree`, and only `land` removes: a fold never does, so a lane a review sends back keeps them. Before it asks, it re-reads the kept evidence (over the evidence roots named before the fold and after it) and marks the lane's seed manifest LANDED; after, it checks the directory, git's registration and DssHarness's record (`list-worktree --json`). Anything left is LANDING INCOMPLETE, exit 4; `land` again folds nothing, compares the lane with its own record in the mark, and finishes the removal or names the command that does. No verb folds or applies rows to a lane marked landed, `seed` resets the mark only as the paragraph on `seed` above says, and every verb refuses a lane directory that is not its own registered git worktree](dss-harness.md)
 
 ⚠ **THE LANE VERBS RESOLVE THEIR TREE FROM THE PROGRAM'S OWN LOCATION, NOT FROM YOUR
 `cwd` — SINCE P53.** The lane-worktree shell and PowerShell programs of the time and
